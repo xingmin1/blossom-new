@@ -10,6 +10,11 @@ ROOTFS_IMG_NAME = rootfs-rv.img
 ROOTFS_IMG_DIR := ../fs-img-dir
 CORE_NUM := 1
 LOG := off
+KERNEL_RV := ../kernel-rv
+KERNEL_LA := ../kernel-la
+SDCARD_RV := ../sdcard-rv.img
+SDCARD_LA := ../sdcard-la.img
+
 ifeq ($(BOARD), vf2)
 	ROOTFS_IMG := /dev/sdc
 else
@@ -131,17 +136,16 @@ runsimple:
 		-smp threads=$(CORE_NUM)
 
 comp:
-	qemu-system-riscv64 \
-	-machine virt \
-	-kernel ../kernel-rv \
-	-m 1G \
-	-nographic \
-	-smp 1 \
-	-drive file=$(ROOTFS_IMG),if=none,format=raw,id=x0 \
-	-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-	-no-reboot -device virtio-net-device,netdev=net \
-	-netdev user,id=net \
-	-rtc base=utc \
-	-snapshot
+	@qemu-system-riscv64 \
+		-machine virt \
+		-kernel $(KERNEL_RV) \
+		-m 1024 \
+		-nographic \
+		-smp 1 \
+		-bios default \
+		-drive file=$(SDCARD_RV),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-rtc base=utc
 
 .PHONY: user

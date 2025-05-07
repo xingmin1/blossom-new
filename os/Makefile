@@ -24,11 +24,17 @@ rv64-only:
 rv64-run-only:
 	make -f make/rv64.mk runsimple
 
+rv64-run:
+	make -f make/rv64.mk comp
+
 la64-only:
 	make -f make/la64.mk all BLK_MODE=${BLK_MODE}
 
 la64-run-only:
 	make -f make/la64.mk runsimple
+
+la64-run:
+	make -f make/la64.mk comp
 
 comp:
 	make -f make/$(CURR_ARCH).mk comp
