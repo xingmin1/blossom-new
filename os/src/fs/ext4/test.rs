@@ -6,7 +6,7 @@ impl Ext4FileSystem {
     /// 尝试打开一个文件并读取内容
     /// 读取 2048 个字节
     pub fn test_get_file(&self, path: &str) {
-        let read_size = 2048;
+        let read_size = 4096;
         let child_inode = self.generic_open(path, &mut 2, false, 0, &mut 0).unwrap();
         println!("child_inode_num: {:?}", child_inode);
         let mut data = vec![0u8; read_size as usize];

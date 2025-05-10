@@ -10,7 +10,7 @@ pub extern "C" fn _start() -> ! {
 
 #[no_mangle]
 fn main() -> i32 {
-    let path = "/bin/bash\0";
+    let path = "/bash\0";
     let environ = [
         "SHELL=/bash\0".as_ptr(),
         "PWD=/\0".as_ptr(),

@@ -54,10 +54,11 @@ impl Swap {
     }
     fn alloc_page(&self) -> Option<usize> {
         for (i, bit) in self.bitmap.iter().enumerate() {
-            if !*bit == 0 {
-                continue;
+            if *bit == u64::MAX {
+                continue; // 所有 64 位都已被占用，跳过
             }
-            return Some(i * 64 + (!*bit).trailing_zeros() as usize);
+            let free_bit = (!*bit).trailing_zeros() as usize;
+            return Some(i * 64 + free_bit);
         }
         None
     }
@@ -68,11 +69,14 @@ impl Swap {
         Self::read_page(self.get_block_ids(swap_id), buf);
     }
     pub fn write(&mut self, buf: &[u8]) -> Arc<SwapTracker> {
-        let swap_id = self.alloc_page().unwrap();
-        Self::write_page(self.get_block_ids(swap_id), buf);
-        self.set_bit(swap_id);
-        Arc::new(SwapTracker(swap_id))
-    }
+        if let Some(swap_id) = self.alloc_page() {
+            Self::write_page(self.get_block_ids(swap_id), buf);
+            self.set_bit(swap_id);
+            Arc::new(SwapTracker(swap_id))
+        } else {
+            panic!("Swap space exhausted!");
+        }
+    }    
     #[inline(always)]
     pub fn discard(&mut self, swap_id: usize) {
         self.clear_bit(swap_id);

@@ -546,9 +546,7 @@ impl InodeTrait for Ext4Inode {
     }
 
     fn get_file_type(&self) -> DiskInodeType {
-        // todo!()
         let file_type = self.file_type();
-        // println!("[kernel ext4inode file type] current inode is {:?}", self);
         // println!("[kernel ext4inode file type] file type is {:#?}", file_type);
         match file_type {
             InodeFileType::S_IFDIR => crate::fs::DiskInodeType::Directory,
@@ -838,8 +836,9 @@ impl Ext4FileSystem {
     /// 从磁盘加载inoderef对象
     pub fn get_inode_ref(&self, inode_num: u32) -> Ext4InodeRef {
         let offset = self.inode_disk_pos(inode_num);
-
         let mut ext4block = Block::load_offset(self.block_device.clone(), offset);
+        // println!("[kernel] ext4block.diskoffset is {:?}", ext4block.disk_offset);
+        // println!("[kernel] ext4block.data is {:?}", ext4block.data);
         let blk_offset = offset % self.block_size;
         let inode: &mut Ext4Inode = ext4block.read_offset_as_mut(offset % self.block_size);
         Ext4InodeRef {

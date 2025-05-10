@@ -54,4 +54,4 @@ gdb:
 	make -f make/$(CURR_ARCH).mk gdb
 
 rv64-gdb: rv64-debug
-	make -f make/rv64.mk gdb
+	make -f make/rv64.mk comp-gdb

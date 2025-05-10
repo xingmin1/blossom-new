@@ -10,7 +10,6 @@ use virtio_drivers::{VirtIOBlk, VirtIOHeader};
 const VIRT_IO_BLOCK_SZ: usize = 512;
 use crate::hal::BLOCK_SZ;
 const BLOCK_RATIO: usize = BLOCK_SZ / VIRT_IO_BLOCK_SZ;
-// const VIRT_IO_BLOCK_SZ: usize = 2048;
 #[allow(unused)]
 const VIRTIO0: usize = 0x10001000;
 

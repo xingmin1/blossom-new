@@ -12,14 +12,14 @@ pub const SUPERBLOCK_OFFSET: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ext4Superblock {
     pub inodes_count: u32,         // 节点数
-    blocks_count_lo: u32,          // 块数
+    pub blocks_count_lo: u32,          // 块数
     reserved_blocks_count_lo: u32, // 保留块数
     free_blocks_count_lo: u32,     // 空闲块数
     free_inodes_count: u32,        // 空闲节点数
     pub first_data_block: u32,     // 第一个数据块
-    log_block_size: u32,           // 块大小
+    pub log_block_size: u32,           // 块大小
     log_cluster_size: u32,         // 废弃的片段大小
-    blocks_per_group: u32,         // 每组块数
+    pub blocks_per_group: u32,         // 每组块数
     frags_per_group: u32,          // 废弃的每组片段数
     pub inodes_per_group: u32,     // 每组节点数
     mount_time: u32,               // 挂载时间

@@ -53,8 +53,8 @@ core::arch::global_asm!(include_str!("load_img.S"));
 core::arch::global_asm!(include_str!("load_img-rv.S"));
 // #[cfg(all(not(feature = "block_mem"), feature = "loongarch64"))]
 // core::arch::global_asm!(include_str!("preload_app.S"));
-// #[cfg(all(not(feature = "block_mem"), feature = "riscv"))]
-// core::arch::global_asm!(include_str!("preload_app-rv.S"));
+#[cfg(all(not(feature = "block_mem"), feature = "riscv"))]
+core::arch::global_asm!(include_str!("preload_app-rv.S"));
 
 fn mem_clear() {
     extern "C" {
@@ -127,7 +127,7 @@ pub fn rust_main() -> ! {
     println!("[kernel] block in virt mode!");
     #[cfg(feature = "oom_handler")]
     println!("[kernel] oom_handler is enabled!");
-    // fs::flush_preload();
+    fs::flush_preload();
     task::add_initproc();
     // note that in run_tasks(), there is yet *another* pre_start_init(),
     // which is used to turn on interrupts in some archs like LoongArch.

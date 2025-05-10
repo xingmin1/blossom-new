@@ -504,7 +504,6 @@ pub fn copy_to_user_array<T: 'static + Copy>(
     dst: *mut T,
     len: usize,
 ) -> Result<(), isize> {
-    println!("len is :{}", len);
     let size = core::mem::size_of::<T>() * len;
     // if all data of `*dst` is in the same page, write directly
     if VirtAddr::from(dst as usize).floor() == VirtAddr::from(dst as usize + size - 1).floor() {

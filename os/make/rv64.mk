@@ -148,4 +148,19 @@ comp:
 		-no-reboot \
 		-rtc base=utc
 
+comp-gdb:
+	@qemu-system-riscv64 \
+        -machine virt \
+        -kernel $(KERNEL_RV) \
+        -m 1024 \
+        -nographic \
+        -smp 1 \
+        -bios default \
+        -drive file=$(SDCARD_RV),if=none,format=raw,id=x0 \
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+        -no-reboot \
+        -rtc base=utc \
+        -S \
+        -s
+
 .PHONY: user
