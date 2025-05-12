@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 // use user_lib::{exit, exec, fork, waitpid, shutdown, sleep};
-use user_lib::{exec, exit, fork, shutdown, waitpid};
+use user_lib::{exec, exit, fork, shutdown, waitpid, chdir};
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -34,18 +34,32 @@ fn main() -> i32 {
     let pid = fork();
     if pid == 0 {
         // 只启动bash
-        exec(
-            path,
-            &[path.as_ptr() as *const u8, core::ptr::null()],
-            &environ,
-        );
-        // 执行初赛测例
-        // exec(path, &[path.as_ptr() as *const u8, "-c\0".as_ptr(), "./run-all.sh\0".as_ptr(), core::ptr::null()], &environ);
-        // 执行决赛测例
-        // exec(path, &[path.as_ptr() as *const u8, "-c\0".as_ptr(), "./run-all-final.sh\0".as_ptr(), core::ptr::null()], &environ);
-        // 执行netperf测例
-        // exec(path, &[path.as_ptr() as *const u8, "-c\0".as_ptr(), "./netperf_testcode.sh\0".as_ptr(), core::ptr::null()], &environ);
-        // exec(path, &[path.as_ptr() as *const u8, "-c\0".as_ptr(), "./iperf_testcode.sh\0".as_ptr(), core::ptr::null()], &environ);
+        // exec(
+        //     path,
+        //     &[path.as_ptr() as *const u8, core::ptr::null()],
+        //     &environ,
+        // );
+        //执行初赛测例
+
+        //===================================MUSL=====================================
+        chdir("/musl\0");
+
+        //basic_testcode.sh:
+        exec(path, &[path.as_ptr() as *const u8, "-c\0".as_ptr(), "./basic_testcode.sh\0".as_ptr(), core::ptr::null()], &environ);
+
+        //===================================MUSL=====================================
+
+        //********************************************************************************************* 
+
+        //===================================glibc====================================
+        chdir("/glibc\0");
+
+        //basic_testcode.sh
+        exec(path, &[path.as_ptr() as *const u8, "-c\0".as_ptr(), "./glibc/basic_testcode.sh\0".as_ptr(), core::ptr::null()], &environ);
+
+
+        //===================================glibc====================================
+
     } else {
         waitpid(pid as usize, &mut exit_code);
     }

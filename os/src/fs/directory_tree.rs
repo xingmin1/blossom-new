@@ -295,6 +295,36 @@ impl DirectoryTreeNode {
         // }
         self.file.create(name, file_type)
     }
+    // 判断路径是否存在
+    pub fn path_exists(&self, path: &str) -> bool {
+        // 解析路径
+        let components = Self::parse_dir_path(path);
+        
+        // 如果路径以 `/` 开头，表示从根目录开始查找
+        let inode = if path.starts_with("/") {
+            &**ROOT
+        } else {
+            &self
+        };
+        
+        // 解析路径
+        match inode.cd_comp(&components) {
+            Ok(parent_inode) => {
+                // 获取路径最后一个组件
+                let last_comp = components.last();
+                if let Some(last_comp) = last_comp {
+                    // 检查最后一个组件是否存在
+                    let lock = parent_inode.children.read();
+                    if let Some(child) = lock.as_ref().and_then(|m| m.get(*last_comp)) {
+                        // 文件或目录存在
+                        return true;
+                    }
+                }
+                false // 最后一个组件不存在
+            },
+            Err(_) => false, // 路径无效
+        }
+    }
 
     // 模拟文件系统的 open 调用
     pub fn open(
@@ -304,31 +334,31 @@ impl DirectoryTreeNode {
         special_use: bool,
     ) -> Result<Arc<dyn File>, isize> {
         log::debug!("[open]: cwd: {}, path: {}", self.get_cwd(), path);
-        // println!("open file in dtn: cwd: {} name: {}",self.get_cwd(), path );
 
-        const BUSYBOX_PATH: &str = "/busybox";
         const REDIRECT_TO_BUSYBOX: [&str; 4] = ["/touch", "/rm", "/ls", "/grep"];
+
         let path = if REDIRECT_TO_BUSYBOX.contains(&path) {
-            BUSYBOX_PATH
+            // 判断使用哪个 busybox 路径
+            "musl/busybox"
+            // if self.path_exists("/glibc/busybox") {
+            //     "/glibc/busybox"
+            // } else if self.path_exists("/musl/busybox") {
+            //     "/musl/busybox"
+            // } else {
+            //     return Err(ENOENT); // 两个都没有，报错
+            // }
         } else {
             path
         };
-        const LIBC_PATH: &str = "/lib/libc.so";
-        const REDIRECT_TO_LIBC: [&str; 3] = [
-            "/lib/ld-musl-riscv64.so.1",
-            "/lib/ld-musl-riscv64-sf.so.1",
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-        ];
-        let path = if REDIRECT_TO_LIBC.contains(&path) {
-            LIBC_PATH
-        } else {
-            path
+
+        // 重定向动态链接库到实际存在的位置
+        let path = match path {            
+            "/lib/ld-linux-riscv64-lp64.so.1" => "/musl/lib/libc.so",
+            "/lib/ld-musl-riscv64.so.1" | "/lib/ld-musl-riscv64-sf.so.1" => "/musl/lib/libc.so",
+            "/usr/lib/tls_get_new-dtv_dso.so" => "./libtls_get_new-dtv_dso.so",
+            _ => path,
         };
-        let path = if path == "/usr/lib/tls_get_new-dtv_dso.so" {
-            "./libtls_get_new-dtv_dso.so"
-        } else {
-            path
-        };
+
         // 获取目录树根节点
         let inode = if path.starts_with("/") {
             &**ROOT
@@ -338,24 +368,20 @@ impl DirectoryTreeNode {
 
         // 获取路径缓存
         let mut path_cache_lock = PATH_CACHE.lock();
-        // 如果路径以 '/' 开头，且路径等于缓存路径，且缓存路径的弱引用存在
         let inode = if path.starts_with('/')
             && path == path_cache_lock.0
             && path_cache_lock.1.upgrade().is_some()
         {
-            // 获取缓存路径的弱引用
             path_cache_lock.1.upgrade().unwrap()
         } else {
-            // 解析路径
             let mut components = Self::parse_dir_path(path);
-            // 获取目录栈的栈顶，也就是父目录或者文件本身
             let last_comp = components.pop();
-            // 从剩余的路径中获取父目录节点
+
             let inode = match inode.cd_comp(&components) {
                 Ok(inode) => inode,
                 Err(errno) => return Err(errno),
             };
-            // 若最后一个组件存在，则进行处理
+
             if let Some(last_comp) = last_comp {
                 let mut lock = inode.children.write();
                 match inode.try_to_open_subfile(last_comp, &mut lock) {
@@ -385,9 +411,7 @@ impl DirectoryTreeNode {
                         lock.as_mut().unwrap().insert(key, value);
                         new_inode
                     }
-                    Err(errno) => {
-                        return Err(errno);
-                    }
+                    Err(errno) => return Err(errno),
                 }
             } else {
                 inode
@@ -395,9 +419,8 @@ impl DirectoryTreeNode {
         };
 
         if flags.contains(OpenFlags::O_TRUNC) {
-            match inode.file.truncate_size(0) {
-                Ok(_) => {}
-                Err(errno) => return Err(errno),
+            if let Err(errno) = inode.file.truncate_size(0) {
+                return Err(errno);
             }
         }
 
@@ -627,6 +650,13 @@ impl DirectoryTreeNode {
         new_lock.lock().as_mut().unwrap().insert(new_key, value);
 
         Ok(())
+    }
+
+    pub fn parent(&self) -> Arc<Self> {
+        match self.father.lock().upgrade() {
+            Some(inode) => inode,
+            None => panic!("parent inode is None"),
+        }
     }
 }
 
