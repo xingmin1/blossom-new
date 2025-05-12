@@ -127,6 +127,7 @@ pub fn rust_main() -> ! {
     println!("[kernel] block in virt mode!");
     #[cfg(feature = "oom_handler")]
     println!("[kernel] oom_handler is enabled!");
+    #[cfg(all(not(feature = "block_mem"), feature = "riscv"))]
     fs::flush_preload();
     task::add_initproc();
     // note that in run_tasks(), there is yet *another* pre_start_init(),
