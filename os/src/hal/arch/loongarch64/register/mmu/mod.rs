@@ -31,6 +31,9 @@ impl core::fmt::Display for MemoryAccessType {
     }
 }
 #[linkage = "weak"]
-pub const VALEN: usize = 48;
+#[no_mangle]
+pub static VALEN: usize = 48;
+
 #[linkage = "weak"]
-pub const PALEN: usize = 48;
+#[no_mangle]
+pub static PALEN: usize = 48;

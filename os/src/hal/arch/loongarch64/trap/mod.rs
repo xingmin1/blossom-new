@@ -1,3 +1,7 @@
+#![feature(asm_experimental_arch)]
+#![feature(naked_functions)]
+#![feature(naked_asm)]
+
 mod context;
 mod mem_access;
 use self::context::GeneralRegs;
@@ -43,7 +47,7 @@ pub extern "C" fn __rfill() {
     //         w_dm_df_pd_i_lv;
     // let i = 0xA8;
     unsafe {
-        asm!(
+        core::arch::naked_asm!(
             // PGD: 0x1b CRMD:0x0 PWCL:0x1c TLBRBADV:0x89 TLBERA:0x8a TLBRSAVE:0x8b SAVE:0x30
             // TLBREHi: 0x8e STLBPS: 0x1e MERRsave:0x95
             "
@@ -99,7 +103,6 @@ pub extern "C" fn __rfill() {
     csrwr  $t0, 0x8d
     b      2b
 ",
-            options(noreturn)
         )
     }
 }
