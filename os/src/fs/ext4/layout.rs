@@ -511,10 +511,10 @@ impl File for Ext4OSInode {
                 inode_mode,
                 &mut nameoff,
             );
-            println!("inhere???");
+            //println!("inhere???");
             if let Ok(new_inode_num) = new_inode_num {
                 let new_inode_ref = self.ext4fs.get_inode_ref(new_inode_num);
-                println!("new_inode_ref:{:#?}", new_inode_ref);
+                //println!("new_inode_ref:{:#?}", new_inode_ref);
                 return Ok(Arc::new(Self {
                     inode_lock: Arc::new(RwLock::new(InodeLock {})),
                     readable: true,
@@ -598,14 +598,14 @@ impl File for Ext4OSInode {
         // 如果是目录
         if file_type == DiskInodeType::Directory {
             self.ext4fs.truncate_inode(&mut child_inode_ref, 0)?;
-            println!("[kernel unlink] unlink dir name: {:?}", name);
+            //println!("[kernel unlink] unlink dir name: {:?}", name);
             self.ext4fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name.as_str());
             self.ext4fs.write_back_inode(&mut parent_inode_ref);
             return Ok(());
         }
 
         // 如果是常规文件
-        println!("[kernel unlink] unlink file name: {:?}", name);
+        //println!("[kernel unlink] unlink file name: {:?}", name);
         self.ext4fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name.as_str());
         self.ext4fs.write_back_inode(&mut parent_inode_ref);
 

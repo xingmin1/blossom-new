@@ -255,9 +255,9 @@ impl Ext4FileSystem {
     /// # 返回值:
     /// + `Result<Ext4InodeRef>` - 新文件的inode
     pub fn create(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef, isize> {
-        println!("in1, parent:{:?}", parent);
+        //println!("in1, parent:{:?}", parent);
         let a = 1+2+parent;
-        println!("a = {:?}", a);
+        //println!("a = {:?}", a);
         // Ext4FileSystem被锁了？
         let dummy = self.get_inode_ref(a);
         // println!("dummy = {:#?}", dummy);
