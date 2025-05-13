@@ -7,7 +7,7 @@ QEMU_URL := https://gitlab.educg.net/wangmingjian/os-contest-2024-image/-/raw/ma
 QEMU_DIR := util/qemu-2k1000/tmp
 QEMU_TAR_PATH := $(QEMU_DIR)/$(QEMU_TAR)
 
-all: clean env
+all: clean
 	make -C os all
 
 env:
