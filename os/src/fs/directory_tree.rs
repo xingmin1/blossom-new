@@ -531,7 +531,11 @@ impl DirectoryTreeNode {
             return Err(ENOTDIR);
         }
 
-        match inode.father.lock().upgrade() {
+        match {
+            // 首先获取父节点的 Weak 引用并释放锁
+            let father_weak = inode.father.lock().clone();
+            father_weak.upgrade()
+        } {
             Some(par_inode) => {
                 let mut lock = par_inode.children.write();
                 match inode.file.unlink(true) {
@@ -653,10 +657,11 @@ impl DirectoryTreeNode {
     }
 
     pub fn parent(&self) -> Arc<Self> {
-        match self.father.lock().upgrade() {
-            Some(inode) => inode,
-            None => panic!("parent inode is None"),
-        }
+        let father_weak = {
+            // 复制出 Weak 引用后立即释放锁
+            self.father.lock().clone()
+        };
+        father_weak.upgrade().expect("parent inode is None")
     }
 }
 

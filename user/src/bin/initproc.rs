@@ -34,11 +34,11 @@ fn main() -> i32 {
     let pid = fork();
     if pid == 0 {
         // 只启动bash
-        // exec(
-        //     path,
-        //     &[path.as_ptr() as *const u8, core::ptr::null()],
-        //     &environ,
-        // );
+        exec(
+            path,
+            &[path.as_ptr() as *const u8, core::ptr::null()],
+            &environ,
+        );
         //执行初赛测例
 
         //===================================MUSL=====================================
