@@ -27,7 +27,7 @@ rustsbi = { path = "../dependency/rustsbi" }
 
 # [target.'cfg(target_arch = "loongarch64")'.dependencies]
 pci = { git = "https://github.com/huayuntao/dep_pci.git" }
-isomorphic_drivers = { path = "../dependency/dep_iso/isomorphic_drivers" }
+isomorphic_drivers = { path = "../dependency/dep_iso" }
 
 smoltcp = { version = "0.10.0", default-features = false, features = [
     "alloc",
