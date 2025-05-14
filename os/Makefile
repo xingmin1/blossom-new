@@ -1,4 +1,4 @@
-ARCHS = la64 rv64
+ARCHS = rv64
 CURR_ARCH ?= la64
 FS_MODE ?= ext4
 BLK_MODE ?= virt
