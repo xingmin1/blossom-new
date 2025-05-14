@@ -719,19 +719,15 @@ impl File for Ext4OSInode {
     }
 
     fn set_timestamp(&self, ctime: Option<usize>, atime: Option<usize>, mtime: Option<usize>) {
-        unsafe {
-            // 将 Arc 转换为裸指针
-            let ptr = Arc::as_ptr(&self.inode) as *mut Ext4Inode;
-            // 直接修改数据
-            if let Some(ctime) = ctime {
-                (*ptr).set_ctime(ctime as u32);
-            }
-            if let Some(atime) = atime {
-                (*ptr).set_atime(atime as u32);
-            }
-            if let Some(mtime) = mtime {
-                (*ptr).set_mtime(mtime as u32);
-            }
+        let mut inode_ref = self.inode.lock();
+        if let Some(ct) = ctime {
+            inode_ref.set_ctime(ct as u32);
+        }
+        if let Some(at) = atime {
+            inode_ref.set_atime(at as u32);
+        }
+        if let Some(mt) = mtime {
+            inode_ref.set_mtime(mt as u32);
         }
     }
 
