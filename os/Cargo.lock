@@ -155,7 +155,6 @@ dependencies = [
 [[package]]
 name = "isomorphic_drivers"
 version = "0.1.0"
-source = "git+https://github.com/huayuntao/dep_iso.git#9761f75e4f551da9427bd102b2526a10365fe875"
 dependencies = [
  "bit_field",
  "bitflags",
