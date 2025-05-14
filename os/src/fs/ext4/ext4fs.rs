@@ -122,7 +122,7 @@ impl Ext4FileSystem {
                     );
                 }
                 Err(errno) => {
-                    //println!("[failed in ext4fs generic_open function!] {:?}", errno)
+                    println!("[failed in ext4fs generic_open function!] {:?}", errno)
                 }
             }
 
