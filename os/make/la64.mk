@@ -162,7 +162,7 @@ else ifeq ($(BOARD), 2k1000)
 endif
 
 # 生成根文件系统镜像并编译内核
-all: fs-img uimage
+all: fs-img uimage mv
 
 mv:
 	cp -f $(KERNEL_ELF) ../kernel-la
