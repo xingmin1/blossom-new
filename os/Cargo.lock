@@ -262,7 +262,6 @@ dependencies = [
 [[package]]
 name = "pci"
 version = "0.0.1"
-source = "git+https://github.com/huayuntao/dep_pci.git#d48724e2ecbdcba3ea5c773b1ae0aa3ec177ecf3"
 dependencies = [
  "bit_field",
  "bitflags",
