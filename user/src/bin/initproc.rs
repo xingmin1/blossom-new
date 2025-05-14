@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 // use user_lib::{exit, exec, fork, waitpid, shutdown, sleep};
-use user_lib::{exec, exit, fork, shutdown, waitpid, chdir};
+use user_lib::{exec, exit, fork, shutdown, waitpid, chdir,wait };
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -59,16 +59,12 @@ fn main() -> i32 {
     }
      //能进入bash，方便调试
     // if fork() == 0 {
-    //     exec(bash_path, &[bash_path.as_ptr() as *const u8, core::ptr::null()], &environ);
+    //     exec(path, &[path.as_ptr() as *const u8, core::ptr::null()], &environ);
     // } else {
     //     loop {
     //         let mut exit_code: i32 = 0;
     //         let pid = wait(&mut exit_code);
     //         // ECHLD is -10
-    //         if pid == -10 {
-    //             yield_();
-    //             continue;
-    //         }
     //         // user_lib::println!(
     //         //     "[initproc] Released a zombie process, pid={}, exit_code={}",
     //         //     pid,
