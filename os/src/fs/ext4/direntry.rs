@@ -323,14 +323,14 @@ impl Ext4FileSystem {
                     return Ok(EOK);
                 }
             } else {
-                println!("[kernel direntry] dir search fail");
+                //println!("[kernel direntry] dir search fail");
                 return Err(Ext4Error::new(Errno::ENOENT));
             }
             // go to next block
             iblock += 1
         }
 
-        println!("[kernel direntry] dir search fail");
+        //println!("[kernel direntry] dir search fail");
         return Err(Ext4Error::new(Errno::ENOENT));
     }
 
@@ -365,7 +365,7 @@ impl Ext4FileSystem {
             // go to next entry
             offset = offset + de.entry_len() as usize;
         }
-        println!("[kernel direntry] dir find in block failed");
+        //println!("[kernel direntry] dir find in block failed");
         return Err(Errno::ENOENT as isize);
     }
 
