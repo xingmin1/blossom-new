@@ -96,6 +96,7 @@ kernel:
 
 clean:
 	@cargo clean
+	@rm -rf $(KERNEL_RV)
 
 run: build
 ifeq ($(BOARD), rvqemu)
