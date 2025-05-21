@@ -395,7 +395,7 @@ impl DirectoryTreeNode {
                         if !flags.contains(OpenFlags::O_CREAT) {
                             return Err(ENOENT);
                         }
-                        println!("last_comp:{:?}", last_comp);
+                        //println!("last_comp:{:?}", last_comp);
                         let new_file = match inode.create(last_comp, DiskInodeType::File) {
                             Ok(file) => file,
                             Err(errno) => return Err(errno),

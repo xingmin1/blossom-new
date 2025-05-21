@@ -330,37 +330,72 @@ impl File for Ext4OSInode {
 
     fn write_user(&self, offset: Option<usize>, buf: UserBuffer) -> usize {
         let mut total_write_size = 0usize;
-        let inode_ref = self.inode.lock();
-        let inode_num = inode_ref.inode_num;
-        let inode_lock = self.inode_lock.write();
+
+        // 获取当前 inode 编号（只读）
+        let inode_num = { self.inode.lock().inode_num };
+
+        // 写时锁保护 inode 状态
+        let _inode_write_guard = self.inode_lock.write();
+
         match offset {
             Some(mut offset) => {
-                let mut offset = &mut offset;
+                //println!("[write_user] 使用显式 offset: {}", offset);
                 for slice in buf.buffers.iter() {
-                    // TODO: 假定ext4_rs的处理是正确的
-                    let write_size = self.ext4fs.write_at(inode_num, *offset, slice);
-                    // 对块设备对象进行写入之后，更新缓存对象。
-                    self.update_block_cache(offset.clone(), slice, Arc::new(inode_ref.clone()));
-                    if let Ok(write_size) = write_size {
-                        if write_size == 0 {
+                    // 写入 ext4 文件系统
+                    let write_result = self.ext4fs.write_at(inode_num, offset, slice);
+
+                    // 第一次使用旧 inode 进行缓存更新
+                    let inode_ref_old = self.inode.lock().clone();
+                    self.update_block_cache(offset, slice, Arc::new(inode_ref_old));
+
+                    // 获取最新 inode，并再次刷新缓存（避免文件扩展后错写）
+                    let inode_ref_fresh = self.ext4fs.get_inode_ref(inode_num);
+                    self.update_block_cache(offset, slice, Arc::new(inode_ref_fresh.clone()));
+
+                    // 替换内部 inode，保持同步
+                    let mut my_inode = self.inode.lock();
+                    *my_inode = inode_ref_fresh;
+
+                    // 更新写入状态
+                    if let Ok(written) = write_result {
+                        if written == 0 {
                             break;
                         }
-                        *offset += write_size;
-                        total_write_size += write_size;
+                        offset += written;
+                        total_write_size += written;
+                    } else {
+                        break;
                     }
                 }
             }
+
             None => {
+                //println!("[write_user] 使用内部自增 offset");
                 let mut offset = self.offset.lock();
                 for slice in buf.buffers.iter() {
-                    let write_size = self.ext4fs.write_at(inode_num, *offset, slice);
-                    self.update_block_cache(offset.clone(), slice, Arc::new(inode_ref.clone()));
-                    if let Ok(write_size) = write_size {
-                        if write_size == 0 {
+                    let write_result = self.ext4fs.write_at(inode_num, *offset, slice);
+
+                    // 使用旧 inode 进行缓存更新
+                    let inode_ref_old = self.inode.lock().clone();
+                    self.update_block_cache(*offset, slice, Arc::new(inode_ref_old));
+
+                    // 获取最新 inode 并再次刷新缓存
+                    let inode_ref_fresh = self.ext4fs.get_inode_ref(inode_num);
+                    self.update_block_cache(*offset, slice, Arc::new(inode_ref_fresh.clone()));
+
+                    // 更新内部 inode
+                    let mut my_inode = self.inode.lock();
+                    *my_inode = inode_ref_fresh;
+
+                    // 更新写入状态
+                    if let Ok(written) = write_result {
+                        if written == 0 {
                             break;
                         }
-                        *offset += write_size;
-                        total_write_size += write_size;
+                        *offset += written;
+                        total_write_size += written;
+                    } else {
+                        break;
                     }
                 }
             }

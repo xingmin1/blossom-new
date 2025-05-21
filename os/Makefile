@@ -13,7 +13,7 @@ $(ARCHS):
 	make ARCH=$@ -f make/$@.mk all BLK_MODE=${BLK_MODE} MODE=${MODE}
 
 rv64-kernel-build-only:
-	make -f make/rv64.mk build BLK_MODE=${BLK_MODE} MODE=${MODE}
+	make -f make/rv64.mk build BLK_MODE=${BLK_MODE} MODE=${MODE} LOG=${LOG}
 
 rv64-debug:
 	make -f make/rv64.mk all BLK_MODE=${BLK_MODE} MODE=debug
