@@ -305,7 +305,7 @@ impl<T: PageTable> MemorySet<T> {
                         return Err(MemoryError::BeyondEOF);
                     }
                     if area.map_perm.contains(MapPermission::W) {
-                        let allocated_ppn = area.map_one_unchecked(&mut self.page_table, vpn);
+                        let allocated_ppn = area.map_one_zeroed_unchecked(&mut self.page_table, vpn);
                         file.lseek(offset_in_area as isize, SeekWhence::SEEK_CUR)
                             .unwrap();
                         file.read(None, unsafe {

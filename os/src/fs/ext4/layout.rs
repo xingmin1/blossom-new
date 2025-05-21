@@ -332,35 +332,46 @@ impl File for Ext4OSInode {
         let mut total_write_size = 0usize;
         let inode_ref = self.inode.lock();
         let inode_num = inode_ref.inode_num;
-        let inode_lock = self.inode_lock.write();
+        let inode_lock = self.inode_lock.write(); // 可能用于文件偏移更新同步
+
         match offset {
             Some(mut offset) => {
-                let mut offset = &mut offset;
                 for slice in buf.buffers.iter() {
-                    // TODO: 假定ext4_rs的处理是正确的
-                    let write_size = self.ext4fs.write_at(inode_num, *offset, slice);
-                    // 对块设备对象进行写入之后，更新缓存对象。
-                    self.update_block_cache(offset.clone(), slice, Arc::new(inode_ref.clone()));
-                    if let Ok(write_size) = write_size {
+                    // 写入磁盘
+                    let write_result = self.ext4fs.write_at(inode_num, offset, slice);
+
+                    if let Ok(write_size) = write_result {
                         if write_size == 0 {
                             break;
                         }
-                        *offset += write_size;
+
+                        // 仅当写入成功后才更新缓存
+                        self.update_block_cache(offset, &slice[..write_size], Arc::new(inode_ref.clone()));
+
+                        offset += write_size;
                         total_write_size += write_size;
+                    } else {
+                        // 写入失败，中止
+                        break;
                     }
                 }
             }
             None => {
                 let mut offset = self.offset.lock();
                 for slice in buf.buffers.iter() {
-                    let write_size = self.ext4fs.write_at(inode_num, *offset, slice);
-                    self.update_block_cache(offset.clone(), slice, Arc::new(inode_ref.clone()));
-                    if let Ok(write_size) = write_size {
+                    let write_result = self.ext4fs.write_at(inode_num, *offset, slice);
+
+                    if let Ok(write_size) = write_result {
                         if write_size == 0 {
                             break;
                         }
+
+                        self.update_block_cache(*offset, &slice[..write_size], Arc::new(inode_ref.clone()));
+
                         *offset += write_size;
                         total_write_size += write_size;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -926,42 +937,39 @@ impl Ext4OSInode {
 impl Ext4OSInode {
     fn update_block_cache(&self, offset: usize, buf: &[u8], inode_ref: Arc<Ext4InodeRef>) -> usize {
         let mut start = offset;
-        let old_size = inode_ref.inode.get_file_size() as usize;
-        let diff_len = buf.len() as isize + offset as isize - old_size as isize;
-        let end = (offset + buf.len()).min(old_size as usize);
-
-        debug_assert!(start <= end);
+        let total_len = buf.len();
+        let mut written = 0;
 
         let mut start_cache = start / PageCacheManager::CACHE_SZ;
-        let mut write_size = 0;
-        loop {
-            // 计算当前块的结束位置
-            let mut end_current_block =
-                (start / PageCacheManager::CACHE_SZ + 1) * PageCacheManager::CACHE_SZ;
-            end_current_block = end_current_block.min(end);
-            // 写入并更新写入的大小
-            let block_write_size = end_current_block - start;
+
+        while written < total_len {
+            // 当前页内偏移和最多可写字节数
+            let page_offset = start % PageCacheManager::CACHE_SZ;
+            let page_remain = PageCacheManager::CACHE_SZ - page_offset;
+            let remain = total_len - written;
+            let block_write_size = page_remain.min(remain);
+
+            // 获取当前缓存页并修改
             self.file_cache_manager
                 .get_cache(
                     start_cache,
-                    || -> Vec<usize> { self.get_neighboring_blk(start_cache, inode_ref.clone()) },
+                    || -> Vec<usize> {
+                        self.get_neighboring_blk(start_cache, inode_ref.clone())
+                    },
                     &self.ext4fs.block_device,
                 )
                 .lock()
                 .modify(0, |data_block: &mut [u8; PAGE_SIZE]| {
-                    let src = &buf[write_size..write_size + block_write_size];
-                    let dst = &mut data_block[start % PageCacheManager::CACHE_SZ
-                        ..start % PageCacheManager::CACHE_SZ + block_write_size];
+                    let src = &buf[written..written + block_write_size];
+                    let dst = &mut data_block[page_offset..page_offset + block_write_size];
                     dst.copy_from_slice(src);
                 });
-            write_size += block_write_size;
-            // move to next block
-            if end_current_block == end {
-                break;
-            }
+
+            written += block_write_size;
+            start += block_write_size;
             start_cache += 1;
-            start = end_current_block;
         }
-        write_size
+
+        written
     }
 }
