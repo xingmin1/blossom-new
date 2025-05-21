@@ -961,39 +961,42 @@ impl Ext4OSInode {
 impl Ext4OSInode {
     fn update_block_cache(&self, offset: usize, buf: &[u8], inode_ref: Arc<Ext4InodeRef>) -> usize {
         let mut start = offset;
-        let total_len = buf.len();
-        let mut written = 0;
+        let old_size = inode_ref.inode.get_file_size() as usize;
+        let diff_len = buf.len() as isize + offset as isize - old_size as isize;
+        let end = (offset + buf.len()).min(old_size as usize);
+
+        debug_assert!(start <= end);
 
         let mut start_cache = start / PageCacheManager::CACHE_SZ;
-
-        while written < total_len {
-            // 当前页内偏移和最多可写字节数
-            let page_offset = start % PageCacheManager::CACHE_SZ;
-            let page_remain = PageCacheManager::CACHE_SZ - page_offset;
-            let remain = total_len - written;
-            let block_write_size = page_remain.min(remain);
-
-            // 获取当前缓存页并修改
+        let mut write_size = 0;
+        loop {
+            // 计算当前块的结束位置
+            let mut end_current_block =
+                (start / PageCacheManager::CACHE_SZ + 1) * PageCacheManager::CACHE_SZ;
+            end_current_block = end_current_block.min(end);
+            // 写入并更新写入的大小
+            let block_write_size = end_current_block - start;
             self.file_cache_manager
                 .get_cache(
                     start_cache,
-                    || -> Vec<usize> {
-                        self.get_neighboring_blk(start_cache, inode_ref.clone())
-                    },
+                    || -> Vec<usize> { self.get_neighboring_blk(start_cache, inode_ref.clone()) },
                     &self.ext4fs.block_device,
                 )
                 .lock()
                 .modify(0, |data_block: &mut [u8; PAGE_SIZE]| {
-                    let src = &buf[written..written + block_write_size];
-                    let dst = &mut data_block[page_offset..page_offset + block_write_size];
+                    let src = &buf[write_size..write_size + block_write_size];
+                    let dst = &mut data_block[start % PageCacheManager::CACHE_SZ
+                        ..start % PageCacheManager::CACHE_SZ + block_write_size];
                     dst.copy_from_slice(src);
                 });
-
-            written += block_write_size;
-            start += block_write_size;
+            write_size += block_write_size;
+            // move to next block
+            if end_current_block == end {
+                break;
+            }
             start_cache += 1;
+            start = end_current_block;
         }
-
-        written
+        write_size
     }
 }

@@ -29,18 +29,18 @@ fn main() -> i32 {
         core::ptr::null(),
     ];
     let schedule = [
-        // [
-        //     path.as_ptr(),
-        //     "-c\0".as_ptr(),
-        //     "./basic_testcode.sh\0".as_ptr(),
-        //     core::ptr::null(),
-        // ],
         [
             path.as_ptr(),
             "-c\0".as_ptr(),
-            "./munmap\0".as_ptr(),
+            "./basic_testcode.sh\0".as_ptr(),
             core::ptr::null(),
         ],
+        // [
+        //     path.as_ptr(),
+        //     "-c\0".as_ptr(),
+        //     "./munmap\0".as_ptr(),
+        //     core::ptr::null(),
+        // ],
         //完成的测试继续添加
     ];
 
@@ -48,36 +48,36 @@ fn main() -> i32 {
     for argv in schedule {
         let pid = fork();
         if pid == 0 {
-            chdir("/musl/basic\0");
+            chdir("/musl\0");
             exec(path, &argv, &environ);
         } else {
             waitpid(pid as usize, &mut exit_code);
         }
     }
-    // for argv in schedule {
-    //     let pid = fork();
-    //     if pid == 0 {
-    //         chdir("/glibc\0");
-    //         exec(path, &argv, &environ);
-    //     } else {
-    //         waitpid(pid as usize, &mut exit_code);
-    //     }
-    // }
-     //能进入bash，方便调试
-    if fork() == 0 {
-        exec(path, &[path.as_ptr() as *const u8, core::ptr::null()], &environ);
-    } else {
-        loop {
-            let mut exit_code: i32 = 0;
-            let pid = wait(&mut exit_code);
-            // ECHLD is -10
-            // user_lib::println!(
-            //     "[initproc] Released a zombie process, pid={}, exit_code={}",
-            //     pid,
-            //     exit_code,
-            // );
+    for argv in schedule {
+        let pid = fork();
+        if pid == 0 {
+            chdir("/glibc\0");
+            exec(path, &argv, &environ);
+        } else {
+            waitpid(pid as usize, &mut exit_code);
         }
     }
+     //能进入bash，方便调试
+    // if fork() == 0 {
+    //     exec(path, &[path.as_ptr() as *const u8, core::ptr::null()], &environ);
+    // } else {
+    //     loop {
+    //         let mut exit_code: i32 = 0;
+    //         let pid = wait(&mut exit_code);
+    //         // ECHLD is -10
+    //         // user_lib::println!(
+    //         //     "[initproc] Released a zombie process, pid={}, exit_code={}",
+    //         //     pid,
+    //         //     exit_code,
+    //         // );
+    //     }
+    // }
     shutdown();
     0
 }
