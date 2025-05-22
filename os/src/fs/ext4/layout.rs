@@ -600,7 +600,13 @@ impl File for Ext4OSInode {
     where
         Self: Sized,
     {
-        todo!()
+        // 获取父目录和子文件 Inode 编号
+        let mut parent_inode = self.inode.lock();
+        let child_inode_ref = child.inode.lock();
+        // 调用 ext4fs 提供的接口添加目录项，假设该接口为 dir_add_entry
+        self.ext4fs
+            .dir_add_entry(&mut parent_inode, &child_inode_ref, name)
+            .map(|_| ())
     }
 
     // remove file

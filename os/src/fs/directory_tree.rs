@@ -646,7 +646,12 @@ impl DirectoryTreeNode {
                 new_par_file.link_child(old_last_comp, old_file)?;
             }
             FS_Type::Ext4 => {
-                todo!()
+                use crate::fs::ext4::layout::Ext4OSInode;
+                let old_file = old_inode.file.downcast_ref::<Ext4OSInode>()
+                    .expect("Ext4 inode downcast failed");
+                let new_par_file = new_par_inode.file.downcast_ref::<Ext4OSInode>()
+                    .expect("Ext4 inode downcast failed");
+                new_par_file.link_child(old_last_comp, old_file)?;
             }
             FS_Type::Null => return Err(EACCES),
         }
