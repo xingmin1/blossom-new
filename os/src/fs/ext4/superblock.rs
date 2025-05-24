@@ -228,7 +228,7 @@ impl Ext4Superblock {
         block_device.read_block(superblk_id, &mut buf);
         // 然后更改的超级块写到对应的位置中（后1024个字节）
         buf[1024..2048].copy_from_slice(data);
-        block_device.write_block(SUPERBLOCK_OFFSET, &buf);
+        block_device.write_block(superblk_id, &buf);
     }
 
     /// 同步超级块到磁盘，同时带有校验值
@@ -247,7 +247,7 @@ impl Ext4Superblock {
         block_device.read_block(superblk_id, &mut buf);
         // 然后更改的超级块写到对应的位置中（后1024个字节）
         buf[1024..2048].copy_from_slice(data);
-        block_device.write_block(SUPERBLOCK_OFFSET, &buf);
+        block_device.write_block(superblk_id, &buf);
     }
 
     /// xein add this, maybe wrong
