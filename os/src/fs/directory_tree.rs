@@ -354,6 +354,7 @@ impl DirectoryTreeNode {
         // 重定向动态链接库到实际存在的位置
         let path = match path {            
             "/lib/ld-linux-riscv64-lp64.so.1" => "/musl/lib/libc.so",
+            "/lib/ld-linux-riscv64-lp64d.so.1" => "/musl/lib/libc.so",
             "/lib/ld-musl-riscv64.so.1" | "/lib/ld-musl-riscv64-sf.so.1" => "/musl/lib/libc.so",
             "/usr/lib/tls_get_new-dtv_dso.so" => "./libtls_get_new-dtv_dso.so",
             _ => path,
