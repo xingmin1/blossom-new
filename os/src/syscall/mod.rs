@@ -67,6 +67,7 @@ pub fn syscall_name(id: usize) -> &'static str {
         SYSCALL_YIELD => "yield",
         SYSCALL_KILL => "kill",
         SYSCALL_TKILL => "tkill",
+        SYSCALL_TGKILL => "tgkill",
         SYSCALL_SIGACTION => "sigaction",
         SYSCALL_SIGPROCMASK => "sigprocmask",
         SYSCALL_SIGTIMEDWAIT => "sigtimedwait",
@@ -227,8 +228,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as u32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as u32),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
+            args[0] as usize,
+            args[1] as u32,
+            args[2] as *const TimeSpec,
+            args[3] as *mut TimeSpec,
+        ),
         SYSCALL_KILL => sys_kill(args[0], args[1]),
         SYSCALL_TKILL => sys_tkill(args[0], args[1]),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2]),
         SYSCALL_SYSLOG => sys_syslog(args[0] as u32, args[1] as *mut u8, args[2] as u32),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_SIGACTION => sys_sigaction(args[0], args[1], args[2]),
@@ -385,6 +393,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as usize, args[1] as usize, args[2] as u32),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         _ => {
+            println!(
+                "[syscall] Unsupported syscall: {} ({}), calling over arguments: {:?}",
+                syscall_name(syscall_id),
+                syscall_id,
+                args
+            );
             error!(
                 "Unsupported syscall:{} ({}), calling over arguments:",
                 syscall_name(syscall_id),

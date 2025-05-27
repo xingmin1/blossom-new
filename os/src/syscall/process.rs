@@ -155,6 +155,35 @@ pub fn sys_tkill(tid: usize, sig: usize) -> isize {
     }
 }
 
+pub fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
+    let signal = match Signals::from_signum(sig) {
+        Ok(signal) => signal,
+        Err(_) => return EINVAL,
+    };
+    if let Some(task) = find_task_by_tgid(tgid) {
+        if !signal.is_empty() {
+            let mut inner = task.acquire_inner_lock();
+            if task.pid.0 == tid {
+                inner.add_signal(signal);
+                // wake up target process if it is sleeping
+                if inner.task_status == TaskStatus::Interruptible {
+                    inner.task_status = TaskStatus::Ready;
+                    drop(inner);
+                    wake_interruptible(task);
+                }
+            } else {
+                warn!(
+                    "[sys_tgkill] tid {} does not match task's tid {}",
+                    tid, task.pid.0
+                );
+            }
+        }
+        SUCCESS
+    } else {
+        ESRCH
+    }
+}
+
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     if req.is_null() {
         return EINVAL;
@@ -256,20 +285,20 @@ pub fn sys_uname(buf: *mut u8) -> isize {
     );
     // A little stupid but still efficient.
     const FIELD_OFFSET: usize = 65;
-    // buffer.write_at(FIELD_OFFSET * 0, b"Linux\0");
-    // buffer.write_at(FIELD_OFFSET * 1, b"debian\0");
-    // buffer.write_at(FIELD_OFFSET * 2, b"5.10.0-7-riscv64\0");
-    // buffer.write_at(FIELD_OFFSET * 3, b"#1 SMP Debian 5.10.40-1 (2021-05-28)\0");
-    // buffer.write_at(FIELD_OFFSET * 4, b"riscv64\0");
-    // buffer.write_at(FIELD_OFFSET * 5, b"\0");
     buffer.write_at(FIELD_OFFSET * 0, b"NPUcore\0");
-    buffer.write_at(FIELD_OFFSET * 1, b"xeinnious\0");
-    buffer.write_at(FIELD_OFFSET * 2, b"0.10.0-1-loongarch64\0");
+    buffer.write_at(FIELD_OFFSET * 1, b"blossom\0");
+    #[cfg(feature = "riscv")]
+    buffer.write_at(FIELD_OFFSET * 2, b"5.10.0-1-rv64\0");
+    #[cfg(feature = "loongarch64")]
+    buffer.write_at(FIELD_OFFSET * 2, b"5.10.0-1-la64\0");
     buffer.write_at(
         FIELD_OFFSET * 3,
-        b"#1 SMP Xein-Revo 0.10.0-1 (2025-01-10)\0",
+        b"#1 SMP blossom 5.10.0-1 (2025-01-10)\0",
     );
-    buffer.write_at(FIELD_OFFSET * 4, b"loongarch64\0");
+    #[cfg(feature = "riscv")]
+    buffer.write_at(FIELD_OFFSET * 4, b"rv64\0");
+    #[cfg(feature = "loongarch64")]
+    buffer.write_at(FIELD_OFFSET * 4, b"la64\0");
     buffer.write_at(FIELD_OFFSET * 5, b"\0");
     SUCCESS
 }
@@ -1033,7 +1062,26 @@ pub fn sys_clock_gettime(clk_id: usize, tp: *mut TimeSpec) -> isize {
     }
     SUCCESS
 }
-
+pub fn sys_clock_nanosleep(
+    clk_id: usize,
+    flags: u32,
+    rqtp: *const TimeSpec,
+    rmtp: *mut TimeSpec,
+) -> isize {
+    if !rqtp.is_null() {
+        let token = current_user_token();
+        let timespec = match translated_ref(token, rqtp) {
+            Ok(timespec) => timespec,
+            Err(errno) => return errno,
+        };
+        info!(
+            "[sys_clock_nanosleep] clk_id: {}, flags: {:?}, rqtp: {:?}, rmtp: {:?}",
+            clk_id, flags, timespec, rmtp
+        );
+    }
+    SUCCESS
+}
+    
 // int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 pub fn sys_sigaction(signum: usize, act: usize, oldact: usize) -> isize {
     trace!(

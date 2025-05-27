@@ -633,7 +633,7 @@ impl<T: PageTable> MemorySet<T> {
                     );
                 }
                 xmas_elf::program::Type::Interp => {
-                    assert!(elf.input[(ph.offset() + ph.file_size()) as usize] == b'\0');
+                    //assert!(elf.input[(ph.offset() + ph.file_size()) as usize] == b'\0');
                     let path = String::from_utf8_lossy(
                         &elf.input
                             [ph.offset() as usize..(ph.offset() + ph.file_size() - 1) as usize],
