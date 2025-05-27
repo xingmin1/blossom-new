@@ -591,7 +591,7 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> isize {
         }
     };
     // 获取目录项向量
-    let dirent_vec = match file_descriptor.get_dirent(count) {
+    let dirent_vec = match file_descriptor.get_dirent(count / size_of::<Dirent>()) {
         Ok(vec) => vec,
         Err(errno) => return errno,
     };
@@ -600,7 +600,8 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> isize {
         token,
         dirent_vec.as_ptr(),
         dirp as *mut Dirent,
-        dirent_vec.len(),
+        count / size_of::<Dirent>()
+        //dirent_vec.len(),
     )
     .is_err()
     {
@@ -609,7 +610,9 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> isize {
     };
     info!("[sys_getdents64] fd: {}, count: {}", fd, count);
     // 返回获取的目录项数量
-    (dirent_vec.len() * size_of::<Dirent>()) as isize
+    // (dirent_vec.len() * size_of::<Dirent>()) as isize
+    (count / size_of::<Dirent>())as isize
+
 }
 
 pub fn sys_dup(oldfd: usize) -> isize {
