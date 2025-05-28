@@ -12,6 +12,6 @@ einitproc:
     .global ebash
     .align 12
 sbash:
-    .incbin "./bash"
+    .incbin "./bash-la"
 ebash:
     .align 12

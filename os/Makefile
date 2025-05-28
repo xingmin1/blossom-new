@@ -30,6 +30,12 @@ rv64-run:
 la64-only:
 	make -f make/la64.mk all BLK_MODE=${BLK_MODE}
 
+la64-kernel-build-only:
+	make -f make/la64.mk build BLK_MODE=${BLK_MODE} MODE=${MODE} LOG=${LOG}
+
+la64-debug:
+	make -f make/la64.mk all BLK_MODE=${BLK_MODE} MODE=debug	
+
 la64-run-only:
 	make -f make/la64.mk runsimple
 
@@ -44,6 +50,9 @@ clean:
 		make ARCH=$$arch -f make/$$arch.mk clean; \
 	done
 
+laclean:
+	make -f make/la64.mk clean
+
 fs-img:
 	make -f make/$(CURR_ARCH).mk fs-img FS_MODE=$(FS_MODE)
 
@@ -55,3 +64,6 @@ gdb:
 
 rv64-gdb: rv64-debug
 	make -f make/rv64.mk comp-gdb
+
+la64-gdb: la64-debug
+	make -f make/la64.mk comp-gdb	
