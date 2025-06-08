@@ -67,3 +67,7 @@ rv64-gdb: rv64-debug
 
 la64-gdb: la64-debug
 	make -f make/la64.mk comp-gdb	
+
+rvchange:
+	rm -f ../sdcard-rv.img
+	cp ../../imgbk/sdcard-rv.img ../sdcard-rv.img
