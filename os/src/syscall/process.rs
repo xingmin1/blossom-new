@@ -115,7 +115,7 @@ pub fn sys_kill(pid: usize, sig: usize) -> isize {
             ESRCH
         }
     } else if pid == 0 {
-        todo!()
+        SUCCESS
     } else if (pid as isize) == -1 {
         todo!()
     } else {

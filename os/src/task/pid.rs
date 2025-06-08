@@ -16,7 +16,7 @@ impl RecycleAllocator {
     pub fn new() -> Self {
         RecycleAllocator {
             // 当前分配的id数量初始化为0
-            current: 0,
+            current: 1,
             // 初始化为空向量
             recycled: Vec::new(),
         }
