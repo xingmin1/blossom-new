@@ -28,7 +28,7 @@ impl BlockDevice for VirtIOBlock {
             buf.len() % BLOCK_SZ == 0,
             "Buffer size must be multiple of BLOCK_SZ"
         );
-        log::info!("Reading block {} with size {}", block_id, buf.len());
+        // log::info!("Reading block {} with size {}", block_id, buf.len());
         // for buf in buf.chunks_mut(VIRT_IO_BLOCK_SZ) {
         //     self.0
         //         .lock()
