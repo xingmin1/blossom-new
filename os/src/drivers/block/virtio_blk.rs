@@ -4,16 +4,19 @@ use crate::mm::{
     PhysPageNum, StepByOne, VirtAddr,
 };
 use alloc::{sync::Arc, vec::Vec};
+use core::ptr::NonNull;
 use lazy_static::*;
 use spin::Mutex;
-use virtio_drivers::{VirtIOBlk, VirtIOHeader};
+use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::transport::mmio::{VirtIOHeader,MmioTransport}; 
+use virtio_drivers::{BufferDirection, Hal};
 const VIRT_IO_BLOCK_SZ: usize = 512;
 use crate::hal::BLOCK_SZ;
 const BLOCK_RATIO: usize = BLOCK_SZ / VIRT_IO_BLOCK_SZ;
 #[allow(unused)]
 const VIRTIO0: usize = 0x10001000;
 
-pub struct VirtIOBlock(Mutex<VirtIOBlk<'static>>);
+pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, MmioTransport<'static>>>);
 
 lazy_static! {
     static ref QUEUE_FRAMES: Mutex<Vec<Arc<FrameTracker>>> = Mutex::new(Vec::new());
@@ -25,6 +28,7 @@ impl BlockDevice for VirtIOBlock {
             buf.len() % BLOCK_SZ == 0,
             "Buffer size must be multiple of BLOCK_SZ"
         );
+        log::info!("Reading block {} with size {}", block_id, buf.len());
         // for buf in buf.chunks_mut(VIRT_IO_BLOCK_SZ) {
         //     self.0
         //         .lock()
@@ -35,7 +39,7 @@ impl BlockDevice for VirtIOBlock {
             let virtio_block_id = block_id * BLOCK_RATIO + i;
             self.0
                 .lock()
-                .read_block(virtio_block_id, chunk)
+                .read_blocks(virtio_block_id as usize, chunk)
                 .expect("Error when reading VirtIOBlk");
         }
     }
@@ -48,7 +52,7 @@ impl BlockDevice for VirtIOBlock {
             let virtio_block_id = block_id * BLOCK_RATIO + i;
             self.0
                 .lock()
-                .write_block(virtio_block_id, chunk)
+                .write_blocks(virtio_block_id as usize, chunk)
                 .expect("Error when writing VirtIOBlk");
         }
         // for buf in buf.chunks(VIRT_IO_BLOCK_SZ) {
@@ -64,9 +68,54 @@ impl BlockDevice for VirtIOBlock {
 impl VirtIOBlock {
     #[allow(unused)]
     pub fn new() -> Self {
-        Self(Mutex::new(
-            VirtIOBlk::new(unsafe { &mut *(VIRTIO0 as *mut VirtIOHeader) }).unwrap(),
-        ))
+        unsafe {
+            Self(Mutex::new(
+                VirtIOBlk::<VirtioHal, MmioTransport<'static>>::new(
+                    MmioTransport::new(
+                        NonNull::new_unchecked((VIRTIO0) as *mut VirtIOHeader),
+                        0x1000,
+                    )
+                    .expect("this is not a valid virtio device"),
+                )
+                .unwrap(),
+            ))
+        }
+    }
+}
+
+pub struct VirtioHal;
+
+unsafe impl Hal for VirtioHal {
+    fn dma_alloc(pages: usize, _direction: BufferDirection) -> (usize, NonNull<u8>) {
+        //log::info!("use dma_alloc with pages: {}", pages);
+        let paddr = virtio_dma_alloc(pages);
+        let vaddr = virtio_phys_to_virt(paddr);
+        let ptr = NonNull::new(vaddr.0 as *mut u8)
+            .expect("virtio_phys_to_virt returned null pointer in dma_alloc");
+        (paddr.0, ptr)
+    }
+
+    unsafe fn dma_dealloc(paddr: usize, _vaddr: NonNull<u8>, pages: usize) -> i32 {
+        //log::info!("use dma_dealloc with paddr: {}, pages: {}", paddr, pages);
+        virtio_dma_dealloc(PhysAddr(paddr), pages)
+    }
+
+    unsafe fn mmio_phys_to_virt(paddr: usize, _size: usize) -> NonNull<u8> {
+        //log::info!("use mmio_phys_to_virt with paddr: {}", paddr);
+        let vaddr = virtio_phys_to_virt(PhysAddr(paddr));
+        NonNull::new(vaddr.0 as *mut u8)
+            .expect("virtio_phys_to_virt returned null pointer in mmio_phys_to_virt")
+    }
+
+    unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> usize {
+        //log::info!("use share with buffer: {:?}", buffer);
+        let vaddr = VirtAddr(buffer.as_ref().as_ptr() as usize);
+        let paddr = virtio_virt_to_phys(vaddr);
+        paddr.0
+    }
+
+    unsafe fn unshare(_paddr: usize, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+        // no op
     }
 }
 
