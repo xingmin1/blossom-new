@@ -339,7 +339,7 @@ impl DirectoryTreeNode {
 
         let path = if REDIRECT_TO_BUSYBOX.contains(&path) {
             // 判断使用哪个 busybox 路径
-            "musl/busybox"
+            "/musl/busybox"
             // if self.path_exists("/glibc/busybox") {
             //     "/glibc/busybox"
             // } else if self.path_exists("/musl/busybox") {

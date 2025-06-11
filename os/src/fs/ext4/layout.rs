@@ -246,6 +246,9 @@ impl File for Ext4OSInode {
         // println!("buf is :{:?}", buf);
         let mut total_write_size = 0usize;
 
+        // 获取写锁
+        let inode_lock = self.inode_lock.write();
+
         // 获取 inode 的文件大小
         let old_size;
         {
@@ -253,19 +256,17 @@ impl File for Ext4OSInode {
             old_size = inode_ref.inode.get_file_size() as usize;
         }
 
-        // 获取写锁
-        let inode_lock = self.inode_lock.write();
 
         match offset {
             Some(offset) => {
                 let mut start = *offset;
                 let diff_len = buf.len() as isize + start as isize - old_size as isize;
-        
+
                 if diff_len > 0 {
                     self.truncate_size((old_size as isize + diff_len) as usize).unwrap();
                 }
-        
-                let inode_ref = self.inode.lock();
+
+                let inode_ref = self.inode.lock().clone();
                 total_write_size = self.update_block_cache(start, buf, Arc::new(inode_ref.clone()));
                 *offset += total_write_size;
             }
@@ -273,12 +274,12 @@ impl File for Ext4OSInode {
                 let mut offset = self.offset.lock();
                 let start = *offset;
                 let diff_len = buf.len() as isize + start as isize - old_size as isize;
-        
+
                 if diff_len > 0 {
                     self.truncate_size((old_size as isize + diff_len) as usize).unwrap();
                 }
-        
-                let inode_ref = self.inode.lock();
+
+                let inode_ref = self.inode.lock().clone();
                 total_write_size = self.update_block_cache(start, buf, Arc::new(inode_ref.clone()));
                 *offset += total_write_size;
             }
@@ -296,7 +297,6 @@ impl File for Ext4OSInode {
 
     fn read_user(&self, offset: Option<usize>, mut buf: UserBuffer) -> usize {
         let mut total_read_size = 0usize;
-
         let inode_lock = self.inode_lock.read();
         let inode_ref = self.inode.lock();
         match offset {
@@ -330,72 +330,42 @@ impl File for Ext4OSInode {
 
     fn write_user(&self, offset: Option<usize>, buf: UserBuffer) -> usize {
         let mut total_write_size = 0usize;
-
-        // 获取当前 inode 编号（只读）
         let inode_num = { self.inode.lock().inode_num };
-
-        // 写时锁保护 inode 状态
-        let _inode_write_guard = self.inode_lock.write();
-
+        let inode_lock = self.inode_lock.write();
         match offset {
             Some(mut offset) => {
-                //println!("[write_user] 使用显式 offset: {}", offset);
+                let mut offset = &mut offset;
                 for slice in buf.buffers.iter() {
-                    // 写入 ext4 文件系统
-                    let write_result = self.ext4fs.write_at(inode_num, offset, slice);
-
-                    // 第一次使用旧 inode 进行缓存更新
-                    let inode_ref_old = self.inode.lock().clone();
-                    self.update_block_cache(offset, slice, Arc::new(inode_ref_old));
-
-                    // 获取最新 inode，并再次刷新缓存（避免文件扩展后错写）
-                    let inode_ref_fresh = self.ext4fs.get_inode_ref(inode_num);
-                    self.update_block_cache(offset, slice, Arc::new(inode_ref_fresh.clone()));
-
-                    // 替换内部 inode，保持同步
-                    let mut my_inode = self.inode.lock();
-                    *my_inode = inode_ref_fresh;
-
-                    // 更新写入状态
-                    if let Ok(written) = write_result {
-                        if written == 0 {
+                    // TODO: 假定ext4_rs的处理是正确的
+                    let write_size = self.ext4fs.write_at(inode_num, *offset, slice);
+                    // 对块设备对象进行写入之后，更新缓存对象。
+                    let fresh = self.ext4fs.get_inode_ref(inode_num);
+                    self.update_block_cache(offset.clone(), slice, Arc::new(fresh.clone()));
+                    let mut my = self.inode.lock();
+                    *my = fresh;
+                    if let Ok(write_size) = write_size {
+                        if write_size == 0 {
                             break;
                         }
-                        offset += written;
-                        total_write_size += written;
-                    } else {
-                        break;
+                        *offset += write_size;
+                        total_write_size += write_size;
                     }
                 }
             }
-
             None => {
-                //println!("[write_user] 使用内部自增 offset");
                 let mut offset = self.offset.lock();
                 for slice in buf.buffers.iter() {
-                    let write_result = self.ext4fs.write_at(inode_num, *offset, slice);
-
-                    // 使用旧 inode 进行缓存更新
-                    let inode_ref_old = self.inode.lock().clone();
-                    self.update_block_cache(*offset, slice, Arc::new(inode_ref_old));
-
-                    // 获取最新 inode 并再次刷新缓存
-                    let inode_ref_fresh = self.ext4fs.get_inode_ref(inode_num);
-                    self.update_block_cache(*offset, slice, Arc::new(inode_ref_fresh.clone()));
-
-                    // 更新内部 inode
-                    let mut my_inode = self.inode.lock();
-                    *my_inode = inode_ref_fresh;
-
-                    // 更新写入状态
-                    if let Ok(written) = write_result {
-                        if written == 0 {
+                    let write_size = self.ext4fs.write_at(inode_num, *offset, slice);
+                    let fresh = self.ext4fs.get_inode_ref(inode_num);
+                    self.update_block_cache(offset.clone(), slice, Arc::new(fresh.clone()));
+                    let mut my = self.inode.lock();
+                    *my = fresh;
+                    if let Ok(write_size) = write_size {
+                        if write_size == 0 {
                             break;
                         }
-                        *offset += written;
-                        total_write_size += written;
-                    } else {
-                        break;
+                        *offset += write_size;
+                        total_write_size += write_size;
                     }
                 }
             }
@@ -535,9 +505,9 @@ impl File for Ext4OSInode {
 
         let inode_ref = self.inode.lock();
         let mut parent_inode_num = inode_ref.inode_num.clone();
-        //println!("self(parent) inode num:{:?} self(parent) name:{:?}", parent_inode_num, inode_ref);
+        // println!("self(parent) inode num:{:?} self(parent) name:{:?}", parent_inode_num, inode_ref);
         let mut nameoff = 0;
-        //println!("in here!!!???");
+        // println!("in here!!!???");
         if inode_mode == InodeFileType::S_IFDIR.bits() {
             let new_inode_num = self.ext4fs.generic_open(
                 name,
@@ -546,10 +516,10 @@ impl File for Ext4OSInode {
                 inode_mode,
                 &mut nameoff,
             );
-            //println!("inhere???");
+            // println!("inhere???");
             if let Ok(new_inode_num) = new_inode_num {
                 let new_inode_ref = self.ext4fs.get_inode_ref(new_inode_num);
-                //println!("new_inode_ref:{:#?}", new_inode_ref);
+                // println!("new_inode_ref:{:#?}", new_inode_ref);
                 return Ok(Arc::new(Self {
                     inode_lock: Arc::new(RwLock::new(InodeLock {})),
                     readable: true,
@@ -567,17 +537,17 @@ impl File for Ext4OSInode {
                 panic!()
             }
         }
-        //println!("[kernel] name={} inode_mode={}", name, inode_mode);
+        // println!("[kernel] name={} inode_mode={}", name, inode_mode);
         let inode_perm = (InodePerm::S_IREAD | InodePerm::S_IWRITE).bits();
-        //println!("[kernel] inode_perm = {}", inode_perm);
+        // println!("[kernel] inode_perm = {}", inode_perm);
         let new_inode_ref = self
             .ext4fs
             // .create(self.inode.inode_num, name, inode_mode | inode_perm);
             .create(parent_inode_num, name, inode_mode | inode_perm);
         // xein TODO: 此处有问题
-        //println!("cre1");
+        // println!("cre1");
         if let Ok(inode_ref) = new_inode_ref {
-            //println!("Successfully here");
+            // println!("Successfully here");
             return Ok(Arc::new(Self {
                 inode_lock: Arc::new(RwLock::new(InodeLock {})),
                 readable: true,
@@ -600,58 +570,68 @@ impl File for Ext4OSInode {
     where
         Self: Sized,
     {
-        // 获取父目录和子文件 Inode 编号
-        let mut parent_inode = self.inode.lock();
-        let child_inode_ref = child.inode.lock();
-        // 调用 ext4fs 提供的接口添加目录项，假设该接口为 dir_add_entry
-        self.ext4fs
-            .dir_add_entry(&mut parent_inode, &child_inode_ref, name)
-            .map(|_| ())
+        let mut parent_inode_ref = self.inode.lock();
+        let mut child_inode_ref = child.inode.lock();
+        self.ext4fs.dir_add_entry(&mut parent_inode_ref, &child_inode_ref, name).map(|_|())
     }
 
     // remove file
     fn unlink(&self, delete: bool) -> Result<(), isize> {
-        let inode_num = self.inode.lock().inode_num;
-        let file_type = self.inode.lock().inode.get_file_type();
-
-        // 如果是非空目录，返回错误
-        if file_type == DiskInodeType::Directory
-            && self.ext4fs.dir_has_entry(inode_num)
+        // 先读取自己的 inode，检查是不是非空目录
+        let inode_ref = self.inode.lock();
+        if inode_ref.inode.get_file_type() == DiskInodeType::Directory
+            && self.ext4fs.dir_has_entry(inode_ref.inode_num)
         {
+            // 非空目录不能删除
             return Err(ENOTEMPTY);
         }
+        // 记录一下要删除的 inode 编号和类型
+        let ino = inode_ref.inode_num;
+        let is_dir = inode_ref.inode.get_file_type() == DiskInodeType::Directory;
+        drop(inode_ref); // 一旦记录完信息就释放自锁，后面再按需锁父/子 inode
 
-        // 先获取当前目录树节点，避免持锁后再调用 parent()
-        let current_node = self.dirnode_ptr.lock().upgrade().unwrap();
-
-        // 获取父目录节点（避免死锁）
-        let parent_node = current_node.parent(); 
-        let parent_file = parent_node.file.clone();
-        let parent = Arc::downcast::<Ext4OSInode>(parent_file).unwrap();
+        // 找到自己在目录树中的节点，以及父目录 inode
+        let dir_node_weak = self.dirnode_ptr.lock().clone();
+        let dir_node = dir_node_weak.upgrade().ok_or(ENOTEMPTY)?;
+        let father_inode = dir_node.parent();
+        let parent_osinode = &father_inode.file;
+        // println!("[kernel in unlink] parent osinode: {:?}", parent_osinode.get_file_type());
+        let parent = Arc::downcast::<Ext4OSInode>(parent_osinode.clone())
+            .map_err(|_| ENOTEMPTY)?;
         let mut parent_inode_ref = parent.inode.lock();
 
-        // 重新获取子 inode，避免持锁冲突
-        let mut child_inode_ref = self.ext4fs.get_inode_ref(inode_num);
+        // 拿到要删除的 child inode 引用
+        let mut child_inode_ref = self.ext4fs.get_inode_ref(ino);
 
-        // 文件名
-        let name = current_node.name.clone();
-
-        // 如果是目录
-        if file_type == DiskInodeType::Directory {
+        // 如果需要释放数据块，就先把大小截断到 0
+        if delete {
             self.ext4fs.truncate_inode(&mut child_inode_ref, 0)?;
-            //println!("[kernel unlink] unlink dir name: {:?}", name);
-            self.ext4fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name.as_str());
-            self.ext4fs.write_back_inode(&mut parent_inode_ref);
-            return Ok(());
         }
 
-        // 如果是常规文件
-        //println!("[kernel unlink] unlink file name: {:?}", name);
-        self.ext4fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name.as_str());
+        // 打印日志，执行 unlink（删除目录项并更新 link_count）
+        // println!(
+        //     "[kernel in unlink] removing {} {:?}",
+        //     dir_node.name,
+        //     if is_dir { "directory" } else { "file" }
+        // );
+        self.ext4fs.unlink(
+            &mut parent_inode_ref,
+            &mut child_inode_ref,
+            dir_node.name.as_str(),
+        );
+
+        // 写回父 inode
         self.ext4fs.write_back_inode(&mut parent_inode_ref);
+        // 若释放了数据块，也要写回子 inode
+        if delete {
+            self.ext4fs.write_back_inode(&mut child_inode_ref);
+        }
+
+        // println!("unlink done");
 
         Ok(())
     }
+
 
     /// 获取目录项
     /// # 参数
@@ -662,53 +642,50 @@ impl File for Ext4OSInode {
         const DT_UNKNOWN: u8 = 0;
         const DT_DIR: u8 = 4;
         const DT_REG: u8 = 8;
-        let inode_ref = self.inode.lock();
-        assert!(inode_ref.inode.get_file_type() == DiskInodeType::Directory);
+
+        use core::mem;
+
+        // 锁定目录 inode 和内部偏移
+        let _inode_lock = self.inode_lock.write();
         let mut offset = self.offset.lock();
-        let inode_lock = self.inode_lock.write();
-        let vec = self.ext4fs.dir_get_entries(inode_ref.inode_num);
+        let inode_ref = self.inode.lock().clone();
+        assert!(inode_ref.inode.get_file_type() == DiskInodeType::Directory);
 
-        let old_offset = *offset;
+        // 从 ext4fs 读取整个目录项列表
+        let entries = self.ext4fs.dir_get_entries(inode_ref.inode_num);
 
-        // fat32下分多次进入get_dirent
-        // ext4下要如何处理？
-        // 不能单纯使用dir_get_entries直接进行，因为这样会出错
-        // 每次都有项
-        if let Some(ext4entry) = vec.last() {
-            *offset = ext4entry.entry_len as usize;
+        // 计算每次最多返回的目录项数
+        let max_items = count / mem::size_of::<Dirent>();
+        let old_index = *offset;
+        let mut result = Vec::new();
+        let mut new_index = old_index;
+
+        // 遍历 entries，从 old_index 开始，最多收集 max_items 条
+        for (idx, entry) in entries.iter().enumerate().skip(old_index) {
+            if result.len() >= max_items {
+                break;
+            }
+            new_index = idx + 1;
+
+            // 映射 ext4 条目到通用 Dirent
+            let d_type = match DirEntryType::from_bits(entry.get_de_type()) {
+                Some(dt) => match dt {
+                    DirEntryType::EXT4_DE_DIR      => DT_DIR,
+                    DirEntryType::EXT4_DE_REG_FILE => DT_REG,
+                    _ => DT_UNKNOWN,
+                },
+                None => panic!("unknown entry type"),
+            };
+            result.push(Dirent::new(
+                entry.inode as usize,
+                entry.entry_len as isize,
+                d_type,
+                &entry.get_name().as_str(),
+            ));
         }
-        // println!("[kernel] current offset2:{:?}", *offset);
 
-        if old_offset == *offset {
-            // 返回一个空的Vec数组
-            return Vec::new();
-        }
-
-        // 此处的offset需要处理
-        let result = vec
-            .iter()
-            .map(|ext4entry| {
-                let d_type = match DirEntryType::from_bits(ext4entry.get_de_type()) {
-                    // TODO:
-                    // maybe wrong
-                    Some(d_type) => match d_type {
-                        DirEntryType::EXT4_DE_DIR => DT_DIR,
-                        DirEntryType::EXT4_DE_REG_FILE => DT_REG,
-                        _ => DT_UNKNOWN,
-                    },
-                    None => {
-                        panic!("unknown entry type")
-                    }
-                };
-                Dirent::new(
-                    ext4entry.inode as usize,
-                    ext4entry.entry_len as isize,
-                    d_type,
-                    &ext4entry.get_name().as_str(),
-                )
-            })
-            .collect();
-        // println!("[kernel in get_dirent] current offset is {:?}", offset);
+        // 更新偏移，下次从 new_index 开始读取
+        *offset = new_index;
         result
     }
 
@@ -750,6 +727,7 @@ impl File for Ext4OSInode {
     }
 
     fn truncate_size(&self, new_size: usize) -> Result<(), isize> {
+        //dead lock
         let mut inode_ref = self.inode.lock();
         let result = self.ext4fs.truncate_inode(&mut inode_ref, new_size as u64);
         if let Ok(result) = result {
@@ -760,6 +738,20 @@ impl File for Ext4OSInode {
     }
 
     fn set_timestamp(&self, ctime: Option<usize>, atime: Option<usize>, mtime: Option<usize>) {
+        // unsafe {
+        //     // 将 Arc 转换为裸指针
+        //     let ptr = Arc::as_ptr(&self.inode) as *mut Ext4Inode;
+        //     // 直接修改数据
+        //     if let Some(ctime) = ctime {
+        //         (*ptr).set_ctime(ctime as u32);
+        //     }
+        //     if let Some(atime) = atime {
+        //         (*ptr).set_atime(atime as u32);
+        //     }
+        //     if let Some(mtime) = mtime {
+        //         (*ptr).set_mtime(mtime as u32);
+        //     }
+        // }
         let mut inode_ref = self.inode.lock();
         if let Some(ct) = ctime {
             inode_ref.set_ctime(ct as u32);
