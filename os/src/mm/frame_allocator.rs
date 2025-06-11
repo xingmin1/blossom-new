@@ -221,6 +221,18 @@ pub fn frame_alloc() -> Option<Arc<FrameTracker>> {
     }
 }
 
+pub fn frames_alloc(num: usize) -> Option<Vec<Arc<FrameTracker>>> {
+    let mut frames = Vec::with_capacity(num);
+    for _ in 0..num {
+        if let Some(frame_tracker) = frame_alloc() {
+            frames.push(frame_tracker);
+        } else {
+            return None;
+        }
+    }
+    Some(frames)
+}
+
 #[cfg(not(feature = "oom_handler"))]
 /// 常规分配操作
 pub fn frame_alloc() -> Option<Arc<FrameTracker>> {

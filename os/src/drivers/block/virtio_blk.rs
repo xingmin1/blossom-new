@@ -1,6 +1,6 @@
 use super::BlockDevice;
 use crate::mm::{
-    frame_alloc, frame_dealloc, kernel_token, FrameTracker, PageTable, PageTableImpl, PhysAddr,
+    frame_alloc, frames_alloc, frame_dealloc, kernel_token, FrameTracker, PageTable, PageTableImpl, PhysAddr,
     PhysPageNum, StepByOne, VirtAddr,
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -11,7 +11,7 @@ use virtio_drivers::device::blk::VirtIOBlk;
 use virtio_drivers::transport::mmio::{VirtIOHeader,MmioTransport}; 
 use virtio_drivers::{BufferDirection, Hal};
 const VIRT_IO_BLOCK_SZ: usize = 512;
-use crate::hal::BLOCK_SZ;
+use crate::hal::config::{BLOCK_SZ, PAGE_SIZE, PAGE_SIZE_BITS};
 const BLOCK_RATIO: usize = BLOCK_SZ / VIRT_IO_BLOCK_SZ;
 #[allow(unused)]
 const VIRTIO0: usize = 0x10001000;
@@ -107,15 +107,38 @@ unsafe impl Hal for VirtioHal {
             .expect("virtio_phys_to_virt returned null pointer in mmio_phys_to_virt")
     }
 
-    unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> usize {
-        //log::info!("use share with buffer: {:?}", buffer);
-        let vaddr = VirtAddr(buffer.as_ref().as_ptr() as usize);
-        let paddr = virtio_virt_to_phys(vaddr);
-        paddr.0
+    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> usize {
+        let buffer = buffer.as_ref();
+        let pages = (buffer.len() + PAGE_SIZE - 1) >> PAGE_SIZE_BITS;
+        let frames = frames_alloc(pages).expect("share: failed to alloc frames");
+        
+        if matches!(direction, BufferDirection::DriverToDevice | BufferDirection::Both) {
+            // 获取第一个物理页的起始地址作为连续区域的基址
+            let pa_start = frames[0].ppn.start_addr().0;
+            // 直接复制到物理内存
+            let dst_slice = core::slice::from_raw_parts_mut(pa_start as *mut u8, buffer.len());
+            dst_slice.copy_from_slice(buffer);
+        }
+
+        let pa = frames[0].ppn.start_addr().0;
+        QUEUE_FRAMES.lock().extend(frames);
+        pa
     }
 
-    unsafe fn unshare(_paddr: usize, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
-        // no op
+    unsafe fn unshare(paddr: usize, mut buffer: NonNull<[u8]>, direction: BufferDirection) {
+            let buffer = buffer.as_mut();
+            let ppn_start = PhysAddr(paddr).floor();
+            let ppn_end = PhysAddr(paddr + buffer.len()).ceil();
+    
+            if matches!(direction, BufferDirection::DeviceToDriver | BufferDirection::Both) {
+                let src_ptr = paddr as *const u8;
+                buffer.copy_from_slice(core::slice::from_raw_parts(src_ptr, buffer.len()));
+            }
+        let mut current_ppn = ppn_start;
+        while current_ppn != ppn_end {
+            frame_dealloc(current_ppn);
+            current_ppn.step();
+        }
     }
 }
 
