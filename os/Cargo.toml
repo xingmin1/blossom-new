@@ -56,6 +56,7 @@ log_error = ["log/max_level_error"]
 block_sata = []
 block_mem = []
 block_virt = []
+block_virt_pci = []
 comp = []
 
 # LoongArch Boards:

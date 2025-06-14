@@ -4,8 +4,8 @@ pub const MEMORY_SIZE: usize = 0x1000_0000;
 pub const TASK_SIZE: usize = 0xc000_0000;
 pub const ELF_DYN_BASE: usize = TASK_SIZE / 3 * 2;
 pub const USER_STACK_BASE: usize = TASK_SIZE - PAGE_SIZE;
-pub const USER_STACK_SIZE: usize = PAGE_SIZE * 40;
-pub const USER_HEAP_SIZE: usize = PAGE_SIZE * 20;
+pub const USER_STACK_SIZE: usize = PAGE_SIZE * 80;
+pub const USER_HEAP_SIZE: usize = PAGE_SIZE * 40;
 
 pub const KERNEL_STACK_SIZE: usize = PAGE_SIZE * 0x10;
 #[cfg(not(feature = "board_fu740"))]

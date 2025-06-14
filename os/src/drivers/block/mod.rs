@@ -2,6 +2,7 @@ mod block_dev;
 mod mem_blk;
 mod sata_blk;
 mod virtio_blk;
+mod virtio_blk_pci;
 pub use block_dev::BlockDevice;
 #[cfg(feature = "block_mem")]
 type BlockDeviceImpl = mem_blk::MemBlockWrapper;
@@ -9,6 +10,8 @@ type BlockDeviceImpl = mem_blk::MemBlockWrapper;
 type BlockDeviceImpl = sata_blk::SataBlock;
 #[cfg(feature = "block_virt")]
 type BlockDeviceImpl = virtio_blk::VirtIOBlock;
+#[cfg(feature = "block_virt_pci")]
+type BlockDeviceImpl = virtio_blk_pci::VirtIOBlock;
 
 use crate::hal::BLOCK_SZ;
 use alloc::sync::Arc;
