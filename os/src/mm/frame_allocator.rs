@@ -44,7 +44,7 @@ impl Drop for FrameTracker {
 }
 
 /// 帧分配器接口
-pub trait FrameAllocator {
+trait FrameAllocator {
     fn new() -> Self;
     /// 分配
     fn alloc(&mut self) -> Option<FrameTracker>;

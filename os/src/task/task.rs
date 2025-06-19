@@ -437,7 +437,7 @@ impl TaskControlBlock {
 
         let page_size = 0x1000;
         let heap_start = align_up(program_break, page_size);
-        let heap_end = heap_start + 0x10000; // 64KiB
+        let heap_end = heap_start + 0x20000; // 64KiB
         memory_set.insert_framed_area(
     VirtAddr::from(heap_start),
     VirtAddr::from(heap_end),
