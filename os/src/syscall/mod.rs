@@ -63,6 +63,7 @@ pub fn syscall_name(id: usize) -> &'static str {
         SYSCALL_GETITIMER => "getitimer",
         SYSCALL_SETITIMER => "setitimer",
         SYSCALL_CLOCK_GETTIME => "clock_gettime",
+        SYSCALL_CLOCK_NANOSLEEP => "clock_nanosleep",
         SYSCALL_SYSLOG => "syslog",
         SYSCALL_YIELD => "yield",
         SYSCALL_KILL => "kill",

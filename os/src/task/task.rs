@@ -300,6 +300,10 @@ impl TaskControlBlockInner {
     }
 }
 
+fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
+
 impl TaskControlBlock {
     /// 获取任务内部状态的互斥锁
     pub fn acquire_inner_lock(&self) -> MutexGuard<TaskControlBlockInner> {
@@ -427,6 +431,24 @@ impl TaskControlBlock {
         // 带有ELF程序头/跳板/陷阱上下文/用户栈的内存集（MemorySet）
         let (mut memory_set, program_break, elf_info) = MemorySet::from_elf(elf_data)?;
         log::trace!("[load_elf] ELF file mapped");
+
+        // 为 glibc 分配用户 heap 空间（0x1c0000 ~ 0x1c4000）
+        use crate::mm::{VirtAddr, MapPermission};
+
+        let page_size = 0x1000;
+        let heap_start = align_up(program_break, page_size);
+        let heap_end = heap_start + 0x20000; // 64KiB
+        memory_set.insert_framed_area(
+    VirtAddr::from(heap_start),
+    VirtAddr::from(heap_end),
+    MapPermission::R | MapPermission::W | MapPermission::U,
+        );
+        log::info!(
+        "[load_elf] mapped user heap from program_break: {:#x} ~ {:#x}",
+        heap_start,
+        heap_end
+        );
+
         // 清除临时映射
         crate::mm::KERNEL_SPACE
             .lock()
