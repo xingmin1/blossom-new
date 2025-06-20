@@ -43,8 +43,8 @@ mod utils;
 use crate::config::DISK_IMAGE_BASE;
 use crate::hal::bootstrap_init;
 use crate::hal::machine_init;
-#[cfg(feature = "loongarch64")]
-core::arch::global_asm!(include_str!("hal/arch/loongarch64/entry.asm"));
+// #[cfg(feature = "loongarch64")]
+// core::arch::global_asm!(include_str!("hal/arch/loongarch64/entry.asm"));
 #[cfg(feature = "riscv")]
 core::arch::global_asm!(include_str!("hal/arch/riscv/entry.asm"));
 #[cfg(all(feature = "block_mem", feature = "loongarch64"))]

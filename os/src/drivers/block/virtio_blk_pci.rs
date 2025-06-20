@@ -19,9 +19,9 @@ use crate::hal::config::{BLOCK_SZ, PAGE_SIZE, PAGE_SIZE_BITS};
 const BLOCK_RATIO: usize = BLOCK_SZ / VIRT_IO_BLOCK_SZ;
 //#[allow(unused)]
 //#[cfg(target_arch = "loongarch64")]
-const VIRTIO0: usize = 0x2000_0000;
-const VIRT_PCI_BASE: usize = 0x4000_0000;
-const VIRT_PCI_SIZE: usize = 0x0002_0000;
+const VIRTIO0: usize = 0x1000_0000;
+const VIRT_PCI_BASE: usize = 0x400E_0000;
+const VIRT_PCI_SIZE: usize = 0x0001_0000;
 
 
 pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, PciTransport>>);

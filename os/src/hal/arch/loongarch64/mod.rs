@@ -1,4 +1,4 @@
-#[path = "../../platform/loongarch64/2k1000.rs"]
+#[path = "../../platform/loongarch64/qemu.rs"]
 pub mod board;
 pub mod config;
 pub mod laflex;
@@ -6,6 +6,7 @@ pub mod laflex;
 mod mem_reg_macro;
 mod acpi;
 mod sbi;
+mod boot;
 pub mod switch;
 pub mod time;
 pub mod trap;

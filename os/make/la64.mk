@@ -31,7 +31,11 @@ else ifeq ($(BOARD), vf2)
 endif
 
 # Logging config
-LOG_OPTION := log_$(LOG)
+ifndef LOG
+	LOG_OPTION := "log_off"
+else
+	LOG_OPTION := "log_${LOG}"
+endif
 
 # KERNEL entry address
 KERNEL_ENTRY_PA := 0x9000000090000000
@@ -144,7 +148,7 @@ comp-gdb:
 		-nographic \
 		-smp 1 \
 		-drive file=$(SDCARD_LA),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-device virtio-blk-pci,drive=x0 \
 		-no-reboot \
 		-rtc base=utc \
 		-S \
