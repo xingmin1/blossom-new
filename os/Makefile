@@ -10,7 +10,7 @@ all: $(ARCHS)
 
 $(ARCHS):
 	@echo "Building for ARCH=$@"
-	make ARCH=$@ -f make/$@.mk all BLK_MODE=${BLK_MODE} MODE=${MODE}
+	make ARCH=$@ -f make/$@.mk all MODE=${MODE}
 
 rv64-kernel-build-only:
 	make -f make/rv64.mk build BLK_MODE=${BLK_MODE} MODE=${MODE} LOG=${LOG}
@@ -28,13 +28,13 @@ rv64-run:
 	make -f make/rv64.mk comp
 
 la64-only:
-	make -f make/la64.mk all BLK_MODE=${BLK_MODE}
+	make -f make/la64.mk all 
 
 la64-kernel-build-only:
-	make -f make/la64.mk build BLK_MODE=${BLK_MODE} MODE=${MODE} LOG=${LOG}
+	make -f make/la64.mk build MODE=${MODE} LOG=${LOG}
 
 la64-debug:
-	make -f make/la64.mk all BLK_MODE=${BLK_MODE} MODE=debug	
+	make -f make/la64.mk all MODE=debug	
 
 la64-run-only:
 	make -f make/la64.mk runsimple
