@@ -51,8 +51,8 @@ core::arch::global_asm!(include_str!("hal/arch/riscv/entry.asm"));
 core::arch::global_asm!(include_str!("load_img.S"));
 #[cfg(all(feature = "block_mem", feature = "riscv"))]
 core::arch::global_asm!(include_str!("load_img-rv.S"));
-// #[cfg(all(not(feature = "block_mem"), feature = "loongarch64"))]
-// core::arch::global_asm!(include_str!("preload_app.S"));
+#[cfg(all(not(feature = "block_mem"), feature = "loongarch64"))]
+core::arch::global_asm!(include_str!("preload_app.S"));
 #[cfg(all(not(feature = "block_mem"), feature = "riscv"))]
 core::arch::global_asm!(include_str!("preload_app-rv.S"));
 

@@ -3,10 +3,10 @@ MODE := debug
 COMP ?= yes
 
 ifeq ($(BOARD), 2k1000)
-	TARGET := loongarch64-unknown-linux-gnu
+	TARGET := loongarch64-unknown-none
 endif
 ifeq ($(BOARD), laqemu)
-	TARGET := loongarch64-unknown-linux-gnu
+	TARGET := loongarch64-unknown-none
 endif
 ifeq ($(BOARD), rvqemu)
 	TARGET := riscv64gc-unknown-none-elf

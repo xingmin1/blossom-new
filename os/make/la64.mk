@@ -1,5 +1,5 @@
 # Target configuration
-TARGET := loongarch64-unknown-linux-gnu
+TARGET := loongarch64-unknown-none
 MODE := release
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
@@ -64,7 +64,7 @@ build: env $(KERNEL_BIN) mv
 
 env:
 	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
-	(rustup target list | grep "loongarch64-unknown-linux-gnu (installed)") || rustup target add loongarch64-unknown-linux-gnu
+	(rustup target list | grep "loongarch64-unknown-none (installed)") || rustup target add loongarch64-unknown-none
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
 
@@ -81,9 +81,9 @@ fs-img: user
 kernel:
 	@echo Platform: $(BOARD)
 ifeq ($(MODE), debug)
-	@LOG=$(LOG) cargo build --features "board_$(BOARD) $(LOG_OPTION) block_$(BLK_MODE) oom_handler" --no-default-features --target loongarch64-unknown-linux-gnu
+	@LOG=$(LOG) cargo build --features "board_$(BOARD) $(LOG_OPTION) block_$(BLK_MODE) oom_handler" --no-default-features --target loongarch64-unknown-none
 else
-	@LOG=$(LOG) cargo build --release --features "board_$(BOARD) $(LOG_OPTION) block_$(BLK_MODE) oom_handler" --no-default-features --target loongarch64-unknown-linux-gnu
+	@LOG=$(LOG) cargo build --release --features "board_$(BOARD) $(LOG_OPTION) block_$(BLK_MODE) oom_handler" --no-default-features --target loongarch64-unknown-none
 endif
 
 clean:
@@ -104,14 +104,14 @@ ifeq ($(BOARD), laqemu)
 endif
 
 monitor:
-	loongarch64-unknown-elf-gdb -ex 'file target/loongarch64-unknown-linux-gnu/debug/os' -ex 'set arch loongarch64' -ex 'target remote localhost:1234'
+	loongarch64-unknown-elf-gdb -ex 'file target/loongarch64-unknown-none/debug/os' -ex 'set arch loongarch64' -ex 'target remote localhost:1234'
 
 gdb:
 	@qemu-system-loongarch64 \
 		-machine virt \
 		-nographic \
 		-bios $(BOOTLOADER) \
-		-device loader,file=target/loongarch64-unknown-linux-gnu/debug/os,addr=$(KERNEL_ENTRY_PA) \
+		-device loader,file=target/loongarch64-unknown-none/debug/os,addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(ROOTFS_IMG),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
 		-m 1024 \
@@ -151,7 +151,11 @@ comp-gdb:
 		-device virtio-blk-pci,drive=x0 \
 		-no-reboot \
 		-rtc base=utc \
+		-d in_asm,exec,cpu,guest_errors \
+		-D qemu_full.log \
 		-S \
 		-s
+	@head -n 500 qemu_full.log > qemu.log
+	@rm qemu_full.log
 
 .PHONY: all build kernel fs-img user clean run gdb comp comp-gdb

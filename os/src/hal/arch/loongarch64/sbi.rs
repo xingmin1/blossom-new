@@ -33,6 +33,9 @@ pub fn console_getchar() -> usize {
 
 pub fn shutdown() -> ! {
     let mut pm1_cnt: Pm1Cnt = Pm1Cnt::empty();
-    pm1_cnt.set_s5().write();
+    // pm1_cnt.set_s5().write();
+    unsafe {
+        (0x100E_001C as *mut u8).write_volatile(0x34);
+    }
     loop {}
 }

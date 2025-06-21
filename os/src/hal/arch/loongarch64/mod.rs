@@ -62,6 +62,7 @@ pub fn machine_init() {
 pub fn pre_start_init() {
     EEntry::empty().set_exception_entry(strampoline as usize);
 }
+#[no_mangle]
 pub fn bootstrap_init() {
     if CPUId::read().get_core_id() != 0 {
         loop {}

@@ -19,9 +19,9 @@ use crate::hal::config::{BLOCK_SZ, PAGE_SIZE, PAGE_SIZE_BITS};
 const BLOCK_RATIO: usize = BLOCK_SZ / VIRT_IO_BLOCK_SZ;
 //#[allow(unused)]
 //#[cfg(target_arch = "loongarch64")]
-const VIRTIO0: usize = 0x1000_0000;
-const VIRT_PCI_BASE: usize = 0x400E_0000;
-const VIRT_PCI_SIZE: usize = 0x0001_0000;
+const PCI_ECAM_BASE: usize = 0x2000_0000;
+const VIRT_PCI_BASE: usize = 0x4000_0000;
+const VIRT_PCI_SIZE: usize = 0x0002_0000;
 
 
 pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, PciTransport>>);
@@ -110,7 +110,7 @@ const fn align_up(addr: usize, align: usize) -> usize {
 
 
 fn enumerate_pci()->Option<PciTransport> {
-    let mmconfig_base = VIRTIO0 as *mut u8;
+    let mmconfig_base = PCI_ECAM_BASE as *mut u8;
     
     let mmio_cam = unsafe { MmioCam::new(mmconfig_base, Cam::Ecam) };
     let mut pci_root = PciRoot::new(mmio_cam);
