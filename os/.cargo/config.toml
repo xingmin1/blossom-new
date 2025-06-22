@@ -7,6 +7,7 @@ rustflags = [
     "-Clink-arg=-Tsrc/hal/arch/loongarch64/linker.ld",
     "-Clink-arg=-nostdlib",
     "-Clink-arg=-static",
+    "-Cforce-frame-pointers=yes",
 ]
 # Add "-Ctarget-feature=-unaligned-access" when ready.
 #linker = "loongarch64-linux-gnu-gcc"

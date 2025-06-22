@@ -2,6 +2,8 @@
 
 os/target/
 
+os/qemu.log
+
 user/target/
 
 fs-img-dir
