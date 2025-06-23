@@ -151,11 +151,7 @@ comp-gdb:
 		-device virtio-blk-pci,drive=x0 \
 		-no-reboot \
 		-rtc base=utc \
-		-d in_asm,exec,cpu,guest_errors \
-		-D qemu_full.log \
 		-S \
 		-s
-	@head -n 500 qemu_full.log > qemu.log
-	@rm qemu_full.log
 
 .PHONY: all build kernel fs-img user clean run gdb comp comp-gdb
