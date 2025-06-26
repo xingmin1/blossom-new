@@ -655,7 +655,7 @@ impl Ext4FileSystem {
 
         // assert!(old_size > new_size);
         if old_size > new_size{
-            println!("[kernel] this may need to be changed");
+            // println!("[kernel] this may need to be changed");
             return Ok(EOK)
         }
 

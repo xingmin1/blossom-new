@@ -600,7 +600,7 @@ impl File for Ext4OSInode {
         // 找到自己在目录树中的节点，以及父目录 inode
         let dir_node_weak = self.dirnode_ptr.lock().clone();
         let dir_node = dir_node_weak.upgrade().ok_or(ENOTEMPTY)?;
-        let father_inode = dir_node.parent();
+        let father_inode = dir_node.father_arc();
         let parent_osinode = &father_inode.file;
         // println!("[kernel in unlink] parent osinode: {:?}", parent_osinode.get_file_type());
         let parent = Arc::downcast::<Ext4OSInode>(parent_osinode.clone())

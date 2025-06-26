@@ -299,3 +299,68 @@ pub enum TimeRange {
     TimeSpec(TimeSpec),
     TimeVal(TimeVal),
 }
+
+use core::sync::atomic::{AtomicU64};
+
+/// 启动以来的时间源（秒），例如通过读取 mtime / TSC
+pub trait TimeSource {
+    /// 返回开机以来的时间（单位：秒）
+    fn uptime(&self) -> u64;
+}
+
+/// 系统启动时间偏移（使 current_time = Unix 时间）
+static BOOT_TIME_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+static mut TIME_SOURCE: Option<&'static dyn TimeSource> = None;
+
+/// 注册全局时间源
+pub fn init_time_source(ts: &'static dyn TimeSource) {
+    unsafe {
+        TIME_SOURCE = Some(ts);
+    }
+}
+
+/// 从引导参数（cmdline）中提取 `now=` 时间戳（Unix 时间）
+pub fn init_time_from_cmdline(cmdline: &str) {
+    if let Some(ts) = parse_cmdline_boot_time(cmdline) {
+        let uptime = uptime();
+        BOOT_TIME_OFFSET.store(ts - uptime, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        panic!("no valid now= timestamp in cmdline");
+    }
+}
+
+/// 当前 Unix 时间戳
+pub fn current_time() -> u64 {
+    uptime() + BOOT_TIME_OFFSET.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// 获取系统启动以来的时间（秒）
+pub fn uptime() -> u64 {
+    unsafe {
+        TIME_SOURCE.expect("TimeSource not initialized").uptime()
+    }
+}
+
+/// 解析启动参数，如 `now=1749900000`
+fn parse_cmdline_boot_time(cmdline: &str) -> Option<u64> {
+    for part in cmdline.split_whitespace() {
+        if let Some(ts) = part.strip_prefix("now=") {
+            if let Ok(val) = ts.parse::<u64>() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+
+const MTIME: *const u64 = 0x0200_BFF8 as *const u64; // RISC-V virt machine 默认 MTIME 地址
+
+pub struct MTime;
+
+impl TimeSource for MTime {
+    fn uptime(&self) -> u64 {
+        unsafe { core::ptr::read_volatile(MTIME) / 100_0000 } // 100万tick = 1秒
+    }
+}
