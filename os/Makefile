@@ -71,3 +71,7 @@ la64-gdb: la64-debug
 rvchange:
 	rm -f ../sdcard-rv.img
 	cp ../../imgbk/sdcard-rv.img ../sdcard-rv.img
+
+lachange:
+	rm -f ../sdcard-la.img
+	cp ../../imgbk/sdcard-la.img ../sdcard-la.img
