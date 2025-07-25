@@ -44,13 +44,11 @@ pub fn sys_splice(
         return EBADF;
     }
     info!("[sys_splice] off_in: {:?}, off_out: {:?}", off_in, off_out);
-    // a buffer in kernel
+    println!("off_in: {:?}, off_out: {:?}", off_in, off_out);
     const BUFFER_SIZE: usize = 4096;
     let mut buffer = Vec::<u8>::with_capacity(BUFFER_SIZE);
-    let mut buffer_ptr: Option<&[u8]> = None;
 
     let token = task.get_user_token();
-    // turn a pointer in user space into a pointer in kernel space if it is not null
     let off_in = if off_in.is_null() {
         off_in
     } else {
@@ -79,60 +77,49 @@ pub fn sys_splice(
     };
 
     let mut left_bytes = len;
-    loop {
-        let write_buffer = match buffer_ptr {
-            Some(buffer_ptr) => buffer_ptr,
-            None => {
-                unsafe {
-                    buffer.set_len(left_bytes.min(BUFFER_SIZE));
-                }
-                let read_size = in_file.read(unsafe { off_in.as_mut() }, buffer.as_mut_slice());
-                if (read_size as isize) < 0 {
-                    let errno = read_size as isize;
-                    return errno;
-                } else if read_size == 0 {
-                    break;
-                }
-                unsafe {
-                    buffer.set_len(read_size);
-                }
-                buffer.as_slice()
-            }
-        };
-
-        let read_size = write_buffer.len();
-
-        // let fallback = |redundant_bytes: usize| unsafe {
-        //     let offset = offset.as_mut();
-        //     match offset {
-        //         Some(offset) => {
-        //             *offset -= redundant_bytes;
-        //         }
-        //         None => match in_file.lseek(-(redundant_bytes as isize), SeekWhence::SEEK_CUR) {
-        //             Ok(_) => {}
-        //             Err(errno) => panic!("failed! errno {}", errno),
-        //         },
-        //     }
-        // };
-
-        let write_size = out_file.write(unsafe { off_out.as_mut() }, write_buffer);
-        if (write_size as isize) < 0 {
-            // fallback(read_size);
-            let errno = read_size as isize;
-            return errno;
-        } else if write_size == 0 {
-            // fallback(read_size);
+    let mut send_size = 0;
+    while left_bytes > 0 {
+        let to_read = left_bytes.min(BUFFER_SIZE);
+        unsafe { buffer.set_len(to_read); }
+        let read_size = in_file.read(
+            if off_in.is_null() { None } else { unsafe { off_in.as_mut() } },
+            buffer.as_mut_slice(),
+        );
+        if (read_size as isize) < 0 {
+            return read_size as isize;
+        } else if read_size == 0 {
             break;
         }
-
-        buffer_ptr = if write_size < read_size {
-            Some(&write_buffer[write_size..])
-        } else {
-            None
-        };
-        left_bytes -= write_size;
+        unsafe { buffer.set_len(read_size); }
+        if !off_in.is_null() {
+            unsafe { *off_in += read_size; }
+        }
+        let mut written = 0;
+        while written < read_size {
+            let write_size = out_file.write(
+                if off_out.is_null() { None } else { unsafe { off_out.as_mut() } },
+                &buffer[written..read_size],
+            );
+            if (write_size as isize) < 0 {
+                return write_size as isize;
+            } else if write_size == 0 {
+                // 写端不可写，直接返回已写入字节
+                return send_size as isize;
+            }
+            if !off_out.is_null() {
+                unsafe { *off_out += write_size; }
+            }
+            written += write_size;
+            send_size += write_size;
+            left_bytes -= write_size;
+        }
+        // 如果本次 read 已经小于请求的 to_read，说明 EOF，不能再读了
+        if read_size < to_read {
+            break;
+        }
     }
-    let send_size = len - left_bytes;
+    // println!("[sys_splice] send bytes: {}", send_size);
+    // println!("left bytes: {}", left_bytes);
     info!("[sys_sendfile] send bytes: {}", send_size);
     send_size as isize
 }
