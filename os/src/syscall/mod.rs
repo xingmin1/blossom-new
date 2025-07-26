@@ -113,6 +113,7 @@ pub fn syscall_name(id: usize) -> &'static str {
         SYSCALL_RENAMEAT2 => "renameat2",
         SYSCALL_FACCESSAT2 => "faccessat2",
         SYSCALL_MEMBARRIER => "membarrier",
+        SYSCALL_COPY_FILE_RANGE => "copy_file_range",
         SYSCALL_STATX => "statx",
         SYSCALL_GETRANDOM => "getrandom",
         // non-standard
@@ -331,6 +332,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
         ),
         SYSCALL_MEMBARRIER => sys_memorybarrier(args[0], args[1], args[2]),
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0],
+            args[1] as *mut usize,
+            args[2],
+            args[3] as *mut usize,
+            args[4],
+            args[5] as u32,
+        ),
         SYSCALL_STATX => sys_statx(
             args[0],
             args[1] as *const u8,

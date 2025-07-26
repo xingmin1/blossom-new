@@ -6,7 +6,10 @@ os/qemu.log
 
 user/target/
 
-make_test/copyfilerange_test
+make_test/copyfilerange_test_1
+make_test/copyfilerange_test_2
+make_test/copyfilerange_test_3
+make_test/copyfilerange_test_4
 make_test/splice_test
 make_test/interrupts_test1
 make_test/interrupts_test2
