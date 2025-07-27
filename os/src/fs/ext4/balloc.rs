@@ -101,7 +101,7 @@ impl Ext4FileSystem {
             bgid = self.get_bgid_of_block(goal);
             idx_in_bg = self.addr_to_idx_bg(goal);
         } else {
-            bgid = 1;
+            bgid = 0;
             idx_in_bg = 0;
         }
 
@@ -210,10 +210,12 @@ impl Ext4FileSystem {
         let super_block = &self.superblock;
         let blocks_per_group = super_block.blocks_per_group();
 
-        let mut bgid = *start_bgid;
+        let block_group_count = super_block.block_group_count();
+
+        // 修正起始块组，防止越界
+        let mut bgid = if *start_bgid >= block_group_count { 0 } else { *start_bgid };
         let mut idx_in_bg = 0;
 
-        let block_group_count = super_block.block_group_count();
         let mut count = block_group_count;
 
         while count > 0 {
