@@ -376,7 +376,8 @@ pub fn trap_return() -> ! {
     let user_satp = task.get_user_token();
     //log::debug!("[trap_return] trap_cx_ptr:{:#x}, user_satp:{:#x}", trap_cx_ptr, user_satp);
     drop(task);
-    let restore_va = __restore as usize - __alltraps as usize + strampoline as usize;
+    let restore_va = __restore as usize ;
+    //println!("[trap return] restore_va: {:#x}", restore_va);
     pre_start_init();
     unsafe {
         asm!(
