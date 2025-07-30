@@ -245,6 +245,13 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::Timer) => {
             do_wake_expired();
+            unsafe {
+                TIMER_INTERRUPT += 1;
+                let f = ROOT
+                    .open("/proc/interrupts", OpenFlags::O_CREAT, false)
+                    .unwrap();
+                f.write(None, format!("5: {}\n", TIMER_INTERRUPT).as_bytes());
+            }
             TIClr::read().clear_timer().write();
             enable_timer_interrupt();
             suspend_current_and_run_next();
