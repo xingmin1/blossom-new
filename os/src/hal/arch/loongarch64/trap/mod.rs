@@ -5,7 +5,7 @@
 mod context;
 mod mem_access;
 use self::context::GeneralRegs;
-
+use crate::fs::OpenFlags;
 use super::register::{self, Exception, Interrupt, Trap, ERA};
 use super::{pre_start_init, MErrEntry};
 use crate::hal::arch::get_clock_freq;
@@ -21,6 +21,10 @@ use crate::task::{
 };
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut};
+
+pub static mut TIMER_INTERRUPT: usize = 0;
+use alloc::format;
+use crate::fs::directory_tree::ROOT;
 
 pub use context::{MachineContext, TrapContext, UserContext};
 use register::{
