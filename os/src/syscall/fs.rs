@@ -729,12 +729,6 @@ pub fn sys_copy_file_range(
     copied as isize
 }
 
-pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> isize {
-    // info!("[sys_madvise] addr: {}, length: {}, advice: {}", addr, length, advice);
-    SUCCESS
-}
-
-
 pub fn sys_close(fd: usize) -> isize {
     info!("[sys_close] fd: {}", fd);
     let task = current_task().unwrap();

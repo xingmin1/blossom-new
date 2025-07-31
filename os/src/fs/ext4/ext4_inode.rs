@@ -519,7 +519,7 @@ impl Ext4Inode {
         // 计算在一个块上的偏移量
         let offset = inode_pos % block_size;
         // println!("[kernel] offset is {}", offset);
-        let mut buf = vec![0u8; *GLOBAL_BLOCK_SIZE];
+        let mut buf = vec![0u8; crate::hal::BLOCK_SZ];
         // 读取一个块
         block_device.read_block(block_id, &mut buf);
         // 偏移量加上数据长度不能超过块大小
@@ -546,8 +546,9 @@ impl InodeTrait for Ext4Inode {
     }
 
     fn get_file_type(&self) -> DiskInodeType {
+        print!("");
         let file_type = self.file_type();
-        // println!("[kernel ext4inode file type] file type is {:#?}", file_type);
+        log::info!("[kernel ext4inode file type] file type is {:#?}", file_type);
         match file_type {
             InodeFileType::S_IFDIR => crate::fs::DiskInodeType::Directory,
             InodeFileType::S_IFREG => crate::fs::DiskInodeType::File,
@@ -834,11 +835,12 @@ impl Ext4FileSystem {
     }
 
     /// 从磁盘加载inoderef对象
+    /// 注意：这个方法每次都从磁盘读取，可能导致缓存不一致
+    /// 建议使用缓存版本或确保磁盘同步
     pub fn get_inode_ref(&self, inode_num: u32) -> Ext4InodeRef {
         let offset = self.inode_disk_pos(inode_num);
+
         let mut ext4block = Block::load_offset(self.block_device.clone(), offset);
-        // println!("[kernel] ext4block.diskoffset is {:?}", ext4block.disk_offset);
-        // println!("[kernel] ext4block.data is {:?}", ext4block.data);
         let blk_offset = offset % self.block_size;
         let inode: &mut Ext4Inode = ext4block.read_offset_as_mut(offset % self.block_size);
         Ext4InodeRef {
@@ -877,7 +879,7 @@ impl Ext4FileSystem {
     /// 不带校验和回写inode信息
     pub fn write_back_inode_without_csum(&self, inode_ref: &Ext4InodeRef) {
         let inode_pos = self.inode_disk_pos(inode_ref.inode_num);
-        //println!("[kernel write_back_inode_without_csum] inode_pos: {:?}, inode_num: {}", inode_pos, inode_ref.inode_num);
+        // println!("[kernel write_back_inode_without_csum] inode_pos: {:?}, inode_num: {}", inode_pos, inode_ref.inode_num);
 
         inode_ref
             .inode

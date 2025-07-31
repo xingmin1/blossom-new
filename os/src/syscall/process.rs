@@ -1215,3 +1215,8 @@ pub fn sys_getrusage(who: isize, usage: *mut Rusage) -> isize {
     //info!("[sys_getrusage] who: RUSAGE_SELF, usage: {:?}", inner.rusage);
     SUCCESS
 }
+
+pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> isize {
+    // info!("[sys_madvise] addr: {}, length: {}, advice: {}", addr, length, advice);
+    SUCCESS
+}
