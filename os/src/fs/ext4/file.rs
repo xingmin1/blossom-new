@@ -7,7 +7,6 @@ use block_group::Block;
 use ext4fs::Ext4FileSystem;
 use path::path_check;
 use spin::RwLock;
-use crate::timer::get_time_sec;
 
 pub struct Ext4FileContent {
     /// The size of the file.
@@ -256,9 +255,9 @@ impl Ext4FileSystem {
     /// # 返回值:
     /// + `Result<Ext4InodeRef>` - 新文件的inode
     pub fn create(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef, isize> {
-        //println!("in1, parent:{:?}", parent);
+        // println!("in1, parent:{:?}", parent);
         let a = 1+2+parent;
-        //println!("a = {:?}", a);
+        log::info!("a = {:?}", a);
         // Ext4FileSystem被锁了？
         let dummy = self.get_inode_ref(a);
         // println!("dummy = {:#?}", dummy);
@@ -453,7 +452,7 @@ impl Ext4FileSystem {
             let pblock_idx = self.get_pblock_idx(&inode_ref, iblock as u32)?;
 
             // 读取数据
-            let mut data = vec![0u8; *GLOBAL_BLOCK_SIZE];
+            let mut data = vec![0u8; crate::hal::BLOCK_SZ];
             self.block_device.read_block(pblock_idx as usize, &mut data);
 
             // 将读取到的数据复制到read_buf中
@@ -652,15 +651,13 @@ impl Ext4FileSystem {
         new_size: u64,
     ) -> Result<usize, isize> {
         let old_size = inode_ref.inode.size();
-
         // assert!(old_size > new_size);
-        if old_size > new_size{
+        if old_size >= new_size{
             // println!("[kernel] this may need to be changed");
+            inode_ref.inode.set_size(new_size);
+            // 确保立即同步到磁盘，避免缓存不一致
+            self.write_back_inode(inode_ref);
             return Ok(EOK)
-        }
-
-        if old_size == new_size {
-            return Ok(EOK);
         }
 
         let block_size = self.block_size as u64;

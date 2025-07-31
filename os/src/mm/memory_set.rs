@@ -288,37 +288,55 @@ impl<T: PageTable> MemorySet<T> {
     /// Checks the permission to decide whether to copy.
     pub fn do_page_fault(&mut self, addr: VirtAddr) -> Result<PhysAddr, MemoryError> {
         let vpn = addr.floor();
+        // 在所有内存区域中查找包含发生页错误的虚拟页号的区域
         if let Some(area) = self.areas.iter_mut().find(|area| {
-            area.map_perm.contains(MapPermission::R | MapPermission::U)// If there is such a page in user space
-                && area.get_start::<T>() <= vpn// ...and the addr is in the vpn range
-                && vpn < area.get_end::<T>()
+            // 检查内存区域是否具有读权限和用户权限
+            // 这确保了该区域是用户空间中的可访问页面
+            area.map_perm.contains(MapPermission::R | MapPermission::U)
+            // 检查虚拟页号是否在该内存区域的范围内
+            // vpn 必须 >= 区域起始地址且 < 区域结束地址
+            && area.get_start::<T>() <= vpn
+            && vpn < area.get_end::<T>()
         }) {
+            // 检查虚拟页号是否已经在页表中映射
             if !self.page_table.is_mapped(vpn) {
-                // lazy alloc file-backed page
+                // === 处理文件映射的页面（延迟分配） ===
                 if let Some(file) = area.map_file.clone() {
+                    // 获取文件当前的偏移量
                     let old_offset = file.get_offset();
+                    // 计算当前页面在虚拟地址空间中的起始地址
                     let page_start_va = VirtAddr::from(vpn).0;
+                    // 计算内存区域的起始虚拟地址
                     let area_start_va = VirtAddr::from(area.get_start::<T>()).0;
+                    // 计算当前页面在内存区域中的偏移量
                     let offset_in_area = page_start_va - area_start_va;
-                    // if offset exceed EOF, SIGBUS should be sent
+                    
+                    // 检查是否超出文件末尾 (EOF) - 如果超出则发送 SIGBUS 信号
+                    // (file.get_size() + PAGE_SIZE - 1) & !0xfff 将文件大小向上对齐到页边界
                     if old_offset + offset_in_area > (file.get_size() + PAGE_SIZE - 1) & !0xfff {
                         return Err(MemoryError::BeyondEOF);
                     }
+                    
+                    // 根据内存区域的写权限选择不同的处理方式
                     if area.map_perm.contains(MapPermission::W) {
+                        // === 可写的文件映射：分配新页面并从文件读取数据 ===
                         let allocated_ppn = area.map_one_zeroed_unchecked(&mut self.page_table, vpn);
+                        // 定位到文件中对应的位置
                         file.lseek(offset_in_area as isize, SeekWhence::SEEK_CUR)
                             .unwrap();
+                        // 从文件读取数据到新分配的物理页面
                         file.read(None, unsafe {
                             core::slice::from_raw_parts_mut(
                                 PhysAddr::from(allocated_ppn).0 as *mut u8,
                                 PAGE_SIZE,
                             )
                         });
+                        // 恢复文件的原始偏移量
                         file.lseek(old_offset as isize, SeekWhence::SEEK_SET)
                             .unwrap();
                         Ok(allocated_ppn.offset(addr.page_offset()))
-                    // map to phys page directly
                     } else {
+                        // === 只读的文件映射：直接映射到文件缓存页面 ===
                         let cache_phys_page = file
                             .get_single_cache(old_offset + offset_in_area)
                             .unwrap()
@@ -326,14 +344,16 @@ impl<T: PageTable> MemorySet<T> {
                             .unwrap()
                             .get_tracker();
                         let cache_ppn = cache_phys_page.ppn;
+                        // 直接将虚拟页号映射到缓存的物理页号
                         self.page_table.map(vpn, cache_ppn, area.map_perm);
                         area.inner.alloc_in_memory(vpn, cache_phys_page);
                         Ok(cache_ppn.offset(addr.page_offset()))
                     }
                 } else {
+                    // === 处理匿名页面（非文件映射）===
                     let frame = area.inner.get_mut(&vpn);
                     let allocated_ppn = match frame {
-                        // Page table is not mapped, but frame is in memory.
+                        // 页表未映射但帧已在内存中 - 这种情况不应该发生
                         Frame::InMemory(_) => {
                             info!(
                                 "[Frame InMemory] addr: {:?}, vpn: {:?}, frame: {:?}",
@@ -341,8 +361,10 @@ impl<T: PageTable> MemorySet<T> {
                             );
                             unreachable!();
                         }
+                        // 页面尚未分配 - 执行延迟分配
                         Frame::Unallocated => {
                             info!("[do_page_fault] addr: {:?}, solution: lazy alloc", addr);
+                            // 分配一个零填充的新页面并建立映射
                             let ppn = area.map_one_zeroed_unchecked(&mut self.page_table, vpn);
                             let frame = area.inner.get_mut(&vpn);
                             info!(
@@ -351,10 +373,12 @@ impl<T: PageTable> MemorySet<T> {
                             );
                             ppn
                         }
+                        // 页面被压缩 - 解压缩页面 (OOM 处理器功能)
                         #[cfg(feature = "oom_handler")]
                         Frame::Compressed(_) => {
                             let ppn = frame.unzip().unwrap();
                             self.page_table.map(vpn, ppn, area.map_perm);
+                            // 将页面添加到活跃列表中
                             area.inner
                                 .active
                                 .push_back((vpn.0 - area.get_start::<T>().0) as u16);
@@ -362,10 +386,12 @@ impl<T: PageTable> MemorySet<T> {
                             info!("[do_page_fault] addr: {:?}, solution: decompress", addr);
                             ppn
                         }
+                        // 页面被换出到交换空间 - 换入页面 (OOM 处理器功能)
                         #[cfg(feature = "oom_handler")]
                         Frame::SwappedOut(_) => {
                             let ppn = frame.swap_in().unwrap();
                             self.page_table.map(vpn, ppn, area.map_perm);
+                            // 将页面添加到活跃列表中
                             area.inner
                                 .active
                                 .push_back((vpn.0 - area.get_start::<T>().0) as u16);
@@ -374,6 +400,7 @@ impl<T: PageTable> MemorySet<T> {
                             ppn
                         }
                     };
+                    // 返回最终的物理地址（物理页号 + 页内偏移）
                     Ok(allocated_ppn.offset(addr.page_offset()))
                 }
             } else {
@@ -633,7 +660,7 @@ impl<T: PageTable> MemorySet<T> {
                     );
                 }
                 xmas_elf::program::Type::Interp => {
-                    //assert!(elf.input[(ph.offset() + ph.file_size()) as usize] == b'\0');
+                    // assert!(elf.input[(ph.offset() + ph.file_size()) as usize] == b'\0');
                     let path = String::from_utf8_lossy(
                         &elf.input
                             [ph.offset() as usize..(ph.offset() + ph.file_size() - 1) as usize],

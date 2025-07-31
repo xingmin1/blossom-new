@@ -781,25 +781,59 @@ impl MapArea {
         first_cut: VirtPageNum,
         second_cut: VirtPageNum,
     ) -> Result<(Self, Self), ()> {
-        if self.map_file.is_some() {
-            warn!("[into_three] break apart file-back MapArea!");
-            return Err(());
-        }
+        // 1. 记录原始起始 VPN，用于后续 file offset 计算
+        let old_start_vpn = self.inner.vpn_range.get_start();
+        let base_va = VirtAddr::from(old_start_vpn).0;
+
+        // 2. 拆分出三段 linear map
         let (second_frames, third_frames) = self.inner.into_three(first_cut, second_cut)?;
-        Ok((
-            MapArea {
-                inner: second_frames,
-                map_type: self.map_type,
-                map_perm: self.map_perm,
-                map_file: None,
-            },
-            MapArea {
-                inner: third_frames,
-                map_type: self.map_type,
-                map_perm: self.map_perm,
-                map_file: None,
-            },
-        ))
+
+        // 3. 根据是否文件映射，生成第二/三段的 file 句柄并调整偏移
+        if let Some(ref file) = self.map_file {
+            // 第一段 self.map_file 保持原 offset
+            let orig_offset = file.get_offset();
+
+            // 第二段
+            let second_file = file.deep_clone();
+            let offset1 = orig_offset + (VirtAddr::from(first_cut).0 - base_va);
+            second_file.lseek(offset1 as isize, SeekWhence::SEEK_SET).unwrap();
+
+            // 第三段
+            let mut third_file = file.deep_clone();
+            let offset2 = orig_offset + (VirtAddr::from(second_cut).0 - base_va);
+            third_file.lseek(offset2 as isize, SeekWhence::SEEK_SET).unwrap();
+
+            Ok((
+                MapArea {
+                    inner: second_frames,
+                    map_type: self.map_type,
+                    map_perm: self.map_perm,
+                    map_file: Some(second_file),
+                },
+                MapArea {
+                    inner: third_frames,
+                    map_type: self.map_type,
+                    map_perm: self.map_perm,
+                    map_file: Some(third_file),
+                },
+            ))
+        } else {
+            // 非文件映射，保持原有逻辑
+            Ok((
+                MapArea {
+                    inner: second_frames,
+                    map_type: self.map_type,
+                    map_perm: self.map_perm,
+                    map_file: None,
+                },
+                MapArea {
+                    inner: third_frames,
+                    map_type: self.map_type,
+                    map_perm: self.map_perm,
+                    map_file: None,
+                },
+            ))
+        }
     }
     #[cfg(feature = "oom_handler")]
     pub fn do_oom<T: PageTable>(&mut self, page_table: &mut T) -> usize {

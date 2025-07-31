@@ -5,7 +5,7 @@
 mod context;
 mod mem_access;
 use self::context::GeneralRegs;
-use crate::fs::OpenFlags;
+
 use super::register::{self, Exception, Interrupt, Trap, ERA};
 use super::{pre_start_init, MErrEntry};
 use crate::hal::arch::get_clock_freq;
@@ -21,10 +21,6 @@ use crate::task::{
 };
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut};
-
-pub static mut TIMER_INTERRUPT: usize = 0;
-use alloc::format;
-use crate::fs::directory_tree::ROOT;
 
 pub use context::{MachineContext, TrapContext, UserContext};
 use register::{
@@ -249,15 +245,22 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::Timer) => {
             do_wake_expired();
-            unsafe {
-                TIMER_INTERRUPT += 1;
-                let f = ROOT
-                    .open("/proc/interrupts", OpenFlags::O_CREAT, false)
-                    .unwrap();
-                f.write(None, format!("5: {}\n", TIMER_INTERRUPT).as_bytes());
-            }
+            // 记录时钟中断次数（中断号5）
+            crate::fs::dev::interrupts::Interrupts::increment_interrupt_count(5);
             TIClr::read().clear_timer().write();
             enable_timer_interrupt();
+            suspend_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::HWI0) => {
+            // 记录外部中断次数（中断号9）
+            crate::fs::dev::interrupts::Interrupts::increment_interrupt_count(9);
+            // 这里可以添加具体的外部中断处理逻辑
+            suspend_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::HWI1) => {
+            // 记录外部中断次数（中断号10）
+            crate::fs::dev::interrupts::Interrupts::increment_interrupt_count(10);
+            // 这里可以添加具体的外部中断处理逻辑
             suspend_current_and_run_next();
         }
         Trap::Exception(Exception::Breakpoint) => {

@@ -92,6 +92,7 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 pub const SYSCALL_MPROTECT: usize = 226;
 pub const SYSCALL_MSYNC: usize = 227;
+pub const SYSCALL_MADVISE: usize = 233;
 pub const SYSCALL_WAIT4: usize = 260; // wait is implemented as wait4(pid, status, options, 0) in pub lib.
 pub const SYSCALL_PRLIMIT: usize = 261;
 pub const SYSCALL_RENAMEAT2: usize = 276;
@@ -106,4 +107,3 @@ pub const SYSCALL_SHUTDOWN: usize = 501;
 pub const SYSCALL_CLEAR: usize = 502;
 pub const SYSCALL_OPEN: usize = 506; //where?
 pub const SYSCALL_GET_TIME: usize = 1690; //you mean get time of day by 169?
-

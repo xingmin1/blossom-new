@@ -1032,123 +1032,6 @@ pub fn sys_memorybarrier(_cmd: usize, _flags: usize, _cpu_id: usize) -> isize {
     return SUCCESS;
 }
 
-pub fn sys_copy_file_range(
-    fd_in: usize,
-    off_in: *mut usize,
-    fd_out: usize,
-    off_out: *mut usize,
-    len: usize,
-    flags: u32, // `flags`总为0，没有实际作用
-    ) -> isize{
-    // 获取当前任务
-    let task = current_task().unwrap();
-    let fd_table = task.files.lock();
-
-    // println!("fd_in: {}", fd_in);
-
-    // println!("fd_out: {}", fd_out);
-
-    // 获取输入文件描述符
-    let in_file = match fd_table.get_ref(fd_in) {
-        Ok(file_descriptor) => file_descriptor,
-        Err(errno) => return errno,
-    };
-
-    // 获取输出文件描述符
-    let out_file = match fd_table.get_ref(fd_out) {
-        Ok(file_descriptor) => file_descriptor,
-        Err(errno) => return errno,
-    };
-
-    // 处理输入文件的偏移量
-    let read_offset_ptr =  if off_in.is_null() {
-        off_in
-    } else {
-        match translated_refmut(task.get_user_token(), off_in) {
-            Ok(offset) => {
-                if (*offset as isize) < 0 {
-                    return EINVAL;
-                };
-                offset as *mut usize
-            },
-            Err(errno) => return errno,
-        }
-    };
-
-    // 处理输出文件的偏移量
-    let write_offset_ptr =  if off_out.is_null() {
-        off_out
-    } else {
-        match translated_refmut(task.get_user_token(), off_out) {
-            Ok(offset) => {
-                if (*offset as isize) < 0 {
-                    return EINVAL;
-                };
-                offset as *mut usize
-            },
-            Err(errno) => return errno,
-        }
-    };
-
-    if(!in_file.readable() || !out_file.writable()){
-        return EINVAL;
-    }
-    
-    //println!("len: {}", len);
-
-    // 创建缓冲区用于数据传输
-    const BUFFER_SIZE: usize = 4096;
-    let mut buffer = Vec::<u8>::with_capacity(BUFFER_SIZE);
-    let mut buffer_ptr: Option<&[u8]> = None;
- 
-    let mut total_send_bytes = 0;
-    let mut left_bytes = len;
-
-    // 复制数据
-    loop {
-        let write_buffer = match buffer_ptr {
-            Some(buffer_ptr) => buffer_ptr,
-            None => {
-                unsafe {
-                    buffer.set_len(left_bytes.min(BUFFER_SIZE));
-                }
-                let read_size = in_file.read(unsafe { read_offset_ptr.as_mut() }, buffer.as_mut_slice());
-                if (read_size as isize) < 0 {
-                    let errno = read_size as isize;
-                    return errno;
-                } else if read_size == 0 {
-                    break;
-                }
-                unsafe {
-                    buffer.set_len(read_size);
-                }
-                buffer.as_slice()
-            }
-        };
-        let read_size = write_buffer.len();
-        let write_size = out_file.write(unsafe { write_offset_ptr.as_mut() }, write_buffer);
-        if (write_size as isize) < 0 {
-            // fallback(read_size);
-            let errno = read_size as isize;
-            return errno;
-        } else if write_size == 0 {
-            // fallback(read_size);
-            break;
-        } 
-
-        buffer_ptr = if write_size < read_size {
-            Some(&write_buffer[write_size..])
-        } else {
-            None
-        };
-        left_bytes -= write_size;
-        //println!("left_bytes: {}", left_bytes);
-    }
-    //println!("=================end=================");
-    total_send_bytes = len - left_bytes;
-    total_send_bytes as isize
-}
-
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     let task = current_task().unwrap();
     let result = task.vm.lock().munmap(start, len);
@@ -1179,26 +1062,69 @@ pub fn sys_clock_gettime(clk_id: usize, tp: *mut TimeSpec) -> isize {
     }
     SUCCESS
 }
+
 pub fn sys_clock_nanosleep(
     clk_id: usize,
     flags: u32,
     rqtp: *const TimeSpec,
     rmtp: *mut TimeSpec,
 ) -> isize {
-    if !rqtp.is_null() {
-        let token = current_user_token();
-        let timespec = match translated_ref(token, rqtp) {
-            Ok(timespec) => timespec,
-            Err(errno) => return errno,
-        };
-        info!(
-            "[sys_clock_nanosleep] clk_id: {}, flags: {:?}, rqtp: {:?}, rmtp: {:?}",
-            clk_id, flags, timespec, rmtp
-        );
+    if rqtp.is_null() {
+        return EINVAL;
     }
-    SUCCESS
-}
     
+    let task = current_task().unwrap();
+    let token = task.get_user_token();
+    let req = match get_from_user(token, rqtp) {
+        Ok(req) => req,
+        Err(errno) => return errno,
+    };
+    
+    info!(
+        "[sys_clock_nanosleep] clk_id: {}, flags: {:?}, rqtp: {:?}, rmtp: {:?}",
+        clk_id, flags, req, rmtp
+    );
+    
+    // 目前只支持 CLOCK_REALTIME (0) 和 CLOCK_MONOTONIC (1)
+    if clk_id > 1 {
+        return EINVAL;
+    }
+    
+    // 目前只支持 TIMER_ABSTIME 标志位
+    if flags != 0 && flags != 1 {
+        return EINVAL;
+    }
+    
+    let end = if flags == 1 {
+        // TIMER_ABSTIME: 绝对时间
+        req
+    } else {
+        // 相对时间
+        TimeSpec::now() + req
+    };
+    
+    wait_with_timeout(Arc::downgrade(&task), end);
+    drop(task);
+
+    block_current_and_run_next();
+    let task = current_task().unwrap();
+    let inner = task.acquire_inner_lock();
+    let now = TimeSpec::now();
+    
+    if inner.sigpending.is_empty() {
+        assert!(end <= now);
+        if !rmtp.is_null() {
+            copy_to_user(token, &TimeSpec::new(), rmtp).unwrap();
+        }
+        SUCCESS
+    } else {
+        if !rmtp.is_null() {
+            copy_to_user(token, &(end - now), rmtp).unwrap();
+        }
+        EINTR
+    }
+}
+
 // int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 pub fn sys_sigaction(signum: usize, act: usize, oldact: usize) -> isize {
     trace!(

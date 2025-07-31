@@ -19,6 +19,7 @@ mod vfs;
 
 pub use self::dev::{
     hwclock::*,
+    interrupts::*,
     // null::*,
     pipe::*,
     // socket::*, tty::*, zero::*

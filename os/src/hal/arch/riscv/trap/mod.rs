@@ -123,16 +123,15 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             do_wake_expired();
-            unsafe {
-                TIMER_INTERRUPT += 1;
-                // if TIMER_INTERRUPT % 100_000 == 0 {
-                let f = ROOT
-                    .open("/proc/interrupts", OpenFlags::O_CREAT, false)
-                    .unwrap();
-                f.write(None, format!("5: {}", TIMER_INTERRUPT).as_bytes());
-                // }
-            }
+            // 记录时钟中断次数（中断号5）
+            crate::fs::dev::interrupts::Interrupts::increment_interrupt_count(5);
             set_next_trigger();
+            suspend_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::SupervisorExternal) => {
+            // 记录外部中断次数（中断号9）
+            crate::fs::dev::interrupts::Interrupts::increment_interrupt_count(9);
+            // 这里可以添加具体的外部中断处理逻辑
             suspend_current_and_run_next();
         }
         _ => {

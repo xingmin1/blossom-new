@@ -78,7 +78,7 @@ impl Ext4FileSystem {
                 super_block.decrease_free_inodes_count();
                 super_block.sync_to_disk_with_csum(self.block_device.clone());
                 // 看是否写入成功
-                let mut test_super_block = vec![0u8; *GLOBAL_BLOCK_SIZE];
+                let mut test_super_block = vec![0u8; crate::hal::BLOCK_SZ];
                 self.block_device.read_block(0, &mut test_super_block);
 
                 /* Compute the absolute i-nodex number */

@@ -42,6 +42,12 @@ fn main() -> i32 {
             "./copy-file-range_testcode.sh\0".as_ptr(),
             core::ptr::null(),
         ],
+        [
+            path.as_ptr(),
+            "-c\0".as_ptr(),
+            "./interrupts_testcode.sh\0".as_ptr(),
+            core::ptr::null(),
+        ],
         //完成的测试继续添加
     ];
 
@@ -57,6 +63,12 @@ fn main() -> i32 {
             path.as_ptr(),
             "-c\0".as_ptr(),
             "./copy-file-range_testcode.sh\0".as_ptr(),
+            core::ptr::null(),
+        ],
+        [
+            path.as_ptr(),
+            "-c\0".as_ptr(),
+            "./interrupts_testcode.sh\0".as_ptr(),
             core::ptr::null(),
         ],
        

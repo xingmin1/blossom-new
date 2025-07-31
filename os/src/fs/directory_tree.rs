@@ -2,7 +2,7 @@ use super::inode::DiskInodeType;
 use super::vfs::VFS;
 use super::{
     cache::BlockCacheManager,
-    dev::{null::Null, tty::Teletype, zero::Zero},
+    dev::{interrupts::Interrupts, null::Null, tty::Teletype, zero::Zero},
     file_trait::File,
     filesystem::FileSystem,
     layout::OpenFlags,
@@ -339,65 +339,45 @@ impl DirectoryTreeNode {
         special_use: bool,
     ) -> Result<Arc<dyn File>, isize> {
         log::debug!("[open]: cwd: {}, path: {}", self.get_cwd(), path);
+        // println!("open file in dtn: cwd: {} name: {}",self.get_cwd(), path );
 
+        // for comp
         const BUSYBOX_PATH: &str = "/musl/busybox";
-        const REDIRECT_TO_BUSYBOX: [&str; 5] = ["/touch", "/rm", "/ls", "/grep", "/cp"];
-
+        // for test
+        // const BUSYBOX_PATH: &str = "/busybox";
+        const REDIRECT_TO_BUSYBOX: [&str; 29] = [
+            "/touch", "/rm", "/ls", "/grep",
+            "/cat", "/cp", "/mv", "/mkdir", "/rmdir", "/chmod",
+            "/chown", "/ln",
+            // 文本处理
+            "/sed", "/awk", "/head", "/tail",
+            // 系统工具
+            "/ps", "/top", "/kill", "/df",
+            // 网络工具
+            "/ping", "/ifconfig", "/netstat",
+            // 其他常用
+            "/find", "/tar", "/which",
+            // 文本读取
+            "less", "more", "vi",
+        ];
         let path = if REDIRECT_TO_BUSYBOX.contains(&path) {
             BUSYBOX_PATH
         } else {
             path
         };
 
-        const LIBC_PATH: &str = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
-        const REDIRECT_TO_LIBC: [&str; 2] = [
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-            "/lib/ld-linux-riscv64-lp64.so.1",
-        ];
-        const LIBC_MUSL_PATH: &str = "/musl/lib/libc.so";
-        const REDIRECT_TO_LIBC_MUSL: [&str; 2] = [
-            "/lib/ld-musl-riscv64.so.1",
-            "/lib/ld-musl-riscv64-sf.so.1",
-        ];
-        const LIBM_PATH: &str = "/glibc/lib/libm.so";
-        const REDIRECT_TO_LIBM: [&str; 2] = [
-            "libm.so.6",
-            "/lib/libm.so.6",
-        ];
-        const LIBC_SO_PATH: &str = "/glibc/lib/libc.so";
-        const REDIRECT_TO_LIBC_SO: [&str; 2] = [
-            "libc.so.6",
-            "/lib/libc.so.6",
-        ];
-        let path = if REDIRECT_TO_LIBC.contains(&path) {
-            // println!("use libc.so");
-            LIBC_PATH
-        } else {
-            path
+        // 重定向链接库
+        let path = match path {
+            "/lib/ld-linux-riscv64-lp64.so.1" => "/musl/lib/libc.so",
+            "/lib/ld-linux-riscv64-lp64d.so.1" => "/musl/lib/libc.so",
+            "/lib/ld-musl-riscv64.so.1" | "/lib/ld-musl-riscv64-sf.so.1" => "/musl/lib/libc.so",
+            "/lib64/ld-linux-loongarch-lp64d.so.1" => "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+            "libm.so.6" => "/glibc/lib/libm.so.6",
+            "/lib64/ld-musl-loongarch-lp64d.so.1" => "/musl/lib/libc.so",
+            "/usr/lib/tls_get_new-dtv_dso.so" => "./libtls_get_new-dtv_dso.so",
+            _ => path,
         };
-        let path = if REDIRECT_TO_LIBM.contains(&path) {
-            // println!("use libm.so");
-            LIBM_PATH
-        } else {
-            path
-        };
-        let path = if REDIRECT_TO_LIBC_SO.contains(&path) {
-            // println!("use libm.so");
-            LIBC_SO_PATH
-        } else {
-            path
-        };
-        let path = if REDIRECT_TO_LIBC_MUSL.contains(&path) {
-            // println!("use libm.so");
-            LIBC_MUSL_PATH
-        } else {
-            path
-        };
-        let path = if path == "/usr/lib/tls_get_new-dtv_dso.so" {
-            "./libtls_get_new-dtv_dso.so"
-        } else {
-            path
-        };
+
         // 获取目录树根节点
         let inode = if path.starts_with("/") {
             &**ROOT
@@ -407,20 +387,24 @@ impl DirectoryTreeNode {
 
         // 获取路径缓存
         let mut path_cache_lock = PATH_CACHE.lock();
+        // 如果路径以 '/' 开头，且路径等于缓存路径，且缓存路径的弱引用存在
         let inode = if path.starts_with('/')
             && path == path_cache_lock.0
             && path_cache_lock.1.upgrade().is_some()
         {
+            // 获取缓存路径的弱引用
             path_cache_lock.1.upgrade().unwrap()
         } else {
+            // 解析路径
             let mut components = Self::parse_dir_path(path);
+            // 获取目录栈的栈顶，也就是父目录或者文件本身
             let last_comp = components.pop();
-
+            // 从剩余的路径中获取父目录节点
             let inode = match inode.cd_comp(&components) {
                 Ok(inode) => inode,
                 Err(errno) => return Err(errno),
             };
-
+            // 若最后一个组件存在，则进行处理
             if let Some(last_comp) = last_comp {
                 let mut lock = inode.children.write();
                 match inode.try_to_open_subfile(last_comp, &mut lock) {
@@ -434,7 +418,7 @@ impl DirectoryTreeNode {
                         if !flags.contains(OpenFlags::O_CREAT) {
                             return Err(ENOENT);
                         }
-                        //println!("last_comp:{:?}", last_comp);
+                        // println!("last_comp:{:?}", last_comp);
                         let new_file = match inode.create(last_comp, DiskInodeType::File) {
                             Ok(file) => file,
                             Err(errno) => return Err(errno),
@@ -493,6 +477,8 @@ impl DirectoryTreeNode {
 
         Ok(inode.file.open(flags, special_use))
     }
+
+
 
     // 创建一个文件夹
     pub fn mkdir(&self, path: &str) -> Result<(), isize> {
@@ -826,4 +812,29 @@ fn init_proc_directory() {
         _ => {}
     }
     println!("[kernel] init_proc_mounts_directory successfully!");
+    
+    // 创建 /proc/interrupts 虚拟文件
+    let proc_inode = match ROOT.cd_path("/proc") {
+        Ok(inode) => inode,
+        Err(_) => panic!("proc directory doesn't exist"),
+    };
+    
+    let interrupts_dev = DirectoryTreeNode::new(
+        "interrupts".to_string(),
+        Arc::new(FileSystem::new(FS_Type::Null)),
+        Arc::new(Interrupts::new()),
+        Arc::downgrade(&proc_inode.get_arc()),
+    );
+    
+    let mut lock = proc_inode.children.write();
+    proc_inode.cache_all_subfile(&mut lock);
+    lock.as_mut()
+        .unwrap()
+        .insert("interrupts".to_string(), interrupts_dev);
+    drop(lock);
+    
+    // 添加一些测试数据
+    crate::fs::dev::interrupts::Interrupts::debug_add_test_data();
+    
+    println!("[kernel] init_proc_interrupts_directory successfully!");
 }

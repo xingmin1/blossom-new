@@ -66,6 +66,7 @@ const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
+const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_STATX: usize = 291;
 // Not standard POSIX sys_call
 const SYSCALL_LS: usize = 500;
@@ -83,8 +84,10 @@ extern "C" {
 
 fn syscall(id: usize, args: [usize; 3]) -> isize {
     #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        __syscall(id, args[0], args[1], args[2])
+    {
+        unsafe {
+            __syscall(id, args[0], args[1], args[2])
+        }
     }
     #[cfg(target_arch = "riscv64")]
     {
@@ -99,6 +102,42 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
             );
         }
         ret
+    }
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+    {
+        unimplemented!("syscall not implemented for this architecture")
+    }
+}
+
+fn syscall6(id: usize, args: [usize; 6]) -> isize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // LoongArch64 doesn't support 6-argument syscalls directly in this implementation
+        // Fall back to generic 3-argument call for now - this may need proper implementation
+        unsafe {
+            __syscall(id, args[0], args[1], args[2])
+        }
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut ret: isize;
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                inlateout("x10") args[0] => ret,
+                in("x11") args[1],
+                in("x12") args[2],
+                in("x13") args[3],
+                in("x14") args[4],
+                in("x15") args[5],
+                in("x17") id
+            );
+        }
+        ret
+    }
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+    {
+        unimplemented!("syscall6 not implemented for this architecture")
     }
 }
 
@@ -178,4 +217,22 @@ pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
 }
 pub fn sys_shutdown() -> isize {
     syscall(SYSCALL_SHUTDOWN, [0, 0, 0])
+}
+
+pub fn sys_copy_file_range(
+    fd_in: i32,
+    off_in: *mut isize,
+    fd_out: i32,
+    off_out: *mut isize,
+    len: usize,
+    flags: u32,
+) -> isize {
+    syscall6(SYSCALL_COPY_FILE_RANGE, [
+        fd_in as usize,
+        off_in as usize,
+        fd_out as usize,
+        off_out as usize,
+        len,
+        flags as usize,
+    ])
 }

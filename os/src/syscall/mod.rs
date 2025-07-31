@@ -44,6 +44,7 @@ pub fn syscall_name(id: usize) -> &'static str {
         SYSCALL_PREAD => "pread",
         SYSCALL_PWRITE => "pwrite",
         SYSCALL_SENDFILE => "sendfile",
+        SYSCALL_SPLICE => "splice",
         SYSCALL_PSELECT6 => "pselect6",
         SYSCALL_PPOLL => "ppoll",
         SYSCALL_READLINKAT => "readlinkat",
@@ -113,9 +114,9 @@ pub fn syscall_name(id: usize) -> &'static str {
         SYSCALL_RENAMEAT2 => "renameat2",
         SYSCALL_FACCESSAT2 => "faccessat2",
         SYSCALL_MEMBARRIER => "membarrier",
-        SYSCALL_COPY_FILE_RANGE => "copy_file_range",
         SYSCALL_STATX => "statx",
         SYSCALL_GETRANDOM => "getrandom",
+        SYSCALL_COPY_FILE_RANGE => "copy_file_range",
         // non-standard
         SYSCALL_LS => "ls",
         SYSCALL_SHUTDOWN => "shutdown",
@@ -334,11 +335,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MEMBARRIER => sys_memorybarrier(args[0], args[1], args[2]),
         SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
             args[0],
-            args[1] as *mut usize,
+            args[1] as *mut isize,
             args[2],
-            args[3] as *mut usize,
+            args[3] as *mut isize,
             args[4],
             args[5] as u32,
+        ),
+        SYSCALL_MADVISE => sys_madvise(
+            args[0],
+            args[1],
+            args[2] as u32,
         ),
         SYSCALL_STATX => sys_statx(
             args[0],
@@ -403,12 +409,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as usize, args[1] as usize, args[2] as u32),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         _ => {
-            println!(
-                "[syscall] Unsupported syscall: {} ({}), calling over arguments: {:?}",
-                syscall_name(syscall_id),
-                syscall_id,
-                args
-            );
+            println!("Unsupported syscall:{} ({})", syscall_name(syscall_id), syscall_id);
             error!(
                 "Unsupported syscall:{} ({}), calling over arguments:",
                 syscall_name(syscall_id),

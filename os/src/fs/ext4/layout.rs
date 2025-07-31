@@ -40,9 +40,6 @@ use super::{
     Cache, Ext4Inode, Ext4InodeRef, InodePerm, PageCacheManager,
 };
 
-// use crate::timer::get_time;
-// use crate::hal::arch::riscv::rv_board::CLOCK_FREQ;
-
 // 可能后续会用到？
 pub enum ExtType {
     Ext2,
@@ -193,7 +190,7 @@ impl File for Ext4OSInode {
                     start_cache += 1;
                     start = end_current_block;
                 }
-                *offset = read_size;
+                *offset += read_size;
                 read_size
             }
             None => {
@@ -390,7 +387,6 @@ impl File for Ext4OSInode {
         let atime = inode_ref.inode.atime();
         let mtime = inode_ref.inode.mtime();
         let ctime = inode_ref.inode.ctime();
-        // let now = get_time() / CLOCK_FREQ;
 
         let st_mod: u32 = {
             if inode_ref.inode.get_file_type() == DiskInodeType::Directory {
@@ -413,9 +409,6 @@ impl File for Ext4OSInode {
             atime as i64,
             mtime as i64,
             ctime as i64,
-            // now as i64,
-            // now as i64,
-            // now as i64,
         )
     }
 

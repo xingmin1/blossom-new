@@ -583,7 +583,7 @@ impl Ext4FileSystem {
                 });
 
                 let next_block = search_path.path.last().unwrap().index.unwrap().leaf_lo;
-                let mut next_data = vec![0u8; *GLOBAL_BLOCK_SIZE];
+                let mut next_data = vec![0u8; crate::hal::BLOCK_SZ];
                 self.block_device
                     .read_block(next_block as usize, &mut next_data);
                 node = ExtentNode::load_from_data_mut(&mut next_data, false);
@@ -723,7 +723,7 @@ impl Ext4FileSystem {
 
     /// Get extent from the node at the given position.
     fn get_extent_from_node(&self, node: &ExtentPathNode, pos: usize) -> Option<Ext4Extent> {
-        let mut data = vec![0u8; *GLOBAL_BLOCK_SIZE];
+        let mut data = vec![0u8; crate::hal::BLOCK_SZ];
         self.block_device
             .read_block(node.pblock as usize, &mut data);
         let extent_node = ExtentNode::load_from_data(&data, false);

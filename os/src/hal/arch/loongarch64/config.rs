@@ -2,7 +2,7 @@
 /// 内存大小，只有256MB？
 pub const MEMORY_SIZE: usize = 0x1000_0000;
 pub const USER_STACK_SIZE: usize = PAGE_SIZE * 40;
-pub const USER_HEAP_SIZE: usize = PAGE_SIZE * 20;
+pub const USER_HEAP_SIZE: usize = PAGE_SIZE * 40;
 pub const SYSTEM_TASK_LIMIT: usize = 128;
 pub const SYSTEM_FD_LIMIT: usize = 256;
 pub const BLOCK_SZ: usize = 4096;
@@ -18,7 +18,7 @@ pub const KSTACK_PG_NUM_SHIFT: usize = 16usize.trailing_zeros() as usize;
 pub const KSTACK_PG_NUM_SHIFT: usize = 16usize.trailing_zeros() as usize;
 
 pub const KERNEL_STACK_SIZE: usize = PAGE_SIZE << KSTACK_PG_NUM_SHIFT;
-pub const KERNEL_HEAP_SIZE: usize = PAGE_SIZE * 0x3000;
+pub const KERNEL_HEAP_SIZE: usize = PAGE_SIZE * 0x8000;
 
 // Addresses
 /// Maximum length of a physical address

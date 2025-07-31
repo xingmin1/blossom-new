@@ -1,5 +1,6 @@
 use crate::fs::poll::{ppoll, pselect, FdSet, PollFd};
 use crate::fs::*;
+use crate::fs::dev::pipe::Pipe;
 use crate::hal::BLOCK_SZ;
 use crate::mm::{
     copy_from_user, copy_from_user_array, copy_to_user, copy_to_user_array, copy_to_user_string,
@@ -13,14 +14,32 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::panic;
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use num_enum::FromPrimitive;
+use downcast_rs::DowncastSync;
 
 use super::errno::*;
 
 pub const AT_FDCWD: usize = 100usize.wrapping_neg();
 
-// todo
+/// Splice data between file descriptors
+/// 
+/// The splice() system call moves data between two file descriptors without copying
+/// between kernel address space and user address space. It transfers up to len bytes
+/// of data from the file descriptor fd_in to the file descriptor fd_out, where one
+/// of the file descriptors must refer to a pipe.
+/// 
+/// # Arguments
+/// * `fd_in` - File descriptor to read from
+/// * `off_in` - Pointer to offset for input file (NULL for current position)
+/// * `fd_out` - File descriptor to write to  
+/// * `off_out` - Pointer to offset for output file (NULL for current position)
+/// * `len` - Number of bytes to transfer
+/// * `flags` - Splice flags (currently ignored)
+/// 
+/// # Returns
+/// * Number of bytes transferred on success
+/// * Negative error code on failure
 pub fn sys_splice(
     fd_in: usize,
     off_in: *mut usize,
@@ -31,97 +50,122 @@ pub fn sys_splice(
 ) -> isize {
     let task = current_task().unwrap();
     let fd_table = task.files.lock();
+    
+    // Get input file descriptor
     let in_file = match fd_table.get_ref(fd_in) {
         Ok(file_descriptor) => file_descriptor,
         Err(errno) => return errno,
     };
+    
+    // Get output file descriptor
     let out_file = match fd_table.get_ref(fd_out) {
         Ok(file_descriptor) => file_descriptor,
         Err(errno) => return errno,
     };
-    info!("[sys_splice] outfd: {}, in_fd: {}", fd_out, fd_in);
-    if !in_file.readable() || !out_file.writable() {
+    
+    info!("[sys_splice] fd_in: {}, fd_out: {}, len: {}", fd_in, fd_out, len);
+    
+    // Check if files are readable/writable
+    if !in_file.readable() {
         return EBADF;
     }
-    info!("[sys_splice] off_in: {:?}, off_out: {:?}", off_in, off_out);
-    println!("off_in: {:?}, off_out: {:?}", off_in, off_out);
-    const BUFFER_SIZE: usize = 4096;
-    let mut buffer = Vec::<u8>::with_capacity(BUFFER_SIZE);
-
+    if !out_file.writable() {
+        return EBADF;
+    }
+    
+    // Handle offset pointers
     let token = task.get_user_token();
-    let off_in = if off_in.is_null() {
-        off_in
+    let mut off_in_ptr = if off_in.is_null() {
+        None
     } else {
         match translated_refmut(token, off_in) {
             Ok(offset) => {
                 if (*offset as isize) < 0 {
                     return EINVAL;
-                };
-                offset as *mut usize
+                }
+                Some(offset)
             }
             Err(errno) => return errno,
         }
     };
-    let off_out = if off_out.is_null() {
-        off_out
+    
+    let mut off_out_ptr = if off_out.is_null() {
+        None
     } else {
         match translated_refmut(token, off_out) {
             Ok(offset) => {
                 if (*offset as isize) < 0 {
                     return EINVAL;
-                };
-                offset as *mut usize
+                }
+                Some(offset)
             }
             Err(errno) => return errno,
         }
     };
-
-    let mut left_bytes = len;
-    let mut send_size = 0;
-    while left_bytes > 0 {
-        let to_read = left_bytes.min(BUFFER_SIZE);
-        unsafe { buffer.set_len(to_read); }
-        let read_size = in_file.read(
-            if off_in.is_null() { None } else { unsafe { off_in.as_mut() } },
-            buffer.as_mut_slice(),
-        );
-        if (read_size as isize) < 0 {
-            return read_size as isize;
-        } else if read_size == 0 {
+    
+    info!("[sys_splice] off_in: {:?}, off_out: {:?}", off_in_ptr, off_out_ptr);
+    
+    // Use a kernel buffer for data transfer
+    const BUFFER_SIZE: usize = 4096;
+    let mut buffer = Vec::<u8>::with_capacity(BUFFER_SIZE);
+    let mut total_transferred = 0usize;
+    let mut remaining = len;
+    
+    // Check if input is a pipe
+    let is_input_pipe = in_file.file.downcast_ref::<Pipe>().is_some();
+    let mut first_read = true;
+    
+    while remaining > 0 {
+        // Determine how much to read
+        let read_size = remaining.min(BUFFER_SIZE);
+        unsafe {
+            buffer.set_len(read_size);
+        }
+        
+        // Read from input file
+        let bytes_read = in_file.read(off_in_ptr.as_deref_mut(), buffer.as_mut_slice());
+        if (bytes_read as isize) < 0 {
+            let errno = bytes_read as isize;
+            return errno;
+        } else if bytes_read == 0 {
+            // EOF reached
             break;
         }
-        unsafe { buffer.set_len(read_size); }
-        if !off_in.is_null() {
-            unsafe { *off_in += read_size; }
+        
+        // Adjust buffer size to actual bytes read
+        unsafe {
+            buffer.set_len(bytes_read);
         }
-        let mut written = 0;
-        while written < read_size {
-            let write_size = out_file.write(
-                if off_out.is_null() { None } else { unsafe { off_out.as_mut() } },
-                &buffer[written..read_size],
-            );
-            if (write_size as isize) < 0 {
-                return write_size as isize;
-            } else if write_size == 0 {
-                // 写端不可写，直接返回已写入字节
-                return send_size as isize;
-            }
-            if !off_out.is_null() {
-                unsafe { *off_out += write_size; }
-            }
-            written += write_size;
-            send_size += write_size;
-            left_bytes -= write_size;
-        }
-        // 如果本次 read 已经小于请求的 to_read，说明 EOF，不能再读了
-        if read_size < to_read {
+        
+        // Write to output file
+        let bytes_written = out_file.write(off_out_ptr.as_deref_mut(), buffer.as_slice());
+        if (bytes_written as isize) < 0 {
+            let errno = bytes_written as isize;
+            return errno;
+        } else if bytes_written == 0 {
+            // No more space to write
             break;
         }
+        
+        total_transferred += bytes_written;
+        remaining -= bytes_read;
+        
+        // If we couldn't write all the data we read, we're done
+        if bytes_written < bytes_read {
+            break;
+        }
+        
+        // For pipes, if this is the first read and we got less data than requested,
+        // don't try to read more (avoids blocking on empty pipe with open write end)
+        if is_input_pipe && first_read && bytes_read < read_size {
+            break;
+        }
+        
+        first_read = false;
     }
-    // println!("[sys_splice] send bytes: {}", send_size);
-    // println!("left bytes: {}", left_bytes);
-    info!("[sys_sendfile] send bytes: {}", send_size);
-    send_size as isize
+    
+    info!("[sys_splice] transferred bytes: {}", total_transferred);
+    total_transferred as isize
 }
 
 /// # Warning
@@ -476,6 +520,220 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut usize, count: usiz
     info!("[sys_sendfile] send bytes: {}", send_size);
     send_size as isize
 }
+
+/// Copy a range of data from one file to another
+/// 
+/// The copy_file_range() system call performs an in-kernel copy between two file descriptors
+/// without the additional cost of transferring data from the kernel to user space and then
+/// back into the kernel. It copies up to len bytes of data from the source file descriptor
+/// fd_in to the target file descriptor fd_out, overwriting any data that exists within the
+/// requested range of the target file.
+/// 
+/// # Arguments
+/// * `fd_in` - File descriptor to read from
+/// * `off_in` - Pointer to offset for input file (NULL for current position)
+/// * `fd_out` - File descriptor to write to  
+/// * `off_out` - Pointer to offset for output file (NULL for current position)
+/// * `len` - Number of bytes to transfer
+/// * `flags` - Copy flags (currently must be 0)
+/// 
+/// # Returns
+/// * Number of bytes transferred on success
+/// * Negative error code on failure
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut isize,
+    fd_out: usize,
+    off_out: *mut isize,
+    len: usize,
+    flags: u32,
+) -> isize {
+    // 1. flags 必须为 0
+    if flags != 0 {
+        return EINVAL;
+    }
+
+    // 2. 取文件对象并检查可读写
+    let task = current_task().unwrap();
+    let fd_table = task.files.lock();
+    let in_file = match fd_table.get_ref(fd_in) {
+        Ok(file) => file,
+        Err(e) => return e as isize,
+    };
+    let out_file = match fd_table.get_ref(fd_out) {
+        Ok(file) => file,
+        Err(e) => return e as isize,
+    };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
+
+    // 3. 翻译用户传入的 off_in/off_out 指针，并校验负值
+    let token = task.get_user_token();
+    // off_in
+    let mut off_in_user = if !off_in.is_null() {
+        let user_ptr = match translated_refmut(token, off_in) {
+            Ok(ptr) => ptr,
+            Err(e) => return e as isize,
+        };
+        let cur = *user_ptr;
+        if cur < 0 {
+            return EINVAL;
+        }
+        Some((user_ptr, cur as usize))
+    } else {
+        None
+    };
+    // off_out
+    let mut off_out_user = if !off_out.is_null() {
+        let user_ptr = match translated_refmut(token, off_out) {
+            Ok(ptr) => ptr,
+            Err(e) => return e as isize,
+        };
+        let cur = *user_ptr;
+        if cur < 0 {
+            return EINVAL;
+        }
+        Some((user_ptr, cur as usize))
+    } else {
+        None
+    };
+
+    // 4. len = 0 时根据规范：将目标文件大小置为0，然后返回 0
+    if len == 0 {
+        // 将目标文件的大小置为 0
+        match out_file.truncate_size(0) {
+            Ok(_) => {}
+            Err(e) => {
+                return e;
+            }
+        }
+        
+        // 更新用户偏移（如果有的话）
+        if let Some((user_ptr, _)) = off_in_user {
+            *user_ptr = *user_ptr; // 保持原值
+        }
+        if let Some((user_ptr, _)) = off_out_user {
+            *user_ptr = *user_ptr; // 保持原值
+        }
+        return 0;
+    }
+
+    // 5. 检查输入文件的偏移是否超过文件大小
+    let in_file_size = in_file.get_size();
+    let in_read_pos = if let Some((_, offset)) = off_in_user {
+        offset
+    } else {
+        in_file.get_offset()
+    };
+    
+    // 如果读取位置超过文件大小，直接返回 0
+    if in_read_pos >= in_file_size {
+        return 0;
+    }
+
+    // 6. 确保写入位置之前的字节都为 0
+    // 获取输出文件的写入位置
+    let out_write_pos = if let Some((_, offset)) = off_out_user {
+        offset
+    } else {
+        out_file.get_offset()
+    };
+    
+    // 如果写入位置不为 0，需要确保从文件开始到写入位置的所有字节都为 0
+    if out_write_pos > 0 {
+        // 获取当前文件大小
+        let current_size = out_file.get_size();
+        
+        // 如果当前文件大小小于写入位置，需要扩展文件并填充 0
+        if current_size < out_write_pos {
+            let padding_needed = out_write_pos - current_size;
+            
+            // 创建一个全 0 的缓冲区来填充
+            let mut zero_buf = Vec::new();
+            zero_buf.resize(4096, 0u8);
+            let mut remaining_padding = padding_needed;
+            let mut padding_offset = current_size;
+            
+            while remaining_padding > 0 {
+                let padding_size = remaining_padding.min(4096);
+                let padding_buf = &zero_buf[..padding_size];
+                
+                let write_result = out_file.write(Some(&mut padding_offset), padding_buf);
+                if write_result < 0 {
+                    return write_result as isize;
+                }
+                
+                remaining_padding -= padding_size;
+            }
+        }
+    }
+
+    // 7. 真正的拷贝循环
+    const BUF_SZ: usize = 4096;
+    let mut buf = Vec::with_capacity(BUF_SZ);
+    let mut leftover = len;
+    let mut copied = 0;
+
+
+
+    while leftover > 0 {
+        // 7.1 准备读缓冲
+        let to_read = leftover.min(BUF_SZ);
+        unsafe { buf.set_len(to_read) };
+        
+        let r = if let Some((_, ref mut cur)) = off_in_user {
+            in_file.read(Some(cur), &mut buf[..])
+        } else {
+            in_file.read(None, &mut buf[..])
+        };
+        
+        if r < 0 {
+            return r as isize;
+        }
+        let r = r as usize;
+        
+        if r == 0 {
+            break; // EOF
+        }
+        unsafe { buf.set_len(r) };
+
+        // 7.2 写数据
+        let w = if let Some((_, ref mut cur)) = off_out_user {
+            out_file.write(Some(cur), &buf)
+        } else {
+            out_file.write(None, &buf)
+        };
+        
+        if w < 0 {
+            return w as isize;
+        }
+        let w = w as usize;
+        
+        if w == 0 {
+            break;
+        }
+
+        leftover -= w;
+        copied += w;
+    }
+
+    // 8. 拷贝结束后，把新的偏移写回用户指针
+    if let Some((user_ptr, new_off)) = off_in_user {
+        *user_ptr = new_off as isize;
+    }
+    if let Some((user_ptr, new_off)) = off_out_user {
+        *user_ptr = new_off as isize;
+    }
+
+    copied as isize
+}
+
+pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> isize {
+    // info!("[sys_madvise] addr: {}, length: {}, advice: {}", addr, length, advice);
+    SUCCESS
+}
+
 
 pub fn sys_close(fd: usize) -> isize {
     info!("[sys_close] fd: {}", fd);
@@ -943,11 +1201,12 @@ pub fn sys_openat(dirfd: usize, path: *const u8, flags: u32, mode: u32) -> isize
             Err(errno) => return errno,
         },
     };
-
+    debug!("[openat] before new_file_descriptor");
     let new_file_descriptor = match file_descriptor.open(&path, flags, false) {
         Ok(file_descriptor) => file_descriptor,
         Err(errno) => return errno,
     };
+    debug!("[openat] after new_file_descriptor");
 
     let new_fd = match fd_table.insert(new_file_descriptor) {
         Ok(fd) => fd,

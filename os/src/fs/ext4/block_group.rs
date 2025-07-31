@@ -362,7 +362,7 @@ impl Block {
     /// 使用块号加载一个块
     #[no_mangle]
     pub fn load_id(block_device: Arc<dyn BlockDevice>, block_id: usize, offset: usize) -> Self {
-        let mut buf = vec![0u8; *GLOBAL_BLOCK_SIZE];
+        let mut buf = vec![0u8; crate::hal::BLOCK_SZ];
         block_device.read_block(block_id, &mut buf);
         let data = buf.to_vec();
         Block {
