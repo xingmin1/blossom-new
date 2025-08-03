@@ -6,7 +6,12 @@ pub mod switch;
 pub mod time;
 pub mod trap;
 
+#[cfg(feature = "board_rvqemu")]
 #[path = "../../platform/riscv/qemu.rs"]
+pub mod rv_board;
+
+#[cfg(feature = "board_visionfive2")]
+#[path = "../../platform/riscv/visionfive2.rs"]
 pub mod rv_board;
 
 pub fn machine_init() {

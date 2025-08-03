@@ -1,5 +1,11 @@
+#[cfg(feature = "board_laqemu")]
 #[path = "../../platform/loongarch64/qemu.rs"]
 pub mod board;
+
+#[cfg(feature = "board_2k1000")]
+#[path = "../../platform/loongarch64/2k1000.rs"]
+pub mod board;
+
 pub mod config;
 pub mod laflex;
 #[macro_use]
