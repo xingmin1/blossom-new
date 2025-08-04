@@ -80,6 +80,7 @@ fs-img: user
 
 kernel:
 	@echo Platform: $(BOARD)
+	@echo BLK_MODE: $(BLK_MODE)
 ifeq ($(MODE), debug)
 	@LOG=$(LOG) cargo build --features "board_$(BOARD) $(LOG_OPTION) block_$(BLK_MODE) oom_handler" --no-default-features --target loongarch64-unknown-none
 else

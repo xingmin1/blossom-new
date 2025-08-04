@@ -33,6 +33,12 @@ la64-only:
 la64-kernel-build-only:
 	make -f make/la64.mk build MODE=${MODE} LOG=${LOG}
 
+la64-b-only:
+	make -f make/la_board/la64board.mk all BLK_MODE=mem BOARD=2k1000
+
+la64-b-run:
+	make -f make/la_board/la64board.mk run-inner BLK_MODE=mem BOARD=2k1000
+
 la64-debug:
 	make -f make/la64.mk all MODE=debug	
 
@@ -49,6 +55,9 @@ clean:
 	for arch in $(ARCHS); do \
 		make ARCH=$$arch -f make/$$arch.mk clean; \
 	done
+
+la_board_clean:
+	make -f make/la_board/la64board.mk clean
 
 laclean:
 	make -f make/la64.mk clean

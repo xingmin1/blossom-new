@@ -12,6 +12,7 @@ pub mod laflex;
 mod mem_reg_macro;
 mod acpi;
 mod sbi;
+#[cfg(feature = "board_laqemu")]
 mod boot;
 pub mod switch;
 pub mod time;

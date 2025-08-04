@@ -1,18 +1,19 @@
 SUDO=$(if [ $(whoami) = "root" ]; then echo -n ""; else echo -n "sudo"; fi)
 U_FS_DIR="../fs-img-dir"
 U_FS="$1"
-BLK_SZ="512"
+BLK_SZ="4096"
 TARGET=riscv64gc-unknown-none-elf
 MODE="release"
 IMG_SZ="56"
 if [ $# -ge 2 ]; then
     if [ "$2" = "2k1000" ] || [ "$2" = "laqemu" ]; then
-        TARGET=loongarch64-unknown-linux-gnu
-        BLK_SZ="2048"
+        TARGET=loongarch64-unknown-none
+        BLK_SZ="4096"
+        IMG_SZ="56"
     else
         TARGET=riscv64gc-unknown-none-elf
-        BLK_SZ="2048"
-        IMG_SZ="4096"
+        BLK_SZ="4096"
+        IMG_SZ="512"
     fi
 fi
 
@@ -45,7 +46,7 @@ if test -e ${U_FS_DIR}/fs; then
     "$SUDO" rm -r ${U_FS_DIR}/fs
 fi
 
-"$SUDO" mkdir ${U_FS_DIR}/fs
+"$SUDO" mkdir -p ${U_FS_DIR}/fs
 
 "$SUDO" mount -f ${U_FS} ${U_FS_DIR}/fs
 if [ $? -ne 0 ]; then
@@ -82,15 +83,23 @@ if [ ! -f ${U_FS_DIR}/fs/syscall ]; then
 fi
 
 if [ "$2" = "laqemu" ]; then
-    try_copy ../user/busybox_lua_testsuites/${ARCH} ${U_FS_DIR}/fs/
-    try_copy ../user/fs ${U_FS_DIR}/fs/
-    try_copy ../live/splice-test ${U_FS_DIR}/fs/
+    "$SUDO" cp -r ../user/busybox_lua_testsuites/loongarch64/* ${U_FS_DIR}/fs/
+    "$SUDO" cp -r ../user/fs/* ${U_FS_DIR}/fs/
+    "$SUDO" cp ./bash-la ${U_FS_DIR}/fs/bash
+    "$SUDO" cp ../user/target/loongarch64-unknown-none/release/initproc ${U_FS_DIR}/fs/
+fi
+
+if [ "$2" = "2k1000" ]; then
+    "$SUDO" cp -r ../user/busybox_lua_testsuites/loongarch64/* ${U_FS_DIR}/fs/
+    "$SUDO" cp -r ../user/fs/* ${U_FS_DIR}/fs/
+    "$SUDO" cp ./bash-la ${U_FS_DIR}/fs/bash
+    "$SUDO" cp ../user/target/loongarch64-unknown-none/release/initproc ${U_FS_DIR}/fs/
 fi
 
 if [ "$2" = "rvqemu" ]; then
-    sudo cp -r ./bash-rv ${U_FS_DIR}/fs/bin/bash
-    sudo cp -r ../user/target/riscv64gc-unknown-none-elf/release/initproc ${U_FS_DIR}/fs/
-    sudo cp -r ../1.txt ${U_FS_DIR}/fs/
+    "$SUDO" cp -r ./bash-rv ${U_FS_DIR}/fs/bash
+    "$SUDO" cp -r ../user/target/riscv64gc-unknown-none-elf/release/initproc ${U_FS_DIR}/fs/
+    "$SUDO" cp -r ../user/busybox_lua_testsuites/${ARCH}/* ${U_FS_DIR}/fs/
 fi
 
 "$SUDO" umount ${U_FS_DIR}/fs

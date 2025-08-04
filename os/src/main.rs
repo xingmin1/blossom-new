@@ -43,8 +43,8 @@ mod utils;
 use crate::config::DISK_IMAGE_BASE;
 use crate::hal::bootstrap_init;
 use crate::hal::machine_init;
-// #[cfg(feature = "loongarch64")]
-// core::arch::global_asm!(include_str!("hal/arch/loongarch64/entry.asm"));
+#[cfg(feature = "board_2k1000")]
+core::arch::global_asm!(include_str!("hal/arch/loongarch64/entry.asm"));
 #[cfg(feature = "riscv")]
 core::arch::global_asm!(include_str!("hal/arch/riscv/entry.asm"));
 #[cfg(all(feature = "block_mem", feature = "loongarch64"))]
@@ -127,6 +127,7 @@ pub fn rust_main() -> ! {
     println!("[kernel] block in virt mode!");
     #[cfg(feature = "oom_handler")]
     println!("[kernel] oom_handler is enabled!");
+    #[cfg(any(feature = "blk_virt_pci", feature = "blk_virt"))]
     fs::flush_preload();
     task::add_initproc();
     // note that in run_tasks(), there is yet *another* pre_start_init(),
