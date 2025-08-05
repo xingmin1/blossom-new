@@ -659,10 +659,7 @@ pub fn sys_copy_file_range(
                 let padding_size = remaining_padding.min(4096);
                 let padding_buf = &zero_buf[..padding_size];
                 
-                let write_result = out_file.write(Some(&mut padding_offset), padding_buf);
-                if write_result < 0 {
-                    return write_result as isize;
-                }
+                let write_result: isize = out_file.write(Some(&mut padding_offset), padding_buf) as isize;
                 
                 remaining_padding -= padding_size;
             }
@@ -682,40 +679,30 @@ pub fn sys_copy_file_range(
         let to_read = leftover.min(BUF_SZ);
         unsafe { buf.set_len(to_read) };
         
-        let r = if let Some((_, ref mut cur)) = off_in_user {
-            in_file.read(Some(cur), &mut buf[..])
+        let r: isize = if let Some((_, ref mut cur)) = off_in_user {
+            in_file.read(Some(cur), &mut buf[..]) as isize
         } else {
-            in_file.read(None, &mut buf[..])
+            in_file.read(None, &mut buf[..]) as isize
         };
-        
-        if r < 0 {
-            return r as isize;
-        }
-        let r = r as usize;
         
         if r == 0 {
             break; // EOF
         }
-        unsafe { buf.set_len(r) };
+        unsafe { buf.set_len(r as usize) };
 
         // 7.2 写数据
-        let w = if let Some((_, ref mut cur)) = off_out_user {
-            out_file.write(Some(cur), &buf)
+        let w: isize = if let Some((_, ref mut cur)) = off_out_user {
+            out_file.write(Some(cur), &buf) as isize
         } else {
-            out_file.write(None, &buf)
+            out_file.write(None, &buf) as isize
         };
-        
-        if w < 0 {
-            return w as isize;
-        }
-        let w = w as usize;
         
         if w == 0 {
             break;
         }
 
-        leftover -= w;
-        copied += w;
+        leftover -= w as usize;
+        copied += w as usize;
     }
 
     // 8. 拷贝结束后，把新的偏移写回用户指针
