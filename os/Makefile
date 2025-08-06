@@ -21,6 +21,10 @@ rv64-debug:
 rv64-only:
 	make -f make/rv64.mk all BLK_MODE=${BLK_MODE}
 
+rv64-b-only:
+	make -f make/rv64.mk all BLK_MODE=mem BOARD=visionfive2
+	cp ../kernel-rv ../os.bin
+
 rv64-run-only:
 	make -f make/rv64.mk runsimple
 
@@ -61,6 +65,10 @@ la_board_clean:
 
 laclean:
 	make -f make/la64.mk clean
+
+rv_board_clean:
+	make -f make/rv64.mk clean
+	rm ../os.bin
 
 fs-img:
 	make -f make/$(CURR_ARCH).mk fs-img FS_MODE=$(FS_MODE)

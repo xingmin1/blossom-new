@@ -30,3 +30,7 @@ util/qemu-2k1000/tmp/qemu-2k1000-static.20240526.tar.xz
 
 util/qemu-2k1000/tmp/.extracted
 
+os.bin
+
+user/LaTest
+user/RvTest

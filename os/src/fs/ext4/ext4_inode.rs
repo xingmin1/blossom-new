@@ -546,7 +546,7 @@ impl InodeTrait for Ext4Inode {
     }
 
     fn get_file_type(&self) -> DiskInodeType {
-        // print!("");
+        print!("");
         let file_type = self.file_type();
         log::info!("[kernel ext4inode file type] file type is {:#?}", file_type);
         match file_type {

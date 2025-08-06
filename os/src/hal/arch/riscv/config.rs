@@ -1,11 +1,11 @@
 #![allow(unused)]
 
-pub const MEMORY_SIZE: usize = 0x1000_0000;
+pub const MEMORY_SIZE: usize = 0x3000_0000;
 pub const TASK_SIZE: usize = 0xc000_0000;
 pub const ELF_DYN_BASE: usize = TASK_SIZE / 3 * 2;
 pub const USER_STACK_BASE: usize = TASK_SIZE - PAGE_SIZE;
-pub const USER_STACK_SIZE: usize = PAGE_SIZE * 80;
-pub const USER_HEAP_SIZE: usize = PAGE_SIZE * 40;
+pub const USER_STACK_SIZE: usize = PAGE_SIZE * 0x40;
+pub const USER_HEAP_SIZE: usize = PAGE_SIZE * 0x20;
 
 pub const KERNEL_STACK_SIZE: usize = PAGE_SIZE * 0x10;
 #[cfg(not(feature = "board_fu740"))]
@@ -35,7 +35,8 @@ pub const SIGNAL_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const TRAP_CONTEXT_BASE: usize = SIGNAL_TRAMPOLINE - PAGE_SIZE;
 
 pub const MEMORY_PHYS: usize = 0x800_0000;
-pub const DISK_IMAGE_BASE: usize = 0x8000_0000 + MEMORY_PHYS;
+pub const DISK_IMAGE_BASE: usize = MEMORY_START + 0x1000_0000;
+// pub const DISK_IMAGE_BASE: usize = 0x8000_0000 + MEMORY_PHYS;
 // pub const DISK_IMAGE_BASE: usize = MEMORY_END;
 
 pub const SYSTEM_TASK_LIMIT: usize = 128;

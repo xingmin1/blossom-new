@@ -102,7 +102,7 @@ else ifeq ($(BOARD), 2k1000)
 	@./make/la_board/run_script $(QEMU_2k1000)
 endif
 
-all: build mv
+all: ext4 build uimage mv
 mv:
 	mv $(U_IMG) ../uImage
 

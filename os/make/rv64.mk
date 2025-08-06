@@ -48,7 +48,7 @@ endif
 # KERNEL ENTRY
 ifeq ($(BOARD), rvqemu)
 	KERNEL_ENTRY_PA := 0x80200000
-else ifeq ($(BOARD), vf2)
+else ifeq ($(BOARD), visionfive2)
 	KERNEL_ENTRY_PA := 0x80020000
 endif
 
@@ -82,7 +82,7 @@ $(KERNEL_BIN): kernel
 $(APPS):
 
 fs-img: user
-	./buildfs.sh "$(ROOTFS_IMG)" "rvqemu" $(MODE) $(FS_MODE)
+	./buildfs.sh "$(ROOTFS_IMG)" $(BOARD) $(MODE) $(FS_MODE)
 
 # xein TODO: 注意需要评估zero_init启用与否的影响
 kernel:

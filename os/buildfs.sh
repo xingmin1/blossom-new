@@ -13,7 +13,7 @@ if [ $# -ge 2 ]; then
     else
         TARGET=riscv64gc-unknown-none-elf
         BLK_SZ="4096"
-        IMG_SZ="512"
+        IMG_SZ="56"
     fi
 fi
 
@@ -90,16 +90,21 @@ if [ "$2" = "laqemu" ]; then
 fi
 
 if [ "$2" = "2k1000" ]; then
-    "$SUDO" cp -r ../user/busybox_lua_testsuites/loongarch64/* ${U_FS_DIR}/fs/
     "$SUDO" cp -r ../user/fs/* ${U_FS_DIR}/fs/
     "$SUDO" cp ./bash-la ${U_FS_DIR}/fs/bash
-    "$SUDO" cp ../user/target/loongarch64-unknown-none/release/initproc ${U_FS_DIR}/fs/
+    #"$SUDO" cp -r ../user/LaTest/* ${U_FS_DIR}/fs/
 fi
 
 if [ "$2" = "rvqemu" ]; then
     "$SUDO" cp -r ./bash-rv ${U_FS_DIR}/fs/bash
     "$SUDO" cp -r ../user/target/riscv64gc-unknown-none-elf/release/initproc ${U_FS_DIR}/fs/
     "$SUDO" cp -r ../user/busybox_lua_testsuites/${ARCH}/* ${U_FS_DIR}/fs/
+fi
+
+if [ "$2" = "visionfive2" ]; then
+    "$SUDO" cp -r ./bash-rv ${U_FS_DIR}/fs/bash
+    "$SUDO" cp -r ../user/target/riscv64gc-unknown-none-elf/release/initproc ${U_FS_DIR}/fs/
+    "$SUDO" cp -r ../user/RvTest/* ${U_FS_DIR}/fs/
 fi
 
 "$SUDO" umount ${U_FS_DIR}/fs

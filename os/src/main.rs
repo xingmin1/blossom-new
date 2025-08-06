@@ -88,9 +88,16 @@ fn move_to_high_address() {
         let img =
             core::slice::from_raw_parts(simg as usize as *mut u8, eimg as usize - simg as usize);
         // 以DISK_IMAGE_BASE到MEMORY_END上的内存作为根文件系统镜像
+        #[cfg(all(feature = "block_mem", feature = "riscv"))]
         let mem_disk = core::slice::from_raw_parts_mut(
             DISK_IMAGE_BASE as *mut u8,
             // 大小为128MB
+            0x1000_0000,
+        );
+        #[cfg(all(feature = "block_mem", feature = "loongarch64"))]
+        let mem_disk = core::slice::from_raw_parts_mut(
+            DISK_IMAGE_BASE as *mut u8,                     
+            // 大小为64MB
             0x800_0000,
         );
         // 清空mem_disk上的内容
