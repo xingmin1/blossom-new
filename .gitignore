@@ -33,6 +33,7 @@ util/qemu-2k1000/tmp/.extracted
 os.bin
 
 apps/kilo/build
+apps/tetris/build
 
 user/LaTest
 user/RvTest
