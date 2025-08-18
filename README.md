@@ -58,3 +58,16 @@
 - [初赛测评demo](https://pan.baidu.com/s/1n96Q_IbJ-VjQ0bWSVBW3hA?pwd=qcre)
 
 - [拓展功能demo](https://pan.baidu.com/s/1V1t0xwEsobjb84zbqir-Ng?pwd=vqxp)
+
+### 六、参考资料
+
+- baseline
+
+RISC-V：[oskernel2023-npucore-plus](https://gitlab.eduxiji.net/202310699101073/oskernel2023-npucore-plus/-/tree/master?ref_type=heads)
+
+LoongArch：[NPUcore-IMPACT](https://github.com/Fediory/NPUcore-IMPACT)
+
+- dependency
+
+[rustsbi](https://github.com/rustsbi/rustsbi)
+[virtio-drivers](https://github.com/rcore-os/virtio-drivers)
