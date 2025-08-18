@@ -312,13 +312,24 @@ impl File for Teletype {
         let token = crate::task::current_user_token();
         match TeletypeCommand::from_primitive(cmd) {
             TeletypeCommand::TCGETS | TeletypeCommand::TCGETA => {
-                copy_to_user(token, &inner.termios, argp as *mut Termios);
-                SUCCESS
+                match copy_to_user(token, &inner.termios, argp as *mut Termios) {
+                    Ok(()) => SUCCESS,
+                    Err(errno) => errno,
+                }
             }
-            TeletypeCommand::TCSETS | TeletypeCommand::TCSETSW | TeletypeCommand::TCSETSF => {
-                copy_from_user(token, argp as *const Termios, &mut inner.termios);
-                SUCCESS
-            }
+            TeletypeCommand::TCSETS
+            | TeletypeCommand::TCSETSW
+            | TeletypeCommand::TCSETSF
+            | TeletypeCommand::TCSETA
+            | TeletypeCommand::TCSETAW
+            | TeletypeCommand::TCSETAF => match copy_from_user(
+                token,
+                argp as *const Termios,
+                &mut inner.termios,
+            ) {
+                Ok(()) => SUCCESS,
+                Err(errno) => errno,
+            },
             TeletypeCommand::TIOCGPGRP => match translated_refmut(token, argp as *mut u32) {
                 Ok(word) => {
                     *word = inner.foreground_pgid;
@@ -334,14 +345,18 @@ impl File for Teletype {
                 Err(errno) => errno,
             },
             TeletypeCommand::TIOCGWINSZ => {
-                copy_to_user(token, &inner.winsize, argp as *mut WinSize);
-                SUCCESS
+                match copy_to_user(token, &inner.winsize, argp as *mut WinSize) {
+                    Ok(()) => SUCCESS,
+                    Err(errno) => errno,
+                }
             }
             TeletypeCommand::TIOCSWINSZ => {
-                copy_from_user(token, argp as *mut WinSize, &mut inner.winsize);
-                SUCCESS
+                match copy_from_user(token, argp as *const WinSize, &mut inner.winsize) {
+                    Ok(()) => SUCCESS,
+                    Err(errno) => errno,
+                }
             }
-            _ => todo!(),
+            _ => ENOTTY,
         }
     }
 
@@ -404,21 +419,22 @@ pub enum TeletypeCommand {
 #[derive(Clone, Copy)]
 /// The termios functions describe a general terminal interface that
 /// is provided to control asynchronous communications ports.
+
 pub struct Termios {
-    /// input modes
+    /// Input mode flags.
     pub iflag: u32,
-    /// ouput modes
+    /// Output mode flags.
     pub oflag: u32,
-    /// control modes
+    /// Control mode flags.
     pub cflag: u32,
-    /// local modes
+    /// Local mode flags.
     pub lflag: u32,
+    /// Line discipline.
     pub line: u8,
-    /// terminal special characters.
-    pub cc: [u8; 32],
-    pub ispeed: u32,
-    pub ospeed: u32,
+    /// control characters.
+    pub cc: [u8; 19],
 }
+
 
 impl Default for Termios {
     fn default() -> Self {
@@ -450,10 +466,8 @@ impl Default for Termios {
                 23,  // VWERASE
                 22,  // VLNEXT
                 255, // VEOL2
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0,
             ],
-            ispeed: 0,
-            ospeed: 0,
         }
     }
 }

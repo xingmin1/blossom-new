@@ -49,7 +49,7 @@ void clear_screen() {
 }
 
 int main() {
-    //enableRawMode();
+    enableRawMode();
     Game game;
     clear_screen();
     printf("Welcome to Tetris!\n");
