@@ -1,147 +1,82 @@
 #![no_std]
 #![no_main]
-#![feature(linkage)]
-#![feature(asm_const)]
-#![feature(naked_functions)]
 #![feature(asm_experimental_arch)]
-#![feature(panic_info_message)]
-#![feature(alloc_error_handler)]
-#![feature(int_roundings)]
-#![feature(string_remove_matches)]
-#![allow(internal_features)]
-#![feature(lang_items)]
-#![feature(custom_test_frameworks)]
-#![test_runner(crate::test_runner)]
-#![feature(const_maybe_uninit_assume_init)]
-#![feature(trait_upcasting)]
-#![feature(core_intrinsics)]
-#![allow(dead_code)]
-#![allow(unused_assignments)]
-#![allow(unused_variables)]
-pub use hal::config;
-extern crate alloc;
-extern crate core;
 
-#[macro_use]
-extern crate bitflags;
+extern crate rlibc;
 
-#[macro_use]
+mod arch;
+mod boot;
 mod console;
-mod drivers;
-mod fs;
-mod hal;
-mod lang_items;
-mod math;
-mod mm;
-mod net;
-mod syscall;
-mod task;
-mod timer;
-mod utils;
+mod cpu;
+mod irq;
+mod platform;
+mod sync;
 
-#[cfg(feature = "block_mem")]
-use crate::config::DISK_IMAGE_BASE;
-use crate::hal::bootstrap_init;
-use crate::hal::machine_init;
-#[cfg(feature = "board_2k1000")]
-core::arch::global_asm!(include_str!("hal/arch/loongarch64/entry.asm"));
-#[cfg(feature = "riscv")]
-core::arch::global_asm!(include_str!("hal/arch/riscv/entry.asm"));
-#[cfg(all(feature = "block_mem", feature = "loongarch64"))]
-core::arch::global_asm!(include_str!("load_img.S"));
-#[cfg(all(feature = "block_mem", feature = "riscv"))]
-core::arch::global_asm!(include_str!("load_img-rv.S"));
-#[cfg(all(not(feature = "block_mem"), feature = "loongarch64"))]
-core::arch::global_asm!(include_str!("preload_app.S"));
-#[cfg(all(not(feature = "block_mem"), feature = "riscv"))]
-core::arch::global_asm!(include_str!("preload_app-rv.S"));
+#[cfg(feature = "boot-tests")]
+mod boot_tests;
 
-fn mem_clear() {
-    extern "C" {
-        fn sbss();
-        fn ebss();
-    }
-    #[cfg(feature = "zero_init")]
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            sbss as usize as *mut u8,
-            crate::config::MEMORY_END - sbss as usize,
-        )
-        .fill(0);
-    }
-    #[cfg(not(feature = "zero_init"))]
-    unsafe {
-        core::slice::from_raw_parts_mut(sbss as usize as *mut u8, ebss as usize - sbss as usize)
-            .fill(0);
-    }
-}
-
-// 这一行可能有误，需要后续处理
-#[cfg(feature = "block_mem")]
-fn move_to_high_address() {
-    extern "C" {
-        fn simg();
-        fn eimg();
-    }
-    unsafe {
-        // 加载根文件系统镜像
-        let img =
-            core::slice::from_raw_parts(simg as usize as *mut u8, eimg as usize - simg as usize);
-        // 以DISK_IMAGE_BASE到MEMORY_END上的内存作为根文件系统镜像
-        #[cfg(all(feature = "block_mem", feature = "riscv"))]
-        let mem_disk = core::slice::from_raw_parts_mut(
-            DISK_IMAGE_BASE as *mut u8,
-            // 大小为128MB
-            0x1000_0000,
-        );
-        #[cfg(all(feature = "block_mem", feature = "loongarch64"))]
-        let mem_disk = core::slice::from_raw_parts_mut(
-            DISK_IMAGE_BASE as *mut u8,                     
-            // 大小为64MB
-            0x800_0000,
-        );
-        // 清空mem_disk上的内容
-        mem_disk.fill(0);
-        // 将img上的所有内容copy到mem_disk上，可能是因为这一步
-        // 所以img大小不得大于64MB
-        mem_disk[..img.len()].copy_from_slice(img);
-    }
-}
-
+/// BSP 高地址主入口；底层汇编已保存引导寄存器并一次清理普通 BSS。
 #[no_mangle]
-pub fn rust_main() -> ! {
-    bootstrap_init();
-    mem_clear();
-    // 这一行可能有误，需要后续处理
-    #[cfg(all(feature = "block_mem"))]
-    move_to_high_address();
-    console::log_init();
-    println!("[kernel] Console initialized.");
-    mm::init();
-    println!("[kernel] Hello, world!");
-    // note that remap_test is currently NOT supported by LA64, for the whole kernel space is RW!
-    // #[cfg(feature = "riscv")]
-    // mm::remap_test();
+pub extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
+    console::initialize();
+    let arguments = [arg0, arg1, arg2];
+    let hardware_id = arch::boot_hardware_id(arguments);
+    let mut resources = unsafe { platform::discover(arguments, hardware_id) }
+        .unwrap_or_else(|error| panic!("启动输入解析失败：{}", error));
+    let kernel = boot::kernel_region();
+    assert!(resources.memory[..resources.memory_count].iter().any(|region| {
+        region.start <= kernel.start && kernel.end <= region.end
+    }), "内核物理装载区不在实际 RAM 内");
+    resources.reserve(kernel).expect("内核启动资源保留失败");
+    unsafe { boot::publish(resources) };
+    let resources = boot::info();
+    arch::finish_boot_mappings(resources);
+    unsafe { cpu::initialize(resources) };
+    arch::init_current_cpu();
+    irq::initialize(resources);
+    unsafe { irq::register_uart(console::uart_handler, core::ptr::null_mut()) };
+    irq::enable_uart();
+    cpu::publish_online();
+    arch::enable_interrupts();
 
-    machine_init();
+    println!("BOOT arch={} cpus={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
+        arch::NAME, resources.cpu_count, arg0, arg1, arg2, resources.dtb.start, resources.dtb.end);
+    for region in &resources.memory[..resources.memory_count] {
+        println!("RAM start={:#x} end={:#x}", region.start, region.end);
+    }
+    for region in &resources.reserved[..resources.reserved_count] {
+        println!("RESERVED start={:#x} end={:#x}", region.start, region.end);
+    }
+    println!("PCI config={:#x}..{:#x} windows={}",
+        resources.pci.configuration.start, resources.pci.configuration.end, resources.pci.range_count);
+    cpu::start_secondaries();
+    for id in 0..cpu::count() {
+        let local = cpu::get(id);
+        println!("CPU id={} hardware={} local={:#x} stack={:#x}",
+            local.id, local.hardware_id, local as *const _ as usize, local.stack_top);
+    }
+    println!("READY arch={} cpus={}", arch::NAME, cpu::count());
 
-    //machine independent initialization
-    // use crate::drivers::block::block_device_test;
-    // block_device_test();
-    fs::directory_tree::init_fs();
-    net::config::init();
-    #[cfg(feature = "block_virt")]
-    println!("[kernel] block in virt mode!");
-    #[cfg(feature = "oom_handler")]
-    println!("[kernel] oom_handler is enabled!");
-    #[cfg(any(feature = "block_virt_pci", feature = "block_virt"))]
-    fs::flush_preload();
-    task::add_initproc();
-    // note that in run_tasks(), there is yet *another* pre_start_init(),
-    // which is used to turn on interrupts in some archs like LoongArch.
-    task::run_tasks();
-    panic!("Unreachable in rust_main!");
+    #[cfg(feature = "boot-tests")]
+    boot_tests::primary();
+    #[cfg(not(feature = "boot-tests"))]
+    cpu::idle();
 }
 
-#[cfg(test)]
-fn test_runner(_tests: &[&dyn Fn()]) {}
+/// AP 只安装自己的执行现场和中断设施，不重新清 BSS 或解析全局资源。
+#[no_mangle]
+pub extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
+    unsafe { arch::install_cpu_local(local) };
+    arch::init_current_cpu();
+    cpu::publish_online();
+    arch::enable_interrupts();
+    #[cfg(feature = "boot-tests")]
+    boot_tests::secondary();
+    #[cfg(not(feature = "boot-tests"))]
+    cpu::idle();
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    console::panic(info)
+}

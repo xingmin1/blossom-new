@@ -1,6 +1,7 @@
 .vscode
 
 os/target/
+/build/
 
 os/qemu.log
 
