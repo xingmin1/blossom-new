@@ -1,9 +1,9 @@
 //! 选定串口的低层拥有者；正常访问共享一把端口短锁，故障输出不等待业务锁。
 
+use crate::sync::SpinLock;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use crate::sync::SpinLock;
 
 const DATA: usize = 0;
 const IER: usize = 1;
@@ -104,7 +104,8 @@ pub fn receive_pending() -> bool {
 pub fn fatal(pc: usize, sp: usize, cause: usize, bad_address: usize) -> ! {
     let _ = crate::arch::irq_save();
     let _ = PortWriter.write_fmt(format_args!(
-        "FATAL pc={:#x} sp={:#x} cause={:#x} bad={:#x}\n", pc, sp, cause, bad_address,
+        "FATAL pc={:#x} sp={:#x} cause={:#x} bad={:#x}\n",
+        pc, sp, cause, bad_address,
     ));
     loop {
         crate::arch::wait_for_interrupt();

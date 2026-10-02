@@ -24,9 +24,12 @@ pub extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
     let mut resources = unsafe { platform::discover(arguments, hardware_id) }
         .unwrap_or_else(|error| panic!("启动输入解析失败：{}", error));
     let kernel = boot::kernel_region();
-    assert!(resources.memory[..resources.memory_count].iter().any(|region| {
-        region.start <= kernel.start && kernel.end <= region.end
-    }), "内核物理装载区不在实际 RAM 内");
+    assert!(
+        resources.memory[..resources.memory_count]
+            .iter()
+            .any(|region| { region.start <= kernel.start && kernel.end <= region.end }),
+        "内核物理装载区不在实际 RAM 内"
+    );
     resources.reserve(kernel).expect("内核启动资源保留失败");
     unsafe { boot::publish(resources) };
     let resources = boot::info();
@@ -39,21 +42,35 @@ pub extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
     arch::enable_interrupts();
     cpu::publish_online();
 
-    println!("BOOT arch={} cpus={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
-        arch::NAME, resources.cpu_count, arg0, arg1, arg2, resources.dtb.start, resources.dtb.end);
+    println!(
+        "BOOT arch={} cpus={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
+        arch::NAME,
+        resources.cpu_count,
+        arg0,
+        arg1,
+        arg2,
+        resources.dtb.start,
+        resources.dtb.end
+    );
     for region in &resources.memory[..resources.memory_count] {
         println!("RAM start={:#x} end={:#x}", region.start, region.end);
     }
     for region in &resources.reserved[..resources.reserved_count] {
         println!("RESERVED start={:#x} end={:#x}", region.start, region.end);
     }
-    println!("PCI config={:#x}..{:#x} windows={}",
-        resources.pci.configuration.start, resources.pci.configuration.end, resources.pci.range_count);
+    println!(
+        "PCI config={:#x}..{:#x} windows={}",
+        resources.pci.configuration.start,
+        resources.pci.configuration.end,
+        resources.pci.range_count
+    );
     cpu::start_secondaries();
     for id in 0..cpu::count() {
         let local = cpu::get(id);
-        println!("CPU id={} hardware={} local={:#x} stack={:#x}",
-            local.id, local.hardware_id, local as *const _ as usize, local.stack_top);
+        println!(
+            "CPU id={} hardware={} local={:#x} stack={:#x}",
+            local.id, local.hardware_id, local as *const _ as usize, local.stack_top
+        );
     }
     println!("READY arch={} cpus={}", arch::NAME, cpu::count());
 

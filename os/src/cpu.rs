@@ -46,7 +46,10 @@ unsafe impl Send for CallQueue {}
 
 impl CallQueue {
     const fn new() -> Self {
-        Self { head: ptr::null_mut(), tail: ptr::null_mut() }
+        Self {
+            head: ptr::null_mut(),
+            tail: ptr::null_mut(),
+        }
     }
 
     unsafe fn push(&mut self, call: *mut Call) {
@@ -85,7 +88,9 @@ pub struct CpuLocal {
 impl CpuLocal {
     const fn new(id: usize, hardware_id: usize, stack_top: usize) -> Self {
         Self {
-            id, hardware_id, stack_top,
+            id,
+            hardware_id,
+            stack_top,
             online: AtomicBool::new(false),
             timer_interrupts: AtomicUsize::new(0),
             ipi_interrupts: AtomicUsize::new(0),
@@ -98,8 +103,13 @@ struct CpuStorage(UnsafeCell<[CpuLocal; MAX_CPUS]>);
 // BSP 在发布 AP 前构造表；随后身份不可变，其余共享状态使用原子或短锁。
 unsafe impl Sync for CpuStorage {}
 
-static CPU_LOCALS: CpuStorage = CpuStorage(UnsafeCell::new([const { CpuLocal::new(0, 0, 0) }; MAX_CPUS]));
-static mut BOOT_RECORDS: [CpuBoot; MAX_CPUS] = [CpuBoot { stack_top: 0, local: 0 }; MAX_CPUS];
+static CPU_LOCALS: CpuStorage = CpuStorage(UnsafeCell::new(
+    [const { CpuLocal::new(0, 0, 0) }; MAX_CPUS],
+));
+static mut BOOT_RECORDS: [CpuBoot; MAX_CPUS] = [CpuBoot {
+    stack_top: 0,
+    local: 0,
+}; MAX_CPUS];
 
 /// 消费一次启动 CPU 输入，并安装 BSP 的真实每核基址。
 ///
@@ -108,10 +118,17 @@ static mut BOOT_RECORDS: [CpuBoot; MAX_CPUS] = [CpuBoot { stack_top: 0, local: 0
 pub unsafe fn initialize(info: &BootInfo) {
     let locals = CPU_LOCALS.0.get().cast::<CpuLocal>();
     for id in 0..info.cpu_count {
-        let stack_top = ptr::addr_of!(BOOT_STACKS).cast::<BootStack>().add(id) as usize + STACK_SIZE;
+        let stack_top =
+            ptr::addr_of!(BOOT_STACKS).cast::<BootStack>().add(id) as usize + STACK_SIZE;
         let local = locals.add(id);
         ptr::write(local, CpuLocal::new(id, info.hardware_ids[id], stack_top));
-        ptr::addr_of_mut!(BOOT_RECORDS).cast::<CpuBoot>().add(id).write(CpuBoot { stack_top, local: local as usize });
+        ptr::addr_of_mut!(BOOT_RECORDS)
+            .cast::<CpuBoot>()
+            .add(id)
+            .write(CpuBoot {
+                stack_top,
+                local: local as usize,
+            });
     }
     crate::arch::install_cpu_local(locals);
 }
@@ -143,7 +160,10 @@ pub fn start_secondaries() {
         let record = unsafe { ptr::addr_of!(BOOT_RECORDS).cast::<CpuBoot>().add(id) as usize };
         let physical = crate::arch::virt_to_phys(record);
         if let Err(error) = crate::arch::start_cpu(local.hardware_id, physical) {
-            panic!("AP 启动请求失败：硬件ID={}，错误={}", local.hardware_id, error);
+            panic!(
+                "AP 启动请求失败：硬件ID={}，错误={}",
+                local.hardware_id, error
+            );
         }
         let deadline = crate::arch::read_counter() + crate::boot::info().counter_frequency * 5;
         while !local.online.load(Ordering::Acquire) {
@@ -191,7 +211,10 @@ pub unsafe fn call(target: usize, callback: unsafe fn(*mut ()), argument: *mut (
     }
     let local = get(target);
     let pinned = core::pin::pin!(Call {
-        callback, argument, next: UnsafeCell::new(ptr::null_mut()), done: AtomicBool::new(false),
+        callback,
+        argument,
+        next: UnsafeCell::new(ptr::null_mut()),
+        done: AtomicBool::new(false),
     });
     let request = pinned.as_ref().get_ref();
     let node = request as *const Call as *mut Call;

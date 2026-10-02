@@ -1,8 +1,8 @@
 //! 当前真实 UART 源的最小 domain/descriptor/flow；回调不在控制器或描述符锁内执行。
 
-use core::hint::spin_loop;
 use crate::boot::BootInfo;
 use crate::sync::SpinLock;
+use core::hint::spin_loop;
 
 #[derive(Clone, Copy)]
 struct Action {
@@ -53,11 +53,15 @@ pub fn enable_uart() {
     crate::arch::external_unmask();
 }
 
-fn stop_and_synchronize() {
+fn stop_and_synchronize(remove_action: bool) {
     {
         let mut descriptor = UART.lock();
         descriptor.enabled = false;
         crate::arch::external_mask();
+        if remove_action {
+            // 先撤销发布，防止同步等待期间再次启用旧 action。
+            descriptor.action = None;
+        }
     }
     while UART.lock().in_flight != 0 {
         spin_loop();
@@ -66,13 +70,12 @@ fn stop_and_synchronize() {
 
 /// 屏蔽源并同步等待当前 handler 退出，等待时不持有 handler 所需锁。
 pub fn disable_uart() {
-    stop_and_synchronize();
+    stop_and_synchronize(false);
 }
 
-/// 源停止并同步退出以后解除 action，返回后旧 context 可以释放。
+/// 先撤销 action 发布并屏蔽源，再同步退出；返回后旧 context 可以释放。
 pub fn unregister_uart() {
-    stop_and_synchronize();
-    UART.lock().action = None;
+    stop_and_synchronize(true);
 }
 
 /// 消费控制器的真实待处理中断；源为空时不猜默认设备号。

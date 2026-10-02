@@ -107,7 +107,8 @@ struct BootStorage(core::cell::UnsafeCell<core::mem::MaybeUninit<BootInfo>>);
 // BSP 在释放 AP 前写入一次；发布以后快照只读，AP 上线握手包含其可见性。
 unsafe impl Sync for BootStorage {}
 
-static BOOT_INFO: BootStorage = BootStorage(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+static BOOT_INFO: BootStorage =
+    BootStorage(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 
 /// 从附近高地址链接符号取得完整内核物理保留区，包含栈和启动表。
 pub fn kernel_region() -> Region {

@@ -13,7 +13,10 @@ pub struct IrqSaveGuard {
 impl IrqSaveGuard {
     /// 关闭本地 IRQ，并保存进入前的状态。
     pub fn new() -> Self {
-        Self { saved: crate::arch::irq_save(), _local: PhantomData }
+        Self {
+            saved: crate::arch::irq_save(),
+            _local: PhantomData,
+        }
     }
 }
 
@@ -31,7 +34,9 @@ pub struct SpinLock<T> {
 impl<T> SpinLock<T> {
     /// 在静态初始化中建立一把具体对象的短锁。
     pub const fn new(value: T) -> Self {
-        Self { inner: spin::Mutex::new(value) }
+        Self {
+            inner: spin::Mutex::new(value),
+        }
     }
 
     /// 先保存并关闭 IRQ，再进入锁域。

@@ -27,7 +27,10 @@ fn cells(bytes: &[u8]) -> Result<usize, &'static str> {
 }
 
 fn cstr(bytes: &[u8]) -> Result<&str, &'static str> {
-    let end = bytes.iter().position(|b| *b == 0).ok_or("FDT 字符串缺少结束符")?;
+    let end = bytes
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or("FDT 字符串缺少结束符")?;
     core::str::from_utf8(&bytes[..end]).map_err(|_| "FDT 字符串不是有效 UTF-8")
 }
 
@@ -96,7 +99,9 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                 if !name.is_ascii() || (depth == 0 && !name.is_empty()) {
                     return Err("FDT 节点名或根节点无效");
                 }
-                at = at.checked_add((name.len() + 4) & !3).ok_or("FDT 节点名长度溢出")?;
+                at = at
+                    .checked_add((name.len() + 4) & !3)
+                    .ok_or("FDT 节点名长度溢出")?;
                 if at > structure.len() {
                     return Err("FDT 节点名填充被截断");
                 }
@@ -131,7 +136,10 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                         return Err("FDT cell 数无效或超过平台支持范围");
                     }
                 }
-                if matches!(name, "compatible" | "status" | "device_type" | "stdout-path") {
+                if matches!(
+                    name,
+                    "compatible" | "status" | "device_type" | "stdout-path"
+                ) {
                     let mut list = value;
                     while !list.is_empty() {
                         let text = cstr(list)?;
@@ -156,7 +164,9 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
 }
 
 fn property<'a>(node: Node<'a>, name: &str) -> Result<&'a [u8], &'static str> {
-    node.property(name).map(|p| p.value).ok_or("FDT 缺少所需资源属性")
+    node.property(name)
+        .map(|p| p.value)
+        .ok_or("FDT 缺少所需资源属性")
 }
 
 fn number(node: Node<'_>, name: &str) -> Result<u32, &'static str> {
@@ -168,30 +178,39 @@ fn number(node: Node<'_>, name: &str) -> Result<u32, &'static str> {
 }
 
 fn enabled(node: Node<'_>) -> bool {
-    node.property("status").map_or(true, |p| matches!(p.as_str(), Some("okay" | "ok")))
+    node.property("status")
+        .map_or(true, |p| matches!(p.as_str(), Some("okay" | "ok")))
 }
 
 fn compatible(node: Node<'_>, expected: &str) -> bool {
-    node.compatible().is_some_and(|c| c.all().any(|s| s == expected))
+    node.compatible()
+        .is_some_and(|c| c.all().any(|s| s == expected))
 }
 
 fn parent<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Option<Node<'a>> {
     tree.all_nodes().find(|candidate| {
-        candidate.children().any(|child| child.name.as_ptr() == node.name.as_ptr())
+        candidate
+            .children()
+            .any(|child| child.name.as_ptr() == node.name.as_ptr())
     })
 }
 
 fn interrupt_parent<'a>(tree: &'a Fdt<'a>, mut node: Node<'a>) -> Result<Node<'a>, &'static str> {
     loop {
         if node.property("interrupt-parent").is_some() {
-            return tree.find_phandle(number(node, "interrupt-parent")?).ok_or("FDT 中断父 phandle 没有对应控制器");
+            return tree
+                .find_phandle(number(node, "interrupt-parent")?)
+                .ok_or("FDT 中断父 phandle 没有对应控制器");
         }
         node = parent(tree, node).ok_or("FDT 缺少中断父控制器关系")?;
     }
 }
 
 fn require_controller(node: Node<'_>, expected: &str, count: u32) -> Result<(), &'static str> {
-    if !enabled(node) || !compatible(node, expected) || node.property("interrupt-controller").is_none() {
+    if !enabled(node)
+        || !compatible(node, expected)
+        || node.property("interrupt-controller").is_none()
+    {
         return Err("FDT 中断链不是所选平台的实际控制器");
     }
     if number(node, "#interrupt-cells")? != count {
@@ -200,12 +219,23 @@ fn require_controller(node: Node<'_>, expected: &str, count: u32) -> Result<(), 
     Ok(())
 }
 
-fn regions<'a>(node: Node<'a>) -> Result<impl Iterator<Item = Result<Region, &'static str>> + 'a, &'static str> {
+fn regions<'a>(
+    node: Node<'a>,
+) -> Result<impl Iterator<Item = Result<Region, &'static str>> + 'a, &'static str> {
     let raw = node.raw_reg().ok_or("FDT 资源节点缺少 reg")?;
     let value = property(node, "reg")?;
-    let first = node.raw_reg().and_then(|mut r| r.next()).ok_or("FDT reg 为空或被截断")?;
+    let first = node
+        .raw_reg()
+        .and_then(|mut r| r.next())
+        .ok_or("FDT reg 为空或被截断")?;
     let stride = first.address.len() + first.size.len();
-    if stride == 0 || value.len() % stride != 0 || first.address.is_empty() || first.address.len() > 8 || first.size.is_empty() || first.size.len() > 8 {
+    if stride == 0
+        || value.len() % stride != 0
+        || first.address.is_empty()
+        || first.address.len() > 8
+        || first.size.is_empty()
+        || first.size.len() > 8
+    {
         return Err("FDT reg 地址长度格式无效");
     }
     Ok(raw.map(|reg| Region::from_size(cells(reg.address)?, cells(reg.size)?)))
@@ -239,7 +269,12 @@ fn irq(node: Node<'_>, controller: Node<'_>) -> Result<u32, &'static str> {
     word(value, 0)
 }
 
-fn discover_tree(bytes: &[u8], raw_args: [usize; 3], bsp: usize, dtb_address: usize) -> Result<BootInfo, &'static str> {
+fn discover_tree(
+    bytes: &[u8],
+    raw_args: [usize; 3],
+    bsp: usize,
+    dtb_address: usize,
+) -> Result<BootInfo, &'static str> {
     validate(bytes)?;
     let tree = Fdt::new(bytes).map_err(|_| "FDT 解析入口拒绝输入")?;
     let mut info = BootInfo::empty(raw_args, bsp);
@@ -248,10 +283,16 @@ fn discover_tree(bytes: &[u8], raw_args: [usize; 3], bsp: usize, dtb_address: us
     #[cfg(target_arch = "loongarch64")]
     info.reserve(Region::from_size(0, 0x10_0000)?)?;
     for reservation in tree.memory_reservations() {
-        info.reserve(Region::from_size(reservation.address() as usize, reservation.size())?)?;
+        info.reserve(Region::from_size(
+            reservation.address() as usize,
+            reservation.size(),
+        )?)?;
     }
     if let Some(reserved) = tree.find_node("/reserved-memory") {
-        if reserved.property("ranges").is_some_and(|p| !p.value.is_empty()) {
+        if reserved
+            .property("ranges")
+            .is_some_and(|p| !p.value.is_empty())
+        {
             return Err("FDT reserved-memory 不是物理恒等地址空间");
         }
         for child in reserved.children().filter(|n| enabled(*n)) {
@@ -271,7 +312,10 @@ fn discover_tree(bytes: &[u8], raw_args: [usize; 3], bsp: usize, dtb_address: us
                 return Err("FDT RAM 区间超过支持容量");
             }
             let region = region?;
-            if info.memory[..info.memory_count].iter().any(|old| old.overlaps(region)) {
+            if info.memory[..info.memory_count]
+                .iter()
+                .any(|old| old.overlaps(region))
+            {
                 return Err("FDT RAM 区间重叠");
             }
             info.memory[info.memory_count] = region;
@@ -281,7 +325,10 @@ fn discover_tree(bytes: &[u8], raw_args: [usize; 3], bsp: usize, dtb_address: us
     if info.memory_count == 0 {
         return Err("FDT 缺少实际 RAM");
     }
-    if !info.memory[..info.memory_count].iter().any(|r| r.start <= info.dtb.start && r.end >= info.dtb.end) {
+    if !info.memory[..info.memory_count]
+        .iter()
+        .any(|r| r.start <= info.dtb.start && r.end >= info.dtb.end)
+    {
         return Err("运行 DTB 不在已描述的 RAM 区间内");
     }
     let cpus = tree.find_node("/cpus").ok_or("FDT 缺少 cpus 节点")?;
@@ -306,19 +353,30 @@ fn discover_tree(bytes: &[u8], raw_args: [usize; 3], bsp: usize, dtb_address: us
         info.hardware_ids[info.cpu_count] = id;
         info.cpu_count += 1;
     }
-    let bsp_index = info.hardware_ids[..info.cpu_count].iter().position(|id| *id == bsp).ok_or("FDT 可用 CPU 不包含实际 BSP")?;
+    let bsp_index = info.hardware_ids[..info.cpu_count]
+        .iter()
+        .position(|id| *id == bsp)
+        .ok_or("FDT 可用 CPU 不包含实际 BSP")?;
     info.hardware_ids.swap(0, bsp_index);
     #[cfg(target_arch = "riscv64")]
-    { info.counter_frequency = number(cpus, "timebase-frequency").map_err(|_| "FDT cpus 缺少有效 timebase-frequency")? as u64; }
+    {
+        info.counter_frequency = number(cpus, "timebase-frequency")
+            .map_err(|_| "FDT cpus 缺少有效 timebase-frequency")?
+            as u64;
+    }
     #[cfg(target_arch = "loongarch64")]
-    { info.counter_frequency = crate::arch::counter_frequency(); }
+    {
+        info.counter_frequency = crate::arch::counter_frequency();
+    }
     if info.counter_frequency == 0 {
         return Err("实际硬件 counter frequency 为零");
     }
     let chosen = tree.find_node("/chosen").ok_or("FDT 缺少 chosen 节点")?;
     let stdout = cstr(property(chosen, "stdout-path").map_err(|_| "FDT chosen 缺少 stdout-path")?)?;
     let path = stdout.split(':').next().ok_or("FDT stdout-path 无效")?;
-    let uart = tree.find_node(path).ok_or("FDT stdout-path 没有对应 UART")?;
+    let uart = tree
+        .find_node(path)
+        .ok_or("FDT stdout-path 没有对应 UART")?;
     if !enabled(uart) || !compatible(uart, "ns16550a") {
         return Err("FDT chosen UART 不是可用 ns16550a");
     }
@@ -353,7 +411,9 @@ fn discover_tree(bytes: &[u8], raw_args: [usize; 3], bsp: usize, dtb_address: us
 }
 
 fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
-    let mut hosts = tree.all_nodes().filter(|n| enabled(*n) && compatible(*n, "pci-host-ecam-generic"));
+    let mut hosts = tree
+        .all_nodes()
+        .filter(|n| enabled(*n) && compatible(*n, "pci-host-ecam-generic"));
     let host = hosts.next().ok_or("FDT 缺少所选 virt 的 PCI ECAM host")?;
     if hosts.next().is_some() {
         return Err("FDT 含多个未支持的 PCI host");
@@ -390,14 +450,23 @@ fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
         let bus_start = cells(&range[4..12])?;
         let cpu = Region::from_size(cells(&range[12..20])?, cells(&range[20..28])?)?;
         Region::from_size(bus_start, cpu.end - cpu.start)?;
-        info.pci.ranges[info.pci.range_count] = crate::boot::PciRange { flags, bus_start, cpu };
+        info.pci.ranges[info.pci.range_count] = crate::boot::PciRange {
+            flags,
+            bus_start,
+            cpu,
+        };
         info.pci.range_count += 1;
     }
     Ok(())
 }
 
 #[cfg(target_arch = "riscv64")]
-fn discover_plic(tree: &Fdt<'_>, cpus: Node<'_>, plic: Node<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
+fn discover_plic(
+    tree: &Fdt<'_>,
+    cpus: Node<'_>,
+    plic: Node<'_>,
+    info: &mut BootInfo,
+) -> Result<(), &'static str> {
     require_controller(plic, "riscv,plic0", 1)?;
     let sources = number(plic, "riscv,ndev")?;
     if info.interrupts.uart_source == 0 || info.interrupts.uart_source > sources {
@@ -405,17 +474,31 @@ fn discover_plic(tree: &Fdt<'_>, cpus: Node<'_>, plic: Node<'_>, info: &mut Boot
     }
     let mut handles = [0; MAX_CPUS];
     for cpu in cpus.children().filter(|n| enabled(*n)) {
-        if cpu.property("device_type").and_then(|p| p.as_str()) != Some("cpu") { continue; }
+        if cpu.property("device_type").and_then(|p| p.as_str()) != Some("cpu") {
+            continue;
+        }
         let id = cells(property(cpu, "reg")?)?;
-        let logical = info.hardware_ids[..info.cpu_count].iter().position(|old| *old == id).ok_or("PLIC CPU 未在可用 CPU 表中")?;
-        let intc = cpu.children().find(|n| compatible(*n, "riscv,cpu-intc")).ok_or("FDT CPU 缺少实际本地中断控制器")?;
+        let logical = info.hardware_ids[..info.cpu_count]
+            .iter()
+            .position(|old| *old == id)
+            .ok_or("PLIC CPU 未在可用 CPU 表中")?;
+        let intc = cpu
+            .children()
+            .find(|n| compatible(*n, "riscv,cpu-intc"))
+            .ok_or("FDT CPU 缺少实际本地中断控制器")?;
         require_controller(intc, "riscv,cpu-intc", 1)?;
         handles[logical] = number(intc, "phandle")?;
-        if handles[logical] == 0 || handles.iter().enumerate().any(|(i, value)| i != logical && *value == handles[logical]) {
+        if handles[logical] == 0
+            || handles
+                .iter()
+                .enumerate()
+                .any(|(i, value)| i != logical && *value == handles[logical])
+        {
             return Err("FDT CPU 中断控制器 phandle 无效或重复");
         }
     }
-    let extended = property(plic, "interrupts-extended").map_err(|_| "FDT PLIC 缺少 interrupts-extended")?;
+    let extended =
+        property(plic, "interrupts-extended").map_err(|_| "FDT PLIC 缺少 interrupts-extended")?;
     if extended.is_empty() || extended.len() % 8 != 0 {
         return Err("FDT PLIC context 描述被截断");
     }
@@ -424,12 +507,23 @@ fn discover_plic(tree: &Fdt<'_>, cpus: Node<'_>, plic: Node<'_>, info: &mut Boot
         let handle = word(entry, 0)?;
         let cause = word(entry, 4)?;
         // OpenSBI 会把 M-mode context 的 cause 标为全一；它仍占实际 context 槽位。
-        if cause == u32::MAX { continue; }
-        let intc = tree.find_phandle(handle).ok_or("PLIC context 引用了不存在的 CPU 控制器")?;
+        if cause == u32::MAX {
+            continue;
+        }
+        let intc = tree
+            .find_phandle(handle)
+            .ok_or("PLIC context 引用了不存在的 CPU 控制器")?;
         require_controller(intc, "riscv,cpu-intc", 1)?;
-        if cause != 9 { continue; }
-        if let Some(logical) = handles[..info.cpu_count].iter().position(|old| *old == handle) {
-            if found[logical] { return Err("FDT CPU 含重复 S-mode PLIC context"); }
+        if cause != 9 {
+            continue;
+        }
+        if let Some(logical) = handles[..info.cpu_count]
+            .iter()
+            .position(|old| *old == handle)
+        {
+            if found[logical] {
+                return Err("FDT CPU 含重复 S-mode PLIC context");
+            }
             info.interrupts.plic_contexts[logical] = context;
             found[logical] = true;
         }
@@ -446,7 +540,10 @@ fn discover_plic(tree: &Fdt<'_>, cpus: Node<'_>, plic: Node<'_>, info: &mut Boot
 /// # Safety
 /// 固件必须提供至少可读的 FDT 头部及头部所声明的完整存储范围；本函数检查内容边界，
 /// 不能验证任意物理指针是否实际可读。调用时 BSP 必须已建立对应 RAM 访问映射。
-pub unsafe fn discover(raw_args: [usize; 3], bsp_hardware_id: usize) -> Result<BootInfo, &'static str> {
+pub unsafe fn discover(
+    raw_args: [usize; 3],
+    bsp_hardware_id: usize,
+) -> Result<BootInfo, &'static str> {
     #[cfg(target_arch = "riscv64")]
     let physical = raw_args[1];
     #[cfg(target_arch = "loongarch64")]
@@ -456,12 +553,23 @@ pub unsafe fn discover(raw_args: [usize; 3], bsp_hardware_id: usize) -> Result<B
     }
     let pointer = crate::arch::phys_to_virt(physical) as *const u8;
     let header = core::slice::from_raw_parts(pointer, 40);
-    if word(header, 0)? != 0xd00d_feed { return Err("固件 DTB magic 错误"); }
+    if word(header, 0)? != 0xd00d_feed {
+        return Err("固件 DTB magic 错误");
+    }
     let total = word(header, 4)? as usize;
-    if total < 40 || total > MAX_DTB_SIZE || physical.checked_add(total).is_none() || (pointer as usize).checked_add(total).is_none() {
+    if total < 40
+        || total > MAX_DTB_SIZE
+        || physical.checked_add(total).is_none()
+        || (pointer as usize).checked_add(total).is_none()
+    {
         return Err("固件 DTB 长度无效或地址溢出");
     }
-    discover_tree(core::slice::from_raw_parts(pointer, total), raw_args, bsp_hardware_id, physical)
+    discover_tree(
+        core::slice::from_raw_parts(pointer, total),
+        raw_args,
+        bsp_hardware_id,
+        physical,
+    )
 }
 
 /// 在测试构建中验证真实 DTB 的原始边界，并拒绝截断头部和数据块。
@@ -474,7 +582,11 @@ pub fn test_input_boundaries() -> bool {
     // 只由 BSP 的有限自检调用；LA 固件把 DTB 填充到 1 MiB，不能放进启动栈。
     let bytes = unsafe {
         let copy = core::ptr::addr_of_mut!(COPY).cast::<u8>();
-        core::ptr::copy_nonoverlapping(crate::arch::phys_to_virt(physical) as *const u8, copy, size);
+        core::ptr::copy_nonoverlapping(
+            crate::arch::phys_to_virt(physical) as *const u8,
+            copy,
+            size,
+        );
         core::slice::from_raw_parts_mut(copy, size)
     };
     if validate(&bytes).is_err() || !(0..bytes.len()).all(|end| validate(&bytes[..end]).is_err()) {
@@ -490,23 +602,31 @@ pub fn test_input_boundaries() -> bool {
     }
     // 删除不参与资源发现的根 compatible 属性，覆盖固件留下 NOP 属性洞的情况。
     let (start, end) = {
-        let tree = match Fdt::new(bytes) { Ok(tree) => tree, Err(_) => return false };
+        let tree = match Fdt::new(bytes) {
+            Ok(tree) => tree,
+            Err(_) => return false,
+        };
         let metadata = match tree.find_node("/").and_then(|n| n.property("compatible")) {
             Some(metadata) => metadata,
             None => return false,
         };
         let value_start = metadata.value.as_ptr() as usize - bytes.as_ptr() as usize;
-        (value_start - 12, (value_start + metadata.value.len() + 3) & !3)
+        (
+            value_start - 12,
+            (value_start + metadata.value.len() + 3) & !3,
+        )
     };
     for token in bytes[start..end].chunks_exact_mut(4) {
         token.copy_from_slice(&4u32.to_be_bytes());
     }
     let nop_ok = match discover_tree(bytes, live.raw_args, hardware_id, physical) {
-        Ok(info) => info.hardware_ids == original.hardware_ids
-            && info.memory == original.memory
-            && info.interrupts.uart == original.interrupts.uart
-            && info.interrupts.plic_contexts == original.interrupts.plic_contexts
-            && info.pci.range_count == original.pci.range_count,
+        Ok(info) => {
+            info.hardware_ids == original.hardware_ids
+                && info.memory == original.memory
+                && info.interrupts.uart == original.interrupts.uart
+                && info.interrupts.plic_contexts == original.interrupts.plic_contexts
+                && info.pci.range_count == original.pci.range_count
+        }
         Err(_) => false,
     };
     if !nop_ok {
@@ -514,7 +634,12 @@ pub fn test_input_boundaries() -> bool {
     }
     // 保持真实总长不变，仅破坏各数据块边界；不能靠总长检查替代块校验。
     for field in [8, 12, 16, 32, 36] {
-        let saved = [bytes[field], bytes[field + 1], bytes[field + 2], bytes[field + 3]];
+        let saved = [
+            bytes[field],
+            bytes[field + 1],
+            bytes[field + 2],
+            bytes[field + 3],
+        ];
         bytes[field..field + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         let rejected = validate(&bytes).is_err();
         bytes[field..field + 4].copy_from_slice(&saved);
