@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""直接驱动已构建的阶段一 ELF，保留 QEMU 原始输出并逐项核对串口协议。"""
+"""驱动已构建内核，保留 QEMU 原始输出并逐项核对串口协议。"""
 
 import argparse
 import os
@@ -9,12 +9,13 @@ import selectors
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 
 def run(args):
     """运行一台指定目标，所有正常验收标记齐全才接受关机结果。"""
     command = [f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
-               "-kernel", str(args.kernel), "-m", "1G", "-smp", str(args.cpus),
+               "-kernel", str(args.kernel), "-m", args.memory, "-smp", str(args.cpus),
                "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "none"]
     if args.arch == "riscv64":
@@ -44,6 +45,7 @@ def run(args):
     number = r"(?:0x[0-9a-fA-F]+|[0-9]+)"
 
     def observe(line):
+        """核对真实异常字段、每核身份和有序 UART 协议，不接受缺失或重复证据。"""
         nonlocal passed, fatal, fault_ready, prompt_index
         text = line.decode("utf-8", errors="replace").rstrip("\r")
         if "FAIL" in text or "panicked" in text or re.search(r"\b[Pp][Aa][Nn][Ii][Cc]\b", text):
@@ -57,6 +59,14 @@ def run(args):
             if any(int(value, 16 if value.startswith("0x") else 10) == 0
                    for value in match.groups()[:3]):
                 raise RuntimeError("fault PC/SP/cause must be nonzero")
+            cause = int(match.group(3), 0)
+            bad = int(match.group(4), 0)
+            if args.fault == "refill":
+                if cause != 1 or bad != 0x1000:
+                    raise RuntimeError("refill fault must report TLBRERA.IsTLBR and TLBRBADV=0x1000")
+            elif ((args.arch == "riscv64" and cause != 2)
+                  or (args.arch == "loongarch64" and (cause >> 16) & 0x3F != 13)):
+                raise RuntimeError("illegal-instruction fault reported a different hardware cause")
             fatal = True
             return
         if args.fault:
@@ -160,25 +170,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
     parser.add_argument("--cpus", required=True, type=int, choices=(1, 2, 4))
+    parser.add_argument("--memory", default="1G", help="QEMU memory specification (default: 1G)")
     parser.add_argument("--kernel", required=True, type=Path)
-    parser.add_argument("--fault", action="store_true", help="expect independently built fault-test image")
+    parser.add_argument("--fault", choices=("illegal", "refill"), help="expected independently built hardware fault")
     parser.add_argument("--timeout", type=float, default=30, help="whole-machine timeout in seconds")
     parser.add_argument("--output", type=Path, help="raw guest/QEMU output (default: beside ELF)")
     args = parser.parse_args()
+    if args.fault == "refill" and args.arch != "loongarch64":
+        parser.error("refill fault requires --arch loongarch64")
     if not args.kernel.is_file():
         parser.error("--kernel must name an already built ELF")
     if not 0 < args.timeout < float("inf"):
         parser.error("--timeout must be finite and positive")
     if args.output is None:
-        args.output = args.kernel.with_name(f"{args.kernel.name}.{args.arch}.{args.cpus}.{'fault' if args.fault else 'boot'}.log")
+        memory_name = quote(args.memory, safe="")
+        args.output = args.kernel.with_name(f"{args.kernel.name}.{args.arch}.{args.cpus}.{memory_name}.{args.fault or 'boot'}.log")
     if args.output.resolve() == args.kernel.resolve():
         parser.error("--output cannot overwrite --kernel")
     try:
         run(args)
     except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
-        print(f"\nHOST FAIL: {error}; raw output: {args.output}", file=sys.stderr)
+        print(f"\nHOST FAIL: {error}; memory={args.memory}; raw output: {args.output}", file=sys.stderr)
         return 1
-    print(f"HOST PASS: {args.arch} cpus={args.cpus} {'fault' if args.fault else 'boot'}; raw output: {args.output}")
+    print(f"HOST PASS: {args.arch} cpus={args.cpus} memory={args.memory} {args.fault or 'boot'}; raw output: {args.output}")
     return 0
 
 

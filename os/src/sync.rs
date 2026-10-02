@@ -21,7 +21,9 @@ impl IrqSaveGuard {
 }
 
 impl Drop for IrqSaveGuard {
+    /// 临界区结束后恢复同核进入时的 IRQ 位，不修改其他架构状态。
     fn drop(&mut self) {
+        // SAFETY: guard 不可 Send/Sync，保存值来自同核 irq_save；IRQ 关闭期间不迁移 CPU。
         unsafe { crate::arch::irq_restore(self.saved) };
     }
 }
@@ -56,19 +58,24 @@ pub struct SpinLockGuard<'a, T> {
 impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
 
+    /// 借用锁内对象，不延长超过 guard 的生命周期。
     fn deref(&self) -> &T {
         &self.guard
     }
 }
 
 impl<T> DerefMut for SpinLockGuard<'_, T> {
+    /// 在当前短锁独占期间借用可变对象。
     fn deref_mut(&mut self) -> &mut T {
         &mut self.guard
     }
 }
 
 impl<T> Drop for SpinLockGuard<'_, T> {
+    /// 先释放短锁，再由字段析构恢复本核 IRQ，避免 handler 重入仍被持有的锁。
     fn drop(&mut self) {
+        // SAFETY: guard 在构造时放入 ManuallyDrop，尚未手动析构；只在此释放一次，
+        // 随后 _irq 析构，guard 字段不会再次析构。
         unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
 }

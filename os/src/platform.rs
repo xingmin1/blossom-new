@@ -11,48 +11,56 @@ pub const EARLY_UART_BASE: usize = 0x1fe0_01e0;
 const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
 type Node<'a> = FdtNode<'a, 'a>;
 
+/// 从已取得的字节切片读取一个大端 cell，拒绝截断和偏移溢出。
 fn word(bytes: &[u8], at: usize) -> Result<u32, &'static str> {
-    let end = at.checked_add(4).ok_or("FDT 字段偏移溢出")?;
-    let value = bytes.get(at..end).ok_or("FDT 字段被截断")?;
+    let end = at.checked_add(4).ok_or("FDT field offset overflows")?;
+    let value = bytes.get(at..end).ok_or("FDT field is truncated")?;
     Ok(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+/// 将绑定允许的单/双 cell 转为原生地址；空 size-cells 表示零。
 fn cells(bytes: &[u8]) -> Result<usize, &'static str> {
     match bytes.len() {
         0 => Ok(0),
         4 => Ok(word(bytes, 0)? as usize),
-        8 => Ok(((word(bytes, 0)? as u64) << 32 | word(bytes, 4)? as u64) as usize),
-        _ => Err("FDT 地址或长度不是支持的单/双 cell"),
+        8 => Ok((((word(bytes, 0)? as u64) << 32) | word(bytes, 4)? as u64) as usize),
+        _ => Err("FDT address or size is not one or two cells"),
     }
 }
 
+/// 借用 NUL 结尾的属性字符串，解析时验证 UTF-8。
 fn cstr(bytes: &[u8]) -> Result<&str, &'static str> {
     let end = bytes
         .iter()
         .position(|b| *b == 0)
-        .ok_or("FDT 字符串缺少结束符")?;
-    core::str::from_utf8(&bytes[..end]).map_err(|_| "FDT 字符串不是有效 UTF-8")
+        .ok_or("FDT string is not NUL terminated")?;
+    core::str::from_utf8(&bytes[..end]).map_err(|_| "FDT string is not valid UTF-8")
 }
 
+/// 借用头部以外的数据块，所有范围检查在传入解析库前完成。
 fn block(bytes: &[u8], offset: usize, size: usize) -> Result<&[u8], &'static str> {
     if offset < 40 {
-        return Err("FDT 数据块覆盖头部");
+        return Err("FDT block overlaps the header");
     }
-    let end = offset.checked_add(size).ok_or("FDT 数据块范围溢出")?;
-    bytes.get(offset..end).ok_or("FDT 数据块超出总长度")
+    let end = offset
+        .checked_add(size)
+        .ok_or("FDT block range overflows")?;
+    bytes
+        .get(offset..end)
+        .ok_or("FDT block exceeds the total size")
 }
 
-// fdt 0.1.5 只校验 magic 和总长；补齐其切片、字符串和固定深度栈的前提。
+/// 验证库会使用的块边界、字符串和父栈深度，成功后才允许资源遍历。
 fn validate(bytes: &[u8]) -> Result<(), &'static str> {
     if word(bytes, 0)? != 0xd00d_feed {
-        return Err("FDT magic 错误");
+        return Err("FDT magic is invalid");
     }
     let total = word(bytes, 4)? as usize;
-    if total < 40 || total > MAX_DTB_SIZE || total != bytes.len() {
-        return Err("FDT 总长度无效或输入被截断");
+    if !(40..=MAX_DTB_SIZE).contains(&total) || total != bytes.len() {
+        return Err("FDT total size is invalid or truncated");
     }
-    if word(bytes, 20)? != 17 || word(bytes, 24)? > 17 {
-        return Err("FDT 版本不是支持的 v17 格式");
+    if word(bytes, 20)? != 17 || 17 < word(bytes, 24)? {
+        return Err("FDT version is not v17");
     }
     let structure_start = word(bytes, 8)? as usize;
     let strings_start = word(bytes, 12)? as usize;
@@ -60,7 +68,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
     let structure = block(bytes, structure_start, word(bytes, 36)? as usize)?;
     let strings = block(bytes, strings_start, word(bytes, 32)? as usize)?;
     if structure_start % 4 != 0 || reserve_start % 8 != 0 {
-        return Err("FDT 结构或保留表未对齐");
+        return Err("FDT structure or reservation block is unaligned");
     }
     let mut reserve_end = reserve_start;
     loop {
@@ -78,7 +86,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
     for i in 0..spans.len() {
         for j in i + 1..spans.len() {
             if spans[i].0 < spans[j].1 && spans[j].0 < spans[i].1 {
-                return Err("FDT 数据块互相重叠");
+                return Err("FDT blocks overlap");
             }
         }
     }
@@ -92,20 +100,20 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
         at += 4;
         match token {
             1 => {
-                if depth >= 63 || (depth == 0 && root_seen) {
-                    return Err("FDT 节点层级超限或存在多个根");
+                if 63 <= depth || (depth == 0 && root_seen) {
+                    return Err("FDT node depth exceeds capacity or has multiple roots");
                 }
-                let name = cstr(structure.get(at..).ok_or("FDT 节点名被截断")?)?;
+                let name = cstr(structure.get(at..).ok_or("FDT node name is truncated")?)?;
                 if !name.is_ascii() || (depth == 0 && !name.is_empty()) {
-                    return Err("FDT 节点名或根节点无效");
+                    return Err("FDT node name or root is invalid");
                 }
                 at = at
                     .checked_add((name.len() + 4) & !3)
-                    .ok_or("FDT 节点名长度溢出")?;
-                if at > structure.len() {
-                    return Err("FDT 节点名填充被截断");
+                    .ok_or("FDT node name size overflows")?;
+                if structure.len() < at {
+                    return Err("FDT node name padding is truncated");
                 }
-                if depth > 0 {
+                if 0 < depth {
                     children[depth - 1] = true;
                 }
                 children[depth] = false;
@@ -114,27 +122,33 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                 root_seen = true;
             }
             2 => {
-                depth = depth.checked_sub(1).ok_or("FDT 节点结束标记不匹配")?;
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or("FDT end-node token is unmatched")?;
             }
             3 => {
                 if depth == 0 || children[depth - 1] {
-                    return Err("FDT 属性不在节点属性区");
+                    return Err("FDT property is outside the property section");
                 }
                 let len = word(structure, at)? as usize;
                 let name_at = word(structure, at + 4)? as usize;
                 at += 8;
-                let name = cstr(strings.get(name_at..).ok_or("FDT 属性名偏移越界")?)?;
-                let end = at.checked_add(len).ok_or("FDT 属性长度溢出")?;
-                let value = structure.get(at..end).ok_or("FDT 属性值被截断")?;
-                if aliases[depth - 1] {
-                    if name.contains('/') || !cstr(value)?.starts_with('/') {
-                        return Err("FDT aliases 必须使用无斜杠名字并指向绝对节点路径");
-                    }
+                let name = cstr(
+                    strings
+                        .get(name_at..)
+                        .ok_or("FDT property name offset exceeds the string block")?,
+                )?;
+                let end = at.checked_add(len).ok_or("FDT property size overflows")?;
+                let value = structure
+                    .get(at..end)
+                    .ok_or("FDT property value is truncated")?;
+                if aliases[depth - 1] && (name.contains('/') || !cstr(value)?.starts_with('/')) {
+                    return Err("FDT aliases require slash-free names and absolute paths");
                 }
-                if matches!(name, "#address-cells" | "#size-cells" | "#interrupt-cells") {
-                    if value.len() != 4 || word(value, 0)? > 3 {
-                        return Err("FDT cell 数无效或超过平台支持范围");
-                    }
+                if matches!(name, "#address-cells" | "#size-cells" | "#interrupt-cells")
+                    && (value.len() != 4 || 3 < word(value, 0)?)
+                {
+                    return Err("FDT cell count exceeds the supported range");
                 }
                 if matches!(
                     name,
@@ -146,47 +160,52 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                         list = &list[text.len() + 1..];
                     }
                 }
-                at = end.checked_add(3).ok_or("FDT 属性填充溢出")? & !3;
-                if at > structure.len() {
-                    return Err("FDT 属性填充被截断");
+                at = end.checked_add(3).ok_or("FDT property padding overflows")? & !3;
+                if structure.len() < at {
+                    return Err("FDT property padding is truncated");
                 }
             }
             4 => {}
             9 => {
                 if depth != 0 || !root_seen || structure[at..].iter().any(|b| *b != 0) {
-                    return Err("FDT 结构结束标记无效");
+                    return Err("FDT structure end token is invalid");
                 }
                 return Ok(());
             }
-            _ => return Err("FDT 含未知结构标记"),
+            _ => return Err("FDT structure contains an unknown token"),
         }
     }
 }
 
+/// 借用必须存在的资源属性，不为缺失设备填入默认配置。
 fn property<'a>(node: Node<'a>, name: &str) -> Result<&'a [u8], &'static str> {
     node.property(name)
         .map(|p| p.value)
-        .ok_or("FDT 缺少所需资源属性")
+        .ok_or("FDT required resource property is missing")
 }
 
+/// 读取绑定要求的一个整数 cell。
 fn number(node: Node<'_>, name: &str) -> Result<u32, &'static str> {
     let value = property(node, name)?;
     if value.len() != 4 {
-        return Err("FDT 整数属性长度不是一个 cell");
+        return Err("FDT integer property is not one cell");
     }
     word(value, 0)
 }
 
+/// 按设备树规范判断节点状态，未写 status 的节点处于启用状态。
 fn enabled(node: Node<'_>) -> bool {
     node.property("status")
-        .map_or(true, |p| matches!(p.as_str(), Some("okay" | "ok")))
+        .is_none_or(|p| matches!(p.as_str(), Some("okay" | "ok")))
 }
 
+/// 判断节点声明是否含所需控制器绑定。
 fn compatible(node: Node<'_>, expected: &str) -> bool {
     node.compatible()
         .is_some_and(|c| c.all().any(|s| s == expected))
 }
 
+/// 在已验证的树中定位直接父节点，保持原始节点身份。
 fn parent<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Option<Node<'a>> {
     tree.all_nodes().find(|candidate| {
         candidate
@@ -195,80 +214,89 @@ fn parent<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Option<Node<'a>> {
     })
 }
 
+/// 沿真实中断父链解析 phandle，缺少关系时返回错误。
 fn interrupt_parent<'a>(tree: &'a Fdt<'a>, mut node: Node<'a>) -> Result<Node<'a>, &'static str> {
     loop {
         if node.property("interrupt-parent").is_some() {
             return tree
                 .find_phandle(number(node, "interrupt-parent")?)
-                .ok_or("FDT 中断父 phandle 没有对应控制器");
+                .ok_or("FDT interrupt-parent phandle has no controller");
         }
-        node = parent(tree, node).ok_or("FDT 缺少中断父控制器关系")?;
+        node = parent(tree, node).ok_or("FDT interrupt-parent relationship is missing")?;
     }
 }
 
+/// 验证选定控制器的启用状态、compatible 和中断 cell 格式。
 fn require_controller(node: Node<'_>, expected: &str, count: u32) -> Result<(), &'static str> {
     if !enabled(node)
         || !compatible(node, expected)
         || node.property("interrupt-controller").is_none()
     {
-        return Err("FDT 中断链不是所选平台的实际控制器");
+        return Err("FDT interrupt chain is not the selected platform controller");
     }
     if number(node, "#interrupt-cells")? != count {
-        return Err("FDT 中断控制器 cell 格式与实际绑定不符");
+        return Err("FDT interrupt cell count does not match the controller binding");
     }
     Ok(())
 }
 
-fn regions<'a>(
-    node: Node<'a>,
-) -> Result<impl Iterator<Item = Result<Region, &'static str>> + 'a, &'static str> {
-    let raw = node.raw_reg().ok_or("FDT 资源节点缺少 reg")?;
+/// 按父节点 cell 约定遍历 reg，逐段返回不溢出的物理区间。
+fn regions(
+    node: Node<'_>,
+) -> Result<impl Iterator<Item = Result<Region, &'static str>> + '_, &'static str> {
+    let raw = node
+        .raw_reg()
+        .ok_or("FDT resource node has no reg property")?;
     let value = property(node, "reg")?;
     let first = node
         .raw_reg()
         .and_then(|mut r| r.next())
-        .ok_or("FDT reg 为空或被截断")?;
+        .ok_or("FDT reg is empty or truncated")?;
     let stride = first.address.len() + first.size.len();
     if stride == 0
         || value.len() % stride != 0
         || first.address.is_empty()
-        || first.address.len() > 8
+        || 8 < first.address.len()
         || first.size.is_empty()
-        || first.size.len() > 8
+        || 8 < first.size.len()
     {
-        return Err("FDT reg 地址长度格式无效");
+        return Err("FDT reg address or size format is invalid");
     }
     Ok(raw.map(|reg| Region::from_size(cells(reg.address)?, cells(reg.size)?)))
 }
 
+/// 验证当前资源所在总线是物理恒等映射，不隐式猜测地址转换。
 fn identity_address<'a>(tree: &'a Fdt<'a>, mut node: Node<'a>) -> Result<(), &'static str> {
     while let Some(bus) = parent(tree, node) {
         if bus.name != "/" && !bus.property("ranges").is_some_and(|p| p.value.is_empty()) {
-            return Err("FDT 当前物理资源的父总线不是支持的恒等映射");
+            return Err("FDT resource parent bus is not identity mapped");
         }
         node = bus;
     }
     Ok(())
 }
 
+/// 取得绑定要求的唯一寄存器区间。
 fn single_region<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<Region, &'static str> {
     identity_address(tree, node)?;
     let mut ranges = regions(node)?;
-    let first = ranges.next().ok_or("FDT reg 无资源区间")??;
+    let first = ranges.next().ok_or("FDT reg has no resource range")??;
     if ranges.next().is_some() {
-        return Err("FDT 当前设备含多个未支持的寄存器区间");
+        return Err("FDT device has multiple unsupported register ranges");
     }
     Ok(first)
 }
 
+/// 读取与父控制器绑定一致的真实中断源号。
 fn irq(node: Node<'_>, controller: Node<'_>) -> Result<u32, &'static str> {
     let value = property(node, "interrupts")?;
     if value.len() != number(controller, "#interrupt-cells")? as usize * 4 {
-        return Err("FDT UART/root 中断描述长度不符");
+        return Err("FDT UART or root interrupt size does not match its binding");
     }
     word(value, 0)
 }
 
+/// 将完整 DTB 转为一份资源快照，保留 BSP 身份及全部实际 RAM/保留区。
 fn discover_tree(
     bytes: &[u8],
     raw_args: [usize; 3],
@@ -276,7 +304,7 @@ fn discover_tree(
     dtb_address: usize,
 ) -> Result<BootInfo, &'static str> {
     validate(bytes)?;
-    let tree = Fdt::new(bytes).map_err(|_| "FDT 解析入口拒绝输入")?;
+    let tree = Fdt::new(bytes).map_err(|_| "FDT parser rejected the input")?;
     let mut info = BootInfo::empty(raw_args, bsp);
     info.dtb = Region::from_size(dtb_address, tree.total_size())?;
     info.reserve(info.dtb)?;
@@ -293,7 +321,7 @@ fn discover_tree(
             .property("ranges")
             .is_some_and(|p| !p.value.is_empty())
         {
-            return Err("FDT reserved-memory 不是物理恒等地址空间");
+            return Err("FDT reserved-memory is not an identity address space");
         }
         for child in reserved.children().filter(|n| enabled(*n)) {
             identity_address(&tree, child)?;
@@ -309,31 +337,31 @@ fn discover_tree(
         identity_address(&tree, node)?;
         for region in regions(node)? {
             if info.memory_count == MAX_MEMORY_REGIONS {
-                return Err("FDT RAM 区间超过支持容量");
+                return Err("FDT RAM range capacity exceeded");
             }
             let region = region?;
             if info.memory[..info.memory_count]
                 .iter()
                 .any(|old| old.overlaps(region))
             {
-                return Err("FDT RAM 区间重叠");
+                return Err("FDT RAM ranges overlap");
             }
             info.memory[info.memory_count] = region;
             info.memory_count += 1;
         }
     }
     if info.memory_count == 0 {
-        return Err("FDT 缺少实际 RAM");
+        return Err("FDT has no RAM resources");
     }
     if !info.memory[..info.memory_count]
         .iter()
-        .any(|r| r.start <= info.dtb.start && r.end >= info.dtb.end)
+        .any(|r| r.start <= info.dtb.start && info.dtb.end <= r.end)
     {
-        return Err("运行 DTB 不在已描述的 RAM 区间内");
+        return Err("runtime DTB is outside the described RAM");
     }
-    let cpus = tree.find_node("/cpus").ok_or("FDT 缺少 cpus 节点")?;
+    let cpus = tree.find_node("/cpus").ok_or("FDT cpus node is missing")?;
     if !matches!(number(cpus, "#address-cells")?, 1 | 2) || number(cpus, "#size-cells")? != 0 {
-        return Err("FDT CPU reg cell 格式无效");
+        return Err("FDT CPU reg cell format is invalid");
     }
     for node in cpus.children().filter(|n| enabled(*n)) {
         if node.property("device_type").and_then(|p| p.as_str()) != Some("cpu") {
@@ -341,14 +369,14 @@ fn discover_tree(
         }
         let reg = property(node, "reg")?;
         if reg.len() != number(cpus, "#address-cells")? as usize * 4 {
-            return Err("FDT CPU reg 为空、被截断或包含多个 ID");
+            return Err("FDT CPU reg is empty, truncated, or contains multiple IDs");
         }
         let id = cells(reg)?;
         if info.hardware_ids[..info.cpu_count].contains(&id) {
-            return Err("FDT CPU 硬件 ID 重复");
+            return Err("FDT CPU hardware IDs are duplicated");
         }
         if info.cpu_count == MAX_CPUS {
-            return Err("FDT 可用 CPU 超过四核容量");
+            return Err("FDT CPU count exceeds the four-CPU capacity");
         }
         info.hardware_ids[info.cpu_count] = id;
         info.cpu_count += 1;
@@ -356,12 +384,12 @@ fn discover_tree(
     let bsp_index = info.hardware_ids[..info.cpu_count]
         .iter()
         .position(|id| *id == bsp)
-        .ok_or("FDT 可用 CPU 不包含实际 BSP")?;
+        .ok_or("FDT enabled CPUs do not include the BSP")?;
     info.hardware_ids.swap(0, bsp_index);
     #[cfg(target_arch = "riscv64")]
     {
         info.counter_frequency = number(cpus, "timebase-frequency")
-            .map_err(|_| "FDT cpus 缺少有效 timebase-frequency")?
+            .map_err(|_| "FDT cpus timebase-frequency is missing or invalid")?
             as u64;
     }
     #[cfg(target_arch = "loongarch64")]
@@ -369,20 +397,24 @@ fn discover_tree(
         info.counter_frequency = crate::arch::counter_frequency();
     }
     if info.counter_frequency == 0 {
-        return Err("实际硬件 counter frequency 为零");
+        return Err("hardware counter frequency is zero");
     }
-    let chosen = tree.find_node("/chosen").ok_or("FDT 缺少 chosen 节点")?;
-    let stdout = cstr(property(chosen, "stdout-path").map_err(|_| "FDT chosen 缺少 stdout-path")?)?;
-    let path = stdout.split(':').next().ok_or("FDT stdout-path 无效")?;
-    let uart = tree
-        .find_node(path)
-        .ok_or("FDT stdout-path 没有对应 UART")?;
+    let chosen = tree
+        .find_node("/chosen")
+        .ok_or("FDT chosen node is missing")?;
+    let stdout =
+        cstr(property(chosen, "stdout-path").map_err(|_| "FDT chosen stdout-path is missing")?)?;
+    let path = stdout
+        .split(':')
+        .next()
+        .ok_or("FDT stdout-path is invalid")?;
+    let uart = tree.find_node(path).ok_or("FDT stdout-path has no UART")?;
     if !enabled(uart) || !compatible(uart, "ns16550a") {
-        return Err("FDT chosen UART 不是可用 ns16550a");
+        return Err("FDT chosen UART is not an enabled ns16550a");
     }
     info.interrupts.uart = single_region(&tree, uart)?;
     if info.interrupts.uart.start != EARLY_UART_BASE {
-        return Err("FDT chosen UART 与所选早期 UART 不一致");
+        return Err("FDT chosen UART differs from the early UART");
     }
     let controller = interrupt_parent(&tree, uart)?;
     info.interrupts.uart_source = irq(uart, controller)?;
@@ -392,8 +424,8 @@ fn discover_tree(
     #[cfg(target_arch = "loongarch64")]
     {
         require_controller(controller, "loongson,pch-pic-1.0", 2)?;
-        if word(property(uart, "interrupts")?, 4)? != 4 || info.interrupts.uart_source >= 64 {
-            return Err("FDT UART 不是支持的 PCH-PIC 高电平源");
+        if word(property(uart, "interrupts")?, 4)? != 4 || 64 <= info.interrupts.uart_source {
+            return Err("FDT UART is not a supported PCH-PIC level-high source");
         }
         let extioi = interrupt_parent(&tree, controller)?;
         require_controller(extioi, "loongson,ls2k2000-eiointc", 1)?;
@@ -402,50 +434,51 @@ fn discover_tree(
         let root = interrupt_parent(&tree, extioi)?;
         require_controller(root, "loongson,cpu-interrupt-controller", 1)?;
         info.interrupts.root_interrupt = irq(extioi, root)?;
-        if info.interrupts.root_interrupt >= 8 {
-            return Err("FDT EXTIOI 的 CPU 根中断超出支持范围");
+        if 8 <= info.interrupts.root_interrupt {
+            return Err("FDT EXTIOI CPU root interrupt exceeds the supported range");
         }
     }
     discover_pci(&tree, &mut info)?;
     Ok(info)
 }
 
+/// 记录 PCI ECAM、总线编号和窗口，不枚举设备或访问配置空间。
 fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
     let mut hosts = tree
         .all_nodes()
         .filter(|n| enabled(*n) && compatible(*n, "pci-host-ecam-generic"));
-    let host = hosts.next().ok_or("FDT 缺少所选 virt 的 PCI ECAM host")?;
+    let host = hosts.next().ok_or("FDT PCI ECAM host is missing")?;
     if hosts.next().is_some() {
-        return Err("FDT 含多个未支持的 PCI host");
+        return Err("FDT has multiple unsupported PCI hosts");
     }
     info.pci.configuration = single_region(tree, host)?;
     if number(host, "#address-cells")? != 3 || number(host, "#size-cells")? != 2 {
-        return Err("FDT PCI ranges cell 格式不符");
+        return Err("FDT PCI ranges cell format is invalid");
     }
-    let parent = parent(tree, host).ok_or("FDT PCI host 缺少父总线")?;
+    let parent = parent(tree, host).ok_or("FDT PCI host has no parent bus")?;
     if parent.cell_sizes().address_cells != 2 {
-        return Err("FDT PCI host 的物理地址不是双 cell");
+        return Err("FDT PCI physical addresses are not two cells");
     }
     let buses = property(host, "bus-range")?;
     if buses.len() != 8 {
-        return Err("FDT PCI bus-range 被截断");
+        return Err("FDT PCI bus-range is truncated");
     }
     info.pci.bus_start = word(buses, 0)?;
     info.pci.bus_end = word(buses, 4)?;
-    if info.pci.bus_start > info.pci.bus_end || info.pci.bus_end > 255 {
-        return Err("FDT PCI bus-range 无效");
+    if info.pci.bus_end < info.pci.bus_start || 255 < info.pci.bus_end {
+        return Err("FDT PCI bus-range is invalid");
     }
     let ranges = property(host, "ranges")?;
     if ranges.is_empty() || ranges.len() % 28 != 0 {
-        return Err("FDT PCI ranges 被截断");
+        return Err("FDT PCI ranges is truncated");
     }
     for range in ranges.chunks_exact(28) {
         if info.pci.range_count == info.pci.ranges.len() {
-            return Err("FDT PCI 窗口超过支持容量");
+            return Err("FDT PCI window capacity exceeded");
         }
         let flags = word(range, 0)?;
         if !matches!(flags & 0x0300_0000, 0x0100_0000 | 0x0200_0000 | 0x0300_0000) {
-            return Err("FDT PCI 窗口不是 IO 或内存空间");
+            return Err("FDT PCI window is neither IO nor memory");
         }
         let bus_start = cells(&range[4..12])?;
         let cpu = Region::from_size(cells(&range[12..20])?, cells(&range[20..28])?)?;
@@ -460,6 +493,7 @@ fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
     Ok(())
 }
 
+/// 按 CPU phandle 定位 S-mode context，并在输入边界验证寄存器窗口。
 #[cfg(target_arch = "riscv64")]
 fn discover_plic(
     tree: &Fdt<'_>,
@@ -469,8 +503,11 @@ fn discover_plic(
 ) -> Result<(), &'static str> {
     require_controller(plic, "riscv,plic0", 1)?;
     let sources = number(plic, "riscv,ndev")?;
-    if info.interrupts.uart_source == 0 || info.interrupts.uart_source > sources {
-        return Err("FDT UART 中断源超出实际 PLIC 容量");
+    if info.interrupts.uart_source == 0 || sources < info.interrupts.uart_source {
+        return Err("FDT UART source exceeds the PLIC capacity");
+    }
+    if 1023 < sources || info.interrupts.controller.start % 4 != 0 {
+        return Err("FDT PLIC register layout is unsupported");
     }
     let mut handles = [0; MAX_CPUS];
     for cpu in cpus.children().filter(|n| enabled(*n)) {
@@ -481,11 +518,11 @@ fn discover_plic(
         let logical = info.hardware_ids[..info.cpu_count]
             .iter()
             .position(|old| *old == id)
-            .ok_or("PLIC CPU 未在可用 CPU 表中")?;
+            .ok_or("PLIC CPU is not in the enabled CPU table")?;
         let intc = cpu
             .children()
             .find(|n| compatible(*n, "riscv,cpu-intc"))
-            .ok_or("FDT CPU 缺少实际本地中断控制器")?;
+            .ok_or("FDT CPU local interrupt controller is missing")?;
         require_controller(intc, "riscv,cpu-intc", 1)?;
         handles[logical] = number(intc, "phandle")?;
         if handles[logical] == 0
@@ -494,13 +531,13 @@ fn discover_plic(
                 .enumerate()
                 .any(|(i, value)| i != logical && *value == handles[logical])
         {
-            return Err("FDT CPU 中断控制器 phandle 无效或重复");
+            return Err("FDT CPU interrupt phandle is zero or duplicated");
         }
     }
-    let extended =
-        property(plic, "interrupts-extended").map_err(|_| "FDT PLIC 缺少 interrupts-extended")?;
+    let extended = property(plic, "interrupts-extended")
+        .map_err(|_| "FDT PLIC interrupts-extended is missing")?;
     if extended.is_empty() || extended.len() % 8 != 0 {
-        return Err("FDT PLIC context 描述被截断");
+        return Err("FDT PLIC context description is truncated");
     }
     let mut found = [false; MAX_CPUS];
     for (context, entry) in extended.chunks_exact(8).enumerate() {
@@ -512,7 +549,7 @@ fn discover_plic(
         }
         let intc = tree
             .find_phandle(handle)
-            .ok_or("PLIC context 引用了不存在的 CPU 控制器")?;
+            .ok_or("PLIC context references a missing CPU controller")?;
         require_controller(intc, "riscv,cpu-intc", 1)?;
         if cause != 9 {
             continue;
@@ -522,14 +559,22 @@ fn discover_plic(
             .position(|old| *old == handle)
         {
             if found[logical] {
-                return Err("FDT CPU 含重复 S-mode PLIC context");
+                return Err("FDT CPU has duplicate supervisor PLIC contexts");
             }
             info.interrupts.plic_contexts[logical] = context;
             found[logical] = true;
         }
     }
     if found[..info.cpu_count].iter().any(|present| !present) {
-        return Err("FDT PLIC 缺少某个可用 CPU 的 S-mode context");
+        return Err("FDT PLIC has no supervisor context for an enabled CPU");
+    }
+    let size = info.interrupts.controller.end - info.interrupts.controller.start;
+    for context in &info.interrupts.plic_contexts[..info.cpu_count] {
+        let claim_end = 0x20_0000 + context * 0x1000 + 8;
+        let enable_end = 0x2000 + context * 0x80 + (sources as usize / 32 + 1) * 4;
+        if size < claim_end.max(enable_end) {
+            return Err("FDT PLIC context exceeds its register window");
+        }
     }
     info.interrupts.root_interrupt = 9;
     Ok(())
@@ -549,37 +594,40 @@ pub unsafe fn discover(
     #[cfg(target_arch = "loongarch64")]
     let physical: usize = 0x10_0000;
     if physical == 0 || physical % 8 != 0 || physical.checked_add(40).is_none() {
-        return Err("固件 DTB 物理地址为空或未对齐");
+        return Err("firmware DTB physical address is zero or unaligned");
     }
     let pointer = crate::arch::phys_to_virt(physical) as *const u8;
-    let header = core::slice::from_raw_parts(pointer, 40);
+    // SAFETY: caller 保证固件头部可读，物理地址已转换为当前 RAM 映射。
+    let header = unsafe { core::slice::from_raw_parts(pointer, 40) };
     if word(header, 0)? != 0xd00d_feed {
-        return Err("固件 DTB magic 错误");
+        return Err("firmware DTB magic is invalid");
     }
     let total = word(header, 4)? as usize;
-    if total < 40
-        || total > MAX_DTB_SIZE
+    if !(40..=MAX_DTB_SIZE).contains(&total)
         || physical.checked_add(total).is_none()
         || (pointer as usize).checked_add(total).is_none()
     {
-        return Err("固件 DTB 长度无效或地址溢出");
+        return Err("firmware DTB size is invalid or address overflows");
     }
-    discover_tree(
-        core::slice::from_raw_parts(pointer, total),
-        raw_args,
-        bsp_hardware_id,
-        physical,
-    )
+    // SAFETY: caller 保证固件声明的完整存储可读；长度、物理和虚拟地址范围已验证。
+    let bytes = unsafe { core::slice::from_raw_parts(pointer, total) };
+    discover_tree(bytes, raw_args, bsp_hardware_id, physical)
 }
 
-/// 在测试构建中验证真实 DTB 的原始边界，并拒绝截断头部和数据块。
+/// 在独占副本上检验实际 DTB 的截断、块边界和 NOP 属性处理。
+///
+/// # Safety
+/// 仅由 BSP 在所有 CPU 上线后的普通执行流调用一次，不得重入或被其他核并发调用。
+/// 原始 DTB 映射仍有效，且内核自检副本不与固件存储重叠。
 #[cfg(feature = "boot-tests")]
-pub fn test_input_boundaries() -> bool {
+pub unsafe fn test_input_boundaries() -> bool {
     static mut COPY: [u8; MAX_DTB_SIZE] = [0; MAX_DTB_SIZE];
     let live = crate::boot::info();
     let physical = live.dtb.start;
     let size = live.dtb.end - physical;
-    // 只由 BSP 的有限自检调用；LA 固件把 DTB 填充到 1 MiB，不能放进启动栈。
+    // LA 固件把 DTB 填充到 1 MiB，副本使用独占静态存储而非启动栈。
+    // SAFETY: caller 保证 BSP 唯一访问 COPY；size 来自已验证 DTB，未超过其容量，
+    // 源映射与 COPY 不重叠，可变借用仅持续到本次自检返回。
     let bytes = unsafe {
         let copy = core::ptr::addr_of_mut!(COPY).cast::<u8>();
         core::ptr::copy_nonoverlapping(
@@ -589,7 +637,7 @@ pub fn test_input_boundaries() -> bool {
         );
         core::slice::from_raw_parts_mut(copy, size)
     };
-    if validate(&bytes).is_err() || !(0..bytes.len()).all(|end| validate(&bytes[..end]).is_err()) {
+    if validate(bytes).is_err() || !(0..bytes.len()).all(|end| validate(&bytes[..end]).is_err()) {
         return false;
     }
     let hardware_id = live.hardware_ids[live.cpu_count - 1];
@@ -641,7 +689,7 @@ pub fn test_input_boundaries() -> bool {
             bytes[field + 3],
         ];
         bytes[field..field + 4].copy_from_slice(&u32::MAX.to_be_bytes());
-        let rejected = validate(&bytes).is_err();
+        let rejected = validate(bytes).is_err();
         bytes[field..field + 4].copy_from_slice(&saved);
         if !rejected {
             return false;

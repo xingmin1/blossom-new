@@ -49,7 +49,7 @@ impl<'b, 'a: 'b> FdtNode<'b, 'a> {
         Self { name, header, props, parent_props }
     }
 
-    /// Returns an iterator over the available properties of the node
+    /// 依次借用节点属性，跳过固件删除属性后保留的 NOP 标记。
     pub fn properties(self) -> impl Iterator<Item = NodeProperty<'a>> + 'b {
         let mut stream = FdtData::new(self.props);
         let mut done = false;
@@ -77,7 +77,7 @@ impl<'b, 'a: 'b> FdtNode<'b, 'a> {
         self.properties().find(|p| p.name == name)
     }
 
-    /// Returns an iterator over the children of the current node
+    /// 遍历直接子节点，在属性及节点边界跳过 NOP，保持父节点属性身份。
     pub fn children(self) -> impl Iterator<Item = FdtNode<'b, 'a>> {
         let mut stream = FdtData::new(self.props);
 
@@ -327,6 +327,7 @@ pub struct RawReg<'a> {
     pub size: &'a [u8],
 }
 
+/// 按已验证的绝对路径查找节点，NOP 不改变路径层级或父属性范围。
 pub(crate) fn find_node<'b, 'a: 'b>(
     stream: &mut FdtData<'a>,
     name: &str,
@@ -393,7 +394,7 @@ pub(crate) fn find_node<'b, 'a: 'b>(
     None
 }
 
-// FIXME: this probably needs refactored
+/// 按结构顺序借用全部节点；调用者须提供完整结构和不超过父栈容量的层级。
 pub(crate) fn all_nodes<'b, 'a: 'b>(header: &'b Fdt<'a>) -> impl Iterator<Item = FdtNode<'b, 'a>> {
     let mut stream = FdtData::new(header.structs_block());
     let mut done = false;
@@ -457,6 +458,7 @@ pub(crate) fn all_nodes<'b, 'a: 'b>(header: &'b Fdt<'a>) -> impl Iterator<Item =
     })
 }
 
+/// 跳过当前完整节点及其子树，保留流中下一个节点或结束标记的位置。
 pub(crate) fn skip_current_node<'a>(stream: &mut FdtData<'a>, header: &Fdt<'a>) {
     assert_eq!(stream.u32().unwrap().get(), FDT_BEGIN_NODE, "bad node");
 

@@ -1,7 +1,7 @@
 //! QEMU 9.2.1 virt 的 DMW、异常、一次定时器及 PCH-PIC/EXTIOI 机制。
 use crate::boot::BootInfo;
 use core::arch::{asm, global_asm};
-use core::mem::{offset_of, size_of};
+use core::mem::{offset_of, size_of, MaybeUninit};
 
 pub const NAME: &str = "loongarch64";
 
@@ -14,9 +14,10 @@ struct KernelTrapFrame {
     badv: usize,
     euen: usize,
     cpu_base: usize,
-    fpr: [u64; 32],
-    fcsr: usize,
-    fcc: [usize; 8],
+    // EUEN.FPE 关闭时汇编跳过这些字段，Rust 不得把它们视为已初始化值。
+    fpr: MaybeUninit<[u64; 32]>,
+    fcsr: MaybeUninit<usize>,
+    fcc: MaybeUninit<[usize; 8]>,
 }
 
 // refill 有独立 CSR 现场，不借用普通异常的 ERA/PRMD/BADV。
@@ -28,12 +29,12 @@ struct RefillFrame {
     badv: usize,
 }
 
-global_asm!(include_str!("entry.S"),
+global_asm!(include_str!("loongarch64/entry.S"),
     stack_size = const crate::cpu::STACK_SIZE,
     boot_stack = const offset_of!(crate::cpu::CpuBoot, stack_top),
     boot_local = const offset_of!(crate::cpu::CpuBoot, local),
 );
-global_asm!(include_str!("trap.S"),
+global_asm!(include_str!("loongarch64/trap.S"),
     frame_size = const size_of::<KernelTrapFrame>(),
     gpr = const offset_of!(KernelTrapFrame, gpr),
     era = const offset_of!(KernelTrapFrame, era),
@@ -56,51 +57,72 @@ extern "C" {
     static __direct_base: u8;
     static __mmio_base: u8;
     static __secondary_entry_phys: u8;
-    fn __kernel_trap();
-    fn __kernel_refill();
+    /// 普通内核异常入口，由硬件跳转并按 KernelTrapFrame 布局保存本核现场。
+    fn la_kernel_trap();
+    /// 物理 refill 入口，使用独立 CSR 现场并在调用 Rust 前恢复高地址 DMW。
+    fn la_kernel_refill();
 }
 
+/// 在引导入口确立的 PLV0 环境读取本核 CSR；寄存器编号由本模块常量指定。
 #[inline]
 fn csr_read<const R: u16>() -> usize {
     let value;
+    // SAFETY: 两种 Rust 引导入口均处于 PLV0；调用点只选择本架构可读的 CSR。
     unsafe {
         asm!("csrrd {value}, {reg}", value = out(reg) value, reg = const R, options(nomem, nostack));
     }
     value
 }
+/// 写入本核 CSR，调用点负责保持寄存器对应的异常、映射和中断协议。
+///
+/// # Safety
+/// 必须处于 PLV0，R 必须是可写 CSR，写入值不得破坏当前代码、栈和 per-CPU 对象的可达性。
 #[inline]
 unsafe fn csr_write<const R: u16>(value: usize) {
-    asm!("csrwr {value}, {reg}", value = inout(reg) value => _, reg = const R, options(nostack));
+    // SAFETY: 调用者保证 CSR 可写、特权级正确，并保持当前执行现场所依赖的映射。
+    unsafe {
+        asm!("csrwr {value}, {reg}", value = inout(reg) value => _, reg = const R, options(nostack));
+    }
 }
+/// 读取本模块选定的 QEMU IOCSR 状态，不通过普通内存指针访问设备。
 #[inline]
 fn iocsr_read32(reg: usize) -> u32 {
     let value: usize;
+    // SAFETY: 调用点只传递 QEMU virt 的有效 IOCSR 编号，入口保证当前执行级为 PLV0。
     unsafe {
         asm!("iocsrrd.w {value}, {reg}", value = out(reg) value, reg = in(reg) reg, options(nostack));
     }
     value as u32
 }
+/// 读取 QEMU virt 的 64 位 IOCSR 状态。
 #[inline]
 fn iocsr_read64(reg: usize) -> u64 {
     let value;
+    // SAFETY: 调用点只选择有效的 64 位 IOCSR，PLV0 已由引导入口建立。
     unsafe {
         asm!("iocsrrd.d {value}, {reg}", value = out(reg) value, reg = in(reg) reg, options(nostack));
     }
     value
 }
+/// 写入选定的 32 位 IOCSR；共享路由读改写由公共 IRQ 锁串行化。
 #[inline]
 fn iocsr_write32(reg: usize, value: u32) {
+    // SAFETY: 本模块调用点使用已验证平台的有效 IOCSR；设备状态不承载 Rust 引用。
     unsafe {
         asm!("iocsrwr.w {value}, {reg}", value = in(reg) value as usize, reg = in(reg) reg, options(nostack));
     }
 }
+/// 写入 QEMU mailbox 或 EXTIOI 的 64 位 IOCSR。
 #[inline]
 fn iocsr_write64(reg: usize, value: u64) {
+    // SAFETY: 调用点选择 QEMU virt 的有效 IOCSR，mailbox 指针的生命周期由启动接口约定。
     unsafe {
         asm!("iocsrwr.d {value}, {reg}", value = in(reg) value, reg = in(reg) reg, options(nostack));
     }
 }
+/// 排序本核设备访问和已发表的共享启动记录。
 fn barrier() {
+    // SAFETY: dbar 在引导入口建立的 PLV0 可执行，不解引用任何指针。
     unsafe {
         asm!("dbar 0", options(nostack));
     }
@@ -113,32 +135,43 @@ pub fn boot_hardware_id(_: [usize; 3]) -> usize {
 /// 将真实 RAM 物理地址转换为缓存 DMW 别名。
 pub fn phys_to_virt(pa: usize) -> usize {
     let base: usize;
+    // SAFETY: 链接脚本提供绝对 DMW 段值；la.abs 仅取符号值，不读取该地址。
     unsafe {
         asm!("la.abs {base}, {symbol}", base = out(reg) base, symbol = sym __direct_base, options(nomem, nostack));
     }
     pa | base
 }
-/// 去掉内核缓存 DMW 段，取得实际物理地址。
+/// 从缓存 DMW 内的 RAM 地址取得物理地址；其他地址类别不适用此换算。
 pub fn virt_to_phys(va: usize) -> usize {
     va & !phys_to_virt(0)
 }
-/// 将设备物理地址转换为强序 DMW 地址。
+/// 将设备物理地址转换为强序 DMW 地址；返回整数地址，不验证设备资源范围。
 pub fn mmio_address(pa: usize) -> usize {
     let base: usize;
+    // SAFETY: 链接脚本提供强序 DMW 段值；此指令仅计算地址，不访问设备。
     unsafe {
         asm!("la.abs {base}, {symbol}", base = out(reg) base, symbol = sym __mmio_base, options(nomem, nostack));
     }
     pa | base
 }
 /// 确认入口已安装最终 DMW；普通内核不再使用 DA 低地址别名。
-pub fn finish_boot_mappings(_: &BootInfo) {
+///
+/// # Safety
+/// 必须由 BSP 在 IRQ 关闭、辅核尚未释放时调用一次；入口已建立 PG、缓存与强序 DMW。
+/// BootInfo 必须是已发布的真实平台对象，调用期间不得修改这些映射。
+pub unsafe fn finish_boot_mappings(_: &BootInfo) {
     assert_eq!(csr_read::<0>() & 0x18, 0x10);
     assert_eq!(csr_read::<0x181>(), phys_to_virt(0) | 0x11);
     assert_eq!(csr_read::<0x180>(), mmio_address(0) | 1);
 }
 /// 将稳定的内核 per-CPU 指针放入 KS0；用户 TLS 寄存器不参与此约定。
+///
+/// # Safety
+/// local 必须非空、满足 CpuLocal 对齐、已完整初始化且属于本核；对象和 DMW 映射必须永久有效。
+/// 必须在本核 IRQ 关闭时安装，不得把同一个对象安装给另一个 CPU。
 pub unsafe fn install_cpu_local(local: *const crate::cpu::CpuLocal) {
-    csr_write::<0x30>(local as usize);
+    // SAFETY: 调用者保证本核 IRQ 已关闭，指针是本核永久有效对象，KS0 只保存该基址。
+    unsafe { csr_write::<0x30>(local as usize) };
 }
 /// 读取当前 CPU 的 KS0 基址。
 pub fn cpu_local() -> *const crate::cpu::CpuLocal {
@@ -147,9 +180,10 @@ pub fn cpu_local() -> *const crate::cpu::CpuLocal {
 /// 安装本核异常入口，并只初始化本核 timer/IPI 状态。
 pub fn init_current_cpu() {
     irq_save();
+    // SAFETY: 入口已建立本核 PLV0/DMW 和有效栈；IRQ 已关闭，异常代码在永久内核映射内。
     unsafe {
-        csr_write::<0xc>(__kernel_trap as usize);
-        csr_write::<0x88>(virt_to_phys(__kernel_refill as usize));
+        csr_write::<0xc>(la_kernel_trap as usize);
+        csr_write::<0x88>(virt_to_phys(la_kernel_refill as usize));
         csr_write::<4>((1 << 11) | (1 << 12) | (1 << 3));
         csr_write::<2>(1);
     }
@@ -161,14 +195,23 @@ pub fn init_current_cpu() {
 /// 原子关闭本核 IRQ，返回原 CRMD 状态。
 pub fn irq_save() -> usize {
     let old;
+    // 保留汇编的编译器内存屏障，禁止临界区访存移到关闭 IRQ 之前。
+    // SAFETY: 入口保证 PLV0；csrxchg 只关闭本核 IE，不修改分页、特权级或内存映射。
     unsafe {
         asm!("csrxchg {old}, {mask}, 0", old = inout(reg) 0usize => old, mask = in(reg) 4usize, options(nostack));
     }
     old
 }
 /// 只恢复原来的 IE 位，不修改分页或特权状态。
+///
+/// # Safety
+/// saved 必须来自本核匹配的 irq_save，期间不能迁移 CPU；恢复 IE 前必须释放依赖 IRQ 关闭的锁和借用。
 pub unsafe fn irq_restore(saved: usize) {
-    asm!("csrxchg {value}, {mask}, 0", value = inout(reg) (saved & 4) => _, mask = in(reg) 4usize, options(nostack));
+    // 保留编译器内存屏障，禁止释放锁和结束借用的操作移到恢复 IRQ 之后。
+    // SAFETY: 调用者保证恢复发生在同一 CPU 且 IRQ 临界区已结束；掩码只允许修改 IE。
+    unsafe {
+        asm!("csrxchg {value}, {mask}, 0", value = inout(reg) (saved & 4) => _, mask = in(reg) 4usize, options(nostack));
+    }
 }
 /// 查询本核全局 IRQ 开关。
 pub fn irq_enabled() -> bool {
@@ -176,12 +219,15 @@ pub fn irq_enabled() -> bool {
 }
 /// 打开本核全局 IRQ。
 pub fn enable_interrupts() {
+    // 保留编译器内存屏障，使后续本核 online 发布不能移到开 IRQ 之前。
+    // SAFETY: 入口保证 PLV0；此接口显式使能本核 IRQ，不恢复任何临界区的旧状态。
     unsafe {
-        irq_restore(4);
+        asm!("csrxchg {value}, {mask}, 0", value = inout(reg) 4usize => _, mask = in(reg) 4usize, options(nostack));
     }
 }
 /// 等待真实硬件中断。
 pub fn wait_for_interrupt() {
+    // SAFETY: 当前在 PLV0，idle 不解引用指针，也不改变已建立的映射。
     unsafe {
         asm!("idle 0", options(nostack));
     }
@@ -189,13 +235,16 @@ pub fn wait_for_interrupt() {
 /// 读取稳定硬件计数器。
 pub fn read_counter() -> u64 {
     let value;
+    // SAFETY: rdtime 仅读取硬件计数器，入口已建立可执行该指令的环境。
     unsafe {
         asm!("rdtime.d {value}, $zero", value = out(reg) value, options(nomem, nostack));
     }
     value
 }
+/// 读取只读 CPUCFG 参数；本模块仅选择计数器频率的配置项。
 fn cpucfg(index: usize) -> u64 {
     let value: usize;
+    // SAFETY: CPUCFG4/5 是本架构有效的只读配置项，不访问普通内存。
     unsafe {
         asm!("cpucfg {value}, {index}", value = out(reg) value, index = in(reg) index, options(nomem, nostack));
     }
@@ -209,7 +258,7 @@ pub fn counter_frequency() -> u64 {
     let div = ratio >> 16;
     assert!(
         base != 0 && mul != 0 && div != 0,
-        "CPUCFG counter frequency 无效"
+        "invalid CPUCFG counter frequency"
     );
     base * mul / div
 }
@@ -218,17 +267,20 @@ pub fn program_timer(deadline: u64) {
     disable_timer();
     let delta = deadline.saturating_sub(read_counter()).max(4);
     let value = delta.saturating_add(3).min((1u64 << 48) - 4) & !3;
+    // SAFETY: 在 PLV0 写本核 TCFG；上面的量化保证只写有效 tick 位与一次事件使能位。
     unsafe {
         csr_write::<0x41>(value as usize | 1);
     }
 }
 /// 关闭一次事件并清除真实 timer pending。
 pub fn disable_timer() {
+    // SAFETY: TCFG/TICLR 是本核定时器 CSR，写零关闭事件、写一清 pending 均不影响映射。
     unsafe {
         csr_write::<0x41>(0);
         csr_write::<0x44>(1);
     }
 }
+/// 按 QEMU MAIL_SEND 编码向目标 CPU 发表一个 64 位邮箱值。
 fn mail_send(cpu: usize, mailbox: usize, data: usize) {
     let target = (1u64 << 31) | ((cpu as u64) << 16);
     iocsr_write64(
@@ -241,13 +293,19 @@ fn mail_send(cpu: usize, mailbox: usize, data: usize) {
     );
 }
 /// 通过真实 mailbox1 发表启动记录，mailbox0 发表物理入口，再发送启动 IPI。
-pub fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Result<(), isize> {
-    if hardware_id >= crate::boot::MAX_CPUS {
+///
+/// # Safety
+/// 必须由 BSP 串行启动尚未运行的已枚举辅核；物理地址须指向对齐、完整初始化且永久保留的 CpuBoot。
+/// 记录中的栈须独占、满足 16 字节 ABI 对齐，CpuLocal 须属于目标核且完整初始化；两者与 DMW 均须永久有效。
+/// 发布后不得再修改启动记录。
+pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Result<(), isize> {
+    if crate::boot::MAX_CPUS <= hardware_id {
         return Err(-22);
     }
     barrier();
     mail_send(hardware_id, 1, boot_record_physical);
     let entry: usize;
+    // SAFETY: 链接脚本给出可执行的物理辅核入口；这里只取符号值，记录契约由调用者保证。
     unsafe {
         asm!("la.abs {entry}, {symbol}", entry = out(reg) entry, symbol = sym __secondary_entry_phys, options(nomem, nostack));
     }
@@ -261,7 +319,9 @@ pub fn send_ipi(hardware_id: usize) {
     barrier();
     iocsr_write32(0x1040, (1 << 31) | ((hardware_id as u32) << 16) | 1);
 }
+/// 写入已验证 PCH-PIC 范围的 32 位寄存器，路由操作由公共 IRQ 锁保护。
 fn pic_write(offset: usize, value: u32) {
+    // SAFETY: 已发布 BootInfo 的控制器范围覆盖调用点的对齐 offset；入口保持强序 DMW 永久有效。
     unsafe {
         core::ptr::write_volatile(
             (mmio_address(crate::boot::info().interrupts.controller.start) + offset) as *mut u32,
@@ -269,21 +329,29 @@ fn pic_write(offset: usize, value: u32) {
         );
     }
 }
+/// 读取已验证 PCH-PIC 范围的 32 位寄存器。
 fn pic_read(offset: usize) -> u32 {
+    // SAFETY: BootInfo getter 返回已发布对象，调用点 offset 对齐且位于控制器范围，强序 DMW 永久有效。
     unsafe {
         core::ptr::read_volatile(
             (mmio_address(crate::boot::info().interrupts.controller.start) + offset) as *const u32,
         )
     }
 }
+/// 将已验证的 EXTIOI 基址与本模块寄存器偏移组合成 IOCSR 编号。
 fn ext_reg(offset: usize) -> usize {
     crate::boot::info().interrupts.parent_controller.start + offset
 }
+/// 取得平台验证过的 UART 源位，源号小于 32。
 fn uart_bit() -> u32 {
     1 << crate::boot::info().interrupts.uart_source
 }
 /// 将已选 UART 的 PCH 源向量路由到 BSP 的 EXTIOI/IP1，初始保持屏蔽。
-pub fn external_init(info: &BootInfo) {
+///
+/// # Safety
+/// 必须由 BSP 在本核 IRQ 关闭且全局 IRQ 初始化独占时调用；info 必须是已发布的平台对象。
+/// PCH-PIC/EXTIOI 资源必须已经验证，强序 DMW 必须覆盖 PCH-PIC 并永久有效。
+pub unsafe fn external_init(info: &BootInfo) {
     let source = info.interrupts.uart_source as usize;
     assert!(source < 32 && info.bsp_hardware_id < 4);
     assert_eq!(info.interrupts.root_interrupt, 3);
@@ -294,6 +362,7 @@ pub fn external_init(info: &BootInfo) {
     pic_write(0x3e0, 0);
     pic_write(0x3e4, 0);
     pic_write(0x40, uart_bit());
+    // SAFETY: 调用者保证 PCH-PIC 范围与强序映射有效；source 已验证小于 32，两处访问均为字节寄存器。
     unsafe {
         let base = mmio_address(info.interrupts.controller.start);
         core::ptr::write_volatile((base + 0x100 + source) as *mut u8, 1);
@@ -318,7 +387,7 @@ pub fn external_mask() {
     iocsr_write32(ext_reg(0x200), 0);
     barrier();
 }
-/// 先使能 EXTIOI，再解除 PCH 源屏蔽，让仍存在的 level 请求重发。
+/// 先使能 EXTIOI，再解除 PCH 源屏蔽；公共 IRQ 锁串行化读改写，level 请求可重新发送。
 pub fn external_unmask() {
     iocsr_write32(ext_reg(0x200), uart_bit());
     pic_write(0x20, pic_read(0x20) & !uart_bit());
@@ -333,7 +402,11 @@ pub fn external_claim() -> Option<u32> {
     }
 }
 /// UART 设备已消除 level 请求后，清除 EXTIOI 的真实 W1C pending。
-pub fn external_complete(source: u32) {
+///
+/// # Safety
+/// source 必须来自本核真实 claim，并等于已选 UART 硬件源；调用者须持描述符锁串行控制硬件。
+/// UART 的 level 请求必须已经消除，调用期间不得迁移 CPU。
+pub unsafe fn external_complete(source: u32) {
     assert_eq!(source, crate::boot::info().interrupts.uart_source);
     iocsr_write32(ext_reg(0x400), 1 << source);
     barrier();
@@ -341,6 +414,7 @@ pub fn external_complete(source: u32) {
 /// 写入所选 virt FDT 的 GED syscon poweroff 字节。
 pub fn shutdown() -> ! {
     irq_save();
+    // SAFETY: QEMU virt 固定 GED poweroff 寄存器在永久强序 DMW 中，按硬件要求进行单字节写入。
     unsafe {
         core::ptr::write_volatile(mmio_address(0x100e001c) as *mut u8, 0x34);
     }
@@ -349,13 +423,27 @@ pub fn shutdown() -> ! {
         wait_for_interrupt();
     }
 }
+#[cfg(all(feature = "fault-test", not(feature = "refill-test")))]
 /// 触发明确的非法指令，保留真实 kernel fault 现场。
 pub fn trigger_fault() -> ! {
+    // SAFETY: 此接口有意执行非法指令并由已安装的内核异常入口终止，不访问 Rust 内存。
     unsafe {
         asm!(".word 0xffffffff", options(noreturn));
     }
 }
 
+/// 读取 DMW 之外的低虚拟地址，触发真实 TLB refill 并保留 TLBRBADV 现场。
+#[cfg(feature = "refill-test")]
+pub fn trigger_unmapped_fault() -> ! {
+    // SAFETY: 两种引导入口均启用 PG；0x1000 不属于任何 DMW，内核没有安装低地址 TLB 映射。
+    // 使用汇编执行故障 load，避免用 Rust 指针解引用表达无效地址访问。
+    unsafe {
+        asm!("ld.d {value}, {address}, 0", value = out(reg) _, address = in(reg) 0x1000usize, options(nostack));
+    }
+    panic!("unmapped load unexpectedly returned");
+}
+
+/// 接收汇编保存的本核异常现场；未启用 FP 的条件字段保持 MaybeUninit，处理器不读取它们。
 #[no_mangle]
 extern "C" fn loongarch_trap(frame: &KernelTrapFrame) {
     if (frame.estat >> 16) & 0x3f != 0 {
@@ -376,6 +464,7 @@ extern "C" fn loongarch_trap(frame: &KernelTrapFrame) {
         crate::irq::handle_external();
     }
 }
+/// 接收 refill 专用 CSR 现场并终止；TLBRERA 的 IsTLBR 位保留为真实 cause。
 #[no_mangle]
 extern "C" fn loongarch_refill(frame: &RefillFrame) -> ! {
     // refill 不产生普通 ESTAT.Ecode；cause 记录 TLBRERA.IsTLBR 的真实值。
@@ -383,10 +472,11 @@ extern "C" fn loongarch_refill(frame: &RefillFrame) -> ! {
 }
 
 #[cfg(feature = "boot-tests")]
-global_asm!(include_str!("register_test.S"));
+global_asm!(include_str!("loongarch64/register_test.S"));
 #[cfg(feature = "boot-tests")]
 extern "C" {
-    fn __test_registers(
+    /// 在有效本核计数器与异常入口下暂时改写寄存器，等待真实 timer IRQ 后恢复调用现场。
+    fn la_test_register_preservation(
         counter: *const core::sync::atomic::AtomicUsize,
         ticks: usize,
         fcc: usize,
@@ -394,21 +484,28 @@ extern "C" {
     ) -> usize;
 }
 /// 以真实 timer 返回检查寄存器、FP/FCSR、全部 FCC 图样及 FP 关闭路径。
+///
+/// # Safety
+/// 必须在已安装本核 CpuLocal、异常入口和 timer IRQ 后调用，不得持有会被中断处理器获取的锁。
+/// 当前栈和计数器必须保持有效；此函数临时使能 IRQ，期间不得迁移 CPU。
 #[cfg(feature = "boot-tests")]
-pub fn test_register_preservation() -> bool {
+pub unsafe fn test_register_preservation() -> bool {
     let counter = &crate::cpu::current().timer_interrupts;
     let saved = irq_save();
     let ticks = ((counter_frequency() / 10000).max(0x600) as usize + 3) & !3;
     let mut good = true;
     for fcc in 0..256 {
-        if unsafe { __test_registers(counter, ticks, fcc, 1) } == 0 {
+        // SAFETY: 调用者保证本核异常与 timer 已就绪；counter 来自永久本核对象，图样在八位范围内。
+        if unsafe { la_test_register_preservation(counter, ticks, fcc, 1) } == 0 {
             good = false;
             break;
         }
     }
-    if unsafe { __test_registers(counter, ticks, 0, 0) } == 0 {
+    // SAFETY: 同一永久本核计数器仍有效；FP 关闭图样使汇编跳过所有 FPR/FCSR/FCC 指令。
+    if unsafe { la_test_register_preservation(counter, ticks, 0, 0) } == 0 {
         good = false;
     }
+    // SAFETY: saved 来自本核 irq_save；汇编已经恢复本核现场，此函数未持锁且未迁移 CPU。
     unsafe {
         irq_restore(saved);
     }

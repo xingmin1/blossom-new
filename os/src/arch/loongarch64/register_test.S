@@ -1,7 +1,9 @@
-.section .text,"ax"
+.text
+
 .balign 16
-.global __test_registers
-__test_registers:
+.global la_test_register_preservation
+.type la_test_register_preservation, @function
+la_test_register_preservation:
     addi.d $sp, $sp, -192
     st.d $ra, $sp, 0
     st.d $s0, $sp, 8
@@ -194,3 +196,4 @@ __test_registers:
     ld.d $s1, $sp, 16
     addi.d $sp, $sp, 192
     jirl $zero, $ra, 0
+.size la_test_register_preservation, .-la_test_register_preservation

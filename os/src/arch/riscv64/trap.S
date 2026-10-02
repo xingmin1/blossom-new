@@ -1,5 +1,6 @@
+.text
+
 .option arch, +d
-.section .text,"ax"
 .balign 4
 .global rv_trap_entry
 rv_trap_entry:

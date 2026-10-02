@@ -1,4 +1,5 @@
-.section .text.boot,"ax"
+.section .text.boot,"ax",@progbits
+
 .option push
 .option norelax
 .macro address reg, symbol
@@ -106,7 +107,8 @@ rv_secondary_entry:
     address t0, rv_secondary_high
     jr t0
 .option pop
-.section .text,"ax"
+.text
+
 .balign 4
 rv_primary_high:
     .option push

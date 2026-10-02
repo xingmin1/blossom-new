@@ -60,9 +60,13 @@ debug: build
 
 test:
 	$(MAKE) build FEATURES=boot-tests OUTPUT=build/$(ARCH)/kernel-boot-tests.elf
-	python3 scripts/test-boot.py --arch $(ARCH) --cpus $(CPUS) --kernel build/$(ARCH)/kernel-boot-tests.elf
+	python3 scripts/test-boot.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --kernel build/$(ARCH)/kernel-boot-tests.elf
 	$(MAKE) build FEATURES=fault-test OUTPUT=build/$(ARCH)/kernel-fault-test.elf
-	python3 scripts/test-boot.py --arch $(ARCH) --cpus $(CPUS) --kernel build/$(ARCH)/kernel-fault-test.elf --fault
+	python3 scripts/test-boot.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --kernel build/$(ARCH)/kernel-fault-test.elf --fault illegal
+ifeq ($(ARCH),loongarch64)
+	$(MAKE) build FEATURES=refill-test OUTPUT=build/$(ARCH)/kernel-refill-test.elf
+	python3 scripts/test-boot.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --kernel build/$(ARCH)/kernel-refill-test.elf --fault refill
+endif
 
 clean:
 	cd os && cargo clean

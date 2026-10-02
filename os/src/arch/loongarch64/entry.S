@@ -1,10 +1,13 @@
-.section .text.entry,"ax"
+.section .text.entry,"ax",@progbits
+
 .balign 64
 .global __primary_entry
 __primary_entry:
-    # QEMU 的 a0/a1/a2 原样保留；不是 hart/DTB 协议。
+    # QEMU 的 a0/a1/a2 原样保留；CPU 身份从 CSR 读取。
     li.w $t0, 4
     csrxchg $zero, $t0, 0
+    # KS0 的零值表示尚未安装本核 CpuLocal。
+    csrwr $zero, 0x30
     la.abs $t0, __direct_base
     ori $t0, $t0, 0x11
     csrwr $t0, 0x181
@@ -34,6 +37,8 @@ __primary_entry:
 __secondary_entry:
     li.w $t0, 4
     csrxchg $zero, $t0, 0
+    # 辅核安装 CpuLocal 前也保持可检查的空基址。
+    csrwr $zero, 0x30
     # 邮箱入口为物理 PC，先跳到高别名，再打开 PG。
     la.abs $t0, .Lsecondary_high
     jirl $zero, $t0, 0

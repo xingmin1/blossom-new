@@ -11,4 +11,4 @@ mod loongarch64;
 pub use loongarch64::*;
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-compile_error!("内核只支持 riscv64 和 loongarch64 裸机目标");
+compile_error!("kernel supports only riscv64 and loongarch64 bare-metal targets");

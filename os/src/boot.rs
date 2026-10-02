@@ -1,4 +1,6 @@
-//! 启动输入与阶段二接管的物理资源；这里只记录实际区间，不提供运行期分配器。
+//! 固件资源与内核保留区的不可变快照，由 BSP 在释放 AP 前发布。
+
+use spin::Once;
 
 pub const MAX_CPUS: usize = 4;
 pub const MAX_MEMORY_REGIONS: usize = 8;
@@ -14,9 +16,9 @@ pub struct Region {
 impl Region {
     /// 构造外部资源区间，在解析边界拒绝地址溢出和空区间。
     pub fn from_size(start: usize, size: usize) -> Result<Self, &'static str> {
-        let end = start.checked_add(size).ok_or("物理资源区间溢出")?;
+        let end = start.checked_add(size).ok_or("physical region overflows")?;
         if end <= start {
-            return Err("物理资源区间为空");
+            return Err("physical region is empty");
         }
         Ok(Self { start, end })
     }
@@ -95,7 +97,7 @@ impl BootInfo {
     /// 在输入边界登记一段实际保留资源。
     pub fn reserve(&mut self, region: Region) -> Result<(), &'static str> {
         if self.reserved_count == MAX_RESERVED_REGIONS {
-            return Err("启动保留区数量超过支持容量");
+            return Err("boot reservation capacity exceeded");
         }
         self.reserved[self.reserved_count] = region;
         self.reserved_count += 1;
@@ -103,12 +105,7 @@ impl BootInfo {
     }
 }
 
-struct BootStorage(core::cell::UnsafeCell<core::mem::MaybeUninit<BootInfo>>);
-// BSP 在释放 AP 前写入一次；发布以后快照只读，AP 上线握手包含其可见性。
-unsafe impl Sync for BootStorage {}
-
-static BOOT_INFO: BootStorage =
-    BootStorage(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+static BOOT_INFO: Once<BootInfo> = Once::new();
 
 /// 从附近高地址链接符号取得完整内核物理保留区，包含栈和启动表。
 pub fn kernel_region() -> Region {
@@ -116,23 +113,23 @@ pub fn kernel_region() -> Region {
         static __kernel_virt_start: u8;
         static __kernel_virt_end: u8;
     }
-    unsafe {
-        Region {
-            start: crate::arch::virt_to_phys(core::ptr::addr_of!(__kernel_virt_start) as usize),
-            end: crate::arch::virt_to_phys(core::ptr::addr_of!(__kernel_virt_end) as usize),
-        }
+    Region {
+        start: crate::arch::virt_to_phys(core::ptr::addr_of!(__kernel_virt_start) as usize),
+        end: crate::arch::virt_to_phys(core::ptr::addr_of!(__kernel_virt_end) as usize),
     }
 }
 
-/// 发布已解析、已登记内核拥有区间的唯一启动快照。
+/// 发布实际固件资源和当前内核拥有的物理区间；AP 读取以前完成初始化。
 ///
-/// # 安全
-/// 只能由 BSP 在 AP 尚未发布时写入一次，之后不得修改。
+/// # Safety
+/// 只能由 BSP 在 AP 尚未释放、IRQ 关闭时执行一次。info 必须来自选定机器的
+/// 实际固件，已验证数组计数、物理区间和设备寄存器，并包含内核保留区。
 pub unsafe fn publish(info: BootInfo) {
-    (*BOOT_INFO.0.get()).write(info);
+    assert!(BOOT_INFO.get().is_none(), "BootInfo is already published");
+    BOOT_INFO.call_once(|| info);
 }
 
-/// 返回初始化顺序已保证存在的真实启动快照，不在每层重复检查 ready。
+/// 借用已发布的真实启动资源；发布前调用会在这个边界失败。
 pub fn info() -> &'static BootInfo {
-    unsafe { (*BOOT_INFO.0.get()).assume_init_ref() }
+    BOOT_INFO.get().expect("BootInfo has not been published")
 }

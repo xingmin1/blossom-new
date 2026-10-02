@@ -89,6 +89,7 @@ impl<'a> FdtData<'a> {
         self.remaining().is_empty()
     }
 
+    /// 仅消费当前连续的 NOP token，不把实际节点或结构结束标记当作填充。
     pub fn skip_nops(&mut self) {
         while let Some(crate::node::FDT_NOP) = self.peek_u32().map(|n| n.get()) {
             let _ = self.u32();

@@ -1,7 +1,9 @@
+.text
+
 .option arch, +d
-.section .text,"ax"
 .balign 4
 .global rv_register_roundtrip
+.type rv_register_roundtrip, @function
 rv_register_roundtrip:
     addi sp, sp, -112
     sd ra, 0(sp)
@@ -77,3 +79,4 @@ rv_register_roundtrip:
     ld s5, 48(sp)
     addi sp, sp, 112
     ret
+.size rv_register_roundtrip, .-rv_register_roundtrip

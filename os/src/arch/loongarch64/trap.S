@@ -1,7 +1,8 @@
-.section .text,"ax"
+.text
+
 .balign 64
-.global __kernel_trap
-__kernel_trap:
+.global la_kernel_trap
+la_kernel_trap:
     addi.d $sp, $sp, -{frame_size}
     st.d $r0, $sp, {gpr}+0*8
     st.d $r1, $sp, {gpr}+1*8
@@ -50,7 +51,7 @@ __kernel_trap:
     st.d $t0, $sp, {cpu_base}
     ld.d $t0, $sp, {euen}
     andi $t0, $t0, 1
-    beqz $t0, .Lfp_saved
+    beqz $t0, .Lla_fp_saved
     fst.d $f0, $sp, {fpr}+0*8
     fst.d $f1, $sp, {fpr}+1*8
     fst.d $f2, $sp, {fpr}+2*8
@@ -101,14 +102,14 @@ __kernel_trap:
     st.d $t0, $sp, {fcc}+6*8
     movcf2gr $t0, $fcc7
     st.d $t0, $sp, {fcc}+7*8
-.Lfp_saved:
+.Lla_fp_saved:
     move $a0, $sp
     bl loongarch_trap
     ld.d $t0, $sp, {euen}
     csrwr $t0, 2
     ld.d $t0, $sp, {euen}
     andi $t0, $t0, 1
-    beqz $t0, .Lfp_restored
+    beqz $t0, .Lla_fp_restored
     fld.d $f0, $sp, {fpr}+0*8
     fld.d $f1, $sp, {fpr}+1*8
     fld.d $f2, $sp, {fpr}+2*8
@@ -159,7 +160,7 @@ __kernel_trap:
     movgr2cf $fcc6, $t0
     ld.d $t0, $sp, {fcc}+7*8
     movgr2cf $fcc7, $t0
-.Lfp_restored:
+.Lla_fp_restored:
     ld.d $t0, $sp, {era}
     csrwr $t0, 6
     ld.d $t0, $sp, {prmd}
@@ -200,8 +201,8 @@ __kernel_trap:
     ertn
 
 .balign 64
-.global __kernel_refill
-__kernel_refill:
+.global la_kernel_refill
+la_kernel_refill:
     # refill 自动处于 DA；高地址栈仍以物理掩码可访问。
     addi.d $sp, $sp, -{refill_size}
     st.d $r0, $sp, {refill_gpr}+0*8
