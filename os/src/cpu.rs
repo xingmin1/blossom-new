@@ -131,7 +131,7 @@ pub fn get(id: usize) -> &'static CpuLocal {
     unsafe { &*CPU_LOCALS.0.get().cast::<CpuLocal>().add(id) }
 }
 
-/// 在当前核的异常和本地中断设施就绪后发布上线。
+/// 在本核已能服务中断后发布上线，使等待者的 acquire 观察对应真实可用状态。
 pub fn publish_online() {
     current().online.store(true, Ordering::Release);
 }

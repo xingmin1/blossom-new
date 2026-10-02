@@ -36,8 +36,8 @@ pub extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
     irq::initialize(resources);
     unsafe { irq::register_uart(console::uart_handler, core::ptr::null_mut()) };
     irq::enable_uart();
-    cpu::publish_online();
     arch::enable_interrupts();
+    cpu::publish_online();
 
     println!("BOOT arch={} cpus={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
         arch::NAME, resources.cpu_count, arg0, arg1, arg2, resources.dtb.start, resources.dtb.end);
@@ -68,8 +68,8 @@ pub extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
 pub extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
     unsafe { arch::install_cpu_local(local) };
     arch::init_current_cpu();
-    cpu::publish_online();
     arch::enable_interrupts();
+    cpu::publish_online();
     #[cfg(feature = "boot-tests")]
     boot_tests::secondary();
     #[cfg(not(feature = "boot-tests"))]
