@@ -1,0 +1,131 @@
+.section .text.boot,"ax"
+.option push
+.option norelax
+.macro address reg, symbol
+    lla \reg, 991f
+    ld \reg, 0(\reg)
+    j 992f
+    .balign 8
+991: .quad \symbol
+992:
+.endm
+.balign 4
+.global __primary_entry_phys
+__primary_entry_phys:
+    csrw sie, zero
+    csrci sstatus, 2
+    csrw satp, zero
+    csrw sscratch, zero
+    // a0/a1/a2 保持固件原始值；启动构表只使用临时寄存器。
+    address t0, __bss_phys_start
+    address t1, __bss_phys_end
+1:  bgeu t0, t1, 2f
+    sd zero, 0(t0)
+    addi t0, t0, 8
+    j 1b
+2:  address t0, __bootstrap_root_phys
+    address t1, __bootstrap_image_phys
+    mv t2, t0
+    mv t4, t1
+    li t3, 512
+3:  sd zero, 0(t2)
+    sd zero, 0(t4)
+    addi t2, t2, 8
+    addi t4, t4, 8
+    addi t3, t3, -1
+    bnez t3, 3b
+    // 临时低映射仅供进入分页的连续取指，永不修改这份 AP 表。
+    address t2, __phys_ram_base
+    srli t3, t2, 2
+    ori t3, t3, 0xcf
+    srli t4, t2, 30
+    slli t4, t4, 3
+    add t4, t0, t4
+    sd t3, 0(t4)
+    address t4, __direct_base
+    srli t4, t4, 30
+    andi t4, t4, 511
+    slli t4, t4, 3
+    add t4, t0, t4
+    li t5, 64
+4:  sd t3, 0(t4)
+    li t6, 0x10000000
+    add t3, t3, t6
+    addi t4, t4, 8
+    addi t5, t5, -1
+    bnez t5, 4b
+    address t4, __mmio_base
+    srli t4, t4, 30
+    andi t4, t4, 511
+    slli t4, t4, 3
+    add t4, t0, t4
+    li t3, 0xc7
+    sd t3, 0(t4)
+    address t4, __kernel_virt_start
+    srli t4, t4, 30
+    andi t4, t4, 511
+    slli t4, t4, 3
+    add t4, t0, t4
+    srli t3, t1, 2
+    ori t3, t3, 1
+    sd t3, 0(t4)
+    address t2, __kernel_phys_start
+    srli t2, t2, 2
+    ori t2, t2, 0xcf
+    li t3, 512
+5:  sd t2, 0(t1)
+    li t4, 0x80000
+    add t2, t2, t4
+    addi t1, t1, 8
+    addi t3, t3, -1
+    bnez t3, 5b
+    fence rw, rw
+    srli t0, t0, 12
+    li t1, 8
+    slli t1, t1, 60
+    or t0, t0, t1
+    sfence.vma
+    csrw satp, t0
+    address t0, rv_primary_high
+    jr t0
+.global rv_secondary_entry
+rv_secondary_entry:
+    csrw sie, zero
+    csrci sstatus, 2
+    csrw sscratch, zero
+    // HSM a1 是 CpuBoot 的物理指针，不是 DTB。
+    ld sp, {boot_stack}(a1)
+    ld tp, {boot_local}(a1)
+    address t0, __bootstrap_root_phys
+    srli t0, t0, 12
+    li t1, 8
+    slli t1, t1, 60
+    or t0, t0, t1
+    sfence.vma
+    csrw satp, t0
+    address t0, rv_secondary_high
+    jr t0
+.option pop
+.section .text,"ax"
+.balign 4
+rv_primary_high:
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+    la sp, BOOT_STACKS
+    li t0, {stack_size}
+    add sp, sp, t0
+    mv tp, zero
+    tail primary_main
+rv_secondary_high:
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+    la t0, RV_FINAL_SATP
+    ld t0, 0(t0)
+    csrw satp, t0
+    sfence.vma
+    mv a0, tp
+    tail secondary_main

@@ -1,0 +1,45 @@
+OUTPUT_ARCH(riscv)
+ENTRY(__primary_entry_phys)
+__kernel_phys_start = 0x80200000;
+__kernel_virt_start = 0xffffffff80000000;
+__direct_base = 0xffffffd600000000;
+__mmio_base = 0xffffffc000000000;
+__phys_ram_base = 0x80000000;
+PHDRS { boot PT_LOAD FLAGS(5); text PT_LOAD FLAGS(5); rodata PT_LOAD FLAGS(4); data PT_LOAD FLAGS(6); }
+SECTIONS {
+  . = __kernel_phys_start;
+  .boot : { KEEP(*(.text.boot)) } :boot
+  . = __kernel_virt_start + ALIGN(SIZEOF(.boot), 0x200000);
+  .text : AT(ADDR(.text) - __kernel_virt_start + __kernel_phys_start) {
+    *(.text .text.*)
+  } :text
+  . = ALIGN(4096);
+  .rodata : AT(ADDR(.rodata) - __kernel_virt_start + __kernel_phys_start) { *(.rodata .rodata.*) } :rodata
+  . = ALIGN(4096);
+  .data : AT(ADDR(.data) - __kernel_virt_start + __kernel_phys_start) {
+    *(.data .data.*) *(.sdata .sdata.*)
+    PROVIDE(__global_pointer$ = . + 0x800);
+  } :data
+  . = ALIGN(4096);
+  __boot_reserved_phys_start = . - __kernel_virt_start + __kernel_phys_start;
+  .boot.resources (NOLOAD) : AT(ADDR(.boot.resources) - __kernel_virt_start + __kernel_phys_start) {
+    *(.boot.stacks) . = ALIGN(4096); *(.boot.tables)
+  } :data
+  __boot_reserved_phys_end = . - __kernel_virt_start + __kernel_phys_start;
+  . = ALIGN(16);
+  __bss_start = .;
+  .bss (NOLOAD) : AT(ADDR(.bss) - __kernel_virt_start + __kernel_phys_start) { *(.bss .bss.*) *(.sbss .sbss.*) *(COMMON) }
+  . = ALIGN(16);
+  __bss_end = .;
+  __kernel_virt_end = .;
+  __kernel_phys_end = . - __kernel_virt_start + __kernel_phys_start;
+  __boot_stacks_phys = BOOT_STACKS - __kernel_virt_start + __kernel_phys_start;
+  __bootstrap_root_phys = RV_BOOT_ROOT - __kernel_virt_start + __kernel_phys_start;
+  __bootstrap_image_phys = RV_BOOT_IMAGE - __kernel_virt_start + __kernel_phys_start;
+  __bss_phys_start = __bss_start - __kernel_virt_start + __kernel_phys_start;
+  __bss_phys_end = __bss_end - __kernel_virt_start + __kernel_phys_start;
+  __secondary_entry_phys = rv_secondary_entry;
+  /DISCARD/ : { *(.eh_frame) }
+}
+ASSERT(SIZEOF(.boot) <= 0x200000, "physical entry exceeds bootstrap section")
+ASSERT(__kernel_phys_end - __kernel_phys_start < 0x40000000, "image exceeds bootstrap mapping")
