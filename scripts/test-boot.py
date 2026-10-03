@@ -166,7 +166,7 @@ def run(args):
 
 
 def main():
-    """解析唯一运行目标，不构建内核或自动修复宿主环境。"""
+    """解析唯一运行目标并拒绝日志覆盖输入 ELF，不构建或自动修复宿主环境。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
     parser.add_argument("--cpus", required=True, type=int, choices=(1, 2, 4))
@@ -185,7 +185,8 @@ def main():
     if args.output is None:
         memory_name = quote(args.memory, safe="")
         args.output = args.kernel.with_name(f"{args.kernel.name}.{args.arch}.{args.cpus}.{memory_name}.{args.fault or 'boot'}.log")
-    if args.output.resolve() == args.kernel.resolve():
+    if (args.output.resolve() == args.kernel.resolve()
+            or (args.output.exists() and args.output.samefile(args.kernel))):
         parser.error("--output cannot overwrite --kernel")
     try:
         run(args)

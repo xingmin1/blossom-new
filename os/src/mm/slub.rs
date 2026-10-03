@@ -28,7 +28,6 @@ pub(crate) struct Geometry {
     pub(crate) objects: usize,
 }
 
-#[derive(Clone, Copy)]
 struct CpuSlab {
     active: usize,
     local: usize,
@@ -79,7 +78,7 @@ impl CpuSlab {
         ticket
     }
 
-    /// 将固定控制字段一次复制到票据，不访问任何对象或 slab 链。
+    /// 摘离本核控制字段，将一次归并责任移交票据，不访问任何对象或 slab 链。
     fn take_all(&mut self) -> FlushTicket {
         let ticket = FlushTicket {
             active: self.take_active(),
@@ -91,7 +90,6 @@ impl CpuSlab {
     }
 }
 
-#[derive(Clone, Copy)]
 struct ActiveTicket {
     head: usize,
     local: usize,
@@ -99,7 +97,6 @@ struct ActiveTicket {
     count: usize,
 }
 
-#[derive(Clone, Copy)]
 struct FlushTicket {
     active: ActiveTicket,
     partial: usize,
@@ -632,7 +629,7 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
     put_partials(class, drained);
 }
 
-/// 持续时间固定的本核 callback，只复制十二份控制字段到发送者稳定票据。
+/// 在本核短保护下摘离十二份控制字段，将一次归并责任移交发送者稳定票据。
 ///
 /// # Safety
 /// argument 指向同步 cpu::call 返回前有效、此 callback 独占写入的十二项票据；
@@ -651,7 +648,7 @@ unsafe fn detach_cpu(argument: *mut ()) {
 /// 调用者不得持 MM 短锁；并发对象操作可在返回前重新建立缓存。
 pub fn flush_all() {
     for owner in 0..cpu::count() {
-        let mut tickets = [FlushTicket::new(); SIZES.len()];
+        let mut tickets = [const { FlushTicket::new() }; SIZES.len()];
         // SAFETY: owner 属于固定在线 CPU 表，调用者可服务 IPI 且不持 MM 锁；
         // 栈数组保持有效并只由该同步 callback 写入，call 完成后才读取。
         unsafe {
@@ -661,7 +658,7 @@ pub fn flush_all() {
                 (&mut tickets as *mut [FlushTicket; SIZES.len()]).cast(),
             )
         };
-        for (class, ticket) in tickets.iter().enumerate() {
+        for (class, ticket) in IntoIterator::into_iter(tickets).enumerate() {
             deactivate(class, ticket.active);
             put_partials(class, ticket.partial);
         }
