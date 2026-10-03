@@ -14,6 +14,9 @@ use core::marker::PhantomData;
 
 pub const STACK_SIZE: usize = 64 * 1024;
 
+pub(crate) const KICK_RESCHEDULE: usize = 1 << 0;
+pub(crate) const KICK_TIMER_REPROGRAM: usize = 1 << 1;
+
 /// 链接期保留的独立启动栈，不由旧页分配器申请。
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -104,6 +107,21 @@ pub struct CpuLocal {
     pub(crate) hardirq_depth: AtomicUsize,
     pub(crate) bh_depth: AtomicUsize,
     pub(crate) preempt_depth: AtomicUsize,
+    pub(crate) accounting: crate::accounting::CpuAccount,
+    pub(crate) time_event: crate::time::LocalEvent,
+    pub(crate) need_resched: AtomicBool,
+    pub(crate) idle: AtomicBool,
+    kick_reasons: AtomicUsize,
+    #[cfg(feature = "execution-tests")]
+    test_idle_pause: AtomicUsize,
+    #[cfg(feature = "execution-tests")]
+    test_ipi_pause: AtomicUsize,
+    #[cfg(feature = "execution-tests")]
+    test_idle_waits: AtomicUsize,
+    #[cfg(feature = "execution-tests")]
+    test_wait_completions: AtomicUsize,
+    #[cfg(feature = "execution-tests")]
+    test_timer_reprograms: AtomicUsize,
     calls: SpinLock<CallQueue>,
 }
 
@@ -131,8 +149,51 @@ impl CpuLocal {
             hardirq_depth: AtomicUsize::new(0),
             bh_depth: AtomicUsize::new(0),
             preempt_depth: AtomicUsize::new(0),
+            accounting: crate::accounting::CpuAccount::new(),
+            time_event: crate::time::LocalEvent::new(),
+            need_resched: AtomicBool::new(false),
+            idle: AtomicBool::new(false),
+            kick_reasons: AtomicUsize::new(0),
+            #[cfg(feature = "execution-tests")]
+            test_idle_pause: AtomicUsize::new(0),
+            #[cfg(feature = "execution-tests")]
+            test_ipi_pause: AtomicUsize::new(0),
+            #[cfg(feature = "execution-tests")]
+            test_idle_waits: AtomicUsize::new(0),
+            #[cfg(feature = "execution-tests")]
+            test_wait_completions: AtomicUsize::new(0),
+            #[cfg(feature = "execution-tests")]
+            test_timer_reprograms: AtomicUsize::new(0),
             calls: SpinLock::new(CallQueue::new()),
         }
+    }
+
+    /// 只观察未处理原因；最终等待检查不得消费通知。
+    pub(crate) fn kick_pending(&self) -> bool {
+        self.kick_reasons.load(Ordering::Acquire) != 0
+    }
+
+    /// 在最终队列与提示复查之后等待一次硬件事件，返回保持 IRQ 关闭。
+    ///
+    /// # Safety
+    /// self 必须属于本核；必须在 scheduler 栈上、IRQ 关闭且无普通任务、锁或
+    /// IRQ/preempt guard 时调用。调用者已发表 idle 并复查队列，允许临时服务 IRQ。
+    pub(crate) unsafe fn idle_once(&self) {
+        assert!(core::ptr::eq(self, current()), "idle uses another CPU");
+        #[cfg(feature = "execution-tests")]
+        self.test_idle_waits.fetch_add(1, Ordering::Release);
+        // SAFETY: 调用者保证本核无锁 IRQ-off 边界；字段永久有效，架构重查但不清通知，
+        // 临时开放 IRQ 时不存在依赖 IRQ 关闭的普通借用；测试计数仅以原子访问。
+        unsafe {
+            #[cfg(feature = "execution-tests")]
+            crate::arch::idle_once(
+                &self.kick_reasons,
+                &self.need_resched,
+                &self.test_wait_completions,
+            );
+            #[cfg(not(feature = "execution-tests"))]
+            crate::arch::idle_once(&self.kick_reasons, &self.need_resched);
+        };
     }
 }
 
@@ -233,9 +294,18 @@ pub unsafe fn start_secondaries() {
     }
 }
 
-/// 记录真实本地 timer 中断；硬件确认由架构 handler 完成，内存验收 hook 只在专用 feature 下运行。
+/// 硬 timer 只记录中断并提示普通任务在安全点让出，不在 IRQ 栈上调度。
 pub fn handle_timer() {
-    current().timer_interrupts.fetch_add(1, Ordering::Relaxed);
+    let local = current();
+    assert!(
+        0 < local.hardirq_depth.load(Ordering::Relaxed),
+        "timer handler requires hard IRQ context"
+    );
+    local.timer_interrupts.fetch_add(1, Ordering::Relaxed);
+    if local.current_task_id.load(Ordering::Relaxed) != 0 {
+        local.need_resched.store(true, Ordering::Release);
+    }
+    crate::time::handle_timer();
     #[cfg(feature = "memory-tests")]
     crate::mm::tests::timer_irq();
 }
@@ -244,6 +314,18 @@ pub fn handle_timer() {
 pub fn handle_ipi() {
     let local = current();
     local.ipi_interrupts.fetch_add(1, Ordering::Relaxed);
+    // 硬件已确认后一次取走旧位；处理期间远端再置位仍留在原子中，并发送新的 IPI。
+    let reasons = local.kick_reasons.swap(0, Ordering::AcqRel);
+    #[cfg(feature = "execution-tests")]
+    test_pause_boundary(&local.test_ipi_pause);
+    if reasons & KICK_RESCHEDULE != 0 {
+        local.need_resched.store(true, Ordering::Release);
+    }
+    if reasons & KICK_TIMER_REPROGRAM != 0 {
+        crate::time::reprogram_current();
+        #[cfg(feature = "execution-tests")]
+        local.test_timer_reprograms.fetch_add(1, Ordering::Release);
+    }
     loop {
         // SAFETY: 队列短锁覆盖 pop；入队协议保证所有未完成节点仍然存活。
         let request = unsafe { local.calls.lock().pop() };
@@ -305,10 +387,16 @@ pub fn pending_calls(target: usize) -> usize {
     count
 }
 
-/// 以本地硬件等待保持 IRQ 可服务，不执行任务调度或申请运行期内存。
-pub fn idle() -> ! {
-    loop {
-        crate::arch::wait_for_interrupt();
+/// 先发布固定软件原因再发送硬件 IPI；允许持调度锁调用，不等待目标执行。
+pub(crate) fn kick(target: usize, reason: usize) {
+    assert!(
+        reason != 0 && reason & !(KICK_RESCHEDULE | KICK_TIMER_REPROGRAM) == 0,
+        "invalid CPU kick reason"
+    );
+    let local = get(target);
+    local.kick_reasons.fetch_or(reason, Ordering::Release);
+    if local.online.load(Ordering::Acquire) {
+        crate::arch::send_ipi(local.hardware_id);
     }
 }
 
@@ -327,6 +415,9 @@ impl HardIrqGuard {
         );
         let local = current();
         increment_depth(&local.hardirq_depth);
+        if local.hardirq_depth.load(Ordering::Relaxed) == 1 {
+            crate::accounting::irq_enter();
+        }
         Self {
             local,
             _local: PhantomData,
@@ -338,6 +429,9 @@ impl Drop for HardIrqGuard {
     /// 保持原 IRQ 关闭状态并结束本 CPU 的硬中断嵌套，不触发调度。
     fn drop(&mut self) {
         assert!(!crate::arch::irq_enabled(), "hard IRQ exit has IRQ enabled");
+        if self.local.hardirq_depth.load(Ordering::Relaxed) == 1 {
+            crate::accounting::irq_exit();
+        }
         decrement_depth(&self.local.hardirq_depth);
     }
 }
@@ -385,4 +479,97 @@ pub(crate) fn decrement_depth(depth: &AtomicUsize) {
             value.checked_sub(1)
         })
         .expect("execution depth underflow");
+}
+
+/// 可武装的一次真实边界停点，状态不参与生产调度或通知协议。
+#[cfg(feature = "execution-tests")]
+#[derive(Clone, Copy)]
+pub(crate) enum TestPause {
+    Idle,
+    Ipi,
+}
+
+/// 选择固定 CPU 上独立的验收停点状态。
+#[cfg(feature = "execution-tests")]
+fn test_pause_state(target: usize, boundary: TestPause) -> &'static AtomicUsize {
+    let local = get(target);
+    match boundary {
+        TestPause::Idle => &local.test_idle_pause,
+        TestPause::Ipi => &local.test_ipi_pause,
+    }
+}
+
+/// 武装尚未使用的单次停点，测试必须由另一 CPU 负责及时释放。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_arm_pause(target: usize, boundary: TestPause) {
+    test_pause_state(target, boundary)
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .expect("CPU test pause already armed");
+}
+
+/// 观察目标是否已经在真实 IRQ-off 边界停下。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_is_paused(target: usize, boundary: TestPause) -> bool {
+    test_pause_state(target, boundary).load(Ordering::Acquire) == 2
+}
+
+/// 释放已经到达的停点，不改变软件通知或硬件 pending。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_release_pause(target: usize, boundary: TestPause) {
+    test_pause_state(target, boundary)
+        .compare_exchange(2, 3, Ordering::Release, Ordering::Relaxed)
+        .expect("CPU test pause has not been reached");
+}
+
+/// 仅在已武装时停留于本核无锁边界，以统一单调时钟限制验收等待。
+#[cfg(feature = "execution-tests")]
+fn test_pause_boundary(state: &AtomicUsize) {
+    if state
+        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    assert!(
+        !crate::arch::irq_enabled(),
+        "CPU test pause requires IRQ off"
+    );
+    let deadline = crate::time::now()
+        .checked_add(crate::time::Duration::from_secs(5))
+        .expect("CPU test pause deadline overflows");
+    while state.load(Ordering::Acquire) != 3 {
+        assert!(crate::time::now() < deadline, "CPU test pause timed out");
+        spin_loop();
+    }
+    state.store(0, Ordering::Release);
+}
+
+/// 在 idle 发表且放开调度锁后、最终队列与提示检查之前提供单次停点。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_idle_boundary() {
+    test_pause_boundary(&current().test_idle_pause);
+}
+
+/// 读取真实原因位以验证 handler 处理期间新通知未被抹掉。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_pending_kicks(target: usize) -> usize {
+    get(target).kick_reasons.load(Ordering::Acquire)
+}
+
+/// 读取真实重编程原因的已处理次数，不以置位次数代替收件执行。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_timer_reprograms(target: usize) -> usize {
+    get(target).test_timer_reprograms.load(Ordering::Acquire)
+}
+
+/// 读取进入架构等待协议的次数，软件 pending 可使入口直接返回而不执行等待指令。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_idle_waits(target: usize) -> usize {
+    get(target).test_idle_waits.load(Ordering::Acquire)
+}
+
+/// 读取本核真正执行 WFI/IDLE 并返回的次数，软件提示跳过等待时不增加。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_wait_completions(owner: usize) -> usize {
+    get(owner).test_wait_completions.load(Ordering::Acquire)
 }

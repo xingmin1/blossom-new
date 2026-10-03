@@ -394,7 +394,7 @@ fn discover_tree(
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        info.counter_frequency = crate::arch::counter_frequency();
+        info.counter_frequency = crate::arch::boot_counter_frequency();
     }
     if info.counter_frequency == 0 {
         return Err("hardware counter frequency is zero");

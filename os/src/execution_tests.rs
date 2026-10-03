@@ -1,7 +1,8 @@
 //! 在生产任务栈上验证切换、迁核与离栈归还，协调者也通过普通 yield 让出执行权。
 
+mod time;
 mod wait;
-use crate::{arch, cpu, mm, sched, task};
+use crate::{arch, cpu, mm, sched, task, time as clock};
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -30,11 +31,13 @@ impl Drop for LocalDrop {
     }
 }
 
-/// 对协作条件实施有限硬件时间约束，每次重试都走生产调度安全点。
+/// 对协作条件实施有限单调时间约束，每次重试都走生产调度安全点。
 fn until(mut predicate: impl FnMut() -> bool, name: &str) {
-    let end = arch::read_counter().wrapping_add(arch::counter_frequency() * 5);
+    let end = clock::now()
+        .checked_add(clock::Duration::from_secs(5))
+        .expect("execution deadline overflow");
     while !predicate() {
-        assert!(arch::read_counter() < end, "execution timeout: {}", name);
+        assert!(clock::now() < end, "execution timeout: {}", name);
         sched::yield_now();
     }
 }
@@ -251,6 +254,7 @@ pub(crate) fn run() -> ! {
     test_switch_and_return();
     test_migration();
     wait::run();
+    time::run();
     crate::println!("EXECUTION TESTS PASS");
     arch::shutdown();
 }

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""运行给定执行测试 ELF，核对真实等待同步或原子上下文中的切换拒绝。"""
+"""运行给定执行测试 ELF，核对 X01–X12 的真实执行、等待与时间证据。
+
+正常镜像按唯一顺序输出 X01–X08、X10–X12；单核仅 X02 明确 N/A。
+X10 检查重新武装后的硬 IRQ 延后切换与架构寄存器保存，X11 检查同一时间
+算法的维护、快照交错拒绝重试及边界，X12 检查执行/IRQ/scheduler/idle 四账、
+迁核和不依靠 timer tick 的远端 kick 与实际等待指令完成。故障镜像只接受 X09 真实拒绝。
+"""
 
 import argparse
 import os
@@ -52,7 +58,7 @@ def check_header(args, lines):
 
 
 def check_execution(args):
-    """核对真实切换、等待窗口、无分配进度、同步可见性及持观察者时的离栈归页。"""
+    """核对唯一有序记录、真实切换与等待，以及统一时间和四账的观测关系。"""
     lines = args.output.read_text(encoding="utf-8", errors="replace").splitlines()
     begin, cpu_locals = check_header(args, lines)
     require(lines.count("EXECUTION TESTS PASS") == 1,
@@ -64,17 +70,24 @@ def check_execution(args):
     for index, line in enumerate(lines):
         reject_failure(line.encode("utf-8"))
         require(not line.startswith("EXECUTION X09"), "normal image armed a switch fault")
+        require(not line.startswith("EXECUTION TESTS PASS") or line == "EXECUTION TESTS PASS",
+                "malformed execution success marker")
         if line.startswith("PASS execution-"):
-            match = re.fullmatch(r"PASS execution-(X0[1-8]) (.+)", line)
+            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-2]) (.+)", line)
             require(match is not None and begin < index < done, "unexpected execution pass: " + line)
             name, payload = match.groups()
             require(name not in records, "duplicate execution record: " + name)
             records[name] = fields(payload)
+        require(not line.startswith("EXECUTION X") or line.startswith("EXECUTION X02 "),
+                "unexpected execution evidence: " + line)
         if line.startswith("EXECUTION X02"):
             require(begin < index < done and line.startswith("EXECUTION X02 "),
                     "migration evidence is out of order")
             require("X01" in records and "X02" not in records, "migration evidence preceded X01 or followed X02")
             hops.append(fields(line[len("EXECUTION X02 "):]))
+    expected = ["X01"] + ([] if args.cpus == 1 else ["X02"]) + [
+        "X03", "X04", "X05", "X06", "X07", "X08", "X10", "X11", "X12"]
+    require(list(records) == expected, "missing or out-of-order execution records")
     first = records["X01"]
     require(set(first) == {"task0", "task1", "stack0", "stack1", "rounds", "registers",
                            "deep_frames", "starts", "drops", "order", "reclaimed", "observers"},
@@ -113,9 +126,7 @@ def check_execution(args):
                     and hop["cpu"] == cpu and hop["local"] == cpu_locals[cpu]
                     and hop["stack"] == stack,
                     "migration changed identity, stack, or destination CPU base")
-    expected = ["X01"] + ([] if args.cpus == 1 else ["X02"]) + [
-        "X03", "X04", "X05", "X06", "X07", "X08"]
-    require(list(records) == expected, "missing or out-of-order execution records")
+    check_time(args, records)
     check_waiting(args, records)
 
 
@@ -165,6 +176,50 @@ def check_waiting(args, records):
             and eighth["drops"] == 1 and eighth["retained"] == 2
             and eighth["stack_pages"] == 16 and eighth["result"] == sum(range(1, 9)),
             "X08 did not repay the stack with observers alive or consume the real join result")
+
+
+def check_time(args, records):
+    """核对时间四账、真实快照拒绝重试和等待指令完成，并区分架构与 CPU 数。"""
+    tenth = records["X10"]
+    require(set(tenth) == {"irq", "deferred", "safe_points", "registers"}
+            and all(0 <= value < (1 << 64) for value in tenth.values())
+            and 1 <= tenth["irq"] and tenth["deferred"] == 1
+            and 1 <= tenth["safe_points"]
+            and (2 if args.arch == "riscv64" else 1) <= tenth["registers"],
+            "X10 did not establish IRQ deferral, legal safe points, and register preservation")
+    eleventh = records["X11"]
+    require(set(eleventh) == {"frequencies", "cases", "updates", "readers", "overlaps", "retries",
+                              "monotonic", "wrap", "fraction", "max_delta"}
+            and all(0 <= value < (1 << 64) for value in eleventh.values())
+            and 4 <= eleventh["frequencies"] <= eleventh["cases"]
+            and 1 <= eleventh["updates"]
+            and (1 if args.cpus == 1 else 2) <= eleventh["readers"]
+            and all(eleventh[name] == 1 for name in ("monotonic", "wrap", "fraction", "max_delta")),
+            "X11 did not establish real maintenance/readers and production time arithmetic boundaries")
+    if args.cpus == 1:
+        require(eleventh["overlaps"] == 0 and eleventh["retries"] == 0,
+                "single-CPU X11 reported cross-CPU snapshot overlap or rejection")
+    else:
+        require(1 <= eleventh["overlaps"] and 1 <= eleventh["retries"],
+                "multi-CPU X11 did not overlap a real update or reject the changed snapshot sequence")
+    twelfth = records["X12"]
+    require(set(twelfth) == {"task_ns", "wall_ns", "offcpu_ns", "irq_ns", "scheduler_ns",
+                             "idle_ns", "migrations", "kick_rounds", "waits", "no_tick"}
+            and all(0 <= value < (1 << 64) for value in twelfth.values())
+            and 0 < twelfth["task_ns"] < twelfth["wall_ns"]
+            and 0 < twelfth["offcpu_ns"] <= twelfth["wall_ns"]
+            and twelfth["task_ns"] + twelfth["offcpu_ns"] <= twelfth["wall_ns"]
+            and 0 < twelfth["irq_ns"] and 0 < twelfth["scheduler_ns"],
+            "X12 did not establish bounded execution time excluding off-CPU time and separate IRQ/scheduler accounts")
+    if args.cpus == 1:
+        require(twelfth["migrations"] == 0 and twelfth["kick_rounds"] == 0
+                and twelfth["no_tick"] == 0 and twelfth["waits"] == 0,
+                "single-CPU X12 reported migration or remote hardware-wait/kick evidence")
+    else:
+        require(0 < twelfth["idle_ns"] and 2 <= twelfth["migrations"]
+                and 4 <= twelfth["kick_rounds"] <= twelfth["waits"]
+                and twelfth["no_tick"] == 1,
+                "multi-CPU X12 did not establish real hardware waits, migration, and tick-free asynchronous kicks")
 
 
 def fault_reason(args):

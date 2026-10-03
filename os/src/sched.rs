@@ -3,14 +3,13 @@
 pub mod context;
 
 use alloc::sync::Arc;
-use core::hint::spin_loop;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
-use crate::cpu;
 use crate::sync::{IrqSaveGuard, SpinLock};
-use crate::task::{ActiveWait, Placement, Resources, State, SwitchIntent, Task};
+use crate::task::{ActiveWait, Placement, Resources, Scheduling, State, SwitchIntent, Task};
 use crate::wait::WaitId;
+use crate::{accounting, cpu, time};
 
 struct Scheduler {
     live_head: *const Task,
@@ -22,6 +21,17 @@ struct Scheduler {
 unsafe impl Send for Scheduler {}
 
 static SCHED_LOCK: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+
+/// 归属与一次测试迁核目标使用同一准入判断，队列选择和 idle 重检不能分歧。
+fn allowed_on(data: &Scheduling, owner: usize) -> bool {
+    let allowed = match data.placement {
+        Placement::Any => true,
+        Placement::Cpu(cpu) => cpu == owner,
+    };
+    #[cfg(feature = "execution-tests")]
+    let allowed = allowed && data.next_cpu.is_none_or(|cpu| cpu == owner);
+    allowed
+}
 
 impl Scheduler {
     /// 两组 intrusive 链表无需引导时或锁内分配。
@@ -47,7 +57,7 @@ impl Scheduler {
         self.push_ready(task);
     }
 
-    /// 对不在 ready 中的活 Ready 任务尾插，不转移活登记拥有权。
+    /// 锁内发表独立 ready 节点，随后向所有合法目标发不等待的调度提示。
     fn push_ready(&mut self, task: *const Task) {
         // SAFETY: 私有调用点保证 task 活着且为 Ready、不在 ready；锁独占独立 ready 链接。
         unsafe {
@@ -61,6 +71,11 @@ impl Scheduler {
                 (*(*self.ready_tail).scheduling.get()).ready_next = task;
             }
             self.ready_tail = task;
+            for owner in 0..cpu::count() {
+                if allowed_on(data, owner) && cpu::get(owner).online.load(Ordering::Acquire) {
+                    cpu::kick(owner, cpu::KICK_RESCHEDULE);
+                }
+            }
         }
     }
 
@@ -90,13 +105,7 @@ impl Scheduler {
         while !task.is_null() {
             // SAFETY: ready 只包含活登记节点，锁保护状态和链接，不访问 ctx。
             let data = unsafe { &mut *(*task).scheduling.get() };
-            let allowed = match data.placement {
-                Placement::Any => true,
-                Placement::Cpu(cpu) => cpu == owner,
-            };
-            #[cfg(feature = "execution-tests")]
-            let allowed = allowed && data.next_cpu.is_none_or(|cpu| cpu == owner);
-            if allowed {
+            if allowed_on(data, owner) {
                 self.remove_ready(task);
                 // SAFETY: task 仍由 live 强拥有且锁尚未释放；摘离 ready 后只给本 CPU 执行权。
                 let data = unsafe { &mut *(*task).scheduling.get() };
@@ -110,6 +119,20 @@ impl Scheduler {
             task = data.ready_next;
         }
         None
+    }
+
+    /// 在同一发表锁下只读本 CPU 可执行的 ready，最终 idle 检查不取得任务执行权。
+    fn has_ready(&self, owner: usize) -> bool {
+        let mut task = self.ready_head;
+        while !task.is_null() {
+            // SAFETY: 同一调度锁保护活登记与 ready 链，本函数只读调度数据。
+            let data = unsafe { &*(*task).scheduling.get() };
+            if allowed_on(data, owner) {
+                return true;
+            }
+            task = data.ready_next;
+        }
+        false
     }
 
     /// ctx 已保存以后结束 SwitchingOut，退出资源仅移出而不在锁内析构。
@@ -203,6 +226,26 @@ pub fn yield_now() {
     resume_task();
 }
 
+/// 仅普通可服务 IRQ 的安全点消耗提示；非法上下文保留提示给后续安全点。
+pub fn cond_resched() -> bool {
+    if !crate::arch::irq_enabled() {
+        return false;
+    }
+    let requested = {
+        let _irq = IrqSaveGuard::new();
+        let local = cpu::current();
+        let legal = local.hardirq_depth.load(Ordering::Relaxed) == 0
+            && local.bh_depth.load(Ordering::Relaxed) == 0
+            && local.preempt_depth.load(Ordering::Relaxed) == 0
+            && crate::task::current_task_id().is_some();
+        legal && local.need_resched.swap(false, Ordering::Relaxed)
+    };
+    if requested {
+        yield_now();
+    }
+    requested
+}
+
 /// 在专用 IRQ-off 段提交意图，通知已到达的 Park 不交出执行权。
 fn prepare_switch(
     intent: SwitchIntent,
@@ -236,6 +279,8 @@ fn prepare_switch(
             !notified
         };
         if committed {
+            accounting::task_leave();
+            time::task_switch_out();
             // SAFETY: 活登记保护 task，SwitchingOut 不可分派；只取独立 ctx 裸指针，不构造 &mut Task。
             Some((
                 unsafe { (*task).ctx.get() },
@@ -377,6 +422,8 @@ fn resume_task() {
         crate::task::current_task_id().is_some(),
         "task resume has no current task"
     );
+    time::task_switch_in();
+    accounting::task_enter();
     crate::arch::enable_interrupts();
 }
 
@@ -425,17 +472,27 @@ fn finish_current() {
     }
 }
 
-/// 每 CPU 从自己的永久 boot 栈进入相同调度循环，无普通任务时身份为空。
+/// 每 CPU 从永久 boot 栈进入调度，ready 与 idle 的发表由同一调度锁线性化。
 pub fn run() -> ! {
     assert!(
         cpu::current().online.load(Ordering::Acquire),
         "scheduler CPU is offline"
     );
     crate::arch::irq_save();
+    accounting::start_scheduler();
+    time::activate_current_cpu();
     loop {
-        let local = cpu::current();
-        let next = SCHED_LOCK.lock().pick(local.id);
+        let next = {
+            let local = cpu::current();
+            let mut scheduler = SCHED_LOCK.lock();
+            let next = scheduler.pick(local.id);
+            // 已开始一次新分派，或已经证明无本核工作；旧任务的提示不留给下一执行者。
+            local.need_resched.store(false, Ordering::Relaxed);
+            local.idle.store(next.is_none(), Ordering::Release);
+            next
+        };
         if let Some(task) = next {
+            let local = cpu::current();
             // SAFETY: pick 将唯一 Running 执行权交给本核，活登记保护指针；本 CPU 在 IRQ 关闭时发表身份。
             unsafe { *local.current_task.get() = task };
             // SAFETY: 活 Task 不可被其他 CPU 摘离，身份为不可变字段。
@@ -450,12 +507,37 @@ pub fn run() -> ! {
             };
             finish_current();
         } else {
-            // 当前尚无等待型 idle；开放 IRQ 的短自旋不依赖周期 timer 补救漏醒。
-            crate::arch::enable_interrupts();
-            spin_loop();
-            crate::arch::irq_save();
+            idle_once();
         }
     }
+}
+
+/// idle 已在队列锁下发表；放锁后最终重检，等待入口保持 IRQ-off 且不携带 guard。
+fn idle_once() {
+    #[cfg(feature = "execution-tests")]
+    cpu::test_idle_boundary();
+    let local = cpu::current();
+    let should_wait = {
+        let scheduler = SCHED_LOCK.lock();
+        !scheduler.has_ready(local.id)
+            && !local.kick_pending()
+            && !local.need_resched.load(Ordering::Relaxed)
+    };
+    if should_wait {
+        #[cfg(feature = "execution-tests")]
+        accounting::test_idle_checked();
+        accounting::idle_enter();
+        // SAFETY: 本核已在锁下发表 idle 且最终重检无工作；IRQ 关闭、没有普通 Task 或锁，
+        // 架构入口在睡前再次检查原子提示，并保证返回时 IRQ 关闭。
+        unsafe { local.idle_once() };
+        accounting::idle_leave();
+    } else {
+        // 待处理提示阻止睡眠，开放 IRQ 消费硬件 pending，队列工作随后重新选择。
+        crate::arch::enable_interrupts();
+        crate::arch::irq_save();
+    }
+    let _scheduler = SCHED_LOCK.lock();
+    local.idle.store(false, Ordering::Release);
 }
 
 /// Any 任务只将下一次真实分派指定为在线目标 CPU，pick 后立即恢复 Any 选择。

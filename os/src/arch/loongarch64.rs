@@ -3,6 +3,7 @@ use crate::boot::BootInfo;
 use crate::sched::context::TaskContext;
 use core::arch::{asm, global_asm};
 use core::mem::{offset_of, size_of, MaybeUninit};
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 pub const NAME: &str = "loongarch64";
 
@@ -61,6 +62,10 @@ global_asm!(include_str!("loongarch64/switch.S"),
     execution_tests = const cfg!(feature = "execution-tests") as usize,
 );
 
+global_asm!(
+    include_str!("loongarch64/idle.S"),
+    execution_tests = const cfg!(feature = "execution-tests") as usize,
+);
 extern "C" {
     static __direct_base: u8;
     static __mmio_base: u8;
@@ -71,6 +76,14 @@ extern "C" {
     fn la_kernel_refill();
     /// 按普通函数 ABI 保存旧整数现场并恢复下一执行者，不改写本核 KS0。
     fn la_switch_context(prev: *mut TaskContext, next: *const TaskContext);
+    /// 在启 IE 到 IDLE 的显式窗口内复查软件提示；trap 可把返回地址改到函数入口重新检查。
+    fn la_idle_once_asm(
+        kick_pending: *const AtomicUsize,
+        need_resched: *const AtomicBool,
+        #[cfg(feature = "execution-tests")] wait_completions: *const AtomicUsize,
+    );
+    static la_idle_window_start: u8;
+    static la_idle_window_end: u8;
 }
 
 /// 在引导入口确立的 PLV0 环境读取本核 CSR；寄存器编号由本模块常量指定。
@@ -261,6 +274,31 @@ pub fn wait_for_interrupt() {
         asm!("idle 0", options(nostack));
     }
 }
+
+/// 以启 IE 后重查与 trap 返回回滚避免通知已消费后进入 IDLE，返回保持 IRQ 关闭。
+///
+/// # Safety
+/// 仅允许本核 scheduler 在 IRQ-off、无锁且无普通 guard 时调用；原子必须是本核
+/// 永久有效字段，trap 与独立 IRQ 源已安装且开启，当前栈不得跨本次调用迁移。
+/// 测试计数以自然对齐的 AtomicUsize 提供，整个生命周期仅使用原子访问。
+pub(crate) unsafe fn idle_once(
+    kick_pending: &AtomicUsize,
+    need_resched: &AtomicBool,
+    #[cfg(feature = "execution-tests")] wait_completions: &AtomicUsize,
+) {
+    assert!(!irq_enabled(), "idle entry requires IRQ off");
+    // SAFETY: 调用者保证本核稳定原子与无锁 scheduler 栈；汇编遵守整数 ABI，
+    // 在精确标记的启 IE/重查/IDLE 窗口可被 trap 重启，返回前关闭 IE，不改 FP/KS0。
+    // 测试计数指针经 a2 传入；amadd_db.d 的输出 t1、增量 t0、地址 a2 互不重叠，
+    // 64 位原子 RMW 的完整屏障与远端 Acquire 读取匹配，trap 保留全部参数和临时寄存器。
+    unsafe {
+        #[cfg(feature = "execution-tests")]
+        la_idle_once_asm(kick_pending, need_resched, wait_completions);
+        #[cfg(not(feature = "execution-tests"))]
+        la_idle_once_asm(kick_pending, need_resched);
+    };
+    assert!(!irq_enabled(), "idle exit has IRQ enabled");
+}
 /// 读取稳定硬件计数器。
 pub fn read_counter() -> u64 {
     let value;
@@ -279,8 +317,8 @@ fn cpucfg(index: usize) -> u64 {
     }
     value as u64 & 0xffff_ffff
 }
-/// 按 CPUCFG4/5 的基频、乘数、除数计算实际 counter 频率。
-pub fn counter_frequency() -> u64 {
+/// 仅资源发现前从 CPUCFG4/5 取得实际 counter 频率，不作为运行期读数路径。
+pub fn boot_counter_frequency() -> u64 {
     let base = cpucfg(4);
     let ratio = cpucfg(5);
     let mul = ratio & 0xffff;
@@ -290,6 +328,10 @@ pub fn counter_frequency() -> u64 {
         "invalid CPUCFG counter frequency"
     );
     base * mul / div
+}
+/// 返回一次启动资源发现发布的 counter 频率。
+pub fn counter_frequency() -> u64 {
+    crate::boot::info().counter_frequency
 }
 /// 将绝对 deadline 向上量化到四个 tick，并编程一次事件。
 pub fn program_timer(deadline: u64) {
@@ -474,11 +516,19 @@ pub fn trigger_unmapped_fault() -> ! {
 
 /// 分派真实硬中断并记录本核深度；异常直接终止，FP 关闭时不读取条件字段。
 #[no_mangle]
-extern "C" fn loongarch_trap(frame: &KernelTrapFrame) {
+extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
     if (frame.estat >> 16) & 0x3f != 0 {
         crate::console::fatal(frame.era, frame.gpr[3], frame.estat, frame.badv);
     }
     let _hardirq = crate::cpu::HardIrqGuard::enter();
+    // 仅显式等待窗口允许回滚。重启包含 mask 初始化，不能复用 csrxchg 已改写的 t0。
+    let (idle_start, idle_end) = (
+        core::ptr::addr_of!(la_idle_window_start) as usize,
+        core::ptr::addr_of!(la_idle_window_end) as usize,
+    );
+    if idle_start <= frame.era && frame.era < idle_end {
+        frame.era = la_idle_once_asm as usize;
+    }
     let pending = frame.estat & csr_read::<4>() & 0x1fff;
     if pending & (1 << 11) != 0 {
         disable_timer();
@@ -501,9 +551,9 @@ extern "C" fn loongarch_refill(frame: &RefillFrame) -> ! {
     crate::console::fatal(frame.era & !1, frame.gpr[3], frame.era & 1, frame.badv)
 }
 
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
 global_asm!(include_str!("loongarch64/register_test.S"));
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
 extern "C" {
     /// 在有效本核计数器与异常入口下暂时改写寄存器，等待真实 timer IRQ 后恢复调用现场。
     fn la_test_register_preservation(
@@ -558,4 +608,29 @@ pub fn test_task_context_preservation() -> bool {
     // SAFETY: 仅向汇编传递真实 yield 函数入口；汇编保持 ABI 栈对齐及调用者现场，
     // yield 自身检查可调度边界，探针不启用 FP、不恢复旧 CPU 基址。
     unsafe { la_test_task_context_preservation(crate::sched::yield_now as usize) != 0 }
+}
+
+/// 用一次真实 timer trap 检验整数、SP、KS0 与返回路径，不执行任何 FP 指令。
+///
+/// # Safety
+/// 本核异常入口、timer IRQ、CpuLocal 已安装；不得持锁或 guard，不得有活跃 FP 现场。
+/// 测试临时开放 IRQ 并覆盖本核 timer，期间不得调度或迁移。
+#[cfg(feature = "execution-tests")]
+pub(crate) unsafe fn test_integer_register_preservation() -> usize {
+    let saved = irq_save();
+    let counter = &crate::cpu::current().timer_interrupts;
+    let before = counter.load(core::sync::atomic::Ordering::Acquire);
+    let ticks = ((counter_frequency() / 1000).max(4) as usize + 3) & !3;
+    // SAFETY: 调用者保证本核 trap/timer 与栈可服务；counter 永久有效。
+    // fp=0 使汇编跳过全部 FP/FCSR/FCC 访问，返回恢复同核整数与 IRQ-off 现场。
+    let good = unsafe { la_test_register_preservation(counter, ticks, 0, 0) };
+    assert!(good != 0, "integer timer trap register preservation failed");
+    assert!(
+        before < counter.load(core::sync::atomic::Ordering::Acquire),
+        "integer timer trap was not observed"
+    );
+    crate::time::reprogram_current();
+    // SAFETY: saved 来自同核，汇编已恢复现场，测试期间没有迁移或留存受 IRQ 保护的锁。
+    unsafe { irq_restore(saved) };
+    1
 }

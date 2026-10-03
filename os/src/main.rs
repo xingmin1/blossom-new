@@ -15,6 +15,7 @@ compile_error!("execution IRQ and preempt faults require separate images");
 extern crate alloc;
 extern crate rlibc;
 
+mod accounting;
 mod arch;
 mod boot;
 mod console;
@@ -25,6 +26,7 @@ mod platform;
 mod sched;
 mod sync;
 mod task;
+mod time;
 mod wait;
 
 #[cfg(feature = "boot-tests")]
@@ -32,7 +34,7 @@ mod boot_tests;
 #[cfg(feature = "execution-tests")]
 mod execution_tests;
 
-/// 使用固件原始参数构造全局资源、CPU 表、物理页与堆、中断设施，然后释放 AP。
+/// 使用固件资源准备 CPU、MM、统一时间与中断，再发表内核任务并释放 AP。
 ///
 /// # Safety
 /// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
@@ -68,6 +70,8 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
     // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
     unsafe { mm::initialize(resources) };
+    // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前发表 BootInfo 的计数器频率。
+    unsafe { time::initialize(resources) };
     #[cfg(not(feature = "boot-tests"))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
@@ -221,9 +225,11 @@ fn init_consumers() {
     }
 
     let watchdog = task::spawn_kernel_on(0, || {
-        let deadline = arch::read_counter().wrapping_add(arch::counter_frequency() * 20);
+        let deadline = time::now()
+            .checked_add(time::Duration::from_secs(20))
+            .expect("initial task deadline overflows");
         while !INIT_DONE.load(Ordering::Acquire) {
-            assert!(arch::read_counter() < deadline, "initial task deadline");
+            assert!(time::now() < deadline, "initial task deadline");
             sched::yield_now();
         }
         0

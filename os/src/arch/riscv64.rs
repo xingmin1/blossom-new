@@ -8,6 +8,7 @@ use core::{
     arch::{asm, global_asm},
     mem::{offset_of, size_of, MaybeUninit},
     ptr,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 /// 当前唯一编译目标的架构名称。
@@ -320,6 +321,36 @@ pub fn wait_for_interrupt() {
         asm!("wfi", options(nomem, nostack));
     }
 }
+
+/// 关闭全局 SIE 时复查提示并执行 WFI，随后临时服务 IRQ，返回保持 IRQ 关闭。
+///
+/// # Safety
+/// 仅允许本核 scheduler 的 IRQ-off、无锁且无普通 guard 的最终等待边界调用；
+/// 原子必须属于本核并永久有效，trap 与各独立 IRQ 源已经使能；测试计数不得非原子访问。
+pub(crate) unsafe fn idle_once(
+    kick_pending: &AtomicUsize,
+    need_resched: &AtomicBool,
+    #[cfg(feature = "execution-tests")] wait_completions: &AtomicUsize,
+) {
+    assert!(!irq_enabled(), "idle entry requires IRQ off");
+    if kick_pending.load(Ordering::Acquire) == 0 && !need_resched.load(Ordering::Acquire) {
+        // SAFETY: 调用者保证 S-mode、本核有效 trap 栈与独立使能的 IRQ 源。
+        // WFI 在全局 SIE 关闭时仍由独立使能源的 pending 唤醒，通知不会在检查与等待间被消费。
+        unsafe { asm!("wfi", options(nostack)) };
+        #[cfg(feature = "execution-tests")]
+        wait_completions.fetch_add(1, Ordering::Release);
+    }
+    // SAFETY: 调用者保证无锁且可服务 IRQ；无论是否执行 WFI 都开放一次处理 pending，
+    // 再关闭 SIE 返回调度段，不恢复任何旧 CPU 的 IRQ 状态。
+    unsafe {
+        asm!(
+            "csrsi sstatus, 2",
+            "nop",
+            "csrci sstatus, 2",
+            options(nostack)
+        )
+    };
+}
 /// 读取真实硬件时间计数器。
 pub fn read_counter() -> u64 {
     let value;
@@ -509,9 +540,9 @@ extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
     }
 }
 
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
 global_asm!(include_str!("riscv64/registers.S"));
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
 extern "C" {
     /// 按整数调用 ABI 临时启用 IRQ，等待本核计数器推进并检验寄存器现场。
     ///
@@ -548,4 +579,35 @@ pub unsafe fn test_register_preservation() -> bool {
         irq_restore(saved);
     }
     success
+}
+
+/// 在普通 Task 内以两次真实 timer trap 检验整数、SP、TP 与返回路径，不启用 FP。
+///
+/// # Safety
+/// 本核 trap/timer/CpuLocal 已安装；不得持锁或 guard，不得有活跃 FP 现场。
+/// 测试临时打开 IRQ 且改写本核 timer，期间不得切换或迁移任务。
+#[cfg(feature = "execution-tests")]
+pub(crate) unsafe fn test_integer_register_preservation() -> usize {
+    let saved = irq_save();
+    let counter = &crate::cpu::current().timer_interrupts;
+    let mut rounds = 0;
+    for _ in 0..2 {
+        let expected = counter.load(Ordering::Acquire) + 1;
+        program_timer(read_counter() + counter_frequency() / 1000);
+        // SAFETY: 调用者保证已安装 trap/timer，无锁不调度；永久 counter 属于本核。
+        // fp=0 只保存并检查整数现场，汇编返回时恢复进入时的 IRQ-off 状态。
+        assert!(
+            unsafe { rv_register_roundtrip(counter, expected, 0) } != 0,
+            "integer timer trap register preservation failed"
+        );
+        assert!(
+            expected <= counter.load(Ordering::Acquire),
+            "integer timer trap was not observed"
+        );
+        rounds += 1;
+    }
+    crate::time::reprogram_current();
+    // SAFETY: saved 来自本函数同核保存；全部汇编已经返回、无持锁借用且未发生迁移。
+    unsafe { irq_restore(saved) };
+    rounds
 }

@@ -5,11 +5,12 @@ use alloc::sync::Arc;
 use core::alloc::AllocError;
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::mm::{alloc_pages, OwnedPages};
 use crate::sched::context::TaskContext;
 use crate::sync::{Completion, IrqSaveGuard};
+use crate::time::Duration;
 use crate::wait::WaitId;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -97,6 +98,7 @@ impl JoinState {
 
 pub struct Task {
     id: TaskId,
+    execution_ns: AtomicU64,
     pub(crate) ctx: UnsafeCell<TaskContext>,
     pub(crate) scheduling: UnsafeCell<Scheduling>,
     pub(crate) resources: UnsafeCell<Resources>,
@@ -113,6 +115,22 @@ impl Task {
     /// 返回与调度位置、迁核和完成状态无关的唯一身份。
     pub fn id(&self) -> TaskId {
         self.id
+    }
+
+    /// 读取各次真实在 CPU 执行并已结算的总时长，不包含离 CPU 的等待。
+    pub fn execution_time(&self) -> Duration {
+        Duration::from_nanos(self.execution_ns.load(Ordering::Relaxed))
+    }
+
+    /// 唯一执行拥有者在 IRQ 关闭的片段边界增加总账，迁核交接以前完成写入。
+    pub(crate) fn account_execution(&self, delta_ns: u64) {
+        let total = self.execution_ns.load(Ordering::Relaxed);
+        self.execution_ns.store(
+            total
+                .checked_add(delta_ns)
+                .expect("task execution time overflow"),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -176,6 +194,7 @@ fn spawn(
     let id = TaskId(id);
     let task = Arc::try_new(Task {
         id,
+        execution_ns: AtomicU64::new(0),
         ctx: UnsafeCell::new(TaskContext::initial(stack_top)),
         scheduling: UnsafeCell::new(Scheduling {
             state: State::Ready,
