@@ -9,7 +9,8 @@ const FAN_IN: usize = 2;
 const DELAY: usize = 3;
 const ARRIVAL: usize = 4;
 const UART_REMOVE: usize = 5;
-const STOP: usize = 6;
+const MEMORY: usize = 6;
+const STOP: usize = 7;
 static PHASE: AtomicUsize = AtomicUsize::new(0);
 static READY: [AtomicBool; MAX] = [const { AtomicBool::new(false) }; MAX];
 static ACK: [AtomicUsize; MAX] = [const { AtomicUsize::new(0) }; MAX];
@@ -224,6 +225,7 @@ pub unsafe fn secondary() -> ! {
                 irq::unregister_uart();
                 UART_RETURNED.store(true, Ordering::Release);
             }
+            MEMORY => crate::mm::tests::secondary(),
             STOP => loop {
                 arch::wait_for_interrupt();
             },
@@ -507,6 +509,9 @@ pub unsafe fn primary() -> ! {
             crate::println!("PASS smp-call delayed-local");
             crate::println!("SCOPE smp-call local-only");
         }
+        start(MEMORY);
+        crate::mm::tests::primary();
+        join(MEMORY);
         uart_checks();
         PHASE.store(STOP, Ordering::Release);
         crate::println!("STAGE1 PASS");

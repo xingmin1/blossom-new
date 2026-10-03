@@ -47,6 +47,25 @@ impl<T> SpinLock<T> {
         let guard = ManuallyDrop::new(self.inner.lock());
         SpinLockGuard { guard, _irq: irq }
     }
+
+    /// 关闭 IRQ 后仅尝试一次取锁；竞争失败立即恢复原状态，成功仍先解锁再恢复 IRQ。
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.try_lock_with_irq(IrqSaveGuard::new())
+    }
+
+    /// 接管固定当前 CPU 的 IRQ guard，仅尝试一次取锁；失败恢复原 IRQ，成功先解锁再恢复。
+    pub(crate) fn try_lock_with_irq(&self, irq: IrqSaveGuard) -> Option<SpinLockGuard<'_, T>> {
+        match self.inner.try_lock() {
+            Some(guard) => Some(SpinLockGuard {
+                guard: ManuallyDrop::new(guard),
+                _irq: irq,
+            }),
+            None => {
+                drop(irq);
+                None
+            }
+        }
+    }
 }
 
 /// 持锁期间保持进入前的 IRQ 状态，退出顺序为解锁、恢复 IRQ。

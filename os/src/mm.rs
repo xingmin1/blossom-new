@@ -2,8 +2,12 @@ mod bootmem;
 mod buddy;
 mod frame_allocator;
 mod page;
+mod pcp;
+#[cfg(feature = "boot-tests")]
+pub(crate) mod tests;
 
 pub use frame_allocator::{alloc_pages, OwnedPages};
+pub use pcp::drain_all_pages;
 
 use crate::boot::BootInfo;
 use crate::mm::bootmem::BootMemory;
@@ -20,7 +24,7 @@ pub(crate) fn pages() -> &'static PageMap<'static> {
         .expect("physical memory has not been initialized")
 }
 
-/// 从实际启动 RAM 和保留区构造并发布描述符，随后将最终自由范围一次交给 buddy。
+/// 从实际启动 RAM 发布描述符，将自由范围交给 buddy，随后建立每 CPU 空页缓存。
 ///
 /// # Safety
 /// 只能由 BSP 在 IRQ 关闭、AP 未释放时调用一次。info 必须是已验证并包含完整
@@ -77,6 +81,10 @@ pub unsafe fn initialize(info: &BootInfo) {
         "buddy initial free pages differ from boot memory"
     );
     crate::println!("BUDDY free={} max_order={}", free, buddy::MAX_ORDER);
+
+    // SAFETY: buddy 已唯一接管全部自由页；调用者保证 BSP 独占初始化、IRQ 关闭
+    // 且 AP 未释放，当前尚无页申请或 PCP 使用者。
+    unsafe { pcp::initialize() };
 
     #[cfg(feature = "boot-tests")]
     {

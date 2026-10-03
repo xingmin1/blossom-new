@@ -1,6 +1,7 @@
 use crate::arch;
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::{self, Block};
+use crate::mm::pcp;
 use core::mem::MaybeUninit;
 
 /// 持有一个真实连续页块的唯一归还权；移动或复制原始地址不会复制拥有权。
@@ -32,38 +33,49 @@ impl OwnedPages {
 }
 
 impl Drop for OwnedPages {
-    /// 在调用者结束全部原始访问后，按原块头与阶数一次归还整个块。
+    /// 在全部原始访问结束后，单页交给当前 CPU 缓存，其余块按原阶一次归还 buddy。
     fn drop(&mut self) {
-        // SAFETY: block 仅来自 buddy 的成功摘块且不能复制；本对象仍持有整块唯一
-        // 归还权，safe 接口没有产生页内容引用，原始指针使用者须在析构前结束访问。
-        unsafe { buddy::release(self.block.head_pfn(), self.block.order()) };
+        if self.block.order() == 0 {
+            // SAFETY: block 来自生产页入口且不能复制；本对象持有该单页唯一归还权，
+            // 页未进入其他空闲链，原始指针使用者须在析构前结束全部访问。
+            unsafe { pcp::release(self.block.head_pfn()) };
+        } else {
+            // SAFETY: block 来自 buddy 成功摘块且不能复制，保存了整块原阶；
+            // 本对象持有唯一归还权，原始指针使用者须在析构前结束全部访问。
+            unsafe { buddy::release(self.block.head_pfn(), self.block.order()) };
+        }
     }
 }
 
-/// 非阻塞地申请一个连续页块；不足或阶数超限返回 None，不睡眠或自动回收。
-/// 清零在 buddy 已释放 zone 锁及其 IRQ guard 后执行，返回前写满全部请求字节。
+/// 非阻塞地申请一个连续页块；单页使用当前 CPU 缓存，其他阶直接请求 buddy。
+/// 不足或阶数超限返回 None，不睡眠或自动回收；清零在全部锁及 IRQ guard 退出后执行。
 pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
-    let block = buddy::allocate(order)?;
+    let block = if order == 0 {
+        pcp::allocate()
+    } else {
+        buddy::allocate(order)
+    }?;
     let mut pages = OwnedPages { block };
     if zeroed {
         let len = pages.len();
-        // SAFETY: buddy 返回已摘链的真实连续 RAM 块，当前拥有者独占全部 len 字节，
-        // BSP 初始化已保证永久可写直映；此时 zone 锁和 IRQ guard 均已释放。
+        // SAFETY: 页入口返回已离开全部空闲链的真实连续 RAM 块，当前拥有者独占
+        // 全部 len 字节，BSP 已保证永久可写直映；全部 zone/PCP 锁与 IRQ guard 已退出。
         unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0, len) };
     }
     Some(pages)
 }
 
-/// 在 BSP 独占分配期间，用生产入口检查各阶拥有、真实分类、锁外清零与完整归还。
+/// 在 BSP 独占期间检查各阶拥有、真实分类与清零，计入缓存并在排空后核对 buddy 账务。
 #[cfg(feature = "boot-tests")]
 pub(crate) fn test_owned_pages() -> bool {
     use crate::mm::page::PageKind;
-    use crate::mm::{alloc_pages, OwnedPages};
+    use crate::mm::{alloc_pages, drain_all_pages, OwnedPages};
 
+    drain_all_pages();
     let initial = buddy::free_pages();
     if alloc_pages(buddy::MAX_ORDER + 1, false).is_some()
         || alloc_pages(usize::MAX, true).is_some()
-        || buddy::free_pages() != initial
+        || buddy::free_pages() + pcp::cached_pages() != initial
     {
         return false;
     }
@@ -93,7 +105,7 @@ pub(crate) fn test_owned_pages() -> bool {
         // 不从尚未初始化的页构造正常引用；写入结束后才允许归还。
         unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0xa5, len) };
         allocated += 1 << order;
-        if buddy::free_pages() != initial - allocated {
+        if buddy::free_pages() + pcp::cached_pages() != initial - allocated {
             return false;
         }
         held[order] = Some(pages);
@@ -101,7 +113,7 @@ pub(crate) fn test_owned_pages() -> bool {
     for slot in held.iter_mut().rev() {
         drop(slot.take());
     }
-    if buddy::free_pages() != initial {
+    if buddy::free_pages() + pcp::cached_pages() != initial {
         return false;
     }
     for order in 0..=buddy::MAX_ORDER {
@@ -112,13 +124,16 @@ pub(crate) fn test_owned_pages() -> bool {
         // SAFETY: 此调用点明确请求 zeroed，生产入口已写满 len 字节；pages 在
         // 读取期间持有唯一拥有权且没有并发写者，切片借用在归还前结束。
         let bytes = unsafe { core::slice::from_raw_parts(pages.as_mut_ptr().cast::<u8>(), len) };
-        if bytes.iter().any(|byte| *byte != 0) || buddy::free_pages() != initial - (1 << order) {
+        if bytes.iter().any(|byte| *byte != 0)
+            || buddy::free_pages() + pcp::cached_pages() != initial - (1 << order)
+        {
             return false;
         }
         drop(pages);
-        if buddy::free_pages() != initial {
+        if buddy::free_pages() + pcp::cached_pages() != initial {
             return false;
         }
     }
+    drain_all_pages();
     buddy::free_pages() == initial
 }

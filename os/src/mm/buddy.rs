@@ -6,6 +6,7 @@ use crate::mm::page::{BuddyLink, PageKind, PageMap};
 use crate::sync::SpinLock;
 
 pub(crate) const MAX_ORDER: usize = 10;
+pub(crate) const BATCH_CAPACITY: usize = 8;
 const NONE: usize = usize::MAX;
 
 /// 唯一连续块释放权；移动不会复制归还责任，不自动归还。
@@ -23,6 +24,15 @@ impl Block {
     /// 返回分配时的阶，归还必须保留此值。
     pub(crate) fn order(&self) -> usize {
         self.order
+    }
+
+    /// 恢复从真实 PCP 链摘下的零阶页唯一归还权，不查询或修改 zone 元数据。
+    ///
+    /// # Safety
+    /// head 必须是此前由本 buddy 分配、交给 PCP 且刚从其链摘下的真实零阶页；
+    /// 调用者仍持有唯一归还权，该页不在任何自由链中，且无另一份有效归还凭证。
+    pub(crate) unsafe fn from_pcp(head: usize) -> Self {
+        Self { head, order: 0 }
     }
 }
 
@@ -189,6 +199,49 @@ pub(crate) fn allocate(order: usize) -> Option<Block> {
         .expect("buddy is not initialized")
         .lock()
         .allocate(order)
+}
+
+/// 在一份 zone guard 下逐项摘取独立零阶块，不足 count 时保留已成功取得的块。
+/// output 必须全为空；固定表仅承担移动型 Block 的临时归还责任，不要求页相邻。
+pub(crate) fn allocate_batch(output: &mut [Option<Block>; BATCH_CAPACITY], count: usize) -> usize {
+    assert!(
+        count <= BATCH_CAPACITY,
+        "buddy batch exceeds fixed capacity"
+    );
+    assert!(
+        output.iter().all(Option::is_none),
+        "buddy batch output is occupied"
+    );
+    let mut zone = ZONE.get().expect("buddy is not initialized").lock();
+    let mut allocated = 0;
+    for slot in &mut output[..count] {
+        let Some(block) = zone.allocate(0) else {
+            break;
+        };
+        *slot = Some(block);
+        allocated += 1;
+    }
+    allocated
+}
+
+/// 在一份 zone guard 下消耗固定表中所有零阶块并归还，空槽不产生释放动作。
+///
+/// # Safety
+/// 所有非空槽持有本 buddy 分配的不同零阶页唯一归还权，页访问已结束；
+/// 页已从 PCP 链摘离，当前不属于任何 buddy、PCP 或 slab 自由链。
+pub(crate) unsafe fn release_batch(blocks: &mut [Option<Block>; BATCH_CAPACITY]) {
+    assert!(
+        blocks.iter().flatten().all(|block| block.order == 0),
+        "buddy batch contains a nonzero order"
+    );
+    let mut zone = ZONE.get().expect("buddy is not initialized").lock();
+    for slot in blocks {
+        if let Some(block) = slot.take() {
+            // SAFETY: 调用者保证每份 Block 对应已摘离且访问结束的唯一零阶页；
+            // take 消耗此槽归还权，本批全程持有这些页所属的同一 zone guard。
+            unsafe { zone.release(block.head, 0) };
+        }
+    }
 }
 
 /// 将整体释放权归还唯一 zone，按原阶恢复自由链。
