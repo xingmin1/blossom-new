@@ -29,6 +29,7 @@ mod task;
 mod time;
 mod timer;
 mod wait;
+mod workqueue;
 
 #[cfg(feature = "boot-tests")]
 mod boot_tests;
@@ -75,6 +76,8 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     unsafe { time::initialize(resources) };
     #[cfg(not(feature = "boot-tests"))]
     timer::initialize_services().expect("timer service task allocation failed");
+    #[cfg(not(feature = "boot-tests"))]
+    workqueue::initialize_services().expect("worker pool service task allocation failed");
     #[cfg(not(feature = "boot-tests"))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。

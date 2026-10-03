@@ -3,6 +3,7 @@
 mod time;
 mod timer;
 mod wait;
+mod workqueue;
 use crate::{arch, cpu, mm, sched, task, time as clock};
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -237,6 +238,7 @@ pub(crate) fn run() -> ! {
     assert_eq!(cpu::current().id, 0);
     assert!(task::current_task_id().is_some());
     timer::wait_services_blocked();
+    workqueue::wait_services_blocked();
     crate::println!(
         "EXECUTION TEST READY arch={} cpus={} mode={}",
         arch::NAME,
@@ -258,6 +260,7 @@ pub(crate) fn run() -> ! {
     wait::run();
     time::run();
     timer::run();
+    workqueue::run();
     crate::println!("EXECUTION TESTS PASS");
     arch::shutdown();
 }

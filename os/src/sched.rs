@@ -307,10 +307,26 @@ fn switch_out(intent: SwitchIntent) {
 
 /// 同一等待轮次只有真正缺少通知时才阻塞，恢复后重新开启目的 CPU 的 IRQ。
 pub(crate) fn park(id: WaitId) {
-    if let Some((task_ctx, scheduler_ctx)) = prepare_switch(SwitchIntent::Park(id)) {
+    assert_switchable();
+    let worker = crate::task::current_worker();
+    // 池反馈和其中的通知先于最终 IRQ-off/SCHED 段，任何普通 guard 已在调用返回时析构。
+    let was_running = worker.as_ref().is_some_and(|worker| worker.sleeping());
+    let contexts = prepare_switch(SwitchIntent::Park(id));
+    #[cfg(feature = "execution-tests")]
+    if contexts.is_none() && was_running {
+        worker
+            .as_ref()
+            .expect("sleeping worker is absent")
+            .early_wake();
+    }
+    if let Some((task_ctx, scheduler_ctx)) = contexts {
         // SAFETY: prepare_switch 已提交 SwitchingOut 且放锁，IRQ 关闭，两份 ctx 的执行权唯一。
         unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
         resume_task();
+    }
+    // 未提交的提前通知与实际恢复都归还同一进度贡献；yield 不经过此反馈。
+    if let Some(worker) = worker {
+        worker.running(was_running);
     }
 }
 
@@ -378,17 +394,35 @@ pub(crate) fn notify(task: &Task, id: WaitId) -> bool {
 /// 在真实 SwitchingOut 放锁后、ctx 保存前通知，并继续同一汇编与 finish 路径。
 #[cfg(feature = "execution-tests")]
 pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Waker) {
-    let (task_ctx, scheduler_ctx) =
-        prepare_switch(SwitchIntent::Park(id)).expect("test park was already notified");
-    assert!(waker.notify(), "switching-out notification was rejected");
-    assert!(matches!(
-        test_state(task),
-        State::SwitchingOut(_, SwitchIntent::Park(active)) if active == id
-    ));
-    assert_eq!(test_ready_occurrences(task), 0);
-    // SAFETY: prepare_switch 已提交 SwitchingOut 且放锁，通知没有转移执行权；IRQ 关闭，两份 ctx 独占。
-    unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
-    resume_task();
+    assert_switchable();
+    let worker = crate::task::current_worker();
+    let was_running = worker.as_ref().is_some_and(|worker| worker.sleeping());
+    let contexts = prepare_switch(SwitchIntent::Park(id));
+    // 普通任务仍必须进入既有 SwitchingOut 测试窗口；仅工作者允许池反馈后的提前通知。
+    assert!(
+        worker.is_some() || contexts.is_some(),
+        "test park was already notified"
+    );
+    if let Some((task_ctx, scheduler_ctx)) = contexts {
+        assert!(waker.notify(), "switching-out notification was rejected");
+        assert!(matches!(
+            test_state(task),
+            State::SwitchingOut(_, SwitchIntent::Park(active)) if active == id
+        ));
+        assert_eq!(test_ready_occurrences(task), 0);
+        // SAFETY: prepare_switch 已提交 SwitchingOut 且放锁，通知没有转移执行权；IRQ 关闭，
+        // 两份 ctx 独占，sleeping 的全部池锁与普通 guard 都已在进入最终 IRQ 段前释放。
+        unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
+        resume_task();
+    } else if was_running {
+        worker
+            .as_ref()
+            .expect("sleeping worker is absent")
+            .early_wake();
+    }
+    if let Some(worker) = worker {
+        worker.running(was_running);
+    }
 }
 
 /// 在唯一调度锁内读取真实状态，不向测试导出写权限。
@@ -464,10 +498,12 @@ fn finish_current() {
     if let Some((resources, result)) = retired {
         // SAFETY: finish 已摘离活登记；task 对应此前 into_raw 的那一份强拥有，仅在此恢复一次。
         let task = unsafe { Arc::from_raw(task) };
+        let join = Arc::clone(&task.join);
         crate::arch::enable_interrupts();
         drop(resources);
-        task.join.complete(result);
         drop(task);
+        join.complete(result);
+        drop(join);
         crate::arch::irq_save();
     }
 }

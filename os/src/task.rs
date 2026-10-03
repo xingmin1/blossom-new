@@ -14,6 +14,8 @@ use crate::time::Duration;
 use crate::wait::WaitId;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+#[cfg(feature = "execution-tests")]
+static LIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskId(usize);
@@ -103,6 +105,7 @@ pub struct Task {
     pub(crate) scheduling: UnsafeCell<Scheduling>,
     pub(crate) resources: UnsafeCell<Resources>,
     pub(crate) join: Arc<JoinState>,
+    pub(crate) worker: Option<Arc<crate::workqueue::Worker>>,
 }
 
 // SAFETY: scheduling 仅在调度锁内访问；ctx 仅由 Running 的唯一 CPU 与其离栈交接访问。
@@ -134,6 +137,20 @@ impl Task {
     }
 }
 
+#[cfg(feature = "execution-tests")]
+impl Drop for Task {
+    /// 真正最后强拥有或未发表 Arc 分配失败归还 payload，克隆及弱观察不计。
+    fn drop(&mut self) {
+        LIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 仅供停稳后的真实 metadata 收敛观察，不代表弱控制块或栈 backing 已释放。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_live_tasks() -> usize {
+    LIVE_TASKS.load(Ordering::Relaxed)
+}
+
 pub struct JoinHandle {
     id: TaskId,
     join: Arc<JoinState>,
@@ -160,11 +177,30 @@ impl JoinHandle {
     }
 }
 
+/// 完成全部分配但尚未进入活登记；丢弃时由普通拥有关系归还入口与执行栈。
+pub(crate) struct PreparedTask {
+    task: Arc<Task>,
+    handle: JoinHandle,
+}
+
+impl PreparedTask {
+    /// 发表前即可将稳定身份登记到服务元数据，不保留 Task 强引用。
+    pub(crate) fn task_id(&self) -> TaskId {
+        self.task.id()
+    }
+
+    /// 将预备的唯一任务拥有移交调度器，不再执行任何可失败的分配。
+    pub(crate) fn publish(self) -> JoinHandle {
+        crate::sched::publish(self.task);
+        self.handle
+    }
+}
+
 /// 在任意在线 CPU 执行拥有数据的入口；所有分配成功以后才发表任务。
 pub fn spawn_kernel(
     entry: impl FnOnce() -> i32 + Send + 'static,
 ) -> Result<JoinHandle, AllocError> {
-    spawn(Placement::Any, entry)
+    prepare(Placement::Any, None, entry).map(PreparedTask::publish)
 }
 
 /// 将入口固定到已构造的有效 CPU；允许引导过程在该 CPU 上线之前准备任务。
@@ -172,15 +208,34 @@ pub fn spawn_kernel_on(
     cpu: usize,
     entry: impl FnOnce() -> i32 + Send + 'static,
 ) -> Result<JoinHandle, AllocError> {
+    prepare_kernel_on(cpu, entry).map(PreparedTask::publish)
+}
+
+/// 预备固定 CPU 的普通入口，未发表时可以安全放弃全部资源。
+pub(crate) fn prepare_kernel_on(
+    cpu: usize,
+    entry: impl FnOnce() -> i32 + Send + 'static,
+) -> Result<PreparedTask, AllocError> {
     assert!(cpu < crate::cpu::count(), "task CPU is out of range");
-    spawn(Placement::Cpu(cpu), entry)
+    prepare(Placement::Cpu(cpu), None, entry)
+}
+
+/// 预备拥有不可变工作者身份的固定 CPU 入口，调度器只读取该身份。
+pub(crate) fn prepare_worker_on(
+    cpu: usize,
+    worker: Arc<crate::workqueue::Worker>,
+    entry: impl FnOnce() -> i32 + Send + 'static,
+) -> Result<PreparedTask, AllocError> {
+    assert!(cpu < crate::cpu::count(), "worker CPU is out of range");
+    prepare(Placement::Cpu(cpu), Some(worker), entry)
 }
 
 /// 准备入口、结果、连续栈与控制对象，失败对象按正常拥有关系在锁外析构。
-fn spawn(
+fn prepare(
     placement: Placement,
+    worker: Option<Arc<crate::workqueue::Worker>>,
     entry: impl FnOnce() -> i32 + Send + 'static,
-) -> Result<JoinHandle, AllocError> {
+) -> Result<PreparedTask, AllocError> {
     let entry: Entry = Box::try_new(entry)?;
     let join = Arc::try_new(JoinState {
         result: AtomicI32::new(0),
@@ -192,7 +247,7 @@ fn spawn(
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("task ID space exhausted");
     let id = TaskId(id);
-    let task = Arc::try_new(Task {
+    let value = Task {
         id,
         execution_ns: AtomicU64::new(0),
         ctx: UnsafeCell::new(TaskContext::initial(stack_top)),
@@ -213,9 +268,16 @@ fn spawn(
             entry: Some(entry),
         }),
         join: Arc::clone(&join),
-    })?;
-    crate::sched::publish(task);
-    Ok(JoinHandle { id, join })
+        worker,
+    };
+    // 完整 value 在 fallible Arc 分配前计入，失败时普通 Drop 精确配对。
+    #[cfg(feature = "execution-tests")]
+    LIVE_TASKS.fetch_add(1, Ordering::Relaxed);
+    let task = Arc::try_new(value)?;
+    Ok(PreparedTask {
+        task,
+        handle: JoinHandle { id, join },
+    })
 }
 
 /// 借用普通任务的强引用；调度栈或硬 IRQ/BH 调用直接报告上下文错误。
@@ -240,6 +302,16 @@ pub fn current_task() -> Arc<Task> {
         Arc::increment_strong_count(task);
         Arc::from_raw(task)
     }
+}
+
+/// 只克隆本 CPU 当前任务的不可变工作者身份，不取调度锁或申请存储。
+pub(crate) fn current_worker() -> Option<Arc<crate::workqueue::Worker>> {
+    let _irq = IrqSaveGuard::new();
+    let local = crate::cpu::current();
+    // SAFETY: IRQ 关闭且不切换，本 CPU 独占 current_task；非空当前任务由活登记保活，
+    // worker 构造后不再修改，克隆现存 Arc 不分配，也不延长任何 CPU 私有借用。
+    unsafe { (*local.current_task.get()).as_ref() }
+        .and_then(|task| task.worker.as_ref().map(Arc::clone))
 }
 
 /// 无锁读取本 CPU 的普通任务身份，IRQ 可诊断被打断者，调度栈返回 None。

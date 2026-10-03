@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""运行给定执行测试 ELF，核对 X01–X17 的真实执行、等待、时间与 timer 证据。
+"""运行给定执行测试 ELF，核对 X01–X23 的真实执行、等待、时间与工作队列证据。
 
-正常镜像按唯一顺序输出 X01–X08、X10–X17；单核仅 X02 明确 N/A。
+正常镜像按唯一顺序输出 X01–X08、X10–X23；单核仅 X02 明确 N/A。
 X10 检查重新武装后的硬 IRQ 延后切换与架构寄存器保存，X11 检查同一时间
 算法的维护、快照交错拒绝重试及边界，X12 检查执行/IRQ/scheduler/idle 四账、
 迁核和不依靠 timer tick 的远端 kick 与实际等待指令完成。X13–X17 检查原期限
-睡眠、同步取消真尾部、复用关闭、远端重编程与有界粗 timer 批处理；故障镜像只接受 X09 真实拒绝。
+睡眠、同步取消真尾部、复用关闭、远端重编程与有界粗 timer 批处理。
+X18–X23 检查真实 worker 扩展与回收、OOM rescuer、有限 flush 边界、
+DelayedWork 移交寿命和显式停止；故障镜像只接受 X09 真实拒绝。
 """
 
 import argparse
@@ -59,7 +61,7 @@ def check_header(args, lines):
 
 
 def check_execution(args):
-    """核对唯一有序记录、真实切换与等待，以及统一时间、四账和 timer 观测关系。"""
+    """核对唯一有序记录、真实切换与等待，以及时间、timer 和工作队列观测关系。"""
     lines = args.output.read_text(encoding="utf-8", errors="replace").splitlines()
     begin, cpu_locals = check_header(args, lines)
     require(lines.count("EXECUTION TESTS PASS") == 1,
@@ -74,7 +76,7 @@ def check_execution(args):
         require(not line.startswith("EXECUTION TESTS PASS") or line == "EXECUTION TESTS PASS",
                 "malformed execution success marker")
         if line.startswith("PASS execution-"):
-            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-7]) (.+)", line)
+            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-9]|X2[0-3]) (.+)", line)
             require(match is not None and begin < index < done, "unexpected execution pass: " + line)
             name, payload = match.groups()
             require(name not in records, "duplicate execution record: " + name)
@@ -88,7 +90,7 @@ def check_execution(args):
             hops.append(fields(line[len("EXECUTION X02 "):]))
     expected = ["X01"] + ([] if args.cpus == 1 else ["X02"]) + [
         "X03", "X04", "X05", "X06", "X07", "X08", "X10", "X11", "X12",
-        "X13", "X14", "X15", "X16", "X17"]
+        "X13", "X14", "X15", "X16", "X17", "X18", "X19", "X20", "X21", "X22", "X23"]
     require(list(records) == expected, "missing or out-of-order execution records")
     first = records["X01"]
     require(set(first) == {"task0", "task1", "stack0", "stack1", "rounds", "registers",
@@ -131,6 +133,7 @@ def check_execution(args):
     check_time(args, records)
     check_waiting(args, records)
     check_timer(args, records)
+    check_workqueue(args, records)
 
 
 def check_waiting(args, records):
@@ -283,6 +286,73 @@ def check_timer(args, records):
             and 12 <= seventeenth["wheel_cases"] and 2 <= seventeenth["jump_ticks"]
             and seventeenth["reclaimed"] == 1,
             "X17 did not conserve timer totals, cancel the majority, run bounded continuation batches, or repay resources")
+
+
+def check_workqueue(args, records):
+    """严格核对工作队列业务、真实进度与停止回收，区分单核和跨 CPU 证据。"""
+    expected = {
+        "X18": {"before_duplicates", "running_duplicates", "submitted", "consumed", "callbacks",
+                "max_active", "overlap", "ordered", "ordered_fifo", "reclaimed"},
+        "X19": {"depth", "blocked", "creators", "released", "paired", "early_wake",
+                "retired", "reclaimed"},
+        "X20": {"page_null", "heap_null", "create_failures", "rescuer_callbacks",
+                "worker_callbacks", "recovered", "reclaimed"},
+        "X21": {"remote", "earlier_blocked", "later_done", "future_submitted", "boundary_done",
+                "future_running", "ordered", "reclaimed"},
+        "X22": {"delayed", "modified", "transfers", "cancelled", "sync_wait", "inflight",
+                "orphan", "access_after_close", "reclaimed"},
+        "X23": {"self_requeue", "callbacks", "max_active", "reused", "closed", "rejected",
+                "stops", "drops", "reclaimed"},
+    }
+    for name, names in expected.items():
+        record = records[name]
+        require(set(record) == names and all(0 <= value < (1 << 64) for value in record.values()),
+                name + " has missing, extra, or non-u64 workqueue fields")
+    eighteenth = records["X18"]
+    require(3 <= eighteenth["before_duplicates"] and 3 <= eighteenth["running_duplicates"]
+            and 16 <= eighteenth["submitted"] == eighteenth["consumed"]
+            and 2 <= eighteenth["callbacks"] and 1 <= eighteenth["overlap"]
+            and all(eighteenth[name] == 1 for name in
+                    ("max_active", "ordered", "ordered_fifo", "reclaimed")),
+            "X18 did not conserve submitted work, reject duplicates, or establish non-reentrant overlap and global ordered FIFO")
+    nineteenth = records["X19"]
+    require(3 <= nineteenth["depth"] <= nineteenth["blocked"]
+            and nineteenth["depth"] - 1 <= nineteenth["creators"]
+            and nineteenth["released"] == nineteenth["depth"] and nineteenth["paired"] == 1
+            and 1 <= nineteenth["early_wake"] and 1 <= nineteenth["retired"]
+            and nineteenth["reclaimed"] == 1,
+            "X19 did not create real workers for blocked dependency depth, pair early-wake feedback, or retire and reclaim resources")
+    twentieth = records["X20"]
+    require(all(1 <= twentieth[name] for name in
+                ("page_null", "heap_null", "create_failures", "rescuer_callbacks"))
+            and twentieth["worker_callbacks"] == 0
+            and twentieth["recovered"] == 1 and twentieth["reclaimed"] == 1,
+            "X20 did not exhaust real page/heap allocation, fail worker creation, execute the reserved rescuer, or recover resources")
+    twenty_first = records["X21"]
+    require(1 <= twenty_first["earlier_blocked"] and 1 <= twenty_first["later_done"]
+            and 4 <= twenty_first["future_submitted"] and 1 <= twenty_first["future_running"]
+            and all(twenty_first[name] == 1 for name in ("boundary_done", "ordered", "reclaimed")),
+            "X21 did not wait for the earlier work prefix, leave future work pending at flush return, or reclaim ordered work")
+    require(twenty_first["remote"] == 0 if args.cpus == 1 else 1 <= twenty_first["remote"],
+            "X21 remote flush-prefix evidence does not match the CPU count")
+    twenty_second = records["X22"]
+    require(2 <= twenty_second["delayed"] and 1 <= twenty_second["modified"]
+            and 1 <= twenty_second["transfers"] and 1 <= twenty_second["cancelled"]
+            and twenty_second["orphan"] == 0 and twenty_second["access_after_close"] == 0
+            and twenty_second["reclaimed"] == 1,
+            "X22 did not modify, transfer, and cancel real delayed work or preserve storage lifetime through close")
+    if args.cpus == 1:
+        require(twenty_second["sync_wait"] == 0 and twenty_second["inflight"] == 0,
+                "single-CPU X22 reported cross-CPU transfer or synchronous stop-wait overlap")
+    else:
+        require(2 <= twenty_second["sync_wait"] and 2 <= twenty_second["inflight"],
+                "multi-CPU X22 did not block synchronous waiters before and after real timer-to-pool transfer")
+    twenty_third = records["X23"]
+    require(2 <= twenty_third["self_requeue"] and 3 <= twenty_third["callbacks"]
+            and 1 <= twenty_third["rejected"]
+            and all(twenty_third[name] == 1 for name in
+                    ("max_active", "reused", "closed", "stops", "drops", "reclaimed")),
+            "X23 did not establish non-reentrant self-requeue, cancellation reuse, irreversible close, and exactly-once stop/drop")
 
 
 def fault_reason(args):

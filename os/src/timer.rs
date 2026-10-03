@@ -224,6 +224,24 @@ impl Timer {
         result
     }
 
+    /// 只撤下一轮，不等待或改变当前回调；运行中也可摘掉独立的 queued 登记。
+    /// 返回是否实际摘链，拥有引用仍在 base 锁外归还；不改变 try_cancel 的 Busy 契约。
+    pub(crate) fn cancel_pending(self: Pin<&Self>) -> bool {
+        let pointer = self.node_pointer();
+        let mut state = base(self.cpu).state.lock();
+        // SAFETY: base 锁保护 queued 状态和摘链；运行票独立，始终留给真实回调尾部。
+        let (queued, release) = unsafe {
+            let queued = (*self.node.get()).queued;
+            (queued, state.cancel(pointer))
+        };
+        drop(state);
+        release_owned(pointer, release);
+        if queued {
+            changed(self.cpu);
+        }
+        queued
+    }
+
     /// 在可睡普通任务中撤当前登记并等待真实回调尾部，不阻止将来重新登记。
     /// 调用者先停止外部生产者；不能从自身回调调用。
     pub fn cancel_sync(self: Pin<&Self>) -> bool {
