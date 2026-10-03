@@ -433,6 +433,13 @@ pub(crate) fn test_state(task: &Task) -> State {
     unsafe { (*task.scheduling.get()).state }
 }
 
+/// 在真实调度短锁内仅记录标量，不重取调度状态或直接唤醒服务任务。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_klog() -> u64 {
+    let _scheduler = SCHED_LOCK.lock();
+    crate::klog!(crate::klog::Level::Debug, "X25 scheduler locked")
+}
+
 /// 遍历实际 ready 链并计算同一 Task 的成员次数。
 #[cfg(feature = "execution-tests")]
 pub(crate) fn test_ready_occurrences(task: &Task) -> usize {

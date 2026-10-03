@@ -78,7 +78,7 @@ test-execution:
 	python3 scripts/test-execution.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-execution-tests.elf
 
 test-execution-fault:
-	@test "$(FAULT)" = irq -o "$(FAULT)" = preempt || { echo "FAULT must be irq or preempt" >&2; exit 2; }
+	@test "$(FAULT)" = irq -o "$(FAULT)" = preempt -o "$(FAULT)" = printer-oom -o "$(FAULT)" = timekeeper || { echo "FAULT must be irq, preempt, printer-oom, or timekeeper" >&2; exit 2; }
 	$(MAKE) build ARCH=$(ARCH) CPUS=$(CPUS) MEMORY="$(MEMORY)" MODE=$(MODE) FEATURES=execution-$(FAULT)-fault OUTPUT=build/$(ARCH)/kernel-execution-$(FAULT)-fault.elf
 	python3 scripts/test-execution.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-execution-$(FAULT)-fault.elf --fault $(FAULT)
 

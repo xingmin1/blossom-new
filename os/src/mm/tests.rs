@@ -276,7 +276,7 @@ fn partial_batch() {
     // AP 仍等待，全部样本和补充页已经归还，没有并发消费者。
     unsafe { release_pressure_pages(pressure) };
     restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-pcp-partial free=2 partial={} batch={} pressure_handles={} restored={}",
         refilled,
         batch,
@@ -338,7 +338,7 @@ fn try_lock_checks() {
             "memory try-lock outer guard did not restore IRQ"
         );
     }
-    crate::println!("PASS memory-try-lock cpu={}", cpu::current().id);
+    crate::test_println!("PASS memory-try-lock cpu={}", cpu::current().id);
 }
 
 /// 每核申请并初始化真实页，将唯一拥有者放入固定 ring，发布前保持全部页 live。
@@ -791,7 +791,7 @@ fn slub_local(initial: usize) {
         release_object(&mut held, index);
     }
     slub_restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-slub-local objects={} local_hits={} active_switches={} restored={}",
         count,
         hits,
@@ -827,7 +827,7 @@ fn slub_secondary(id: usize) {
 /// 在停点证明远端只写 shared，并与 owner 剩余 local 命中并行，随后完成真实交接。
 fn slub_remote(initial: usize) {
     if cpu::count() == 1 {
-        crate::println!("SCOPE memory-slub-remote requires=2");
+        crate::test_println!("SCOPE memory-slub-remote requires=2");
         return;
     }
     let objects = slub::geometry(SLUB_CLASS).objects;
@@ -925,7 +925,7 @@ fn slub_remote(initial: usize) {
     STEP.store(SLUB_STOPPED, Ordering::Release);
     join(SLUB_STOPPED, 1);
     slub_restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-slub-remote owner=0 remote=1 objects={} shared_handoffs={} restored={}",
         objects,
         SLUB_TRANSFER / 2,
@@ -1127,7 +1127,7 @@ fn slub_partial(initial: usize) {
         }
     }
     slub_restored(initial);
-    crate::println!("PASS memory-slub-partial full_to_cpu=1 cpu_to_node=1 node_to_active=1 empty_retained=1 live_across_shrink=1 bound={} restored={}", slub::CPU_PARTIAL_LIMIT, initial);
+    crate::test_println!("PASS memory-slub-partial full_to_cpu=1 cpu_to_node=1 node_to_active=1 empty_retained=1 live_across_shrink=1 bound={} restored={}", slub::CPU_PARTIAL_LIMIT, initial);
 }
 
 /// 复用全局压力句柄并只放回一个真实零阶页，证明高阶失败及实际 minimum 接管。
@@ -1224,7 +1224,7 @@ fn slub_fallback(initial: usize) {
     // 均已完整归还，AP 仍停稳，所有压力页访问结束并由 BSP 独占移动消费。
     unsafe { release_pressure_pages(pressure) };
     slub_restored(initial);
-    crate::println!("PASS memory-slub-fallback preferred={} actual={} objects={} pressure_handles={} restored={}", geometry.preferred_order, actual.order, actual.objects, pressure, initial);
+    crate::test_println!("PASS memory-slub-fallback preferred={} actual={} objects={} pressure_handles={} restored={}", geometry.preferred_order, actual.order, actual.objects, pressure, initial);
 }
 
 /// 在正常高阶 4096 slab 中释放非首页对象，检查真正 head/cache 和其他 live 内容。
@@ -1290,7 +1290,7 @@ fn slub_tail(initial: usize) {
         release_object(&mut held, index);
     }
     slub_restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-slub-tail order={} objects={} tail_pfn={} head_pfn={} restored={}",
         first.order,
         first.objects,
@@ -1338,7 +1338,7 @@ pub(crate) fn secondary() {
 /// BSP 在一个内存动作中验证真实页压力、经典 SLUB 与标准堆，停止参与者后恢复精确账务。
 pub(crate) fn primary() {
     assert_eq!(cpu::current().id, 0, "memory primary requires BSP");
-    crate::println!(
+    crate::test_println!(
         "MEMORY TEST READY arch={} cpus={} mode={}",
         arch::NAME,
         cpu::count(),
@@ -1378,7 +1378,7 @@ pub(crate) fn primary() {
         );
     }
     restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-pcp-transfer mode={} cpus={} live={} cross_cpu_drops={} restored={}",
         if 1 < cpu::count() {
             "cross-cpu"
@@ -1447,14 +1447,14 @@ pub(crate) fn primary() {
         local_stream(initial);
     }
     restored(initial);
-    crate::println!("PASS memory-pcp-drain mode={} cpus={} batch={} high={} high_events={} cached_after_high={} remote_cached={} rounds={} drains={} restored={}", if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), batch, high, cpu::count(), high - batch, batch * (cpu::count() - 1), ROUNDS, DRAINS.load(Ordering::Acquire), initial);
+    crate::test_println!("PASS memory-pcp-drain mode={} cpus={} batch={} high={} high_events={} cached_after_high={} remote_cached={} rounds={} drains={} restored={}", if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), batch, high, cpu::count(), high - batch, batch * (cpu::count() - 1), ROUNDS, DRAINS.load(Ordering::Acquire), initial);
     slub_primary(initial);
     heap_primary(initial);
     join(MEMORY_WAIT, 1);
     pressure_failures(initial);
     irq_primary(initial);
     stats_accounting(initial);
-    crate::println!("MEMORY TESTS PASS");
+    crate::test_println!("MEMORY TESTS PASS");
     STEP.store(IRQ_DONE, Ordering::Release);
 }
 
@@ -1598,7 +1598,7 @@ fn heap_layout(initial: usize) {
         );
     }
     slub_restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-heap-layout layouts={} max_order={} restored={}",
         CASES.len(),
         buddy::MAX_ORDER,
@@ -1665,7 +1665,7 @@ fn heap_zeroed(initial: usize) {
         }
     }
     slub_restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-heap-zeroed small_neighbors=2 large_align={} restored={}",
         PAGE_SIZE * 2,
         initial
@@ -1729,7 +1729,7 @@ fn heap_realloc(initial: usize) {
         release_pressure_pages(count);
     }
     slub_restored(initial);
-    crate::println!("PASS memory-heap-realloc grow=8193 shrink=33 pressure_handles={} failed_old_live=65 restored={}",
+    crate::test_println!("PASS memory-heap-realloc grow=8193 shrink=33 pressure_handles={} failed_old_live=65 restored={}",
         count, initial);
 }
 
@@ -1860,9 +1860,9 @@ fn heap_alloc_types(initial: usize) {
     );
     slub_restored(initial);
     if cpu::count() == 1 {
-        crate::println!("SCOPE memory-heap-alloc cross-cpu-last-drop requires=2 mode=local");
+        crate::test_println!("SCOPE memory-heap-alloc cross-cpu-last-drop requires=2 mode=local");
     }
-    crate::println!("PASS memory-heap-alloc mode={} vec_elements=1025 growths={} arc_drops=1 drop_cpu={} restored={}",
+    crate::test_println!("PASS memory-heap-alloc mode={} vec_elements=1025 growths={} arc_drops=1 drop_cpu={} restored={}",
         if 1 < cpu::count() { "cross-cpu" } else { "local" }, growths, expected_cpu, initial);
 }
 
@@ -1979,7 +1979,7 @@ fn pressure_failures(initial: usize) {
         buddy::test_orders_and_fragmentation(),
         "memory controlled production Zone failed"
     );
-    crate::println!("PASS memory-pressure kind=controlled pages=1024 restored=1024");
+    crate::test_println!("PASS memory-pressure kind=controlled pages=1024 restored=1024");
     slub_restored(initial);
     // SAFETY: 所有 AP 已 acquire 确认 MEMORY_WAIT；BSP 独占空压力前缀，且没有其他 live 页。
     let pressure = unsafe { exhaust_global_pages() };
@@ -1995,7 +1995,7 @@ fn pressure_failures(initial: usize) {
     // SAFETY: pressure 是刚刚返回且尚未移动的完整前缀；AP 仍等待，页未被访问。
     unsafe { release_pressure_pages(pressure) };
     restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-pressure kind=global free=0 pressure_handles={} restored={}",
         pressure,
         initial
@@ -2045,7 +2045,7 @@ fn pressure_failures(initial: usize) {
     // SAFETY: pressure 保持本次独占前缀原值，各槽未归还；所有样本已结束访问并归还。
     unsafe { release_pressure_pages(pressure) };
     restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-pressure kind=fragmented free=2 order=1 restored={}",
         initial
     );
@@ -2053,7 +2053,7 @@ fn pressure_failures(initial: usize) {
     assert!(black_box(alloc_pages(buddy::MAX_ORDER + 1, false)).is_none());
     assert!(black_box(alloc_pages(usize::MAX, true)).is_none());
     restored(initial);
-    crate::println!(
+    crate::test_println!(
         "PASS memory-pressure kind=over-max order={} restored={}",
         buddy::MAX_ORDER + 1,
         initial
@@ -2171,9 +2171,9 @@ fn irq_primary(initial: usize) {
     assert_eq!(TURN.load(Ordering::Acquire), cpu::count());
     slub_restored(initial);
     if cpu::count() == 1 {
-        crate::println!("SCOPE memory-irq cross-cpu-free-drain requires=2 mode=local");
+        crate::test_println!("SCOPE memory-irq cross-cpu-free-drain requires=2 mode=local");
     }
-    crate::println!("PASS memory-irq mode={} cpus={} budget={} attempts={} handlers={} window_hits={} completed={} remote_frees={} remote_drains={} remote_completed={} stopped={} restored={}",
+    crate::test_println!("PASS memory-irq mode={} cpus={} budget={} attempts={} handlers={} window_hits={} completed={} remote_frees={} remote_drains={} remote_completed={} stopped={} restored={}",
         if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), IRQ_BUDGET, IRQ_BUDGET,
         handlers, hits, completed, IRQ_REMOTE_FREES.load(Ordering::Acquire),
         IRQ_REMOTE_DRAINS.load(Ordering::Acquire), remote_completed, cpu::count(), initial);
@@ -2234,7 +2234,7 @@ fn stats_accounting(initial: usize) {
         allocated, whole_pages,
         "memory live pages were returned prematurely"
     );
-    crate::println!("PASS memory-stats-live objects={} whole_pages={} present={} reserved={} metadata={} buddy={} pcp={} slab={}",
+    crate::test_println!("PASS memory-stats-live objects={} whole_pages={} present={} reserved={} metadata={} buddy={} pcp={} slab={}",
         objects.len(), whole_pages, live.present_pages, live.reserved_pages, live.metadata_pages,
         live.buddy_free_pages, live.pcp_cached_pages, live.slab_backing_pages);
     release_object(&mut objects, 0);
@@ -2249,7 +2249,7 @@ fn stats_accounting(initial: usize) {
         final_state, baseline,
         "memory final formal stats did not restore all domains"
     );
-    crate::println!("PASS memory-stats-final present={} reserved={} metadata={} buddy={} pcp={} slab={} stopped={}",
+    crate::test_println!("PASS memory-stats-final present={} reserved={} metadata={} buddy={} pcp={} slab={} stopped={}",
         final_state.present_pages, final_state.reserved_pages, final_state.metadata_pages,
         final_state.buddy_free_pages, final_state.pcp_cached_pages, final_state.slab_backing_pages, cpu::count());
 }

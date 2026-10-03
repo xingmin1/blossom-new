@@ -497,7 +497,7 @@ fn test_duplicates() {
     drop((work, started, queue, probe));
     let (ordered, ordered_fifo) = ordered_case();
     let recovered = reclaimed(initial);
-    crate::println!("PASS execution-X18 before_duplicates={} running_duplicates={} submitted={} consumed={} callbacks={} max_active={} overlap={} ordered={} ordered_fifo={} reclaimed={}", before_duplicates, running_duplicates, submitted, consumed, callbacks, maximum, overlap, ordered, ordered_fifo, recovered);
+    crate::test_println!("PASS execution-X18 before_duplicates={} running_duplicates={} submitted={} consumed={} callbacks={} max_active={} overlap={} ordered={} ordered_fifo={} reclaimed={}", before_duplicates, running_duplicates, submitted, consumed, callbacks, maximum, overlap, ordered, ordered_fifo, recovered);
 }
 
 /// 基础执行者与同域占位者真睡眠；关联票只在第一轮 callback 内 selfqueue。
@@ -777,7 +777,7 @@ fn test_deep_blocking() {
         association_case(AssociationAction::CancelBeforeWait);
     }
     let recovered = reclaimed(initial);
-    crate::println!("PASS execution-X19 depth={} blocked={} creators={} released={} paired={} early_wake={} retired={} reclaimed={}", DEPTH, blocked, creators, released, paired, early_wake, retired, recovered);
+    crate::test_println!("PASS execution-X19 depth={} blocked={} creators={} released={} paired={} early_wake={} retired={} reclaimed={}", DEPTH, blocked, creators, released, paired, early_wake, retired, recovered);
 }
 
 /// 用现有唯一页入口从大块到单页真正摘尽 RAM；容量耗尽是测试错误而非 OOM。
@@ -834,6 +834,14 @@ fn exhaust_objects() -> (usize, usize) {
     }
     assert_eq!(nulls, mm::SLUB_SIZES.len());
     (count, nulls)
+}
+
+/// 故障镜像复用唯一真实压力表，保留全部页与十二类对象直到标准不可恢复分配。
+#[cfg(feature = "execution-printer-oom-fault")]
+pub(super) fn exhaust_for_printer_fault() -> (usize, usize, usize) {
+    let pages = exhaust_pages();
+    let (objects, nulls) = exhaust_objects();
+    (pages, objects, nulls)
 }
 
 /// 已发布压力前缀只由实际 rescuer callback 消费一次；归还全部发生在池锁和 MM 锁外。
@@ -956,7 +964,7 @@ fn test_reclaim() {
     unique_work(&recovery);
     drop((blocker, recovery, queue, probe));
     let settled = reclaimed(initial);
-    crate::println!("PASS execution-X20 page_null={} heap_null={} create_failures={} rescuer_callbacks={} worker_callbacks={} recovered={} reclaimed={}", page_null, heap_null, create_failures, rescuer_callbacks, worker_callbacks, recovered, settled);
+    crate::test_println!("PASS execution-X20 page_null={} heap_null={} create_failures={} rescuer_callbacks={} worker_callbacks={} recovered={} reclaimed={}", page_null, heap_null, create_failures, rescuer_callbacks, worker_callbacks, recovered, settled);
 }
 
 /// 较早 work 在指定真实 CPU 阻塞，较晚项完成后，未来项继续独立占据 pending/running。
@@ -1089,7 +1097,7 @@ fn test_flush_boundary() {
     }
     ordered_association_case();
     let settled = reclaimed(initial);
-    crate::println!("PASS execution-X21 remote={} earlier_blocked={} later_done={} future_submitted={} boundary_done={} future_running={} ordered={} reclaimed={}", remote, earlier_blocked, later_done, future_submitted, boundary_done, future_running, ordered, settled);
+    crate::test_println!("PASS execution-X21 remote={} earlier_blocked={} later_done={} future_submitted={} boundary_done={} future_running={} ordered={} reclaimed={}", remote, earlier_blocked, later_done, future_submitted, boundary_done, future_running, ordered, settled);
 }
 
 /// 业务回调只能在绑定 worker 上执行；关闭哨兵先于 context 解引用，记录真实迟到访问。
@@ -1288,7 +1296,7 @@ fn test_delayed() {
     let access_after_close = ACCESS_AFTER_CLOSE.load(Ordering::Acquire);
     assert_eq!(access_after_close, 0);
     let settled = reclaimed(initial);
-    crate::println!("PASS execution-X22 delayed={} modified={} transfers={} cancelled={} sync_wait={} inflight={} orphan={} access_after_close={} reclaimed={}", delayed, modified, transfers, cancelled, sync_wait, inflight, orphan, access_after_close, settled);
+    crate::test_println!("PASS execution-X22 delayed={} modified={} transfers={} cancelled={} sync_wait={} inflight={} orphan={} access_after_close={} reclaimed={}", delayed, modified, transfers, cancelled, sync_wait, inflight, orphan, access_after_close, settled);
 }
 
 static OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -1377,7 +1385,7 @@ fn test_owner() {
     let drops = OWNER_DROPS.load(Ordering::Acquire) - drops_before;
     assert_eq!(drops, 1);
     let settled = reclaimed(initial);
-    crate::println!("PASS execution-X23 self_requeue={} callbacks={} max_active={} reused={} closed={} rejected={} stops={} drops={} reclaimed={}", self_requeue, callbacks, max_active, reused, closed, rejected, stops, drops, settled);
+    crate::test_println!("PASS execution-X23 self_requeue={} callbacks={} max_active={} reused={} closed={} rejected={} stops={} drops={} reclaimed={}", self_requeue, callbacks, max_active, reused, closed, rejected, stops, drops, settled);
 }
 
 /// 原定时器用例之后运行六项真实工作场景，末尾再次确认常驻基础服务稳态。

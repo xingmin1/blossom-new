@@ -9,8 +9,14 @@
 compile_error!("refill-test requires the loongarch64 target");
 #[cfg(all(feature = "execution-tests", feature = "boot-tests"))]
 compile_error!("execution-tests cannot be combined with boot-tests");
-#[cfg(all(feature = "execution-irq-fault", feature = "execution-preempt-fault"))]
-compile_error!("execution IRQ and preempt faults require separate images");
+const _: () = assert!(
+    cfg!(feature = "execution-irq-fault") as usize
+        + cfg!(feature = "execution-preempt-fault") as usize
+        + cfg!(feature = "execution-printer-oom-fault") as usize
+        + cfg!(feature = "execution-timekeeper-fault") as usize
+        <= 1,
+    "execution faults require separate images"
+);
 
 extern crate alloc;
 extern crate rlibc;
@@ -21,6 +27,7 @@ mod boot;
 mod console;
 mod cpu;
 mod irq;
+mod klog;
 mod mm;
 mod platform;
 mod sched;
@@ -79,6 +86,8 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     #[cfg(not(feature = "boot-tests"))]
     workqueue::initialize_services().expect("worker pool service task allocation failed");
     #[cfg(not(feature = "boot-tests"))]
+    klog::initialize_service().expect("log printer task allocation failed");
+    #[cfg(not(feature = "boot-tests"))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
     unsafe { irq::initialize(resources) };
@@ -88,7 +97,7 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     arch::enable_interrupts();
     cpu::publish_online();
 
-    println!(
+    early_println!(
         "BOOT arch={} cpus={} bsp={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
         arch::NAME,
         resources.cpu_count,
@@ -100,33 +109,39 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
         resources.dtb.end
     );
     for region in &resources.memory[..resources.memory_count] {
-        println!("RAM start={:#x} end={:#x}", region.start, region.end);
+        early_println!("RAM start={:#x} end={:#x}", region.start, region.end);
     }
     for region in &resources.reserved[..resources.reserved_count] {
-        println!("RESERVED start={:#x} end={:#x}", region.start, region.end);
+        early_println!("RESERVED start={:#x} end={:#x}", region.start, region.end);
     }
-    println!(
+    early_println!(
         "PCI config={:#x}..{:#x} windows={}",
         resources.pci.configuration.start,
         resources.pci.configuration.end,
         resources.pci.range_count
     );
     for window in &resources.pci.ranges[..resources.pci.range_count] {
-        println!(
+        early_println!(
             "PCI WINDOW flags={:#x} bus={:#x} physical={:#x}..{:#x}",
-            window.flags, window.bus_start, window.cpu.start, window.cpu.end
+            window.flags,
+            window.bus_start,
+            window.cpu.start,
+            window.cpu.end
         );
     }
     // SAFETY: 全部记录已构造，本核能服务 IPI；每个 AP 的独占栈和 CPU 对象永久保留。
     unsafe { cpu::start_secondaries() };
     for id in 0..cpu::count() {
         let local = cpu::get(id);
-        println!(
+        early_println!(
             "CPU id={} hardware={} local={:#x} stack={:#x}",
-            local.id, local.hardware_id, local as *const _ as usize, local.stack_top
+            local.id,
+            local.hardware_id,
+            local as *const _ as usize,
+            local.stack_top
         );
     }
-    println!("READY arch={} cpus={}", arch::NAME, cpu::count());
+    early_println!("READY arch={} cpus={}", arch::NAME, cpu::count());
 
     #[cfg(feature = "boot-tests")]
     // SAFETY: 唯一 BSP 在全部 CPU 上线以后运行一次；测试缓冲区与串口协议由它独占。
@@ -287,12 +302,16 @@ fn init_consumers() {
     assert_eq!(*counter.lock(), 32);
     INIT_DONE.store(true, Ordering::Release);
     assert_eq!(watchdog.join(), 0);
-    println!(
+    let final_counter = *counter.lock();
+    crate::klog!(
+        klog::Level::Info,
         "INIT completed task={} cpu={} produced=8 consumed=8 sum={} counter={}",
-        task::current_task().id().as_usize(),
+        task::current_task_id()
+            .expect("initial kernel task")
+            .as_usize(),
         cpu::current().id,
         sum,
-        *counter.lock()
+        final_counter
     );
 }
 

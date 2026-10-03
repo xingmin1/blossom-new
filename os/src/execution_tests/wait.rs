@@ -187,7 +187,7 @@ fn test_exclusive() {
         .sum();
     assert_eq!(maximum, 1);
     assert_eq!(switches, TASKS * ROUNDS * 2);
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X03 tasks={} switches={} max_active={} ready_max={}",
         completed,
         switches,
@@ -425,7 +425,7 @@ fn test_windows() {
         (1, 1, 1, 1, 1, 5)
     );
     assert_eq!(QUEUE.wake_all(), 0);
-    crate::println!("PASS execution-X04 pre_register={} post_register={} blocked={} switching={} ready={} duplicate={} remote={} wake_initial={} wake_pops={} wake_rearms={}", pre_register, post_register, blocked_accept, switching, ready, duplicate, remote, wake_initial, wake_pops, wake_rearms);
+    crate::test_println!("PASS execution-X04 pre_register={} post_register={} blocked={} switching={} ready={} duplicate={} remote={} wake_initial={} wake_pops={} wake_rearms={}", pre_register, post_register, blocked_accept, switching, ready, duplicate, remote, wake_initial, wake_pops, wake_rearms);
 }
 
 /// 在同一任务结束 A 后登记 B，保留的旧 Waker 不得改变 B 的状态。
@@ -477,7 +477,7 @@ fn test_generation() {
     let retained = OLD_WAKER.lock().take();
     drop((retained, old));
     assert_eq!(QUEUE.wake_all(), 0);
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X05 stale={} blocked={} fresh={}",
         stale,
         blocked_count,
@@ -645,7 +645,7 @@ fn test_oom() {
     mm::drain_all_pages();
     let recovered = page_total();
     assert_eq!(recovered, baseline);
-    crate::println!("PASS execution-X06 pages={} classes={} nulls={} blocked={} progress={} baseline={} recovered={}", pages, CLASSES.len(), nulls, blocked_count, progress, baseline, recovered);
+    crate::test_println!("PASS execution-X06 pages={} classes={} nulls={} blocked={} progress={} baseline={} recovered={}", pages, CLASSES.len(), nulls, blocked_count, progress, baseline, recovered);
 }
 
 /// 在同一 Task 持有 guard 时真实迁核并 park，其他竞争者只能等待 Release 解锁。
@@ -726,7 +726,7 @@ fn test_mutex() {
         slot.clear();
     }
     let (completion_waiters, tokens, stolen) = test_completion();
-    crate::println!("PASS execution-X07 contenders={} failed_try={} updates={} visibility={} parked={} migrations={} completion_waiters={} tokens={} stolen={}", contenders, failed_try, updates, visibility, parked, migrations, completion_waiters, tokens, stolen);
+    crate::test_println!("PASS execution-X07 contenders={} failed_try={} updates={} visibility={} parked={} migrations={} completion_waiters={} tokens={} stolen={}", contenders, failed_try, updates, visibility, parked, migrations, completion_waiters, tokens, stolen);
 }
 
 /// 消费共享完成源的一个真实 token，普通返回以前发布实际消费次数。
@@ -825,7 +825,7 @@ fn test_exit() {
     assert_eq!(result, (1..=8).sum::<i32>());
     SLOTS[0].clear();
     drop(external);
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X08 drops={} retained={} stack_pages={} result={}",
         drops,
         retained,

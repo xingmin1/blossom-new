@@ -1,5 +1,6 @@
 //! 在生产任务栈上验证切换、迁核与离栈归还，协调者也通过普通 yield 让出执行权。
 
+mod klog;
 mod time;
 mod timer;
 mod wait;
@@ -155,7 +156,7 @@ fn test_switch_and_return() {
     assert_eq!(FRAMES.load(Ordering::Acquire), 2 * (DEPTH + 1));
     check_stack_pages(base0);
     check_stack_pages(base1);
-    crate::println!("PASS execution-X01 task0={} task1={} stack0={:#x} stack1={:#x} rounds={} registers={} deep_frames={} starts=2 drops=2 order=4 reclaimed={} observers=2", id0, id1, stack0, stack1, ROUNDS, 2 * ROUNDS, FRAMES.load(Ordering::Acquire), returned_pages - live_pages);
+    crate::test_println!("PASS execution-X01 task0={} task1={} stack0={:#x} stack1={:#x} rounds={} registers={} deep_frames={} starts=2 drops=2 order=4 reclaimed={} observers=2", id0, id1, stack0, stack1, ROUNDS, 2 * ROUNDS, FRAMES.load(Ordering::Acquire), returned_pages - live_pages);
     drop((first, second));
 }
 
@@ -168,7 +169,7 @@ fn migration_record(hop: usize, target: usize, id: usize, local: &usize, stack: 
     assert_eq!(task::current_task_id().map(|id| id.as_usize()), Some(id));
     assert_eq!(black_box(local) as *const _ as usize, stack);
     assert_eq!(*black_box(local), 0x7301);
-    crate::println!(
+    crate::test_println!(
         "EXECUTION X02 hop={} task={} cpu={} local={:#x} stack={:#x}",
         hop,
         id,
@@ -196,13 +197,13 @@ fn migration_worker() -> i32 {
 /// 单核明确记录不适用；多核等待真实迁核入口返回后才输出成功证据。
 fn test_migration() {
     if cpu::count() == 1 {
-        crate::println!("N/A execution-X02 requires=2 cpus=1");
+        crate::test_println!("N/A execution-X02 requires=2 cpus=1");
         return;
     }
     let handle = task::spawn_kernel(migration_worker).expect("migration task allocation failed");
     until(|| handle.try_join().is_some(), "task-migration-return");
     assert_eq!(handle.try_join(), Some(31));
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X02 task={} cpus={} hops={} rounds=2",
         handle.task_id().as_usize(),
         cpu::count(),
@@ -217,7 +218,7 @@ fn run_fault() -> ! {
     } else {
         2
     };
-    crate::println!(
+    crate::test_println!(
         "EXECUTION X09 guard={} task={} cpu={}",
         guard_kind,
         task::current_task().id().as_usize(),
@@ -239,7 +240,7 @@ pub(crate) fn run() -> ! {
     assert!(task::current_task_id().is_some());
     timer::wait_services_blocked();
     workqueue::wait_services_blocked();
-    crate::println!(
+    crate::test_println!(
         "EXECUTION TEST READY arch={} cpus={} mode={}",
         arch::NAME,
         cpu::count(),
@@ -255,12 +256,23 @@ pub(crate) fn run() -> ! {
     )) {
         run_fault();
     }
+    if cfg!(any(
+        feature = "execution-printer-oom-fault",
+        feature = "execution-timekeeper-fault"
+    )) {
+        #[cfg(any(
+            feature = "execution-printer-oom-fault",
+            feature = "execution-timekeeper-fault"
+        ))]
+        klog::run_fault();
+    }
     test_switch_and_return();
     test_migration();
     wait::run();
     time::run();
     timer::run();
     workqueue::run();
-    crate::println!("EXECUTION TESTS PASS");
+    klog::run();
+    crate::test_println!("EXECUTION TESTS PASS");
     arch::shutdown();
 }

@@ -1,6 +1,7 @@
 //! 选定串口的低层拥有者；正常访问共享一把端口短锁，故障输出不等待业务锁。
 
 use crate::sync::SpinLock;
+use crate::wait::WaitQueue;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -8,15 +9,22 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 const DATA: usize = 0;
 const IER: usize = 1;
 const FCR: usize = 2;
+const IIR: usize = 2;
 const LCR: usize = 3;
 const LSR: usize = 5;
 const DATA_READY: u8 = 1;
 const TRANSMIT_READY: u8 = 0x20;
+const RECEIVE_INTERRUPT: u8 = 1;
+const TRANSMIT_INTERRUPT: u8 = 2;
+#[cfg(feature = "execution-tests")]
+const THRE_INTERRUPT: u8 = 2;
+const TX_BUDGET: usize = 16;
 
 // 整条应急消息最多读取这些次 LSR，不依赖时钟或其他 CPU 的进度。
 const EMERGENCY_POLL_BUDGET: usize = 10_000;
 
 static PORT: SpinLock<()> = SpinLock::new(());
+static TX_WAIT: WaitQueue = WaitQueue::new();
 static RECEIVED: AtomicUsize = AtomicUsize::new(0);
 static LAST_BYTE: AtomicU8 = AtomicU8::new(0);
 
@@ -172,34 +180,107 @@ pub fn initialize() {
     write_register(FCR, 7);
 }
 
-/// 输出一个低频完整信息，不获取任务/PID、分配内存或重新探测硬件。
-pub fn write(arguments: fmt::Arguments<'_>) {
+/// 引导阶段同步输出，不获取任务/PID、分配内存或重新探测硬件。
+pub fn early_write(arguments: fmt::Arguments<'_>) {
     let _port = PORT.lock();
     PortWriter
         .write_fmt(arguments)
         .expect("UART formatting failed");
 }
 
+/// 测试协议复用原始同步输出，不将测试标记送入普通日志环。
+#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
+pub fn test_write(arguments: fmt::Arguments<'_>) {
+    early_write(arguments);
+}
+
+/// 在端口短锁内最多提交十六个实际可接受字节，无等待、格式化或换行转换。
+pub fn try_write(bytes: &[u8]) -> usize {
+    let _port = PORT.lock();
+    let mut accepted = 0;
+    for &byte in bytes.iter().take(TX_BUDGET) {
+        if read_register(LSR) & TRANSMIT_READY == 0 {
+            break;
+        }
+        write_register(DATA, byte);
+        accepted += 1;
+    }
+    #[cfg(feature = "execution-tests")]
+    {
+        testing::COUNTERS
+            .accepted
+            .fetch_add(accepted, Ordering::Relaxed);
+        if accepted == 0 && !bytes.is_empty() {
+            testing::COUNTERS
+                .zero_writes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    accepted
+}
+
+/// 返回永久发送等待源；登记节点后才允许使能并复查硬件条件。
+pub(crate) fn tx_wait_queue() -> &'static WaitQueue {
+    &TX_WAIT
+}
+
+/// 登记者在同一端口锁内合并发送使能并重读真实空位，已有空位时撤销无必要通知。
+pub(crate) fn arm_tx_interrupt() -> bool {
+    let _port = PORT.lock();
+    let ier = read_register(IER);
+    write_register(IER, ier | TRANSMIT_INTERRUPT);
+    let ready = read_register(LSR) & TRANSMIT_READY != 0;
+    if ready {
+        write_register(IER, ier & !TRANSMIT_INTERRUPT);
+    }
+    ready
+}
+
 /// 开启真实接收中断，源的注册与屏蔽由 IRQ 描述符负责。
 pub fn enable_receive_interrupts() {
     let _port = PORT.lock();
-    write_register(IER, 1);
+    write_register(IER, read_register(IER) | RECEIVE_INTERRUPT);
 }
 
-/// 在真实 IRQ action 中接收有限字节，记录原始数据而非 UTF-8 过滤结果。
+/// 在真实 IRQ action 中接收有限原始字节并确认发送空位，锁外通知等待者。
 ///
 /// # Safety
 /// 只作为当前 UART 的 IRQ action 调用；端口映射已建立，当前是非嵌套硬中断，
 /// 且调用者没有持有 PORT。此 handler 不使用 context。
 pub unsafe fn uart_handler(_context: *mut ()) {
-    let _port = PORT.lock();
-    for _ in 0..16 {
-        if read_register(LSR) & DATA_READY == 0 {
-            break;
+    let notify_tx = {
+        let _port = PORT.lock();
+        let first_interrupt = read_register(IIR) & 0x0f;
+        for _ in 0..16 {
+            if read_register(LSR) & DATA_READY == 0 {
+                break;
+            }
+            let byte = read_register(DATA);
+            LAST_BYTE.store(byte, Ordering::Relaxed);
+            RECEIVED.fetch_add(1, Ordering::Release);
         }
-        let byte = read_register(DATA);
-        LAST_BYTE.store(byte, Ordering::Relaxed);
-        RECEIVED.fetch_add(1, Ordering::Release);
+        let last_interrupt = read_register(IIR) & 0x0f;
+        let ier = read_register(IER);
+        let ready = read_register(LSR) & TRANSMIT_READY != 0;
+        let notify_tx = ier & TRANSMIT_INTERRUPT != 0 && ready;
+        if notify_tx {
+            write_register(IER, ier & !TRANSMIT_INTERRUPT);
+            #[cfg(feature = "execution-tests")]
+            if first_interrupt == THRE_INTERRUPT || last_interrupt == THRE_INTERRUPT {
+                testing::COUNTERS
+                    .tx_interrupts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // IIR 读取确认真实 THRE；接收优先级较高时仍以真实 LSR 关闭已满足的 TX 请求。
+        let _ = (first_interrupt, last_interrupt);
+        notify_tx
+    };
+    if notify_tx {
+        let woken = TX_WAIT.wake_all();
+        #[cfg(feature = "execution-tests")]
+        testing::COUNTERS.wakes.fetch_add(woken, Ordering::Relaxed);
+        let _ = woken;
     }
 }
 
@@ -241,11 +322,64 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     }
 }
 
-/// 使用同一个 UART 端口输出换行信息。
+/// 使用唯一 UART 端口输出引导阶段换行信息。
 #[macro_export]
-macro_rules! println {
-    () => { $crate::console::write(format_args!("\n")) };
+macro_rules! early_println {
+    () => { $crate::console::early_write(format_args!("\n")) };
     ($($argument:tt)*) => {
-        $crate::console::write(format_args!("{}\n", format_args!($($argument)*)))
+        $crate::console::early_write(format_args!("{}\n", format_args!($($argument)*)))
     };
+}
+
+/// 使用原始同步串口输出测试协议，不存在普通日志的兼容别名。
+#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
+#[macro_export]
+macro_rules! test_println {
+    () => { $crate::console::test_write(format_args!("\n")) };
+    ($($argument:tt)*) => {
+        $crate::console::test_write(format_args!("{}\n", format_args!($($argument)*)))
+    };
+}
+
+/// 仅执行测试观察真实端口活动与原始应急输出，不建立另一套 UART 后端。
+#[cfg(feature = "execution-tests")]
+pub mod testing {
+    /// 测试故障现场复用原始应急消息预算，不取端口锁、时间或任务信息。
+    pub fn emergency_write(arguments: fmt::Arguments<'_>) {
+        let _ = emergency_writer().write_fmt(arguments);
+    }
+
+    use super::*;
+
+    pub(super) struct Counters {
+        pub(super) accepted: AtomicUsize,
+        pub(super) zero_writes: AtomicUsize,
+        pub(super) tx_interrupts: AtomicUsize,
+        pub(super) wakes: AtomicUsize,
+    }
+
+    pub(super) static COUNTERS: Counters = Counters {
+        accepted: AtomicUsize::new(0),
+        zero_writes: AtomicUsize::new(0),
+        tx_interrupts: AtomicUsize::new(0),
+        wakes: AtomicUsize::new(0),
+    };
+
+    #[derive(Clone, Copy)]
+    pub struct Snapshot {
+        pub accepted: usize,
+        pub zero_writes: usize,
+        pub tx_interrupts: usize,
+        pub wakes: usize,
+    }
+
+    /// 读取实际接受、拒写、THRE 中断与成功通知计数，不读取或消费 RX。
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            accepted: COUNTERS.accepted.load(Ordering::Relaxed),
+            zero_writes: COUNTERS.zero_writes.load(Ordering::Relaxed),
+            tx_interrupts: COUNTERS.tx_interrupts.load(Ordering::Relaxed),
+            wakes: COUNTERS.wakes.load(Ordering::Relaxed),
+        }
+    }
 }

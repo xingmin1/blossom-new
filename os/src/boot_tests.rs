@@ -26,7 +26,7 @@ static UART_RETURNED: AtomicBool = AtomicBool::new(false);
 /// 记录首个真实失败并结束客体，宿主仍须拒绝该次运行。
 fn check(ok: bool, name: &str) {
     if !ok {
-        crate::println!("FAIL {} cpu={}", name, cpu::current().id);
+        crate::test_println!("FAIL {} cpu={}", name, cpu::current().id);
         arch::shutdown();
     }
 }
@@ -330,15 +330,15 @@ fn uart_checks() {
     unsafe { irq::register_uart(uart_action, (&mut context as *mut UartContext).cast()) };
     irq::enable_uart();
     let before = console::received();
-    crate::println!("UART READY normal");
+    crate::test_println!("UART READY normal");
     receive(b'U', before);
     check(0 < context.hits.load(Ordering::Acquire), "uart-real-action");
-    crate::println!("PASS uart normal");
+    crate::test_println!("PASS uart normal");
 
     irq::disable_uart();
     let hits = context.hits.load(Ordering::Acquire);
     let before = console::received();
-    crate::println!("UART READY masked");
+    crate::test_println!("UART READY masked");
     until(console::receive_pending, "uart-masked-physical-input");
     check(
         console::received() == before && context.hits.load(Ordering::Acquire) == hits,
@@ -346,7 +346,7 @@ fn uart_checks() {
     );
     irq::enable_uart();
     receive(b'M', before);
-    crate::println!("PASS uart mask-unmask");
+    crate::test_println!("PASS uart mask-unmask");
     irq::disable_uart();
     irq::unregister_uart();
     context.alive.store(false, Ordering::Release);
@@ -359,7 +359,7 @@ fn uart_checks() {
     if 1 < cpu::count() {
         start(UART_REMOVE);
     }
-    crate::println!("UART READY lifecycle");
+    crate::test_println!("UART READY lifecycle");
     receive(b'L', before);
     if 1 < cpu::count() {
         join(UART_REMOVE);
@@ -379,7 +379,7 @@ fn uart_checks() {
     check(!irq::uart_enabled(), "uart-tail-kept-disabled");
     let hits = old.hits.load(Ordering::Acquire);
     let before = console::received();
-    crate::println!("UART READY unregistered");
+    crate::test_println!("UART READY unregistered");
     until(console::receive_pending, "uart-unregistered-physical-input");
     check(
         console::received() == before && old.hits.load(Ordering::Acquire) == hits,
@@ -397,7 +397,7 @@ fn uart_checks() {
     irq::disable_uart();
     irq::unregister_uart();
     new.alive.store(false, Ordering::Release);
-    crate::println!(
+    crate::test_println!(
         "PASS uart lifecycle mode={}",
         if 1 < cpu::count() {
             "concurrent"
@@ -415,7 +415,7 @@ fn uart_checks() {
 pub unsafe fn primary() -> ! {
     #[cfg(feature = "fault-test")]
     {
-        crate::println!("FAULT READY arch={} cpus={}", arch::NAME, cpu::count());
+        crate::test_println!("FAULT READY arch={} cpus={}", arch::NAME, cpu::count());
         #[cfg(feature = "refill-test")]
         arch::trigger_unmapped_fault();
         #[cfg(not(feature = "refill-test"))]
@@ -423,15 +423,15 @@ pub unsafe fn primary() -> ! {
     }
     #[cfg(not(feature = "fault-test"))]
     {
-        crate::println!("TEST READY arch={} cpus={}", arch::NAME, cpu::count());
+        crate::test_println!("TEST READY arch={} cpus={}", arch::NAME, cpu::count());
         check(console::test_emergency_budget(), "console-emergency-budget");
-        crate::println!("PASS console-emergency-budget");
+        crate::test_println!("PASS console-emergency-budget");
         // SAFETY: 只有 BSP 在此执行一次，AP 不访问平台 COPY，实际 DTB 映射仍然保留。
         check(
             unsafe { crate::platform::test_input_boundaries() },
             "boot-input-boundaries",
         );
-        crate::println!("PASS boot-input");
+        crate::test_println!("PASS boot-input");
         // SAFETY: 本核普通执行流、IRQ 开启且没有持锁，资源已由主入口构造。
         unsafe { local_checks() };
         for id in 0..cpu::count() {
@@ -452,21 +452,21 @@ pub unsafe fn primary() -> ! {
                 );
             }
             check(local.id == id, "logical-cpu-id");
-            crate::println!(
+            crate::test_println!(
                 "PASS cpu-local cpu={} hw={} stack={:#x} local={:#x}",
                 id,
                 local.hardware_id,
                 STACK[id].load(Ordering::Relaxed),
                 LOCAL[id].load(Ordering::Relaxed)
             );
-            crate::println!(
+            crate::test_println!(
                 "PASS registers cpu={} timer={}",
                 id,
                 local.timer_interrupts.load(Ordering::Acquire)
             );
-            crate::println!("PASS irq-save cpu={}", id);
-            crate::println!("PASS self-call cpu={}", id);
-            crate::println!(
+            crate::test_println!("PASS irq-save cpu={}", id);
+            crate::test_println!("PASS self-call cpu={}", id);
+            crate::test_println!(
                 "PASS ipi cpu={} count={}",
                 id,
                 local.ipi_interrupts.load(Ordering::Acquire)
@@ -476,23 +476,23 @@ pub unsafe fn primary() -> ! {
             start(PAIR);
             call_identity(1);
             join(PAIR);
-            crate::println!("PASS smp-call pair");
+            crate::test_println!("PASS smp-call pair");
             start(FAN_IN);
             join(FAN_IN);
-            crate::println!("PASS smp-call fan-in senders={}", cpu::count() - 1);
+            crate::test_println!("PASS smp-call fan-in senders={}", cpu::count() - 1);
             start(DELAY);
             join(DELAY);
             check(
                 ENTERED.load(Ordering::Acquire) && RETURNED.load(Ordering::Acquire),
                 "delayed-call-ran",
             );
-            crate::println!("PASS smp-call delayed");
+            crate::test_println!("PASS smp-call delayed");
             if cpu::count() == 4 {
                 start(ARRIVAL);
                 join(ARRIVAL);
-                crate::println!("PASS smp-call processing-arrival");
+                crate::test_println!("PASS smp-call processing-arrival");
             } else {
-                crate::println!("SCOPE smp-call processing-arrival requires=4");
+                crate::test_println!("SCOPE smp-call processing-arrival requires=4");
             }
         } else {
             let before = HITS[0].load(Ordering::Relaxed);
@@ -508,8 +508,8 @@ pub unsafe fn primary() -> ! {
                 payload.result == 0x100 && HITS[0].load(Ordering::Relaxed) == before + 1,
                 "delayed-self-result",
             );
-            crate::println!("PASS smp-call delayed-local");
-            crate::println!("SCOPE smp-call local-only");
+            crate::test_println!("PASS smp-call delayed-local");
+            crate::test_println!("SCOPE smp-call local-only");
         }
         #[cfg(feature = "memory-tests")]
         {
@@ -520,7 +520,7 @@ pub unsafe fn primary() -> ! {
         }
         uart_checks();
         PHASE.store(STOP, Ordering::Release);
-        crate::println!("STAGE1 PASS");
+        crate::test_println!("STAGE1 PASS");
         arch::shutdown();
     }
 }

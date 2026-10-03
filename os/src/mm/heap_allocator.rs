@@ -2,6 +2,8 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
+#[cfg(feature = "execution-tests")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
@@ -11,6 +13,15 @@ struct HeapAllocator;
 
 #[global_allocator]
 static HEAP_ALLOCATOR: HeapAllocator = HeapAllocator;
+
+#[cfg(feature = "execution-tests")]
+static ALLOCATION_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// 观察真实全局分配器入口次数；调用者须先停稳其他分配参与者再比较有限区间。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn allocation_attempts() -> usize {
+    ALLOCATION_ATTEMPTS.load(Ordering::Relaxed)
+}
 
 /// 按容量与对齐选择最小整体页阶；先拒绝超过真实上限的请求再取整。
 fn page_order(layout: Layout) -> Option<usize> {
@@ -33,6 +44,8 @@ unsafe impl GlobalAlloc for HeapAllocator {
     /// # Safety
     /// layout 必须满足 GlobalAlloc 的有效非零布局合同；页与 SLUB 后端须已初始化。
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "execution-tests")]
+        ALLOCATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         if let Some(class) = slub::class_for(layout) {
             return slub::allocate(class).map_or(ptr::null_mut(), NonNull::as_ptr);
         }

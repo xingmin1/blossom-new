@@ -16,6 +16,7 @@ pub const STACK_SIZE: usize = 64 * 1024;
 
 pub(crate) const KICK_RESCHEDULE: usize = 1 << 0;
 pub(crate) const KICK_TIMER_REPROGRAM: usize = 1 << 1;
+pub(crate) const KICK_LOG_PRINTER: usize = 1 << 2;
 
 /// 链接期保留的独立启动栈，不由旧页分配器申请。
 #[repr(C, align(16))]
@@ -330,6 +331,9 @@ pub fn handle_ipi() {
         #[cfg(feature = "execution-tests")]
         local.test_timer_reprograms.fetch_add(1, Ordering::Release);
     }
+    if reasons & KICK_LOG_PRINTER != 0 {
+        crate::klog::wake_printer();
+    }
     loop {
         // SAFETY: 队列短锁覆盖 pop；入队协议保证所有未完成节点仍然存活。
         let request = unsafe { local.calls.lock().pop() };
@@ -394,7 +398,7 @@ pub fn pending_calls(target: usize) -> usize {
 /// 先发布固定软件原因再发送硬件 IPI；允许持调度锁调用，不等待目标执行。
 pub(crate) fn kick(target: usize, reason: usize) {
     assert!(
-        reason != 0 && reason & !(KICK_RESCHEDULE | KICK_TIMER_REPROGRAM) == 0,
+        reason != 0 && reason & !(KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER) == 0,
         "invalid CPU kick reason"
     );
     let local = get(target);

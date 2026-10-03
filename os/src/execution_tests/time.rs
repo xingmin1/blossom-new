@@ -142,7 +142,7 @@ fn deferred_worker() -> i32 {
     });
     let irq = local.timer_interrupts.load(Ordering::Acquire) - before;
     assert!(1 <= irq);
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X10 irq={} deferred=1 safe_points={} registers={}",
         irq,
         safe_points,
@@ -338,7 +338,7 @@ fn test_timekeeper() {
     assert_eq!(READERS_PASSED.load(Ordering::Acquire), readers);
     let updates = clock::testing::updates() - before;
     assert!(READ_ROUNDS as u64 <= updates);
-    crate::println!("PASS execution-X11 frequencies={} cases={} updates={} readers={} overlaps={} retries={} monotonic=1 wrap=1 fraction=1 max_delta=1", frequencies, cases, updates, readers, overlaps, retries);
+    crate::test_println!("PASS execution-X11 frequencies={} cases={} updates={} readers={} overlaps={} retries={} monotonic=1 wrap=1 fraction=1 max_delta=1", frequencies, cases, updates, readers, overlaps, retries);
 }
 
 /// 在同一 Task 的普通忙段、真 park 与迁核后分别结算累计执行时间。
@@ -660,7 +660,7 @@ fn test_accounting() {
         assert!(2 <= migrations && 4 <= kick_rounds && kick_rounds <= waits && 0 < idle_ns);
         1
     };
-    crate::println!("PASS execution-X12 task_ns={} wall_ns={} offcpu_ns={} irq_ns={} scheduler_ns={} idle_ns={} migrations={} kick_rounds={} waits={} no_tick={}", task_ns, wall_ns, offcpu_ns, irq_ns, scheduler_ns, idle_ns, migrations, kick_rounds, waits, no_tick);
+    crate::test_println!("PASS execution-X12 task_ns={} wall_ns={} offcpu_ns={} irq_ns={} scheduler_ns={} idle_ns={} migrations={} kick_rounds={} waits={} no_tick={}", task_ns, wall_ns, offcpu_ns, irq_ns, scheduler_ns, idle_ns, migrations, kick_rounds, waits, no_tick);
     let published = ACCOUNT_TASK.lock().take();
     drop((published, observer));
 }

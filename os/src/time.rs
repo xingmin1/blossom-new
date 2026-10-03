@@ -252,6 +252,8 @@ impl Timekeeper {
         // 全部可能失败的算术在奇序号前结束；写侧关 IRQ，不能被本核 reader 打断。
         self.sequence.store(sequence + 1, Ordering::Relaxed);
         fence(Ordering::Release);
+        #[cfg(feature = "execution-timekeeper-fault")]
+        testing::panic_writer(self, cycle);
         self.base_ns.store(sample.instant.0, Ordering::Relaxed);
         self.cycle_last.store(sample.cycle, Ordering::Relaxed);
         self.fraction.store(sample.fraction, Ordering::Relaxed);
@@ -478,6 +480,32 @@ pub(crate) mod testing {
     static OVERLAP_WRITER: AtomicUsize = AtomicUsize::new(0);
     static OVERLAPS: AtomicUsize = AtomicUsize::new(0);
     static RETRIES: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "execution-timekeeper-fault")]
+    static FAULT_WRITER: AtomicUsize = AtomicUsize::new(0);
+
+    /// 将故障限定到已等待 printer 真阻塞的当前普通 Task，维护 IRQ 不消费停点。
+    #[cfg(feature = "execution-timekeeper-fault")]
+    pub(crate) fn arm_writer_fault() {
+        FAULT_WRITER.store(task::current_task().id().as_usize(), Ordering::Release);
+    }
+
+    /// 仅在生产写锁和真实奇序号内触发 panic，输出不读取单调时间或普通日志。
+    #[cfg(feature = "execution-timekeeper-fault")]
+    pub(super) fn panic_writer(timekeeper: &Timekeeper, raw: u64) {
+        if core::ptr::eq(timekeeper, keeper())
+            && cpu::current().hardirq_depth.load(Ordering::Relaxed) == 0
+            && task::current_task_id().map(|id| id.as_usize())
+                == Some(FAULT_WRITER.load(Ordering::Acquire))
+        {
+            let sequence = timekeeper.sequence.load(Ordering::Relaxed);
+            assert_eq!(sequence & 1, 1);
+            crate::console::testing::emergency_write(format_args!(
+                "EXECUTION X27 state fault=timekeeper sequence={} sequence_odd=1 raw={}\n",
+                sequence, raw
+            ));
+            panic!("execution timekeeper writer fault");
+        }
+    }
 
     /// 为指定 CPU 的下一次真实硬件提交武装锁前停点，须由另一 CPU 释放。
     pub(crate) fn arm_program_pause(target: usize) {

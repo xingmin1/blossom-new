@@ -249,7 +249,7 @@ fn test_sleep() {
     assert_eq!(Arc::strong_count(&old_task), 1);
     let old_waker = SLEEP_WAKER.lock().take();
     drop((old_task, old_waker));
-    crate::println!("PASS execution-X13 zero={} past={} future={} blocked={} wakes={} deadline_kept={} early={} phase={} after={}", zero, past, future, blocked, wakes, deadline_kept, early, phase, after);
+    crate::test_println!("PASS execution-X13 zero={} past={} future={} blocked={} wakes={} deadline_kept={} early={} phase={} after={}", zero, past, future, blocked, wakes, deadline_kept, early, phase, after);
 }
 
 /// 硬回调内部必须报告 Busy；自重排仍由同一拥有对象和同一个 base 执行。
@@ -417,7 +417,7 @@ fn test_cancel() {
     timer.as_ref().close_sync();
     assert_unique(&timer);
     drop(timer);
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X14 queued={} after={} busy={} inflight={} sync_wait={} tail={}",
         queued,
         after,
@@ -486,7 +486,7 @@ fn test_rearm_close() {
     assert_eq!((max_active, reused, closed, rejected), (1, 1, 1, 1));
     assert_unique(&timer);
     drop(timer);
-    crate::println!("PASS execution-X15 rearmed={} callbacks={} max_active={} reused={} closed={} rejected={} overlap={}", rearmed, callbacks, max_active, reused, closed, rejected, overlap);
+    crate::test_println!("PASS execution-X15 rearmed={} callbacks={} max_active={} reused={} closed={} rejected={} overlap={}", rearmed, callbacks, max_active, reused, closed, rejected, overlap);
 }
 
 /// 较早 precise 回调在真实目标硬 IRQ 检查绝对期限，并记录相同源中的实际顺序。
@@ -647,7 +647,7 @@ fn test_remote() {
         assert_unique(&early);
         assert_unique(&long);
     }
-    crate::println!(
+    crate::test_println!(
         "PASS execution-X16 remote={} kicks={} first={} stale={} idle={}",
         remote,
         kicks,
@@ -820,7 +820,7 @@ fn test_coarse(baseline: usize) {
         "temporary timer/task pages not reclaimed"
     );
     let reclaimed = usize::from(returned == baseline);
-    crate::println!("PASS execution-X17 armed={} cancelled={} fired={} batches={} continuations={} max_batch={} budget={} wheel_cases={} jump_ticks={} reclaimed={}", armed, cancelled, fired, batches, continuations, max_batch, budget, wheel_cases, jump_ticks, reclaimed);
+    crate::test_println!("PASS execution-X17 armed={} cancelled={} fired={} batches={} continuations={} max_batch={} budget={} wheel_cases={} jump_ticks={} reclaimed={}", armed, cancelled, fired, batches, continuations, max_batch, budget, wheel_cases, jump_ticks, reclaimed);
 }
 
 /// 顺序追加五项真实定时器验收；协调者始终固定 CPU0，不迁移 init。

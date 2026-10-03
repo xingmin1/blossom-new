@@ -9,6 +9,8 @@ mod slub;
 pub(crate) mod tests;
 
 pub use frame_allocator::{alloc_pages, OwnedPages};
+#[cfg(feature = "execution-tests")]
+pub(crate) use heap_allocator::allocation_attempts;
 pub use pcp::drain_all_pages;
 #[cfg(feature = "execution-tests")]
 pub(crate) use slub::SIZES as SLUB_SIZES;
@@ -71,7 +73,7 @@ pub unsafe fn initialize(info: &BootInfo) {
             bootmem::test_input_boundaries(),
             "memory boot range checks failed"
         );
-        crate::println!("PASS memory-boot-ranges");
+        crate::early_println!("PASS memory-boot-ranges");
     }
 
     let mut memory = BootMemory::new(info)
@@ -84,21 +86,19 @@ pub unsafe fn initialize(info: &BootInfo) {
     MEMORY.call_once(|| map);
     let map = pages();
     let stats = map.stats();
-    crate::println!(
-        "MEMORY present={} reserved={} metadata={} free={} sections={} present_sections={} descriptor_size={}",
-        stats.present_pages,
-        stats.reserved_pages,
-        stats.metadata_pages,
-        stats.free_pages,
-        map.section_count(),
-        map.present_sections(),
-        size_of::<PageDesc>()
-    );
+    crate::early_println!("MEMORY present={} reserved={} metadata={} free={} sections={} present_sections={} descriptor_size={}",
+    stats.present_pages,
+    stats.reserved_pages,
+    stats.metadata_pages,
+    stats.free_pages,
+    map.section_count(),
+    map.present_sections(),
+    size_of::<PageDesc>());
 
     #[cfg(feature = "memory-tests")]
     {
         assert!(map.test_layout(info), "memory page map checks failed");
-        crate::println!("PASS memory-page-map");
+        crate::early_println!("PASS memory-page-map");
     }
 
     // SAFETY: 调用者保证 BSP 唯一初始化、IRQ 关闭且 AP 未释放；map 及全部
@@ -109,7 +109,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         free, stats.free_pages,
         "buddy initial free pages differ from boot memory"
     );
-    crate::println!("BUDDY free={} max_order={}", free, buddy::MAX_ORDER);
+    crate::early_println!("BUDDY free={} max_order={}", free, buddy::MAX_ORDER);
 
     // SAFETY: buddy 已唯一接管全部自由页；调用者保证 BSP 独占初始化、IRQ 关闭
     // 且 AP 未释放，当前尚无页申请或 PCP 使用者。
@@ -125,11 +125,11 @@ pub unsafe fn initialize(info: &BootInfo) {
             buddy::test_orders_and_fragmentation(),
             "memory buddy checks failed"
         );
-        crate::println!("PASS memory-buddy");
+        crate::early_println!("PASS memory-buddy");
         assert!(
             frame_allocator::test_owned_pages(),
             "memory owned pages checks failed"
         );
-        crate::println!("PASS memory-owned-pages");
+        crate::early_println!("PASS memory-owned-pages");
     }
 }

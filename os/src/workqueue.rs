@@ -656,6 +656,11 @@ pub(crate) mod testing {
             domains: LIVE_DOMAINS.load(Ordering::Relaxed),
         }
     }
+    /// 在真实工作元数据锁内记录标量消息，验证延期通知不会反向取得调度锁。
+    pub(crate) fn test_klog() -> u64 {
+        let _lock = STATE_LOCK.lock();
+        crate::klog::write(crate::klog::Level::Debug, format_args!("X25 pool locked"))
+    }
     /// 观察真实工作票与当前实际 TaskId。
     pub(crate) struct WorkSnapshot {
         pub queued: bool,
