@@ -190,7 +190,7 @@ pub unsafe fn local_checks() {
     READY[local.id].store(true, Ordering::Release);
 }
 
-/// 在当前 AP 的普通执行流处理有限测试阶段，同步请求均在 callback 之外发出。
+/// 在当前 AP 普通流处理有限测试阶段；同一个 MEMORY 动作内完成页/对象握手与压力停稳。
 ///
 /// # Safety
 /// 仅由完成本核设施初始化的 AP 入口调用一次，拥有独占内核栈和有效 CpuLocal。
@@ -405,7 +405,7 @@ fn uart_checks() {
     );
 }
 
-/// 由 BSP 汇总实际 CPU 结果并驱动串口协议，故障构建只触发指定异常。
+/// BSP 汇总硬件结果，并在唯一 MEMORY 动作中驱动页/对象压力；故障构建只触发指定异常。
 ///
 /// # Safety
 /// 仅由 BSP 在所有 CPU 上线后调用一次；本核 IRQ 开启且没有持锁。
@@ -510,6 +510,7 @@ pub unsafe fn primary() -> ! {
             crate::println!("SCOPE smp-call local-only");
         }
         start(MEMORY);
+        // AP 的 MEMORY 返回保证压力句柄和对象交接已经结束，才继续串口生命周期检查。
         crate::mm::tests::primary();
         join(MEMORY);
         uart_checks();

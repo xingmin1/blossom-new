@@ -1,11 +1,15 @@
-//! BSP/AP 普通执行流中的真实页压力、拥有权转移及直接 PCP 排空检查。
+//! BSP/AP 普通执行流中的真实页压力、对象拥有权交接及 PCP/SLUB 缓存检查。
 
 use crate::arch;
 use crate::cpu;
 use crate::mm::bootmem::PAGE_SIZE;
-use crate::mm::{alloc_pages, buddy, drain_all_pages, pcp, OwnedPages};
+use crate::mm::page::SlabLocation;
+use crate::mm::{
+    alloc_pages, buddy, drain_all_pages, flush_all, pcp, shrink_all, slub, OwnedPages,
+};
 use crate::sync::{IrqSaveGuard, SpinLock};
 use core::mem::MaybeUninit;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX: usize = crate::boot::MAX_CPUS;
@@ -18,6 +22,15 @@ const TRANSFER_DROP: usize = 2;
 const HIGH: usize = 3;
 const REMOTE_CACHE: usize = 4;
 const STREAM: usize = 5;
+const SLUB_REMOTE: usize = STREAM + ROUNDS * 2;
+const SLUB_STOPPED: usize = SLUB_REMOTE + 1;
+const SLUB_DONE: usize = SLUB_STOPPED + 1;
+const SLUB_SLOTS: usize = 96;
+const SLUB_TRANSFER: usize = 6;
+const SLUB_CLASS: usize = 11;
+static OBJECTS: [AtomicUsize; SLUB_TRANSFER] = [const { AtomicUsize::new(0) }; SLUB_TRANSFER];
+static REMOTE_COMMAND: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_ACK: AtomicUsize = AtomicUsize::new(0);
 static STEP: AtomicUsize = AtomicUsize::new(0);
 static ACK: [AtomicUsize; MAX] = [const { AtomicUsize::new(0) }; MAX];
 static TURN: AtomicUsize = AtomicUsize::new(0);
@@ -36,7 +49,7 @@ static mut PRESSURE: [MaybeUninit<OwnedPages>; PRESSURE_CAPACITY] =
 fn until(mut ready: impl FnMut() -> bool, name: &str) {
     let end = arch::read_counter().wrapping_add(arch::counter_frequency() * 5);
     while !ready() {
-        assert!(arch::read_counter() < end, "memory PCP timeout: {}", name);
+        assert!(arch::read_counter() < end, "memory timeout: {}", name);
         core::hint::spin_loop();
     }
 }
@@ -544,7 +557,735 @@ fn local_stream(initial: usize) {
     }
 }
 
-/// AP 只在普通执行流参加拥有权转移、高水位与有限压力；耗尽全局页期间保持等待。
+/// 将固定拥有槽中的 live 地址转为对象指针；零值只表示已经交出的释放权。
+fn object_pointer(address: usize) -> NonNull<u8> {
+    NonNull::new(address as *mut u8).expect("memory SLUB object ownership is missing")
+}
+
+/// 在固定 live 集中核验地址唯一；仅检查身份，不产生第二份释放权。
+fn unique_objects(held: &[usize]) {
+    for (index, address) in held.iter().enumerate() {
+        if *address == 0 {
+            continue;
+        }
+        assert!(
+            !held[..index].contains(address),
+            "memory SLUB returned duplicate live ownership"
+        );
+    }
+}
+
+/// 在唯一 live 对象内初始化整段内容；地址签名同时覆盖对象首尾。
+fn initialize_object(pointer: NonNull<u8>) {
+    let address = pointer.as_ptr() as usize;
+    let signature = address ^ 0x5a39_26c1_78ef_04bdu64 as usize;
+    // SAFETY: pointer 刚由 4096 class 返回且尚未发布或释放；整段 4096 字节可写，
+    // class 步长和页基址满足 usize 对齐，首尾 usize 均在同一个对象内。
+    unsafe {
+        pointer.as_ptr().write_bytes(0xa7, PAGE_SIZE);
+        pointer.as_ptr().cast::<usize>().write(signature);
+        pointer
+            .as_ptr()
+            .add(PAGE_SIZE - core::mem::size_of::<usize>())
+            .cast::<usize>()
+            .write(!signature);
+    }
+}
+
+/// 读取由本核拥有槽或 acquire 交接取得的已初始化 live 对象，检查首尾与正文。
+fn check_object(address: usize) {
+    let pointer = object_pointer(address);
+    let signature = address ^ 0x5a39_26c1_78ef_04bdu64 as usize;
+    let word = core::mem::size_of::<usize>();
+    // SAFETY: 所有调用点仍独占该 live 4096 对象，初始化已完成；远端调用先通过
+    // release/acquire 取得唯一权，读取结束前没有归还者或其他写者。
+    unsafe {
+        assert_eq!(
+            pointer.as_ptr().cast::<usize>().read(),
+            signature,
+            "memory SLUB live first word changed"
+        );
+        assert_eq!(
+            pointer
+                .as_ptr()
+                .add(PAGE_SIZE - word)
+                .cast::<usize>()
+                .read(),
+            !signature,
+            "memory SLUB live last word changed"
+        );
+        for offset in word..PAGE_SIZE - word {
+            assert_eq!(
+                pointer.as_ptr().add(offset).read(),
+                0xa7,
+                "memory SLUB live object contents changed"
+            );
+        }
+    }
+}
+
+/// 把新对象唯一权写入空槽；发布或读取前先检查全部 live 地址并完成初始化。
+fn allocate_object(held: &mut [usize], index: usize) {
+    assert_eq!(held[index], 0, "memory SLUB allocation slot is occupied");
+    let pointer = slub::allocate(SLUB_CLASS).expect("memory SLUB allocation failed");
+    held[index] = pointer.as_ptr() as usize;
+    unique_objects(held);
+    initialize_object(pointer);
+}
+
+/// 接收已由远端 release 确认归还的一对对象；先核验身份，再写入重新取得的唯一权。
+fn receive_remote_object(held: &mut [usize], index: usize, available: &[usize]) {
+    assert_eq!(
+        held[index], 0,
+        "memory SLUB remote receive slot is occupied"
+    );
+    let pointer = slub::allocate(SLUB_CLASS).expect("memory SLUB remote refill failed");
+    let address = pointer.as_ptr() as usize;
+    assert!(
+        available.contains(&address),
+        "memory SLUB refill returned an object still owned by remote CPU"
+    );
+    held[index] = address;
+    unique_objects(held);
+    initialize_object(pointer);
+}
+
+/// 消耗一个本核 live 槽的唯一释放权；先检查内容，清槽后不再访问对象。
+fn release_object(held: &mut [usize], index: usize) {
+    let address = core::mem::replace(&mut held[index], 0);
+    check_object(address);
+    // SAFETY: replace 已移动本槽唯一 live 对象释放权；没有别的拥有槽或远端访问者，
+    // 内容读取已结束，本次 deallocate 后不再通过该地址访问对象。
+    unsafe { slub::deallocate(object_pointer(address)) };
+}
+
+/// 在所有普通参与者等待时回收空 slab，再把 PCP 归还到真实 buddy 账务。
+fn slub_restored(initial: usize) {
+    shrink_all();
+    assert_eq!(
+        slub::backing_pages(),
+        0,
+        "memory SLUB shrink retained empty backing"
+    );
+    for class in 0..slub::SIZES.len() {
+        assert_eq!(
+            slub::node_snapshot(class).count,
+            0,
+            "memory SLUB shrink left node members"
+        );
+        for id in 0..cpu::count() {
+            let state = slub::cpu_snapshot(class, id);
+            assert_eq!(
+                state.active,
+                usize::MAX,
+                "memory SLUB shrink left active responsibility"
+            );
+            assert_eq!(
+                state.local_count, 0,
+                "memory SLUB shrink left local objects"
+            );
+            assert_eq!(state.local, 0, "memory SLUB shrink left local freelist");
+            assert_eq!(
+                state.partial_count, 0,
+                "memory SLUB shrink left CPU partial members"
+            );
+            assert_eq!(
+                state.partial,
+                usize::MAX,
+                "memory SLUB shrink left CPU partial head"
+            );
+        }
+    }
+    restored(initial);
+}
+
+/// 通过真实 local 数量和 active 身份验证多次本地命中及跨 slab 切换。
+fn slub_local(initial: usize) {
+    let geometry = slub::geometry(SLUB_CLASS);
+    assert_eq!(
+        geometry.stride, PAGE_SIZE,
+        "memory SLUB large class stride differs"
+    );
+    let count = geometry.objects * 3 + 1;
+    assert!(
+        count <= SLUB_SLOTS,
+        "memory SLUB local storage is too small"
+    );
+    let mut held = [0; SLUB_SLOTS];
+    let mut switches = 0;
+    let mut hits = 0;
+    for index in 0..count {
+        let before = slub::cpu_snapshot(SLUB_CLASS, 0);
+        allocate_object(&mut held, index);
+        let after = slub::cpu_snapshot(SLUB_CLASS, 0);
+        let slab = slub::slab_snapshot(object_pointer(held[index]));
+        assert_eq!(
+            slab.head_pfn, after.active,
+            "memory SLUB allocation is not owner active"
+        );
+        assert_eq!(
+            slab.location,
+            SlabLocation::Active(0),
+            "memory SLUB active role differs"
+        );
+        if 0 < before.local_count {
+            assert_eq!(
+                after.active, before.active,
+                "memory SLUB local hit changed active"
+            );
+            assert_eq!(
+                after.local_count + 1,
+                before.local_count,
+                "memory SLUB local hit lost objects"
+            );
+            hits += 1;
+        } else if before.active != usize::MAX && before.active != after.active {
+            switches += 1;
+            let previous = slub::slab_snapshot(object_pointer(held[index - 1]));
+            assert_eq!(
+                previous.location,
+                SlabLocation::Full,
+                "memory SLUB exhausted active was not full"
+            );
+            assert_eq!(
+                previous.inuse, previous.objects,
+                "memory SLUB full count differs"
+            );
+        }
+    }
+    assert!(
+        1 < switches && 0 < hits,
+        "memory SLUB did not exercise local hits and active switches"
+    );
+    for index in 0..count {
+        release_object(&mut held, index);
+    }
+    slub_restored(initial);
+    crate::println!(
+        "PASS memory-slub-local objects={} local_hits={} active_switches={} restored={}",
+        count,
+        hits,
+        switches,
+        initial
+    );
+}
+
+/// AP 在普通执行流按有限命令消费对象交接；最终 release 确认停稳后不再操作 allocator。
+fn slub_secondary(id: usize) {
+    if id == 1 {
+        wait_step(SLUB_REMOTE);
+        for round in 1..=SLUB_TRANSFER / 2 {
+            until(
+                || REMOTE_COMMAND.load(Ordering::Acquire) == round,
+                "SLUB remote command",
+            );
+            for slot in &OBJECTS[(round - 1) * 2..round * 2] {
+                let address = slot.swap(0, Ordering::AcqRel);
+                check_object(address);
+                // SAFETY: BSP 在发布命令前已清除其 owning 槽，并 release 发布该地址；
+                // swap 的 acquire 接收唯一 live 权且原子清空交接槽，内容访问已结束。
+                unsafe { slub::deallocate(object_pointer(address)) };
+            }
+            REMOTE_ACK.store(round, Ordering::Release);
+        }
+    }
+    wait_step(SLUB_STOPPED);
+    ACK[id].store(SLUB_STOPPED, Ordering::Release);
+    wait_step(SLUB_DONE);
+}
+
+/// 在停点证明远端只写 shared，并与 owner 剩余 local 命中并行，随后完成真实交接。
+fn slub_remote(initial: usize) {
+    if cpu::count() == 1 {
+        crate::println!("SCOPE memory-slub-remote requires=2");
+        return;
+    }
+    let objects = slub::geometry(SLUB_CLASS).objects;
+    assert!(
+        SLUB_TRANSFER < objects,
+        "memory SLUB remote test needs retained live object"
+    );
+    let mut held = [0; SLUB_SLOTS];
+    for index in 0..objects {
+        allocate_object(&mut held, index);
+    }
+    let anchor = object_pointer(held[SLUB_TRANSFER]);
+    let head = slub::slab_snapshot(anchor).head_pfn;
+    assert_eq!(
+        slub::cpu_snapshot(SLUB_CLASS, 0).local_count,
+        0,
+        "memory SLUB remote owner local was not exhausted"
+    );
+    // 只保留无拥有权的身份快照；原槽清空并发布后，这些整数不得用于对象访问或释放。
+    let transferred: [usize; SLUB_TRANSFER] = core::array::from_fn(|index| held[index]);
+    for (index, slot) in OBJECTS.iter().enumerate() {
+        let address = core::mem::replace(&mut held[index], 0);
+        slot.store(address, Ordering::Release);
+    }
+    STEP.store(SLUB_REMOTE, Ordering::Release);
+    REMOTE_COMMAND.store(1, Ordering::Release);
+    for round in 1..=SLUB_TRANSFER / 2 {
+        until(
+            || REMOTE_ACK.load(Ordering::Acquire) == round,
+            "SLUB remote frees",
+        );
+        let before = slub::cpu_snapshot(SLUB_CLASS, 0);
+        let shared = slub::slab_snapshot(anchor);
+        assert_eq!(
+            before.active, head,
+            "memory SLUB remote free changed owner active"
+        );
+        assert_eq!(
+            before.local_count, 0,
+            "memory SLUB remote free changed owner local"
+        );
+        assert_eq!(
+            shared.location,
+            SlabLocation::Active(0),
+            "memory SLUB remote free unfroze active"
+        );
+        assert_eq!(
+            shared.inuse,
+            objects - 2,
+            "memory SLUB remote shared count differs"
+        );
+        assert_ne!(
+            shared.shared, 0,
+            "memory SLUB remote free did not populate shared"
+        );
+        let first = (round - 1) * 2;
+        receive_remote_object(&mut held, first, &transferred[first..first + 2]);
+        let received = slub::cpu_snapshot(SLUB_CLASS, 0);
+        assert_eq!(
+            received.active, head,
+            "memory SLUB shared handoff switched active"
+        );
+        assert_eq!(
+            received.local_count, 1,
+            "memory SLUB shared handoff lost a remote object"
+        );
+        let state = slub::slab_snapshot(anchor);
+        assert_eq!(
+            state.shared, 0,
+            "memory SLUB shared handoff left objects behind"
+        );
+        assert_eq!(
+            state.inuse, objects,
+            "memory SLUB shared handoff inuse differs"
+        );
+        if round < SLUB_TRANSFER / 2 {
+            REMOTE_COMMAND.store(round + 1, Ordering::Release);
+        }
+        // 下一对 remote free 与本次 owner local 命中同时获准运行；本地命中不会
+        // 触碰仍在交接的对象，下一轮 acquire 停点才检查 shared 的真实数量。
+        receive_remote_object(&mut held, first + 1, &transferred[first..first + 2]);
+        assert_eq!(
+            slub::cpu_snapshot(SLUB_CLASS, 0).local_count,
+            0,
+            "memory SLUB owner did not consume local"
+        );
+    }
+    assert!(
+        OBJECTS.iter().all(|slot| slot.load(Ordering::Acquire) == 0),
+        "memory SLUB remote transfer retained ownership"
+    );
+    for index in 0..objects {
+        release_object(&mut held, index);
+    }
+    STEP.store(SLUB_STOPPED, Ordering::Release);
+    join(SLUB_STOPPED, 1);
+    slub_restored(initial);
+    crate::println!(
+        "PASS memory-slub-remote owner=0 remote=1 objects={} shared_handoffs={} restored={}",
+        objects,
+        SLUB_TRANSFER / 2,
+        initial
+    );
+}
+
+/// 在静止边界遍历真实成员链，检查数量、角色以及 CPU/node 成员不重叠。
+fn partial_members() {
+    let node = slub::node_snapshot(SLUB_CLASS);
+    let mut node_heads = [usize::MAX; SLUB_SLOTS];
+    assert!(
+        node.count <= SLUB_SLOTS,
+        "memory SLUB node snapshot exceeds storage"
+    );
+    let mut head = node.partial;
+    let mut previous = usize::MAX;
+    let mut empty = 0;
+    for index in 0..node.count {
+        assert!(
+            !node_heads[..index].contains(&head),
+            "memory SLUB node list contains duplicate member"
+        );
+        node_heads[index] = head;
+        let state =
+            slub::slab_head_snapshot(head).expect("memory SLUB node points at freed backing");
+        assert_eq!(
+            state.location,
+            SlabLocation::NodePartial,
+            "memory SLUB node member role differs"
+        );
+        assert_eq!(
+            state.previous, previous,
+            "memory SLUB node previous link differs"
+        );
+        assert!(
+            state.inuse < state.objects,
+            "memory SLUB node member is full"
+        );
+        assert_eq!(
+            state.cache, SLUB_CLASS,
+            "memory SLUB node member cache differs"
+        );
+        if state.inuse == 0 {
+            empty += 1;
+        }
+        previous = head;
+        head = state.next;
+    }
+    assert_eq!(
+        head,
+        usize::MAX,
+        "memory SLUB node count does not cover list"
+    );
+    assert!(
+        empty <= slub::MIN_PARTIAL,
+        "memory SLUB node retained too many empty slabs"
+    );
+    for id in 0..cpu::count() {
+        let state = slub::cpu_snapshot(SLUB_CLASS, id);
+        assert!(
+            state.partial_count <= slub::CPU_PARTIAL_LIMIT,
+            "memory SLUB CPU partial exceeded bound"
+        );
+        assert!(
+            !node_heads[..node.count].contains(&state.active),
+            "memory SLUB active is also node member"
+        );
+        let mut cpu_heads = [usize::MAX; slub::CPU_PARTIAL_LIMIT];
+        let mut head = state.partial;
+        for index in 0..state.partial_count {
+            assert_ne!(head, state.active, "memory SLUB CPU partial is also active");
+            assert!(
+                !node_heads[..node.count].contains(&head),
+                "memory SLUB partial belongs to node and CPU"
+            );
+            assert!(
+                !cpu_heads[..index].contains(&head),
+                "memory SLUB CPU list contains duplicate member"
+            );
+            cpu_heads[index] = head;
+            let slab =
+                slub::slab_head_snapshot(head).expect("memory SLUB CPU points at freed backing");
+            assert_eq!(
+                slab.location,
+                SlabLocation::CpuPartial(id),
+                "memory SLUB CPU partial was frozen or misplaced"
+            );
+            assert_eq!(
+                slab.cache, SLUB_CLASS,
+                "memory SLUB CPU partial cache differs"
+            );
+            head = slab.next;
+        }
+        assert_eq!(
+            head,
+            usize::MAX,
+            "memory SLUB CPU partial count does not cover list"
+        );
+    }
+}
+
+/// 强制 full→CPU partial→node→active，验证 empty 责任及跨 shrink 的 live 内容寿命。
+fn slub_partial(initial: usize) {
+    let objects = slub::geometry(SLUB_CLASS).objects;
+    let count = objects * 4 + 1;
+    assert!(
+        count + objects * 4 <= SLUB_SLOTS,
+        "memory SLUB partial storage is too small"
+    );
+    let mut held = [0; SLUB_SLOTS];
+    for index in 0..count {
+        allocate_object(&mut held, index);
+    }
+    let first = slub::slab_snapshot(object_pointer(held[0]));
+    let target = slub::slab_snapshot(object_pointer(held[objects + 1])).head_pfn;
+    let backing = slub::backing_pages();
+    for slab in 0..4 {
+        assert_eq!(
+            slub::slab_snapshot(object_pointer(held[slab * objects])).location,
+            SlabLocation::Full,
+            "memory SLUB full setup failed"
+        );
+    }
+    release_object(&mut held, 0);
+    let partial = slub::slab_head_snapshot(first.head_pfn)
+        .expect("memory SLUB first free destroyed live slab");
+    assert_eq!(
+        partial.location,
+        SlabLocation::CpuPartial(0),
+        "memory SLUB full first free did not enter CPU partial"
+    );
+    partial_members();
+    for index in 1..objects {
+        release_object(&mut held, index);
+    }
+    let empty = slub::slab_head_snapshot(first.head_pfn)
+        .expect("memory SLUB empty CPU partial was freed early");
+    assert_eq!(
+        empty.location,
+        SlabLocation::CpuPartial(0),
+        "memory SLUB empty lost CPU responsibility"
+    );
+    assert_eq!(
+        empty.inuse, 0,
+        "memory SLUB empty CPU partial is still in use"
+    );
+    assert_eq!(
+        slub::backing_pages(),
+        backing,
+        "memory SLUB empty CPU partial released backing early"
+    );
+    release_object(&mut held, objects);
+    release_object(&mut held, objects * 2);
+    partial_members();
+    assert!(
+        0 < slub::node_snapshot(SLUB_CLASS).count,
+        "memory SLUB partial bound did not move any slab to node"
+    );
+    flush_all();
+    partial_members();
+    assert_eq!(
+        slub::slab_head_snapshot(target).unwrap().location,
+        SlabLocation::NodePartial,
+        "memory SLUB flush lost live node partial"
+    );
+    let mut allocated = count;
+    while slub::cpu_snapshot(SLUB_CLASS, 0).active != target {
+        assert!(
+            allocated < count + objects * 4,
+            "memory SLUB node partial was never reactivated"
+        );
+        allocate_object(&mut held, allocated);
+        allocated += 1;
+    }
+    assert_eq!(
+        slub::slab_head_snapshot(target).unwrap().location,
+        SlabLocation::Active(0),
+        "memory SLUB node acquisition did not freeze active"
+    );
+    partial_members();
+    shrink_all();
+    partial_members();
+    for address in held.iter().copied().filter(|address| *address != 0) {
+        check_object(address);
+    }
+    assert_eq!(
+        slub::slab_snapshot(object_pointer(held[objects + 1])).head_pfn,
+        target,
+        "memory SLUB shrink changed live slab identity"
+    );
+    assert!(
+        0 < slub::backing_pages(),
+        "memory SLUB shrink freed live backing"
+    );
+    for index in 0..allocated {
+        if held[index] != 0 {
+            release_object(&mut held, index);
+        }
+    }
+    slub_restored(initial);
+    crate::println!("PASS memory-slub-partial full_to_cpu=1 cpu_to_node=1 node_to_active=1 empty_retained=1 live_across_shrink=1 bound={} restored={}", slub::CPU_PARTIAL_LIMIT, initial);
+}
+
+/// 复用全局压力句柄并只放回一个真实零阶页，证明高阶失败及实际 minimum 接管。
+fn slub_fallback(initial: usize) {
+    slub_restored(initial);
+    let geometry = slub::geometry(SLUB_CLASS);
+    assert!(
+        0 < geometry.preferred_order,
+        "memory SLUB fallback requires preferred high order"
+    );
+    assert_eq!(
+        geometry.minimum_order, 0,
+        "memory SLUB fallback minimum is not order zero"
+    );
+    let sample = alloc_pages(0, false).expect("memory SLUB fallback sample allocation failed");
+    let expected = sample.phys_addr();
+    drain_all_pages();
+    // SAFETY: 所有 AP 已 release 确认 SLUB_STOPPED 并等待 DONE；全部 slab/PCP 已排空，
+    // BSP 独占空 PRESSURE 存储，唯一额外页由 sample 持有，不与任何消费者并发。
+    let pressure = unsafe { exhaust_global_pages() };
+    assert_eq!(
+        total_free(),
+        0,
+        "memory SLUB pressure did not exhaust actual pages"
+    );
+    assert!(
+        alloc_pages(0, false).is_none(),
+        "memory SLUB real page OOM returned a page"
+    );
+    assert!(
+        slub::allocate(SLUB_CLASS).is_none(),
+        "memory SLUB real OOM returned an object"
+    );
+    assert_eq!(
+        slub::backing_pages(),
+        0,
+        "memory SLUB failed allocation retained backing"
+    );
+    drop(sample);
+    drain_all_pages();
+    assert_eq!(
+        buddy::free_pages(),
+        1,
+        "memory SLUB fallback did not release exactly one page"
+    );
+    assert!(
+        alloc_pages(geometry.preferred_order, false).is_none(),
+        "memory SLUB preferred order succeeded with one page"
+    );
+    let mut held = [0; 1];
+    allocate_object(&mut held, 0);
+    let actual = slub::slab_snapshot(object_pointer(held[0]));
+    assert_eq!(
+        actual.order, 0,
+        "memory SLUB fallback recorded preferred order"
+    );
+    assert_eq!(
+        actual.objects, 1,
+        "memory SLUB fallback capacity is not actual"
+    );
+    assert_eq!(
+        actual.cache, SLUB_CLASS,
+        "memory SLUB fallback cache differs"
+    );
+    assert_eq!(
+        actual.head_pfn * PAGE_SIZE,
+        expected,
+        "memory SLUB fallback did not consume released page"
+    );
+    assert_eq!(
+        slub::backing_pages(),
+        1,
+        "memory SLUB fallback backing count used preferred order"
+    );
+    assert_eq!(
+        total_free(),
+        0,
+        "memory SLUB fallback did not consume only free page"
+    );
+    release_object(&mut held, 0);
+    shrink_all();
+    drain_all_pages();
+    assert_eq!(
+        slub::backing_pages(),
+        0,
+        "memory SLUB fallback backing was not returned"
+    );
+    assert_eq!(
+        buddy::free_pages(),
+        1,
+        "memory SLUB fallback release used incorrect order"
+    );
+    // SAFETY: pressure 是本次 exhaust 原始前缀且从未归还；sample 和实际 fallback slab
+    // 均已完整归还，AP 仍停稳，所有压力页访问结束并由 BSP 独占移动消费。
+    unsafe { release_pressure_pages(pressure) };
+    slub_restored(initial);
+    crate::println!("PASS memory-slub-fallback preferred={} actual={} objects={} pressure_handles={} restored={}", geometry.preferred_order, actual.order, actual.objects, pressure, initial);
+}
+
+/// 在正常高阶 4096 slab 中释放非首页对象，检查真正 head/cache 和其他 live 内容。
+fn slub_tail(initial: usize) {
+    let geometry = slub::geometry(SLUB_CLASS);
+    assert!(
+        0 < geometry.preferred_order && 1 < geometry.objects,
+        "memory SLUB tail requires normal high-order slab"
+    );
+    let mut held = [0; SLUB_SLOTS];
+    for index in 0..geometry.objects {
+        allocate_object(&mut held, index);
+    }
+    let first = slub::slab_snapshot(object_pointer(held[0]));
+    let tail_index = geometry.objects - 1;
+    let tail = slub::slab_snapshot(object_pointer(held[tail_index]));
+    assert_eq!(
+        first.order, geometry.preferred_order,
+        "memory SLUB normal allocation did not use preferred order"
+    );
+    assert_eq!(
+        first.objects, geometry.objects,
+        "memory SLUB normal capacity differs from actual geometry"
+    );
+    assert_eq!(first.cache, SLUB_CLASS, "memory SLUB normal cache differs");
+    assert_eq!(
+        first.head_pfn,
+        arch::virt_to_phys(held[0]) / PAGE_SIZE,
+        "memory SLUB first object did not locate its actual backing head"
+    );
+    assert_eq!(
+        tail.head_pfn, first.head_pfn,
+        "memory SLUB tail lookup selected another head"
+    );
+    assert_eq!(tail.cache, SLUB_CLASS, "memory SLUB tail cache differs");
+    assert_eq!(
+        tail.order, first.order,
+        "memory SLUB tail actual order differs"
+    );
+    let tail_pfn = arch::virt_to_phys(held[tail_index]) / PAGE_SIZE;
+    assert!(
+        first.head_pfn < tail_pfn && tail_pfn < first.head_pfn + (1 << first.order),
+        "memory SLUB tail object is not on a backing tail page"
+    );
+    let backing = slub::backing_pages();
+    release_object(&mut held, tail_index);
+    assert_eq!(
+        slub::backing_pages(),
+        backing,
+        "memory SLUB tail free released live backing"
+    );
+    for index in 0..tail_index {
+        check_object(held[index]);
+        let state = slub::slab_snapshot(object_pointer(held[index]));
+        assert_eq!(
+            state.head_pfn, first.head_pfn,
+            "memory SLUB tail free changed surviving head"
+        );
+        assert_eq!(
+            state.cache, SLUB_CLASS,
+            "memory SLUB tail free changed surviving cache"
+        );
+        release_object(&mut held, index);
+    }
+    slub_restored(initial);
+    crate::println!(
+        "PASS memory-slub-tail order={} objects={} tail_pfn={} head_pfn={} restored={}",
+        first.order,
+        first.objects,
+        tail_pfn,
+        first.head_pfn,
+        initial
+    );
+}
+
+/// 在既有 MEMORY 协作内完成对象验收；真实压力前 acquire 确认全部 AP 已停止操作。
+fn slub_primary(initial: usize) {
+    slub_restored(initial);
+    slub_local(initial);
+    slub_remote(initial);
+    if cpu::count() == 1 {
+        STEP.store(SLUB_STOPPED, Ordering::Release);
+    }
+    join(SLUB_STOPPED, 1);
+    slub_partial(initial);
+    slub_fallback(initial);
+    slub_tail(initial);
+    STEP.store(SLUB_DONE, Ordering::Release);
+}
+
+/// AP 在同一个内存动作中处理页与对象交接；真实耗尽期间停止申请和归还。
 pub(crate) fn secondary() {
     let id = cpu::current().id;
     assert!(0 < id, "memory secondary requires AP");
@@ -559,9 +1300,10 @@ pub(crate) fn secondary() {
     wait_step(REMOTE_CACHE);
     cache_checkpoint(id);
     stream_worker(id);
+    slub_secondary(id);
 }
 
-/// BSP 依次执行真实耗尽、异核最终归还、高水位和直接远端排空，静止后恢复精确账务。
+/// BSP 在一个内存动作中验证真实页压力和经典 SLUB，停止参与者后恢复精确账务。
 pub(crate) fn primary() {
     assert_eq!(cpu::current().id, 0, "memory primary requires BSP");
     try_lock_checks();
@@ -664,4 +1406,5 @@ pub(crate) fn primary() {
     }
     restored(initial);
     crate::println!("PASS memory-pcp-drain mode={} cpus={} batch={} high={} high_events={} cached_after_high={} remote_cached={} rounds={} drains={} restored={}", if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), batch, high, cpu::count(), high - batch, batch * (cpu::count() - 1), ROUNDS, DRAINS.load(Ordering::Acquire), initial);
+    slub_primary(initial);
 }

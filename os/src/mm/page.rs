@@ -5,11 +5,14 @@ use core::mem::size_of;
 #[cfg(feature = "boot-tests")]
 use core::mem::size_of_val;
 use core::slice;
+use core::sync::atomic::AtomicUsize;
 
 #[cfg(feature = "boot-tests")]
 use crate::boot::BootInfo;
 use crate::boot::MAX_MEMORY_REGIONS;
 use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
+use crate::mm::OwnedPages;
+use crate::sync::SpinLock;
 
 const PAGES_PER_SECTION: usize = (128 * 1024 * 1024) / PAGE_SIZE;
 type Section<'a> = Option<&'a [PageDesc]>;
@@ -26,6 +29,11 @@ pub(crate) struct PageDesc {
     kind: PageKind,
     /// 仅由唯一所属 zone 的锁域访问，不以启动分类代替自由链成员身份。
     pub(crate) buddy: UnsafeCell<BuddyLink>,
+    /// 块内每个 PFN 关联实际头；SLUB 独占建块后以 Release 发布，定位方以 Acquire 读取。
+    /// 无关联时为 usize::MAX；销毁时须先结束所有对象与成员责任，再清除整块关联。
+    pub(crate) slab_head: AtomicUsize,
+    /// 仅实际头保存拥有与共享状态，所有普通字段读写均在此锁域内。
+    pub(crate) slab: SpinLock<Option<SlabState>>,
 }
 
 #[derive(Clone, Copy)]
@@ -35,11 +43,39 @@ pub(crate) struct BuddyLink {
     pub(crate) next: usize,
 }
 
-// SAFETY: kind 发布后不可变，buddy 的全部读写由唯一所属 zone 锁互斥。
+/// 唯一成员责任；Active 表达 frozen，只有 NodePartial 属于 node 链。
+/// flush 摘离 active 后的 CPU ticket 延续其责任，普通执行流 deactivate 才改变角色。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlabLocation {
+    Detached,
+    Active(usize),
+    CpuPartial(usize),
+    NodePartial,
+    Full,
+}
+
+/// 实际 slab 头的共享状态；成员链同时受对应 CPU/node 锁与本头锁保护。
+/// backing 保存唯一整体归还权与实际 order。销毁须先从头锁 take 本状态，
+/// 退出全部 MM 锁并清除块内 head 关联后，才能析构 backing。
+pub(crate) struct SlabState {
+    pub(crate) backing: OwnedPages,
+    pub(crate) cache: usize,
+    pub(crate) objects: usize,
+    /// Active 时包含交给 CPU local freelist 的对象，不能用作用户 live 数。
+    pub(crate) inuse: usize,
+    /// 已释放对象首 word 构成的 freelist；仍为 live 的对象不属于此链。
+    pub(crate) shared: usize,
+    pub(crate) location: SlabLocation,
+    pub(crate) next: usize,
+    pub(crate) previous: usize,
+}
+
+// SAFETY: kind 发布后不可变，buddy 的全部读写由唯一所属 zone 锁互斥；
+// slab_head 仅原子访问，slab 普通状态仅通过其 SpinLock guard 访问，锁域互不重叠。
 unsafe impl Sync for PageDesc {}
 
 impl PageDesc {
-    /// 写入不可变启动类别和未加入自由链的初始状态。
+    /// 写入不可变启动类别、未加入 buddy 链的状态及无 slab 关联的有效原子/锁初值。
     pub(crate) const fn new(kind: PageKind) -> Self {
         Self {
             kind,
@@ -48,6 +84,8 @@ impl PageDesc {
                 previous: usize::MAX,
                 next: usize::MAX,
             }),
+            slab_head: AtomicUsize::new(usize::MAX),
+            slab: SpinLock::new(None),
         }
     }
 
@@ -316,7 +354,8 @@ unsafe fn write_ranges(address: usize, ranges: &[PageRange]) -> &'static [PageRa
 /// 起址非空且按 PAGE_SIZE 对齐，整个分配的虚拟地址范围不得回绕。
 /// 本函数取得的页必须独占，不得与 memory 自身或其他存活引用重叠，之后
 /// backing 不得释放或重新分配，kind/索引/区间快照不得修改；buddy 字段仅允许
-/// 由唯一所属 zone 锁域改变。失败时已扣除的 backing 仍保留，调用者必须终止启动。
+/// 由唯一所属 zone 锁域改变，slab 共享状态仅允许由其头锁访问，head 关联采用原子协议。
+/// 失败时已扣除的 backing 仍保留，调用者必须终止启动。
 pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'static>, &'static str> {
     let mut groups = [SectionGroup {
         start: 0,

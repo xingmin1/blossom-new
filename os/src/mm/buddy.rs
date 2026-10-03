@@ -1,7 +1,11 @@
 //! 单 Normal zone 的连续页块自由链，元数据仅在 zone 锁域内改变。
 
+#[cfg(feature = "boot-tests")]
+use core::mem::MaybeUninit;
 use spin::Once;
 
+#[cfg(feature = "boot-tests")]
+use crate::mm::page::PageDesc;
 use crate::mm::page::{BuddyLink, PageKind, PageMap};
 use crate::sync::SpinLock;
 
@@ -178,6 +182,12 @@ impl<'a> Zone<'a> {
 
 static ZONE: Once<SpinLock<Zone<'static>>> = Once::new();
 
+// 独立测试元数据仅在借用期间由此锁独占，初始化不构造或复制巨型栈数组。
+// 该 arena 不发布到全局 PageMap、不提供物理页 backing，也不参加生产页分配。
+#[cfg(feature = "boot-tests")]
+static TEST_DESCRIPTORS: SpinLock<[MaybeUninit<PageDesc>; 1 << MAX_ORDER]> =
+    SpinLock::new([const { MaybeUninit::uninit() }; 1 << MAX_ORDER]);
+
 /// 在 BSP 独占启动期一次性接管永久 PageMap 的最终自由页。
 ///
 /// # Safety
@@ -277,18 +287,17 @@ fn return_block(zone: &mut Zone<'_>, block: Block) {
     unsafe { zone.release(block.head, block.order) };
 }
 
-/// 在独立 1024 槽中覆盖 order0–10、混合阶不重叠及非顺序归还后的最大块恢复。
+/// 独占静态 1024 槽 arena，覆盖 order0–10、混合阶不重叠与最大块恢复；zone 借用结束前不复用槽。
 #[cfg(feature = "boot-tests")]
 fn test_orders() -> bool {
     use crate::mm::bootmem::PageRange;
-    use crate::mm::page::PageDesc;
-    use core::mem::MaybeUninit;
 
-    let mut storage = [const { MaybeUninit::<PageDesc>::uninit() }; 1 << MAX_ORDER];
-    for slot in &mut storage {
+    let mut storage = TEST_DESCRIPTORS.lock();
+    for slot in storage.iter_mut() {
         slot.write(PageDesc::new(PageKind::Available));
     }
-    // SAFETY: 1024 槽已逐项写入，切片仅覆盖此独立栈数组，storage 保活至 zone 销毁。
+    // SAFETY: 静态 arena 在 storage guard 存活期间独占，1024 槽已逐项写入有效值；
+    // 切片仅覆盖本数组，全部 map/zone 借用先于 guard 销毁；测试从不设置 slab 拥有状态。
     let descriptors =
         unsafe { core::slice::from_raw_parts(storage.as_ptr().cast(), storage.len()) };
     let sections = [Some(descriptors)];
@@ -362,7 +371,6 @@ fn test_orders() -> bool {
 #[cfg(feature = "boot-tests")]
 fn test_fragmentation() -> bool {
     use crate::mm::bootmem::PageRange;
-    use crate::mm::page::PageDesc;
 
     let descriptors: [PageDesc; 16] = core::array::from_fn(|pfn| {
         PageDesc::new(match pfn {

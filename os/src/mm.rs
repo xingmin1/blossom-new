@@ -3,11 +3,13 @@ mod buddy;
 mod frame_allocator;
 mod page;
 mod pcp;
+mod slub;
 #[cfg(feature = "boot-tests")]
 pub(crate) mod tests;
 
 pub use frame_allocator::{alloc_pages, OwnedPages};
 pub use pcp::drain_all_pages;
+pub use slub::{flush_all, shrink_all};
 
 use crate::boot::BootInfo;
 use crate::mm::bootmem::BootMemory;
@@ -24,7 +26,7 @@ pub(crate) fn pages() -> &'static PageMap<'static> {
         .expect("physical memory has not been initialized")
 }
 
-/// 从实际启动 RAM 发布描述符，将自由范围交给 buddy，随后建立每 CPU 空页缓存。
+/// 从实际启动 RAM 发布描述符，依次建立 buddy、每 CPU 空页缓存与固定 SLUB 控制对象。
 ///
 /// # Safety
 /// 只能由 BSP 在 IRQ 关闭、AP 未释放时调用一次。info 必须是已验证并包含完整
@@ -85,6 +87,10 @@ pub unsafe fn initialize(info: &BootInfo) {
     // SAFETY: buddy 已唯一接管全部自由页；调用者保证 BSP 独占初始化、IRQ 关闭
     // 且 AP 未释放，当前尚无页申请或 PCP 使用者。
     unsafe { pcp::initialize() };
+
+    // SAFETY: 永久描述符、buddy 与 PCP 均已建立；BSP 仍独占启动，IRQ 关闭、
+    // AP 未释放且没有 SLUB 对象使用者，仅一次构造固定 cache/CPU/node 控制对象。
+    unsafe { slub::initialize() };
 
     #[cfg(feature = "boot-tests")]
     {
