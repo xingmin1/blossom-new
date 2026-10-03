@@ -1,6 +1,7 @@
 //! 在生产任务栈上验证切换、迁核与离栈归还，协调者也通过普通 yield 让出执行权。
 
 mod time;
+mod timer;
 mod wait;
 use crate::{arch, cpu, mm, sched, task, time as clock};
 use core::hint::black_box;
@@ -235,6 +236,7 @@ fn run_fault() -> ! {
 pub(crate) fn run() -> ! {
     assert_eq!(cpu::current().id, 0);
     assert!(task::current_task_id().is_some());
+    timer::wait_services_blocked();
     crate::println!(
         "EXECUTION TEST READY arch={} cpus={} mode={}",
         arch::NAME,
@@ -255,6 +257,7 @@ pub(crate) fn run() -> ! {
     test_migration();
     wait::run();
     time::run();
+    timer::run();
     crate::println!("EXECUTION TESTS PASS");
     arch::shutdown();
 }

@@ -1,10 +1,12 @@
-//! 有限硬件差值维护单调时间；每核一次事件只覆盖维护期限与当前任务时间片。
+//! 有限硬件差值维护单调时间；每核事件统一选择维护、时间片和两类 timer 的最早期限。
 
 pub use core::time::Duration;
 
 use core::cell::UnsafeCell;
 use core::convert::TryFrom;
 use core::hint::spin_loop;
+#[cfg(feature = "execution-tests")]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{compiler_fence, fence, AtomicU64, Ordering};
 use spin::Once;
 
@@ -324,6 +326,10 @@ struct EventState {
 /// CpuLocal 中预备的本核事件状态，只由所属 CPU 在 IRQ-off 边界访问。
 pub(crate) struct LocalEvent {
     state: UnsafeCell<EventState>,
+    #[cfg(feature = "execution-tests")]
+    program_pause: AtomicUsize,
+    #[cfg(feature = "execution-tests")]
+    last_programmed: AtomicU64,
 }
 
 // SAFETY: state 只经 with_current 访问；它校验所属 CPU 和 IRQ-off，远端只发送重编程提示。
@@ -338,6 +344,10 @@ impl LocalEvent {
                 maintenance: MonotonicInstant::from_nanos(0),
                 quantum: None,
             }),
+            #[cfg(feature = "execution-tests")]
+            program_pause: AtomicUsize::new(0),
+            #[cfg(feature = "execution-tests")]
+            last_programmed: AtomicU64::new(0),
         }
     }
 
@@ -360,8 +370,8 @@ pub(crate) fn activate_current_cpu() {
         let instant = keeper().update(arch::read_counter);
         event.active = true;
         event.maintenance = maintenance_deadline(instant);
-        program(event);
     });
+    reprogram_current();
 }
 
 /// 当前任务真实切入时建立新时间片，不继承旧 CPU 或旧执行段的期限。
@@ -373,6 +383,7 @@ pub(crate) fn task_switch_in() {
         );
         arm_quantum(event);
     });
+    reprogram_current();
 }
 
 /// 当前任务真实切出时移除时间片，保留本核计数器维护事件。
@@ -380,15 +391,15 @@ pub(crate) fn task_switch_out() {
     cpu::current().time_event.with_current(|event| {
         assert!(event.active, "task clockevent is not activated");
         event.quantum = None;
-        program(event);
     });
+    reprogram_current();
 }
 
-/// 处理本核已经确认的 timer IRQ，只推进维护与事件，不做硬中断调度。
+/// 先结束事件维护借用，再执行允许重新武装 timer 的硬回调，最后重查本核期限。
 pub(crate) fn handle_timer() {
-    cpu::current().time_event.with_current(|event| {
+    let active = cpu::current().time_event.with_current(|event| {
         if !event.active {
-            return;
+            return false;
         }
         let instant = now();
         if event.maintenance <= instant {
@@ -397,17 +408,22 @@ pub(crate) fn handle_timer() {
         if event.quantum.is_some_and(|deadline| deadline <= instant) {
             event.quantum = None;
         }
-        program(event);
+        true
     });
+    if active {
+        crate::timer::handle_interrupt();
+        reprogram_current();
+    }
 }
 
 /// 重查本核真实最早事件并编程；远端提示不携带可能失效的旧期限。
 pub(crate) fn reprogram_current() {
-    cpu::current().time_event.with_current(|event| {
-        if event.active {
-            program(event);
-        }
-    });
+    let event = cpu::current()
+        .time_event
+        .with_current(|event| event.active.then_some(*event));
+    if let Some(event) = event {
+        program(event);
+    }
 }
 
 /// 从本次真实维护基准建立下一次期限，纳秒空间耗尽直接失败。
@@ -417,27 +433,36 @@ fn maintenance_deadline(instant: MonotonicInstant) -> MonotonicInstant {
         .expect("counter maintenance deadline overflows")
 }
 
-/// 对当前执行段重建一次真实调度期限，并提交同一本核事件选择。
+/// 对当前执行段重建一次真实调度期限，提交前由调用者结束可变事件借用。
 fn arm_quantum(event: &mut EventState) {
     event.quantum = Some(now().checked_add(QUANTUM).expect("task quantum overflows"));
-    program(event);
 }
 
-/// 将维护与当前任务期限中的最早者转换为一次硬件事件。
-fn program(event: &EventState) {
-    let deadline = event
-        .quantum
-        .map_or(event.maintenance, |quantum| quantum.min(event.maintenance));
-    let timekeeper = keeper();
-    let sample = timekeeper.sample(arch::read_counter);
-    arch::program_timer(timekeeper.scale.deadline_cycles(sample, deadline));
+/// 在同一本核 base 锁下最终重查两类 timer，并保持锁直到真实硬件编程结束。
+fn program(event: EventState) {
+    #[cfg(feature = "execution-tests")]
+    testing::pause_program();
+    crate::timer::with_next_deadline(|timer_deadline| {
+        let deadline = event
+            .quantum
+            .map_or(event.maintenance, |quantum| quantum.min(event.maintenance));
+        let deadline = timer_deadline.map_or(deadline, |timer| timer.min(deadline));
+        let timekeeper = keeper();
+        let sample = timekeeper.sample(arch::read_counter);
+        arch::program_timer(timekeeper.scale.deadline_cycles(sample, deadline));
+        #[cfg(feature = "execution-tests")]
+        cpu::current()
+            .time_event
+            .last_programmed
+            .store(deadline.as_nanos(), Ordering::Release);
+    });
 }
 
 /// 专用验收只公开生产对象与同一算法，不维护第二套时间模型。
 #[cfg(feature = "execution-tests")]
 pub(crate) mod testing {
     pub(crate) use super::Timekeeper;
-    use super::{arm_quantum, keeper, MonotonicInstant};
+    use super::{arm_quantum, keeper, reprogram_current, MonotonicInstant};
     use crate::arch;
     use crate::cpu;
     use crate::task::{self, TaskId};
@@ -454,6 +479,76 @@ pub(crate) mod testing {
     static OVERLAPS: AtomicUsize = AtomicUsize::new(0);
     static RETRIES: AtomicUsize = AtomicUsize::new(0);
 
+    /// 为指定 CPU 的下一次真实硬件提交武装锁前停点，须由另一 CPU 释放。
+    pub(crate) fn arm_program_pause(target: usize) {
+        assert_ne!(
+            target,
+            cpu::current().id,
+            "program pause requires another CPU"
+        );
+        cpu::get(target)
+            .time_event
+            .program_pause
+            .compare_exchange(0, ARMED, Ordering::AcqRel, Ordering::Acquire)
+            .expect("clockevent program pause already armed");
+    }
+
+    /// 观察目标已进入真实提交入口，但尚未持有 timer base 锁。
+    pub(crate) fn program_paused(target: usize) -> bool {
+        cpu::get(target)
+            .time_event
+            .program_pause
+            .load(Ordering::Acquire)
+            == PAUSED
+    }
+
+    /// 释放真实提交停点；目标随后在 base 锁内重新选择已发表的最早节点。
+    pub(crate) fn release_program_pause(target: usize) {
+        cpu::get(target)
+            .time_event
+            .program_pause
+            .compare_exchange(PAUSED, PUBLISHED, Ordering::Release, Ordering::Relaxed)
+            .expect("clockevent program pause has not been reached");
+    }
+
+    /// 读取真实硬件编程结束后发表的统一纳秒期限，不把候选期限冒充提交证据。
+    pub(crate) fn last_programmed_deadline(target: usize) -> MonotonicInstant {
+        MonotonicInstant::from_nanos(
+            cpu::get(target)
+                .time_event
+                .last_programmed
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// 只在真实提交取最终 base 锁之前暂停；原始计数器限制等待且不重入时间事件。
+    pub(super) fn pause_program() {
+        let state = &cpu::current().time_event.program_pause;
+        if state
+            .compare_exchange(ARMED, PAUSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        assert!(
+            !arch::irq_enabled(),
+            "clockevent program pause requires IRQ-off"
+        );
+        let limit = arch::counter_frequency()
+            .checked_mul(5)
+            .expect("clockevent program raw timeout overflows");
+        let start = arch::read_counter();
+        while state.load(Ordering::Acquire) == PAUSED {
+            assert!(
+                arch::read_counter().wrapping_sub(start) < limit,
+                "clockevent program pause timed out"
+            );
+            spin_loop();
+        }
+        assert_eq!(state.load(Ordering::Acquire), PUBLISHED);
+        state.store(0, Ordering::Release);
+    }
+
     /// 在当前普通任务的 IRQ-off 段重建时间片，沿用生产事件和硬件提交。
     ///
     /// # Safety
@@ -465,6 +560,7 @@ pub(crate) mod testing {
             assert!(event.active, "task clockevent is not activated");
             arm_quantum(event);
         });
+        reprogram_current();
     }
 
     /// 为唯一生产基准准备一次指定任务的跨核快照交错。

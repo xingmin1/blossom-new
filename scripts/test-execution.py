@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""运行给定执行测试 ELF，核对 X01–X12 的真实执行、等待与时间证据。
+"""运行给定执行测试 ELF，核对 X01–X17 的真实执行、等待、时间与 timer 证据。
 
-正常镜像按唯一顺序输出 X01–X08、X10–X12；单核仅 X02 明确 N/A。
+正常镜像按唯一顺序输出 X01–X08、X10–X17；单核仅 X02 明确 N/A。
 X10 检查重新武装后的硬 IRQ 延后切换与架构寄存器保存，X11 检查同一时间
 算法的维护、快照交错拒绝重试及边界，X12 检查执行/IRQ/scheduler/idle 四账、
-迁核和不依靠 timer tick 的远端 kick 与实际等待指令完成。故障镜像只接受 X09 真实拒绝。
+迁核和不依靠 timer tick 的远端 kick 与实际等待指令完成。X13–X17 检查原期限
+睡眠、同步取消真尾部、复用关闭、远端重编程与有界粗 timer 批处理；故障镜像只接受 X09 真实拒绝。
 """
 
 import argparse
@@ -58,7 +59,7 @@ def check_header(args, lines):
 
 
 def check_execution(args):
-    """核对唯一有序记录、真实切换与等待，以及统一时间和四账的观测关系。"""
+    """核对唯一有序记录、真实切换与等待，以及统一时间、四账和 timer 观测关系。"""
     lines = args.output.read_text(encoding="utf-8", errors="replace").splitlines()
     begin, cpu_locals = check_header(args, lines)
     require(lines.count("EXECUTION TESTS PASS") == 1,
@@ -73,7 +74,7 @@ def check_execution(args):
         require(not line.startswith("EXECUTION TESTS PASS") or line == "EXECUTION TESTS PASS",
                 "malformed execution success marker")
         if line.startswith("PASS execution-"):
-            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-2]) (.+)", line)
+            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-7]) (.+)", line)
             require(match is not None and begin < index < done, "unexpected execution pass: " + line)
             name, payload = match.groups()
             require(name not in records, "duplicate execution record: " + name)
@@ -86,7 +87,8 @@ def check_execution(args):
             require("X01" in records and "X02" not in records, "migration evidence preceded X01 or followed X02")
             hops.append(fields(line[len("EXECUTION X02 "):]))
     expected = ["X01"] + ([] if args.cpus == 1 else ["X02"]) + [
-        "X03", "X04", "X05", "X06", "X07", "X08", "X10", "X11", "X12"]
+        "X03", "X04", "X05", "X06", "X07", "X08", "X10", "X11", "X12",
+        "X13", "X14", "X15", "X16", "X17"]
     require(list(records) == expected, "missing or out-of-order execution records")
     first = records["X01"]
     require(set(first) == {"task0", "task1", "stack0", "stack1", "rounds", "registers",
@@ -128,6 +130,7 @@ def check_execution(args):
                     "migration changed identity, stack, or destination CPU base")
     check_time(args, records)
     check_waiting(args, records)
+    check_timer(args, records)
 
 
 def check_waiting(args, records):
@@ -220,6 +223,66 @@ def check_time(args, records):
                 and 4 <= twelfth["kick_rounds"] <= twelfth["waits"]
                 and twelfth["no_tick"] == 1,
                 "multi-CPU X12 did not establish real hardware waits, migration, and tick-free asynchronous kicks")
+
+
+def check_timer(args, records):
+    """严格核对 timer 字段、无提前执行、真实尾部等待和各 CPU 数下的观测下界。"""
+    expected = {
+        "X13": {"zero", "past", "future", "blocked", "wakes", "deadline_kept",
+                "early", "phase", "after"},
+        "X14": {"queued", "after", "busy", "inflight", "sync_wait", "tail"},
+        "X15": {"rearmed", "callbacks", "max_active", "reused", "closed", "rejected", "overlap"},
+        "X16": {"remote", "kicks", "first", "stale", "idle"},
+        "X17": {"armed", "cancelled", "fired", "batches", "continuations", "max_batch",
+                "budget", "wheel_cases", "jump_ticks", "reclaimed"},
+    }
+    for name, names in expected.items():
+        record = records[name]
+        require(set(record) == names and all(0 <= value < (1 << 64) for value in record.values()),
+                name + " has missing, extra, or non-u64 timer fields")
+    thirteenth = records["X13"]
+    require(all(thirteenth[name] == 1 for name in
+                ("zero", "past", "future", "deadline_kept", "phase", "after"))
+            and 1 <= thirteenth["blocked"] and 3 <= thirteenth["wakes"]
+            and thirteenth["early"] == 0,
+            "X13 did not preserve the original sleep deadline after early wakes or cover phase boundaries")
+    fourteenth = records["X14"]
+    require(all(fourteenth[name] == 1 for name in ("queued", "after", "tail"))
+            and 1 <= fourteenth["busy"],
+            "X14 did not establish queued cancellation, real callback Busy, and completion after the true tail")
+    if args.cpus == 1:
+        require(fourteenth["inflight"] == 0 and fourteenth["sync_wait"] == 0,
+                "single-CPU X14 reported cross-CPU callback or synchronous tail-wait overlap")
+    else:
+        require(2 <= fourteenth["inflight"] and 2 <= fourteenth["sync_wait"],
+                "multi-CPU X14 did not block synchronous waiters in both dequeued and callback-tail windows")
+    fifteenth = records["X15"]
+    require(1 <= fifteenth["rearmed"] and 2 <= fifteenth["callbacks"]
+            and all(fifteenth[name] == 1 for name in ("max_active", "reused", "closed"))
+            and 1 <= fifteenth["rejected"],
+            "X15 did not establish non-reentrant self-rearm, cancellation reuse, and irreversible close")
+    require(fifteenth["overlap"] == 0 if args.cpus == 1 else 1 <= fifteenth["overlap"],
+            "X15 running/queued close overlap does not match the CPU count")
+    sixteenth = records["X16"]
+    require(sixteenth["first"] == 1 and sixteenth["stale"] == 0,
+            "X16 did not fire the earlier timer first or let an old plan overwrite its deadline")
+    if args.cpus == 1:
+        require(all(sixteenth[name] == 0 for name in ("remote", "kicks", "idle")),
+                "single-CPU X16 reported remote timer insertion, kick, or hardware idle evidence")
+    else:
+        require(sixteenth["remote"] == args.cpus - 1
+                and sixteenth["remote"] <= sixteenth["kicks"]
+                and sixteenth["remote"] <= sixteenth["idle"],
+                "multi-CPU X16 did not reprogram every remote CPU after a real idle wait and timer kick")
+    seventeenth = records["X17"]
+    require(128 <= seventeenth["armed"]
+            and seventeenth["armed"] // 2 < seventeenth["cancelled"]
+            and seventeenth["fired"] == seventeenth["armed"] - seventeenth["cancelled"]
+            and 2 <= seventeenth["batches"] and 1 <= seventeenth["continuations"]
+            and 1 <= seventeenth["max_batch"] <= seventeenth["budget"]
+            and 12 <= seventeenth["wheel_cases"] and 2 <= seventeenth["jump_ticks"]
+            and seventeenth["reclaimed"] == 1,
+            "X17 did not conserve timer totals, cancel the majority, run bounded continuation batches, or repay resources")
 
 
 def fault_reason(args):
