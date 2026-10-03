@@ -281,7 +281,7 @@ impl BootMemory {
 }
 
 /// 用生产区间与分配算法检查对齐、空洞、保留交集和错误后的账务。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn test_input_boundaries() -> bool {
     let mut info = BootInfo::empty([0; 3], 0);
     info.memory_count = 5;

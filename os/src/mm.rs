@@ -5,7 +5,7 @@ mod heap_allocator;
 mod page;
 mod pcp;
 mod slub;
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) mod tests;
 
 pub use frame_allocator::{alloc_pages, OwnedPages};
@@ -19,6 +19,30 @@ use core::mem::size_of;
 use spin::Once;
 
 static MEMORY: Once<PageMap<'static>> = Once::new();
+
+/// 物理内存各域的页数快照；启动分类固定，其他字段只在参与者停稳后构成精确账务。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryStats {
+    pub present_pages: usize,
+    pub reserved_pages: usize,
+    pub metadata_pages: usize,
+    pub buddy_free_pages: usize,
+    pub pcp_cached_pages: usize,
+    pub slab_backing_pages: usize,
+}
+
+/// 全部后端初始化后由不持 MM 锁的调用者逐域读取真实页数；跨锁快照不能推导并发 live 数。
+pub fn stats() -> MemoryStats {
+    let boot = pages().stats();
+    MemoryStats {
+        present_pages: boot.present_pages,
+        reserved_pages: boot.reserved_pages,
+        metadata_pages: boot.metadata_pages,
+        buddy_free_pages: buddy::free_pages(),
+        pcp_cached_pages: pcp::cached_pages(),
+        slab_backing_pages: slub::backing_pages(),
+    }
+}
 
 /// 借用永久发布的物理页描述符表；初始化前调用直接报告时序错误。
 pub(crate) fn pages() -> &'static PageMap<'static> {
@@ -39,7 +63,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         MEMORY.get().is_none(),
         "physical memory is already initialized"
     );
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     {
         assert!(
             bootmem::test_input_boundaries(),
@@ -69,7 +93,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         size_of::<PageDesc>()
     );
 
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     {
         assert!(map.test_layout(info), "memory page map checks failed");
         crate::println!("PASS memory-page-map");
@@ -93,7 +117,7 @@ pub unsafe fn initialize(info: &BootInfo) {
     // AP 未释放且没有 SLUB 对象使用者，仅一次构造固定 cache/CPU/node 控制对象。
     unsafe { slub::initialize() };
 
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     {
         assert!(
             buddy::test_orders_and_fragmentation(),

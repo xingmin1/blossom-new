@@ -70,7 +70,10 @@ impl Drop for OwnedPages {
 
 /// 非阻塞地申请一个连续页块；单页使用当前 CPU 缓存，其他阶直接请求 buddy。
 /// 不足或阶数超限返回 None，不睡眠或自动回收；清零在全部锁及 IRQ guard 退出后执行。
+/// 内存验收武装时，成功清零的普通 BSP 调用还须在锁外等待对应 AP 同票完成，才允许返回。
 pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
+    #[cfg(feature = "memory-tests")]
+    let mut window = crate::mm::tests::AllocationWindow::enter();
     let block = if order == 0 {
         pcp::allocate()
     } else {
@@ -79,6 +82,8 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
     let mut pages = OwnedPages { block };
     if zeroed {
         let len = pages.len();
+        #[cfg(feature = "memory-tests")]
+        window.arm_timer();
         // SAFETY: 页入口返回已离开全部空闲链的真实连续 RAM 块，当前拥有者独占
         // 全部 len 字节，BSP 已保证永久可写直映；全部 zone/PCP 锁与 IRQ guard 已退出。
         unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0, len) };
@@ -87,7 +92,7 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
 }
 
 /// 在 BSP 独占期间检查各阶拥有、真实分类与清零，计入缓存并在排空后核对 buddy 账务。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn test_owned_pages() -> bool {
     use crate::mm::page::PageKind;
     use crate::mm::{alloc_pages, drain_all_pages, OwnedPages};

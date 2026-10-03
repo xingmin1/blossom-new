@@ -2,12 +2,12 @@
 
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 use core::mem::size_of_val;
 use core::slice;
 use core::sync::atomic::AtomicUsize;
 
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 use crate::boot::BootInfo;
 use crate::boot::MAX_MEMORY_REGIONS;
 use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
@@ -100,7 +100,7 @@ pub(crate) struct PageMap<'a> {
     free: &'a [PageRange],
     stats: BootStats,
     present_sections: usize,
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     metadata: &'a [PageRange],
 }
 
@@ -141,7 +141,7 @@ impl<'a> PageMap<'a> {
     }
 
     /// 借用独立测试描述符与范围；不发布，也不授予物理页访问权限。
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     pub(crate) fn test_map(sections: &'a [Section<'a>], free: &'a [PageRange]) -> Self {
         Self {
             sections,
@@ -158,7 +158,7 @@ impl<'a> PageMap<'a> {
     }
 
     /// 用实际启动资源逐 PFN 核对分类、空洞、保留资源和计数。
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     pub(crate) fn test_layout(&self, info: &BootInfo) -> bool {
         let mut present = 0;
         let mut reserved = 0;
@@ -255,7 +255,7 @@ impl<'a> PageMap<'a> {
     }
 
     /// 核对静态内核资源与 DTB 的 RAM 交集不出现在自由范围中。
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     fn resource_is_reserved(&self, region: crate::boot::Region) -> bool {
         if region.start == region.end {
             return true;
@@ -269,7 +269,7 @@ impl<'a> PageMap<'a> {
     }
 
     /// 核对永久控制对象的每个 backing 页均由元数据分类覆盖。
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     fn metadata_covers(&self, address: usize, bytes: usize) -> bool {
         if bytes == 0 {
             return true;
@@ -301,7 +301,7 @@ fn cursor_contains(ranges: &[PageRange], cursor: &mut usize, pfn: usize) -> bool
 }
 
 /// 检查测试快照中是否存在包含该 PFN 的范围。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 fn contains(ranges: &[PageRange], pfn: usize) -> bool {
     ranges
         .iter()
@@ -309,7 +309,7 @@ fn contains(ranges: &[PageRange], pfn: usize) -> bool {
 }
 
 /// 从原始字节资源的覆盖关系判断整页 RAM，允许相邻未对齐资源共同覆盖一页。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 fn page_is_ram(info: &BootInfo, pfn: usize) -> bool {
     let mut covered = pfn * PAGE_SIZE;
     let end = covered + PAGE_SIZE;
@@ -388,7 +388,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     let root_bytes = section_bytes
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     let root_bytes = root_bytes
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
@@ -456,7 +456,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     // SAFETY: root 后部留有 RANGE_CAPACITY 个对齐槽，不与 sections 重叠；
     // BootMemory 的范围容量不超过该上界，写完后仅发布只读引用。
     let free = unsafe { write_ranges(root_address + section_bytes, memory.free()) };
-    #[cfg(feature = "boot-tests")]
+    #[cfg(feature = "memory-tests")]
     // SAFETY: 测试布局额外预留另一组 RANGE_CAPACITY 槽，与根和 free 快照不重叠。
     let metadata = unsafe {
         write_ranges(
@@ -469,7 +469,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
         free,
         stats: memory.stats(),
         present_sections,
-        #[cfg(feature = "boot-tests")]
+        #[cfg(feature = "memory-tests")]
         metadata,
     })
 }

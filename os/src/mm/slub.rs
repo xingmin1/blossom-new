@@ -24,6 +24,7 @@ pub(crate) struct Geometry {
     pub(crate) stride: usize,
     pub(crate) preferred_order: usize,
     pub(crate) minimum_order: usize,
+    #[cfg(feature = "memory-tests")]
     pub(crate) objects: usize,
 }
 
@@ -163,6 +164,7 @@ fn calculate_geometry(stride: usize) -> Geometry {
         stride,
         preferred_order,
         minimum_order,
+        #[cfg(feature = "memory-tests")]
         objects: (PAGE_SIZE << preferred_order) / stride,
     }
 }
@@ -699,7 +701,7 @@ pub(crate) fn backing_pages() -> usize {
         .sum()
 }
 
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 #[derive(Clone, Copy)]
 pub(crate) struct SlabSnapshot {
     pub(crate) head_pfn: usize,
@@ -713,7 +715,7 @@ pub(crate) struct SlabSnapshot {
     pub(crate) previous: usize,
 }
 
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 #[derive(Clone, Copy)]
 pub(crate) struct CpuSnapshot {
     pub(crate) active: usize,
@@ -723,7 +725,7 @@ pub(crate) struct CpuSnapshot {
     pub(crate) partial_count: usize,
 }
 
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 #[derive(Clone, Copy)]
 pub(crate) struct NodeSnapshot {
     pub(crate) partial: usize,
@@ -731,13 +733,13 @@ pub(crate) struct NodeSnapshot {
 }
 
 /// 返回实际生产缓存几何，不重建另一份选阶算法。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn geometry(class: usize) -> Geometry {
     cache(class).geometry
 }
 
 /// 持真实 slab 锁读取仍由消费者保留的 live 对象所在块。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn slab_snapshot(pointer: NonNull<u8>) -> SlabSnapshot {
     let pfn = arch::virt_to_phys(pointer.as_ptr() as usize) / PAGE_SIZE;
     let head = descriptor(pfn).slab_head.load(Ordering::Acquire);
@@ -745,7 +747,7 @@ pub(crate) fn slab_snapshot(pointer: NonNull<u8>) -> SlabSnapshot {
 }
 
 /// 持真实头 descriptor 的 slab 锁观察成员或已归页的 None，不读取空闲页内容。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn slab_head_snapshot(head: usize) -> Option<SlabSnapshot> {
     let slot = pages().get(head)?.slab.lock();
     let state = slot.as_ref()?;
@@ -763,7 +765,7 @@ pub(crate) fn slab_head_snapshot(head: usize) -> Option<SlabSnapshot> {
 }
 
 /// 持指定本核控制锁取得小快照，远端只观察且不修改其 local 链。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn cpu_snapshot(class: usize, owner: usize) -> CpuSnapshot {
     let local = cache(class).cpus[owner].lock();
     CpuSnapshot {
@@ -776,7 +778,7 @@ pub(crate) fn cpu_snapshot(class: usize, owner: usize) -> CpuSnapshot {
 }
 
 /// 持真实 node 锁读取成员头和计数，不将多个快照视为全局原子状态。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn node_snapshot(class: usize) -> NodeSnapshot {
     let node = cache(class).node.lock();
     NodeSnapshot {

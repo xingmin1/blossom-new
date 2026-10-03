@@ -1,10 +1,10 @@
 //! 单 Normal zone 的连续页块自由链，元数据仅在 zone 锁域内改变。
 
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 use core::mem::MaybeUninit;
 use spin::Once;
 
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 use crate::mm::page::PageDesc;
 use crate::mm::page::{BuddyLink, PageKind, PageMap};
 use crate::sync::SpinLock;
@@ -185,7 +185,7 @@ static ZONE: Once<SpinLock<Zone<'static>>> = Once::new();
 
 // 独立测试元数据仅在借用期间由此锁独占，初始化不构造或复制巨型栈数组。
 // 该 arena 不发布到全局 PageMap、不提供物理页 backing，也不参加生产页分配。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 static TEST_DESCRIPTORS: SpinLock<[MaybeUninit<PageDesc>; 1 << MAX_ORDER]> =
     SpinLock::new([const { MaybeUninit::uninit() }; 1 << MAX_ORDER]);
 
@@ -276,20 +276,20 @@ pub(crate) fn free_pages() -> usize {
 }
 
 /// 使用生产 Zone 方法验证全部阶、非顺序归还、碎片失败及受控池真实穷尽。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn test_orders_and_fragmentation() -> bool {
     test_orders() && test_fragmentation()
 }
 
 /// 消耗独立受控池唯一块句柄，避免测试复制裸 PFN 的释放责任。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 fn return_block(zone: &mut Zone<'_>, block: Block) {
     // SAFETY: 测试只传入该 zone 刚分配且未访问物理内容的唯一 Block，消耗后不再归还。
     unsafe { zone.release(block.head, block.order) };
 }
 
 /// 独占静态 1024 槽 arena，覆盖 order0–10、混合阶不重叠与最大块恢复；zone 借用结束前不复用槽。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 fn test_orders() -> bool {
     use crate::mm::bootmem::PageRange;
 
@@ -369,7 +369,7 @@ fn test_orders() -> bool {
 }
 
 /// 以保留槽与空洞切断连续块，在总量足够时失败并逐页耗尽、归还恢复。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 fn test_fragmentation() -> bool {
     use crate::mm::bootmem::PageRange;
 

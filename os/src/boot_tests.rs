@@ -9,6 +9,7 @@ const FAN_IN: usize = 2;
 const DELAY: usize = 3;
 const ARRIVAL: usize = 4;
 const UART_REMOVE: usize = 5;
+#[cfg(feature = "memory-tests")]
 const MEMORY: usize = 6;
 const STOP: usize = 7;
 static PHASE: AtomicUsize = AtomicUsize::new(0);
@@ -190,7 +191,7 @@ pub unsafe fn local_checks() {
     READY[local.id].store(true, Ordering::Release);
 }
 
-/// 在当前 AP 普通流处理有限阶段；MEMORY 内完成页、SLUB、标准堆交接与压力停稳。
+/// 在当前 AP 普通流处理有限阶段；内存测试构建在同一协调入口内完成 MEMORY 动作。
 ///
 /// # Safety
 /// 仅由完成本核设施初始化的 AP 入口调用一次，拥有独占内核栈和有效 CpuLocal。
@@ -225,6 +226,7 @@ pub unsafe fn secondary() -> ! {
                 irq::unregister_uart();
                 UART_RETURNED.store(true, Ordering::Release);
             }
+            #[cfg(feature = "memory-tests")]
             MEMORY => crate::mm::tests::secondary(),
             STOP => loop {
                 arch::wait_for_interrupt();
@@ -405,7 +407,7 @@ fn uart_checks() {
     );
 }
 
-/// BSP 汇总硬件结果，在唯一 MEMORY 动作中驱动页、SLUB 与标准堆验收；故障构建只触发指定异常。
+/// BSP 汇总硬件结果；内存测试构建增加唯一 MEMORY 动作，故障构建只触发指定异常。
 ///
 /// # Safety
 /// 仅由 BSP 在所有 CPU 上线后调用一次；本核 IRQ 开启且没有持锁。
@@ -509,10 +511,13 @@ pub unsafe fn primary() -> ! {
             crate::println!("PASS smp-call delayed-local");
             crate::println!("SCOPE smp-call local-only");
         }
-        start(MEMORY);
-        // AP 的 MEMORY 返回保证压力页和最后 Arc 权已归还；AP 继续普通阶段以检查串口生命周期。
-        crate::mm::tests::primary();
-        join(MEMORY);
+        #[cfg(feature = "memory-tests")]
+        {
+            start(MEMORY);
+            // AP 的 MEMORY 返回保证压力页和最后 Arc 权已归还；随后继续串口生命周期阶段。
+            crate::mm::tests::primary();
+            join(MEMORY);
+        }
         uart_checks();
         PHASE.store(STOP, Ordering::Release);
         crate::println!("STAGE1 PASS");

@@ -16,7 +16,7 @@ use core::alloc::Layout;
 use core::hint::black_box;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MAX: usize = crate::boot::MAX_CPUS;
 const PRESSURE_CAPACITY: usize = 65536;
@@ -35,6 +35,23 @@ const HEAP_WAIT: usize = SLUB_DONE + 1;
 const HEAP_ARC: usize = HEAP_WAIT + 1;
 const HEAP_STOPPED: usize = HEAP_ARC + 1;
 const HEAP_DONE: usize = HEAP_STOPPED + 1;
+const MEMORY_WAIT: usize = HEAP_DONE + 1;
+const IRQ_RUN: usize = MEMORY_WAIT + 1;
+const IRQ_STOP: usize = IRQ_RUN + 1;
+const IRQ_DONE: usize = IRQ_STOP + 1;
+const IRQ_BUDGET: usize = 16;
+static IRQ_ARMED: AtomicBool = AtomicBool::new(false);
+static ALLOCATION_WINDOW: AtomicBool = AtomicBool::new(false);
+static WINDOW_TICKET: AtomicUsize = AtomicUsize::new(0);
+static TIMER_PROGRAMS: AtomicUsize = AtomicUsize::new(0);
+static IRQ_HANDLERS: AtomicUsize = AtomicUsize::new(0);
+static IRQ_WINDOW_HITS: AtomicUsize = AtomicUsize::new(0);
+static IRQ_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+static IRQ_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static IRQ_REMOTE_FREES: AtomicUsize = AtomicUsize::new(0);
+static IRQ_REMOTE_DRAINS: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_REQUEST: [AtomicUsize; MAX] = [const { AtomicUsize::new(0) }; MAX];
+static REMOTE_COMPLETED: [AtomicUsize; MAX] = [const { AtomicUsize::new(0) }; MAX];
 const SLUB_SLOTS: usize = 96;
 const SLUB_TRANSFER: usize = 6;
 const SLUB_CLASS: usize = 11;
@@ -1315,11 +1332,22 @@ pub(crate) fn secondary() {
     stream_worker(id);
     slub_secondary(id);
     heap_secondary(id);
+    irq_secondary(id);
 }
 
 /// BSP 在一个内存动作中验证真实页压力、经典 SLUB 与标准堆，停止参与者后恢复精确账务。
 pub(crate) fn primary() {
     assert_eq!(cpu::current().id, 0, "memory primary requires BSP");
+    crate::println!(
+        "MEMORY TEST READY arch={} cpus={} mode={}",
+        arch::NAME,
+        cpu::count(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
     try_lock_checks();
     partial_batch();
     drain_all_pages();
@@ -1422,6 +1450,12 @@ pub(crate) fn primary() {
     crate::println!("PASS memory-pcp-drain mode={} cpus={} batch={} high={} high_events={} cached_after_high={} remote_cached={} rounds={} drains={} restored={}", if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), batch, high, cpu::count(), high - batch, batch * (cpu::count() - 1), ROUNDS, DRAINS.load(Ordering::Acquire), initial);
     slub_primary(initial);
     heap_primary(initial);
+    join(MEMORY_WAIT, 1);
+    pressure_failures(initial);
+    irq_primary(initial);
+    stats_accounting(initial);
+    crate::println!("MEMORY TESTS PASS");
+    STEP.store(IRQ_DONE, Ordering::Release);
 }
 
 /// 通过标准非零分配入口取得唯一 live 权，失败立即终止本次布局验收。
@@ -1840,4 +1874,382 @@ fn heap_primary(initial: usize) {
     heap_realloc(initial);
     heap_alloc_types(initial);
     STEP.store(HEAP_DONE, Ordering::Release);
+}
+
+/// 持有已武装 BSP 普通页申请的活票；对应 AP 完成前不能退出真实调用。
+pub(crate) struct AllocationWindow {
+    ticket: usize,
+    target: usize,
+}
+
+impl AllocationWindow {
+    /// 在生产入口发布普通调用窗口；IRQ 内嵌套申请不占票、不改变外层窗口。
+    pub(crate) fn enter() -> Self {
+        let mut window = Self {
+            ticket: 0,
+            target: 0,
+        };
+        if !IRQ_ARMED.load(Ordering::Acquire) || !arch::irq_enabled() || cpu::current().id != 0 {
+            return window;
+        }
+        if ALLOCATION_WINDOW.load(Ordering::Acquire) {
+            return window;
+        }
+        window.ticket = WINDOW_TICKET.fetch_add(1, Ordering::Relaxed) + 1;
+        ALLOCATION_WINDOW.store(true, Ordering::Release);
+        window
+    }
+
+    /// 在 backing 成功且全部 MM 锁及 IRQ guard 退出后发布本票请求，并编程一次有限 timer。
+    pub(crate) fn arm_timer(&mut self) {
+        if self.ticket == 0 {
+            return;
+        }
+        assert!(
+            arch::irq_enabled(),
+            "memory IRQ window must allow timer service"
+        );
+        let target = TURN.load(Ordering::Acquire);
+        if target < cpu::count() {
+            assert!(0 < target, "memory IRQ remote target is BSP");
+            self.target = target;
+            assert_eq!(REMOTE_REQUEST[target].load(Ordering::Acquire), 0);
+            REMOTE_REQUEST[target].store(self.ticket, Ordering::Release);
+        }
+        if TIMER_PROGRAMS.fetch_add(1, Ordering::Relaxed) < IRQ_BUDGET {
+            arch::program_timer(arch::read_counter().wrapping_add(1));
+        }
+    }
+}
+
+impl Drop for AllocationWindow {
+    /// 锁外 acquire 确认本票 AP 的真实操作完成才关窗并推进 TURN；未发布请求的失败返回直接关窗。
+    fn drop(&mut self) {
+        if self.ticket == 0 {
+            return;
+        }
+        if self.target != 0 {
+            assert!(
+                arch::irq_enabled(),
+                "memory IRQ completion wait masks timer"
+            );
+            until(
+                || REMOTE_COMPLETED[self.target].load(Ordering::Acquire) == self.ticket,
+                "IRQ remote same-ticket completion",
+            );
+        }
+        ALLOCATION_WINDOW.store(false, Ordering::Release);
+        if self.target != 0 {
+            TURN.store(self.target + 1, Ordering::Release);
+        }
+    }
+}
+
+/// 在真实 timer handler 内完成有限零阶页申请和归还；未武装路径立即返回。
+pub(crate) fn timer_irq() {
+    if !IRQ_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    if cpu::current().id != 0 || IRQ_BUDGET <= IRQ_HANDLERS.fetch_add(1, Ordering::Relaxed) {
+        return;
+    }
+    if !ALLOCATION_WINDOW.load(Ordering::Acquire) {
+        return;
+    }
+    IRQ_WINDOW_HITS.fetch_add(1, Ordering::Relaxed);
+    if arch::irq_enabled() {
+        IRQ_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let Some(pages) = alloc_pages(0, false) else {
+        IRQ_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    drop(pages);
+    if arch::irq_enabled() {
+        IRQ_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    IRQ_COMPLETED.fetch_add(1, Ordering::Release);
+}
+
+/// 在 AP acquire 停稳后分别验证受控池、全局耗尽、真实碎片和超阶拒绝，并完整还账。
+fn pressure_failures(initial: usize) {
+    assert!(
+        buddy::test_orders_and_fragmentation(),
+        "memory controlled production Zone failed"
+    );
+    crate::println!("PASS memory-pressure kind=controlled pages=1024 restored=1024");
+    slub_restored(initial);
+    // SAFETY: 所有 AP 已 acquire 确认 MEMORY_WAIT；BSP 独占空压力前缀，且没有其他 live 页。
+    let pressure = unsafe { exhaust_global_pages() };
+    assert_eq!(
+        total_free(),
+        0,
+        "memory global pressure left available pages"
+    );
+    assert!(
+        black_box(alloc_pages(0, false)).is_none(),
+        "memory global OOM returned a page"
+    );
+    // SAFETY: pressure 是刚刚返回且尚未移动的完整前缀；AP 仍等待，页未被访问。
+    unsafe { release_pressure_pages(pressure) };
+    restored(initial);
+    crate::println!(
+        "PASS memory-pressure kind=global free=0 pressure_handles={} restored={}",
+        pressure,
+        initial
+    );
+
+    let mut samples: [Option<OwnedPages>; TRANSFER_PAGES] = [const { None }; TRANSFER_PAGES];
+    for slot in &mut samples {
+        *slot = Some(alloc_pages(0, false).expect("memory fragmentation sample failed"));
+    }
+    let mut pair = None;
+    for (first, a) in samples.iter().enumerate() {
+        for (second, b) in samples.iter().enumerate().skip(first + 1) {
+            if PAGE_SIZE
+                < a.as_ref()
+                    .unwrap()
+                    .phys_addr()
+                    .abs_diff(b.as_ref().unwrap().phys_addr())
+            {
+                pair = Some((first, second));
+                break;
+            }
+        }
+        if pair.is_some() {
+            break;
+        }
+    }
+    let (first, second) = pair.expect("memory fragmentation has no nonadjacent pages");
+    drain_all_pages();
+    // SAFETY: BSP 独占空压力存储；AP 仍停稳，唯一其他 live 页由 samples 在本栈独占。
+    let pressure = unsafe { exhaust_global_pages() };
+    assert_eq!(total_free(), 0);
+    drop(samples[first].take());
+    drop(samples[second].take());
+    drain_all_pages();
+    assert_eq!(buddy::free_pages(), 2);
+    assert_eq!(pcp::cached_pages(), 0);
+    assert!(
+        black_box(alloc_pages(1, false)).is_none(),
+        "memory fragmentation produced contiguous pages"
+    );
+    assert_eq!(
+        total_free(),
+        2,
+        "memory fragmented failure changed page ownership"
+    );
+    drop(samples);
+    // SAFETY: pressure 保持本次独占前缀原值，各槽未归还；所有样本已结束访问并归还。
+    unsafe { release_pressure_pages(pressure) };
+    restored(initial);
+    crate::println!(
+        "PASS memory-pressure kind=fragmented free=2 order=1 restored={}",
+        initial
+    );
+
+    assert!(black_box(alloc_pages(buddy::MAX_ORDER + 1, false)).is_none());
+    assert!(black_box(alloc_pages(usize::MAX, true)).is_none());
+    restored(initial);
+    crate::println!(
+        "PASS memory-pressure kind=over-max order={} restored={}",
+        buddy::MAX_ORDER + 1,
+        initial
+    );
+}
+
+/// acquire 取得本核持有的活票请求，锁外释放唯一对象与页、直接 drain 后 release 发布同票完成。
+fn irq_secondary(id: usize) {
+    ACK[id].store(MEMORY_WAIT, Ordering::Release);
+    wait_step(IRQ_RUN);
+    until(
+        || TURN.load(Ordering::Acquire) == id,
+        "IRQ remote drain turn",
+    );
+    until(
+        || REMOTE_REQUEST[id].load(Ordering::Acquire) != 0,
+        "IRQ allocator request",
+    );
+    let ticket = REMOTE_REQUEST[id].load(Ordering::Acquire);
+    assert!(ALLOCATION_WINDOW.load(Ordering::Acquire));
+    assert_eq!(WINDOW_TICKET.load(Ordering::Acquire), ticket);
+    let address = OBJECTS[id - 1].swap(0, Ordering::AcqRel);
+    check_object(address);
+    // SAFETY: swap 消耗 BSP release 发布的唯一 live 对象权；BSP 不再访问，内容检查已结束。
+    unsafe { slub::deallocate(object_pointer(address)) };
+    IRQ_REMOTE_FREES.fetch_add(1, Ordering::Relaxed);
+    let pages = RING[id * TRANSFER_PAGES]
+        .lock()
+        .take()
+        .expect("memory IRQ remote page is missing");
+    drop(pages);
+    assert!(
+        0 < pcp::cpu_cached_pages(id),
+        "memory IRQ remote free did not cache page"
+    );
+    drain_all_pages();
+    assert_eq!(
+        pcp::cpu_cached_pages(id),
+        0,
+        "memory IRQ direct drain left remote pages"
+    );
+    IRQ_REMOTE_DRAINS.fetch_add(1, Ordering::Relaxed);
+    // BSP 在 acquire 本票完成前保持真实 alloc_pages 调用，随后才关窗并允许下一个 AP。
+    REMOTE_COMPLETED[id].store(ticket, Ordering::Release);
+    ACK[id].store(IRQ_RUN, Ordering::Release);
+    wait_step(IRQ_STOP);
+    arch::disable_timer();
+    ACK[id].store(IRQ_STOP, Ordering::Release);
+    wait_step(IRQ_DONE);
+}
+
+/// 用 16 次真实锁外 4MiB 清零接受 timer 打断；每个 AP 的同票完成须先于对应分配返回。
+fn irq_primary(initial: usize) {
+    for id in 1..cpu::count() {
+        let pointer = slub::allocate(SLUB_CLASS).expect("memory IRQ remote object failed");
+        initialize_object(pointer);
+        assert_eq!(
+            OBJECTS[id - 1].swap(pointer.as_ptr() as usize, Ordering::Release),
+            0
+        );
+        let pages = alloc_pages(0, false).expect("memory IRQ remote page failed");
+        let mut slot = RING[id * TRANSFER_PAGES].lock();
+        assert!(slot.is_none());
+        *slot = Some(pages);
+    }
+    TURN.store(1, Ordering::Relaxed);
+    IRQ_ARMED.store(true, Ordering::Release);
+    STEP.store(IRQ_RUN, Ordering::Release);
+    for _ in 0..IRQ_BUDGET {
+        let mut pages = black_box(alloc_pages(buddy::MAX_ORDER, true))
+            .expect("memory IRQ window backing failed");
+        // SAFETY: 真实 zeroed 申请已初始化整块，pages 独占 live 块，检查期间没有别的访问者。
+        let first = unsafe { pages.as_mut_ptr().cast::<u8>().read() };
+        assert_eq!(black_box(first), 0);
+        drop(pages);
+    }
+    join(IRQ_RUN, 1);
+    {
+        let _irq = IrqSaveGuard::new();
+        arch::disable_timer();
+        IRQ_ARMED.store(false, Ordering::Release);
+    }
+    STEP.store(IRQ_STOP, Ordering::Release);
+    join(IRQ_STOP, 1);
+    assert!(!ALLOCATION_WINDOW.load(Ordering::Acquire));
+    assert_eq!(IRQ_FAILURES.load(Ordering::Acquire), 0);
+    let handlers = IRQ_HANDLERS.load(Ordering::Acquire);
+    let hits = IRQ_WINDOW_HITS.load(Ordering::Acquire);
+    let completed = IRQ_COMPLETED.load(Ordering::Acquire);
+    assert!(0 < hits && hits <= handlers && handlers <= IRQ_BUDGET);
+    assert_eq!(
+        hits, completed,
+        "memory IRQ did not complete allocation/free"
+    );
+    assert_eq!(TIMER_PROGRAMS.load(Ordering::Acquire), IRQ_BUDGET);
+    assert_eq!(IRQ_REMOTE_FREES.load(Ordering::Acquire), cpu::count() - 1);
+    assert_eq!(IRQ_REMOTE_DRAINS.load(Ordering::Acquire), cpu::count() - 1);
+    let mut remote_completed = 0;
+    let mut previous_ticket = 0;
+    for id in 1..cpu::count() {
+        let requested = REMOTE_REQUEST[id].load(Ordering::Acquire);
+        assert!(
+            previous_ticket < requested && requested <= IRQ_BUDGET,
+            "memory AP has no distinct allocator request"
+        );
+        assert_eq!(
+            REMOTE_COMPLETED[id].load(Ordering::Acquire),
+            requested,
+            "memory AP did not complete its allocator request"
+        );
+        previous_ticket = requested;
+        remote_completed += 1;
+    }
+    assert_eq!(remote_completed, cpu::count() - 1);
+    assert_eq!(TURN.load(Ordering::Acquire), cpu::count());
+    slub_restored(initial);
+    if cpu::count() == 1 {
+        crate::println!("SCOPE memory-irq cross-cpu-free-drain requires=2 mode=local");
+    }
+    crate::println!("PASS memory-irq mode={} cpus={} budget={} attempts={} handlers={} window_hits={} completed={} remote_frees={} remote_drains={} remote_completed={} stopped={} restored={}",
+        if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), IRQ_BUDGET, IRQ_BUDGET,
+        handlers, hits, completed, IRQ_REMOTE_FREES.load(Ordering::Acquire),
+        IRQ_REMOTE_DRAINS.load(Ordering::Acquire), remote_completed, cpu::count(), initial);
+}
+
+/// 只在全部 worker acquire 停稳后消费正式六域统计，保留 live 内容跨 flush/shrink，再最终还账。
+fn stats_accounting(initial: usize) {
+    join(IRQ_STOP, 1);
+    let baseline = crate::mm::stats();
+    assert_eq!(
+        baseline.present_pages,
+        baseline.reserved_pages + baseline.metadata_pages + initial
+    );
+    assert_eq!(baseline.buddy_free_pages, initial);
+    assert_eq!(baseline.pcp_cached_pages, 0);
+    assert_eq!(baseline.slab_backing_pages, 0);
+    let mut objects = [0usize; 1];
+    allocate_object(&mut objects, 0);
+    let pointer = object_pointer(objects[0]);
+    let head = slub::slab_snapshot(pointer).head_pfn;
+    let mut pages = alloc_pages(1, false).expect("memory stats live OwnedPages failed");
+    let whole_pages = pages.len() / PAGE_SIZE;
+    // SAFETY: pages 独占真实连续块，整个 len 字节可写；写入结束前不会归还或发布给其他核。
+    unsafe {
+        pages
+            .as_mut_ptr()
+            .cast::<u8>()
+            .write_bytes(0x6d, pages.len())
+    };
+    flush_all();
+    shrink_all();
+    drain_all_pages();
+    check_object(objects[0]);
+    // SAFETY: pages 始终 live，完整范围已写入且没有并发写者；借用在最后 drop 之前结束。
+    let contents =
+        unsafe { core::slice::from_raw_parts(pages.as_mut_ptr().cast::<u8>(), pages.len()) };
+    assert!(
+        contents.iter().all(|&byte| byte == 0x6d),
+        "memory stats flush changed live pages"
+    );
+    let slab = slub::slab_snapshot(pointer);
+    assert_eq!(slab.head_pfn, head);
+    assert_eq!(
+        slab.inuse,
+        objects.len(),
+        "memory flushed slab live count differs"
+    );
+    let live = crate::mm::stats();
+    assert_eq!(live.present_pages, baseline.present_pages);
+    assert_eq!(live.reserved_pages, baseline.reserved_pages);
+    assert_eq!(live.metadata_pages, baseline.metadata_pages);
+    assert_eq!(live.pcp_cached_pages, 0);
+    assert_eq!(live.slab_backing_pages, 1 << slab.order);
+    let allocated = initial
+        .checked_sub(live.buddy_free_pages + live.pcp_cached_pages + live.slab_backing_pages)
+        .expect("memory stopped page accounting exceeds available pages");
+    assert_eq!(
+        allocated, whole_pages,
+        "memory live pages were returned prematurely"
+    );
+    crate::println!("PASS memory-stats-live objects={} whole_pages={} present={} reserved={} metadata={} buddy={} pcp={} slab={}",
+        objects.len(), whole_pages, live.present_pages, live.reserved_pages, live.metadata_pages,
+        live.buddy_free_pages, live.pcp_cached_pages, live.slab_backing_pages);
+    release_object(&mut objects, 0);
+    drop(pages);
+    slub_restored(initial);
+    assert!(
+        slub::slab_head_snapshot(head).is_none(),
+        "memory final shrink retained live slab metadata"
+    );
+    let final_state = crate::mm::stats();
+    assert_eq!(
+        final_state, baseline,
+        "memory final formal stats did not restore all domains"
+    );
+    crate::println!("PASS memory-stats-final present={} reserved={} metadata={} buddy={} pcp={} slab={} stopped={}",
+        final_state.present_pages, final_state.reserved_pages, final_state.metadata_pages,
+        final_state.buddy_free_pages, final_state.pcp_cached_pages, final_state.slab_backing_pages, cpu::count());
 }

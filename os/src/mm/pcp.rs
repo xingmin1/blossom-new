@@ -172,13 +172,16 @@ pub fn drain_all_pages() {
 }
 
 /// 持每份 PCP 锁求缓存快照，停止所有分配与归还后才是精确总数。
-#[cfg(feature = "boot-tests")]
 pub(crate) fn cached_pages() -> usize {
-    (0..cpu::count()).map(cpu_cached_pages).sum()
+    let pagesets = PAGESETS.get().expect("PCP is not initialized");
+    pagesets[..cpu::count()]
+        .iter()
+        .map(|pageset| pageset.lock().count)
+        .sum()
 }
 
 /// 持指定 CPU 的 PCP 锁读取真实缓存计数，不将并发快照当成全局账务。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn cpu_cached_pages(cpu: usize) -> usize {
     assert!(cpu < cpu::count(), "PCP CPU index is out of range");
     PAGESETS.get().expect("PCP is not initialized")[cpu]
@@ -187,7 +190,7 @@ pub(crate) fn cpu_cached_pages(cpu: usize) -> usize {
 }
 
 /// 提供生产固定参数供正常流测试核对真实 partial refill 与 high 边界。
-#[cfg(feature = "boot-tests")]
+#[cfg(feature = "memory-tests")]
 pub(crate) fn parameters() -> (usize, usize) {
     let pageset = PAGESETS.get().expect("PCP is not initialized")[0].lock();
     (pageset.batch, pageset.high)

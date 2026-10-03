@@ -192,37 +192,41 @@ pub fn init_current_cpu() {
     iocsr_write32(0x1004, u32::MAX);
     barrier();
 }
-/// 原子关闭本核 IRQ，返回原 CRMD 状态。
+/// 在 PLV0 原子关闭本核 IRQ 并返回原 CRMD；编译器内存屏障保持临界区访问位于关 IRQ 之后。
 pub fn irq_save() -> usize {
     let old;
-    // 保留汇编的编译器内存屏障，禁止临界区访存移到关闭 IRQ 之前。
-    // SAFETY: 入口保证 PLV0；csrxchg 只关闭本核 IE，不修改分页、特权级或内存映射。
+    // SAFETY: 入口保证 PLV0；固定输入 $t0/r12 仅承载 IE 掩码 4，避开 csrxchg 禁用的 r0/r1。
+    // csrxchg 不改写 $t0，inout 声明旧 CRMD 的回写并排除与 $t0 重叠；指令不访问栈。
+    // 仅清除 IE；不使用 nomem/readonly，保留普通访存不能跨越 IRQ 边界的编译器屏障。
     unsafe {
-        asm!("csrxchg {old}, {mask}, 0", old = inout(reg) 0usize => old, mask = in(reg) 4usize, options(nostack));
+        asm!("csrxchg {old}, $t0, 0", old = inout(reg) 0usize => old, in("$t0") 4usize, options(nostack));
     }
     old
 }
-/// 只恢复原来的 IE 位，不修改分页或特权状态。
+/// 在 PLV0 只恢复原来的 IE 位；编译器内存屏障保持临界区访问位于恢复 IRQ 之前。
 ///
 /// # Safety
-/// saved 必须来自本核匹配的 irq_save，期间不能迁移 CPU；恢复 IE 前必须释放依赖 IRQ 关闭的锁和借用。
+/// saved 必须来自本核匹配的 irq_save，期间不能迁移 CPU；嵌套保存必须逆序恢复，
+/// 恢复 IE 前必须释放依赖 IRQ 关闭的锁和借用。
 pub unsafe fn irq_restore(saved: usize) {
-    // 保留编译器内存屏障，禁止释放锁和结束借用的操作移到恢复 IRQ 之后。
-    // SAFETY: 调用者保证恢复发生在同一 CPU 且 IRQ 临界区已结束；掩码只允许修改 IE。
+    // SAFETY: 调用者保证同核恢复且临界区已结束；入口保证 PLV0，固定 $t0/r12 为合法掩码寄存器。
+    // 只恢复掩码 4 指定的 IE；$t0 保持不变，inout 声明旧 CRMD 回写并排除与 $t0 重叠。
+    // 指令不访问栈；不使用 nomem/readonly，保留锁释放及借用结束不能越过恢复 IRQ 的编译器屏障。
     unsafe {
-        asm!("csrxchg {value}, {mask}, 0", value = inout(reg) (saved & 4) => _, mask = in(reg) 4usize, options(nostack));
+        asm!("csrxchg {value}, $t0, 0", value = inout(reg) (saved & 4) => _, in("$t0") 4usize, options(nostack));
     }
 }
 /// 查询本核全局 IRQ 开关。
 pub fn irq_enabled() -> bool {
     csr_read::<0>() & 4 != 0
 }
-/// 打开本核全局 IRQ。
+/// 在 PLV0 打开本核全局 IRQ；编译器内存屏障保持初始化写入和 online 发布位于各自边界。
 pub fn enable_interrupts() {
-    // 保留编译器内存屏障，使后续本核 online 发布不能移到开 IRQ 之前。
-    // SAFETY: 入口保证 PLV0；此接口显式使能本核 IRQ，不恢复任何临界区的旧状态。
+    // SAFETY: 入口保证 PLV0，本核异常及 IRQ 资源已安装；固定 $t0/r12 避开禁用的 r0/r1。
+    // 掩码 4 只使能 IE；$t0 保持不变，inout 声明旧 CRMD 回写并排除与 $t0 重叠。
+    // 指令不访问栈；不使用 nomem/readonly，保留普通访存不能跨越开 IRQ 边界的编译器屏障。
     unsafe {
-        asm!("csrxchg {value}, {mask}, 0", value = inout(reg) 4usize => _, mask = in(reg) 4usize, options(nostack));
+        asm!("csrxchg {value}, $t0, 0", value = inout(reg) 4usize => _, in("$t0") 4usize, options(nostack));
     }
 }
 /// 等待真实硬件中断。

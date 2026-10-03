@@ -210,9 +210,11 @@ pub unsafe fn start_secondaries() {
     }
 }
 
-/// 记录真实本地 timer 中断；硬件确认由架构 handler 完成。
+/// 记录真实本地 timer 中断；硬件确认由架构 handler 完成，内存验收 hook 只在专用 feature 下运行。
 pub fn handle_timer() {
     current().timer_interrupts.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "memory-tests")]
+    crate::mm::tests::timer_irq();
 }
 
 /// 在硬件通知已清除后取出真实请求，锁外执行并发布完成。
