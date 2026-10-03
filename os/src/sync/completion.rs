@@ -74,4 +74,10 @@ impl Completion {
     pub fn is_ready(&self) -> bool {
         self.tokens.load(Ordering::Acquire) != 0
     }
+
+    /// 只观察真实等待源成员，用于确认登记与最终撤链，不消费完成 token。
+    #[cfg(feature = "execution-tests")]
+    pub(crate) fn test_waiting(&self) -> usize {
+        self.waiters.test_members()
+    }
 }

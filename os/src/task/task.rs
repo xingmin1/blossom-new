@@ -1,4 +1,3 @@
-use super::manager::TASK_MANAGER;
 use super::pid::RecycleAllocator;
 use super::signal::*;
 use super::threads::Futex;
@@ -80,7 +79,7 @@ pub struct TaskControlBlockInner {
     /// 任务上下文
     pub task_cx: TaskContext,
     /// 任务状态
-    pub task_status: TaskStatus,
+    task_status: TaskStatus,
     /// 父进程
     pub parent: Option<Weak<TaskControlBlock>>,
     /// 子进程
@@ -511,17 +510,6 @@ impl TaskControlBlock {
         }
         // 清空futex
         self.futex.lock().clear();
-        // 检查当前任务是否是多线程任务
-        if self.tid_allocator.lock().get_allocated() > 1 {
-            let mut manager = TASK_MANAGER.lock();
-            // 销毁所有其他同一线程组的任务
-            manager
-                .ready_queue
-                .retain(|task| (*task).tgid != (*self).tgid);
-            manager
-                .interruptible_queue
-                .retain(|task| (*task).tgid != (*self).tgid);
-        };
         Ok(())
         // **** 释放当前PCB锁
     }
@@ -720,7 +708,7 @@ impl Drop for TaskControlBlock {
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// 任务状态
-pub enum TaskStatus {
+enum TaskStatus {
     /// 就绪态
     Ready,
     /// 运行态

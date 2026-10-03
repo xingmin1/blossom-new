@@ -1,6 +1,8 @@
 //! 在生产任务栈上验证切换、迁核与离栈归还，协调者也通过普通 yield 让出执行权。
 
 mod klog;
+mod memory;
+mod mixed;
 mod time;
 mod timer;
 mod wait;
@@ -43,6 +45,37 @@ fn until(mut predicate: impl FnMut() -> bool, name: &str) {
         assert!(clock::now() < end, "execution timeout: {}", name);
         sched::yield_now();
     }
+}
+
+/// 返回完整新稳态账目，常驻服务真实等待后才排空缓存，不能相加抵消 SLUB 泄漏。
+fn baseline() -> (mm::MemoryStats, crate::workqueue::testing::MetadataStats) {
+    crate::klog::testing::wait_service_blocked();
+    workqueue::wait_services_blocked();
+    // 远核 join 结果先于调度栈上的最后完成引用释放；下一次 idle 发布才证明离栈尾部结束。
+    until(
+        || {
+            (0..cpu::count())
+                .all(|id| id == cpu::current().id || cpu::get(id).idle.load(Ordering::Acquire))
+        },
+        "remote scheduler resource tail",
+    );
+    mm::shrink_all();
+    mm::drain_all_pages();
+    (mm::stats(), crate::workqueue::testing::metadata_stats())
+}
+
+/// 比较完整页账和 Task/Worker/Domain 实际最后强析构，不只比较总页数。
+fn reclaimed(expected: (mm::MemoryStats, crate::workqueue::testing::MetadataStats)) -> usize {
+    let actual = baseline();
+    assert_eq!(
+        actual.0, expected.0,
+        "temporary execution memory did not converge"
+    );
+    assert_eq!(
+        actual.1, expected.1,
+        "temporary execution metadata did not converge"
+    );
+    1
 }
 
 /// 用保持存活的独立栈帧包围多轮切换，返回时逐层核对栈内容和返回路径。
@@ -116,6 +149,7 @@ fn check_stack_pages(base: usize) {
 
 /// 在同一 CPU 交替执行两个实际任务，句柄保留期间核对 32 个栈页已归还。
 fn test_switch_and_return() {
+    let initial = baseline();
     let first = task::spawn_kernel_on(0, || switch_worker(0))
         .expect("first execution task allocation failed");
     let second = task::spawn_kernel_on(0, || switch_worker(1))
@@ -158,6 +192,7 @@ fn test_switch_and_return() {
     check_stack_pages(base1);
     crate::test_println!("PASS execution-X01 task0={} task1={} stack0={:#x} stack1={:#x} rounds={} registers={} deep_frames={} starts=2 drops=2 order=4 reclaimed={} observers=2", id0, id1, stack0, stack1, ROUNDS, 2 * ROUNDS, FRAMES.load(Ordering::Acquire), returned_pages - live_pages);
     drop((first, second));
+    assert_eq!(reclaimed(initial), 1);
 }
 
 /// 在每次恢复点核对目的硬件 CPU 基址、稳定任务身份和同一栈局部对象地址。
@@ -200,6 +235,7 @@ fn test_migration() {
         crate::test_println!("N/A execution-X02 requires=2 cpus=1");
         return;
     }
+    let initial = baseline();
     let handle = task::spawn_kernel(migration_worker).expect("migration task allocation failed");
     until(|| handle.try_join().is_some(), "task-migration-return");
     assert_eq!(handle.try_join(), Some(31));
@@ -209,6 +245,8 @@ fn test_migration() {
         cpu::count(),
         2 * cpu::count()
     );
+    drop(handle);
+    assert_eq!(reclaimed(initial), 1);
 }
 
 /// 在真实普通任务持有禁止切换 guard 时触发同一生产安全边界。
@@ -238,7 +276,6 @@ fn run_fault() -> ! {
 pub(crate) fn run() -> ! {
     assert_eq!(cpu::current().id, 0);
     assert!(task::current_task_id().is_some());
-    timer::wait_services_blocked();
     workqueue::wait_services_blocked();
     crate::test_println!(
         "EXECUTION TEST READY arch={} cpus={} mode={}",
@@ -266,13 +303,16 @@ pub(crate) fn run() -> ! {
         ))]
         klog::run_fault();
     }
+    let suite_baseline = baseline();
     test_switch_and_return();
     test_migration();
     wait::run();
     time::run();
     timer::run();
     workqueue::run();
+    memory::run();
     klog::run();
+    mixed::run(suite_baseline);
     crate::test_println!("EXECUTION TESTS PASS");
     arch::shutdown();
 }

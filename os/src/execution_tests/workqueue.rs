@@ -1,5 +1,6 @@
 //! 以真实任务、工作域、定时器与唯一 MM 验证工作进度和一次停止责任。
 
+use super::{baseline, reclaimed};
 use alloc::alloc::{alloc, dealloc};
 use alloc::sync::Arc;
 use core::alloc::Layout;
@@ -200,28 +201,6 @@ fn spin_until(mut predicate: impl FnMut() -> bool, name: &str) {
 pub(super) fn wait_services_blocked() {
     testing::wait_services_blocked();
     super::timer::wait_services_blocked();
-}
-
-/// 基础服务真 Blocked 且退休者已释放后排空缓存，独立保留空闲页、PCP 与 SLUB 实账。
-fn baseline() -> (mm::MemoryStats, testing::MetadataStats) {
-    wait_services_blocked();
-    mm::shrink_all();
-    mm::drain_all_pages();
-    (mm::stats(), testing::metadata_stats())
-}
-
-/// 所有临时源停止并归还强票后，完整页账与 Task/Worker/Domain 最后强析构必须分别收敛。
-fn reclaimed(expected: (mm::MemoryStats, testing::MetadataStats)) -> usize {
-    let actual = baseline();
-    assert_eq!(
-        actual.0, expected.0,
-        "temporary work/task memory fields did not converge"
-    );
-    assert_eq!(
-        actual.1, expected.1,
-        "temporary task/worker/domain payloads did not converge"
-    );
-    1
 }
 
 /// 只有测试 owner 留下的真实强引用才允许结束上下文寿命。

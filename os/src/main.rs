@@ -43,6 +43,9 @@ mod boot_tests;
 #[cfg(feature = "execution-tests")]
 mod execution_tests;
 
+#[cfg(not(feature = "boot-tests"))]
+static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// 使用固件资源准备 CPU、MM、统一时间与中断，再发表内核任务并释放 AP。
 ///
 /// # Safety
@@ -149,7 +152,10 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
         boot_tests::primary()
     };
     #[cfg(not(feature = "boot-tests"))]
-    sched::run();
+    {
+        EXECUTION_READY.store(true, core::sync::atomic::Ordering::Release);
+        enter_scheduler();
+    }
 }
 
 /// 使用 BSP 发布的 CpuLocal 安装本核执行状态，只初始化本地中断。
@@ -170,7 +176,16 @@ pub unsafe extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
         boot_tests::secondary()
     };
     #[cfg(not(feature = "boot-tests"))]
-    sched::run();
+    enter_scheduler();
+}
+
+/// 全部 CPU 已上线且启动输出完成后才允许分派，等待中的 AP 仍能服务 IRQ/IPI。
+#[cfg(not(feature = "boot-tests"))]
+fn enter_scheduler() -> ! {
+    while !EXECUTION_READY.load(core::sync::atomic::Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    sched::run()
 }
 
 /// 在普通任务栈执行内核初始入口，返回后由调度器完成离栈回收。

@@ -1,5 +1,6 @@
 //! 使用生产 Task、等待源与页分配器验证一次等待和睡眠同步。
 
+use super::{baseline, reclaimed};
 use alloc::alloc::{alloc, dealloc};
 use alloc::sync::Arc;
 use core::alloc::Layout;
@@ -836,6 +837,7 @@ fn test_exit() {
 
 /// 顺序运行真实等待与同步案例，每个案例退出全部临时 Task 和源登记。
 pub(crate) fn run() {
+    let initial = baseline();
     let watchdog = task::spawn_kernel_on(0, || {
         let deadline =
             crate::arch::read_counter().wrapping_add(crate::arch::counter_frequency() * 20);
@@ -858,4 +860,15 @@ pub(crate) fn run() {
     assert_eq!(QUEUE.wake_all(), 0);
     FINISHED.store(true, Ordering::Release);
     assert_eq!(watchdog.join(), 0);
+    assert_eq!(QUEUE.test_members(), 0);
+    assert_eq!(DRAIN_QUEUE.test_members(), 0);
+    assert!(OLD_WAKER.lock().is_none());
+    assert!(SLOTS
+        .iter()
+        .all(|slot| slot.task.lock().is_none() && slot.waker.lock().is_none()));
+    for source in [&START_OOM, &FINISH_OOM, &EXIT_GATE, &TOKENS] {
+        assert_eq!(source.test_waiting(), 0);
+        assert!(!source.is_ready());
+    }
+    assert_eq!(reclaimed(initial), 1);
 }

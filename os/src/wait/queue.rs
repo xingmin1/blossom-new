@@ -189,6 +189,12 @@ impl WaitQueue {
         self.wake_all_after_notify(after)
     }
 
+    /// 只读源锁保护的实际登记数，不维护另一份观测状态。
+    #[cfg(feature = "execution-tests")]
+    pub(crate) fn test_members(&self) -> usize {
+        self.inner.lock().members
+    }
+
     /// 普通唤醒与确定性交错共用入口成员数预算，每个实际 pop 消耗一次，拒绝通知不延长遍历。
     fn wake_all_after_notify(&self, mut after: impl FnMut()) -> usize {
         let mut remaining = self.inner.lock().members;

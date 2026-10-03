@@ -1,5 +1,6 @@
 //! 在真实任务、硬中断、单调时钟与 idle 入口上验证时间和执行账。
 
+use super::{baseline, reclaimed};
 use alloc::sync::Arc;
 use core::convert::TryFrom;
 use core::hint::{black_box, spin_loop};
@@ -667,10 +668,20 @@ fn test_accounting() {
 
 /// 仅正常 execution 镜像顺序追加时间、执行账与远端 idle 提醒验收。
 pub(crate) fn run() {
+    let initial = baseline();
     let deferred =
         task::spawn_kernel_on(0, deferred_worker).expect("deferred task allocation failed");
     until(|| deferred.try_join().is_some(), "deferred-task-return");
     assert_eq!(deferred.join(), 110);
     test_timekeeper();
     test_accounting();
+    assert!(ACCOUNT_TASK.lock().is_none());
+    assert!(KICKS.iter().all(|slot| slot.task.lock().is_none()));
+    assert_eq!(ACCOUNT_WAKE.test_waiting(), 0);
+    assert!(!ACCOUNT_WAKE.is_ready());
+    for slot in &KICKS {
+        assert_eq!(slot.wake.test_waiting(), 0);
+        assert!(!slot.wake.is_ready());
+    }
+    assert_eq!(reclaimed(initial), 1);
 }

@@ -1,5 +1,6 @@
 //! 在唯一生产定时器、真实 Task、硬中断与服务 BH 上核验睡眠及停止协议。
 
+use super::{baseline, reclaimed};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
@@ -81,12 +82,6 @@ pub(super) fn wait_services_blocked() {
             "timer service initial block",
         );
     }
-}
-
-/// 只在全部临时参与者和服务停稳之后核算唯一 MM 的可归还页。
-fn pages() -> usize {
-    let stats = mm::stats();
-    stats.buddy_free_pages + stats.pcp_cached_pages + stats.slab_backing_pages
 }
 
 /// 克隆现存 timer 控制块，不分配另一种节点或排队后端。
@@ -717,7 +712,7 @@ fn coarse_callback(timer: Pin<&Timer>) {
 }
 
 /// 真实 counter 跨桶积压，绝大多数取消后仍剩三批；所有节点和临时任务归还后才发布账务。
-fn test_coarse(baseline: usize) {
+fn test_coarse(initial: (mm::MemoryStats, crate::workqueue::testing::MetadataStats)) {
     tree_cases();
     let wheel_cases = testing::self_check_wheel();
     assert!(12 <= wheel_cases);
@@ -814,23 +809,22 @@ fn test_coarse(baseline: usize) {
     drop(nodes);
     wait_services_blocked();
     assert_eq!(testing::validate_tree(0).0, 0);
-    let returned = pages();
-    assert_eq!(
-        returned, baseline,
-        "temporary timer/task pages not reclaimed"
-    );
-    let reclaimed = usize::from(returned == baseline);
+    assert!(SLEEP_TASK.lock().is_none());
+    assert!(SLEEP_WAKER.lock().is_none());
+    assert!(CANCEL_TASK.lock().is_none());
+    assert_eq!(CANCEL_GATE.test_waiting(), 0);
+    assert!(!CANCEL_GATE.is_ready());
+    let reclaimed = reclaimed(initial);
     crate::test_println!("PASS execution-X17 armed={} cancelled={} fired={} batches={} continuations={} max_batch={} budget={} wheel_cases={} jump_ticks={} reclaimed={}", armed, cancelled, fired, batches, continuations, max_batch, budget, wheel_cases, jump_ticks, reclaimed);
 }
 
 /// 顺序追加五项真实定时器验收；协调者始终固定 CPU0，不迁移 init。
 pub(super) fn run() {
     assert_eq!(cpu::current().id, 0);
-    wait_services_blocked();
-    let baseline = pages();
+    let initial = baseline();
     test_sleep();
     test_cancel();
     test_rearm_close();
     test_remote();
-    test_coarse(baseline);
+    test_coarse(initial);
 }

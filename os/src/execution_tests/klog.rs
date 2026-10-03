@@ -13,6 +13,8 @@ use crate::time::{self as clock, Duration};
 use crate::timer::{Timer, TimerKind};
 use crate::{arch, console, cpu, mm, sched};
 
+use super::{baseline, reclaimed};
+
 static PRODUCER: SpinLock<Option<Arc<Task>>> = SpinLock::new(None);
 static START: Completion = Completion::new();
 static EXIT: Completion = Completion::new();
@@ -48,29 +50,6 @@ fn until(mut predicate: impl FnMut() -> bool, name: &str) {
         );
         sched::yield_now();
     }
-}
-
-/// 返回完整新稳态账目，常驻服务真实等待后才排空缓存，不能相加抵消 SLUB 泄漏。
-fn baseline() -> (mm::MemoryStats, crate::workqueue::testing::MetadataStats) {
-    log::testing::wait_service_blocked();
-    super::workqueue::wait_services_blocked();
-    mm::shrink_all();
-    mm::drain_all_pages();
-    (mm::stats(), crate::workqueue::testing::metadata_stats())
-}
-
-/// 比较完整页账和 Task/Worker/Domain 实际最后强析构，不只比较总页数。
-fn reclaimed(expected: (mm::MemoryStats, crate::workqueue::testing::MetadataStats)) -> usize {
-    let actual = baseline();
-    assert_eq!(
-        actual.0, expected.0,
-        "temporary klog memory did not converge"
-    );
-    assert_eq!(
-        actual.1, expected.1,
-        "temporary klog metadata did not converge"
-    );
-    1
 }
 
 /// 独立普通生产者在预备完成后阻塞，记录完成仍保持存储直到协调者同步退出。

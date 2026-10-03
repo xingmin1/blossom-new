@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证实际 UART 正文的等长损坏与旧正文重放会被执行日志消费者拒绝。"""
+"""验证 UART 正文损坏、旧正文重放与混合回调身份错误会被正式消费者拒绝。"""
 
 from pathlib import Path
 import runpy
@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 
 def main():
-    """直接运行正式解析函数，保留有效协议及两种等长正文错误的边界。"""
+    """运行正式解析函数，核对有界混合正文、来源及虚报覆盖缺口的拒绝边界。"""
     parser = runpy.run_path(str(Path(__file__).with_name("test-execution.py")))
     args = SimpleNamespace(cpus=1)
     held = 6
@@ -41,6 +41,24 @@ def main():
                     catchup=held + 73, reclaimed=1, fill_bytes=280, fill_zero=1,
                     rx_ack=1),
     }
+    mixed_first = records["X26"]["catchup"]
+    mixed_positions = []
+    for round_number in range(8):
+        for source in ("timer", "work"):
+            sequence = mixed_first + 2 * round_number + (source == "work")
+            mixed_positions.append(len(lines))
+            lines.append(
+                f"KLOG seq={sequence} level=INFO ns=1 cpu=0 "
+                f"task={'none' if source == 'timer' else 8} "
+                "truncated=0 lost=0 "
+                f"X28 {source} slot=0 round={round_number}")
+    lines.append("PASS execution-X28 ")
+    records["X28"] = dict(cpus=1, tasks=1, rounds=8, timer_callbacks=8,
+                          work_callbacks=8, log_records=16, waited=16, blocked=1,
+                          drops=1, stopped=2, pending=0, waiters=0, reclaimed=1,
+                          suite_reclaimed=1, seq_first=mixed_first,
+                          seq_last=mixed_first + 15, catchup=mixed_first + 16)
+    parser["check_mixed"](args, records, lines, parser["check_klog"](args, lines))
     parser["check_logging"](args, records, lines, parser["check_klog"](args, lines))
     for position, replacement in ((held_position, "Q"), (first_survivor, "7")):
         corrupted = list(lines)
@@ -52,7 +70,27 @@ def main():
         except RuntimeError:
             continue
         raise AssertionError("等长 UART 正文损坏或旧正文重放未被拒绝")
-    print("PASS 执行日志消费者：有效正文、等长损坏拒绝、旧正文重放拒绝")
+    for position, old, replacement in (
+            (mixed_positions[2], "round=1", "round=0"),
+            (mixed_positions[1], "task=8", "task=none")):
+        corrupted = list(lines)
+        corrupted[position] = corrupted[position].replace(old, replacement)
+        try:
+            parser["check_mixed"](args, records, corrupted,
+                                  parser["check_klog"](args, corrupted))
+        except RuntimeError:
+            continue
+        raise AssertionError("重复混合回调正文或无 Task 的 work 来源未被拒绝")
+    missing = lines[:mixed_positions[0]] + lines[mixed_positions[2]:]
+    missing[mixed_positions[0]] = missing[mixed_positions[0]].replace("lost=0", "lost=2", 1)
+    try:
+        parser["check_mixed"](args, records, missing,
+                              parser["check_klog"](args, missing))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("环容量内缺失混合回调却虚报覆盖仍被接受")
+    print("PASS 执行日志消费者：有效有界正文、等长损坏拒绝、重放拒绝、混合身份及虚报缺口拒绝")
 
 
 if __name__ == "__main__":

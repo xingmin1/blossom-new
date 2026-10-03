@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """运行给定执行测试 ELF，核对真实执行、等待、时间、工作队列与记录输出。
 
-正常镜像按唯一顺序输出 X01–X08、X10–X23、X25–X26；单核仅 X02 明确 N/A。
+正常镜像按唯一顺序输出 X01–X08、X10–X26、X28；单核仅 X02 明确 N/A。
 X10 检查重新武装后的硬 IRQ 延后切换与架构寄存器保存，X11 检查同一时间
 算法的维护、快照交错拒绝重试及边界，X12 检查执行/IRQ/scheduler/idle 四账、
 迁核和不依靠 timer tick 的远端 kick 与实际等待指令完成。X13–X17 检查原期限
 睡眠、同步取消真尾部、复用关闭、远端重编程与有界粗 timer 批处理。
 X18–X23 检查真实 worker 扩展与回收、OOM rescuer、有限 flush 边界、
-DelayedWork 移交寿命和显式停止；X25–X26 检查有界记录与真实 UART 进度。
-X24 留待独立覆盖，故障镜像只接受 X09 或 X27 对应的真实不可恢复错误。
+DelayedWork 移交寿命和显式停止；X24 检查同一 Task 的本核/迁核 MM 消费，
+X25–X26 检查有界记录与真实 UART 进度，X28 检查混合消费者与整套资源归还。
+故障镜像只接受 X09 或 X27 对应的真实不可恢复错误。
 """
 
 import argparse
@@ -32,12 +33,13 @@ def require(condition, message):
 
 
 def fields(payload):
-    """读取有限测试记录中的整数键值，不接受重复键或非整数值。"""
+    """读取有限测试记录中的 u64 键值，不接受重复键、非整数或越界值。"""
     result = {}
     for item in payload.split():
         pair = item.split("=", 1)
         require(len(pair) == 2 and pair[0] not in result, "malformed execution field: " + item)
         result[pair[0]] = int(pair[1], 0)
+        require(0 <= result[pair[0]] < (1 << 64), "non-u64 execution field: " + item)
     return result
 
 
@@ -91,7 +93,7 @@ def check_klog(args, lines):
 
 
 def check_execution(args):
-    """核对唯一有序记录、真实切换与等待，以及时间、timer 和工作队列观测关系。"""
+    """核对唯一有序记录及执行、等待、MM、混合消费与整套归还的真实观测关系。"""
     raw_lines = args.output.read_bytes().decode("utf-8", errors="strict").split("\n")
     lines = [line.rstrip("\r") for line in raw_lines]
     begin, cpu_locals = check_header(args, lines)
@@ -109,7 +111,7 @@ def check_execution(args):
         require(not line.startswith("EXECUTION TESTS PASS") or line == "EXECUTION TESTS PASS",
                 "malformed execution success marker")
         if line.startswith("PASS execution-"):
-            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-9]|X2[0-3]|X2[56]) (.+)", line)
+            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-9]|X2[0-6]|X28) (.+)", line)
             require(match is not None and begin < index < done, "unexpected execution pass: " + line)
             name, payload = match.groups()
             require(name not in records, "duplicate execution record: " + name)
@@ -129,7 +131,7 @@ def check_execution(args):
     expected = ["X01"] + ([] if args.cpus == 1 else ["X02"]) + [
         "X03", "X04", "X05", "X06", "X07", "X08", "X10", "X11", "X12",
         "X13", "X14", "X15", "X16", "X17", "X18", "X19", "X20", "X21", "X22", "X23",
-        "X25", "X26"]
+        "X24", "X25", "X26", "X28"]
     require(list(records) == expected, "missing or out-of-order execution records")
     require(len(holds) == 1, "missing or duplicate UART hold")
     first = records["X01"]
@@ -174,7 +176,10 @@ def check_execution(args):
     check_waiting(args, records)
     check_timer(args, records)
     check_workqueue(args, records)
-    check_logging(args, records, lines, check_klog(args, raw_lines))
+    check_memory(args, records)
+    logs = check_klog(args, raw_lines)
+    check_logging(args, records, lines, logs)
+    check_mixed(args, records, lines, logs)
 
 
 def check_waiting(args, records):
@@ -395,8 +400,32 @@ def check_workqueue(args, records):
                     ("max_active", "reused", "closed", "stops", "drops", "reclaimed")),
             "X23 did not establish non-reentrant self-requeue, cancellation reuse, irreversible close, and exactly-once stop/drop")
 
+
+def check_memory(args, records):
+    """核对同一 Task 的本核和迁核 MM 消费、完整内容检查及停稳资源归还。"""
+    memory = records["X24"]
+    require(set(memory) == {
+        "task", "cpus", "visited", "hops", "local_rounds", "page_allocs", "page_frees",
+        "heap_allocs", "heap_frees", "flushes", "pressure_pages", "pressure_objects",
+        "content_checks", "cpu_checks", "stack_checks", "reclaimed",
+    } and all(0 <= value < (1 << 64) for value in memory.values()),
+            "X24 has missing, extra, or non-u64 memory fields")
+    hops = 0 if args.cpus == 1 else 2 * args.cpus
+    require(0 < memory["task"] and memory["cpus"] == args.cpus
+            and memory["visited"] == (1 << args.cpus) - 1
+            and memory["local_rounds"] == 2 and memory["hops"] == hops
+            and 2 * (hops + 2) <= memory["page_allocs"] == memory["page_frees"]
+            and 12 * (hops + 2) <= memory["heap_allocs"] == memory["heap_frees"]
+            and hops + 2 <= memory["flushes"]
+            and 64 <= memory["pressure_pages"] and 96 <= memory["pressure_objects"]
+            and memory["page_allocs"] + memory["heap_allocs"] <= memory["content_checks"]
+            and hops + 3 <= memory["cpu_checks"] == memory["stack_checks"]
+            and memory["reclaimed"] == 1,
+            "X24 did not establish complete local/migrating MM consumption, content/CPU/stack checks, pressure, or repayment")
+
+
 def check_logging(args, records, lines, logs):
-    """核对两个真实记录区间、独立读者缺口、UART 部分写入与末尾固定追赶边界。"""
+    """核对两个日志区间、独立读者缺口和 UART 追赶边界，不混入后续混合日志。"""
     expected = {
         "X25": {"seq_first", "seq_last", "records", "task_records", "timer_records",
                 "sched_locked", "pool_locked", "allocation_attempts", "utf8", "truncated",
@@ -411,7 +440,7 @@ def check_logging(args, records, lines, logs):
                 and all(0 <= value < (1 << 64) for value in records[name].values()),
                 name + " has missing, extra, or non-u64 logging fields")
     first = records["X25"]
-    require(0 < first["seq_first"] and first["seq_last"] == first["seq_first"] + 4
+    require(first["seq_first"] == 1 and first["seq_last"] == first["seq_first"] + 4
             and first["records"] == 5 and first["task_records"] == 4
             and first["timer_records"] == 1 and first["allocation_attempts"] == 0
             and first["trunc_len"] == 510 and first["independent"] == 2
@@ -459,7 +488,7 @@ def check_logging(args, records, lines, logs):
             and second["fill_zero"] == second["rx_ack"] == 1,
             "X26 did not establish genuine blocked UART progress, exact independent cursor loss, or a fixed catchup boundary")
     sequences = [held] + list(range(held + 9, second["catchup"]))
-    require([seq for seq in logs if held <= seq] == sequences,
+    require([seq for seq in logs if held <= seq < second["catchup"]] == sequences,
             "X26 replayed an overwritten/current record or omitted its surviving prefix")
     for number in sequences:
         expected_message = ("X26 partial " + "P" * 450 if number == held
@@ -471,6 +500,57 @@ def check_logging(args, records, lines, logs):
     held_line = lines[positions[held]]
     require(second["length"] == len(held_line.encode("utf-8")) + 1,
             "X26 partial offset did not refer to the actual complete held UART record")
+
+
+def check_mixed(args, records, lines, logs):
+    """核对有界混合回调的完整正文、真实身份，以及局部和全套资源归还。"""
+    mixed = records["X28"]
+    require(set(mixed) == {
+        "cpus", "tasks", "rounds", "timer_callbacks", "work_callbacks", "log_records",
+        "waited", "blocked", "drops", "stopped", "pending", "waiters", "reclaimed",
+        "suite_reclaimed", "seq_first", "seq_last", "catchup",
+    } and all(0 <= value < (1 << 64) for value in mixed.values()),
+            "X28 has missing, extra, or non-u64 mixed fields")
+    callbacks = args.cpus * 8
+    require(mixed["cpus"] == mixed["tasks"] == args.cpus and mixed["rounds"] == 8
+            and mixed["timer_callbacks"] == mixed["work_callbacks"] == callbacks
+            and mixed["log_records"] == mixed["waited"] == 2 * callbacks
+            and mixed["blocked"] == mixed["drops"] == args.cpus
+            and mixed["stopped"] == 2 * args.cpus
+            and mixed["pending"] == mixed["waiters"] == 0
+            and mixed["reclaimed"] == mixed["suite_reclaimed"] == 1
+            and mixed["seq_first"] == records["X26"]["catchup"]
+            and mixed["seq_last"] == mixed["seq_first"] + mixed["log_records"] - 1
+            and mixed["catchup"] == mixed["seq_last"] + 1,
+            "X28 did not conserve mixed callback/wait/stop totals, repay both baselines, or fix its log boundary")
+    markers = {name: next(index for index, line in enumerate(lines)
+                          if line.startswith("PASS execution-" + name + " "))
+               for name in ("X26", "X28")}
+    positions = {int(line.split(" ", 2)[1][4:]): index
+                 for index, line in enumerate(lines) if line.startswith("KLOG ")}
+    seen = set()
+    for sequence, record in logs.items():
+        if sequence < mixed["seq_first"]:
+            continue
+        require(sequence < mixed["catchup"]
+                and markers["X26"] < positions[sequence] < markers["X28"],
+                "X28 emitted a record outside its fixed sequence or marker interval")
+        match = re.fullmatch(r"X28 (timer|work) slot=([0-9]+) round=([0-9]+)", record["message"])
+        require(match is not None, "X28 printed corrupt or unrelated callback body")
+        source, slot, round_number = match.groups()
+        slot, round_number = int(slot), int(round_number)
+        require(record["message"] == f"X28 {source} slot={slot} round={round_number}",
+                "X28 callback body did not preserve its actual scalar formatting")
+        identity = (source, slot, round_number)
+        require(slot in range(args.cpus) and round_number in range(8)
+                and record["level"] == "INFO" and record["cpu"] == slot
+                and 0 < record["ns"] and record["truncated"] == 0
+                and (source == "timer" or record["task"] != "none")
+                and identity not in seen,
+                "X28 printed invalid level, CPU/Task identity, round, truncation, or duplicate callback")
+        seen.add(identity)
+    require(len(seen) == mixed["log_records"] and mixed["seq_last"] in logs,
+            "X28 omitted bounded-capacity callback records or its final record before catchup")
 
 
 
