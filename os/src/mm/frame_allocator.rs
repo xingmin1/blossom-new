@@ -2,7 +2,7 @@ use crate::arch;
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::{self, Block};
 use crate::mm::pcp;
-use core::mem::MaybeUninit;
+use core::mem::{ManuallyDrop, MaybeUninit};
 
 /// 持有一个真实连续页块的唯一归还权；移动或复制原始地址不会复制拥有权。
 pub struct OwnedPages {
@@ -29,6 +29,27 @@ impl OwnedPages {
     /// 返回整块直接映射的原始写指针；读取前须完成初始化，所有访问须在归还前结束。
     pub fn as_mut_ptr(&mut self) -> *mut MaybeUninit<u8> {
         arch::phys_to_virt(self.phys_addr()) as *mut MaybeUninit<u8>
+    }
+
+    /// 消耗页拥有者，将仍 live 整体块的唯一归还权交给原指针与原阶协议。
+    /// 返回后不得再使用旧拥有者；接收者须保留原阶，最终恢复一次拥有并结束全部访问。
+    pub(crate) fn into_raw(self) -> *mut u8 {
+        let pages = ManuallyDrop::new(self);
+        arch::phys_to_virt(pages.phys_addr()) as *mut u8
+    }
+
+    /// 从先前消费的原 live 整体块恢复唯一拥有者，不重新分配或更改自由链。
+    ///
+    /// # Safety
+    /// pointer 必须是本类型 into_raw 返回的原直映块首址，order 必须是同块原阶；
+    /// 块仍 live 且从未归还，全部访问已结束，无其他有效拥有凭证，亦不在任何
+    /// buddy、PCP 或 slab 自由链中。恢复后不得继续用旧裸指针访问或再次恢复。
+    pub(crate) unsafe fn from_raw(pointer: *mut u8, order: usize) -> Self {
+        let head = arch::virt_to_phys(pointer as usize) / PAGE_SIZE;
+        // SAFETY: 调用者保证这是 into_raw 转移的原 live 整体块，直映逆转换得到
+        // 同一原首 PFN，order 未改变；访问已结束，唯一归还权不属于其他凭证或自由链。
+        let block = unsafe { Block::from_raw(head, order) };
+        Self { block }
     }
 }
 

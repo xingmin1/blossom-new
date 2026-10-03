@@ -8,6 +8,12 @@ use crate::mm::{
     alloc_pages, buddy, drain_all_pages, flush_all, pcp, shrink_all, slub, OwnedPages,
 };
 use crate::sync::{IrqSaveGuard, SpinLock};
+use alloc::alloc::{alloc, alloc_zeroed, dealloc, realloc};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::alloc::Layout;
+use core::hint::black_box;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +31,10 @@ const STREAM: usize = 5;
 const SLUB_REMOTE: usize = STREAM + ROUNDS * 2;
 const SLUB_STOPPED: usize = SLUB_REMOTE + 1;
 const SLUB_DONE: usize = SLUB_STOPPED + 1;
+const HEAP_WAIT: usize = SLUB_DONE + 1;
+const HEAP_ARC: usize = HEAP_WAIT + 1;
+const HEAP_STOPPED: usize = HEAP_ARC + 1;
+const HEAP_DONE: usize = HEAP_STOPPED + 1;
 const SLUB_SLOTS: usize = 96;
 const SLUB_TRANSFER: usize = 6;
 const SLUB_CLASS: usize = 11;
@@ -41,6 +51,9 @@ static LIVE: [AtomicUsize; MAX * WORK_PAGES] =
     [const { AtomicUsize::new(usize::MAX) }; MAX * WORK_PAGES];
 static RING: [SpinLock<Option<OwnedPages>>; MAX * TRANSFER_PAGES] =
     [const { SpinLock::new(None) }; MAX * TRANSFER_PAGES];
+static HEAP_ARC_SLOT: SpinLock<Option<Arc<HeapPayload>>> = SpinLock::new(None);
+static HEAP_DROPS: AtomicUsize = AtomicUsize::new(0);
+static HEAP_DROP_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 // BSP 只通过原始指针写入/移动已初始化前缀；AP 在压力期间不访问此存储。
 static mut PRESSURE: [MaybeUninit<OwnedPages>; PRESSURE_CAPACITY] =
     [const { MaybeUninit::uninit() }; PRESSURE_CAPACITY];
@@ -1285,7 +1298,7 @@ fn slub_primary(initial: usize) {
     STEP.store(SLUB_DONE, Ordering::Release);
 }
 
-/// AP 在同一个内存动作中处理页与对象交接；真实耗尽期间停止申请和归还。
+/// AP 在同一个内存动作中处理页、SLUB 与标准堆交接；真实耗尽期间停止申请和归还。
 pub(crate) fn secondary() {
     let id = cpu::current().id;
     assert!(0 < id, "memory secondary requires AP");
@@ -1301,9 +1314,10 @@ pub(crate) fn secondary() {
     cache_checkpoint(id);
     stream_worker(id);
     slub_secondary(id);
+    heap_secondary(id);
 }
 
-/// BSP 在一个内存动作中验证真实页压力和经典 SLUB，停止参与者后恢复精确账务。
+/// BSP 在一个内存动作中验证真实页压力、经典 SLUB 与标准堆，停止参与者后恢复精确账务。
 pub(crate) fn primary() {
     assert_eq!(cpu::current().id, 0, "memory primary requires BSP");
     try_lock_checks();
@@ -1407,4 +1421,423 @@ pub(crate) fn primary() {
     restored(initial);
     crate::println!("PASS memory-pcp-drain mode={} cpus={} batch={} high={} high_events={} cached_after_high={} remote_cached={} rounds={} drains={} restored={}", if 1 < cpu::count() { "parallel-direct" } else { "local" }, cpu::count(), batch, high, cpu::count(), high - batch, batch * (cpu::count() - 1), ROUNDS, DRAINS.load(Ordering::Acquire), initial);
     slub_primary(initial);
+    heap_primary(initial);
+}
+
+/// 通过标准非零分配入口取得唯一 live 权，失败立即终止本次布局验收。
+fn heap_allocate(layout: Layout) -> NonNull<u8> {
+    assert!(0 < layout.size(), "memory heap requires nonzero Layout");
+    // SAFETY: Layout 已由标准构造器验证，size 非零；返回权仅由当前测试保存。
+    NonNull::new(unsafe { alloc(black_box(layout)) }).expect("memory heap allocation failed")
+}
+
+/// 初始化请求范围，不把缓存的 rounded 容量当作消费者可访问范围。
+///
+/// # Safety
+/// pointer 必须独占拥有至少 length 字节的 live 分配，没有并发访问。
+unsafe fn heap_fill(pointer: NonNull<u8>, length: usize, byte: u8) {
+    // SAFETY: 调用者保证 length 位于独占 live 请求范围，原始写入不读取未初始化字节。
+    unsafe { pointer.as_ptr().write_bytes(byte, length) };
+}
+
+/// 逐字节检查消费者此前初始化的请求前缀。
+///
+/// # Safety
+/// pointer 的前 length 字节必须仍 live、已初始化，且没有并发写入。
+unsafe fn heap_check(pointer: NonNull<u8>, length: usize, byte: u8) {
+    for offset in 0..length {
+        // SAFETY: 调用者保证整个前缀已初始化且仍 live；offset 严格位于该前缀。
+        assert_eq!(
+            unsafe { pointer.as_ptr().add(offset).read() },
+            byte,
+            "memory heap requested contents changed at {}",
+            offset
+        );
+    }
+}
+
+/// 在全体 AP 等待时同时保留布局矩阵，核验真实 cache/order、地址与完整请求内容。
+fn heap_layout(initial: usize) {
+    const LARGE: usize = slub::NONE;
+    const MAX_BLOCK: usize = PAGE_SIZE << buddy::MAX_ORDER;
+    const CASES: &[(usize, usize, usize)] = &[
+        (1, 1, 0),
+        (8, 8, 0),
+        (9, 1, 1),
+        (16, 16, 1),
+        (17, 1, 2),
+        (32, 32, 2),
+        (33, 1, 3),
+        (64, 64, 3),
+        (65, 8, 4),
+        (96, 32, 4),
+        (65, 64, 5),
+        (128, 128, 5),
+        (129, 8, 6),
+        (192, 64, 6),
+        (193, 1, 7),
+        (256, 256, 7),
+        (257, 1, 8),
+        (512, 512, 8),
+        (513, 1, 9),
+        (1024, 1024, 9),
+        (1025, 1, 10),
+        (2048, 2048, 10),
+        (2049, PAGE_SIZE, 11),
+        (4096, PAGE_SIZE, 11),
+        (4097, 8, LARGE),
+        (7, PAGE_SIZE * 2, LARGE),
+        (8193, PAGE_SIZE * 4, LARGE),
+        (MAX_BLOCK, MAX_BLOCK, LARGE),
+    ];
+    let mut live = [0usize; CASES.len()];
+    let mut large_pages = 0;
+    for (index, &(size, align, class)) in CASES.iter().enumerate() {
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let pointer = heap_allocate(layout);
+        let address = pointer.as_ptr() as usize;
+        assert_eq!(address % align, 0, "memory heap Layout alignment differs");
+        for (other, &previous) in live[..index].iter().enumerate() {
+            assert!(
+                previous + CASES[other].0 <= address || address + size <= previous,
+                "memory heap live requested ranges overlap"
+            );
+        }
+        if class == LARGE {
+            let bytes = size.max(align).max(PAGE_SIZE).next_power_of_two();
+            large_pages += bytes / PAGE_SIZE;
+            let physical = arch::virt_to_phys(address);
+            assert_eq!(
+                physical % bytes,
+                0,
+                "memory heap large block alignment differs"
+            );
+        } else {
+            let state = slub::slab_snapshot(pointer);
+            let geometry = slub::geometry(class);
+            assert_eq!(state.cache, class, "memory heap selected wrong cache");
+            assert_eq!(
+                state.order, geometry.preferred_order,
+                "memory heap slab order differs"
+            );
+            let base = arch::phys_to_virt(state.head_pfn * PAGE_SIZE);
+            assert_eq!(
+                (address - base) % geometry.stride,
+                0,
+                "memory heap object stride differs"
+            );
+            assert!(
+                address + size <= base + (PAGE_SIZE << state.order),
+                "memory heap requested range exceeds backing"
+            );
+        }
+        // SAFETY: 本轮取得的唯一 live 权尚未发布，写入仅限原 Layout 的请求范围。
+        unsafe { heap_fill(pointer, size, (index as u8).wrapping_mul(7).wrapping_add(1)) };
+        live[index] = address;
+    }
+    assert_eq!(
+        total_free() + slub::backing_pages() + large_pages,
+        initial,
+        "memory heap live slab/large order accounting differs"
+    );
+    for (index, &(size, align, _)) in CASES.iter().enumerate() {
+        let pointer = object_pointer(live[index]);
+        // SAFETY: 全部请求前缀已初始化且仍 live，AP 等待；核验后以原 Layout 消耗唯一权。
+        unsafe {
+            heap_check(pointer, size, (index as u8).wrapping_mul(7).wrapping_add(1));
+            dealloc(
+                pointer.as_ptr(),
+                Layout::from_size_align(size, align).unwrap(),
+            );
+        }
+        live[index] = 0;
+    }
+    for layout in [
+        Layout::from_size_align(MAX_BLOCK + 1, 1).unwrap(),
+        Layout::from_size_align(1, MAX_BLOCK * 2).unwrap(),
+    ] {
+        // 屏蔽返回值，保留仅观察失败结果的真实分配调用与 null 判定。
+        // SAFETY: 两个 Layout 合法且非零，超上限失败不得产生可释放的对象。
+        assert!(
+            black_box(unsafe { alloc(black_box(layout)) }).is_null(),
+            "memory heap accepted an over-maximum request"
+        );
+    }
+    slub_restored(initial);
+    crate::println!(
+        "PASS memory-heap-layout layouts={} max_order={} restored={}",
+        CASES.len(),
+        buddy::MAX_ORDER,
+        initial
+    );
+}
+
+/// 保留左右 live 请求后复用中间对象，zeroed 必须只初始化自己且不破坏邻居。
+fn heap_zeroed(initial: usize) {
+    for (size, align) in [(65, 8), (129, 8), (4097, PAGE_SIZE * 2)] {
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let left = heap_allocate(layout);
+        let middle = heap_allocate(layout);
+        let right = heap_allocate(layout);
+        // SAFETY: 三个分配分别拥有唯一 live 权，请求范围互不重叠且 AP 停稳。
+        unsafe {
+            heap_fill(left, size, 0x35);
+            heap_fill(middle, size, 0xac);
+            heap_fill(right, size, 0x79);
+            dealloc(middle.as_ptr(), layout);
+        }
+        // SAFETY: 合法非零 Layout；middle 的释放已结束，返回新的唯一权。
+        let zero = NonNull::new(unsafe { alloc_zeroed(black_box(layout)) })
+            .expect("memory heap zeroed allocation failed");
+        assert_eq!(
+            (zero.as_ptr() as usize) % align,
+            0,
+            "memory heap zeroed alignment differs"
+        );
+        if align <= PAGE_SIZE {
+            let left_state = slub::slab_snapshot(left);
+            let right_state = slub::slab_snapshot(right);
+            let zero_state = slub::slab_snapshot(zero);
+            assert_eq!(
+                zero, middle,
+                "memory heap zeroed did not reuse adjacent slot"
+            );
+            assert_eq!(
+                left_state.head_pfn, zero_state.head_pfn,
+                "memory heap zeroed left neighbor is not in same slab"
+            );
+            assert_eq!(
+                right_state.head_pfn, zero_state.head_pfn,
+                "memory heap zeroed right neighbor is not in same slab"
+            );
+            let stride = slub::geometry(left_state.cache).stride;
+            assert_eq!(
+                (left.as_ptr() as usize).abs_diff(zero.as_ptr() as usize),
+                stride
+            );
+            assert_eq!(
+                (right.as_ptr() as usize).abs_diff(zero.as_ptr() as usize),
+                stride
+            );
+        }
+        // SAFETY: zeroed 初始化自己的完整请求；左右请求已由本测试写入且一直保留唯一权。
+        unsafe {
+            heap_check(zero, size, 0);
+            heap_check(left, size, 0x35);
+            heap_check(right, size, 0x79);
+            dealloc(zero.as_ptr(), layout);
+            dealloc(left.as_ptr(), layout);
+            dealloc(right.as_ptr(), layout);
+        }
+    }
+    slub_restored(initial);
+    crate::println!(
+        "PASS memory-heap-zeroed small_neighbors=2 large_align={} restored={}",
+        PAGE_SIZE * 2,
+        initial
+    );
+}
+
+/// 增缩只读取旧请求初始化前缀；真实耗尽后失败必须保留原内容和唯一释放权。
+fn heap_realloc(initial: usize) {
+    let old = Layout::from_size_align(65, 64).unwrap();
+    let pointer = heap_allocate(old);
+    // SAFETY: 原对象独占且 live，仅初始化请求的 65 字节，rounded 容量保持不可读取。
+    unsafe { heap_fill(pointer, old.size(), 0x5b) };
+    // SAFETY: pointer 来自该 allocator 且仍 live，old 是原 Layout；新尺寸合法非零。
+    let grown = NonNull::new(unsafe { realloc(black_box(pointer.as_ptr()), old, 8193) })
+        .expect("memory heap growing realloc failed");
+    assert_eq!((grown.as_ptr() as usize) % old.align(), 0);
+    // SAFETY: 成功 realloc 只保证旧请求的 65 字节已初始化；核验后显式初始化新请求全部。
+    unsafe {
+        heap_check(grown, old.size(), 0x5b);
+        heap_fill(grown, 8193, 0x91);
+    }
+    let large = Layout::from_size_align(8193, old.align()).unwrap();
+    // SAFETY: grown 是成功增长后唯一 live 权，large 为该次分配 Layout；新尺寸合法非零。
+    let shrunk = NonNull::new(unsafe { realloc(black_box(grown.as_ptr()), large, 33) })
+        .expect("memory heap shrinking realloc failed");
+    assert_eq!((shrunk.as_ptr() as usize) % old.align(), 0);
+    let small = Layout::from_size_align(33, old.align()).unwrap();
+    // SAFETY: 缩小成功保证 min(8193,33) 的已初始化前缀；读取后消耗唯一权。
+    unsafe {
+        heap_check(shrunk, small.size(), 0x91);
+        dealloc(shrunk.as_ptr(), small);
+    }
+    slub_restored(initial);
+
+    let survivor = heap_allocate(old);
+    // SAFETY: survivor 独占且 live，原 Layout 请求前缀完整初始化。
+    unsafe { heap_fill(survivor, old.size(), 0xc7) };
+    drain_all_pages();
+    // SAFETY: BSP 独占空 PRESSURE，heap_primary 已 acquire 确认全部 AP 停稳；
+    // survivor 在独立 slab 内保留，压力页分配器不会申请该仍 live 的 backing。
+    let count = unsafe { exhaust_global_pages() };
+    assert_eq!(
+        total_free(),
+        0,
+        "memory heap realloc pressure did not exhaust global pages"
+    );
+    assert!(
+        0 < count,
+        "memory heap realloc pressure held no actual pages"
+    );
+    // SAFETY: survivor 仍为原 Layout 的唯一 live 权；8193 在上限内且满足 realloc 合同。
+    let failed = black_box(unsafe { realloc(black_box(survivor.as_ptr()), old, 8193) });
+    assert!(
+        failed.is_null(),
+        "memory heap realloc succeeded after actual page exhaustion"
+    );
+    // SAFETY: 失败的 realloc 必须保留旧对象；原请求前缀此前已初始化，访问后合法归还。
+    unsafe {
+        heap_check(survivor, old.size(), 0xc7);
+        dealloc(survivor.as_ptr(), old);
+        release_pressure_pages(count);
+    }
+    slub_restored(initial);
+    crate::println!("PASS memory-heap-realloc grow=8193 shrink=33 pressure_handles={} failed_old_live=65 restored={}",
+        count, initial);
+}
+
+struct HeapPayload {
+    words: [usize; 12],
+}
+
+impl HeapPayload {
+    /// 检查交接中的真实 Arc payload，记录生命周期前不得读取释放后的存储。
+    fn check(&self) {
+        for (index, &word) in self.words.iter().enumerate() {
+            assert_eq!(word, index * 37 + 11, "memory heap Arc payload changed");
+        }
+    }
+}
+
+impl Drop for HeapPayload {
+    /// 记录最后拥有者实际执行析构的 CPU 和次数，不在析构中申请堆。
+    fn drop(&mut self) {
+        self.check();
+        HEAP_DROP_CPU.store(cpu::current().id, Ordering::Relaxed);
+        HEAP_DROPS.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// 从槽中移动唯一 Arc，结束槽锁作用域后才检查 payload 并执行最后析构。
+fn heap_take_arc() {
+    let payload = {
+        let mut slot = HEAP_ARC_SLOT.lock();
+        slot.take().expect("memory heap Arc ownership is missing")
+    };
+    assert_eq!(
+        Arc::strong_count(&payload),
+        1,
+        "memory heap transferred Arc is not final owner"
+    );
+    black_box(&payload).check();
+    drop(payload);
+}
+
+/// AP 在普通 MEMORY worker 中接收最后 Arc 权，随后发布停稳并保留后续 boot phase 能力。
+fn heap_secondary(id: usize) {
+    ACK[id].store(HEAP_WAIT, Ordering::Release);
+    wait_step(HEAP_ARC);
+    if id == 1 {
+        heap_take_arc();
+    }
+    ACK[id].store(HEAP_STOPPED, Ordering::Release);
+    wait_step(HEAP_DONE);
+}
+
+/// 使用真实 Box、增长 Vec 和 Arc；唯一最后权由普通执行流交接，不在 IPI 中分配或析构。
+fn heap_alloc_types(initial: usize) {
+    let boxed = black_box(Box::new(core::array::from_fn::<usize, 12, _>(|index| {
+        index * 19 + 7
+    })));
+    let box_pointer = NonNull::from(black_box(boxed.as_ref())).cast::<u8>();
+    let box_state = slub::slab_snapshot(box_pointer);
+    assert_eq!(
+        slub::SIZES[box_state.cache],
+        core::mem::size_of_val(boxed.as_ref()),
+        "memory heap Box payload cache differs"
+    );
+    for (index, &word) in boxed.iter().enumerate() {
+        assert_eq!(word, index * 19 + 7, "memory heap Box payload changed");
+    }
+    let mut vector = Vec::with_capacity(2);
+    let initial_capacity = vector.capacity();
+    let mut growths = 0;
+    for index in 0usize..1025 {
+        let before = vector.capacity();
+        vector.push(index * 23 + 3);
+        growths += usize::from(before < vector.capacity());
+    }
+    assert!(
+        initial_capacity < vector.capacity() && 1 < growths,
+        "memory heap Vec did not exercise repeated growth"
+    );
+    assert_eq!(vector.len(), 1025);
+    for (index, &word) in black_box(&vector).iter().enumerate() {
+        assert_eq!(
+            word,
+            index * 23 + 3,
+            "memory heap Vec growth lost an element"
+        );
+    }
+    drop(vector);
+    drop(boxed);
+
+    HEAP_DROPS.store(0, Ordering::Relaxed);
+    HEAP_DROP_CPU.store(usize::MAX, Ordering::Relaxed);
+    let payload = black_box(Arc::new(HeapPayload {
+        words: core::array::from_fn(|index| index * 37 + 11),
+    }));
+    payload.check();
+    let last = Arc::clone(&payload);
+    drop(payload);
+    assert_eq!(
+        HEAP_DROPS.load(Ordering::Acquire),
+        0,
+        "memory heap Arc dropped before final owner"
+    );
+    assert_eq!(Arc::strong_count(&last), 1);
+    {
+        let mut slot = HEAP_ARC_SLOT.lock();
+        assert!(slot.is_none(), "memory heap Arc slot already owns payload");
+        *slot = Some(last);
+    }
+    STEP.store(HEAP_ARC, Ordering::Release);
+    if cpu::count() == 1 {
+        heap_take_arc();
+    }
+    join(HEAP_STOPPED, 1);
+    assert_eq!(
+        HEAP_DROPS.load(Ordering::Acquire),
+        1,
+        "memory heap Arc final Drop count differs"
+    );
+    let expected_cpu = usize::from(1 < cpu::count());
+    assert_eq!(
+        HEAP_DROP_CPU.load(Ordering::Relaxed),
+        expected_cpu,
+        "memory heap Arc final Drop ran on wrong CPU"
+    );
+    assert!(
+        HEAP_ARC_SLOT.lock().is_none(),
+        "memory heap Arc slot retained owner"
+    );
+    slub_restored(initial);
+    if cpu::count() == 1 {
+        crate::println!("SCOPE memory-heap-alloc cross-cpu-last-drop requires=2 mode=local");
+    }
+    crate::println!("PASS memory-heap-alloc mode={} vec_elements=1025 growths={} arc_drops=1 drop_cpu={} restored={}",
+        if 1 < cpu::count() { "cross-cpu" } else { "local" }, growths, expected_cpu, initial);
+}
+
+/// 停稳普通 AP 后完成标准堆验收；还账后再放回既有 boot phase 循环。
+fn heap_primary(initial: usize) {
+    join(HEAP_WAIT, 1);
+    heap_layout(initial);
+    heap_zeroed(initial);
+    heap_realloc(initial);
+    heap_alloc_types(initial);
+    STEP.store(HEAP_DONE, Ordering::Release);
 }

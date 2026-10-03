@@ -30,13 +30,14 @@ impl Block {
         self.order
     }
 
-    /// 恢复从真实 PCP 链摘下的零阶页唯一归还权，不查询或修改 zone 元数据。
+    /// 恢复已从拥有者或 PCP 链转移的真实整体块唯一归还权，不改变 zone 元数据。
     ///
     /// # Safety
-    /// head 必须是此前由本 buddy 分配、交给 PCP 且刚从其链摘下的真实零阶页；
-    /// 调用者仍持有唯一归还权，该页不在任何自由链中，且无另一份有效归还凭证。
-    pub(crate) unsafe fn from_pcp(head: usize) -> Self {
-        Self { head, order: 0 }
+    /// head 必须是本 buddy 原分配且仍 live 的整体块首 PFN，order 必须是原阶；
+    /// 原拥有凭证已消费或页刚从 PCP 链摘离，全部访问已结束，块从未归还，
+    /// 不在任何 buddy、PCP 或 slab 自由链中，也无另一份有效归还凭证。
+    pub(crate) unsafe fn from_raw(head: usize, order: usize) -> Self {
+        Self { head, order }
     }
 }
 

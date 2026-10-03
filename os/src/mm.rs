@@ -1,6 +1,7 @@
 mod bootmem;
 mod buddy;
 mod frame_allocator;
+mod heap_allocator;
 mod page;
 mod pcp;
 mod slub;

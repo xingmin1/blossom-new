@@ -55,8 +55,8 @@ impl Pageset {
         self.head = unsafe { next.read() };
         self.count -= 1;
         // SAFETY: head 刚从本 PCP 链摘离，原 buddy 零阶页的唯一归还权未复制；
-        // 页没有其他访问者或 Block，恢复后不再由此链访问或归还。
-        Some(unsafe { Block::from_pcp(head) })
+        // 原阶为 0，链字读取已结束，页没有其他访问者、有效凭证或自由链成员。
+        Some(unsafe { Block::from_raw(head, 0) })
     }
 
     /// 在 PCP→zone 锁序下补充最多 batch 个独立页，接受真实不足整批的结果。

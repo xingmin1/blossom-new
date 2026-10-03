@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 #![feature(asm_experimental_arch)]
+#![feature(alloc_error_handler)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(all(feature = "refill-test", not(target_arch = "loongarch64")))]
 compile_error!("refill-test requires the loongarch64 target");
 
+extern crate alloc;
 extern crate rlibc;
 
 mod arch;
@@ -20,7 +22,7 @@ mod sync;
 #[cfg(feature = "boot-tests")]
 mod boot_tests;
 
-/// 使用固件原始参数构造全局资源、CPU 表、物理页描述符和中断设施，然后释放 AP。
+/// 使用固件原始参数构造全局资源、CPU 表、物理页与堆、中断设施，然后释放 AP。
 ///
 /// # Safety
 /// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
@@ -138,4 +140,14 @@ pub unsafe extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     console::panic(info)
+}
+
+/// 记录不可恢复的标准堆分配错误，复用不分配内存的有界应急 panic 输出。
+#[alloc_error_handler]
+fn allocation_error(layout: core::alloc::Layout) -> ! {
+    panic!(
+        "heap allocation failed: size={} align={}",
+        layout.size(),
+        layout.align()
+    )
 }
