@@ -1,301 +1,124 @@
-#[cfg(feature = "oom_handler")]
-use super::super::fs;
-use super::{PhysAddr, PhysPageNum};
-use crate::hal::MEMORY_END;
-#[cfg(feature = "oom_handler")]
-use crate::task::current_task;
+use crate::arch;
+use crate::mm::bootmem::PAGE_SIZE;
+use crate::mm::buddy::{self, Block};
+use core::mem::MaybeUninit;
 
-use alloc::{sync::Arc, vec::Vec};
-use core::fmt::{self, Debug, Formatter};
-use lazy_static::*;
-use spin::RwLock;
-
-/// 物理帧跟踪器
-pub struct FrameTracker {
-    /// 跟踪的物理页号
-    pub ppn: PhysPageNum,
+/// 持有一个真实连续页块的唯一归还权；移动或复制原始地址不会复制拥有权。
+pub struct OwnedPages {
+    block: Block,
 }
 
-impl FrameTracker {
-    pub fn new(ppn: PhysPageNum) -> Self {
-        // 清理页面内容
-        let dwords_array = ppn.get_dwords_array();
-        for i in dwords_array {
-            *i = 0;
-        }
-        Self { ppn }
+impl OwnedPages {
+    /// 返回块头物理地址，不授予该整数地址的解引用或归还权限。
+    pub fn phys_addr(&self) -> usize {
+        self.block.head_pfn() * PAGE_SIZE
     }
-    pub unsafe fn new_uninit(ppn: PhysPageNum) -> Self {
-        Self { ppn }
+
+    /// 返回整块字节长度；成功申请的块始终至少包含一页。
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        PAGE_SIZE << self.order()
+    }
+
+    /// 返回唯一归还所需的原始阶数。
+    pub fn order(&self) -> usize {
+        self.block.order()
+    }
+
+    /// 返回整块直接映射的原始写指针；读取前须完成初始化，所有访问须在归还前结束。
+    pub fn as_mut_ptr(&mut self) -> *mut MaybeUninit<u8> {
+        arch::phys_to_virt(self.phys_addr()) as *mut MaybeUninit<u8>
     }
 }
 
-impl Debug for FrameTracker {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!("FrameTracker:PPN={:#x}", self.ppn.0))
-    }
-}
-impl Drop for FrameTracker {
-    // 自动回收物理帧
+impl Drop for OwnedPages {
+    /// 在调用者结束全部原始访问后，按原块头与阶数一次归还整个块。
     fn drop(&mut self) {
-        // println!("do drop at {}", self.ppn.0);
-        frame_dealloc(self.ppn);
+        // SAFETY: block 仅来自 buddy 的成功摘块且不能复制；本对象仍持有整块唯一
+        // 归还权，safe 接口没有产生页内容引用，原始指针使用者须在析构前结束访问。
+        unsafe { buddy::release(self.block.head_pfn(), self.block.order()) };
     }
 }
 
-/// 帧分配器接口
-trait FrameAllocator {
-    fn new() -> Self;
-    /// 分配
-    fn alloc(&mut self) -> Option<FrameTracker>;
-    unsafe fn alloc_uninit(&mut self) -> Option<FrameTracker>;
-    /// 释放
-    fn dealloc(&mut self, ppn: PhysPageNum);
-}
-
-/// 栈式帧分配器
-pub struct StackFrameAllocator {
-    // 当前分配器的位置，指向可分配区域的开始
-    current: usize,
-    // 分配器的结束地址，表示可分配内存区域的末尾
-    end: usize,
-    // 已回收的页面（内存框架）的列表
-    recycled: Vec<usize>,
-}
-
-impl StackFrameAllocator {
-    /// 初始化方法
-    pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
-        self.current = l.0;
-        self.end = r.0;
-        let last_frames = self.end - self.current;
-        self.recycled.reserve(last_frames);
-        println!("last {} Physical Frames.", last_frames);
+/// 非阻塞地申请一个连续页块；不足或阶数超限返回 None，不睡眠或自动回收。
+/// 清零在 buddy 已释放 zone 锁及其 IRQ guard 后执行，返回前写满全部请求字节。
+pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
+    let block = buddy::allocate(order)?;
+    let mut pages = OwnedPages { block };
+    if zeroed {
+        let len = pages.len();
+        // SAFETY: buddy 返回已摘链的真实连续 RAM 块，当前拥有者独占全部 len 字节，
+        // BSP 初始化已保证永久可写直映；此时 zone 锁和 IRQ guard 均已释放。
+        unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0, len) };
     }
-    /// 计算未分配的大小
-    pub fn unallocated_frames(&self) -> usize {
-        self.end - self.current + self.recycled.len()
-    }
+    Some(pages)
 }
 
-impl FrameAllocator for StackFrameAllocator {
-    fn new() -> Self {
-        Self {
-            current: 0,
-            end: 0,
-            recycled: Vec::new(),
+/// 在 BSP 独占分配期间，用生产入口检查各阶拥有、真实分类、锁外清零与完整归还。
+#[cfg(feature = "boot-tests")]
+pub(crate) fn test_owned_pages() -> bool {
+    use crate::mm::page::PageKind;
+    use crate::mm::{alloc_pages, OwnedPages};
+
+    let initial = buddy::free_pages();
+    if alloc_pages(buddy::MAX_ORDER + 1, false).is_some()
+        || alloc_pages(usize::MAX, true).is_some()
+        || buddy::free_pages() != initial
+    {
+        return false;
+    }
+    let mut held: [Option<OwnedPages>; buddy::MAX_ORDER + 1] =
+        [const { None }; buddy::MAX_ORDER + 1];
+    let mut allocated = 0;
+    for order in 0..=buddy::MAX_ORDER {
+        let Some(mut pages) = alloc_pages(order, false) else {
+            return false;
+        };
+        let len = PAGE_SIZE << order;
+        let start = pages.phys_addr();
+        if pages.order() != order || pages.len() != len || start % len != 0 {
+            return false;
+        }
+        for pfn in start / PAGE_SIZE..start / PAGE_SIZE + (1 << order) {
+            if crate::mm::pages().get(pfn).map(|page| page.kind()) != Some(PageKind::Available) {
+                return false;
+            }
+        }
+        for other in held.iter().flatten() {
+            if start < other.phys_addr() + other.len() && other.phys_addr() < start + len {
+                return false;
+            }
+        }
+        // SAFETY: pages 独占真实连续块且 len 是完整长度；只写入原始字节，
+        // 不从尚未初始化的页构造正常引用；写入结束后才允许归还。
+        unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0xa5, len) };
+        allocated += 1 << order;
+        if buddy::free_pages() != initial - allocated {
+            return false;
+        }
+        held[order] = Some(pages);
+    }
+    for slot in held.iter_mut().rev() {
+        drop(slot.take());
+    }
+    if buddy::free_pages() != initial {
+        return false;
+    }
+    for order in 0..=buddy::MAX_ORDER {
+        let Some(mut pages) = alloc_pages(order, true) else {
+            return false;
+        };
+        let len = pages.len();
+        // SAFETY: 此调用点明确请求 zeroed，生产入口已写满 len 字节；pages 在
+        // 读取期间持有唯一拥有权且没有并发写者，切片借用在归还前结束。
+        let bytes = unsafe { core::slice::from_raw_parts(pages.as_mut_ptr().cast::<u8>(), len) };
+        if bytes.iter().any(|byte| *byte != 0) || buddy::free_pages() != initial - (1 << order) {
+            return false;
+        }
+        drop(pages);
+        if buddy::free_pages() != initial {
+            return false;
         }
     }
-
-    /// 分配一个物理页
-    fn alloc(&mut self) -> Option<FrameTracker> {
-        // 优先使用回收的帧
-        if let Some(ppn) = self.recycled.pop() {
-            let frame_tracker = FrameTracker::new(ppn.into());
-            log::trace!("[frame_alloc] {:?}", frame_tracker);
-            Some(frame_tracker)
-        } else if self.current == self.end {
-            // 无可用帧
-            None
-        } else {
-            // 否则分配当前页
-            self.current += 1;
-            #[cfg(not(feature = "zero_init"))]
-            let frame_tracker = FrameTracker::new((self.current - 1).into());
-            #[cfg(feature = "zero_init")]
-            let frame_tracker = unsafe { FrameTracker::new_uninit((self.current - 1).into()) };
-            log::trace!("[frame_alloc] {:?}", frame_tracker);
-            Some(frame_tracker)
-        }
-    }
-    unsafe fn alloc_uninit(&mut self) -> Option<FrameTracker> {
-        if let Some(ppn) = self.recycled.pop() {
-            let frame_tracker = FrameTracker::new_uninit(ppn.into());
-            //log::trace!("[frame_alloc_uninit] {:?}", frame_tracker);
-            Some(frame_tracker)
-        } else if self.current == self.end {
-            None
-        } else {
-            self.current += 1;
-            let frame_tracker = FrameTracker::new_uninit((self.current - 1).into());
-            log::trace!("[frame_alloc_uninit] {:?}", frame_tracker);
-            Some(frame_tracker)
-        }
-    }
-    /// 释放一个物理页
-    fn dealloc(&mut self, ppn: PhysPageNum) {
-        log::trace!("[frame_dealloc] {:?}", ppn);
-        let ppn = ppn.0;
-        // 验证帧的有效性（DEBUG模式下），RELEASE中这个检查不必要，并且这个检查可能会显著降低回收速度
-        if option_env!("MODE") == Some("debug") && ppn >= self.current
-            || self.recycled.iter().find(|&v| *v == ppn).is_some()
-        {
-            panic!("Frame ppn={:#x} has not been allocated!", ppn);
-        }
-        // recycle
-        self.recycled.push(ppn);
-    }
-}
-
-type FrameAllocatorImpl = StackFrameAllocator;
-
-lazy_static! {
-    /// 全局帧分配器
-    pub static ref FRAME_ALLOCATOR: RwLock<FrameAllocatorImpl> =
-        RwLock::new(FrameAllocatorImpl::new());
-}
-/// 初始化全局帧分配器
-pub fn init_frame_allocator() {
-    extern "C" {
-        // 内核结束地址？
-        fn ekernel();
-    }
-    FRAME_ALLOCATOR.write().init(
-        // 从内核结束地址ekernel
-        PhysAddr::from(ekernel as usize).ceil(),
-        // 到内存结束地址
-        PhysAddr::from(MEMORY_END).floor(),
-        // 作为可用物理内存
-    );
-}
-
-/// 尝试使用所有可能的方法来释放制定数量为`req`的页
-/// 成功返回Ok(())，失败返回Err(())
-#[cfg(feature = "oom_handler")]
-pub fn oom_handler(req: usize) -> Result<(), ()> {
-    // step 1: 清理文件系统缓存
-    let mut released = 0;
-    released += fs::directory_tree::oom();
-    if released >= req {
-        return Ok(());
-    }
-    // step 2: 清理当前任务的内存
-    let task = current_task().unwrap();
-    if let Some(mut memory_set) = task.vm.try_lock() {
-        released += memory_set.do_shallow_clean();
-        log::warn!("[oom_handler] current task released: {}", released);
-    } else {
-        log::warn!("[oom_handler] try lock current task vm failed!");
-    }
-    if released >= req {
-        return Ok(());
-    }
-    // step 3: 清理所有任务的内存
-    log::warn!("[oom_handler] notify all tasks!");
-    crate::task::do_oom(req - released)
-}
-
-#[cfg(feature = "oom_handler")]
-/// 帧预留机制
-/// # 参数
-/// + num: 指定要保留的帧数量
-pub fn frame_reserve(num: usize) {
-    // 获取还可分配的帧数量
-    let remain = FRAME_ALLOCATOR.read().unallocated_frames();
-    if remain < num {
-        oom_handler(num - remain).unwrap()
-    }
-}
-
-#[cfg(not(feature = "oom_handler"))]
-pub fn frame_reserve(_num: usize) {
-    // do nothing
-}
-
-#[cfg(feature = "oom_handler")]
-/// 带OOM的分配操作
-pub fn frame_alloc() -> Option<Arc<FrameTracker>> {
-    let result = FRAME_ALLOCATOR.write().alloc();
-    match result {
-        Some(frame_tracker) => Some(Arc::new(frame_tracker)),
-        None => {
-            crate::show_frame_consumption! {
-                "GC";
-                oom_handler(1).unwrap();
-            };
-            FRAME_ALLOCATOR
-                .write()
-                .alloc()
-                .map(|frame_tracker| Arc::new(frame_tracker))
-        }
-    }
-}
-
-pub fn frames_alloc(num: usize) -> Option<Vec<Arc<FrameTracker>>> {
-    let mut frames = Vec::with_capacity(num);
-    for _ in 0..num {
-        if let Some(frame_tracker) = frame_alloc() {
-            frames.push(frame_tracker);
-        } else {
-            return None;
-        }
-    }
-    Some(frames)
-}
-
-#[cfg(not(feature = "oom_handler"))]
-/// 常规分配操作
-pub fn frame_alloc() -> Option<Arc<FrameTracker>> {
-    FRAME_ALLOCATOR
-        .write()
-        .alloc()
-        .map(|frame_tracker| Arc::new(frame_tracker))
-}
-
-#[cfg(feature = "oom_handler")]
-pub unsafe fn frame_alloc_uninit() -> Option<Arc<FrameTracker>> {
-    let result = FRAME_ALLOCATOR.write().alloc_uninit();
-    match result {
-        Some(frame_tracker) => Some(Arc::new(frame_tracker)),
-        None => {
-            crate::show_frame_consumption! {
-                "GC";
-                oom_handler(1).unwrap();
-            };
-            FRAME_ALLOCATOR
-                .write()
-                .alloc_uninit()
-                .map(|frame_tracker| Arc::new(frame_tracker))
-        }
-    }
-}
-
-#[cfg(not(feature = "oom_handler"))]
-pub unsafe fn frame_alloc_uninit() -> Option<Arc<FrameTracker>> {
-    FRAME_ALLOCATOR
-        .write()
-        .alloc_uninit()
-        .map(|frame_tracker| Arc::new(frame_tracker))
-}
-
-/// 释放帧
-pub fn frame_dealloc(ppn: PhysPageNum) {
-    FRAME_ALLOCATOR.write().dealloc(ppn);
-}
-
-/// 计算可用帧数量
-pub fn unallocated_frames() -> usize {
-    FRAME_ALLOCATOR.write().unallocated_frames()
-}
-
-#[macro_export]
-/// * `$place`: the name tag for the promotion.
-/// * `statement`: the enclosed
-/// * `before`:
-/// 用于测量代码块的帧消耗情况
-macro_rules! show_frame_consumption {
-    ($place:literal; $($statement:stmt); *;) => {
-        let __frame_consumption_before = crate::mm::unallocated_frames();
-        $($statement)*
-        let __frame_consumption_after = crate::mm::unallocated_frames();
-        log::debug!("[{}] consumed frames: {}, last frames: {}", $place, (__frame_consumption_before - __frame_consumption_after) as isize, __frame_consumption_after)
-    };
-    ($place:literal, $before:ident) => {
-        log::debug!(
-            "[{}] consumed frames:{}, last frames:{}",
-            $place,
-            ($before - crate::mm::unallocated_frames()) as isize,
-            crate::mm::unallocated_frames()
-        );
-    };
+    buddy::free_pages() == initial
 }

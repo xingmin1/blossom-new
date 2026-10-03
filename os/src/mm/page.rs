@@ -1,5 +1,6 @@
 //! 从实际 RAM 直映建立永久页描述符；空洞仅占 section 索引。
 
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 #[cfg(feature = "boot-tests")]
 use core::mem::size_of_val;
@@ -11,7 +12,7 @@ use crate::boot::MAX_MEMORY_REGIONS;
 use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
 
 const PAGES_PER_SECTION: usize = (128 * 1024 * 1024) / PAGE_SIZE;
-type Section = Option<&'static [PageDesc]>;
+type Section<'a> = Option<&'a [PageDesc]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageKind {
@@ -23,22 +24,46 @@ pub(crate) enum PageKind {
 
 pub(crate) struct PageDesc {
     kind: PageKind,
+    /// 仅由唯一所属 zone 的锁域访问，不以启动分类代替自由链成员身份。
+    pub(crate) buddy: UnsafeCell<BuddyLink>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct BuddyLink {
+    pub(crate) order: usize,
+    pub(crate) previous: usize,
+    pub(crate) next: usize,
+}
+
+// SAFETY: kind 发布后不可变，buddy 的全部读写由唯一所属 zone 锁互斥。
+unsafe impl Sync for PageDesc {}
+
 impl PageDesc {
-    /// 取得当前页的真实用途；Absent 槽不代表可分配 RAM。
+    /// 写入不可变启动类别和未加入自由链的初始状态。
+    pub(crate) const fn new(kind: PageKind) -> Self {
+        Self {
+            kind,
+            buddy: UnsafeCell::new(BuddyLink {
+                order: usize::MAX,
+                previous: usize::MAX,
+                next: usize::MAX,
+            }),
+        }
+    }
+
+    /// 取得页的不可变启动来源类别；Available 不表示当前在自由链中。
     pub(crate) fn kind(&self) -> PageKind {
         self.kind
     }
 }
 
-pub(crate) struct PageMap {
-    sections: &'static [Section],
-    free: &'static [PageRange],
+pub(crate) struct PageMap<'a> {
+    sections: &'a [Section<'a>],
+    free: &'a [PageRange],
     stats: BootStats,
     present_sections: usize,
     #[cfg(feature = "boot-tests")]
-    metadata: &'static [PageRange],
+    metadata: &'a [PageRange],
 }
 
 #[derive(Clone, Copy)]
@@ -48,7 +73,7 @@ struct SectionGroup {
     backing: PageRange,
 }
 
-impl PageMap {
+impl<'a> PageMap<'a> {
     /// 按 section 和槽内偏移定位 PFN，不读取启动区间表。
     pub(crate) fn get(&self, pfn: usize) -> Option<&PageDesc> {
         self.sections
@@ -77,6 +102,23 @@ impl PageMap {
         self.free
     }
 
+    /// 借用独立测试描述符与范围；不发布，也不授予物理页访问权限。
+    #[cfg(feature = "boot-tests")]
+    pub(crate) fn test_map(sections: &'a [Section<'a>], free: &'a [PageRange]) -> Self {
+        Self {
+            sections,
+            free,
+            stats: BootStats {
+                present_pages: 0,
+                reserved_pages: 0,
+                metadata_pages: 0,
+                free_pages: free.iter().map(|range| range.end - range.start).sum(),
+            },
+            present_sections: sections.iter().filter(|section| section.is_some()).count(),
+            metadata: &[],
+        }
+    }
+
     /// 用实际启动资源逐 PFN 核对分类、空洞、保留资源和计数。
     #[cfg(feature = "boot-tests")]
     pub(crate) fn test_layout(&self, info: &BootInfo) -> bool {
@@ -98,10 +140,7 @@ impl PageMap {
                     });
                 let is_metadata = contains(self.metadata, pfn);
                 let is_free = contains(self.free, pfn);
-                if (!ram && (is_metadata || is_free))
-                    || (is_reserved && (is_metadata || is_free))
-                    || (is_metadata && is_free)
-                {
+                if ((is_reserved || !ram) && (is_metadata || is_free)) || (is_metadata && is_free) {
                     return false;
                 }
                 let expected = if !ram {
@@ -276,9 +315,9 @@ unsafe fn write_ranges(address: usize, ranges: &[PageRange]) -> &'static [PageRa
 /// 永久可写且一一对应；每次分配的连续页必须在直映中构成单个连续分配，
 /// 起址非空且按 PAGE_SIZE 对齐，整个分配的虚拟地址范围不得回绕。
 /// 本函数取得的页必须独占，不得与 memory 自身或其他存活引用重叠，之后
-/// 不得通过其他别名修改、释放或重新分配。失败时已扣除的 backing 仍保留，
-/// 调用者必须终止启动。
-pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap, &'static str> {
+/// backing 不得释放或重新分配，kind/索引/区间快照不得修改；buddy 字段仅允许
+/// 由唯一所属 zone 锁域改变。失败时已扣除的 backing 仍保留，调用者必须终止启动。
+pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'static>, &'static str> {
     let mut groups = [SectionGroup {
         start: 0,
         end: 0,
@@ -301,7 +340,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap, &'st
     }
     let section_count = groups[group_count - 1].end;
     let section_bytes = section_count
-        .checked_mul(size_of::<Section>())
+        .checked_mul(size_of::<Section<'static>>())
         .ok_or("page root size overflows")?;
     // Section 与 PageRange 均按 usize 对齐，索引后可直接放范围快照。
     let range_bytes = RANGE_CAPACITY
@@ -329,7 +368,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap, &'st
     }
 
     let root_address = crate::arch::phys_to_virt(root.start * PAGE_SIZE);
-    let root_pointer = root_address as *mut Section;
+    let root_pointer = root_address as *mut Section<'static>;
     let mut group_index = 0;
     let mut ram_cursor = 0;
     let mut reserved_cursor = 0;
@@ -361,7 +400,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap, &'st
                 // SAFETY: group backing 独占且永久，offset 将本 section 定位到
                 // 不重叠的 section_descriptor_bytes 子范围，PageDesc 对齐由页
                 // 对齐起址与类型大小保证；add 仅在此 section 内，每槽首次写入。
-                unsafe { destination.add(index).write(PageDesc { kind }) };
+                unsafe { destination.add(index).write(PageDesc::new(kind)) };
             }
             // SAFETY: 本 section 全部槽已写入有效值，跨度由 backing_pages 限制；
             // 该子范围属于一个永久分配，后续 section 写入不与本 slice 重叠。

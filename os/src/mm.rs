@@ -1,5 +1,9 @@
 mod bootmem;
+mod buddy;
+mod frame_allocator;
 mod page;
+
+pub use frame_allocator::{alloc_pages, OwnedPages};
 
 use crate::boot::BootInfo;
 use crate::mm::bootmem::BootMemory;
@@ -7,16 +11,16 @@ use crate::mm::page::{PageDesc, PageMap};
 use core::mem::size_of;
 use spin::Once;
 
-static MEMORY: Once<PageMap> = Once::new();
+static MEMORY: Once<PageMap<'static>> = Once::new();
 
 /// 借用永久发布的物理页描述符表；初始化前调用直接报告时序错误。
-pub(crate) fn pages() -> &'static PageMap {
+pub(crate) fn pages() -> &'static PageMap<'static> {
     MEMORY
         .get()
         .expect("physical memory has not been initialized")
 }
 
-/// 从实际启动 RAM 和保留区构造物理页描述符，并一次发布其永久索引。
+/// 从实际启动 RAM 和保留区构造并发布描述符，随后将最终自由范围一次交给 buddy。
 ///
 /// # Safety
 /// 只能由 BSP 在 IRQ 关闭、AP 未释放时调用一次。info 必须是已验证并包含完整
@@ -62,5 +66,29 @@ pub unsafe fn initialize(info: &BootInfo) {
     {
         assert!(map.test_layout(info), "memory page map checks failed");
         crate::println!("PASS memory-page-map");
+    }
+
+    // SAFETY: 调用者保证 BSP 唯一初始化、IRQ 关闭且 AP 未释放；map 及全部
+    // 描述符已永久发布，最终 free 范围尚未交给其他 owner，也没有并发分配或归还。
+    unsafe { buddy::initialize(map) };
+    let free = buddy::free_pages();
+    assert_eq!(
+        free, stats.free_pages,
+        "buddy initial free pages differ from boot memory"
+    );
+    crate::println!("BUDDY free={} max_order={}", free, buddy::MAX_ORDER);
+
+    #[cfg(feature = "boot-tests")]
+    {
+        assert!(
+            buddy::test_orders_and_fragmentation(),
+            "memory buddy checks failed"
+        );
+        crate::println!("PASS memory-buddy");
+        assert!(
+            frame_allocator::test_owned_pages(),
+            "memory owned pages checks failed"
+        );
+        crate::println!("PASS memory-owned-pages");
     }
 }
