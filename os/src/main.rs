@@ -13,13 +13,14 @@ mod boot;
 mod console;
 mod cpu;
 mod irq;
+mod mm;
 mod platform;
 mod sync;
 
 #[cfg(feature = "boot-tests")]
 mod boot_tests;
 
-/// 使用固件原始参数构造全局资源、CPU 表和中断设施，然后释放 AP。
+/// 使用固件原始参数构造全局资源、CPU 表、物理页描述符和中断设施，然后释放 AP。
 ///
 /// # Safety
 /// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
@@ -51,6 +52,10 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     // SAFETY: 当前为 BSP，IRQ 关闭、AP 未释放；静态栈和全部 CPU 输入均有效。
     unsafe { cpu::initialize(resources) };
     arch::init_current_cpu();
+    // SAFETY: BSP 尚未释放 AP，IRQ 仍关闭；实际 RAM 永久可写的一一直映已完成，
+    // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
+    // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
+    unsafe { mm::initialize(resources) };
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
     unsafe { irq::initialize(resources) };
     // SAFETY: 默认 handler 不使用 context；函数和端口均永久存在，源尚未启用。
