@@ -7,7 +7,10 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Once;
 
 use crate::boot::{BootInfo, MAX_CPUS};
+use crate::sched::context::TaskContext;
 use crate::sync::{IrqSaveGuard, SpinLock};
+use crate::task::Task;
+use core::marker::PhantomData;
 
 pub const STACK_SIZE: usize = 64 * 1024;
 
@@ -95,11 +98,25 @@ pub struct CpuLocal {
     pub online: AtomicBool,
     pub timer_interrupts: AtomicUsize,
     pub ipi_interrupts: AtomicUsize,
+    pub(crate) scheduler_ctx: UnsafeCell<TaskContext>,
+    pub(crate) current_task: UnsafeCell<*const Task>,
+    pub(crate) current_task_id: AtomicUsize,
+    pub(crate) hardirq_depth: AtomicUsize,
+    pub(crate) bh_depth: AtomicUsize,
+    pub(crate) preempt_depth: AtomicUsize,
     calls: SpinLock<CallQueue>,
 }
 
+// SAFETY: scheduler_ctx/current_task 仅由所属 CPU 在 IRQ 关闭的调度交接中访问；
+// 其余共享字段为原子或短锁，远端 CPU 不读写所属 CPU 的私有现场。
+unsafe impl Sync for CpuLocal {}
+
+// SAFETY: CPU 对象只在尚未安装基址、未执行调度时移动到永久 Once 存储；
+// 发布后的静态对象不再移动，现场访问限制由所属 CPU 与 IRQ-off 协议保持。
+unsafe impl Send for CpuLocal {}
+
 impl CpuLocal {
-    /// 构造 CPU 身份和独立执行状态，发布以后只修改原子字段与请求队列。
+    /// 构造 CPU 身份、静态调度现场与独立执行深度，不申请普通任务对象。
     const fn new(id: usize, hardware_id: usize, stack_top: usize) -> Self {
         Self {
             id,
@@ -108,6 +125,12 @@ impl CpuLocal {
             online: AtomicBool::new(false),
             timer_interrupts: AtomicUsize::new(0),
             ipi_interrupts: AtomicUsize::new(0),
+            scheduler_ctx: UnsafeCell::new(TaskContext::empty()),
+            current_task: UnsafeCell::new(ptr::null()),
+            current_task_id: AtomicUsize::new(0),
+            hardirq_depth: AtomicUsize::new(0),
+            bh_depth: AtomicUsize::new(0),
+            preempt_depth: AtomicUsize::new(0),
             calls: SpinLock::new(CallQueue::new()),
         }
     }
@@ -287,4 +310,79 @@ pub fn idle() -> ! {
     loop {
         crate::arch::wait_for_interrupt();
     }
+}
+
+/// 在真实硬中断分支内记录嵌套，析构只结束本次硬中断。
+pub struct HardIrqGuard {
+    local: &'static CpuLocal,
+    _local: PhantomData<*mut ()>,
+}
+
+impl HardIrqGuard {
+    /// 在 CPU 基址已安装且 IRQ 关闭的 handler 中进入硬中断执行段。
+    pub fn enter() -> Self {
+        assert!(
+            !crate::arch::irq_enabled(),
+            "hard IRQ entry has IRQ enabled"
+        );
+        let local = current();
+        increment_depth(&local.hardirq_depth);
+        Self {
+            local,
+            _local: PhantomData,
+        }
+    }
+}
+
+impl Drop for HardIrqGuard {
+    /// 保持原 IRQ 关闭状态并结束本 CPU 的硬中断嵌套，不触发调度。
+    fn drop(&mut self) {
+        assert!(!crate::arch::irq_enabled(), "hard IRQ exit has IRQ enabled");
+        decrement_depth(&self.local.hardirq_depth);
+    }
+}
+
+/// 底半部允许服务硬 IRQ，但不能切换普通任务。
+pub struct BottomHalfGuard {
+    local: &'static CpuLocal,
+    _local: PhantomData<*mut ()>,
+}
+
+impl BottomHalfGuard {
+    /// 在已安装 CPU 上进入底半部，短 IRQ-save 只保护深度修改。
+    pub fn enter() -> Self {
+        let _irq = IrqSaveGuard::new();
+        let local = current();
+        increment_depth(&local.bh_depth);
+        Self {
+            local,
+            _local: PhantomData,
+        }
+    }
+}
+
+impl Drop for BottomHalfGuard {
+    /// 结束同核底半部，不因深度归零而调用调度器。
+    fn drop(&mut self) {
+        let _irq = IrqSaveGuard::new();
+        decrement_depth(&self.local.bh_depth);
+    }
+}
+
+/// 原子执行深度不能溢出，违反嵌套协议立即报告。
+pub(crate) fn increment_depth(depth: &AtomicUsize) {
+    depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("execution depth overflow");
+}
+
+/// 匹配一次进入，禁止下溢掩盖跨上下文析构。
+pub(crate) fn decrement_depth(depth: &AtomicUsize) {
+    depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(1)
+        })
+        .expect("execution depth underflow");
 }

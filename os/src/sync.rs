@@ -28,6 +28,33 @@ impl Drop for IrqSaveGuard {
     }
 }
 
+/// CPU 初始化后的显式不可抢占段，可服务 IRQ，但不能跨任务切换。
+pub struct PreemptGuard {
+    local: &'static crate::cpu::CpuLocal,
+    _local: PhantomData<*mut ()>,
+}
+
+impl PreemptGuard {
+    /// 记录本 CPU 抢占禁止深度，临时关 IRQ 仅保护进入动作。
+    pub fn new() -> Self {
+        let _irq = IrqSaveGuard::new();
+        let local = crate::cpu::current();
+        crate::cpu::increment_depth(&local.preempt_depth);
+        Self {
+            local,
+            _local: PhantomData,
+        }
+    }
+}
+
+impl Drop for PreemptGuard {
+    /// 结束同核不可抢占段，恢复 IRQ 只由局部 IRQ guard 负责，不自动调度。
+    fn drop(&mut self) {
+        let _irq = IrqSaveGuard::new();
+        crate::cpu::decrement_depth(&self.local.preempt_depth);
+    }
+}
+
 /// 保护不能睡眠或长期等待的共享状态。
 pub struct SpinLock<T> {
     inner: spin::Mutex<T>,

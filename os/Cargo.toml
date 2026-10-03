@@ -10,6 +10,7 @@ spin = "0.7"
 
 [features]
 boot-tests = []
+execution-tests = []
 memory-tests = ["boot-tests"]
 fault-test = ["boot-tests"]
 refill-test = ["fault-test"]

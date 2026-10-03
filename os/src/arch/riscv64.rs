@@ -2,6 +2,7 @@
 use crate::{
     boot::BootInfo,
     cpu::{CpuBoot, CpuLocal},
+    sched::context::TaskContext,
 };
 use core::{
     arch::{asm, global_asm},
@@ -74,6 +75,57 @@ global_asm!(include_str!("riscv64/trap.S"),
     fpr = const offset_of!(KernelTrapFrame, fpr),
     float_word = const size_of::<u64>(),
     fcsr = const offset_of!(KernelTrapFrame, fcsr));
+global_asm!(include_str!("riscv64/switch.S"),
+    context_size = const size_of::<TaskContext>(),
+    context_ra = const offset_of!(TaskContext, ra),
+    context_sp = const offset_of!(TaskContext, sp),
+    context_saved = const offset_of!(TaskContext, saved),
+    word = const size_of::<usize>(),
+    execution_tests = const cfg!(feature = "execution-tests") as usize,
+    yield_now = sym crate::sched::yield_now);
+
+extern "C" {
+    /// 保存当前普通调用现场并返回到下一执行者的调用现场，不改变目的 CPU 的 tp。
+    ///
+    /// # Safety
+    /// 调用者必须独占有效且不重叠的上下文，IRQ 关闭且 FS 为 Off；
+    /// next 的栈、返回地址与 callee-saved 必须组成有效普通调用现场。
+    fn rv_switch_context(prev: *mut TaskContext, next: *const TaskContext);
+}
+
+/// 在 IRQ 关闭的调度交接段切换整数调用现场，恢复后使用目的 CPU 的 CpuLocal。
+///
+/// # Safety
+/// 当前执行拥有者必须独占两个有效、对齐且不重叠的上下文；prev 可写，next 已初始化。
+/// next 的栈与返回地址必须有效且按 16 字节对齐，两个执行栈均须存活到各自恢复或退出。
+/// 调用者必须已关闭 IRQ，不能持普通 IRQ/锁/preempt guard 跨此调用；
+/// 普通内核 FS 必须为 Off，受控浮点测试不得调用此接口。
+pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
+    assert!(!irq_enabled(), "task switch requires IRQ disabled");
+    let status: usize;
+    // SAFETY: S-mode 可读取本核 sstatus；只检查普通内核不持有浮点现场的调用约束。
+    unsafe { asm!("csrr {0}, sstatus", out(reg) status, options(nomem, nostack)) };
+    assert_eq!(status & 0x6000, 0, "task switch requires FS Off");
+    // SAFETY: 调用者保证上下文独占、栈/返回地址有效和交接生命周期；上面已检查 IRQ 与 FS。
+    unsafe { rv_switch_context(prev, next) };
+}
+
+#[cfg(feature = "execution-tests")]
+extern "C" {
+    /// 按普通调用 ABI 保存调用者寄存器，跨真实 yield 校验整数现场并恢复调用者。
+    ///
+    /// # Safety
+    /// 必须由能合法 yield 的普通 Task 调用，FS 为 Off，栈满足 16 字节 ABI 对齐。
+    fn rv_task_context_roundtrip() -> usize;
+}
+
+/// 在可调度的普通 Task 中跨真实 yield 检验全部 callee-saved、SP 与返回地址。
+#[cfg(feature = "execution-tests")]
+pub fn test_task_context_preservation() -> bool {
+    // SAFETY: Rust 入口提供对齐普通调用栈；生产 yield 统一检查 Task、IRQ 和原子上下文，
+    // switch_context 检查 FS Off；汇编恢复调用者 callee-saved，并始终保留目的 CPU 的 tp。
+    unsafe { rv_task_context_roundtrip() != 0 }
+}
 
 /// 从固件原始参数取得真实 BSP hart ID。
 pub fn boot_hardware_id(args: [usize; 3]) -> usize {
@@ -436,6 +488,10 @@ pub fn trigger_fault() -> ! {
 /// 处理汇编构造的本核独占 trap frame；FS 为 Off 时不访问未保存的浮点字段。
 #[no_mangle]
 extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
+    if frame.scause & (1usize << 63) == 0 {
+        crate::console::fatal(frame.sepc, frame.gpr[2], frame.scause, frame.stval);
+    }
+    let _hard_irq = crate::cpu::HardIrqGuard::enter();
     match frame.scause {
         value if value == (1usize << 63) | 5 => {
             disable_timer();

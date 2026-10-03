@@ -2,10 +2,13 @@
 #![no_main]
 #![feature(asm_experimental_arch)]
 #![feature(alloc_error_handler)]
+#![feature(allocator_api)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(all(feature = "refill-test", not(target_arch = "loongarch64")))]
 compile_error!("refill-test requires the loongarch64 target");
+#[cfg(all(feature = "execution-tests", feature = "boot-tests"))]
+compile_error!("execution-tests cannot be combined with boot-tests");
 
 extern crate alloc;
 extern crate rlibc;
@@ -17,10 +20,14 @@ mod cpu;
 mod irq;
 mod mm;
 mod platform;
+mod sched;
 mod sync;
+mod task;
 
 #[cfg(feature = "boot-tests")]
 mod boot_tests;
+#[cfg(feature = "execution-tests")]
+mod execution_tests;
 
 /// 使用固件原始参数构造全局资源、CPU 表、物理页与堆、中断设施，然后释放 AP。
 ///
@@ -58,6 +65,8 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
     // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
     unsafe { mm::initialize(resources) };
+    #[cfg(not(feature = "boot-tests"))]
+    task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
     unsafe { irq::initialize(resources) };
     // SAFETY: 默认 handler 不使用 context；函数和端口均永久存在，源尚未启用。
@@ -112,7 +121,7 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
         boot_tests::primary()
     };
     #[cfg(not(feature = "boot-tests"))]
-    cpu::idle();
+    sched::run();
 }
 
 /// 使用 BSP 发布的 CpuLocal 安装本核执行状态，只初始化本地中断。
@@ -133,7 +142,23 @@ pub unsafe extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
         boot_tests::secondary()
     };
     #[cfg(not(feature = "boot-tests"))]
-    cpu::idle();
+    sched::run();
+}
+
+/// 在普通任务栈执行内核初始入口，返回后由调度器完成离栈回收。
+#[cfg(not(feature = "boot-tests"))]
+fn init() -> i32 {
+    #[cfg(feature = "execution-tests")]
+    execution_tests::run();
+    #[cfg(not(feature = "execution-tests"))]
+    {
+        let id = task::current_task().id();
+        println!("INIT task={:?} cpu={}", id, cpu::current().id);
+        sched::yield_now();
+        assert_eq!(task::current_task().id(), id);
+        println!("INIT entry completed task={:?}", id);
+        0
+    }
 }
 
 /// 在不可继续的内核错误中记录真实 panic 信息并停止当前核。

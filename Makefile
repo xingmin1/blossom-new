@@ -35,7 +35,7 @@ endif
 QEMU_ARGS := -machine virt -accel tcg $(BIOS) -m $(MEMORY) -smp $(CPUS) -nographic -monitor none -no-reboot -nic none
 CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
 
-.PHONY: all kernel-rv kernel-la build run debug test test-memory clean
+.PHONY: all kernel-rv kernel-la build run debug test test-memory test-execution clean
 
 all: kernel-rv kernel-la
 
@@ -71,6 +71,10 @@ endif
 test-memory:
 	$(MAKE) build ARCH=$(ARCH) CPUS=$(CPUS) MEMORY="$(MEMORY)" MODE=$(MODE) FEATURES=memory-tests OUTPUT=build/$(ARCH)/kernel-memory-tests.elf
 	python3 scripts/test-memory.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-memory-tests.elf
+
+test-execution:
+	$(MAKE) build ARCH=$(ARCH) CPUS=$(CPUS) MEMORY="$(MEMORY)" MODE=$(MODE) FEATURES=execution-tests OUTPUT=build/$(ARCH)/kernel-execution-tests.elf
+	python3 scripts/test-execution.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-execution-tests.elf
 
 clean:
 	cd os && cargo clean

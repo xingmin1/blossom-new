@@ -1,5 +1,6 @@
 //! QEMU 9.2.1 virt 的 DMW、异常、一次定时器及 PCH-PIC/EXTIOI 机制。
 use crate::boot::BootInfo;
+use crate::sched::context::TaskContext;
 use core::arch::{asm, global_asm};
 use core::mem::{offset_of, size_of, MaybeUninit};
 
@@ -52,6 +53,13 @@ global_asm!(include_str!("loongarch64/trap.S"),
     refill_prmd = const offset_of!(RefillFrame, prmd),
     refill_badv = const offset_of!(RefillFrame, badv),
 );
+global_asm!(include_str!("loongarch64/switch.S"),
+    context_ra = const offset_of!(TaskContext, ra),
+    context_sp = const offset_of!(TaskContext, sp),
+    context_saved = const offset_of!(TaskContext, saved),
+    word_size = const size_of::<usize>(),
+    execution_tests = const cfg!(feature = "execution-tests") as usize,
+);
 
 extern "C" {
     static __direct_base: u8;
@@ -61,6 +69,8 @@ extern "C" {
     fn la_kernel_trap();
     /// 物理 refill 入口，使用独立 CSR 现场并在调用 Rust 前恢复高地址 DMW。
     fn la_kernel_refill();
+    /// 按普通函数 ABI 保存旧整数现场并恢复下一执行者，不改写本核 KS0。
+    fn la_switch_context(prev: *mut TaskContext, next: *const TaskContext);
 }
 
 /// 在引导入口确立的 PLV0 环境读取本核 CSR；寄存器编号由本模块常量指定。
@@ -177,7 +187,22 @@ pub unsafe fn install_cpu_local(local: *const crate::cpu::CpuLocal) {
 pub fn cpu_local() -> *const crate::cpu::CpuLocal {
     csr_read::<0x30>() as *const _
 }
-/// 安装本核异常入口，并只初始化本核 timer/IPI 状态。
+
+/// 在调度专用 IRQ 关闭段切换整数现场；恢复后 KS0 仍属于实际执行的 CPU。
+///
+/// # Safety
+/// 调用者必须独占 prev、next 的上下文访问，两者非空、对齐且互不重叠。
+/// prev 可写，next 已初始化为合法函数返回现场，其独占栈满足 16 字节 ABI 对齐；
+/// 两份现场及其栈必须保留到各自恢复。当前 IRQ 必须关闭、EUEN 必须为零，
+/// 不得持有普通锁、IRQ/preempt guard 或跨切换保存本核借用。
+pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
+    assert!(!irq_enabled(), "context switch requires IRQ off");
+    assert_eq!(csr_read::<2>(), 0, "context switch requires EUEN off");
+    // SAFETY: 调用者独占两个有效现场及栈，断言确认 IRQ 与扩展单元关闭；
+    // 汇编仅按 Rust 提供的布局访问整数字段，不恢复 CPU 基址或扩展单元现场。
+    unsafe { la_switch_context(prev, next) };
+}
+/// 安装本核异常入口、关闭普通内核扩展单元，并初始化本核 timer/IPI 状态。
 pub fn init_current_cpu() {
     irq_save();
     // SAFETY: 入口已建立本核 PLV0/DMW 和有效栈；IRQ 已关闭，异常代码在永久内核映射内。
@@ -185,7 +210,7 @@ pub fn init_current_cpu() {
         csr_write::<0xc>(la_kernel_trap as usize);
         csr_write::<0x88>(virt_to_phys(la_kernel_refill as usize));
         csr_write::<4>((1 << 11) | (1 << 12) | (1 << 3));
-        csr_write::<2>(1);
+        csr_write::<2>(0);
     }
     disable_timer();
     iocsr_write32(0x100c, u32::MAX);
@@ -447,12 +472,13 @@ pub fn trigger_unmapped_fault() -> ! {
     panic!("unmapped load unexpectedly returned");
 }
 
-/// 接收汇编保存的本核异常现场；未启用 FP 的条件字段保持 MaybeUninit，处理器不读取它们。
+/// 分派真实硬中断并记录本核深度；异常直接终止，FP 关闭时不读取条件字段。
 #[no_mangle]
 extern "C" fn loongarch_trap(frame: &KernelTrapFrame) {
     if (frame.estat >> 16) & 0x3f != 0 {
         crate::console::fatal(frame.era, frame.gpr[3], frame.estat, frame.badv);
     }
+    let _hardirq = crate::cpu::HardIrqGuard::enter();
     let pending = frame.estat & csr_read::<4>() & 0x1fff;
     if pending & (1 << 11) != 0 {
         disable_timer();
@@ -514,4 +540,22 @@ pub unsafe fn test_register_preservation() -> bool {
         irq_restore(saved);
     }
     good
+}
+
+#[cfg(feature = "execution-tests")]
+extern "C" {
+    /// 保留调用者整数现场，调用真实 yield 并检查恢复现场，期间不读写 KS0。
+    fn la_test_task_context_preservation(yield_fn: usize) -> usize;
+}
+
+/// 在真实普通 Task 中检查 yield 的 callee-saved、栈及返回路径，并恢复调用者现场。
+#[cfg(feature = "execution-tests")]
+pub fn test_task_context_preservation() -> bool {
+    assert!(
+        crate::task::current_task_id().is_some(),
+        "context probe requires a running task"
+    );
+    // SAFETY: 仅向汇编传递真实 yield 函数入口；汇编保持 ABI 栈对齐及调用者现场，
+    // yield 自身检查可调度边界，探针不启用 FP、不恢复旧 CPU 基址。
+    unsafe { la_test_task_context_preservation(crate::sched::yield_now as usize) != 0 }
 }
