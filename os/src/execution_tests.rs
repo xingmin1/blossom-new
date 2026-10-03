@@ -1,5 +1,6 @@
 //! 在生产任务栈上验证切换、迁核与离栈归还，协调者也通过普通 yield 让出执行权。
 
+mod wait;
 use crate::{arch, cpu, mm, sched, task};
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -204,6 +205,29 @@ fn test_migration() {
     );
 }
 
+/// 在真实普通任务持有禁止切换 guard 时触发同一生产安全边界。
+fn run_fault() -> ! {
+    let guard_kind = if cfg!(feature = "execution-irq-fault") {
+        1
+    } else {
+        2
+    };
+    crate::println!(
+        "EXECUTION X09 guard={} task={} cpu={}",
+        guard_kind,
+        task::current_task().id().as_usize(),
+        cpu::current().id
+    );
+    if cfg!(feature = "execution-irq-fault") {
+        let _guard = crate::sync::IrqSaveGuard::new();
+        sched::yield_now();
+    } else {
+        let _guard = crate::sync::PreemptGuard::new();
+        sched::yield_now();
+    }
+    panic!("execution fault crossed prohibited switch boundary");
+}
+
 /// 从正式 init 任务驱动已实现的执行案例，最后沿实际架构关机协议结束客体。
 pub(crate) fn run() -> ! {
     assert_eq!(cpu::current().id, 0);
@@ -218,8 +242,15 @@ pub(crate) fn run() -> ! {
             "release"
         }
     );
+    if cfg!(any(
+        feature = "execution-irq-fault",
+        feature = "execution-preempt-fault"
+    )) {
+        run_fault();
+    }
     test_switch_and_return();
     test_migration();
+    wait::run();
     crate::println!("EXECUTION TESTS PASS");
     arch::shutdown();
 }

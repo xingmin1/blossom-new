@@ -1,5 +1,11 @@
 //! 短临界区只借用已有 spin 锁；锁释放以后才恢复当前 CPU 的原 IRQ 状态。
 
+pub mod completion;
+pub mod mutex;
+
+pub use completion::Completion;
+pub use mutex::{SleepMutex, SleepMutexGuard};
+
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};

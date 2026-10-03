@@ -5,11 +5,12 @@ use alloc::sync::Arc;
 use core::alloc::AllocError;
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use crate::mm::{alloc_pages, OwnedPages};
 use crate::sched::context::TaskContext;
-use crate::sync::IrqSaveGuard;
+use crate::sync::{Completion, IrqSaveGuard};
+use crate::wait::WaitId;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -40,6 +41,7 @@ pub(crate) enum Placement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SwitchIntent {
     Yield,
+    Park(WaitId),
     Exit(i32),
 }
 
@@ -48,6 +50,7 @@ pub(crate) enum State {
     Ready,
     Running(usize),
     SwitchingOut(usize, SwitchIntent),
+    Blocked,
     Exited,
 }
 
@@ -55,12 +58,20 @@ pub(crate) enum State {
 pub(crate) struct Scheduling {
     pub state: State,
     pub placement: Placement,
+    pub last_wait_id: WaitId,
+    pub active_wait: Option<ActiveWait>,
     pub live_previous: *const Task,
     pub live_next: *const Task,
     pub ready_previous: *const Task,
     pub ready_next: *const Task,
     #[cfg(feature = "execution-tests")]
     pub next_cpu: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveWait {
+    pub id: WaitId,
+    pub notified: bool,
 }
 
 pub(crate) type Entry = Box<dyn FnOnce() -> i32 + Send + 'static>;
@@ -71,16 +82,16 @@ pub(crate) struct Resources {
     pub entry: Option<Entry>,
 }
 
-pub(crate) struct Completion {
+pub(crate) struct JoinState {
     result: AtomicI32,
-    done: AtomicBool,
+    completed: Completion,
 }
 
-impl Completion {
-    /// 栈与入口已在锁外释放后发布一次结果，观察者 acquire 后可见完整退出。
+impl JoinState {
+    /// 栈与入口已在锁外释放后发布一次结果，由完成 token 保证结果可见性。
     pub(crate) fn complete(&self, result: i32) {
         self.result.store(result, Ordering::Relaxed);
-        self.done.store(true, Ordering::Release);
+        self.completed.complete();
     }
 }
 
@@ -89,7 +100,7 @@ pub struct Task {
     pub(crate) ctx: UnsafeCell<TaskContext>,
     pub(crate) scheduling: UnsafeCell<Scheduling>,
     pub(crate) resources: UnsafeCell<Resources>,
-    pub(crate) completion: Arc<Completion>,
+    pub(crate) join: Arc<JoinState>,
 }
 
 // SAFETY: scheduling 仅在调度锁内访问；ctx 仅由 Running 的唯一 CPU 与其离栈交接访问。
@@ -107,16 +118,22 @@ impl Task {
 
 pub struct JoinHandle {
     id: TaskId,
-    completion: Arc<Completion>,
+    join: Arc<JoinState>,
 }
 
 impl JoinHandle {
     /// 非阻塞地观察正常返回结果；Some 保证任务已经离栈并归还执行栈。
     pub fn try_join(&self) -> Option<i32> {
-        self.completion
-            .done
-            .load(Ordering::Acquire)
-            .then(|| self.completion.result.load(Ordering::Relaxed))
+        self.join
+            .completed
+            .is_ready()
+            .then(|| self.join.result.load(Ordering::Relaxed))
+    }
+
+    /// 消耗唯一句柄并真实等待正常返回，完成 token 在执行栈归还后才发布。
+    pub fn join(self) -> i32 {
+        self.join.completed.wait();
+        self.join.result.load(Ordering::Relaxed)
     }
 
     /// 即使任务已退出，观察者仍保留原任务身份。
@@ -147,9 +164,9 @@ fn spawn(
     entry: impl FnOnce() -> i32 + Send + 'static,
 ) -> Result<JoinHandle, AllocError> {
     let entry: Entry = Box::try_new(entry)?;
-    let completion = Arc::try_new(Completion {
+    let join = Arc::try_new(JoinState {
         result: AtomicI32::new(0),
-        done: AtomicBool::new(false),
+        completed: Completion::new(),
     })?;
     let mut stack = alloc_pages(4, false).ok_or(AllocError)?;
     let stack_top = stack.as_mut_ptr() as usize + stack.len();
@@ -163,6 +180,8 @@ fn spawn(
         scheduling: UnsafeCell::new(Scheduling {
             state: State::Ready,
             placement,
+            last_wait_id: WaitId::initial(),
+            active_wait: None,
             live_previous: ptr::null(),
             live_next: ptr::null(),
             ready_previous: ptr::null(),
@@ -174,10 +193,10 @@ fn spawn(
             stack: Some(stack),
             entry: Some(entry),
         }),
-        completion: Arc::clone(&completion),
+        join: Arc::clone(&join),
     })?;
     crate::sched::publish(task);
-    Ok(JoinHandle { id, completion })
+    Ok(JoinHandle { id, join })
 }
 
 /// 借用普通任务的强引用；调度栈或硬 IRQ/BH 调用直接报告上下文错误。

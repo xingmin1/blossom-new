@@ -9,6 +9,8 @@
 compile_error!("refill-test requires the loongarch64 target");
 #[cfg(all(feature = "execution-tests", feature = "boot-tests"))]
 compile_error!("execution-tests cannot be combined with boot-tests");
+#[cfg(all(feature = "execution-irq-fault", feature = "execution-preempt-fault"))]
+compile_error!("execution IRQ and preempt faults require separate images");
 
 extern crate alloc;
 extern crate rlibc;
@@ -23,6 +25,7 @@ mod platform;
 mod sched;
 mod sync;
 mod task;
+mod wait;
 
 #[cfg(feature = "boot-tests")]
 mod boot_tests;
@@ -152,13 +155,133 @@ fn init() -> i32 {
     execution_tests::run();
     #[cfg(not(feature = "execution-tests"))]
     {
-        let id = task::current_task().id();
-        println!("INIT task={:?} cpu={}", id, cpu::current().id);
-        sched::yield_now();
-        assert_eq!(task::current_task().id(), id);
-        println!("INIT entry completed task={:?}", id);
+        init_consumers();
         0
     }
+}
+
+/// 在普通任务之间传送有限数据，源登记后复查槽状态，结束时消费真实 join。
+#[cfg(not(any(feature = "boot-tests", feature = "execution-tests")))]
+fn init_consumers() {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use sync::SleepMutex;
+    use wait::queue::{WaitNode, WaitQueue};
+    use wait::Waiter;
+
+    static INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+    struct Channel {
+        slot: SleepMutex<Option<usize>>,
+        changed: WaitQueue,
+    }
+
+    impl Channel {
+        /// 在同一槽上执行生产或消费，失败时登记源并再次检查后才 park。
+        fn transfer(&self, input: Option<usize>) -> usize {
+            loop {
+                {
+                    let mut slot = self.slot.lock();
+                    if input.is_some() == slot.is_none() {
+                        let result = slot.take().unwrap_or(0);
+                        *slot = input;
+                        drop(slot);
+                        self.changed.wake_all();
+                        return result;
+                    }
+                }
+                let waiter = Waiter::new();
+                let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
+                // SAFETY: node 在当前栈固定，Arc Channel 保持源地址有效；registration 不被遗忘，
+                // 成功、恢复与正常退栈路径都在 node 和 waiter 析构之前撤销链接。
+                let registration = unsafe { self.changed.register(node.as_mut()) };
+                {
+                    // 已登记资源等待时不能再创建 mutex 等待轮次；先撤该轮再等待锁。
+                    let Some(mut slot) = self.slot.try_lock() else {
+                        drop(registration);
+                        drop(waiter);
+                        drop(self.slot.lock());
+                        continue;
+                    };
+                    if input.is_some() == slot.is_none() {
+                        let result = slot.take().unwrap_or(0);
+                        *slot = input;
+                        drop(slot);
+                        drop(registration);
+                        drop(waiter);
+                        self.changed.wake_all();
+                        return result;
+                    }
+                }
+                waiter.park();
+                drop(registration);
+                drop(waiter);
+            }
+        }
+    }
+
+    let watchdog = task::spawn_kernel_on(0, || {
+        let deadline = arch::read_counter().wrapping_add(arch::counter_frequency() * 20);
+        while !INIT_DONE.load(Ordering::Acquire) {
+            assert!(arch::read_counter() < deadline, "initial task deadline");
+            sched::yield_now();
+        }
+        0
+    })
+    .expect("init watchdog allocation failed");
+
+    let channel = Arc::new(Channel {
+        slot: SleepMutex::new(None),
+        changed: WaitQueue::new(),
+    });
+    let producer_channel = Arc::clone(&channel);
+    let producer = task::spawn_kernel(move || {
+        for value in 1..=8 {
+            producer_channel.transfer(Some(value));
+        }
+        8
+    })
+    .expect("producer allocation failed");
+    let consumer =
+        task::spawn_kernel(move || (0..8).map(|_| channel.transfer(None)).sum::<usize>() as i32)
+            .expect("consumer allocation failed");
+
+    let counter = Arc::new(SleepMutex::new(0usize));
+    let guard = counter.lock();
+    let first_counter = Arc::clone(&counter);
+    let first = task::spawn_kernel_on(0, move || {
+        for _ in 0..16 {
+            *first_counter.lock() += 1;
+            sched::yield_now();
+        }
+        16
+    })
+    .expect("counter task allocation failed");
+    let second_counter = Arc::clone(&counter);
+    let second = task::spawn_kernel_on(0, move || {
+        for _ in 0..16 {
+            *second_counter.lock() += 1;
+            sched::yield_now();
+        }
+        16
+    })
+    .expect("counter task allocation failed");
+    sched::yield_now();
+    drop(guard);
+    assert_eq!(producer.join(), 8);
+    let sum = consumer.join();
+    assert_eq!(sum, (1..=8).sum::<i32>());
+    assert_eq!(first.join() + second.join(), 32);
+    assert_eq!(*counter.lock(), 32);
+    INIT_DONE.store(true, Ordering::Release);
+    assert_eq!(watchdog.join(), 0);
+    println!(
+        "INIT completed task={} cpu={} produced=8 consumed=8 sum={} counter={}",
+        task::current_task().id().as_usize(),
+        cpu::current().id,
+        sum,
+        *counter.lock()
+    );
 }
 
 /// 在不可继续的内核错误中记录真实 panic 信息并停止当前核。

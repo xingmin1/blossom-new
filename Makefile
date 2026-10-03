@@ -5,6 +5,7 @@ CPUS ?= 4
 MEMORY ?= 1G
 MODE ?= debug
 FEATURES ?=
+FAULT ?= irq
 OUTPUT ?= build/$(ARCH)/kernel.elf
 
 ifeq ($(ARCH),riscv64)
@@ -35,7 +36,7 @@ endif
 QEMU_ARGS := -machine virt -accel tcg $(BIOS) -m $(MEMORY) -smp $(CPUS) -nographic -monitor none -no-reboot -nic none
 CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
 
-.PHONY: all kernel-rv kernel-la build run debug test test-memory test-execution clean
+.PHONY: all kernel-rv kernel-la build run debug test test-memory test-execution test-execution-fault clean
 
 all: kernel-rv kernel-la
 
@@ -75,6 +76,11 @@ test-memory:
 test-execution:
 	$(MAKE) build ARCH=$(ARCH) CPUS=$(CPUS) MEMORY="$(MEMORY)" MODE=$(MODE) FEATURES=execution-tests OUTPUT=build/$(ARCH)/kernel-execution-tests.elf
 	python3 scripts/test-execution.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-execution-tests.elf
+
+test-execution-fault:
+	@test "$(FAULT)" = irq -o "$(FAULT)" = preempt || { echo "FAULT must be irq or preempt" >&2; exit 2; }
+	$(MAKE) build ARCH=$(ARCH) CPUS=$(CPUS) MEMORY="$(MEMORY)" MODE=$(MODE) FEATURES=execution-$(FAULT)-fault OUTPUT=build/$(ARCH)/kernel-execution-$(FAULT)-fault.elf
+	python3 scripts/test-execution.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-execution-$(FAULT)-fault.elf --fault $(FAULT)
 
 clean:
 	cd os && cargo clean

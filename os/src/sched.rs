@@ -9,7 +9,8 @@ use core::sync::atomic::Ordering;
 
 use crate::cpu;
 use crate::sync::{IrqSaveGuard, SpinLock};
-use crate::task::{Placement, Resources, State, SwitchIntent, Task};
+use crate::task::{ActiveWait, Placement, Resources, State, SwitchIntent, Task};
+use crate::wait::WaitId;
 
 struct Scheduler {
     live_head: *const Task,
@@ -121,7 +122,24 @@ impl Scheduler {
                 self.push_ready(task);
                 None
             }
+            State::SwitchingOut(cpu, SwitchIntent::Park(id)) if cpu == owner => {
+                let active = data.active_wait.expect("park has no active wait");
+                assert_eq!(active.id, id, "park wait identity changed");
+                data.state = if active.notified {
+                    State::Ready
+                } else {
+                    State::Blocked
+                };
+                if active.notified {
+                    self.push_ready(task);
+                }
+                None
+            }
             State::SwitchingOut(cpu, SwitchIntent::Exit(result)) if cpu == owner => {
+                assert!(
+                    data.active_wait.is_none(),
+                    "exiting task has an active wait"
+                );
                 data.state = State::Exited;
                 // SAFETY: 活节点尚未释放且退出任务不会再执行；同锁覆盖活链接和资源摘离。
                 let resources = unsafe {
@@ -155,7 +173,7 @@ pub(crate) fn publish(task: Arc<Task>) {
 }
 
 /// 集中检查显式安全点，普通 IRQ-save 锁通过 IRQ 关闭自然被拒绝。
-fn assert_switchable() {
+pub(crate) fn assert_switchable() {
     assert!(crate::arch::irq_enabled(), "task switch with IRQ disabled");
     let local = cpu::current();
     assert_eq!(
@@ -185,16 +203,18 @@ pub fn yield_now() {
     resume_task();
 }
 
-/// 在专用 IRQ-off 段提交意图，放锁后才保存 ctx，恢复路径不使用旧 CPU 引用或 IRQ 值。
-fn switch_out(intent: SwitchIntent) {
+/// 在专用 IRQ-off 段提交意图，通知已到达的 Park 不交出执行权。
+fn prepare_switch(
+    intent: SwitchIntent,
+) -> Option<(*mut context::TaskContext, *const context::TaskContext)> {
     assert_switchable();
     crate::arch::irq_save();
-    let (task_ctx, scheduler_ctx) = {
+    let contexts = {
         let local = cpu::current();
         // SAFETY: IRQ 关闭，唯一所属 CPU 读取 current；Running 对象由活登记保持有效。
         let task = unsafe { *local.current_task.get() };
         assert!(!task.is_null(), "switching task is missing");
-        {
+        let committed = {
             let _scheduler = SCHED_LOCK.lock();
             // SAFETY: 调度锁独占 state；当前 Task 仍有唯一 Running 执行权，不访问其他 CPU 的 ctx。
             let data = unsafe { &mut *(*task).scheduling.get() };
@@ -203,17 +223,151 @@ fn switch_out(intent: SwitchIntent) {
                 State::Running(local.id),
                 "switching task has no execution ownership"
             );
-            data.state = State::SwitchingOut(local.id, intent);
+            let notified = if let SwitchIntent::Park(id) = intent {
+                let active = data.active_wait.expect("park has no active wait");
+                assert_eq!(active.id, id, "park wait identity changed");
+                active.notified
+            } else {
+                false
+            };
+            if !notified {
+                data.state = State::SwitchingOut(local.id, intent);
+            }
+            !notified
+        };
+        if committed {
+            // SAFETY: 活登记保护 task，SwitchingOut 不可分派；只取独立 ctx 裸指针，不构造 &mut Task。
+            Some((
+                unsafe { (*task).ctx.get() },
+                local.scheduler_ctx.get().cast_const(),
+            ))
+        } else {
+            None
         }
-        // SAFETY: 活登记保护 task，SwitchingOut 不可分派；只取独立 ctx 的裸指针，不构造 &mut Task。
-        (
-            unsafe { (*task).ctx.get() },
-            local.scheduler_ctx.get().cast_const(),
-        )
     };
-    // SAFETY: IRQ 关闭、普通锁已释放；Task 的 SwitchingOut 执行者与本 CPU 独占两份 ctx。
-    // scheduler ctx 来自同核 run 的已保存现场；恢复后只执行重新取得目的 CPU 的 resume_task。
+    if contexts.is_none() {
+        crate::arch::enable_interrupts();
+    }
+    contexts
+}
+
+/// 提交成功后保存 ctx，普通锁和本 CPU 引用都不跨越汇编切换。
+fn switch_out(intent: SwitchIntent) {
+    let (task_ctx, scheduler_ctx) =
+        prepare_switch(intent).expect("non-park switch was not committed");
+    // SAFETY: IRQ 关闭、普通锁已释放；SwitchingOut 执行者与本 CPU 独占两份有效 ctx，
+    // scheduler ctx 来自同核 run 的保存现场；调用者恢复后重新获取目的 CPU。
     unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
+}
+
+/// 同一等待轮次只有真正缺少通知时才阻塞，恢复后重新开启目的 CPU 的 IRQ。
+pub(crate) fn park(id: WaitId) {
+    if let Some((task_ctx, scheduler_ctx)) = prepare_switch(SwitchIntent::Park(id)) {
+        // SAFETY: prepare_switch 已提交 SwitchingOut 且放锁，IRQ 关闭，两份 ctx 的执行权唯一。
+        unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
+        resume_task();
+    }
+}
+
+/// 为当前 Running Task 开始唯一等待，序号耗尽不允许回绕。
+pub(crate) fn begin_wait(task: &Task) -> WaitId {
+    let _scheduler = SCHED_LOCK.lock();
+    assert_eq!(
+        crate::task::current_task_id(),
+        Some(task.id()),
+        "wait belongs to another task"
+    );
+    // SAFETY: 调度锁独占 scheduling；调用者强引用保护 task，当前身份核对其 Running 执行权。
+    let data = unsafe { &mut *task.scheduling.get() };
+    assert_eq!(data.state, State::Running(cpu::current().id));
+    assert!(
+        data.active_wait.is_none(),
+        "task already has an active wait"
+    );
+    let id = data.last_wait_id.next();
+    data.last_wait_id = id;
+    data.active_wait = Some(ActiveWait {
+        id,
+        notified: false,
+    });
+    id
+}
+
+/// 唯一 Waiter 析构核对本轮身份并清除等待，不改变业务源链接。
+pub(crate) fn end_wait(task: &Task, id: WaitId) {
+    let _scheduler = SCHED_LOCK.lock();
+    assert_eq!(crate::task::current_task_id(), Some(task.id()));
+    // SAFETY: 调度锁独占 scheduling；Waiter 的强引用保护 task，析构只能发生在同一任务。
+    let data = unsafe { &mut *task.scheduling.get() };
+    assert_eq!(data.state, State::Running(cpu::current().id));
+    assert_eq!(data.active_wait.expect("ending absent wait").id, id);
+    data.active_wait = None;
+}
+
+/// 接受本轮首次通知；Ready 保留已有成员，切换保存前仅记通知，只有 Blocked 需要入队。
+pub(crate) fn notify(task: &Task, id: WaitId) -> bool {
+    let mut scheduler = SCHED_LOCK.lock();
+    // SAFETY: 调度锁独占状态和等待；调用者在锁外升级的强引用覆盖整个访问。
+    let data = unsafe { &mut *task.scheduling.get() };
+    let Some(active) = data.active_wait.as_mut() else {
+        return false;
+    };
+    if active.id != id || active.notified {
+        return false;
+    }
+    assert!(
+        matches!(
+            data.state,
+            State::Ready | State::Running(_) | State::SwitchingOut(_, _) | State::Blocked
+        ),
+        "unnotified wait has invalid state"
+    );
+    active.notified = true;
+    if data.state == State::Blocked {
+        data.state = State::Ready;
+        scheduler.push_ready(task);
+    }
+    true
+}
+
+/// 在真实 SwitchingOut 放锁后、ctx 保存前通知，并继续同一汇编与 finish 路径。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Waker) {
+    let (task_ctx, scheduler_ctx) =
+        prepare_switch(SwitchIntent::Park(id)).expect("test park was already notified");
+    assert!(waker.notify(), "switching-out notification was rejected");
+    assert!(matches!(
+        test_state(task),
+        State::SwitchingOut(_, SwitchIntent::Park(active)) if active == id
+    ));
+    assert_eq!(test_ready_occurrences(task), 0);
+    // SAFETY: prepare_switch 已提交 SwitchingOut 且放锁，通知没有转移执行权；IRQ 关闭，两份 ctx 独占。
+    unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
+    resume_task();
+}
+
+/// 在唯一调度锁内读取真实状态，不向测试导出写权限。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_state(task: &Task) -> State {
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY: 调度锁保护 scheduling，调用者借用保持 task 有效，只复制状态值。
+    unsafe { (*task.scheduling.get()).state }
+}
+
+/// 遍历实际 ready 链并计算同一 Task 的成员次数。
+#[cfg(feature = "execution-tests")]
+pub(crate) fn test_ready_occurrences(task: &Task) -> usize {
+    let scheduler = SCHED_LOCK.lock();
+    let mut member = scheduler.ready_head;
+    let mut count = 0;
+    while !member.is_null() {
+        if ptr::eq(member, task) {
+            count += 1;
+        }
+        // SAFETY: ready 节点由同锁活登记保活，遍历期间链接不会变化。
+        member = unsafe { (*(*member).scheduling.get()).ready_next };
+    }
+    count
 }
 
 /// 首次入口与普通恢复都重新识别目的 CPU，再开启本核 IRQ，不恢复旧核 saved 状态。
@@ -265,7 +419,7 @@ fn finish_current() {
         let task = unsafe { Arc::from_raw(task) };
         crate::arch::enable_interrupts();
         drop(resources);
-        task.completion.complete(result);
+        task.join.complete(result);
         drop(task);
         crate::arch::irq_save();
     }

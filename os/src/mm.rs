@@ -10,6 +10,8 @@ pub(crate) mod tests;
 
 pub use frame_allocator::{alloc_pages, OwnedPages};
 pub use pcp::drain_all_pages;
+#[cfg(feature = "execution-tests")]
+pub(crate) use slub::SIZES as SLUB_SIZES;
 pub use slub::{flush_all, shrink_all};
 
 use crate::boot::BootInfo;
