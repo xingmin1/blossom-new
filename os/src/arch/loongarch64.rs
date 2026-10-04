@@ -152,6 +152,27 @@ fn barrier() {
     }
 }
 
+/// 以完成型写屏障排序 coherent DMA 内存写入。
+pub(super) fn dma_write_barrier() {
+    // SAFETY: 引导入口已建立 PLV0，dbar 0x0a 排序前后写访问；
+    // 汇编保留 memory 副作用，不声明 nomem/readonly。
+    unsafe { asm!("dbar 0x0a", options(nostack)) };
+}
+
+/// 在观察设备完成后，以完成型读屏障排序 coherent 数据读取。
+pub(super) fn dma_read_barrier() {
+    // SAFETY: PLV0 可执行 dbar 0x05，完成前读并排序后读，不访问额外地址；
+    // 汇编的 memory 副作用同时约束编译器读取顺序。
+    unsafe { asm!("dbar 0x05", options(nostack)) };
+}
+
+/// 对 coherent 内存和设备 MMIO 执行完成型双向排序。
+pub(super) fn dma_barrier() {
+    // SAFETY: PLV0 可执行 dbar 0x00，覆盖全部前后访问；
+    // 不声明 nomem/readonly，禁止编译器将内存访问移过此完整屏障。
+    unsafe { asm!("dbar 0x00", options(nostack)) };
+}
+
 /// 从 CPUId CSR 取得当前硬件身份，不解释 QEMU 的引导参数。
 pub fn boot_hardware_id(_: [usize; 3]) -> usize {
     csr_read::<0x20>() & 0x3ff

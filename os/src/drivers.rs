@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub mod pci;
+pub mod virtio;
 
 use crate::drivers::pci::PciInventory;
 

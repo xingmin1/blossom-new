@@ -12,6 +12,7 @@ virtio-drivers = { path = "../dependency/virtio-drivers", default-features = fal
 [features]
 boot-tests = []
 execution-tests = []
+storage-tests = []
 execution-irq-fault = ["execution-tests"]
 execution-preempt-fault = ["execution-tests"]
 execution-printer-oom-fault = ["execution-tests"]

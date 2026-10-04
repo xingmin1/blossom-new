@@ -128,6 +128,26 @@ pub fn test_task_context_preservation() -> bool {
     unsafe { rv_task_context_roundtrip() != 0 }
 }
 
+/// 排序 coherent DMA 内存写入；通知设备 MMIO 时还须使用完整设备屏障。
+pub(super) fn dma_write_barrier() {
+    // SAFETY: 当前内核在 S-mode 执行，fence w,w 仅排序内存写入，不改变寄存器
+    // 或地址空间；不声明 nomem/readonly，使编译器同样保留内存排序约束。
+    unsafe { asm!("fence w, w", options(nostack)) };
+}
+
+/// 在观察设备写入的完成标记后，排序随后 coherent 内存读取。
+pub(super) fn dma_read_barrier() {
+    // SAFETY: S-mode 可执行 fence r,r；指令不解引用额外地址，汇编保留 memory 副作用。
+    unsafe { asm!("fence r, r", options(nostack)) };
+}
+
+/// 对 coherent 内存及设备 MMIO 执行完整双向排序。
+pub(super) fn dma_barrier() {
+    // SAFETY: S-mode 可执行 fence iorw,iorw，覆盖 CPU 内存及设备输入输出访问；
+    // 汇编不声明 nomem/readonly，编译器也不能跨该指令移动内存访问。
+    unsafe { asm!("fence iorw, iorw", options(nostack)) };
+}
+
 /// 从固件原始参数取得真实 BSP hart ID。
 pub fn boot_hardware_id(args: [usize; 3]) -> usize {
     args[0]

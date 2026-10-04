@@ -1,879 +1,405 @@
-//! Driver for VirtIO block devices.
+//! VirtIO 块设备协议后端；控制区与请求拥有关系由内核持有。
 
-use crate::config::{read_config, ReadOnly};
-use crate::hal::Hal;
-use crate::queue::VirtQueue;
-use crate::transport::Transport;
+use crate::hal::{BufferDirection, DmaRegion, Hal, MappedSegment};
+use crate::queue::{UsedElement, VirtQueue};
+use crate::transport::{DeviceStatus, InterruptStatus, Notification, Transport};
 use crate::{Error, Result};
-use bitflags::bitflags;
-use log::info;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use core::ptr::{read_volatile, write_volatile};
 
 const QUEUE: u16 = 0;
-const QUEUE_SIZE: u16 = 16;
-const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
-    .union(BlkFeature::FLUSH)
-    .union(BlkFeature::RING_INDIRECT_DESC)
-    .union(BlkFeature::RING_EVENT_IDX);
+const SIZE_MAX: u64 = 1 << 1;
+const SEG_MAX: u64 = 1 << 2;
+const RO: u64 = 1 << 5;
+const BLK_SIZE: u64 = 1 << 6;
+const FLUSH: u64 = 1 << 9;
+const SUPPORTED_FEATURES: u64 = SIZE_MAX | SEG_MAX | RO | BLK_SIZE | FLUSH;
 
-/// Driver for a VirtIO block device.
-///
-/// This is a simple virtual block device, e.g. disk.
-///
-/// Read and write requests (and other exotic requests) are placed in the queue and serviced
-/// (probably out of order) by the device except where noted.
-///
-/// # Example
-///
-/// ```
-/// # use virtio_drivers::{Error, Hal};
-/// # use virtio_drivers::transport::Transport;
-/// use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
-///
-/// # fn example<HalImpl: Hal, T: Transport>(transport: T) -> Result<(), Error> {
-/// let mut disk = VirtIOBlk::<HalImpl, _>::new(transport)?;
-///
-/// println!("VirtIO block device: {} kB", disk.capacity() * SECTOR_SIZE as u64 / 2);
-///
-/// // Read sector 0 and then copy it to sector 1.
-/// let mut buf = [0; SECTOR_SIZE];
-/// disk.read_blocks(0, &mut buf)?;
-/// disk.write_blocks(1, &buf)?;
-/// # Ok(())
-/// # }
-/// ```
+/// 设备协议中的 sector 固定为 512 字节，独立于逻辑块大小。
+pub const SECTOR_SIZE: usize = 512;
+/// 每个 tag 独占的稳定控制区跨度。
+pub const PDU_STRIDE: usize = 32;
+/// 请求头包含 type、保留字段与 sector，共 16 字节。
+pub const HEADER_SIZE: usize = 16;
+/// 设备写入的原始状态字节位于请求头之后。
+pub const STATUS_OFFSET: usize = 16;
+
+/// 当前支持的三个块协议操作。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlkOperation {
+    /// 设备写入请求的 payload 范围。
+    Read,
+    /// 设备读取请求的 payload 并写入介质。
+    Write,
+    /// 请求设备将写缓存提交到稳定存储。
+    Flush,
+}
+
+/// 实际协商出的容量、协议限制与固定请求槽数量。
+#[derive(Clone, Copy, Debug)]
+pub struct BlkInfo {
+    /// 设备容量，单位固定为 512 字节扇区。
+    pub capacity_sectors: u64,
+    /// 实际选择的 split-ring descriptor 深度。
+    pub queue_depth: u16,
+    /// 预备稳定 PDU 的请求槽数，与 descriptor 额度分别计量。
+    pub tag_count: u16,
+    /// 单个 payload SG 段的字节上限；协议无上限时为 u32::MAX。
+    pub max_segment_bytes: u32,
+    /// 一条命令的 payload SG 上限，不含 header/status。
+    pub max_segments: u16,
+    /// 普通数据请求必须遵守的设备逻辑块对齐字节数。
+    pub logical_block_size: u32,
+    /// 设备是否通过 RO feature 声明只读。
+    pub readonly: bool,
+    /// 是否协商了实际可提交的 FLUSH 命令。
+    pub flush: bool,
+}
+
+/// 一个设备的一条 split queue；不拥有 DMA 页，也不保存核心请求表。
 pub struct VirtIOBlk<H: Hal, T: Transport> {
     transport: T,
-    queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
-    capacity: u64,
-    negotiated_features: BlkFeature,
+    info: BlkInfo,
+    queue: VirtQueue<H>,
+    pdu: DmaRegion,
+    notification: Option<Notification>,
 }
 
 impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
-    /// Create a new VirtIO-Blk driver.
-    pub fn new(mut transport: T) -> Result<Self> {
-        let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
-
-        // Read configuration space.
-        let capacity = transport.read_consistent(|| {
-            Ok((read_config!(transport, BlkConfig, capacity_low)? as u64)
-                | ((read_config!(transport, BlkConfig, capacity_high)? as u64) << 32))
+    /// 在已经确认 reset 的设备上协商实际使用的特性，并一致读取配置。
+    /// 不发表队列，不置 DRIVER_OK；配置持续变化由 transport 有界返回错误。
+    pub fn negotiate(transport: &mut T) -> Result<BlkInfo> {
+        let features = transport.begin_init(SUPPORTED_FEATURES)?;
+        let queue_max = transport.max_queue_size(QUEUE).min(128);
+        if queue_max < 4 {
+            return Err(Error::InvalidParam);
+        }
+        let queue_depth = (1_u32 << (31 - queue_max.leading_zeros())) as u16;
+        // 配置偏移来自块协议 ABI；仅读取已经协商的可选字段。
+        let (capacity, size_max, seg_max, block_size) = transport.read_consistent(|| {
+            let low = u32::from_le(transport.read_config_space::<u32>(0)?);
+            let high = u32::from_le(transport.read_config_space::<u32>(4)?);
+            let capacity = u64::from(low) | (u64::from(high) << 32);
+            let size_max = if features & SIZE_MAX != 0 {
+                u32::from_le(transport.read_config_space::<u32>(8)?)
+            } else {
+                0
+            };
+            let seg_max = if features & SEG_MAX != 0 {
+                u32::from_le(transport.read_config_space::<u32>(12)?)
+            } else {
+                1
+            };
+            let block_size = if features & BLK_SIZE != 0 {
+                u32::from_le(transport.read_config_space::<u32>(20)?)
+            } else {
+                SECTOR_SIZE as u32
+            };
+            Ok((capacity, size_max, seg_max, block_size))
         })?;
-        //info!("found a block device of size {}KB", capacity / 2);
-
-        let queue = VirtQueue::new(
-            &mut transport,
-            QUEUE,
-            negotiated_features.contains(BlkFeature::RING_INDIRECT_DESC),
-            negotiated_features.contains(BlkFeature::RING_EVENT_IDX),
-        )?;
-        transport.finish_init();
-
-        Ok(VirtIOBlk {
-            transport,
-            queue,
+        block_info(
             capacity,
-            negotiated_features,
+            queue_depth,
+            features,
+            size_max,
+            seg_max,
+            block_size,
+        )
+    }
+
+    /// 绑定已预备的真实 ring 与稳定 PDU，设备此时仍不得访问这些资源。
+    ///
+    /// # Safety
+    /// 调用者必须保证 info 来自同一 transport 的本次协商，ring 与 PDU 不重叠，
+    /// PDU 的 CPU/device 地址指向同一块 coherent 内存，整个范围可读写。
+    /// ring/PDU 原页及 CPU 映射须覆盖本 driver 和其持有者的全部 CPU 访问，通常保活至 driver 销毁。
+    /// 归还前还须确认设备已停止 DMA；仅确认 reset 不能提前释放仍被本对象访问的控制区。
+    /// 不得并发访问 driver-owned 字段或创建与设备可写状态字节重叠的 Rust 引用。
+    /// 库的析构不会停止设备。
+    pub unsafe fn new(
+        transport: T,
+        info: BlkInfo,
+        queue: VirtQueue<H>,
+        pdu: DmaRegion,
+    ) -> Result<Self> {
+        let required = usize::from(info.tag_count)
+            .checked_mul(PDU_STRIDE)
+            .ok_or(Error::InvalidParam)?;
+        if info.queue_depth != queue.depth()
+            || info.tag_count != info.queue_depth.min(32)
+            || required == 0
+            || pdu.len < required
+            || (isize::MAX as usize) < pdu.len
+            || pdu.cpu.as_ptr() as usize % 16 != 0
+            || pdu.device.value() % 16 != 0
+            || (pdu.cpu.as_ptr() as usize)
+                .checked_add(pdu.len - 1)
+                .is_none()
+            || pdu.device.checked_add(pdu.len - 1).is_none()
+        {
+            return Err(Error::InvalidParam);
+        }
+        Ok(Self {
+            transport,
+            info,
+            queue,
+            pdu,
+            notification: None,
         })
     }
 
-    /// Gets the capacity of the block device, in 512 byte ([`SECTOR_SIZE`]) sectors.
-    pub fn capacity(&self) -> u64 {
-        self.capacity
+    /// 返回实际协商事实，供负责层构造队列限制。
+    pub fn info(&self) -> BlkInfo {
+        self.info
     }
 
-    /// Returns true if the block device is read-only, or false if it allows writes.
-    pub fn readonly(&self) -> bool {
-        self.negotiated_features.contains(BlkFeature::RO)
+    /// 全部资源绑定后，先验证 doorbell，再发表队列并置 DRIVER_OK。
+    /// 设备拥有者必须在调用前承担 reset 责任；任何错误都可能已发表 DMA 地址。
+    pub fn publish(&mut self) -> Result<()> {
+        if self.notification.is_some() {
+            return Err(Error::AlreadyUsed);
+        }
+        let notification = self.transport.notification(QUEUE)?;
+        let (descriptors, driver_area, device_area) = self.queue.addresses();
+        // 控制区初始化必须先于向设备发表其地址；该顺序由库边界保证。
+        H::dma_barrier();
+        self.transport.queue_set(
+            QUEUE,
+            u32::from(self.queue.depth()),
+            descriptors,
+            driver_area,
+            device_area,
+        )?;
+        self.transport.finish_init()?;
+        self.notification = Some(notification);
+        Ok(())
     }
 
-    /// Acknowledges a pending interrupt, if any.
+    /// 将稳定 tag PDU 与已映射 payload 写入 ring，返回真实 descriptor head。
+    /// 此调用不分配、不通知、不等待；协议拒绝与队列额度不足原样返回。
     ///
-    /// Returns true if there was an interrupt to acknowledge.
-    pub fn ack_interrupt(&mut self) -> bool {
+    /// # Safety
+    /// 调用者必须独占该 tag，保证它已无设备访问；所有 payload owner 必须先交权，
+    /// 并保活至对应 used 或确认 reset。请求完整范围、sector/逻辑块对齐与能力由
+    /// 核心负责验证；成功后必须在释放队列锁前安装唯一 head→tag 请求记录。
+    /// 失败时没有新链被发表，调用者仍负责撤销尚未发表的 payload 交权。
+    pub unsafe fn submit(
+        &mut self,
+        tag: u16,
+        operation: BlkOperation,
+        sector: u64,
+        payload: &[MappedSegment],
+    ) -> Result<u16> {
+        if self.notification.is_none() {
+            return Err(Error::NotReady);
+        }
+        let offset = self.tag_offset(tag)?;
+        let (request_type, direction) = match operation {
+            BlkOperation::Read => (0_u32, BufferDirection::DeviceToDriver),
+            BlkOperation::Write => {
+                if self.info.readonly {
+                    return Err(Error::Unsupported);
+                }
+                (1_u32, BufferDirection::DriverToDevice)
+            }
+            BlkOperation::Flush => {
+                if !self.info.flush {
+                    return Err(Error::Unsupported);
+                }
+                if !payload.is_empty() || sector != 0 {
+                    return Err(Error::InvalidParam);
+                }
+                (4_u32, BufferDirection::DriverToDevice)
+            }
+        };
+        if (operation != BlkOperation::Flush && payload.is_empty())
+            || usize::from(self.info.max_segments) < payload.len()
+            || payload.iter().any(|segment| {
+                segment.direction != direction || self.info.max_segment_bytes < segment.length
+            })
+        {
+            return Err(Error::InvalidParam);
+        }
+        let device = self
+            .pdu
+            .device
+            .checked_add(offset)
+            .ok_or(Error::InvalidParam)?;
+        let header = [MappedSegment {
+            address: device,
+            length: HEADER_SIZE as u32,
+            direction: BufferDirection::DriverToDevice,
+        }];
+        let status = [MappedSegment {
+            address: device
+                .checked_add(STATUS_OFFSET)
+                .ok_or(Error::InvalidParam)?,
+            length: 1,
+            direction: BufferDirection::DeviceToDriver,
+        }];
+        // SAFETY: new 已验证完整 PDU 范围与 16 字节对齐；tag_offset 保证该槽在范围内。
+        // submit 的调用者独占该 tag，设备尚未访问它；只向稳定控制区写入原始整数。
+        unsafe {
+            let cpu = self.pdu.cpu.as_ptr().add(offset);
+            write_volatile(cpu.cast::<u32>(), request_type.to_le());
+            write_volatile(cpu.add(4).cast::<u32>(), 0);
+            write_volatile(cpu.add(8).cast::<u64>(), sector.to_le());
+            write_volatile(cpu.add(STATUS_OFFSET), 0xff);
+        }
+        // SAFETY: 控制区满足 new 的保活约定；payload 的交权、方向与保活由调用者保证。
+        // 临时数组仅保存地址元数据，queue.add 将真实设备地址复制进 descriptor。
+        unsafe { self.queue.add(&[&header, payload, &status]) }
+    }
+
+    /// 消费并验证真实 used head，descriptor 仅按队列可信 shadow 归还。
+    pub fn pop_used(&mut self) -> Result<Option<UsedElement>> {
+        self.queue.pop_used()
+    }
+
+    /// 在真实完成之后读取设备写入的原始状态字节，未知值按 IO 错误处理。
+    ///
+    /// # Safety
+    /// 调用者必须已通过 pop_used 消费对应 head 并完成设备读屏障，确认该 tag 的
+    /// 状态字节不再由设备写入；在读取结束前不得复用 tag 或释放 PDU。
+    pub unsafe fn completion_status(&self, tag: u16) -> Result<()> {
+        let offset = self.tag_offset(tag)? + STATUS_OFFSET;
+        // SAFETY: tag_offset 验证槽范围，new 保证 PDU 可读；完成及不再写入由调用者保证。
+        let status = unsafe { read_volatile(self.pdu.cpu.as_ptr().add(offset)) };
+        decode_status(status)
+    }
+
+    /// 返回实际 ring 深度。
+    pub fn queue_depth(&self) -> u16 {
+        self.queue.depth()
+    }
+
+    /// 返回当前可提交的 descriptor 数量，不推导核心 tag 额度。
+    pub fn available_descriptors(&self) -> usize {
+        self.queue.available_descriptors()
+    }
+
+    /// 更新真实 avail 中断抑制标志。
+    pub fn set_interrupts(&mut self, enabled: bool) {
+        self.queue.set_interrupts(enabled);
+    }
+
+    /// 重装完成通知并复查 used，返回是否已有未处理完成。
+    pub fn enable_interrupts_and_recheck(&mut self) -> bool {
+        self.queue.enable_interrupts_and_recheck()
+    }
+
+    /// 在 ring 已发表后按设备标志判定是否需要通知。
+    pub fn should_notify(&self) -> bool {
+        self.queue.should_notify()
+    }
+
+    /// 返回成功 publish 时缓存的唯一 doorbell；未发表或 reset 后调用会 panic。
+    /// 实际 notify 的 unsafe 设备/MMIO 保活义务仍由通知调用者承担。
+    pub fn notification(&self) -> Notification {
+        self.notification
+            .expect("virtio block queue is not published")
+    }
+
+    /// 读取并确认本设备 ISR，使共享 IRQ 能区分队列与配置事件。
+    pub fn ack_interrupt(&mut self) -> InterruptStatus {
         self.transport.ack_interrupt()
     }
 
-    /// Enables interrupts from the device.
-    pub fn enable_interrupts(&mut self) {
-        self.queue.set_dev_notify(true);
+    /// 撤销本对象的提交准入并请求真实 reset，不把寄存器写入视为停止完成。
+    pub fn request_reset(&mut self) {
+        self.notification = None;
+        self.transport.request_reset();
     }
 
-    /// Disables interrupts from the device.
-    pub fn disable_interrupts(&mut self) {
-        self.queue.set_dev_notify(false);
+    /// 查询设备是否已经真实报告 reset 完成，不等待。
+    pub fn reset_complete(&self) -> bool {
+        self.transport.reset_complete()
     }
 
-    /// Sends the given request to the device and waits for a response, with no extra data.
-    fn request(&mut self, request: BlkReq) -> Result {
-        let mut resp = BlkResp::default();
-        self.queue.add_notify_wait_pop(
-            &[request.as_bytes()],
-            &mut [resp.as_mut_bytes()],
-            &mut self.transport,
-        )?;
-        resp.status.into()
+    /// 返回实际 transport 状态，供设备拥有者执行停止与故障协议。
+    pub fn status(&self) -> DeviceStatus {
+        self.transport.get_status()
     }
 
-    /// Sends the given request to the device and waits for a response, including the given data.
-    fn request_read(&mut self, request: BlkReq, data: &mut [u8]) -> Result {
-        let mut resp = BlkResp::default();
-        self.queue.add_notify_wait_pop(
-            &[request.as_bytes()],
-            &mut [data, resp.as_mut_bytes()],
-            &mut self.transport,
-        )?;
-        resp.status.into()
-    }
-
-    /// Sends the given request and data to the device and waits for a response.
-    fn request_write(&mut self, request: BlkReq, data: &[u8]) -> Result {
-        let mut resp = BlkResp::default();
-        self.queue.add_notify_wait_pop(
-            &[request.as_bytes(), data],
-            &mut [resp.as_mut_bytes()],
-            &mut self.transport,
-        )?;
-        resp.status.into()
-    }
-
-    /// Requests the device to flush any pending writes to storage.
-    ///
-    /// This will be ignored if the device doesn't support the `VIRTIO_BLK_F_FLUSH` feature.
-    pub fn flush(&mut self) -> Result {
-        if self.negotiated_features.contains(BlkFeature::FLUSH) {
-            self.request(BlkReq {
-                type_: ReqType::Flush,
-                ..Default::default()
-            })
-        } else {
-            Ok(())
+    /// 在原始指针运算前验证 tag，避免将核心输入当作控制区下标。
+    fn tag_offset(&self, tag: u16) -> Result<usize> {
+        if self.info.tag_count <= tag {
+            return Err(Error::InvalidParam);
         }
-    }
-
-    /// Gets the device ID.
-    ///
-    /// The ID is written as ASCII into the given buffer, which must be 20 bytes long, and the used
-    /// length returned.
-    pub fn device_id(&mut self, id: &mut [u8; 20]) -> Result<usize> {
-        self.request_read(
-            BlkReq {
-                type_: ReqType::GetId,
-                ..Default::default()
-            },
-            id,
-        )?;
-
-        let length = id.iter().position(|&x| x == 0).unwrap_or(20);
-        Ok(length)
-    }
-
-    /// Reads one or more blocks into the given buffer.
-    ///
-    /// The buffer length must be a non-zero multiple of [`SECTOR_SIZE`].
-    ///
-    /// Blocks until the read completes or there is an error.
-    pub fn read_blocks(&mut self, block_id: usize, buf: &mut [u8]) -> Result {
-        assert_ne!(buf.len(), 0);
-        assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        // log::info!(
-        //     "read_blocks: block_id={}, buf_len={}",
-        //     block_id,
-        //     buf.len(),
-        // );
-        self.request_read(
-            BlkReq {
-                type_: ReqType::In,
-                reserved: 0,
-                sector: block_id as u64,
-            },
-            buf,
-        )
-    }
-
-    /// Submits a request to read one or more blocks, but returns immediately without waiting for
-    /// the read to complete.
-    ///
-    /// # Arguments
-    ///
-    /// * `block_id` - The identifier of the first block to read.
-    /// * `req` - A buffer which the driver can use for the request to send to the device. The
-    ///   contents don't matter as `read_blocks_nb` will initialise it, but like the other buffers
-    ///   it needs to be valid (and not otherwise used) until the corresponding
-    ///   `complete_read_blocks` call. Its length must be a non-zero multiple of [`SECTOR_SIZE`].
-    /// * `buf` - The buffer in memory into which the block should be read.
-    /// * `resp` - A mutable reference to a variable provided by the caller
-    ///   to contain the status of the request. The caller can safely
-    ///   read the variable only after the request is complete.
-    ///
-    /// # Usage
-    ///
-    /// It will submit request to the VirtIO block device and return a token identifying
-    /// the position of the first Descriptor in the chain. If there are not enough
-    /// Descriptors to allocate, then it returns [`Error::QueueFull`].
-    ///
-    /// The caller can then call `peek_used` with the returned token to check whether the device has
-    /// finished handling the request. Once it has, the caller must call `complete_read_blocks` with
-    /// the same buffers before reading the response.
-    ///
-    /// ```
-    /// # use virtio_drivers::{Error, Hal};
-    /// # use virtio_drivers::device::blk::VirtIOBlk;
-    /// # use virtio_drivers::transport::Transport;
-    /// use virtio_drivers::device::blk::{BlkReq, BlkResp, RespStatus};
-    ///
-    /// # fn example<H: Hal, T: Transport>(blk: &mut VirtIOBlk<H, T>) -> Result<(), Error> {
-    /// let mut request = BlkReq::default();
-    /// let mut buffer = [0; 512];
-    /// let mut response = BlkResp::default();
-    /// let token = unsafe { blk.read_blocks_nb(42, &mut request, &mut buffer, &mut response) }?;
-    ///
-    /// // Wait for an interrupt to tell us that the request completed...
-    /// assert_eq!(blk.peek_used(), Some(token));
-    ///
-    /// unsafe {
-    ///   blk.complete_read_blocks(token, &request, &mut buffer, &mut response)?;
-    /// }
-    /// if response.status() == RespStatus::OK {
-    ///   println!("Successfully read block.");
-    /// } else {
-    ///   println!("Error {:?} reading block.", response.status());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// # Safety
-    ///
-    /// `req`, `buf` and `resp` are still borrowed by the underlying VirtIO block device even after
-    /// this method returns. Thus, it is the caller's responsibility to guarantee that they are not
-    /// accessed before the request is completed in order to avoid data races.
-    pub unsafe fn read_blocks_nb(
-        &mut self,
-        block_id: usize,
-        req: &mut BlkReq,
-        buf: &mut [u8],
-        resp: &mut BlkResp,
-    ) -> Result<u16> {
-        assert_ne!(buf.len(), 0);
-        assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        *req = BlkReq {
-            type_: ReqType::In,
-            reserved: 0,
-            sector: block_id as u64,
-        };
-        let token = self
-            .queue
-            .add(&[req.as_bytes()], &mut [buf, resp.as_mut_bytes()])?;
-        if self.queue.should_notify() {
-            self.transport.notify(QUEUE);
-        }
-        Ok(token)
-    }
-
-    /// Completes a read operation which was started by `read_blocks_nb`.
-    ///
-    /// # Safety
-    ///
-    /// The same buffers must be passed in again as were passed to `read_blocks_nb` when it returned
-    /// the token.
-    pub unsafe fn complete_read_blocks(
-        &mut self,
-        token: u16,
-        req: &BlkReq,
-        buf: &mut [u8],
-        resp: &mut BlkResp,
-    ) -> Result<()> {
-        self.queue
-            .pop_used(token, &[req.as_bytes()], &mut [buf, resp.as_mut_bytes()])?;
-        resp.status.into()
-    }
-
-    /// Writes the contents of the given buffer to a block or blocks.
-    ///
-    /// The buffer length must be a non-zero multiple of [`SECTOR_SIZE`].
-    ///
-    /// Blocks until the write is complete or there is an error.
-    pub fn write_blocks(&mut self, block_id: usize, buf: &[u8]) -> Result {
-        assert_ne!(buf.len(), 0);
-        assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        self.request_write(
-            BlkReq {
-                type_: ReqType::Out,
-                sector: block_id as u64,
-                ..Default::default()
-            },
-            buf,
-        )
-    }
-
-    /// Submits a request to write one or more blocks, but returns immediately without waiting for
-    /// the write to complete.
-    ///
-    /// # Arguments
-    ///
-    /// * `block_id` - The identifier of the first block to write.
-    /// * `req` - A buffer which the driver can use for the request to send to the device. The
-    ///   contents don't matter as `read_blocks_nb` will initialise it, but like the other buffers
-    ///   it needs to be valid (and not otherwise used) until the corresponding
-    ///   `complete_write_blocks` call.
-    /// * `buf` - The buffer in memory containing the data to write to the blocks. Its length must
-    ///   be a non-zero multiple of [`SECTOR_SIZE`].
-    /// * `resp` - A mutable reference to a variable provided by the caller
-    ///   to contain the status of the request. The caller can safely
-    ///   read the variable only after the request is complete.
-    ///
-    /// # Usage
-    ///
-    /// See [VirtIOBlk::read_blocks_nb].
-    ///
-    /// # Safety
-    ///
-    /// See  [VirtIOBlk::read_blocks_nb].
-    pub unsafe fn write_blocks_nb(
-        &mut self,
-        block_id: usize,
-        req: &mut BlkReq,
-        buf: &[u8],
-        resp: &mut BlkResp,
-    ) -> Result<u16> {
-        assert_ne!(buf.len(), 0);
-        assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        *req = BlkReq {
-            type_: ReqType::Out,
-            reserved: 0,
-            sector: block_id as u64,
-        };
-        let token = self
-            .queue
-            .add(&[req.as_bytes(), buf], &mut [resp.as_mut_bytes()])?;
-        if self.queue.should_notify() {
-            self.transport.notify(QUEUE);
-        }
-        Ok(token)
-    }
-
-    /// Completes a write operation which was started by `write_blocks_nb`.
-    ///
-    /// # Safety
-    ///
-    /// The same buffers must be passed in again as were passed to `write_blocks_nb` when it
-    /// returned the token.
-    pub unsafe fn complete_write_blocks(
-        &mut self,
-        token: u16,
-        req: &BlkReq,
-        buf: &[u8],
-        resp: &mut BlkResp,
-    ) -> Result<()> {
-        self.queue
-            .pop_used(token, &[req.as_bytes(), buf], &mut [resp.as_mut_bytes()])?;
-        resp.status.into()
-    }
-
-    /// Fetches the token of the next completed request from the used ring and returns it, without
-    /// removing it from the used ring. If there are no pending completed requests returns `None`.
-    pub fn peek_used(&mut self) -> Option<u16> {
-        self.queue.peek_used()
-    }
-
-    /// Returns the size of the device's VirtQueue.
-    ///
-    /// This can be used to tell the caller how many channels to monitor on.
-    pub fn virt_queue_size(&self) -> u16 {
-        QUEUE_SIZE
+        Ok(usize::from(tag) * PDU_STRIDE)
     }
 }
 
-impl<H: Hal, T: Transport> Drop for VirtIOBlk<H, T> {
-    fn drop(&mut self) {
-        // Clear any pointers pointing to DMA regions, so the device doesn't try to access them
-        // after they have been freed.
-        self.transport.queue_unset(QUEUE);
+/// 将协议配置规范成有界事实；无容量或不可表示的字节几何直接拒绝。
+fn block_info(
+    capacity_sectors: u64,
+    queue_depth: u16,
+    features: u64,
+    size_max: u32,
+    seg_max: u32,
+    logical_block_size: u32,
+) -> Result<BlkInfo> {
+    if capacity_sectors == 0
+        || capacity_sectors.checked_mul(SECTOR_SIZE as u64).is_none()
+        || seg_max == 0
+        || logical_block_size < SECTOR_SIZE as u32
+        || !logical_block_size.is_power_of_two()
+    {
+        return Err(Error::InvalidParam);
     }
+    Ok(BlkInfo {
+        capacity_sectors,
+        queue_depth,
+        tag_count: queue_depth.min(32),
+        max_segment_bytes: if size_max == 0 { u32::MAX } else { size_max },
+        max_segments: u32::from(queue_depth - 2).min(seg_max) as u16,
+        logical_block_size,
+        readonly: features & RO != 0,
+        flush: features & FLUSH != 0,
+    })
 }
 
-#[derive(FromBytes, Immutable, IntoBytes)]
-#[repr(C)]
-struct BlkConfig {
-    /// Number of 512 Bytes sectors
-    capacity_low: ReadOnly<u32>,
-    capacity_high: ReadOnly<u32>,
-    size_max: ReadOnly<u32>,
-    seg_max: ReadOnly<u32>,
-    cylinders: ReadOnly<u16>,
-    heads: ReadOnly<u8>,
-    sectors: ReadOnly<u8>,
-    blk_size: ReadOnly<u32>,
-    physical_block_exp: ReadOnly<u8>,
-    alignment_offset: ReadOnly<u8>,
-    min_io_size: ReadOnly<u16>,
-    opt_io_size: ReadOnly<u32>,
-    // ... ignored
-}
-
-/// A VirtIO block device request.
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-pub struct BlkReq {
-    type_: ReqType,
-    reserved: u32,
-    sector: u64,
-}
-
-impl Default for BlkReq {
-    fn default() -> Self {
-        Self {
-            type_: ReqType::In,
-            reserved: 0,
-            sector: 0,
-        }
-    }
-}
-
-/// Response of a VirtIOBlk request.
-#[repr(C)]
-#[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
-pub struct BlkResp {
-    status: RespStatus,
-}
-
-impl BlkResp {
-    /// Return the status of a VirtIOBlk request.
-    pub fn status(&self) -> RespStatus {
-        self.status
-    }
-}
-
-#[repr(u32)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-enum ReqType {
-    In = 0,
-    Out = 1,
-    Flush = 4,
-    GetId = 8,
-    GetLifetime = 10,
-    Discard = 11,
-    WriteZeroes = 13,
-    SecureErase = 14,
-}
-
-/// Status of a VirtIOBlk request.
-#[repr(transparent)]
-#[derive(Copy, Clone, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
-pub struct RespStatus(u8);
-
-impl RespStatus {
-    /// Ok.
-    pub const OK: RespStatus = RespStatus(0);
-    /// IoErr.
-    pub const IO_ERR: RespStatus = RespStatus(1);
-    /// Unsupported yet.
-    pub const UNSUPPORTED: RespStatus = RespStatus(2);
-    /// Not ready.
-    pub const NOT_READY: RespStatus = RespStatus(3);
-}
-
-impl From<RespStatus> for Result {
-    fn from(status: RespStatus) -> Self {
-        match status {
-            RespStatus::OK => Ok(()),
-            RespStatus::IO_ERR => Err(Error::IoError),
-            RespStatus::UNSUPPORTED => Err(Error::Unsupported),
-            RespStatus::NOT_READY => Err(Error::NotReady),
-            _ => Err(Error::IoError),
-        }
-    }
-}
-
-impl Default for BlkResp {
-    fn default() -> Self {
-        BlkResp {
-            status: RespStatus::NOT_READY,
-        }
-    }
-}
-
-/// The standard sector size of a VirtIO block device. Data is read and written in multiples of this
-/// size.
-pub const SECTOR_SIZE: usize = 512;
-
-bitflags! {
-    #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-    struct BlkFeature: u64 {
-        /// Device supports request barriers. (legacy)
-        const BARRIER       = 1 << 0;
-        /// Maximum size of any single segment is in `size_max`.
-        const SIZE_MAX      = 1 << 1;
-        /// Maximum number of segments in a request is in `seg_max`.
-        const SEG_MAX       = 1 << 2;
-        /// Disk-style geometry specified in geometry.
-        const GEOMETRY      = 1 << 4;
-        /// Device is read-only.
-        const RO            = 1 << 5;
-        /// Block size of disk is in `blk_size`.
-        const BLK_SIZE      = 1 << 6;
-        /// Device supports scsi packet commands. (legacy)
-        const SCSI          = 1 << 7;
-        /// Cache flush command support.
-        const FLUSH         = 1 << 9;
-        /// Device exports information on optimal I/O alignment.
-        const TOPOLOGY      = 1 << 10;
-        /// Device can toggle its cache between writeback and writethrough modes.
-        const CONFIG_WCE    = 1 << 11;
-        /// Device supports multiqueue.
-        const MQ            = 1 << 12;
-        /// Device can support discard command, maximum discard sectors size in
-        /// `max_discard_sectors` and maximum discard segment number in
-        /// `max_discard_seg`.
-        const DISCARD       = 1 << 13;
-        /// Device can support write zeroes command, maximum write zeroes sectors
-        /// size in `max_write_zeroes_sectors` and maximum write zeroes segment
-        /// number in `max_write_zeroes_seg`.
-        const WRITE_ZEROES  = 1 << 14;
-        /// Device supports providing storage lifetime information.
-        const LIFETIME      = 1 << 15;
-        /// Device can support the secure erase command.
-        const SECURE_ERASE  = 1 << 16;
-
-        // device independent
-        const NOTIFY_ON_EMPTY       = 1 << 24; // legacy
-        const ANY_LAYOUT            = 1 << 27; // legacy
-        const RING_INDIRECT_DESC    = 1 << 28;
-        const RING_EVENT_IDX        = 1 << 29;
-        const UNUSED                = 1 << 30; // legacy
-        const VERSION_1             = 1 << 32; // detect legacy
-
-        // the following since virtio v1.1
-        const ACCESS_PLATFORM       = 1 << 33;
-        const RING_PACKED           = 1 << 34;
-        const IN_ORDER              = 1 << 35;
-        const ORDER_PLATFORM        = 1 << 36;
-        const SR_IOV                = 1 << 37;
-        const NOTIFICATION_DATA     = 1 << 38;
+/// 状态保持 raw u8，任何未定义或未完成值都不能被当作成功。
+fn decode_status(status: u8) -> Result<()> {
+    match status {
+        0 => Ok(()),
+        2 => Err(Error::Unsupported),
+        _ => Err(Error::IoError),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        hal::fake::FakeHal,
-        transport::{
-            fake::{FakeTransport, QueueStatus, State},
-            DeviceType,
-        },
-    };
-    use alloc::{sync::Arc, vec};
-    use core::mem::size_of;
-    use std::{sync::Mutex, thread};
 
+    /// 设备可写任意状态字节，只有协议成功值可以完成请求为成功。
     #[test]
-    fn config() {
-        let config_space = BlkConfig {
-            capacity_low: ReadOnly::new(0x42),
-            capacity_high: ReadOnly::new(0x02),
-            size_max: ReadOnly::new(0),
-            seg_max: ReadOnly::new(0),
-            cylinders: ReadOnly::new(0),
-            heads: ReadOnly::new(0),
-            sectors: ReadOnly::new(0),
-            blk_size: ReadOnly::new(0),
-            physical_block_exp: ReadOnly::new(0),
-            alignment_offset: ReadOnly::new(0),
-            min_io_size: ReadOnly::new(0),
-            opt_io_size: ReadOnly::new(0),
-        };
-        let state = Arc::new(Mutex::new(State::new(
-            vec![QueueStatus::default()],
-            config_space,
-        )));
-        let transport = FakeTransport {
-            device_type: DeviceType::Block,
-            max_queue_size: QUEUE_SIZE.into(),
-            device_features: BlkFeature::RO.bits(),
-            state: state.clone(),
-        };
-        let blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
-
-        assert_eq!(blk.capacity(), 0x02_0000_0042);
-        assert_eq!(blk.readonly(), true);
+    fn raw_status_errors() {
+        assert_eq!(decode_status(0), Ok(()));
+        assert_eq!(decode_status(2), Err(Error::Unsupported));
+        for status in [1, 3, 0x7f, 0xff] {
+            assert_eq!(decode_status(status), Err(Error::IoError));
+        }
     }
 
+    /// 协议限制不接受零 SG、非法逻辑块或无法表示为字节范围的容量。
     #[test]
-    fn read() {
-        let config_space = BlkConfig {
-            capacity_low: ReadOnly::new(66),
-            capacity_high: ReadOnly::new(0),
-            size_max: ReadOnly::new(0),
-            seg_max: ReadOnly::new(0),
-            cylinders: ReadOnly::new(0),
-            heads: ReadOnly::new(0),
-            sectors: ReadOnly::new(0),
-            blk_size: ReadOnly::new(0),
-            physical_block_exp: ReadOnly::new(0),
-            alignment_offset: ReadOnly::new(0),
-            min_io_size: ReadOnly::new(0),
-            opt_io_size: ReadOnly::new(0),
-        };
-        let state = Arc::new(Mutex::new(State::new(
-            vec![QueueStatus::default()],
-            config_space,
-        )));
-        let transport = FakeTransport {
-            device_type: DeviceType::Block,
-            max_queue_size: QUEUE_SIZE.into(),
-            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
-            state: state.clone(),
-        };
-        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
-
-        // Start a thread to simulate the device waiting for a read request.
-        let handle = thread::spawn(move || {
-            println!("Device waiting for a request.");
-            State::wait_until_queue_notified(&state, QUEUE);
-            println!("Transmit queue was notified.");
-
-            assert!(state
-                .lock()
-                .unwrap()
-                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |request| {
-                    assert_eq!(
-                        request,
-                        BlkReq {
-                            type_: ReqType::In,
-                            reserved: 0,
-                            sector: 42
-                        }
-                        .as_bytes()
-                    );
-
-                    let mut response = vec![0; SECTOR_SIZE];
-                    response[0..9].copy_from_slice(b"Test data");
-                    response.extend_from_slice(
-                        BlkResp {
-                            status: RespStatus::OK,
-                        }
-                        .as_bytes(),
-                    );
-
-                    response
-                }));
-        });
-
-        // Read a block from the device.
-        let mut buffer = [0; 512];
-        blk.read_blocks(42, &mut buffer).unwrap();
-        assert_eq!(&buffer[0..9], b"Test data");
-
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn write() {
-        let config_space = BlkConfig {
-            capacity_low: ReadOnly::new(66),
-            capacity_high: ReadOnly::new(0),
-            size_max: ReadOnly::new(0),
-            seg_max: ReadOnly::new(0),
-            cylinders: ReadOnly::new(0),
-            heads: ReadOnly::new(0),
-            sectors: ReadOnly::new(0),
-            blk_size: ReadOnly::new(0),
-            physical_block_exp: ReadOnly::new(0),
-            alignment_offset: ReadOnly::new(0),
-            min_io_size: ReadOnly::new(0),
-            opt_io_size: ReadOnly::new(0),
-        };
-        let state = Arc::new(Mutex::new(State::new(
-            vec![QueueStatus::default()],
-            config_space,
-        )));
-        let transport = FakeTransport {
-            device_type: DeviceType::Block,
-            max_queue_size: QUEUE_SIZE.into(),
-            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
-            state: state.clone(),
-        };
-        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
-
-        // Start a thread to simulate the device waiting for a write request.
-        let handle = thread::spawn(move || {
-            println!("Device waiting for a request.");
-            State::wait_until_queue_notified(&state, QUEUE);
-            println!("Transmit queue was notified.");
-
-            assert!(state
-                .lock()
-                .unwrap()
-                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |request| {
-                    assert_eq!(
-                        &request[0..size_of::<BlkReq>()],
-                        BlkReq {
-                            type_: ReqType::Out,
-                            reserved: 0,
-                            sector: 42
-                        }
-                        .as_bytes()
-                    );
-                    let data = &request[size_of::<BlkReq>()..];
-                    assert_eq!(data.len(), SECTOR_SIZE);
-                    assert_eq!(&data[0..9], b"Test data");
-
-                    let mut response = Vec::new();
-                    response.extend_from_slice(
-                        BlkResp {
-                            status: RespStatus::OK,
-                        }
-                        .as_bytes(),
-                    );
-
-                    response
-                }));
-        });
-
-        // Write a block to the device.
-        let mut buffer = [0; 512];
-        buffer[0..9].copy_from_slice(b"Test data");
-        blk.write_blocks(42, &mut buffer).unwrap();
-
-        // Request to flush should be ignored as the device doesn't support it.
-        blk.flush().unwrap();
-
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn flush() {
-        let config_space = BlkConfig {
-            capacity_low: ReadOnly::new(66),
-            capacity_high: ReadOnly::new(0),
-            size_max: ReadOnly::new(0),
-            seg_max: ReadOnly::new(0),
-            cylinders: ReadOnly::new(0),
-            heads: ReadOnly::new(0),
-            sectors: ReadOnly::new(0),
-            blk_size: ReadOnly::new(0),
-            physical_block_exp: ReadOnly::new(0),
-            alignment_offset: ReadOnly::new(0),
-            min_io_size: ReadOnly::new(0),
-            opt_io_size: ReadOnly::new(0),
-        };
-        let state = Arc::new(Mutex::new(State::new(
-            vec![QueueStatus::default()],
-            config_space,
-        )));
-        let transport = FakeTransport {
-            device_type: DeviceType::Block,
-            max_queue_size: QUEUE_SIZE.into(),
-            device_features: (BlkFeature::RING_INDIRECT_DESC | BlkFeature::FLUSH).bits(),
-            state: state.clone(),
-        };
-        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
-
-        // Start a thread to simulate the device waiting for a flush request.
-        let handle = thread::spawn(move || {
-            println!("Device waiting for a request.");
-            State::wait_until_queue_notified(&state, QUEUE);
-            println!("Transmit queue was notified.");
-
-            assert!(state
-                .lock()
-                .unwrap()
-                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |request| {
-                    assert_eq!(
-                        request,
-                        BlkReq {
-                            type_: ReqType::Flush,
-                            reserved: 0,
-                            sector: 0,
-                        }
-                        .as_bytes()
-                    );
-
-                    let mut response = Vec::new();
-                    response.extend_from_slice(
-                        BlkResp {
-                            status: RespStatus::OK,
-                        }
-                        .as_bytes(),
-                    );
-
-                    response
-                }));
-        });
-
-        // Request to flush.
-        blk.flush().unwrap();
-
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn device_id() {
-        let config_space = BlkConfig {
-            capacity_low: ReadOnly::new(66),
-            capacity_high: ReadOnly::new(0),
-            size_max: ReadOnly::new(0),
-            seg_max: ReadOnly::new(0),
-            cylinders: ReadOnly::new(0),
-            heads: ReadOnly::new(0),
-            sectors: ReadOnly::new(0),
-            blk_size: ReadOnly::new(0),
-            physical_block_exp: ReadOnly::new(0),
-            alignment_offset: ReadOnly::new(0),
-            min_io_size: ReadOnly::new(0),
-            opt_io_size: ReadOnly::new(0),
-        };
-        let state = Arc::new(Mutex::new(State::new(
-            vec![QueueStatus::default()],
-            config_space,
-        )));
-        let transport = FakeTransport {
-            device_type: DeviceType::Block,
-            max_queue_size: QUEUE_SIZE.into(),
-            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
-            state: state.clone(),
-        };
-        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
-
-        // Start a thread to simulate the device waiting for a flush request.
-        let handle = thread::spawn(move || {
-            println!("Device waiting for a request.");
-            State::wait_until_queue_notified(&state, QUEUE);
-            println!("Transmit queue was notified.");
-
-            assert!(state
-                .lock()
-                .unwrap()
-                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |request| {
-                    assert_eq!(
-                        request,
-                        BlkReq {
-                            type_: ReqType::GetId,
-                            reserved: 0,
-                            sector: 0,
-                        }
-                        .as_bytes()
-                    );
-
-                    let mut response = Vec::new();
-                    response.extend_from_slice(b"device_id\0\0\0\0\0\0\0\0\0\0\0");
-                    response.extend_from_slice(
-                        BlkResp {
-                            status: RespStatus::OK,
-                        }
-                        .as_bytes(),
-                    );
-
-                    response
-                }));
-        });
-
-        let mut id = [0; 20];
-        let length = blk.device_id(&mut id).unwrap();
-        assert_eq!(&id[0..length], b"device_id");
-
-        handle.join().unwrap();
+    fn limits_boundaries() {
+        let info = block_info(8192, 128, RO | FLUSH, 0, u32::MAX, 4096).unwrap();
+        assert_eq!(info.max_segments, 126);
+        assert_eq!(info.max_segment_bytes, u32::MAX);
+        assert_eq!(info.tag_count, 32);
+        assert!(info.readonly && info.flush);
+        for (capacity, segments, block_size) in [
+            (0, 1, 512),
+            (u64::MAX / 512 + 1, 1, 512),
+            (8192, 0, 512),
+            (8192, 1, 256),
+            (8192, 1, 768),
+        ] {
+            assert!(matches!(
+                block_info(capacity, 4, 0, 4096, segments, block_size),
+                Err(Error::InvalidParam)
+            ));
+        }
     }
 }

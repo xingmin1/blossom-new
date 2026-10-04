@@ -9,6 +9,11 @@
 compile_error!("refill-test requires the loongarch64 target");
 #[cfg(all(feature = "execution-tests", feature = "boot-tests"))]
 compile_error!("execution-tests cannot be combined with boot-tests");
+#[cfg(all(
+    feature = "storage-tests",
+    any(feature = "boot-tests", feature = "execution-tests")
+))]
+compile_error!("storage-tests requires a separate image from boot-tests and execution-tests");
 const _: () = assert!(
     cfg!(feature = "execution-irq-fault") as usize
         + cfg!(feature = "execution-preempt-fault") as usize
@@ -43,8 +48,14 @@ mod workqueue;
 mod boot_tests;
 #[cfg(feature = "execution-tests")]
 mod execution_tests;
+#[cfg(feature = "storage-tests")]
+mod storage_tests;
 
-#[cfg(not(any(feature = "boot-tests", feature = "execution-tests")))]
+#[cfg(not(any(
+    feature = "boot-tests",
+    feature = "execution-tests",
+    feature = "storage-tests"
+)))]
 use crate::drivers::DeviceInventory;
 
 #[cfg(not(feature = "boot-tests"))]
@@ -203,7 +214,9 @@ fn enter_scheduler() -> ! {
 fn init() -> i32 {
     #[cfg(feature = "execution-tests")]
     execution_tests::run();
-    #[cfg(not(feature = "execution-tests"))]
+    #[cfg(feature = "storage-tests")]
+    return storage_tests::run();
+    #[cfg(not(any(feature = "execution-tests", feature = "storage-tests")))]
     {
         let inventory = drivers::discover().expect("device resource discovery failed");
         report_device_resources(&inventory);
@@ -214,7 +227,11 @@ fn init() -> i32 {
 }
 
 /// 只记录启用 MMIO 槽、实际 block 候选与 PCI 功能资源，不触碰设备队列或读取磁盘。
-#[cfg(not(any(feature = "boot-tests", feature = "execution-tests")))]
+#[cfg(not(any(
+    feature = "boot-tests",
+    feature = "execution-tests",
+    feature = "storage-tests"
+)))]
 fn report_device_resources(inventory: &DeviceInventory) {
     let resources = boot::info();
     for (slot, resource) in resources.virtio_mmio[..resources.virtio_mmio_count]
@@ -280,7 +297,11 @@ fn report_device_resources(inventory: &DeviceInventory) {
 }
 
 /// 在普通任务之间传送有限数据，源登记后复查槽状态，结束时消费真实 join。
-#[cfg(not(any(feature = "boot-tests", feature = "execution-tests")))]
+#[cfg(not(any(
+    feature = "boot-tests",
+    feature = "execution-tests",
+    feature = "storage-tests"
+)))]
 fn init_consumers() {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};

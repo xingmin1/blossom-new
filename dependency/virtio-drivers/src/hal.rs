@@ -1,152 +1,73 @@
-#[cfg(test)]
-pub mod fake;
+use core::ptr::NonNull;
 
-use crate::{Error, Result, PAGE_SIZE};
-use core::{marker::PhantomData, ptr::NonNull};
+/// 设备地址域中的 DMA 地址；不表示 CPU 指针或 CPU 物理地址。
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct DmaAddr(u64);
 
-/// A physical address as used for virtio.
-pub type PhysAddr = usize;
-
-/// A region of contiguous physical memory used for DMA.
-#[derive(Debug)]
-pub struct Dma<H: Hal> {
-    paddr: usize,
-    vaddr: NonNull<u8>,
-    pages: usize,
-    _hal: PhantomData<H>,
-}
-
-// SAFETY: DMA memory can be accessed from any thread.
-unsafe impl<H: Hal> Send for Dma<H> {}
-
-// SAFETY: `&Dma` only allows pointers and physical addresses to be returned. Any actual access to
-// the memory requires unsafe code, which is responsible for avoiding data races.
-unsafe impl<H: Hal> Sync for Dma<H> {}
-
-impl<H: Hal> Dma<H> {
-    /// Allocates the given number of pages of physically contiguous memory to be used for DMA in
-    /// the given direction.
-    ///
-    /// The pages will be zeroed.
-    pub fn new(pages: usize, direction: BufferDirection) -> Result<Self> {
-        let (paddr, vaddr) = H::dma_alloc(pages, direction);
-        if paddr == 0 {
-            return Err(Error::DmaError);
-        }
-        Ok(Self {
-            paddr,
-            vaddr,
-            pages,
-            _hal: PhantomData,
-        })
+impl DmaAddr {
+    /// 从已经由 DMA 后端验证的设备地址建立地址值。
+    pub const fn new(value: u64) -> Self {
+        Self(value)
     }
 
-    /// Returns the physical address of the start of the DMA region, as seen by devices.
-    pub fn paddr(&self) -> usize {
-        self.paddr
+    /// 返回协议寄存器和 descriptor 使用的完整设备地址。
+    pub const fn value(self) -> u64 {
+        self.0
     }
 
-    /// Returns a pointer to the given offset within the DMA region.
-    pub fn vaddr(&self, offset: usize) -> NonNull<u8> {
-        assert!(offset < self.pages * PAGE_SIZE);
-        NonNull::new((self.vaddr.as_ptr() as usize + offset) as _).unwrap()
-    }
-
-    /// Returns a pointer to the entire DMA region as a slice.
-    pub fn raw_slice(&self) -> NonNull<[u8]> {
-        let raw_slice =
-            core::ptr::slice_from_raw_parts_mut(self.vaddr(0).as_ptr(), self.pages * PAGE_SIZE);
-        NonNull::new(raw_slice).unwrap()
+    /// 检查字节偏移在设备地址域中的加法。
+    pub fn checked_add(self, offset: usize) -> Option<Self> {
+        self.0.checked_add(u64::try_from(offset).ok()?).map(Self)
     }
 }
 
-impl<H: Hal> Drop for Dma<H> {
-    fn drop(&mut self) {
-        // SAFETY: The memory was previously allocated by `dma_alloc` in `Dma::new`,
-        // not yet deallocated, and we are passing the values from then.
-        let err = unsafe { H::dma_dealloc(self.paddr, self.vaddr, self.pages) };
-        assert_eq!(err, 0, "failed to deallocate DMA");
-    }
+/// 一次设备访问期间的缓冲区方向。
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BufferDirection {
+    /// 设备只读；调用者在设备访问期间不得修改内容。
+    DriverToDevice,
+    /// 设备可写；调用者在设备访问期间不得访问内容。
+    DeviceToDriver,
 }
 
-/// The interface which a particular hardware implementation must implement.
+/// 已经映射并由调用者持有其资源的一个设备可见片段。
+#[derive(Copy, Clone, Debug)]
+pub struct MappedSegment {
+    /// 片段首字节的设备地址。
+    pub address: DmaAddr,
+    /// 片段字节数，受 descriptor 的 32 位长度限制。
+    pub length: u32,
+    /// 设备访问方向。
+    pub direction: BufferDirection,
+}
+
+/// 连贯 DMA 内存的原始视图，不拥有内存，也不授予解引用权限。
+///
+/// 使用该视图的 unsafe 接口须使原页和 CPU 映射覆盖所有消费对象的 CPU 访问期，
+/// 并在归还前另外确认设备访问已结束；设备停止不终止仍存活对象的 CPU 访问义务。
+#[derive(Copy, Clone, Debug)]
+pub struct DmaRegion {
+    /// 实际连贯内存的 CPU 映射起点。
+    pub cpu: NonNull<u8>,
+    /// 同一内存的设备地址起点。
+    pub device: DmaAddr,
+    /// 实际映射的字节数。
+    pub len: usize,
+}
+
+/// 平台提供的设备 DMA 屏障，不承担分配、映射或释放职责。
 ///
 /// # Safety
 ///
-/// Implementations of this trait must follow the "implementation safety" requirements documented
-/// for each method. Callers must follow the safety requirements documented for the unsafe methods.
+/// 实现必须同时约束编译器重排及平台的 CPU/设备访问顺序；普通 Rust 原子屏障
+/// 不能代替平台设备屏障。三个方法均不得分配或阻塞。
 pub unsafe trait Hal {
-    /// Allocates and zeroes the given number of contiguous physical pages of DMA memory for VirtIO
-    /// use.
-    ///
-    /// Returns both the physical address which the device can use to access the memory, and a
-    /// pointer to the start of it which the driver can use to access it.
-    ///
-    /// # Implementation safety
-    ///
-    /// Implementations of this method must ensure that the `NonNull<u8>` returned is a
-    /// [_valid_](https://doc.rust-lang.org/std/ptr/index.html#safety) pointer, aligned to
-    /// [`PAGE_SIZE`], and won't alias any other allocations or references in the program until it
-    /// is deallocated by `dma_dealloc`. The pages must be zeroed.
-    fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>);
+    /// 使此前 descriptor、avail 和数据写入先于随后向设备发布的写入。
+    fn dma_write_barrier();
 
-    /// Deallocates the given contiguous physical DMA memory pages.
-    ///
-    /// # Safety
-    ///
-    /// The memory must have been allocated by `dma_alloc` on the same `Hal` implementation, and not
-    /// yet deallocated. `pages` must be the same number passed to `dma_alloc` originally, and both
-    /// `paddr` and `vaddr` must be the values returned by `dma_alloc`.
-    unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32;
+    /// 使此前观察到的设备完成先于随后读取 used 元素及设备写入的数据。
+    fn dma_read_barrier();
 
-    /// Converts a physical address used for MMIO to a virtual address which the driver can access.
-    ///
-    /// This is only used for MMIO addresses within BARs read from the device, for the PCI
-    /// transport. It may check that the address range up to the given size is within the region
-    /// expected for MMIO.
-    ///
-    /// # Implementation safety
-    ///
-    /// Implementations of this method must ensure that the `NonNull<u8>` returned is a
-    /// [_valid_](https://doc.rust-lang.org/std/ptr/index.html#safety) pointer, and won't alias any
-    /// other allocations or references in the program.
-    ///
-    /// # Safety
-    ///
-    /// The `paddr` and `size` must describe a valid MMIO region. The implementation may validate it
-    /// in some way (and panic if it is invalid) but is not guaranteed to.
-    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8>;
-
-    /// Shares the given memory range with the device, and returns the physical address that the
-    /// device can use to access it.
-    ///
-    /// This may involve mapping the buffer into an IOMMU, giving the host permission to access the
-    /// memory, or copying it to a special region where it can be accessed.
-    ///
-    /// # Safety
-    ///
-    /// The buffer must be a valid pointer to a non-empty memory range which will not be accessed by
-    /// any other thread for the duration of this method call.
-    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr;
-
-    /// Unshares the given memory range from the device and (if necessary) copies it back to the
-    /// original buffer.
-    ///
-    /// # Safety
-    ///
-    /// The buffer must be a valid pointer to a non-empty memory range which will not be accessed by
-    /// any other thread for the duration of this method call. The `paddr` must be the value
-    /// previously returned by the corresponding `share` call.
-    unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection);
-}
-
-/// The direction in which a buffer is passed.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum BufferDirection {
-    /// The buffer may be read or written by the driver, but only read by the device.
-    DriverToDevice,
-    /// The buffer may be read or written by the device, but only read by the driver.
-    DeviceToDriver,
-    /// The buffer may be read or written by both the device and the driver.
-    Both,
+    /// 完整排序 CPU 与设备读写，用于发布后的通知判断及中断重装复查。
+    fn dma_barrier();
 }

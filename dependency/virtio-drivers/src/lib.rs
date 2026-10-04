@@ -1,125 +1,75 @@
-//! VirtIO guest drivers.
+//! 连贯 DMA 与已映射 SG 上的 VirtIO split-ring 块设备后端。
 //!
-//! These drivers can be used by bare-metal code (such as a bootloader or OS kernel) running in a VM
-//! to interact with VirtIO devices provided by the VMM (such as QEMU or crosvm).
-//!
-//! # Usage
-//!
-//! You must first implement the [`Hal`] trait, to allocate DMA regions and translate between
-//! physical addresses (as seen by devices) and virtual addresses (as seen by your program). You can
-//! then construct the appropriate transport for the VirtIO device, e.g. for an MMIO device (perhaps
-//! discovered from the device tree):
-//!
-//! ```
-//! use core::ptr::NonNull;
-//! use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
-//!
-//! # fn example(mmio_device_address: usize, mmio_size: usize) {
-//! let header = NonNull::new(mmio_device_address as *mut VirtIOHeader).unwrap();
-//! let transport = unsafe { MmioTransport::new(header, mmio_size) }.unwrap();
-//! # }
-//! ```
-//!
-//! You can then check what kind of VirtIO device it is and construct the appropriate driver:
-//!
-//! ```
-//! # use virtio_drivers::Hal;
-//! # #[cfg(feature = "alloc")]
-//! use virtio_drivers::{
-//!     device::console::VirtIOConsole,
-//!     transport::{mmio::MmioTransport, DeviceType, Transport},
-//! };
-
-//!
-//! # #[cfg(feature = "alloc")]
-//! # fn example<HalImpl: Hal>(transport: MmioTransport) {
-//! if transport.device_type() == DeviceType::Console {
-//!     let mut console = VirtIOConsole::<HalImpl, _>::new(transport).unwrap();
-//!     // Send a byte to the console.
-//!     console.send(b'H').unwrap();
-//! }
-//! # }
-//! ```
+//! 内核拥有控制页及 payload 映射，并在普通任务、队列锁外准备所有资源。
+//! [`Hal`] 只提供平台设备屏障；[`queue::VirtQueue`] 的 unsafe 提交入口
+//! 接受 [`MappedSegment`]，不隐式分配、映射或共享 CPU slice。
+//! 队列构造不发表硬件地址，设备停止与 DMA 页归还由实际资源拥有者负责。
+//! 无 `alloc` 时仅提供平台屏障、设备地址和原始 DMA 视图，完整后端显式要求 `alloc`。
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unused_must_use, missing_docs, clippy::undocumented_unsafe_blocks)]
-#![allow(clippy::identity_op)]
-#![allow(dead_code)]
 
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
-mod config;
 pub mod device;
-#[cfg(feature = "embedded-io")]
-mod embedded_io;
 mod hal;
-mod queue;
+#[cfg(feature = "alloc")]
+pub mod queue;
+#[cfg(feature = "alloc")]
 pub mod transport;
 
-use device::socket::SocketError;
 use thiserror::Error;
 
-pub use self::hal::{BufferDirection, Hal, PhysAddr};
+pub use crate::hal::{BufferDirection, DmaAddr, DmaRegion, Hal, MappedSegment};
 pub use safe_mmio::UniqueMmioPointer;
 
-/// The page size in bytes supported by the library (4 KiB).
+/// 协议 legacy ring 使用的页对齐字节数。
 pub const PAGE_SIZE: usize = 0x1000;
 
-/// The type returned by driver methods.
+/// 库协议操作的错误返回。
 pub type Result<T = ()> = core::result::Result<T, Error>;
 
-/// The error type of VirtIO drivers.
+/// 实际块设备及 transport 操作可能遇到的错误。
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum Error {
-    /// There are not enough descriptors available in the virtqueue, try again later.
+    /// 当前 descriptor 额度不足，调用者保留未提交请求。
     #[error("Virtqueue is full")]
     QueueFull,
-    /// The device is not ready.
+    /// 设备或预备资源尚未就绪。
     #[error("Device not ready")]
     NotReady,
-    /// The device used a different descriptor chain to the one we were expecting.
-    #[error("Device used a different descriptor chain to the one we were expecting")]
+    /// used id 越界、不是已提交的链头，或重复完成。
+    #[error("Device returned an invalid descriptor head")]
     WrongToken,
-    /// The queue is already in use.
+    /// 队列已被设备使用，不能再次绑定。
     #[error("Virtqueue is already in use")]
     AlreadyUsed,
-    /// Invalid parameter.
+    /// 参数范围、地址或协议布局不合法。
     #[error("Invalid parameter")]
     InvalidParam,
-    /// Failed to allocate DMA memory.
-    #[error("Failed to allocate DMA memory")]
-    DmaError,
-    /// I/O error
+    /// 普通任务预备资源时分配失败。
+    #[error("Memory allocation failed")]
+    NoMemory,
+    /// 设备报告 I/O 失败或非法完成状态。
     #[error("I/O error")]
     IoError,
-    /// The request was not supported by the device.
+    /// 设备不支持该请求或协议能力。
     #[error("Request not supported by device")]
     Unsupported,
-    /// The config space advertised by the device is smaller than the driver expected.
+    /// 实际配置窗口不足以读取声明的字段。
     #[error("Config space advertised by the device is smaller than expected")]
     ConfigSpaceTooSmall,
-    /// The device doesn't have any config space, but the driver expects some.
-    #[error("The device doesn't have any config space, but the driver expects some")]
+    /// 设备缺少所需的配置窗口。
+    #[error("The device does not have config space")]
     ConfigSpaceMissing,
-    /// Error from the socket device.
-    #[error("Error from the socket device: {0}")]
-    SocketDeviceError(#[from] SocketError),
-}
-
-#[cfg(feature = "alloc")]
-impl From<alloc::string::FromUtf8Error> for Error {
-    fn from(_value: alloc::string::FromUtf8Error) -> Self {
-        Self::IoError
-    }
-}
-
-/// Align `size` up to a page.
-fn align_up(size: usize) -> usize {
-    (size + PAGE_SIZE) & !(PAGE_SIZE - 1)
-}
-
-/// The number of pages required to store `size` bytes, rounded up to a whole number of pages.
-fn pages(size: usize) -> usize {
-    size.div_ceil(PAGE_SIZE)
+    /// 设备拒绝 FEATURES_OK 或缺少现代协议必需能力。
+    #[error("Device rejected negotiated features")]
+    FeaturesRejected,
+    /// 设备尚未确认 reset，不能归还 DMA 或开始初始化。
+    #[error("Device reset is pending")]
+    ResetPending,
+    /// 设备故障或协议状态不可信，拥有者须先停止 DMA。
+    #[error("Device needs reset")]
+    DeviceNeedsReset,
 }

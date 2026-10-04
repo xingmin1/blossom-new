@@ -1,11 +1,13 @@
-//! MMIO transport for VirtIO.
+//! 已映射窗口上的 legacy/modern VirtIO MMIO 协议。
 
-use super::{DeviceStatus, DeviceType, DeviceTypeError, Transport};
-use crate::{align_up, queue::Descriptor, Error, PhysAddr, PAGE_SIZE};
+use super::{
+    read_config, validate_queue_addresses, write_config, DeviceStatus, DeviceType, DeviceTypeError,
+    InterruptStatus, Notification, Transport,
+};
+use crate::{DmaAddr, Error, PAGE_SIZE};
 use core::{
     convert::{TryFrom, TryInto},
-    mem::{align_of, size_of},
-    ops::Deref,
+    mem::align_of,
     ptr::NonNull,
 };
 use safe_mmio::{
@@ -52,7 +54,7 @@ impl From<MmioVersion> for u32 {
 }
 
 /// An error encountered initialising a VirtIO MMIO transport.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
 pub enum MmioError {
     /// The header doesn't start with the expected magic value 0x74726976.
     #[error("Invalid magic value {0:#010x} (expected 0x74726976)")]
@@ -212,56 +214,6 @@ pub struct VirtIOHeader {
     config_generation: ReadPure<u32>,
 }
 
-impl VirtIOHeader {
-    /// Constructs a fake VirtIO header for use in unit tests.
-    #[cfg(test)]
-    pub fn make_fake_header(
-        version: u32,
-        device_id: u32,
-        vendor_id: u32,
-        device_features: u32,
-        queue_num_max: u32,
-    ) -> Self {
-        Self {
-            magic: ReadPure(MAGIC_VALUE),
-            version: ReadPure(version),
-            device_id: ReadPure(device_id),
-            vendor_id: ReadPure(vendor_id),
-            device_features: ReadPure(device_features),
-            device_features_sel: WriteOnly::default(),
-            __r1: Default::default(),
-            driver_features: Default::default(),
-            driver_features_sel: Default::default(),
-            legacy_guest_page_size: Default::default(),
-            __r2: Default::default(),
-            queue_sel: Default::default(),
-            queue_num_max: ReadPure(queue_num_max),
-            queue_num: Default::default(),
-            legacy_queue_align: Default::default(),
-            legacy_queue_pfn: Default::default(),
-            queue_ready: Default::default(),
-            __r3: Default::default(),
-            queue_notify: Default::default(),
-            __r4: Default::default(),
-            interrupt_status: Default::default(),
-            interrupt_ack: Default::default(),
-            __r5: Default::default(),
-            status: ReadPureWrite(DeviceStatus::empty()),
-            __r6: Default::default(),
-            queue_desc_low: Default::default(),
-            queue_desc_high: Default::default(),
-            __r7: Default::default(),
-            queue_driver_low: Default::default(),
-            queue_driver_high: Default::default(),
-            __r8: Default::default(),
-            queue_device_low: Default::default(),
-            queue_device_high: Default::default(),
-            __r9: Default::default(),
-            config_generation: Default::default(),
-        }
-    }
-}
-
 /// MMIO Device Register Interface.
 ///
 /// Ref: 4.2.2 MMIO Device Register Layout and 4.2.4 Legacy interface
@@ -274,44 +226,33 @@ pub struct MmioTransport<'a> {
 }
 
 impl<'a> MmioTransport<'a> {
-    /// Constructs a new VirtIO MMIO transport, or returns an error if the header reports an
-    /// unsupported version.
+    /// 从完整已映射窗口创建唯一寄存器访问者。
     ///
     /// # Safety
-    ///
-    /// `header` must point to a properly aligned valid VirtIO MMIO region, which must remain valid
-    /// for the lifetime `'a`. This includes the config space following the header, if any.
+    /// header 必须指向真实 VirtIO MMIO 设备，完整 mmio_size 字节必须强序映射
+    /// 并在 'a 内保持有效；调用者必须独占选择及写寄存器，不能另建 transport。
     pub unsafe fn new(header: NonNull<VirtIOHeader>, mmio_size: usize) -> Result<Self, MmioError> {
-        let Some(config_space_size) = mmio_size.checked_sub(CONFIG_SPACE_OFFSET) else {
+        let config_space_size = mmio_size
+            .checked_sub(CONFIG_SPACE_OFFSET)
+            .ok_or(MmioError::MmioRegionTooSmall)?;
+        if header.as_ptr() as usize % align_of::<VirtIOHeader>() != 0
+            || (header.as_ptr() as usize).checked_add(mmio_size).is_none()
+        {
             return Err(MmioError::MmioRegionTooSmall);
+        }
+        // SAFETY: 调用者保证完整窗口有效，配置区偏移已由最小窗口长度核对。
+        let config_space = unsafe {
+            UniqueMmioPointer::new(NonNull::slice_from_raw_parts(
+                header.cast::<u8>().byte_add(CONFIG_SPACE_OFFSET),
+                config_space_size,
+            ))
         };
-        // log::info!(
-        //     "Creating MMIO transport with header at {:#x}, size {}",
-        //     header.as_ptr() as usize,
-        //     mmio_size
-        // );
-        let config_space = NonNull::slice_from_raw_parts(
-            header.cast::<u8>().byte_add(CONFIG_SPACE_OFFSET),
-            config_space_size,
-        );
-        // log::info!(
-        //     "Config space starts at {:#x}, size {}",
-        //     config_space.as_ptr().cast::<u8>() as usize,
-        //     config_space_size
-        // );
-        // SAFETY: The caller promises that the config space following the header is an MMIO region
-        // valid for `'a`.
-        let config_space = unsafe { UniqueMmioPointer::new(config_space) };
-
-        // SAFETY: The caller promises that `header` is a properly aligned MMIO region  valid for
-        // `'a`.
-        let header = UniqueMmioPointer::new(header);
-
+        // SAFETY: 已检查 header 对齐；调用者承担真实映射及整个借用期独占写义务。
+        let header = unsafe { UniqueMmioPointer::new(header) };
         Self::new_from_unique(header, config_space)
     }
 
-    /// Constructs a new VirtIO MMIO transport, or returns an error if the header reports an
-    /// unsupported version.
+    /// 从具有同一设备寿命的唯一 header/config MMIO 借用核对协议身份。
     pub fn new_from_unique(
         header: UniqueMmioPointer<'a, VirtIOHeader>,
         config_space: UniqueMmioPointer<'a, [u8]>,
@@ -331,220 +272,191 @@ impl<'a> MmioTransport<'a> {
         })
     }
 
-    /// Gets the version of the VirtIO MMIO transport.
+    /// 返回构造时已验证的 MMIO 协议版本。
     pub fn version(&self) -> MmioVersion {
         self.version
     }
 
-    /// Gets the vendor ID.
+    /// 读取真实 vendor 字段。
     pub fn vendor_id(&self) -> u32 {
         field_shared!(self.header, vendor_id).read()
     }
 }
 
-// SAFETY: `&MmioTransport` only allows MMIO reads or getting the config space, both of which are
-// fine to happen concurrently on different CPU cores.
+// SAFETY: 共享引用仅读取无副作用身份、状态及配置；选择和中断确认要求独占引用。
 unsafe impl Sync for MmioTransport<'_> {}
 
 impl Transport for MmioTransport<'_> {
+    /// 返回此已验证窗口的设备类型。
     fn device_type(&self) -> DeviceType {
         self.device_type
     }
 
+    /// legacy 仅访问低功能字，modern 才选择高功能字。
     fn read_device_features(&mut self) -> u64 {
-        field!(self.header, device_features_sel).write(0); // device features [0, 32)
-        let mut device_features_bits = field_shared!(self.header, device_features).read().into();
-        field!(self.header, device_features_sel).write(1); // device features [32, 64)
-        device_features_bits += (field_shared!(self.header, device_features).read() as u64) << 32;
-        device_features_bits
+        field!(self.header, device_features_sel).write(0);
+        let low = u64::from(field_shared!(self.header, device_features).read());
+        if self.version == MmioVersion::Legacy {
+            return low;
+        }
+        field!(self.header, device_features_sel).write(1);
+        low | (u64::from(field_shared!(self.header, device_features).read()) << 32)
     }
 
+    /// 按版本只写存在的功能字。
     fn write_driver_features(&mut self, driver_features: u64) {
-        field!(self.header, driver_features_sel).write(0); // driver features [0, 32)
+        field!(self.header, driver_features_sel).write(0);
         field!(self.header, driver_features).write(driver_features as u32);
-        field!(self.header, driver_features_sel).write(1); // driver features [32, 64)
-        field!(self.header, driver_features).write((driver_features >> 32) as u32);
+        if self.version == MmioVersion::Modern {
+            field!(self.header, driver_features_sel).write(1);
+            field!(self.header, driver_features).write((driver_features >> 32) as u32);
+        }
     }
 
+    /// 选择尚未启用的队列后读取容量。
     fn max_queue_size(&mut self, queue: u16) -> u32 {
-        field!(self.header, queue_sel).write(queue.into());
+        field!(self.header, queue_sel).write(u32::from(queue));
         field_shared!(self.header, queue_num_max).read()
     }
 
-    fn notify(&mut self, queue: u16) {
-        field!(self.header, queue_notify).write(queue.into());
+    /// 通知寄存器位于固定 header 偏移，后续不再写 queue_sel。
+    fn notification(&mut self, queue: u16) -> crate::Result<Notification> {
+        if self.max_queue_size(queue) == 0 {
+            return Err(Error::InvalidParam);
+        }
+        // SAFETY: 0x50 是两版本 header 内已映射且四字节对齐的通知寄存器。
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.header.ptr().cast::<u8>().cast_mut().add(0x50)) };
+        Ok(Notification::mmio(pointer, queue))
     }
 
+    /// 读取设备真实状态。
     fn get_status(&self) -> DeviceStatus {
         field_shared!(self.header, status).read()
     }
 
+    /// 写零只请求停止，拥有者仍须读回确认。
     fn set_status(&mut self, status: DeviceStatus) {
         field!(self.header, status).write(status);
     }
 
+    /// 仅 legacy MMIO 使用 guest page size。
     fn set_guest_page_size(&mut self, guest_page_size: u32) {
-        match self.version {
-            MmioVersion::Legacy => {
-                field!(self.header, legacy_guest_page_size).write(guest_page_size);
-            }
-            MmioVersion::Modern => {
-                // No-op, modern devices don't care.
-            }
+        if self.version == MmioVersion::Legacy {
+            field!(self.header, legacy_guest_page_size).write(guest_page_size);
         }
     }
 
+    /// legacy 使用连续 PFN 布局。
     fn requires_legacy_layout(&self) -> bool {
-        match self.version {
-            MmioVersion::Legacy => true,
-            MmioVersion::Modern => false,
-        }
+        self.version == MmioVersion::Legacy
     }
 
+    /// 完整验证后一次发表队列；失败也可能已有设备访问，拥有者必须 reset。
     fn queue_set(
         &mut self,
         queue: u16,
         size: u32,
-        descriptors: PhysAddr,
-        driver_area: PhysAddr,
-        device_area: PhysAddr,
-    ) {
-        match self.version {
-            MmioVersion::Legacy => {
-                assert_eq!(
-                    driver_area - descriptors,
-                    size_of::<Descriptor>() * size as usize
-                );
-                assert_eq!(
-                    device_area - descriptors,
-                    align_up(
-                        size_of::<Descriptor>() * size as usize
-                            + size_of::<u16>() * (size as usize + 3)
-                    )
-                );
-                let align = PAGE_SIZE as u32;
-                let pfn = (descriptors / PAGE_SIZE) as u32;
-                assert_eq!(pfn as usize * PAGE_SIZE, descriptors);
-                field!(self.header, queue_sel).write(queue.into());
-                field!(self.header, queue_num).write(size);
-                field!(self.header, legacy_queue_align).write(align);
-                field!(self.header, legacy_queue_pfn).write(pfn);
+        descriptors: DmaAddr,
+        driver_area: DmaAddr,
+        device_area: DmaAddr,
+    ) -> crate::Result<()> {
+        let legacy = self.requires_legacy_layout();
+        validate_queue_addresses(size, legacy, descriptors, driver_area, device_area)?;
+        if self.queue_used(queue) {
+            return Err(Error::AlreadyUsed);
+        }
+        if self.max_queue_size(queue) < size {
+            return Err(Error::InvalidParam);
+        }
+        let pfn = if legacy {
+            let page = descriptors.value() / PAGE_SIZE as u64;
+            let pfn = u32::try_from(page).map_err(|_| Error::InvalidParam)?;
+            if pfn == 0 {
+                return Err(Error::InvalidParam);
             }
-            MmioVersion::Modern => {
-                field!(self.header, queue_sel).write(queue.into());
-                field!(self.header, queue_num).write(size);
-                field!(self.header, queue_desc_low).write(descriptors as u32);
-                field!(self.header, queue_desc_high).write((descriptors >> 32) as u32);
-                field!(self.header, queue_driver_low).write(driver_area as u32);
-                field!(self.header, queue_driver_high).write((driver_area >> 32) as u32);
-                field!(self.header, queue_device_low).write(device_area as u32);
-                field!(self.header, queue_device_high).write((device_area >> 32) as u32);
-                field!(self.header, queue_ready).write(1);
+            Some(pfn)
+        } else {
+            None
+        };
+        field!(self.header, queue_num).write(size);
+        if let Some(pfn) = pfn {
+            field!(self.header, legacy_queue_align).write(PAGE_SIZE as u32);
+            field!(self.header, legacy_queue_pfn).write(pfn);
+            if field_shared!(self.header, legacy_queue_pfn).read() != pfn {
+                return Err(Error::NotReady);
+            }
+        } else {
+            field!(self.header, queue_desc_low).write(descriptors.value() as u32);
+            field!(self.header, queue_desc_high).write((descriptors.value() >> 32) as u32);
+            field!(self.header, queue_driver_low).write(driver_area.value() as u32);
+            field!(self.header, queue_driver_high).write((driver_area.value() >> 32) as u32);
+            field!(self.header, queue_device_low).write(device_area.value() as u32);
+            field!(self.header, queue_device_high).write((device_area.value() >> 32) as u32);
+            field!(self.header, queue_ready).write(1);
+            if field_shared!(self.header, queue_ready).read() != 1 {
+                return Err(Error::NotReady);
             }
         }
+        Ok(())
     }
 
-    fn queue_unset(&mut self, queue: u16) {
-        match self.version {
-            MmioVersion::Legacy => {
-                field!(self.header, queue_sel).write(queue.into());
-                field!(self.header, queue_num).write(0);
-                field!(self.header, legacy_queue_align).write(0);
-                field!(self.header, legacy_queue_pfn).write(0);
-            }
-            MmioVersion::Modern => {
-                field!(self.header, queue_sel).write(queue.into());
-
-                field!(self.header, queue_ready).write(0);
-                // Wait until we read the same value back, to ensure synchronisation (see 4.2.2.2).
-                let queue_ready = field_shared!(self.header, queue_ready);
-                while queue_ready.read() != 0 {}
-
-                field!(self.header, queue_num).write(0);
-                field!(self.header, queue_desc_low).write(0);
-                field!(self.header, queue_desc_high).write(0);
-                field!(self.header, queue_driver_low).write(0);
-                field!(self.header, queue_driver_high).write(0);
-                field!(self.header, queue_device_low).write(0);
-                field!(self.header, queue_device_high).write(0);
-            }
-        }
-    }
-
+    /// 读取选定队列实际 PFN 或 ready。
     fn queue_used(&mut self, queue: u16) -> bool {
-        field!(self.header, queue_sel).write(queue.into());
-        match self.version {
-            MmioVersion::Legacy => field_shared!(self.header, legacy_queue_pfn).read() != 0,
-            MmioVersion::Modern => field_shared!(self.header, queue_ready).read() != 0,
-        }
-    }
-
-    fn ack_interrupt(&mut self) -> bool {
-        let interrupt = field_shared!(self.header, interrupt_status).read();
-        if interrupt != 0 {
-            field!(self.header, interrupt_ack).write(interrupt);
-            true
+        field!(self.header, queue_sel).write(u32::from(queue));
+        if self.version == MmioVersion::Legacy {
+            field_shared!(self.header, legacy_queue_pfn).read() != 0
         } else {
-            false
+            field_shared!(self.header, queue_ready).read() != 0
         }
     }
 
+    /// 确认读取到的全部位，并保留 queue/config 原因供共享线处理。
+    fn ack_interrupt(&mut self) -> InterruptStatus {
+        let raw = field_shared!(self.header, interrupt_status).read();
+        if raw != 0 {
+            field!(self.header, interrupt_ack).write(raw);
+        }
+        InterruptStatus::from_bits_retain(raw as u8)
+    }
+
+    /// legacy 没有 generation 寄存器，不访问其保留字段。
     fn read_config_generation(&self) -> u32 {
-        field_shared!(self.header, config_generation).read()
-    }
-
-    fn read_config_space<T: FromBytes + IntoBytes>(&self, offset: usize) -> Result<T, Error> {
-        assert!(align_of::<T>() <= 4,
-            "Driver expected config space alignment of {} bytes, but VirtIO only guarantees 4 byte alignment.",
-            align_of::<T>());
-        assert!(offset % align_of::<T>() == 0);
-
-        if self.config_space.len() < offset + size_of::<T>() {
-            Err(Error::ConfigSpaceTooSmall)
+        if self.version == MmioVersion::Legacy {
+            0
         } else {
-            // SAFETY: The caller of `MmioTransport::new` guaranteed that the header pointer was
-            // valid, including the config space. We have checked that the value is properly aligned
-            // for `T` and within the bounds of the config space. Reading the config space shouldn't
-            // have side-effects.
-            unsafe {
-                let ptr = self.config_space.ptr().cast::<T>().byte_add(offset);
-                Ok(self
-                    .config_space
-                    .deref()
-                    .child(NonNull::new(ptr.cast_mut()).unwrap())
-                    .read_unsafe())
-            }
+            field_shared!(self.header, config_generation).read()
         }
     }
 
+    /// 按真实版本的配置访问宽度读取有界字段。
+    fn read_config_space<T: FromBytes + IntoBytes>(&self, offset: usize) -> crate::Result<T> {
+        // SAFETY: 构造保证完整配置映射和设备寿命；helper 检查完整字段范围及协议对齐。
+        unsafe {
+            read_config(
+                NonNull::new_unchecked(self.config_space.ptr().cast::<u8>().cast_mut()),
+                self.config_space.len(),
+                offset,
+                self.version == MmioVersion::Legacy,
+            )
+        }
+    }
+
+    /// 按真实版本的配置访问宽度写入有界字段。
     fn write_config_space<T: IntoBytes + Immutable>(
         &mut self,
         offset: usize,
         value: T,
-    ) -> Result<(), Error> {
-        assert!(align_of::<T>() <= 4,
-            "Driver expected config space alignment of {} bytes, but VirtIO only guarantees 4 byte alignment.",
-            align_of::<T>());
-        assert!(offset % align_of::<T>() == 0);
-
-        if self.config_space.len() < offset + size_of::<T>() {
-            Err(Error::ConfigSpaceTooSmall)
-        } else {
-            // SAFETY: The caller of `MmioTransport::new` guaranteed that the header pointer was
-            // valid, including the config space. We have checked that the value is properly aligned
-            // for `T` and within the bounds of the config space.
-            unsafe {
-                let ptr = self.config_space.ptr_nonnull().cast::<T>().byte_add(offset);
-                self.config_space.child(ptr).write_unsafe(value);
-            }
-            Ok(())
+    ) -> crate::Result<()> {
+        // SAFETY: 构造保证配置映射有效，独占 transport 串行化写；helper 检查范围和协议对齐。
+        unsafe {
+            write_config(
+                self.config_space.ptr_nonnull().cast::<u8>(),
+                self.config_space.len(),
+                offset,
+                value,
+                self.version == MmioVersion::Legacy,
+            )
         }
-    }
-}
-
-impl Drop for MmioTransport<'_> {
-    fn drop(&mut self) {
-        // Reset the device when the transport is dropped.
-        self.set_status(DeviceStatus::empty())
     }
 }

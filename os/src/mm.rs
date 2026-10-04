@@ -1,5 +1,6 @@
 mod bootmem;
 mod buddy;
+pub mod dma;
 mod frame_allocator;
 mod heap_allocator;
 mod page;
