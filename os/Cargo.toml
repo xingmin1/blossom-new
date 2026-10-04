@@ -7,6 +7,7 @@ edition = "2018"
 fdt = { path = "../dependency/fdt" }
 rlibc = "1.0.0"
 spin = "0.7"
+virtio-drivers = { path = "../dependency/virtio-drivers", default-features = false, features = ["alloc"] }
 
 [features]
 boot-tests = []

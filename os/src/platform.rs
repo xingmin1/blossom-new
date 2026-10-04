@@ -1,6 +1,9 @@
 //! QEMU virt 的一次性无堆资源发现；输入结构验证完成后才交给 fdt 解析。
 
-use crate::boot::{BootInfo, Region, MAX_CPUS, MAX_MEMORY_REGIONS};
+use crate::boot::{
+    BootInfo, PciIntxRoute, PciRange, Region, VirtioMmioResource, MAX_CPUS, MAX_INTERRUPT_SOURCES,
+    MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO,
+};
 use fdt::{node::FdtNode, Fdt};
 
 #[cfg(target_arch = "riscv64")]
@@ -402,6 +405,7 @@ fn discover_tree(
     let chosen = tree
         .find_node("/chosen")
         .ok_or("FDT chosen node is missing")?;
+    discover_bootargs(chosen, &mut info)?;
     let stdout =
         cstr(property(chosen, "stdout-path").map_err(|_| "FDT chosen stdout-path is missing")?)?;
     let path = stdout
@@ -424,6 +428,7 @@ fn discover_tree(
     #[cfg(target_arch = "loongarch64")]
     {
         require_controller(controller, "loongson,pch-pic-1.0", 2)?;
+        info.interrupts.source_count = MAX_INTERRUPT_SOURCES as u32;
         if word(property(uart, "interrupts")?, 4)? != 4 || 64 <= info.interrupts.uart_source {
             return Err("FDT UART is not a supported PCH-PIC level-high source");
         }
@@ -438,12 +443,103 @@ fn discover_tree(
             return Err("FDT EXTIOI CPU root interrupt exceeds the supported range");
         }
     }
-    discover_pci(&tree, &mut info)?;
+    discover_pci(&tree, controller, &mut info)?;
+    discover_virtio_mmio(&tree, controller, &mut info)?;
     Ok(info)
 }
 
+/// 保存完整 NUL 结尾的单一命令行，拒绝截断、内嵌 NUL 和容量外输入。
+fn discover_bootargs(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
+    let Some(property) = chosen.property("bootargs") else {
+        return Ok(());
+    };
+    let value = property.value;
+    if value.is_empty()
+        || info.bootargs.len() < value.len()
+        || value.last() != Some(&0)
+        || value[..value.len() - 1].contains(&0)
+    {
+        return Err("FDT bootargs is not a bounded NUL-terminated command line");
+    }
+    info.bootargs[..value.len()].copy_from_slice(value);
+    info.bootargs_len = value.len() - 1;
+    Ok(())
+}
+
+/// 验证新增设备物理窗口不覆盖 RAM、已有控制器或先前登记的设备窗口。
+fn device_region(region: Region, info: &BootInfo) -> Result<(), &'static str> {
+    if info.memory[..info.memory_count]
+        .iter()
+        .any(|old| old.overlaps(region))
+        || info.interrupts.uart.overlaps(region)
+        || info.interrupts.controller.overlaps(region)
+        || info.pci.configuration.overlaps(region)
+        || info.pci.ranges[..info.pci.range_count]
+            .iter()
+            .any(|old| old.cpu.overlaps(region))
+        || info.virtio_mmio[..info.virtio_mmio_count]
+            .iter()
+            .any(|old| old.registers.overlaps(region))
+    {
+        return Err("FDT device resource overlaps RAM or another device window");
+    }
+    Ok(())
+}
+
+/// 校验当前外部控制器的设备源范围，PLIC 零号保持保留。
+fn device_source(source: u32, info: &BootInfo) -> Result<(), &'static str> {
+    #[cfg(target_arch = "riscv64")]
+    if source == 0 {
+        return Err("FDT device interrupt uses reserved PLIC source zero");
+    }
+    if info.interrupts.source_count <= source {
+        return Err("FDT device interrupt source exceeds the controller capacity");
+    }
+    Ok(())
+}
+
+/// 一次记录启用的 MMIO 槽，物理顺序独立于 FDT 节点遍历顺序。
+fn discover_virtio_mmio(
+    tree: &Fdt<'_>,
+    controller: Node<'_>,
+    info: &mut BootInfo,
+) -> Result<(), &'static str> {
+    for node in tree
+        .all_nodes()
+        .filter(|n| enabled(*n) && compatible(*n, "virtio,mmio"))
+    {
+        if info.virtio_mmio_count == MAX_VIRTIO_MMIO {
+            return Err("FDT VirtIO-MMIO slot capacity exceeded");
+        }
+        require_controller(controller, "riscv,plic0", 1)?;
+        let parent = interrupt_parent(tree, node)?;
+        if parent.name.as_ptr() != controller.name.as_ptr() {
+            return Err("FDT VirtIO-MMIO interrupt parent is not the selected PLIC");
+        }
+        let registers = single_region(tree, node)?;
+        if registers.start % 0x1000 != 0 || registers.end - registers.start != 0x1000 {
+            return Err("FDT VirtIO-MMIO register window is not one aligned page");
+        }
+        device_region(registers, info)?;
+        let interrupt_source = irq(node, parent)?;
+        device_source(interrupt_source, info)?;
+        info.virtio_mmio[info.virtio_mmio_count] = VirtioMmioResource {
+            registers,
+            interrupt_source,
+        };
+        info.virtio_mmio_count += 1;
+    }
+    info.virtio_mmio[..info.virtio_mmio_count]
+        .sort_unstable_by_key(|resource| resource.registers.start);
+    Ok(())
+}
+
 /// 记录 PCI ECAM、总线编号和窗口，不枚举设备或访问配置空间。
-fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
+fn discover_pci(
+    tree: &Fdt<'_>,
+    controller: Node<'_>,
+    info: &mut BootInfo,
+) -> Result<(), &'static str> {
     let mut hosts = tree
         .all_nodes()
         .filter(|n| enabled(*n) && compatible(*n, "pci-host-ecam-generic"));
@@ -451,7 +547,9 @@ fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
     if hosts.next().is_some() {
         return Err("FDT has multiple unsupported PCI hosts");
     }
-    info.pci.configuration = single_region(tree, host)?;
+    let configuration = single_region(tree, host)?;
+    device_region(configuration, info)?;
+    info.pci.configuration = configuration;
     if number(host, "#address-cells")? != 3 || number(host, "#size-cells")? != 2 {
         return Err("FDT PCI ranges cell format is invalid");
     }
@@ -468,6 +566,12 @@ fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
     if info.pci.bus_end < info.pci.bus_start || 255 < info.pci.bus_end {
         return Err("FDT PCI bus-range is invalid");
     }
+    let configuration_size = ((info.pci.bus_end - info.pci.bus_start + 1) as usize) << 20;
+    if configuration.start % (1 << 20) != 0
+        || configuration.end - configuration.start != configuration_size
+    {
+        return Err("FDT PCI ECAM window does not match the declared bus range");
+    }
     let ranges = property(host, "ranges")?;
     if ranges.is_empty() || ranges.len() % 28 != 0 {
         return Err("FDT PCI ranges is truncated");
@@ -482,13 +586,83 @@ fn discover_pci(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
         }
         let bus_start = cells(&range[4..12])?;
         let cpu = Region::from_size(cells(&range[12..20])?, cells(&range[20..28])?)?;
-        Region::from_size(bus_start, cpu.end - cpu.start)?;
-        info.pci.ranges[info.pci.range_count] = crate::boot::PciRange {
+        let bus = Region::from_size(bus_start, cpu.end - cpu.start)?;
+        device_region(cpu, info)?;
+        for old in &info.pci.ranges[..info.pci.range_count] {
+            let old_io = old.flags & 0x0300_0000 == 0x0100_0000;
+            let new_io = flags & 0x0300_0000 == 0x0100_0000;
+            let old_bus = Region::from_size(old.bus_start, old.cpu.end - old.cpu.start)?;
+            if old_io == new_io && old_bus.overlaps(bus) {
+                return Err("FDT PCI bus windows overlap in the same address space");
+            }
+        }
+        info.pci.ranges[info.pci.range_count] = PciRange {
             flags,
             bus_start,
             cpu,
         };
         info.pci.range_count += 1;
+    }
+    discover_pci_intx(tree, host, controller, info)?;
+    Ok(())
+}
+
+/// 按所选 QEMU 9.2.1 host 的六 cell 条目解析 INTx，不猜测其他表格式。
+fn discover_pci_intx(
+    tree: &Fdt<'_>,
+    host: Node<'_>,
+    controller: Node<'_>,
+    info: &mut BootInfo,
+) -> Result<(), &'static str> {
+    // 两机器均以三个 PCI 地址 cell 和一个 pin 构成 key。LA host 未声明
+    // #interrupt-cells，PCH-PIC 虽声明两个 cell，host 条目实际只有 source，
+    // 没有 flag；所选机器的 PCI INTx 固定为 level-high。
+    if host.property("#interrupt-cells").is_some() && number(host, "#interrupt-cells")? != 1 {
+        return Err("FDT PCI host interrupt cells do not describe one INTx pin");
+    }
+    let mask = property(host, "interrupt-map-mask")?;
+    if mask.len() != 16 {
+        return Err("FDT PCI interrupt-map-mask is not four cells");
+    }
+    for i in 0..4 {
+        info.pci.intx_mask[i] = word(mask, i * 4)?;
+    }
+    if info.pci.intx_mask != [0x1800, 0, 0, 7] {
+        return Err("FDT PCI interrupt-map-mask differs from the selected host profile");
+    }
+    let map = property(host, "interrupt-map")?;
+    if map.is_empty() || map.len() % 24 != 0 {
+        return Err("FDT PCI interrupt-map is not a complete six-cell table");
+    }
+    for entry in map.chunks_exact(24) {
+        if info.pci.intx_route_count == info.pci.intx_routes.len() {
+            return Err("FDT PCI INTx route capacity exceeded");
+        }
+        let child = [
+            word(entry, 0)?,
+            word(entry, 4)?,
+            word(entry, 8)?,
+            word(entry, 12)?,
+        ];
+        if !(1..=4).contains(&child[3]) {
+            return Err("FDT PCI interrupt-map contains an invalid INTx pin");
+        }
+        let parent = tree
+            .find_phandle(word(entry, 16)?)
+            .ok_or("FDT PCI interrupt-map parent phandle has no controller")?;
+        if parent.name.as_ptr() != controller.name.as_ptr() {
+            return Err("FDT PCI interrupt-map parent is not the selected controller");
+        }
+        let source = word(entry, 20)?;
+        device_source(source, info)?;
+        if info.pci.intx_routes[..info.pci.intx_route_count]
+            .iter()
+            .any(|old| (0..4).all(|i| ((old.child[i] ^ child[i]) & info.pci.intx_mask[i]) == 0))
+        {
+            return Err("FDT PCI interrupt-map contains duplicate masked keys");
+        }
+        info.pci.intx_routes[info.pci.intx_route_count] = PciIntxRoute { child, source };
+        info.pci.intx_route_count += 1;
     }
     Ok(())
 }
@@ -506,9 +680,10 @@ fn discover_plic(
     if info.interrupts.uart_source == 0 || sources < info.interrupts.uart_source {
         return Err("FDT UART source exceeds the PLIC capacity");
     }
-    if 1023 < sources || info.interrupts.controller.start % 4 != 0 {
+    if MAX_INTERRUPT_SOURCES as u32 <= sources || info.interrupts.controller.start % 4 != 0 {
         return Err("FDT PLIC register layout is unsupported");
     }
+    info.interrupts.source_count = sources + 1;
     let mut handles = [0; MAX_CPUS];
     for cpu in cpus.children().filter(|n| enabled(*n)) {
         if cpu.property("device_type").and_then(|p| p.as_str()) != Some("cpu") {

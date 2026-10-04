@@ -364,6 +364,7 @@ impl From<u32> for PciRangeType {
     }
 }
 
+/// 枚举所选根总线，配置窗口长度取设备树的实际资源区间。
 fn enumerate_pci(pci_node: FdtNode, cam: Cam) {
     let reg = pci_node.reg();
     let mut allocator = PciMemory32Allocator::for_pci_ranges(&pci_node);
@@ -374,10 +375,16 @@ fn enumerate_pci(pci_node: FdtNode, cam: Cam) {
             region.starting_address,
             region.starting_address as usize + region.size.unwrap()
         );
-        assert_eq!(region.size.unwrap(), cam.size() as usize);
-        // SAFETY: We know the pointer is to a valid MMIO region.
-        let mut pci_root =
-            PciRoot::new(unsafe { MmioCam::new(region.starting_address as *mut u8, cam) });
+        // SAFETY: 设备树给出已映射配置窗口，根对象在整个枚举期间独占其配置访问。
+        let cam = unsafe {
+            MmioCam::new(
+                region.starting_address as *mut u8,
+                region.size.unwrap(),
+                cam,
+            )
+        }
+        .expect("invalid PCI configuration window");
+        let mut pci_root = PciRoot::new(cam);
         for (device_function, info) in pci_root.enumerate_bus(0) {
             let (status, command) = pci_root.get_status_command(device_function);
             info!(

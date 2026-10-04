@@ -48,8 +48,7 @@ pub struct HypPciTransport {
 }
 
 impl HypPciTransport {
-    /// Constructs a new x86-64 pKVM PCI VirtIO transport for the given device function on the given
-    /// PCI root controller.
+    /// 从已选 x86-64 pKVM PCI 函数准备 transport，配置链错误在访问能力字段前返回。
     pub fn new<C: ConfigurationAccess>(
         root: &mut PciRoot<C>,
         device_function: DeviceFunction,
@@ -70,6 +69,7 @@ impl HypPciTransport {
         let mut isr_cfg = None;
         let mut device_cfg = None;
         for capability in root.capabilities(device_function) {
+            let capability = capability?;
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
             }

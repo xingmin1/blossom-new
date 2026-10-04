@@ -26,6 +26,7 @@ mod arch;
 mod boot;
 mod console;
 mod cpu;
+mod drivers;
 mod irq;
 mod klog;
 mod mm;
@@ -42,6 +43,9 @@ mod workqueue;
 mod boot_tests;
 #[cfg(feature = "execution-tests")]
 mod execution_tests;
+
+#[cfg(not(any(feature = "boot-tests", feature = "execution-tests")))]
+use crate::drivers::DeviceInventory;
 
 #[cfg(not(feature = "boot-tests"))]
 static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -94,9 +98,15 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
     unsafe { irq::initialize(resources) };
-    // SAFETY: 默认 handler 不使用 context；函数和端口均永久存在，源尚未启用。
-    unsafe { irq::register_uart(console::uart_handler, core::ptr::null_mut()) };
-    irq::enable_uart();
+    let uart_number = irq::map_source(resources.interrupts.uart_source)
+        .expect("UART interrupt source is outside the IRQ domain");
+    // SAFETY: handler 不使用 context；端口、映射和函数永久存在，尚未开放源。
+    // token 在普通启动栈中保活到调度器停机，测试镜像将其移动给同步注销拥有者。
+    let _uart_registration =
+        unsafe { irq::register(uart_number, console::uart_handler, core::ptr::null_mut()) }
+            .expect("UART IRQ action registration failed");
+    console::enable_receive_interrupts();
+    _uart_registration.enable();
     arch::enable_interrupts();
     cpu::publish_online();
 
@@ -149,7 +159,7 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     #[cfg(feature = "boot-tests")]
     // SAFETY: 唯一 BSP 在全部 CPU 上线以后运行一次；测试缓冲区与串口协议由它独占。
     unsafe {
-        boot_tests::primary()
+        boot_tests::primary(_uart_registration)
     };
     #[cfg(not(feature = "boot-tests"))]
     {
@@ -188,16 +198,85 @@ fn enter_scheduler() -> ! {
     sched::run()
 }
 
-/// 在普通任务栈执行内核初始入口，返回后由调度器完成离栈回收。
+/// 在普通任务栈一次发现设备并报告真实资源，再完成有限内核消费者；测试镜像保持独立入口。
 #[cfg(not(feature = "boot-tests"))]
 fn init() -> i32 {
     #[cfg(feature = "execution-tests")]
     execution_tests::run();
     #[cfg(not(feature = "execution-tests"))]
     {
+        let inventory = drivers::discover().expect("device resource discovery failed");
+        report_device_resources(&inventory);
         init_consumers();
+        drop(inventory);
         0
     }
+}
+
+/// 只记录启用 MMIO 槽、实际 block 候选与 PCI 功能资源，不触碰设备队列或读取磁盘。
+#[cfg(not(any(feature = "boot-tests", feature = "execution-tests")))]
+fn report_device_resources(inventory: &DeviceInventory) {
+    let resources = boot::info();
+    for (slot, resource) in resources.virtio_mmio[..resources.virtio_mmio_count]
+        .iter()
+        .enumerate()
+    {
+        crate::klog!(
+            klog::Level::Info,
+            "MMIO slot={} physical={:#x}..{:#x} source={}",
+            slot,
+            resource.registers.start,
+            resource.registers.end,
+            resource.interrupt_source
+        );
+    }
+    for candidate in &inventory.mmio_blocks {
+        crate::klog!(
+            klog::Level::Info,
+            "MMIO BLOCK physical={:#x}..{:#x} version={} vendor={:#x} irq={:?}",
+            candidate.registers.start,
+            candidate.registers.end,
+            candidate.version,
+            candidate.vendor_id,
+            candidate.interrupt
+        );
+    }
+    for device in inventory.pci.devices() {
+        crate::klog!(
+            klog::Level::Info,
+            "PCI BDF={:02x}:{:02x}.{} vendor={:04x} device={:04x} header={:#x} caps={} irq={:?}",
+            device.bus,
+            device.device,
+            device.function,
+            device.vendor_id,
+            device.device_id,
+            device.header_type,
+            device.capability_count,
+            device.interrupt
+        );
+        for (index, bar) in device.bars.iter().enumerate() {
+            if let Some(bar) = bar {
+                crate::klog!(
+                    klog::Level::Info,
+                    "PCI BAR BDF={:02x}:{:02x}.{} index={} bus={:#x} physical={:#x}..{:#x} prefetch={}",
+                    device.bus,
+                    device.device,
+                    device.function,
+                    index,
+                    bar.bus_address,
+                    bar.physical.start,
+                    bar.physical.end,
+                    bar.prefetchable
+                );
+            }
+        }
+    }
+    crate::klog!(
+        klog::Level::Info,
+        "DEVICE discovery mmio-blocks={} pci-functions={}",
+        inventory.mmio_blocks.len(),
+        inventory.pci.devices().len()
+    );
 }
 
 /// 在普通任务之间传送有限数据，源登记后复查槽状态，结束时消费真实 join。

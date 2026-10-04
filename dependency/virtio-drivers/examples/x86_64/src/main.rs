@@ -158,10 +158,14 @@ fn virtio_net<T: Transport>(transport: T) {
     }
 }
 
+/// 枚举该 QEMU 示例已映射的完整 ECAM 窗口，不用设备配置指针推测另一个范围。
 fn enumerate_pci(mmconfig_base: *mut u8) {
     info!("mmconfig_base = {:#x}", mmconfig_base as usize);
 
-    let mut pci_root = PciRoot::new(unsafe { MmioCam::new(mmconfig_base, Cam::Ecam) });
+    // SAFETY: 示例固定 QEMU ECAM 映射覆盖全部配置窗口，本函数独占该窗口直到枚举结束。
+    let cam = unsafe { MmioCam::new(mmconfig_base, Cam::Ecam.size() as usize, Cam::Ecam) }
+        .expect("invalid PCI configuration window");
+    let mut pci_root = PciRoot::new(cam);
     for (device_function, info) in pci_root.enumerate_bus(0) {
         let (status, command) = pci_root.get_status_command(device_function);
         info!(

@@ -5,6 +5,13 @@ use spin::Once;
 pub const MAX_CPUS: usize = 4;
 pub const MAX_MEMORY_REGIONS: usize = 8;
 pub const MAX_RESERVED_REGIONS: usize = 24;
+pub const MAX_VIRTIO_MMIO: usize = 8;
+/// 所选控制器的 source 表容量，PLIC 包含保留的零号源。
+pub const MAX_INTERRUPT_SOURCES: usize = if cfg!(target_arch = "riscv64") {
+    96
+} else {
+    64
+};
 
 /// 半开物理地址区间。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,6 +41,8 @@ impl Region {
 pub struct InterruptResources {
     pub uart: Region,
     pub uart_source: u32,
+    /// 合法 source 索引的开区间上界；PLIC 的零号不用于设备。
+    pub source_count: u32,
     pub controller: Region,
     pub parent_controller: Region,
     pub root_interrupt: u32,
@@ -48,6 +57,20 @@ pub struct PciRange {
     pub cpu: Region,
 }
 
+/// 启用的 VirtIO-MMIO 槽资源，设备类型由普通初始化读取。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VirtioMmioResource {
+    pub registers: Region,
+    pub interrupt_source: u32,
+}
+
+/// PCI 子地址与 INTx pin 经 host 掩码匹配到的控制器源。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PciIntxRoute {
+    pub child: [u32; 4],
+    pub source: u32,
+}
+
 /// 记录真实 PCI 配置与窗口，不在启动阶段执行枚举。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PciResources {
@@ -56,6 +79,40 @@ pub struct PciResources {
     pub range_count: usize,
     pub bus_start: u32,
     pub bus_end: u32,
+    pub intx_mask: [u32; 4],
+    pub intx_routes: [PciIntxRoute; 16],
+    pub intx_route_count: usize,
+}
+
+impl PciResources {
+    /// 以真实 BDF 高 cell 和 pin 匹配 host INTx 表，不使用 interrupt-line 字节。
+    pub fn interrupt_source(
+        &self,
+        bus: u8,
+        device: u8,
+        function: u8,
+        pin: u8,
+    ) -> Result<u32, &'static str> {
+        if (bus as u32) < self.bus_start
+            || self.bus_end < bus as u32
+            || 32 <= device
+            || 8 <= function
+            || !(1..=4).contains(&pin)
+        {
+            return Err("PCI INTx BDF or pin is out of range");
+        }
+        let child = [
+            ((bus as u32) << 16) | ((device as u32) << 11) | ((function as u32) << 8),
+            0,
+            0,
+            pin as u32,
+        ];
+        self.intx_routes[..self.intx_route_count]
+            .iter()
+            .find(|route| (0..4).all(|i| ((route.child[i] ^ child[i]) & self.intx_mask[i]) == 0))
+            .map(|route| route.source)
+            .ok_or("PCI INTx has no host interrupt-map route")
+    }
 }
 
 /// 一次解析完成、由 BSP 发布的启动资源快照。
@@ -72,6 +129,10 @@ pub struct BootInfo {
     pub dtb: Region,
     pub interrupts: InterruptResources,
     pub pci: PciResources,
+    pub virtio_mmio: [VirtioMmioResource; MAX_VIRTIO_MMIO],
+    pub virtio_mmio_count: usize,
+    pub bootargs: [u8; 256],
+    pub bootargs_len: usize,
     pub counter_frequency: u64,
 }
 
@@ -90,8 +151,17 @@ impl BootInfo {
             dtb: Region::default(),
             interrupts: InterruptResources::default(),
             pci: PciResources::default(),
+            virtio_mmio: [VirtioMmioResource::default(); MAX_VIRTIO_MMIO],
+            virtio_mmio_count: 0,
+            bootargs: [0; 256],
+            bootargs_len: 0,
             counter_frequency: 0,
         }
+    }
+
+    /// 借用固件命令行的实际字节前缀，不包含终止 NUL 或补齐空间。
+    pub fn bootargs(&self) -> &[u8] {
+        &self.bootargs[..self.bootargs_len]
     }
 
     /// 在输入边界登记一段实际保留资源。

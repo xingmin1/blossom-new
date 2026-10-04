@@ -1,6 +1,7 @@
 //! QEMU 9.2.1 virt 的 DMW、异常、一次定时器及 PCH-PIC/EXTIOI 机制。
 use crate::boot::BootInfo;
 use crate::sched::context::TaskContext;
+use crate::sync::SpinLock;
 use core::arch::{asm, global_asm};
 use core::mem::{offset_of, size_of, MaybeUninit};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
@@ -127,7 +128,7 @@ fn iocsr_read64(reg: usize) -> u64 {
     }
     value
 }
-/// 写入选定的 32 位 IOCSR；共享路由读改写由公共 IRQ 锁串行化。
+/// 写入选定的 32 位 IOCSR；共享路由读改写由独立控制器锁串行化。
 #[inline]
 fn iocsr_write32(reg: usize, value: u32) {
     // SAFETY: 本模块调用点使用已验证平台的有效 IOCSR；设备状态不承载 Rust 引用。
@@ -390,7 +391,7 @@ pub fn send_ipi(hardware_id: usize) {
     barrier();
     iocsr_write32(0x1040, (1 << 31) | ((hardware_id as u32) << 16) | 1);
 }
-/// 写入已验证 PCH-PIC 范围的 32 位寄存器，路由操作由公共 IRQ 锁保护。
+/// 写入已验证 PCH-PIC 范围的 32 位寄存器，共享 word 由控制器锁保护。
 fn pic_write(offset: usize, value: u32) {
     // SAFETY: 已发布 BootInfo 的控制器范围覆盖调用点的对齐 offset；入口保持强序 DMW 永久有效。
     unsafe {
@@ -413,73 +414,116 @@ fn pic_read(offset: usize) -> u32 {
 fn ext_reg(offset: usize) -> usize {
     crate::boot::info().interrupts.parent_controller.start + offset
 }
-/// 取得平台验证过的 UART 源位，源号小于 32。
-fn uart_bit() -> u32 {
-    1 << crate::boot::info().interrupts.uart_source
+static EXTERNAL_CONTROLLER: SpinLock<()> = SpinLock::new(());
+
+/// 定位实际源所在的共享 32 位 word 与位掩码。
+fn source_word(source: u32) -> (usize, u32) {
+    assert!(source < crate::boot::info().interrupts.source_count);
+    (source as usize / 32 * 4, 1 << (source % 32))
 }
-/// 将已选 UART 的 PCH 源向量路由到 BSP 的 EXTIOI/IP1，初始保持屏蔽。
+
+/// 为实际 PCH 源逐位建立 level-high、同号 EXTIOI 向量与固定 BSP 路由。
 ///
 /// # Safety
-/// 必须由 BSP 在本核 IRQ 关闭且全局 IRQ 初始化独占时调用；info 必须是已发布的平台对象。
-/// PCH-PIC/EXTIOI 资源必须已经验证，强序 DMW 必须覆盖 PCH-PIC 并永久有效。
+/// BSP 必须在本核 IRQ 关闭且 AP 尚未释放时独占初始化；info 是永久发布的平台对象，
+/// PCH-PIC 强序 DMW 与 EXTIOI IOCSR 范围已经验证且永久有效。
 pub unsafe fn external_init(info: &BootInfo) {
-    let source = info.interrupts.uart_source as usize;
-    assert!(source < 32 && info.bsp_hardware_id < 4);
+    assert_eq!(info.interrupts.source_count, 64);
+    assert!(info.bsp_hardware_id < 4);
     assert_eq!(info.interrupts.root_interrupt, 3);
-    pic_write(0x20, u32::MAX);
-    pic_write(0x24, u32::MAX);
-    pic_write(0x60, 0);
-    pic_write(0x64, 0);
-    pic_write(0x3e0, 0);
-    pic_write(0x3e4, 0);
-    pic_write(0x40, uart_bit());
-    // SAFETY: 调用者保证 PCH-PIC 范围与强序映射有效；source 已验证小于 32，两处访问均为字节寄存器。
-    unsafe {
-        let base = mmio_address(info.interrupts.controller.start);
-        core::ptr::write_volatile((base + 0x100 + source) as *mut u8, 1);
-        core::ptr::write_volatile((base + 0x200 + source) as *mut u8, source as u8);
+    let _controller = EXTERNAL_CONTROLLER.lock();
+    for source in 0..info.interrupts.source_count {
+        let (word, bit) = source_word(source);
+        pic_write(0x20 + word, pic_read(0x20 + word) | bit);
+        pic_write(0x40 + word, pic_read(0x40 + word) | bit);
+        pic_write(0x60 + word, pic_read(0x60 + word) & !bit);
+        pic_write(0x3e0 + word, pic_read(0x3e0 + word) & !bit);
+        // SAFETY: 实际源小于 64，两个字节寄存器完整落在已验证 PCH 窗口；
+        // 控制器锁与 AP 前初始化保证独占，各源路由到同号 EXTIOI 向量。
+        unsafe {
+            let base = mmio_address(info.interrupts.controller.start);
+            core::ptr::write_volatile((base + 0x100 + source as usize) as *mut u8, 1);
+            core::ptr::write_volatile((base + 0x200 + source as usize) as *mut u8, source as u8);
+        }
+        let route_reg = ext_reg(0x800 + (source as usize & !3));
+        let shift = source % 4 * 8;
+        let route = (1u32 << info.bsp_hardware_id) << shift;
+        iocsr_write32(
+            route_reg,
+            (iocsr_read32(route_reg) & !(0xff << shift)) | route,
+        );
+        iocsr_write32(
+            ext_reg(0x200 + word),
+            iocsr_read32(ext_reg(0x200 + word)) & !bit,
+        );
+        iocsr_write32(
+            ext_reg(0x280 + word),
+            iocsr_read32(ext_reg(0x280 + word)) | bit,
+        );
+        iocsr_write32(ext_reg(0x400 + word), bit);
     }
-    // QEMU EXTIOI 使用绝对 IOCSR 0x14c0/0x1600/0x1800/0x1c00，reg 基址是 0x1400。
-    for group in 0..8 {
-        iocsr_write32(ext_reg(0x200 + group * 4), 0);
+    // QEMU 的 IPMAP 每个字节选择一组 32 向量的 CPU IP，NODEMAP 每组占 16 位。
+    for group in 0..2usize {
+        let ip_reg = ext_reg(0xc0 + group / 4 * 4);
+        let shift = group % 4 * 8;
+        iocsr_write32(
+            ip_reg,
+            (iocsr_read32(ip_reg) & !(0xff << shift)) | (2 << shift),
+        );
+        let node_reg = ext_reg(0xa0 + group / 2 * 4);
+        let shift = group % 2 * 16;
+        iocsr_write32(
+            node_reg,
+            (iocsr_read32(node_reg) & !(0xffff << shift)) | ((1 << group) << shift),
+        );
     }
-    iocsr_write32(ext_reg(0xc0), 0x0202_0202);
-    iocsr_write32(ext_reg(0xa0), 0x0002_0001);
-    let route = 1u32 << info.bsp_hardware_id;
-    iocsr_write32(ext_reg(0x800 + (source & !3)), route * 0x0101_0101);
-    iocsr_write32(ext_reg(0x280), uart_bit());
-    iocsr_write32(ext_reg(0x400), uart_bit());
     iocsr_write64(0x420, iocsr_read64(0x420) | (1u64 << 48));
     barrier();
 }
-/// 同时屏蔽 PCH 源与 EXTIOI 向量；通用 IRQ 锁负责串行化此读改写。
-pub fn external_mask() {
-    pic_write(0x20, pic_read(0x20) | uart_bit());
-    iocsr_write32(ext_reg(0x200), 0);
+
+/// 按实际源位屏蔽 PCH 与 EXTIOI，不改变同 word 的其他设备。
+pub fn external_mask(source: u32) {
+    let (word, bit) = source_word(source);
+    let _controller = EXTERNAL_CONTROLLER.lock();
+    pic_write(0x20 + word, pic_read(0x20 + word) | bit);
+    let reg = ext_reg(0x200 + word);
+    iocsr_write32(reg, iocsr_read32(reg) & !bit);
     barrier();
 }
-/// 先使能 EXTIOI，再解除 PCH 源屏蔽；公共 IRQ 锁串行化读改写，level 请求可重新发送。
-pub fn external_unmask() {
-    iocsr_write32(ext_reg(0x200), uart_bit());
-    pic_write(0x20, pic_read(0x20) & !uart_bit());
+
+/// 清该源 PCH 锁存、先开放父向量再开放 level 源，保留相邻设备状态。
+pub fn external_unmask(source: u32) {
+    let (word, bit) = source_word(source);
+    let _controller = EXTERNAL_CONTROLLER.lock();
+    pic_write(0x80 + word, bit);
+    let reg = ext_reg(0x200 + word);
+    iocsr_write32(reg, iocsr_read32(reg) | bit);
+    pic_write(0x20 + word, pic_read(0x20 + word) & !bit);
     barrier();
 }
-/// 从本核 EXTIOI pending 与 PCH 真实状态共同 claim UART。
+
+/// 遍历本核真实 EXTIOI pending 与准入位，返回最低待处理 PCH 源。
 pub fn external_claim() -> Option<u32> {
-    if iocsr_read32(ext_reg(0x400)) & pic_read(0x3a0) & uart_bit() != 0 {
-        Some(crate::boot::info().interrupts.uart_source)
-    } else {
+    let _controller = EXTERNAL_CONTROLLER.lock();
+    let enabled =
+        iocsr_read32(ext_reg(0x200)) as u64 | ((iocsr_read32(ext_reg(0x204)) as u64) << 32);
+    let pending = iocsr_read64(ext_reg(0x400)) & enabled;
+    if pending == 0 {
         None
+    } else {
+        Some(pending.trailing_zeros())
     }
 }
-/// UART 设备已消除 level 请求后，清除 EXTIOI 的真实 W1C pending。
+
+/// 对本核已 claim 的源单独 W1C 完成，不清除相邻源的 pending。
 ///
 /// # Safety
-/// source 必须来自本核真实 claim，并等于已选 UART 硬件源；调用者须持描述符锁串行控制硬件。
-/// UART 的 level 请求必须已经消除，调用期间不得迁移 CPU。
+/// source 必须来自本核尚未完成的真实 claim；源已屏蔽，处理者已退出，
+/// 本核不可迁移，调用者持该源 descriptor 锁保护完成与重新开放。
 pub unsafe fn external_complete(source: u32) {
-    assert_eq!(source, crate::boot::info().interrupts.uart_source);
-    iocsr_write32(ext_reg(0x400), 1 << source);
+    let (word, bit) = source_word(source);
+    let _controller = EXTERNAL_CONTROLLER.lock();
+    iocsr_write32(ext_reg(0x400 + word), bit);
     barrier();
 }
 /// 写入所选 virt FDT 的 GED syscon poweroff 字节。

@@ -1,6 +1,6 @@
 //! 固定 Sv39/QEMU virt 后端；SBI 只使用 TIME、IPI、HSM、SRST。
 use crate::{
-    boot::BootInfo,
+    boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO},
     cpu::{CpuBoot, CpuLocal},
     sched::context::TaskContext,
 };
@@ -174,7 +174,7 @@ unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next
     // 新表的容量在取址前检查，非叶项只由本函数写入池中表的物理地址。
     unsafe {
         while pa < end {
-            let huge = (va | pa) & 0x1fffff == 0 && 0x200000 <= end - pa;
+            let huge = huge_leaf(va, pa, end);
             let target = if huge { 1 } else { 0 };
             let mut current = table(0);
             for level in (target + 1..=2).rev() {
@@ -190,28 +190,169 @@ unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next
                 assert_eq!(pte & 0xe, 0, "Sv39 mapping levels overlap");
                 current = phys_to_virt((pte >> 10) << 12) as *mut usize;
             }
-            ptr::write(
-                current.add((va >> (12 + 9 * target)) & 511),
-                (pa >> 2) | flags | 1,
-            );
+            let leaf = current.add((va >> (12 + 9 * target)) & 511);
+            assert_eq!(ptr::read(leaf), 0, "Sv39 leaf mappings overlap");
+            ptr::write(leaf, (pa >> 2) | flags | 1);
             let step = if huge { 0x200000 } else { 4096 };
             pa += step;
             va += step;
         }
     }
 }
-/// 建立实际 RAM/设备的最终表；保留只读 AP bootstrap 表而删除最终低别名。
+/// 判断当前真实映射前缀能否采用 2MiB 叶项，预算与 PTE 写入共用此规则。
+fn huge_leaf(va: usize, pa: usize, end: usize) -> bool {
+    (va | pa) & 0x1fffff == 0 && 0x200000 <= end - pa
+}
+
+#[derive(Clone, Copy)]
+struct BootMapping {
+    virtual_start: usize,
+    physical: Region,
+    flags: usize,
+}
+
+const MAX_BOOT_MAPPINGS: usize = 1 + MAX_MEMORY_REGIONS + 2 + MAX_VIRTIO_MMIO + 1 + 4;
+
+/// 在建表之前核对页边界、canonical VA 和所有实际映射的虚拟范围不重叠。
+fn add_mapping(
+    mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
+    count: &mut usize,
+    virtual_start: usize,
+    physical: Region,
+    flags: usize,
+) {
+    assert!(
+        physical.start < physical.end
+            && (physical.start | physical.end | virtual_start) & 4095 == 0
+    );
+    let virtual_end = virtual_start
+        .checked_add(physical.end - physical.start)
+        .expect("Sv39 mapping address overflows");
+    for address in [virtual_start, virtual_end - 1] {
+        let upper = address >> 39;
+        let expected = if address & (1usize << 38) == 0 {
+            0
+        } else {
+            usize::MAX >> 39
+        };
+        assert_eq!(upper, expected, "Sv39 mapping is not canonical");
+    }
+    for old in &mappings[..*count] {
+        let old_end = old.virtual_start + (old.physical.end - old.physical.start);
+        assert!(
+            virtual_end <= old.virtual_start || old_end <= virtual_start,
+            "Sv39 mappings overlap"
+        );
+    }
+    assert!(*count < mappings.len(), "Sv39 mapping capacity exceeded");
+    mappings[*count] = BootMapping {
+        virtual_start,
+        physical,
+        flags,
+    };
+    *count += 1;
+}
+
+/// 将已验证设备范围向外取页边界，仅映射真实 CPU 物理窗口。
+fn add_device_mapping(
+    mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
+    count: &mut usize,
+    region: Region,
+) {
+    let physical = Region {
+        start: region.start & !4095,
+        end: region
+            .end
+            .checked_add(4095)
+            .expect("MMIO page rounding overflows")
+            & !4095,
+    };
+    add_mapping(
+        mappings,
+        count,
+        mmio_address(physical.start),
+        physical,
+        0xc6,
+    );
+}
+
+/// 按实际 2MiB/4KiB 叶项计算唯一 L1/L0 表数，64页不足时在写表前明确失败。
+fn mapping_table_count(mappings: &[BootMapping]) -> usize {
+    let mut branches = [usize::MAX; 64];
+    let mut count = 0;
+    for mapping in mappings {
+        let mut va = mapping.virtual_start;
+        let mut pa = mapping.physical.start;
+        while pa < mapping.physical.end {
+            let huge = huge_leaf(va, pa, mapping.physical.end);
+            let keys = [va >> 30, (1usize << 63) | (va >> 21)];
+            for &key in &keys[..if huge { 1 } else { 2 }] {
+                if !branches[..count].contains(&key) {
+                    assert!(count < 63, "Sv39 boot page table pool exhausted");
+                    branches[count] = key;
+                    count += 1;
+                }
+            }
+            let step = if huge { 0x200000 } else { 4096 };
+            va += step;
+            pa += step;
+        }
+    }
+    1 + count
+}
+
+/// 在 AP 释放前为实际 RAM、全部 MMIO 槽、PCI ECAM 和 MEM ranges 安装最终 PTE。
 ///
 /// # Safety
 /// 只能由关闭 IRQ 的 BSP 在使用 bootstrap 表且 AP 尚未释放时调用一次。
-/// info 必须描述实际 QEMU RAM/设备，区间算术不得溢出、映射窗口不得重叠；
-/// RAM 必须覆盖当前栈、CpuLocal、页表池及全部内核运行资源。
+/// info 描述真实 QEMU RAM/设备，RAM 覆盖当前栈、CpuLocal、页表池及全部内核资源；
+/// 不得与其他页表访问并发。IO ranges 不作为内存或 DMA RAM 映射。
 pub unsafe fn finish_boot_mappings(info: &BootInfo) {
-    let start = address!(__kernel_phys_start);
-    let end = (address!(__kernel_phys_end) + 4095) & !4095;
-    let kernel_virtual = address!(__kernel_virt_start);
-    // SAFETY: 调用者保证 BSP 独占未激活的表池和真实映射范围；内核与直映覆盖
-    // 切表后的取指、栈及表遍历，fence/sfence 在发布 SATP 前后同步表项与 TLB。
+    let kernel = Region {
+        start: address!(__kernel_phys_start),
+        end: address!(__kernel_phys_end)
+            .checked_add(4095)
+            .expect("kernel page rounding overflows")
+            & !4095,
+    };
+    let empty = BootMapping {
+        virtual_start: 0,
+        physical: Region { start: 0, end: 0 },
+        flags: 0,
+    };
+    let mut mappings = [empty; MAX_BOOT_MAPPINGS];
+    let mut count = 0;
+    add_mapping(
+        &mut mappings,
+        &mut count,
+        address!(__kernel_virt_start),
+        kernel,
+        0xce,
+    );
+    for &region in &info.memory[..info.memory_count] {
+        add_mapping(
+            &mut mappings,
+            &mut count,
+            phys_to_virt(region.start),
+            region,
+            0xc6,
+        );
+    }
+    for region in [info.interrupts.uart, info.interrupts.controller] {
+        add_device_mapping(&mut mappings, &mut count, region);
+    }
+    for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
+        add_device_mapping(&mut mappings, &mut count, resource.registers);
+    }
+    add_device_mapping(&mut mappings, &mut count, info.pci.configuration);
+    for range in &info.pci.ranges[..info.pci.range_count] {
+        if matches!(range.flags & 0x0300_0000, 0x0200_0000 | 0x0300_0000) {
+            add_device_mapping(&mut mappings, &mut count, range.cpu);
+        }
+    }
+    let required = mapping_table_count(&mappings[..count]);
+    // SAFETY: BSP 独占未激活表池，全部 VA/PA 范围及准确表数已经核对；
+    // 内核与 RAM 直映保证切表后取指、栈和表遍历有效，AP 只消费完成发布的 SATP。
     unsafe {
         ptr::write_bytes(
             ptr::addr_of_mut!(FINAL_TABLES).cast::<u8>(),
@@ -219,28 +360,16 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             size_of::<[PageTable; 64]>(),
         );
         let mut next = 1;
-        map_range(kernel_virtual, start, end, 0xce, &mut next);
-        for region in &info.memory[..info.memory_count] {
-            assert_eq!(region.start & 4095, 0, "RAM start is not page aligned");
-            assert_eq!(region.end & 4095, 0, "RAM end is not page aligned");
+        for mapping in &mappings[..count] {
             map_range(
-                phys_to_virt(region.start),
-                region.start,
-                region.end,
-                0xc6,
+                mapping.virtual_start,
+                mapping.physical.start,
+                mapping.physical.end,
+                mapping.flags,
                 &mut next,
             );
         }
-        for region in [info.interrupts.uart, info.interrupts.controller] {
-            let start = region.start & !4095;
-            map_range(
-                mmio_address(start),
-                start,
-                (region.end + 4095) & !4095,
-                0xc6,
-                &mut next,
-            );
-        }
+        assert_eq!(next, required, "Sv39 page table budget mismatch");
         RV_FINAL_SATP = (8usize << 60) | (virt_to_phys(table(0) as usize) >> 12);
         asm!("fence rw, rw", "csrw satp, {0}", "sfence.vma", in(reg) RV_FINAL_SATP, options(nostack));
     }
@@ -448,15 +577,17 @@ unsafe fn mmio_write(offset: usize, value: u32) {
 fn claim_offset() -> usize {
     0x200004 + crate::boot::info().interrupts.plic_contexts[crate::cpu::current().id] * 0x1000
 }
-/// 初始化 FDT 指定的所有 S context，UART 仅路由到 BSP。
+/// 初始化所有合法源的 priority，并将固定路由只保留在实际 BSP 的 S context。
 ///
 /// # Safety
-/// info 必须是已发布的实际 QEMU PLIC 描述，设备窗口已映射；
-/// UART 源号必须小于 1024 且非零，所有 S context 的 enable/threshold/claim 槽必须完整落在窗口内。
-/// BSP 必须关闭 IRQ 且 AP 尚未释放，不能与 claim/complete 或 enable 读改写并发。
+/// info 是已发布的实际 QEMU PLIC 描述，设备窗口已映射；source_count 不超过 1024，
+/// 所有 S context 的 enable/threshold/claim 槽完整落在窗口内。
+/// BSP 必须关闭 IRQ 且 AP 尚未释放，不能与 claim/complete 或 enable 访问并发。
 pub unsafe fn external_init(info: &BootInfo) {
-    // SAFETY: 调用者保证实际 S context、源号和已发布窗口一致；启动串行阶段
-    // 独占 enable/threshold/priority 寄存器，32 位寄存器地址按 PLIC 布局计算。
+    assert!(1 < info.interrupts.source_count && info.interrupts.source_count <= 1024);
+    let words = (info.interrupts.source_count as usize).div_ceil(32);
+    // SAFETY: 调用者保证实际 context 和已映射窗口；此时独占 enable/threshold/priority，
+    // 固定路由中只使用实际合法非零源，屏蔽只改 priority 不撤 enable。
     unsafe {
         for &context in &info.interrupts.plic_contexts[..info.cpu_count] {
             for word in 0..32 {
@@ -464,28 +595,45 @@ pub unsafe fn external_init(info: &BootInfo) {
             }
             mmio_write(0x200000 + context * 0x1000, 0);
         }
-        let source = info.interrupts.uart_source as usize;
-        mmio_write(source * 4, 0);
-        let offset = 0x2000 + info.interrupts.plic_contexts[0] * 0x80 + source / 32 * 4;
-        mmio_write(offset, 1 << (source % 32));
+        for source in 1..info.interrupts.source_count {
+            mmio_write(source as usize * 4, 0);
+        }
+        for word in 0..words {
+            let remaining = info.interrupts.source_count as usize - word * 32;
+            let mut bits = if 32 <= remaining {
+                u32::MAX
+            } else {
+                (1u32 << remaining) - 1
+            };
+            if word == 0 {
+                bits &= !1;
+            }
+            mmio_write(
+                0x2000 + info.interrupts.plic_contexts[0] * 0x80 + word * 4,
+                bits,
+            );
+        }
     }
 }
-/// 将 UART 源优先级置零，屏蔽通知但保留固定路由与待处理状态。
-pub fn external_mask() {
-    // SAFETY: 实际源号和窗口已经验证；公共 IRQ 描述符锁串行化此源状态，
-    // priority=0 禁止 claim，enable 保留以允许已 claim 的源正常 complete。
-    unsafe { mmio_write(crate::boot::info().interrupts.uart_source as usize * 4, 0) };
+
+/// 将实际源优先级置零，保留固定路由、pending 与已 claim 的完成资格。
+pub fn external_mask(source: u32) {
+    assert!(0 < source && source < crate::boot::info().interrupts.source_count);
+    // SAFETY: 源号与实际窗口已验证，源 descriptor 锁串行化对应独立 priority word。
+    unsafe { mmio_write(source as usize * 4, 0) };
 }
-/// 恢复 UART 源优先级，使屏蔽期间已有的 pending 重新参与通知。
-pub fn external_unmask() {
-    // SAFETY: 描述符锁串行化有效源的 priority；固定 BSP 路由已经在独占初始化时建立。
-    // priority 写入使控制器重新评估 pending，不能只改变路由 enable 位。
-    unsafe { mmio_write(crate::boot::info().interrupts.uart_source as usize * 4, 1) };
+
+/// 恢复实际源 priority=1，让屏蔽期间已有 pending 重新参与通知。
+pub fn external_unmask(source: u32) {
+    assert!(0 < source && source < crate::boot::info().interrupts.source_count);
+    // SAFETY: 源 descriptor 锁串行化独立 priority，BSP enable 路由在初始化后保持不变。
+    unsafe { mmio_write(source as usize * 4, 1) };
 }
+
 /// 从本核真实 PLIC context claim；零表示无待处理源。
 pub fn external_claim() -> Option<u32> {
-    // SAFETY: 引导入口已初始化实际 PLIC；已安装的 CpuLocal 选择本核 S context，
-    // claim 由本核 IRQ 流读取，不与其他核共用该寄存器。
+    // SAFETY: 启动入口初始化实际 PLIC，永久 CpuLocal 选择本核 S context；
+    // 该 claim 寄存器只由本核 IRQ 流读取。
     let source = unsafe { mmio_read(claim_offset()) };
     if source == 0 {
         None
@@ -493,14 +641,15 @@ pub fn external_claim() -> Option<u32> {
         Some(source)
     }
 }
-/// 完成本核已 claim 的硬件源，不改变源的屏蔽状态或固定路由。
+
+/// 完成本核已 claim 的实际源，不改变 priority 或固定路由。
 ///
 /// # Safety
-/// source 必须来自本核尚未完成的真实 claim，且等于已验证的 UART 硬件源；
-/// 调用者必须持有对应 IRQ 描述符锁，不能跨核或重复 complete。
+/// source 必须来自本核尚未完成的真实 claim；调用者持对应 descriptor 锁，
+/// 不能跨核、迁移或重复 complete；源号完整落在实际 PLIC 范围内。
 pub unsafe fn external_complete(source: u32) {
-    // SAFETY: source 是本核已 claim 的 UART 源，complete 槽由已验证的 context 定位；
-    // 路由 enable 永久保留，priority 屏蔽不影响这次真实完成。
+    assert!(0 < source && source < crate::boot::info().interrupts.source_count);
+    // SAFETY: 本核真实 claim 与已验证 S context 对应，固定 enable 保留其完成资格。
     unsafe { mmio_write(claim_offset(), source) };
 }
 /// 请求 SBI SRST 关机，失败或异常返回均报告。

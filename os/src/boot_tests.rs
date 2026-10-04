@@ -1,7 +1,8 @@
 //! 普通 CPU 执行流驱动的硬件与生命周期自检，测试协调数据独立于 CpuLocal。
 
+use crate::irq::IrqRegistration;
 use crate::{arch, console, cpu, irq, sync::IrqSaveGuard};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const MAX: usize = crate::boot::MAX_CPUS;
 const PAIR: usize = 1;
@@ -22,6 +23,8 @@ static ENTERED: AtomicBool = AtomicBool::new(false);
 static RETURNED: AtomicBool = AtomicBool::new(false);
 static UART_ENTERED: AtomicBool = AtomicBool::new(false);
 static UART_RETURNED: AtomicBool = AtomicBool::new(false);
+// 仅 UART_REMOVE 阶段借用 BSP 栈中不移动的 token；join 与 handler 退出后才撤指针。
+static UART_REGISTRATION: AtomicPtr<IrqRegistration> = AtomicPtr::new(core::ptr::null_mut());
 
 /// 记录首个真实失败并结束客体，宿主仍须拒绝该次运行。
 fn check(ok: bool, name: &str) {
@@ -195,6 +198,8 @@ pub unsafe fn local_checks() {
 ///
 /// # Safety
 /// 仅由完成本核设施初始化的 AP 入口调用一次，拥有独占内核栈和有效 CpuLocal。
+/// UART_REMOVE 的 BSP 保持所发布 token 地址固定，直到本核 ACK 和该 handler 退出；
+/// 此期间各核只建立共享借用，token 内部锁串行化控制，context 不移动或结束生命周期。
 pub unsafe fn secondary() -> ! {
     // SAFETY: AP 引导入口已安装异常/CPU 基址并开启 IRQ，当前执行流不持有锁。
     unsafe { local_checks() };
@@ -223,7 +228,13 @@ pub unsafe fn secondary() -> ! {
                     || UART_ENTERED.load(Ordering::Acquire),
                     "uart-handler-entered",
                 );
-                irq::unregister_uart();
+                let pointer = UART_REGISTRATION.load(Ordering::Acquire);
+                check(!pointer.is_null(), "uart-registration-published");
+                // SAFETY: UART_ENTERED 和阶段发布均来自 BSP 本轮稳定栈 token；
+                // BSP 等待本核 ACK 后才撤指针，期间只有共享别名与内部受锁状态访问。
+                let registration = unsafe { &*pointer };
+                console::disable_interrupts();
+                registration.unregister_sync();
                 UART_RETURNED.store(true, Ordering::Release);
             }
             #[cfg(feature = "memory-tests")]
@@ -278,19 +289,28 @@ impl UartContext {
 /// 通过真实 UART 接收并在注销期间检查 context 生命周期。
 ///
 /// # Safety
-/// argument 指向尚未同步注销的 UartContext，注册拥有者保持其存活；
-/// 本函数由当前 UART IRQ action 调用，未持有端口或描述符锁。
-unsafe fn uart_action(argument: *mut ()) {
-    // SAFETY: 注册者保持对象到 unregister 返回；这里只读取原子字段和不可变配置。
+/// argument 指向尚未同步注销的 UartContext，注册拥有者保持地址固定且只共享访问；
+/// 本函数由当前 UART IRQ action 调用，未持有端口或描述符锁。concurrent 为真时，
+/// UART_REGISTRATION 指向同轮稳定 token，拥有者等待远核 ACK 与本 handler 退出才撤借用。
+unsafe fn uart_action(argument: *mut ()) -> bool {
+    // SAFETY: 注册者保持对象到 unregister_sync 返回；这里只读取原子字段和不可变配置。
     let context = unsafe { &*argument.cast::<UartContext>() };
     check(
         context.alive.load(Ordering::Acquire),
         "uart-context-after-unregister",
     );
     context.hits.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: 当前处于非嵌套 UART action，未持有 PORT；默认 handler 不使用 context。
+    // 先消费实际 RX，再允许远核停止 UART producer；等待期间不持有端口锁。
+    let handled = unsafe { console::uart_handler(core::ptr::null_mut()) };
     if context.concurrent {
+        let pointer = UART_REGISTRATION.load(Ordering::Acquire);
+        check(!pointer.is_null(), "uart-action-registration");
+        // SAFETY: concurrent 仅用于已发布稳定 token 的本轮；注销拥有者在 action
+        // 执行引用归零与远核 ACK 之前不撤指针，is_enabled 只作内部短锁的共享查询。
+        let registration = unsafe { &*pointer };
         UART_ENTERED.store(true, Ordering::Release);
-        until(|| !irq::uart_enabled(), "uart-disable-published");
+        until(|| !registration.is_enabled(), "uart-disable-published");
         check(
             !UART_RETURNED.load(Ordering::Acquire),
             "uart-remove-before-handler-exit",
@@ -307,9 +327,8 @@ unsafe fn uart_action(argument: *mut ()) {
             );
         }
     }
-    // SAFETY: 当前正处于非嵌套 UART action，未持有 PORT；默认 handler 不使用 context。
-    unsafe { console::uart_handler(core::ptr::null_mut()) };
     context.exited.store(true, Ordering::Release);
+    handled
 }
 
 /// 等待真实 RX action 消费一个指定字节，不从轮询路径绕过中断处理者。
@@ -321,21 +340,32 @@ fn receive(byte: u8, before: usize) {
     );
 }
 
-/// 验证硬件接收、屏蔽、同步注销和新 context 注册，并在结束前停止 action。
-fn uart_checks() {
-    let mut context = UartContext::new(false);
-    irq::disable_uart();
-    irq::unregister_uart();
-    // SAFETY: 旧 action 已同步退出；context 在注销前保持栈地址且只通过原子共享访问。
-    unsafe { irq::register_uart(uart_action, (&mut context as *mut UartContext).cast()) };
-    irq::enable_uart();
+/// 验证真实 RX、屏蔽 pending、同步注销与新 context；初始 token 也由本轮显式停止。
+fn uart_checks(initial_registration: &IrqRegistration) {
+    console::disable_interrupts();
+    initial_registration.unregister_sync();
+    let number = irq::map_source(crate::boot::info().interrupts.uart_source)
+        .expect("UART test source is outside the IRQ domain");
+    let context = UartContext::new(false);
+    // SAFETY: 初始 action 已同步退出；context 地址固定且全部可变字段为原子，
+    // 本执行流在其生命周期结束以前先停止设备 producer 并同步注销。
+    let registration = unsafe {
+        irq::register(
+            number,
+            uart_action,
+            (&context as *const UartContext).cast_mut().cast(),
+        )
+    }
+    .expect("UART test action registration failed");
+    console::enable_receive_interrupts();
+    registration.enable();
     let before = console::received();
     crate::test_println!("UART READY normal");
     receive(b'U', before);
     check(0 < context.hits.load(Ordering::Acquire), "uart-real-action");
     crate::test_println!("PASS uart normal");
 
-    irq::disable_uart();
+    registration.disable_sync();
     let hits = context.hits.load(Ordering::Acquire);
     let before = console::received();
     crate::test_println!("UART READY masked");
@@ -344,17 +374,30 @@ fn uart_checks() {
         console::received() == before && context.hits.load(Ordering::Acquire) == hits,
         "uart-mask-no-handler",
     );
-    irq::enable_uart();
+    registration.enable();
     receive(b'M', before);
     crate::test_println!("PASS uart mask-unmask");
-    irq::disable_uart();
-    irq::unregister_uart();
+    console::disable_interrupts();
+    registration.unregister_sync();
     context.alive.store(false, Ordering::Release);
 
-    let mut old = UartContext::new(1 < cpu::count());
-    // SAFETY: 源已停止并同步注销，old 保持有效到本次同步注销完成。
-    unsafe { irq::register_uart(uart_action, (&mut old as *mut UartContext).cast()) };
-    irq::enable_uart();
+    let old = UartContext::new(1 < cpu::count());
+    // SAFETY: 前一 action 已停止并同步注销；old 保持固定栈地址且只作共享原子访问。
+    // AP 注销完成由 join 同步确认，在此之前不移动 old 或结束其生命周期。
+    let old_registration = unsafe {
+        irq::register(
+            number,
+            uart_action,
+            (&old as *const UartContext).cast_mut().cast(),
+        )
+    }
+    .expect("UART lifecycle action registration failed");
+    UART_REGISTRATION.store(
+        (&old_registration as *const IrqRegistration).cast_mut(),
+        Ordering::Release,
+    );
+    console::enable_receive_interrupts();
+    old_registration.enable();
     let before = console::received();
     if 1 < cpu::count() {
         start(UART_REMOVE);
@@ -372,11 +415,12 @@ fn uart_checks() {
             "uart-unregister-synchronized",
         );
     } else {
-        irq::disable_uart();
-        irq::unregister_uart();
+        console::disable_interrupts();
+        old_registration.unregister_sync();
     }
+    UART_REGISTRATION.store(core::ptr::null_mut(), Ordering::Release);
     old.alive.store(false, Ordering::Release);
-    check(!irq::uart_enabled(), "uart-tail-kept-disabled");
+    check(!old_registration.is_enabled(), "uart-tail-kept-disabled");
     let hits = old.hits.load(Ordering::Acquire);
     let before = console::received();
     crate::test_println!("UART READY unregistered");
@@ -385,17 +429,32 @@ fn uart_checks() {
         console::received() == before && old.hits.load(Ordering::Acquire) == hits,
         "uart-unregister-no-old-access",
     );
-    let mut new = UartContext::new(false);
-    // SAFETY: old 已同步退出；new 保持栈地址和有效原子状态直到其注销返回。
-    unsafe { irq::register_uart(uart_action, (&mut new as *mut UartContext).cast()) };
-    irq::enable_uart();
+    let new = UartContext::new(false);
+    // SAFETY: old 已同步退出且远核不再借用其 token；new 保持固定地址与共享原子状态，
+    // 本执行流在结束 new 生命周期前停止 UART producer 并同步注销。
+    let new_registration = unsafe {
+        irq::register(
+            number,
+            uart_action,
+            (&new as *const UartContext).cast_mut().cast(),
+        )
+    }
+    .expect("UART replacement action registration failed");
+    console::enable_receive_interrupts();
+    new_registration.enable();
+    old_registration.disable_sync();
+    old_registration.unregister_sync();
+    check(
+        new_registration.is_enabled() && !old_registration.is_enabled(),
+        "uart-old-registration-isolated",
+    );
     receive(b'R', before);
     check(
         0 < new.hits.load(Ordering::Acquire) && old.hits.load(Ordering::Acquire) == hits,
         "uart-reregister-new-context",
     );
-    irq::disable_uart();
-    irq::unregister_uart();
+    console::disable_interrupts();
+    new_registration.unregister_sync();
     new.alive.store(false, Ordering::Release);
     crate::test_println!(
         "PASS uart lifecycle mode={}",
@@ -412,7 +471,8 @@ fn uart_checks() {
 /// # Safety
 /// 仅由 BSP 在所有 CPU 上线后调用一次；本核 IRQ 开启且没有持锁。
 /// 普通构建独占平台自检副本和串口生命周期，AP 只运行各自的协作执行流。
-pub unsafe fn primary() -> ! {
+/// initial_registration 独占拥有默认 UART action；本入口保活 token，并在生命周期测试中同步注销。
+pub unsafe fn primary(_initial_registration: IrqRegistration) -> ! {
     #[cfg(feature = "fault-test")]
     {
         crate::test_println!("FAULT READY arch={} cpus={}", arch::NAME, cpu::count());
@@ -518,7 +578,7 @@ pub unsafe fn primary() -> ! {
             crate::mm::tests::primary();
             join(MEMORY);
         }
-        uart_checks();
+        uart_checks(&_initial_registration);
         PHASE.store(STOP, Ordering::Release);
         crate::test_println!("STAGE1 PASS");
         arch::shutdown();

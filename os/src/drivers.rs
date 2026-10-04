@@ -1,0 +1,117 @@
+//! 当前启用设备的只读资源发现入口；普通 Task 负责准备，IRQ 不扩容。
+
+use alloc::vec::Vec;
+use core::ptr;
+use virtio_drivers::transport::pci::bus::PciError;
+
+use crate::{
+    arch,
+    boot::{self, Region},
+    irq::{self, IrqError, IrqNumber},
+    task,
+};
+
+pub mod pci;
+
+use crate::drivers::pci::PciInventory;
+
+/// 资源发现的唯一错误类型，保留固件、PCI 和 IRQ 边界的实际失败。
+#[derive(Debug)]
+pub enum ProbeError {
+    NoMemory,
+    AlreadyDiscovered,
+    Resource(&'static str),
+    Pci(PciError),
+    Irq(IrqError),
+}
+
+impl From<PciError> for ProbeError {
+    /// PCI 配置错误保持原始原因，不自动选择另一配置访问机制。
+    fn from(error: PciError) -> Self {
+        Self::Pci(error)
+    }
+}
+
+impl From<IrqError> for ProbeError {
+    /// IRQ 资源必须来自已初始化的唯一外部 domain。
+    fn from(error: IrqError) -> Self {
+        Self::Irq(error)
+    }
+}
+
+/// 实际 DeviceID=2 的 MMIO block 候选，未操作队列或设备状态。
+#[derive(Debug)]
+pub struct MmioBlockCandidate {
+    pub registers: Region,
+    pub version: u32,
+    pub vendor_id: u32,
+    pub interrupt: IrqNumber,
+}
+
+/// 分开保存 MMIO block 候选与所有 PCI 功能，不预先创建磁盘实例。
+pub struct DeviceInventory {
+    pub mmio_blocks: Vec<MmioBlockCandidate>,
+    pub pci: PciInventory,
+}
+
+/// 普通 init Task 一次读取启用资源；无首盘返回，不设置 queue 或 DRIVER_OK。
+pub fn discover() -> Result<DeviceInventory, ProbeError> {
+    drop(task::current_task());
+    let info = boot::info();
+    let mut mmio_blocks = Vec::new();
+    mmio_blocks
+        .try_reserve_exact(info.virtio_mmio_count)
+        .map_err(|_| ProbeError::NoMemory)?;
+    for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
+        let base = mmio_region_address(resource.registers)?;
+        if resource.registers.end - resource.registers.start < 16 || base & 3 != 0 {
+            return Err(ProbeError::Resource("VirtIO MMIO header window is invalid"));
+        }
+        // SAFETY: BootInfo 仅发布已验证的启用 VirtIO-MMIO 区间，AP 前已安装 PTE
+        // 或强序 DMW；四个对齐 u32 均位于窗口内且是协议只读身份字段。
+        let (magic, version, device_id, vendor_id) = unsafe {
+            (
+                ptr::read_volatile(base as *const u32),
+                ptr::read_volatile((base + 4) as *const u32),
+                ptr::read_volatile((base + 8) as *const u32),
+                ptr::read_volatile((base + 12) as *const u32),
+            )
+        };
+        if magic != 0x7472_6976 || !matches!(version, 1 | 2) {
+            return Err(ProbeError::Resource(
+                "VirtIO MMIO identity or version is invalid",
+            ));
+        }
+        if device_id == 2 {
+            mmio_blocks.push(MmioBlockCandidate {
+                registers: resource.registers,
+                version,
+                vendor_id,
+                interrupt: irq::map_source(resource.interrupt_source)?,
+            });
+        }
+    }
+    mmio_blocks.sort_unstable_by_key(|candidate| candidate.registers.start);
+    let pci = PciInventory::discover(info)?;
+    Ok(DeviceInventory { mmio_blocks, pci })
+}
+
+/// checked CPU PA→强序 VA 换算；可访问映射由 AP 前架构初始化负责。
+pub(crate) fn mmio_region_address(region: Region) -> Result<usize, ProbeError> {
+    if region.end <= region.start {
+        return Err(ProbeError::Resource("MMIO region is empty"));
+    }
+    let base = arch::mmio_address(0);
+    let start = base
+        .checked_add(region.start)
+        .ok_or(ProbeError::Resource("MMIO virtual address overflows"))?;
+    let end = base
+        .checked_add(region.end - 1)
+        .ok_or(ProbeError::Resource("MMIO virtual end overflows"))?;
+    if start != arch::mmio_address(region.start) || end != arch::mmio_address(region.end - 1) {
+        return Err(ProbeError::Resource(
+            "MMIO address exceeds architecture window",
+        ));
+    }
+    Ok(start)
+}

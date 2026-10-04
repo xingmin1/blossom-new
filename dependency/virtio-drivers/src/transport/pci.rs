@@ -98,10 +98,7 @@ pub struct PciTransport {
 }
 
 impl PciTransport {
-    /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
-    /// root controller.
-    ///
-    /// The PCI device must already have had its BARs allocated.
+    /// 从已配置 BAR 的实际设备函数准备 PCI transport，配置链损坏时返回原 PCI 错误。
     pub fn new<H: Hal, C: ConfigurationAccess>(
         root: &mut PciRoot<C>,
         device_function: DeviceFunction,
@@ -122,6 +119,7 @@ impl PciTransport {
         let mut isr_cfg = None;
         let mut device_cfg = None;
         for capability in root.capabilities(device_function) {
+            let capability = capability?;
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
             }

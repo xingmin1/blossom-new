@@ -1,6 +1,7 @@
 //! Module for dealing with a PCI bus in general, without anything specific to VirtIO.
 
 use bitflags::bitflags;
+use core::mem::size_of;
 use core::{
     array,
     convert::TryFrom,
@@ -8,7 +9,6 @@ use core::{
     ops::Deref,
     ptr::NonNull,
 };
-use log::warn;
 use safe_mmio::{fields::ReadPureWrite, UniqueMmioPointer};
 use thiserror::Error;
 
@@ -91,6 +91,27 @@ pub enum PciError {
     /// The device reported an invalid BAR type.
     #[error("Invalid PCI BAR type")]
     InvalidBarType,
+    /// BAR 索引越过当前配置头的资源表。
+    #[error("Invalid PCI BAR index")]
+    InvalidBarIndex,
+    /// BAR 的大小掩码不能表示合法的二次幂窗口。
+    #[error("Invalid PCI BAR size")]
+    InvalidBarSize,
+    /// CAM 地址、长度或总线边界无效。
+    #[error("Invalid PCI configuration window")]
+    InvalidConfigurationWindow,
+    /// capability 指针未对齐或落在配置头内。
+    #[error("Invalid PCI capability offset")]
+    InvalidCapabilityOffset,
+    /// capability 链重复访问同一位置。
+    #[error("PCI capability cycle")]
+    CapabilityCycle,
+    /// capability 声明的长度越界或短于所需字段。
+    #[error("Invalid PCI capability length")]
+    InvalidCapabilityLength,
+    /// 设备未接受 BAR 探测所需的 decode 关闭。
+    #[error("PCI command change was rejected")]
+    CommandRejected,
 }
 
 /// The root complex of a PCI bus.
@@ -184,12 +205,13 @@ impl<C: ConfigurationAccess> PciRoot<C> {
         );
     }
 
-    /// Gets an iterator over the capabilities of the given device function.
+    /// 遍历选定功能的 capability，非法 offset、长度或循环通过迭代项返回错误。
     pub fn capabilities(&self, device_function: DeviceFunction) -> CapabilityIterator<C> {
         CapabilityIterator {
             configuration_access: &self.configuration_access,
             device_function,
             next_capability_offset: self.capabilities_offset(device_function),
+            visited: 0,
         }
     }
 
@@ -213,116 +235,120 @@ impl<C: ConfigurationAccess> PciRoot<C> {
         Ok(bars)
     }
 
-    /// Gets information about the given BAR of the given device function.
+    /// 在关闭 decode 时探测单个 BAR；所有正常错误都保留原 BAR 与 command。
     pub fn bar_info(
         &mut self,
         device_function: DeviceFunction,
         bar_index: u8,
     ) -> Result<Option<BarInfo>, PciError> {
-        // Disable address decoding while sizing the BAR.
-        let (_status, command_orig) = self.get_status_command(device_function);
-        let command_disable_decode = command_orig & !(Command::IO_SPACE | Command::MEMORY_SPACE);
-        if command_disable_decode != command_orig {
-            self.set_command(device_function, command_disable_decode);
-        }
-
-        let bar_orig = self
-            .configuration_access
-            .read_word(device_function, BAR0_OFFSET + 4 * bar_index);
-        let io_space = bar_orig & 0x00000001 == 0x00000001;
-
-        // Get the size of the BAR.
-        self.configuration_access.write_word(
-            device_function,
-            BAR0_OFFSET + 4 * bar_index,
-            0xffffffff,
-        );
-        let mut size_mask = u64::from(
-            self.configuration_access
-                .read_word(device_function, BAR0_OFFSET + 4 * bar_index),
-        );
-
-        // Read the upper 32 bits of 64-bit memory BARs.
-        let (address_top, size_top) = if bar_orig & 0b111 == 0b100 {
-            if bar_index >= 5 {
-                return Err(PciError::InvalidBarType);
-            }
-            let bar_top_orig = self
-                .configuration_access
-                .read_word(device_function, BAR0_OFFSET + 4 * (bar_index + 1));
-            self.configuration_access.write_word(
-                device_function,
-                BAR0_OFFSET + 4 * (bar_index + 1),
-                0xffffffff,
-            );
-            let size_top = self
-                .configuration_access
-                .read_word(device_function, BAR0_OFFSET + 4 * (bar_index + 1));
-            self.configuration_access.write_word(
-                device_function,
-                BAR0_OFFSET + 4 * (bar_index + 1),
-                bar_top_orig,
-            );
-            (bar_top_orig, size_top)
-        } else {
-            let size_top = if size_mask == 0 { 0 } else { 0xffffffff };
-            (0, size_top)
+        let header =
+            (self.configuration_access.read_word(device_function, 0x0c) >> 16) as u8 & 0x7f;
+        let count = match header {
+            0 => 6,
+            1 => 2,
+            _ => 0,
         };
-        size_mask |= u64::from(size_top) << 32;
-
-        // For IO BARs bits 2 and 3 can be part of the address.
-        let flag_bits = if io_space { 0b11 } else { 0b1111 };
-        // A wrapping add is necessary to correctly handle the case of unused BARs, which read back
-        // as 0, and should be treated as size 0.
-        let size = (!(size_mask & !flag_bits)).wrapping_add(1);
-
-        // Restore the original value.
-        self.configuration_access.write_word(
-            device_function,
-            BAR0_OFFSET + 4 * bar_index,
-            bar_orig,
-        );
-
-        if command_disable_decode != command_orig {
-            self.set_command(device_function, command_orig);
+        if count <= bar_index {
+            return Err(PciError::InvalidBarIndex);
         }
+        let offset = BAR0_OFFSET + 4 * bar_index;
+        let original = self.configuration_access.read_word(device_function, offset);
+        let io_space = original & 1 != 0;
+        let address_type = if io_space {
+            MemoryBarType::Width32
+        } else {
+            MemoryBarType::try_from(((original >> 1) & 3) as u8)?
+        };
+        let wide = address_type == MemoryBarType::Width64;
+        if wide && count <= bar_index + 1 {
+            return Err(PciError::InvalidBarIndex);
+        }
+        let top = if wide {
+            self.configuration_access
+                .read_word(device_function, offset + 4)
+        } else {
+            0
+        };
+        let (_, command) = self.get_status_command(device_function);
+        self.set_command(
+            device_function,
+            command & !(Command::IO_SPACE | Command::MEMORY_SPACE),
+        );
+        if self
+            .get_status_command(device_function)
+            .1
+            .intersects(Command::IO_SPACE | Command::MEMORY_SPACE)
+        {
+            self.set_command(device_function, command);
+            return Err(PciError::CommandRejected);
+        }
+        self.configuration_access
+            .write_word(device_function, offset, u32::MAX);
+        if wide {
+            self.configuration_access
+                .write_word(device_function, offset + 4, u32::MAX);
+        }
+        let low_mask = self.configuration_access.read_word(device_function, offset);
+        let high_mask = if wide {
+            self.configuration_access
+                .read_word(device_function, offset + 4)
+        } else {
+            0
+        };
+        self.configuration_access
+            .write_word(device_function, offset, original);
+        if wide {
+            self.configuration_access
+                .write_word(device_function, offset + 4, top);
+        }
+        self.set_command(device_function, command);
 
-        if size_mask == 0 {
-            Ok(None)
-        } else if io_space {
-            // I/O space
-            let address = bar_orig & 0xfffffffc;
+        let flags = if io_space { 3u64 } else { 15u64 };
+        let width_mask = if wide { u64::MAX } else { u64::from(u32::MAX) };
+        let mask = (u64::from(low_mask) | (u64::from(high_mask) << 32)) & !flags;
+        if mask == 0 {
+            return Ok(None);
+        }
+        // 二次幂大小的地址掩码必须连续；零大小与全 1 错误读都不能发表成资源。
+        let size = ((!mask & width_mask).wrapping_add(1)) & width_mask;
+        if !size.is_power_of_two()
+            || mask != (width_mask & !(size - 1) & !flags)
+            || low_mask == INVALID_READ
+        {
+            return Err(PciError::InvalidBarSize);
+        }
+        if io_space {
             Ok(Some(BarInfo::IO {
-                address,
+                address: original & !3,
                 size: size as u32,
             }))
         } else {
-            // Memory space
-            let address = u64::from(bar_orig & 0xfffffff0) | (u64::from(address_top) << 32);
-            let prefetchable = bar_orig & 0x00000008 != 0;
-            let address_type = MemoryBarType::try_from(((bar_orig & 0x00000006) >> 1) as u8)?;
             Ok(Some(BarInfo::Memory {
                 address_type,
-                prefetchable,
-                address,
+                prefetchable: original & 8 != 0,
+                address: u64::from(original & !15) | (u64::from(top) << 32),
                 size,
             }))
         }
     }
 
-    /// Sets the address of the given 32-bit memory or I/O BAR of the given device function.
+    /// 配置 32 位 BAR 的地址，保留设备报告的类型与属性位。
     pub fn set_bar_32(&mut self, device_function: DeviceFunction, bar_index: u8, address: u32) {
-        self.configuration_access
-            .write_word(device_function, BAR0_OFFSET + 4 * bar_index, address);
-    }
-
-    /// Sets the address of the given 64-bit memory BAR of the given device function.
-    pub fn set_bar_64(&mut self, device_function: DeviceFunction, bar_index: u8, address: u64) {
+        assert!(bar_index < 6);
+        let offset = BAR0_OFFSET + 4 * bar_index;
+        let original = self.configuration_access.read_word(device_function, offset);
+        let flags = if original & 1 != 0 { 3 } else { 15 };
         self.configuration_access.write_word(
             device_function,
-            BAR0_OFFSET + 4 * bar_index,
-            address as u32,
+            offset,
+            (address & !flags) | (original & flags),
         );
+    }
+
+    /// 配置配对的 64 位 BAR 地址，保留低寄存器中的属性位。
+    pub fn set_bar_64(&mut self, device_function: DeviceFunction, bar_index: u8, address: u64) {
+        assert!(bar_index < 5);
+        self.set_bar_32(device_function, bar_index, address as u32);
         self.configuration_access.write_word(
             device_function,
             BAR0_OFFSET + 4 * (bar_index + 1),
@@ -330,11 +356,21 @@ impl<C: ConfigurationAccess> PciRoot<C> {
         );
     }
 
-    /// Gets the capabilities 'pointer' for the device function, if any.
+    /// 读取选定功能的对齐配置字，不改变设备状态。
+    pub fn read_config_word(&self, device_function: DeviceFunction, offset: u8) -> u32 {
+        self.configuration_access.read_word(device_function, offset)
+    }
+
+    /// 保存原始 capability 指针，由迭代边界拒绝未对齐和越界值。
     fn capabilities_offset(&self, device_function: DeviceFunction) -> Option<u8> {
         let (status, _) = self.get_status_command(device_function);
         if status.contains(Status::CAPABILITIES_LIST) {
-            Some((self.configuration_access.read_word(device_function, 0x34) & 0xFC) as u8)
+            let offset = self.configuration_access.read_word(device_function, 0x34) as u8;
+            if offset == 0 {
+                None
+            } else {
+                Some(offset)
+            }
         } else {
             None
         }
@@ -359,59 +395,89 @@ pub trait ConfigurationAccess {
     unsafe fn unsafe_clone(&self) -> Self;
 }
 
-/// `ConfigurationAccess` implementation for memory-mapped access to a PCI root complex, via either
-/// a 16 MiB region for the PCI Configuration Access Mechanism or a 256 MiB region for the PCIe
-/// Enhanced Configuration Access Mechanism.
+/// 按真实映射长度访问 CAM；未映射总线的读取返回无设备，不构造越界引用。
 pub struct MmioCam<'a> {
     mmio: UniqueMmioPointer<'a, [ReadPureWrite<u32>]>,
     cam: Cam,
 }
 
 impl MmioCam<'_> {
-    /// Wraps the PCI root complex with the given MMIO base address.
-    ///
-    /// Panics if the base address is not aligned to a 4-byte boundary.
+    /// 使用真实字节长度构造配置窗口；窗口须由完整的总线页组成。
     ///
     /// # Safety
-    ///
-    /// `mmio_base` must be a valid pointer to an appropriately-mapped MMIO region of at least
-    /// 16 MiB (if `cam == Cam::MmioCam`) or 256 MiB (if `cam == Cam::Ecam`). The pointer must be
-    /// valid for the lifetime `'a`, which implies that no Rust references may be used to access any
-    /// of the memory region at least during that lifetime.
-    pub unsafe fn new(mmio_base: *mut u8, cam: Cam) -> Self {
-        assert!(mmio_base as usize & 0x3 == 0);
-        Self {
-            mmio: UniqueMmioPointer::new(NonNull::slice_from_raw_parts(
-                NonNull::new(mmio_base as *mut ReadPureWrite<u32>).unwrap(),
-                cam.size() as usize / size_of::<u32>(),
-            )),
-            cam,
+    /// mmio_base 必须指向在整个借用寿命内有效、正确映射的 byte_length 字节
+    /// MMIO 区间。该区间不能存在 Rust 引用或另一份可写 CAM owner。
+    pub unsafe fn new(mmio_base: *mut u8, byte_length: usize, cam: Cam) -> Result<Self, PciError> {
+        let bus_size = cam.size() as usize / 256;
+        if mmio_base.is_null()
+            || mmio_base as usize & 3 != 0
+            || byte_length == 0
+            || (cam.size() as usize) < byte_length
+            || byte_length % bus_size != 0
+            || (mmio_base as usize).checked_add(byte_length).is_none()
+        {
+            return Err(PciError::InvalidConfigurationWindow);
         }
+        // SAFETY: 调用者保证完整有效 MMIO 区间与独占访问；上面的检查保证对齐和真实长度。
+        let mmio = unsafe {
+            UniqueMmioPointer::new(NonNull::slice_from_raw_parts(
+                NonNull::new(mmio_base.cast::<ReadPureWrite<u32>>()).unwrap(),
+                byte_length / size_of::<u32>(),
+            ))
+        };
+        Ok(Self { mmio, cam })
     }
 }
 
 impl ConfigurationAccess for MmioCam<'_> {
+    /// 越过真实窗口的总线读取按 PCI 无设备返回，不访问窗口外地址。
     fn read_word(&self, device_function: DeviceFunction, register_offset: u8) -> u32 {
         let address = self.cam.cam_offset(device_function, register_offset);
-        // Right shift to convert from byte offset to word offset.
-        self.mmio
-            .deref()
-            .get((address >> 2) as usize)
-            .unwrap()
-            .read()
+        let value = match self.mmio.deref().get((address >> 2) as usize) {
+            Some(word) => word.read(),
+            None => INVALID_READ,
+        };
+        configuration_barrier();
+        value
     }
 
+    /// 写入已映射窗口内的配置字；错误目标在解引用以前失败。
     fn write_word(&mut self, device_function: DeviceFunction, register_offset: u8, data: u32) {
         let address = self.cam.cam_offset(device_function, register_offset);
-        self.mmio.get((address >> 2) as usize).unwrap().write(data);
+        self.mmio
+            .get((address >> 2) as usize)
+            .expect("PCI write outside CAM window")
+            .write(data);
+        configuration_barrier();
     }
 
+    /// 枚举器只借此副本读取设备的不可变身份字段。
+    ///
+    /// # Safety
+    /// 返回副本只能读取只读配置字段，不能与原 owner 并发写配置。
     unsafe fn unsafe_clone(&self) -> Self {
+        // SAFETY: 调用者承担副本只读约束；原窗口长度和生命周期原样保留。
+        let mmio =
+            unsafe { UniqueMmioPointer::new(NonNull::new(self.mmio.ptr().cast_mut()).unwrap()) };
         Self {
-            mmio: UniqueMmioPointer::new(NonNull::new(self.mmio.ptr().cast_mut()).unwrap()),
+            mmio,
             cam: self.cam,
         }
     }
+}
+
+/// 配置寄存器操作在弱序架构上必须按序，尤其 decode 关闭必须先于 BAR 探测。
+fn configuration_barrier() {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: fence 只约束本 CPU 内存和 IO 操作顺序，不读取指针或修改执行权限。
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack))
+    };
+    #[cfg(target_arch = "loongarch64")]
+    // SAFETY: dbar 只约束本 CPU 已发出的设备访问，不要求额外寄存器或对象寿命。
+    unsafe {
+        core::arch::asm!("dbar 0", options(nostack))
+    };
 }
 
 // SAFETY: `&MmioCam` only allows MMIO reads, which are fine to happen concurrently on different CPU
@@ -526,36 +592,63 @@ pub struct CapabilityIterator<'a, C: ConfigurationAccess> {
     configuration_access: &'a C,
     device_function: DeviceFunction,
     next_capability_offset: Option<u8>,
+    visited: u64,
 }
 
 impl<C: ConfigurationAccess> Iterator for CapabilityIterator<'_, C> {
-    type Item = CapabilityInfo;
+    type Item = Result<CapabilityInfo, PciError>;
 
+    /// 有界遍历配置头后的 capability；非法链只返回一次错误并结束。
     fn next(&mut self) -> Option<Self::Item> {
-        let offset = self.next_capability_offset?;
-
-        // Read the first 4 bytes of the capability.
-        let capability_header = self
+        let offset = self.next_capability_offset.take()?;
+        if offset < 0x40 || offset & 3 != 0 {
+            return Some(Err(PciError::InvalidCapabilityOffset));
+        }
+        let bit = 1u64 << (offset / 4);
+        if self.visited & bit != 0 {
+            return Some(Err(PciError::CapabilityCycle));
+        }
+        self.visited |= bit;
+        let header = self
             .configuration_access
             .read_word(self.device_function, offset);
-        let id = capability_header as u8;
-        let next_offset = (capability_header >> 8) as u8;
-        let private_header = (capability_header >> 16) as u16;
-
-        self.next_capability_offset = if next_offset == 0 {
-            None
-        } else if next_offset < 64 || next_offset & 0x3 != 0 {
-            warn!("Invalid next capability offset {:#04x}", next_offset);
-            None
-        } else {
-            Some(next_offset)
-        };
-
-        Some(CapabilityInfo {
+        let id = header as u8;
+        let next = (header >> 8) as u8;
+        let private_header = (header >> 16) as u16;
+        if id == 0xff {
+            return Some(Err(PciError::InvalidCapabilityOffset));
+        }
+        if id == PCI_CAP_ID_VNDR {
+            let length = private_header as u8;
+            let vendor = self.configuration_access.read_word(self.device_function, 0) as u16;
+            let kind = (private_header >> 8) as u8;
+            let minimum = if vendor == 0x1af4 && (1..=5).contains(&kind) {
+                if kind == 2 || kind == 5 {
+                    20
+                } else {
+                    16
+                }
+            } else {
+                3
+            };
+            if length < minimum || 256 < u16::from(offset) + u16::from(length) {
+                return Some(Err(PciError::InvalidCapabilityLength));
+            }
+        }
+        if next != 0 {
+            if next < 0x40 || next & 3 != 0 {
+                return Some(Err(PciError::InvalidCapabilityOffset));
+            }
+            if self.visited & (1u64 << (next / 4)) != 0 {
+                return Some(Err(PciError::CapabilityCycle));
+            }
+            self.next_capability_offset = Some(next);
+        }
+        Some(Ok(CapabilityInfo {
             offset,
             id,
             private_header,
-        })
+        }))
     }
 }
 
@@ -582,39 +675,36 @@ pub struct BusDeviceIterator<C: ConfigurationAccess> {
 impl<C: ConfigurationAccess> Iterator for BusDeviceIterator<C> {
     type Item = (DeviceFunction, DeviceFunctionInfo);
 
+    /// 按设备号与真实 multifunction 位枚举，不读取单功能设备的虚假兄弟功能。
     fn next(&mut self) -> Option<Self::Item> {
         while self.next.device < MAX_DEVICES {
-            // Read the header for the current device and function.
             let current = self.next;
             let device_vendor = self.configuration_access.read_word(current, 0);
-
-            // Advance to the next device or function.
+            let present = device_vendor as u16 != 0xffff;
+            let raw_header = if present {
+                self.configuration_access.read_word(current, 12)
+            } else {
+                0
+            };
             self.next.function += 1;
-            if self.next.function >= MAX_FUNCTIONS {
+            if MAX_FUNCTIONS <= self.next.function
+                || (current.function == 0 && (!present || raw_header & (1 << 23) == 0))
+            {
                 self.next.function = 0;
                 self.next.device += 1;
             }
-
-            if device_vendor != INVALID_READ {
+            if present {
                 let class_revision = self.configuration_access.read_word(current, 8);
-                let device_id = (device_vendor >> 16) as u16;
-                let vendor_id = device_vendor as u16;
-                let class = (class_revision >> 24) as u8;
-                let subclass = (class_revision >> 16) as u8;
-                let prog_if = (class_revision >> 8) as u8;
-                let revision = class_revision as u8;
-                let bist_type_latency_cache = self.configuration_access.read_word(current, 12);
-                let header_type = HeaderType::from((bist_type_latency_cache >> 16) as u8 & 0x7f);
                 return Some((
                     current,
                     DeviceFunctionInfo {
-                        vendor_id,
-                        device_id,
-                        class,
-                        subclass,
-                        prog_if,
-                        revision,
-                        header_type,
+                        vendor_id: device_vendor as u16,
+                        device_id: (device_vendor >> 16) as u16,
+                        class: (class_revision >> 24) as u8,
+                        subclass: (class_revision >> 16) as u8,
+                        prog_if: (class_revision >> 8) as u8,
+                        revision: class_revision as u8,
+                        header_type: HeaderType::from((raw_header >> 16) as u8 & 0x7f),
                     },
                 ));
             }
@@ -737,9 +827,9 @@ mod tests {
         );
     }
 
+    /// BAR5 声称 64 位时必须报错，且不破坏原 decode 或资源寄存器。
     #[test]
-    fn bar_info_unused() {
-        let status_command = 0x0020_0003;
+    fn bar_info_invalid_pair_preserves_configuration() {
         let device_function = DeviceFunction {
             bus: 0,
             device: 1,
@@ -747,37 +837,40 @@ mod tests {
         };
         let fake_cam = FakeCam {
             device_function,
-            bar_values: [0, 1, 4, 0, 0, 0],
-            bar_masks: [
-                0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
-            ],
-            status_command,
+            bar_values: [0, 0, 0, 0, 0, 4],
+            bar_masks: [0; 6],
+            status_command: 0x0020_0007,
         };
-        let fake_cam_orig = fake_cam.clone();
+        let original = fake_cam.clone();
         let mut root = PciRoot::new(fake_cam);
-
         assert_eq!(
-            root.bars(device_function).unwrap(),
-            [
-                None,
-                Some(BarInfo::IO {
-                    address: 0,
-                    size: 0,
-                }),
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width64,
-                    prefetchable: false,
-                    address: 0,
-                    size: 0,
-                }),
-                None,
-                None,
-                None,
-            ]
+            root.bar_info(device_function, 5),
+            Err(PciError::InvalidBarIndex)
         );
+        assert_eq!(root.configuration_access, original);
+    }
 
-        // Status and command should be restored to their initial values, as should BAR values.
-        assert_eq!(root.configuration_access, fake_cam_orig);
+    /// 不连续的大小掩码在探测后失败，原 BAR 与 command 仍必须恢复。
+    #[test]
+    fn bar_info_invalid_size_preserves_configuration() {
+        let device_function = DeviceFunction {
+            bus: 0,
+            device: 1,
+            function: 2,
+        };
+        let fake_cam = FakeCam {
+            device_function,
+            bar_values: [0x4000_0000, 0, 0, 0, 0, 0],
+            bar_masks: [0x50, 0, 0, 0, 0, 0],
+            status_command: 0x0020_0007,
+        };
+        let original = fake_cam.clone();
+        let mut root = PciRoot::new(fake_cam);
+        assert_eq!(
+            root.bar_info(device_function, 0),
+            Err(PciError::InvalidBarSize)
+        );
+        assert_eq!(root.configuration_access, original);
     }
 
     #[test]
@@ -889,6 +982,82 @@ mod tests {
         assert_eq!(root.configuration_access, fake_cam_orig);
     }
 
+    /// 循环链必须终止为明确错误，不能反复返回同一 capability。
+    #[test]
+    fn capability_cycle_is_rejected() {
+        let bdf = DeviceFunction {
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let mut words = [0u32; 64];
+        words[1] = u32::from(Status::CAPABILITIES_LIST.bits()) << 16;
+        words[0x34 / 4] = 0x40;
+        words[0x40 / 4] = 0x4401;
+        words[0x44 / 4] = 0x4001;
+        let root = PciRoot::new(CapabilityCam(words));
+        let mut capabilities = root.capabilities(bdf);
+        assert_eq!(
+            capabilities.next(),
+            Some(Ok(CapabilityInfo {
+                offset: 0x40,
+                id: 1,
+                private_header: 0
+            }))
+        );
+        assert_eq!(capabilities.next(), Some(Err(PciError::CapabilityCycle)));
+        assert_eq!(capabilities.next(), None);
+    }
+
+    /// 原始低指针、未对齐指针与越过配置页尾的 vendor 长度都不能自动修正。
+    #[test]
+    fn capability_boundaries_are_rejected() {
+        let bdf = DeviceFunction {
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        for pointer in [0x3c, 0x41, 0xfc] {
+            let mut words = [0u32; 64];
+            words[0] = 0x1af4;
+            words[1] = u32::from(Status::CAPABILITIES_LIST.bits()) << 16;
+            words[0x34 / 4] = pointer;
+            words[0xfc / 4] = 0x0110_0009;
+            let root = PciRoot::new(CapabilityCam(words));
+            let mut capabilities = root.capabilities(bdf);
+            let expected = if pointer == 0xfc {
+                PciError::InvalidCapabilityLength
+            } else {
+                PciError::InvalidCapabilityOffset
+            };
+            assert_eq!(capabilities.next(), Some(Err(expected)));
+            assert_eq!(capabilities.next(), None);
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapabilityCam([u32; 64]);
+
+    impl ConfigurationAccess for CapabilityCam {
+        /// 测试配置页保持原始 byte offset，暴露链的真实边界错误。
+        fn read_word(&self, _bdf: DeviceFunction, offset: u8) -> u32 {
+            self.0[usize::from(offset) / 4]
+        }
+
+        /// 配置页允许普通测试写入，不把非法链修正为有效输入。
+        fn write_word(&mut self, _bdf: DeviceFunction, offset: u8, data: u32) {
+            self.0[usize::from(offset) / 4] = data;
+        }
+
+        /// 枚举只读测试页时保留相同数据。
+        ///
+        /// # Safety
+        /// 调用者必须遵守 ConfigurationAccess 的只读副本约束。
+        unsafe fn unsafe_clone(&self) -> Self {
+            self.clone()
+        }
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct FakeCam {
         device_function: DeviceFunction,
@@ -899,11 +1068,14 @@ mod tests {
     }
 
     impl ConfigurationAccess for FakeCam {
+        /// 模拟标准配置头与可写 BAR，用于验证探测后的完整恢复。
         fn read_word(&self, device_function: DeviceFunction, register_offset: u8) -> u32 {
             assert_eq!(device_function, self.device_function);
             assert_eq!(register_offset & 0b11, 0);
             if register_offset == STATUS_COMMAND_OFFSET {
                 self.status_command
+            } else if register_offset == 0x0c {
+                0
             } else if register_offset >= BAR0_OFFSET && register_offset < 0x28 {
                 let bar_index = usize::from((register_offset - BAR0_OFFSET) / 4);
                 self.bar_values[bar_index]

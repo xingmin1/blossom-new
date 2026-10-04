@@ -242,15 +242,25 @@ pub fn enable_receive_interrupts() {
     write_register(IER, read_register(IER) | RECEIVE_INTERRUPT);
 }
 
-/// 在真实 IRQ action 中接收有限原始字节并确认发送空位，锁外通知等待者。
+/// 在同步注销 action 前停止 UART 的 RX/TX 中断产生，不消费 FIFO 中的待收字节。
+#[cfg(feature = "boot-tests")]
+pub fn disable_interrupts() {
+    let _port = PORT.lock();
+    write_register(IER, 0);
+}
+
+/// 先核对本端口真实 IIR，仅处理自身的有限 RX/TX，并在锁外通知等待者。
 ///
 /// # Safety
 /// 只作为当前 UART 的 IRQ action 调用；端口映射已建立，当前是非嵌套硬中断，
 /// 且调用者没有持有 PORT。此 handler 不使用 context。
-pub unsafe fn uart_handler(_context: *mut ()) {
+pub unsafe fn uart_handler(_context: *mut ()) -> bool {
     let notify_tx = {
         let _port = PORT.lock();
         let first_interrupt = read_register(IIR) & 0x0f;
+        if first_interrupt & 1 != 0 {
+            return false;
+        }
         for _ in 0..16 {
             if read_register(LSR) & DATA_READY == 0 {
                 break;
@@ -282,6 +292,7 @@ pub unsafe fn uart_handler(_context: *mut ()) {
         testing::COUNTERS.wakes.fetch_add(woken, Ordering::Relaxed);
         let _ = woken;
     }
+    true
 }
 
 /// 返回由真实接收中断消费的字节数量。
