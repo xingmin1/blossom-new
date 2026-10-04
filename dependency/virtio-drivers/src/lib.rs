@@ -14,6 +14,9 @@ extern crate alloc;
 
 pub mod device;
 mod hal;
+/// 使用实际后端 API 的静态测试注册，仅测试镜像参与链接。
+#[cfg(feature = "ktest")]
+pub mod ktest;
 #[cfg(feature = "alloc")]
 pub mod queue;
 #[cfg(feature = "alloc")]

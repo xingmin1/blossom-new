@@ -66,7 +66,7 @@ fn sleep_inner(deadline: MonotonicInstant, after_arm: Option<fn(Waker)>) {
         // SAFETY: timer 与 waker 的栈地址均固定，同步停止确认真实尾部后才允许退栈。
         unsafe { timer.as_ref().arm_borrowed(deadline) }
             .expect("fresh precise sleep timer rejected");
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         if after_arm.is_some() {
             TEST_SLEEP_DEADLINE.store(
                 super::testing::snapshot(timer.as_ref()).expiry.as_nanos(),
@@ -84,16 +84,16 @@ fn sleep_inner(deadline: MonotonicInstant, after_arm: Option<fn(Waker)>) {
 }
 
 /// 提前通知验收走生产睡眠路径，每一轮仍登记原绝对截止，不提供另一套等待后端。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) fn test_sleep_until(deadline: MonotonicInstant, after_arm: fn(Waker)) {
     sleep_inner(deadline, Some(after_arm));
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 static TEST_SLEEP_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// 读取测试睡眠最近一次真实登记的节点快照，不以传入参数替代入队证据。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(super) fn test_sleep_deadline() -> MonotonicInstant {
     MonotonicInstant::from_nanos(TEST_SLEEP_DEADLINE.load(core::sync::atomic::Ordering::Acquire))
 }

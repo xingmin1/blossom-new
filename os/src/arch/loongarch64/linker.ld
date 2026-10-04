@@ -12,11 +12,18 @@ SECTIONS {
     . = __direct_base + __kernel_phys_start;
     __kernel_virt_start = .;
     .text : AT(ADDR(.text) - __direct_base) {
+        PROVIDE(__executable_start = .);
         KEEP(*(.text.entry))
         *(.text .text.*)
+        PROVIDE(__etext = .);
     } :text
     . = ALIGN(4096);
-    .rodata : AT(ADDR(.rodata) - __direct_base) { *(.rodata .rodata.*) } :rodata
+    .rodata : AT(ADDR(.rodata) - __direct_base) {
+        PROVIDE(__rodata_start = .);
+        *(.rodata .rodata.*) *(.data.rel.ro .data.rel.ro.*)
+    } :rodata
+    INCLUDE ktest-sections.ld
+    PROVIDE(__rodata_end = .);
     . = ALIGN(4096);
     .data : AT(ADDR(.data) - __direct_base) { *(.data .data.*) *(.sdata .sdata.*) } :data
     . = ALIGN(4096);
@@ -38,5 +45,4 @@ SECTIONS {
     __kernel_phys_end = . - __direct_base;
     __primary_entry_phys = __primary_entry - __direct_base;
     __secondary_entry_phys = __secondary_entry - __direct_base;
-    /DISCARD/ : { *(.eh_frame .eh_frame_hdr) }
 }

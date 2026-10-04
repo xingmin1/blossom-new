@@ -1,10 +1,10 @@
 //! 单 Normal zone 的连续页块自由链，元数据仅在 zone 锁域内改变。
 
-#[cfg(feature = "memory-tests")]
+#[cfg(any(feature = "memory-tests", feature = "ktest"))]
 use core::mem::MaybeUninit;
 use spin::Once;
 
-#[cfg(feature = "memory-tests")]
+#[cfg(any(feature = "memory-tests", feature = "ktest"))]
 use crate::mm::page::PageDesc;
 use crate::mm::page::{BuddyLink, PageKind, PageMap};
 use crate::sync::SpinLock;
@@ -185,7 +185,7 @@ static ZONE: Once<SpinLock<Zone<'static>>> = Once::new();
 
 // 独立测试元数据仅在借用期间由此锁独占，初始化不构造或复制巨型栈数组。
 // 该 arena 不发布到全局 PageMap、不提供物理页 backing，也不参加生产页分配。
-#[cfg(feature = "memory-tests")]
+#[cfg(any(feature = "memory-tests", feature = "ktest"))]
 static TEST_DESCRIPTORS: SpinLock<[MaybeUninit<PageDesc>; 1 << MAX_ORDER]> =
     SpinLock::new([const { MaybeUninit::uninit() }; 1 << MAX_ORDER]);
 
@@ -449,4 +449,96 @@ fn test_fragmentation() -> bool {
         return_block(&mut zone, slot.take().unwrap());
     }
     zone.free == 14
+}
+
+/// 独立受控 zone 的唯一句柄表，析构在原 zone guard 下归还尚存的所有块。
+#[cfg(feature = "ktest")]
+pub(crate) struct TestZone<'a, 'b> {
+    zone: &'a mut Zone<'b>,
+    blocks: [Option<Block>; 16],
+}
+
+#[cfg(feature = "ktest")]
+impl TestZone<'_, '_> {
+    /// 将生产 allocate 的真实凭证先登记，随后用例才可断言其身份。
+    pub(crate) fn allocate(&mut self, index: usize, order: usize) -> bool {
+        assert!(self.blocks[index].is_none());
+        self.blocks[index] = self.zone.allocate(order);
+        self.blocks[index].is_some()
+    }
+    /// 返回仍 live 块的身份和原阶，不复制其归还权。
+    pub(crate) fn block(&self, index: usize) -> (usize, usize) {
+        let block = self.blocks[index].as_ref().unwrap();
+        (block.head, block.order)
+    }
+    /// 消费原凭证，按原阶执行生产合并算法。
+    pub(crate) fn release(&mut self, index: usize) {
+        let block = self.blocks[index].take().unwrap();
+        // SAFETY: block 是此 zone 分配后仍 live 的唯一凭证，测试从不访问物理页。
+        unsafe { self.zone.release(block.head, block.order) };
+    }
+    /// 读取当前 guard 下的真实自由页计数。
+    pub(crate) fn free(&self) -> usize {
+        self.zone.free
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for TestZone<'_, '_> {
+    /// 正文 panic 同样消费所有受控池凭证，不把裸 PFN 泄漏到全局页池。
+    fn drop(&mut self) {
+        for slot in &mut self.blocks {
+            if let Some(block) = slot.take() {
+                // SAFETY: 表中每槽仅拥有此 zone 的一个未归还块，未访问物理页。
+                unsafe { self.zone.release(block.head, block.order) };
+            }
+        }
+    }
+}
+
+/// 借用独立测试元数据运行实际 Zone 算法；回调结束前全部凭证及 zone 借用结束。
+#[cfg(feature = "ktest")]
+pub(crate) fn with_test_zone(fragmented: bool, body: impl FnOnce(&mut TestZone<'_, '_>)) {
+    use crate::mm::bootmem::PageRange;
+    let mut storage = TEST_DESCRIPTORS.lock();
+    for (pfn, slot) in storage.iter_mut().enumerate() {
+        slot.write(PageDesc::new(if fragmented {
+            match pfn {
+                3 | 11 => PageKind::Reserved,
+                7 | 15 => PageKind::Absent,
+                _ => PageKind::Available,
+            }
+        } else {
+            PageKind::Available
+        }));
+    }
+    // SAFETY: storage guard 独占已初始化数组，所有 map/zone 借用先于该 guard 销毁。
+    let descriptors =
+        unsafe { core::slice::from_raw_parts(storage.as_ptr().cast::<PageDesc>(), storage.len()) };
+    let high = [const { PageDesc::new(PageKind::Available) }; 2];
+    let sections = [Some(descriptors), None, Some(high.as_slice())];
+    let whole = [PageRange {
+        start: 0,
+        end: 1 << MAX_ORDER,
+    }];
+    let pieces = [
+        PageRange { start: 0, end: 3 },
+        PageRange { start: 4, end: 7 },
+        PageRange { start: 8, end: 11 },
+        PageRange { start: 12, end: 15 },
+        PageRange {
+            start: 65536,
+            end: 65538,
+        },
+    ];
+    let memory = PageMap::test_map(&sections, if fragmented { &pieces } else { &whole });
+    // SAFETY: 独立元数据只归属此局部 zone，不与全局 PageMap 或另一 zone 重叠。
+    let lock = SpinLock::new(unsafe { Zone::empty(&memory) });
+    let mut zone = lock.lock();
+    zone.initialize();
+    let mut owner = TestZone {
+        zone: &mut zone,
+        blocks: [const { None }; 16],
+    };
+    body(&mut owner);
 }

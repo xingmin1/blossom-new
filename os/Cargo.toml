@@ -8,8 +8,11 @@ fdt = { path = "../dependency/fdt" }
 rlibc = "1.0.0"
 spin = "0.7"
 virtio-drivers = { path = "../dependency/virtio-drivers", default-features = false, features = ["alloc"] }
+ktest = { path = "../crates/ktest", optional = true }
+unwinding = { path = "../dependency/unwinding", optional = true, default-features = false, features = ["unwinder", "panicking", "personality", "fde-static", "dwarf-expr", "kernel-percpu"] }
 
 [features]
+ktest = ["dep:ktest", "dep:unwinding", "virtio-drivers/ktest"]
 boot-tests = []
 execution-tests = []
 storage-tests = []
@@ -30,3 +33,21 @@ panic = "abort"
 debug = 2
 panic = "abort"
 lto = true
+
+[profile.ktest-dev]
+inherits = "dev"
+panic = "unwind"
+codegen-units = 16
+
+[profile.ktest-release]
+inherits = "release"
+panic = "unwind"
+codegen-units = 16
+
+[profile.ktest-abort-dev]
+inherits = "ktest-dev"
+panic = "abort"
+
+[profile.ktest-abort-release]
+inherits = "ktest-release"
+panic = "abort"

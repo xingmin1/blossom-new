@@ -100,7 +100,7 @@ pub(crate) struct PageMap<'a> {
     free: &'a [PageRange],
     stats: BootStats,
     present_sections: usize,
-    #[cfg(feature = "memory-tests")]
+    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
     metadata: &'a [PageRange],
 }
 
@@ -140,8 +140,14 @@ impl<'a> PageMap<'a> {
         self.free
     }
 
+    /// 借用永久发布的 section 与 metadata 范围，供独立用例核对物理页分类。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_layout_parts(&self) -> (&[Section<'a>], &[PageRange]) {
+        (self.sections, self.metadata)
+    }
+
     /// 借用独立测试描述符与范围；不发布，也不授予物理页访问权限。
-    #[cfg(feature = "memory-tests")]
+    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
     pub(crate) fn test_map(sections: &'a [Section<'a>], free: &'a [PageRange]) -> Self {
         Self {
             sections,
@@ -388,7 +394,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     let root_bytes = section_bytes
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
-    #[cfg(feature = "memory-tests")]
+    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
     let root_bytes = root_bytes
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
@@ -456,7 +462,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     // SAFETY: root 后部留有 RANGE_CAPACITY 个对齐槽，不与 sections 重叠；
     // BootMemory 的范围容量不超过该上界，写完后仅发布只读引用。
     let free = unsafe { write_ranges(root_address + section_bytes, memory.free()) };
-    #[cfg(feature = "memory-tests")]
+    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
     // SAFETY: 测试布局额外预留另一组 RANGE_CAPACITY 槽，与根和 free 快照不重叠。
     let metadata = unsafe {
         write_ranges(
@@ -469,7 +475,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
         free,
         stats: memory.stats(),
         present_sections,
-        #[cfg(feature = "memory-tests")]
+        #[cfg(any(feature = "memory-tests", feature = "ktest"))]
         metadata,
     })
 }

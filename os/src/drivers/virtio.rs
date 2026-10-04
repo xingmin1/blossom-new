@@ -1,5 +1,8 @@
 //! 选定块设备的真实传输、ring/PDU 页和停止责任。
 
+#[cfg(feature = "ktest")]
+pub(crate) mod ktest_prepare;
+
 use crate::{
     boot::Region,
     drivers::{
@@ -22,7 +25,7 @@ use virtio_drivers::{
             bus::{DeviceFunction, PCI_CAP_ID_VNDR},
             PciRegion, PciTransport, SelectedConstruct, VirtioPciError, VIRTIO_VENDOR_ID,
         },
-        DeviceStatus, DeviceType, SomeTransport, Transport,
+        DeviceStatus, DeviceType, InterruptStatus, SomeTransport, Transport,
     },
     DmaRegion, Error, Hal,
 };
@@ -111,6 +114,18 @@ pub struct VirtioDevice {
     identity: VirtioIdentity,
     interrupt: IrqNumber,
     must_reset: bool,
+}
+
+/// 仅验收镜像读取仍由本实例拥有的 transport 与 ring，不更改设备状态。
+#[cfg(any(feature = "storage-tests", feature = "ktest"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestPrepareSnapshot {
+    pub identity: VirtioIdentity,
+    pub status: DeviceStatus,
+    pub avail_index: u16,
+    pub available_descriptors: usize,
+    pub requires_reset: bool,
+    pub irq_actions: usize,
 }
 
 impl VirtioDevice {
@@ -246,6 +261,34 @@ impl VirtioDevice {
     /// 返回真实硬件状态，供初始化诊断和停止流程使用。
     pub fn status(&self) -> DeviceStatus {
         self.driver.status()
+    }
+
+    /// 在真实准备失败点、实例销毁前读取硬件 status 与本实例原 ring 的 avail.idx。
+    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    pub(crate) fn test_prepare_snapshot(&self) -> TestPrepareSnapshot {
+        let depth = self.info().queue_depth;
+        let ring = self.ring.region();
+        // 两种 split 布局的 avail 都紧接 descriptor 表，legacy 仅改变 used 对齐。
+        let avail_index_offset = usize::from(depth) * 16 + 2;
+        assert!(avail_index_offset + core::mem::size_of::<u16>() <= ring.len);
+        KernelHal::dma_read_barrier();
+        // SAFETY: 本方法借用唯一实例，ring 原页仍 live；offset 是已验证 split
+        // 布局内对齐的 u16，volatile 读取不创建 DMA 内存引用，不消费或修改队列。
+        let avail_index = u16::from_le(unsafe {
+            core::ptr::read_volatile(ring.cpu.as_ptr().add(avail_index_offset).cast::<u16>())
+        });
+        TestPrepareSnapshot {
+            identity: self.identity,
+            status: self.status(),
+            avail_index,
+            available_descriptors: self.driver.available_descriptors(),
+            requires_reset: self.must_reset,
+            irq_actions: crate::irq::test_action_count(self.interrupt),
+        }
+    }
+    /// 确认本设备 ISR，不重新引入 DMA 停止责任；退休期仍须清本设备共享 IRQ 原因。
+    pub fn ack_interrupt(&mut self) -> InterruptStatus {
+        self.driver.ack_interrupt()
     }
     /// 在任何 queue_set 写入前标记停止责任；失败返回时仍保完整原页和 driver。
     pub fn publish(&mut self) -> Result<(), VirtioInitError> {

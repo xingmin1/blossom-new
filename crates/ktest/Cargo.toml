@@ -1,0 +1,11 @@
+[package]
+name = "ktest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["macros"]
+macros = ["dep:ktest-macros"]
+
+[dependencies]
+ktest-macros = { path = "../ktest-macros", optional = true }

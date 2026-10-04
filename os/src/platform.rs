@@ -448,6 +448,23 @@ fn discover_tree(
     Ok(info)
 }
 
+/// 对测试拥有的 DTB 字节运行唯一正式结构校验，不访问固件指针或修改启动状态。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_validate(bytes: &[u8]) -> Result<(), &'static str> {
+    validate(bytes)
+}
+
+/// 对测试拥有的 DTB 字节运行正式资源发现，返回独立快照而不发布到全局启动信息。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_discover_tree(
+    bytes: &[u8],
+    raw_args: [usize; 3],
+    bsp: usize,
+    dtb_address: usize,
+) -> Result<crate::boot::BootInfo, &'static str> {
+    discover_tree(bytes, raw_args, bsp, dtb_address)
+}
+
 /// 保存完整 NUL 结尾的单一命令行，拒绝截断、内嵌 NUL 和容量外输入。
 fn discover_bootargs(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
     let Some(property) = chosen.property("bootargs") else {

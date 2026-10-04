@@ -16,7 +16,7 @@ const DATA_READY: u8 = 1;
 const TRANSMIT_READY: u8 = 0x20;
 const RECEIVE_INTERRUPT: u8 = 1;
 const TRANSMIT_INTERRUPT: u8 = 2;
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 const THRE_INTERRUPT: u8 = 2;
 const TX_BUDGET: usize = 16;
 
@@ -102,74 +102,83 @@ fn emergency_writer() -> impl Write {
 }
 
 /// 用可控 LSR 输入验证真实应急 writer 的停止条件和跨字节、跨字符串预算，不访问硬件。
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "ktest"))]
 pub fn test_emergency_budget() -> bool {
-    let mut reads = 0;
-    let mut writes = 0;
-    let stalled = {
-        let mut writer = EmergencyWriter {
-            remaining: EMERGENCY_POLL_BUDGET,
-            read_status: || {
-                reads += 1;
-                0
-            },
-            write_byte: |_| writes += 1,
-        };
-        writer.write_str("a").is_err() && writer.write_str("b").is_err()
-    };
-    if !stalled || reads != EMERGENCY_POLL_BUDGET || writes != 0 {
-        return false;
-    }
+    (0..3).all(emergency_budget)
+}
 
-    let mut reads = 0;
-    let mut output = [0; 4];
-    let mut written = 0;
-    let shared = {
-        let mut writer = EmergencyWriter {
-            remaining: 5,
-            read_status: || {
-                reads += 1;
-                if reads == 1 || reads == 4 {
-                    0
-                } else {
-                    TRANSMIT_READY
-                }
-            },
-            write_byte: |byte| {
-                if written < output.len() {
-                    output[written] = byte;
-                }
-                written += 1;
-            },
-        };
-        writer.write_str("ab").is_ok()
-            && writer.write_str("cd").is_err()
-            && writer.write_str("e").is_err()
-    };
-    if !shared || reads != 5 || written != 3 || output != *b"abc\0" {
-        return false;
+/// 独立验证一种真实 writer 预算场景，不将多个旧断言组绑定为一个测试实例。
+#[cfg(any(feature = "boot-tests", feature = "ktest"))]
+fn emergency_budget(mode: u8) -> bool {
+    match mode {
+        0 => {
+            let mut reads = 0;
+            let mut writes = 0;
+            let stalled = {
+                let mut writer = EmergencyWriter {
+                    remaining: EMERGENCY_POLL_BUDGET,
+                    read_status: || {
+                        reads += 1;
+                        0
+                    },
+                    write_byte: |_| writes += 1,
+                };
+                writer.write_str("a").is_err() && writer.write_str("b").is_err()
+            };
+            stalled && reads == EMERGENCY_POLL_BUDGET && writes == 0
+        }
+        1 => {
+            let mut reads = 0;
+            let mut output = [0; 4];
+            let mut written = 0;
+            let shared = {
+                let mut writer = EmergencyWriter {
+                    remaining: 5,
+                    read_status: || {
+                        reads += 1;
+                        if reads == 1 || reads == 4 {
+                            0
+                        } else {
+                            TRANSMIT_READY
+                        }
+                    },
+                    write_byte: |byte| {
+                        if written < output.len() {
+                            output[written] = byte;
+                        }
+                        written += 1;
+                    },
+                };
+                writer.write_str("ab").is_ok()
+                    && writer.write_str("cd").is_err()
+                    && writer.write_str("e").is_err()
+            };
+            shared && reads == 5 && written == 3 && output == *b"abc\0"
+        }
+        2 => {
+            let mut reads = 0;
+            let mut output = [0; 4];
+            let mut written = 0;
+            let ready = {
+                let mut writer = EmergencyWriter {
+                    remaining: 3,
+                    read_status: || {
+                        reads += 1;
+                        TRANSMIT_READY
+                    },
+                    write_byte: |byte| {
+                        if written < output.len() {
+                            output[written] = byte;
+                        }
+                        written += 1;
+                    },
+                };
+                writer.write_str("ab").is_ok() && writer.write_str("cd").is_err()
+            };
+            ready && reads == 3 && written == 3 && output == *b"abc\0"
+        }
+        _ => false,
     }
-
-    let mut reads = 0;
-    let mut output = [0; 4];
-    let mut written = 0;
-    let ready = {
-        let mut writer = EmergencyWriter {
-            remaining: 3,
-            read_status: || {
-                reads += 1;
-                TRANSMIT_READY
-            },
-            write_byte: |byte| {
-                if written < output.len() {
-                    output[written] = byte;
-                }
-                written += 1;
-            },
-        };
-        writer.write_str("ab").is_ok() && writer.write_str("cd").is_err()
-    };
-    ready && reads == 3 && written == 3 && output == *b"abc\0"
 }
 
 /// 在 UART 接管时一次设置字节模式与 FIFO，尚不接入 TTY 行规程。
@@ -186,6 +195,34 @@ pub fn early_write(arguments: fmt::Arguments<'_>) {
     PortWriter
         .write_fmt(arguments)
         .expect("UART formatting failed");
+}
+
+/// 测试控制者轮询消费 RX；调用前未开放接收中断，或已在同一端口锁下关闭 IER。
+/// 已登记的 action 不得在本次控制字节握手期间重新开启 RX，避免与 FIFO 消费竞争。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_read_byte() -> u8 {
+    loop {
+        let _port = PORT.lock();
+        if read_register(LSR) & DATA_READY != 0 {
+            return read_register(DATA);
+        }
+        drop(_port);
+        spin_loop();
+    }
+}
+
+/// 真实 H 已由默认 RX IRQ 消费后，只关闭接收中断，让后续 ACK 留在 FIFO。
+/// 同一 fixture 独占控制输入直到 ACK 轮询完成；TX 的实际中断与唤醒路径保持开放。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_disable_receive_interrupts() {
+    let _port = PORT.lock();
+    write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
+}
+
+/// 真实故障控制者使用整条消息的有界预算，不等待 PORT 或任何任务进度。
+#[cfg(any(feature = "ktest", feature = "execution-tests"))]
+pub(crate) fn emergency_write(arguments: fmt::Arguments<'_>) {
+    let _ = emergency_writer().write_fmt(arguments);
 }
 
 /// 测试协议复用原始同步输出，不将测试标记送入普通日志环。
@@ -205,7 +242,7 @@ pub fn try_write(bytes: &[u8]) -> usize {
         write_register(DATA, byte);
         accepted += 1;
     }
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     {
         testing::COUNTERS
             .accepted
@@ -243,7 +280,7 @@ pub fn enable_receive_interrupts() {
 }
 
 /// 在同步注销 action 前停止 UART 的 RX/TX 中断产生，不消费 FIFO 中的待收字节。
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "ktest"))]
 pub fn disable_interrupts() {
     let _port = PORT.lock();
     write_register(IER, 0);
@@ -255,19 +292,42 @@ pub fn disable_interrupts() {
 /// 只作为当前 UART 的 IRQ action 调用；端口映射已建立，当前是非嵌套硬中断，
 /// 且调用者没有持有 PORT。此 handler 不使用 context。
 pub unsafe fn uart_handler(_context: *mut ()) -> bool {
+    handle_uart::<16, false>()
+}
+
+/// 测试 action 仅消费一个真实 payload 字节，在同一端口锁内立即关闭 RX/TX 中断。
+///
+/// # Safety
+/// 仅作为已登记的真实 UART IRQ action 调用，遵守 uart_handler 的入口要求。
+/// 原 default action 已停止并同步注销；调用者先轮询消费 H，再开启 RX，且本阶段
+/// 仅允许一个 payload 字节，直到轮询 ACK 完成前不得再次开启 UART 中断。
+#[cfg(feature = "ktest")]
+pub(crate) unsafe fn ktest_uart_handler_one(_context: *mut ()) -> bool {
+    handle_uart::<1, true>()
+}
+
+/// 两个入口共享实际 IIR/RX/TX 流程；编译期参数使普通入口不承担测试分支或状态成本。
+#[inline(always)]
+fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     let notify_tx = {
         let _port = PORT.lock();
         let first_interrupt = read_register(IIR) & 0x0f;
         if first_interrupt & 1 != 0 {
             return false;
         }
-        for _ in 0..16 {
-            if read_register(LSR) & DATA_READY == 0 {
-                break;
+        if read_register(IER) & RECEIVE_INTERRUPT != 0 {
+            for _ in 0..RX_BUDGET {
+                if read_register(LSR) & DATA_READY == 0 {
+                    break;
+                }
+                let byte = read_register(DATA);
+                if STOP_RX {
+                    // 必须紧跟 DATA 读取并留在 PORT 锁内；不得轮询或读取后续 ACK 字节。
+                    write_register(IER, 0);
+                }
+                LAST_BYTE.store(byte, Ordering::Relaxed);
+                RECEIVED.fetch_add(1, Ordering::Release);
             }
-            let byte = read_register(DATA);
-            LAST_BYTE.store(byte, Ordering::Relaxed);
-            RECEIVED.fetch_add(1, Ordering::Release);
         }
         let last_interrupt = read_register(IIR) & 0x0f;
         let ier = read_register(IER);
@@ -275,7 +335,7 @@ pub unsafe fn uart_handler(_context: *mut ()) -> bool {
         let notify_tx = ier & TRANSMIT_INTERRUPT != 0 && ready;
         if notify_tx {
             write_register(IER, ier & !TRANSMIT_INTERRUPT);
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             if first_interrupt == THRE_INTERRUPT || last_interrupt == THRE_INTERRUPT {
                 testing::COUNTERS
                     .tx_interrupts
@@ -288,7 +348,7 @@ pub unsafe fn uart_handler(_context: *mut ()) -> bool {
     };
     if notify_tx {
         let woken = TX_WAIT.wake_all();
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         testing::COUNTERS.wakes.fetch_add(woken, Ordering::Relaxed);
         let _ = woken;
     }
@@ -306,7 +366,7 @@ pub fn last_byte() -> u8 {
 }
 
 /// 测试仅观察硬件已到达的数据，不从轮询路径消费 RX。
-#[cfg(feature = "boot-tests")]
+#[cfg(any(feature = "boot-tests", feature = "ktest"))]
 pub fn receive_pending() -> bool {
     let _port = PORT.lock();
     read_register(LSR) & DATA_READY != 0
@@ -352,16 +412,66 @@ macro_rules! test_println {
     };
 }
 
-/// 仅执行测试观察真实端口活动与原始应急输出，不建立另一套 UART 后端。
-#[cfg(feature = "execution-tests")]
+/// 测试观察唯一真实端口活动；ktest 另保存可移动的 default action 责任，不建立第二套驱动。
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub mod testing {
     /// 测试故障现场复用原始应急消息预算，不取端口锁、时间或任务信息。
     pub fn emergency_write(arguments: fmt::Arguments<'_>) {
-        let _ = emergency_writer().write_fmt(arguments);
+        super::emergency_write(arguments);
     }
 
     use super::*;
 
+    #[cfg(feature = "ktest")]
+    static UART_REGISTRATION: SpinLock<Option<crate::irq::IrqRegistration>> = SpinLock::new(None);
+
+    /// 取走唯一 default UART action 的真实 token，不改变设备 IER 或 action 准入。
+    ///
+    /// 仅 Thread 控制者调用；成功后调用者拥有停止设备、同步注销和归还新 token 的责任。
+    /// 空槽返回错误，不凭空创建 token；不得从同线 handler 或持有 PORT 时调用。
+    #[cfg(feature = "ktest")]
+    pub fn take_uart_registration() -> Result<crate::irq::IrqRegistration, ::ktest::TestError> {
+        UART_REGISTRATION.lock().take().ok_or(::ktest::TestError(
+            "default UART registration is not installed",
+        ))
+    }
+
+    /// 首次登记或归还新 default UART token，并开放该真实 action 的准入。
+    ///
+    /// 传入 token 必须属于当前 UART 的永久 uart_handler/null context；归还前已停止测试
+    /// action 并同步注销，UART IER 仍关闭，成功后再开启接收。允许首次登记的 BSP 或
+    /// 后续 Thread 控制者调用，不得从同线 handler 或持有其退出所需的 PORT/其他锁调用。
+    /// 双拥有时保留原槽责任，拒绝的传入 token 在槽锁外同步注销；不可启用的 token
+    /// 同样在锁外同步注销后返回错误。因此任何返回路径都不会遗失活 action 责任。
+    #[cfg(feature = "ktest")]
+    pub fn restore_uart_registration(
+        registration: crate::irq::IrqRegistration,
+    ) -> ::ktest::TestResult {
+        let mut slot = UART_REGISTRATION.lock();
+        let error = if slot.is_some() {
+            ::ktest::TestError("default UART registration is already installed")
+        } else {
+            // enable/is_enabled 仅取短锁，不等待 handler；handler 不访问此拥有者槽。
+            registration.enable();
+            if registration.is_enabled() {
+                *slot = Some(registration);
+                return Ok(());
+            }
+            ::ktest::TestError("default UART registration cannot be enabled")
+        };
+        drop(slot);
+        registration.unregister_sync();
+        Err(error)
+    }
+
+    /// 独立检查真实应急 writer 的预算：0 停滞，1 跨字符串共享，2 恒可发送。
+    /// 这是确定性 writer 算法验收，不伪称 UART 硬件 IRQ 或硬件 LSR。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn emergency_budget(mode: u8) -> bool {
+        super::emergency_budget(mode)
+    }
+
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(super) struct Counters {
         pub(super) accepted: AtomicUsize,
         pub(super) zero_writes: AtomicUsize,
@@ -369,6 +479,7 @@ pub mod testing {
         pub(super) wakes: AtomicUsize,
     }
 
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(super) static COUNTERS: Counters = Counters {
         accepted: AtomicUsize::new(0),
         zero_writes: AtomicUsize::new(0),
@@ -376,6 +487,7 @@ pub mod testing {
         wakes: AtomicUsize::new(0),
     };
 
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     #[derive(Clone, Copy)]
     pub struct Snapshot {
         pub accepted: usize,
@@ -385,6 +497,7 @@ pub mod testing {
     }
 
     /// 读取实际接受、拒写、THRE 中断与成功通知计数，不读取或消费 RX。
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub fn snapshot() -> Snapshot {
         Snapshot {
             accepted: COUNTERS.accepted.load(Ordering::Relaxed),

@@ -74,6 +74,8 @@ impl Drop for OwnedPages {
 pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
     #[cfg(feature = "memory-tests")]
     let mut window = crate::mm::tests::AllocationWindow::enter();
+    #[cfg(feature = "ktest")]
+    let mut test_window = crate::mm::ktest::AllocationWindow::enter();
     let block = if order == 0 {
         pcp::allocate()
     } else {
@@ -84,6 +86,8 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
         let len = pages.len();
         #[cfg(feature = "memory-tests")]
         window.arm_timer();
+        #[cfg(feature = "ktest")]
+        test_window.arm_timer();
         // SAFETY: 页入口返回已离开全部空闲链的真实连续 RAM 块，当前拥有者独占
         // 全部 len 字节，BSP 已保证永久可写直映；全部 zone/PCP 锁与 IRQ guard 已退出。
         unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0, len) };

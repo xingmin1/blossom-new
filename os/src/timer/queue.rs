@@ -271,7 +271,7 @@ impl Queue {
     ///
     /// # Safety
     /// 必须持有所属 base 锁；所有登记指针均须有效且稳定存活。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(super) unsafe fn validate(&self) -> (usize, usize) {
         // SAFETY: 调用者保证节点有效；递归先核父链，以拒绝回边和重复子树。
         unsafe {
@@ -394,7 +394,7 @@ unsafe fn successor(mut node: *const Timer) -> *const Timer {
 ///
 /// # Safety
 /// 所有可达非空指针有效，调用者持所属 base 锁；可为空子树。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 unsafe fn validate_subtree(
     node: *const Timer,
     parent: *const Timer,

@@ -3,17 +3,20 @@ mod buddy;
 pub mod dma;
 mod frame_allocator;
 mod heap_allocator;
+#[cfg(feature = "ktest")]
+pub(crate) mod ktest;
 mod page;
 mod pcp;
 mod slub;
 #[cfg(feature = "memory-tests")]
 pub(crate) mod tests;
 
+pub(crate) use bootmem::PAGE_SIZE;
 pub use frame_allocator::{alloc_pages, OwnedPages};
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) use heap_allocator::allocation_attempts;
 pub use pcp::drain_all_pages;
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) use slub::SIZES as SLUB_SIZES;
 pub use slub::{flush_all, shrink_all};
 

@@ -30,7 +30,7 @@ pub(crate) struct CpuAccount {
     scheduler_ns: AtomicU64,
     idle_ns: AtomicU64,
     idle_entries: AtomicU64,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     idle_checks: AtomicU64,
 }
 
@@ -44,7 +44,7 @@ pub struct CpuSnapshot {
     pub scheduler_ns: u64,
     pub idle_ns: u64,
     pub idle_entries: u64,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub idle_checks: u64,
 }
 
@@ -62,7 +62,7 @@ impl CpuAccount {
             scheduler_ns: AtomicU64::new(0),
             idle_ns: AtomicU64::new(0),
             idle_entries: AtomicU64::new(0),
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             idle_checks: AtomicU64::new(0),
         }
     }
@@ -230,13 +230,13 @@ pub fn snapshot(owner: usize) -> CpuSnapshot {
         scheduler_ns: account.scheduler_ns.load(Ordering::Relaxed),
         idle_ns: account.idle_ns.load(Ordering::Relaxed),
         idle_entries: account.idle_entries.load(Ordering::Relaxed),
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         idle_checks: account.idle_checks.load(Ordering::Relaxed),
     }
 }
 
 /// 记录最终无 ready 与提示的检查已通过，只供真实 idle 握手验收观察。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) fn test_idle_checked() {
     assert!(!crate::arch::irq_enabled());
     add_total(&cpu::current().accounting.idle_checks, 1);

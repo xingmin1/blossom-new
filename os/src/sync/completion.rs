@@ -76,7 +76,7 @@ impl Completion {
     }
 
     /// 只观察真实等待源成员，用于确认登记与最终撤链，不消费完成 token。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(crate) fn test_waiting(&self) -> usize {
         self.waiters.test_members()
     }

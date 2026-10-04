@@ -4,6 +4,17 @@
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(feature = "ktest", feature(panic_can_unwind))]
+
+#[cfg(all(
+    feature = "ktest",
+    any(
+        feature = "boot-tests",
+        feature = "execution-tests",
+        feature = "storage-tests"
+    )
+))]
+compile_error!("ktest requires a separate image from legacy test features");
 
 #[cfg(all(feature = "refill-test", not(target_arch = "loongarch64")))]
 compile_error!("refill-test requires the loongarch64 target");
@@ -28,15 +39,19 @@ extern crate rlibc;
 
 mod accounting;
 mod arch;
+mod block;
 mod boot;
 mod console;
 mod cpu;
 mod drivers;
 mod irq;
 mod klog;
+#[cfg(feature = "ktest")]
+mod ktest;
 mod mm;
 mod platform;
 mod sched;
+mod storage;
 mod sync;
 mod task;
 mod time;
@@ -61,16 +76,13 @@ use crate::drivers::DeviceInventory;
 #[cfg(not(feature = "boot-tests"))]
 static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// 使用固件资源准备 CPU、MM、统一时间与中断，再发表内核任务并释放 AP。
+/// 完成一次性固件资源与 CPU 准备，返回后不再保留构造数组。
 ///
 /// # Safety
-/// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
-/// 汇编已建立内核/RAM/早期 UART 映射、独占启动栈，并清理普通 BSS。
-/// 原始参数遵守固件协议，DTB 头部及声明的完整存储范围可读且不覆盖内核。
-#[no_mangle]
-pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
+/// 调用者须满足 primary_main 的 BSP、映射和固件参数约束。
+#[inline(never)]
+unsafe fn initialize_boot(arguments: [usize; 3]) {
     console::initialize();
-    let arguments = [arg0, arg1, arg2];
     let hardware_id = arch::boot_hardware_id(arguments);
     // SAFETY: BSP 汇编保留实际固件参数并建立 DTB 访问映射；本核为唯一解析者。
     let mut resources = unsafe { platform::discover(arguments, hardware_id) }
@@ -93,6 +105,46 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     // SAFETY: 当前为 BSP，IRQ 关闭、AP 未释放；静态栈和全部 CPU 输入均有效。
     unsafe { cpu::initialize(resources) };
     arch::init_current_cpu();
+}
+
+/// 使用固件资源准备 CPU、MM、统一时间与中断，再发表内核任务并释放 AP。
+///
+/// # Safety
+/// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
+/// 汇编已建立内核/RAM/早期 UART 映射、独占启动栈，并清理普通 BSS。
+/// 原始参数遵守固件协议，DTB 头部及声明的完整存储范围可读且不覆盖内核。
+#[no_mangle]
+pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
+    // 引导构造帧先真实返回，避免 LTO 把大数组留在 Boot 展开的 64KiB 栈上。
+    // SAFETY: BSP 汇编满足本入口的独占状态、实际映射和固件参数约束。
+    unsafe { initialize_boot([arg0, arg1, arg2]) };
+    #[cfg(feature = "ktest")]
+    let test_command = {
+        let command = ktest::early();
+        if ktest::requested_context(&command) == ::ktest::Context::Boot {
+            ktest::run_boot(command);
+        }
+        command
+    };
+    #[cfg(feature = "ktest")]
+    // SAFETY: 引导资源与本核状态已发表；命令已确认只走 Thread 路径。
+    unsafe {
+        run_kernel(test_command)
+    }
+    #[cfg(not(feature = "ktest"))]
+    // SAFETY: 引导资源与本核状态已发表，IRQ 关闭且 AP 尚未释放。
+    unsafe {
+        run_kernel()
+    }
+}
+
+/// 从已完成的引导进入完整服务；其长期构造帧不得覆盖 Boot 用例。
+///
+/// # Safety
+/// 固件资源、永久映射和本核 CPU 状态已发表；IRQ 关闭且 AP 尚未释放。
+#[inline(never)]
+unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) -> ! {
+    let resources = boot::info();
     // SAFETY: BSP 尚未释放 AP，IRQ 仍关闭；实际 RAM 永久可写的一一直映已完成，
     // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
     // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
@@ -105,8 +157,10 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     workqueue::initialize_services().expect("worker pool service task allocation failed");
     #[cfg(not(feature = "boot-tests"))]
     klog::initialize_service().expect("log printer task allocation failed");
-    #[cfg(not(feature = "boot-tests"))]
+    #[cfg(not(any(feature = "boot-tests", feature = "ktest")))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
+    #[cfg(feature = "ktest")]
+    let _test_task = ktest::spawn_thread(test_command).expect("test suite Task allocation failed");
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
     unsafe { irq::initialize(resources) };
     let uart_number = irq::map_source(resources.interrupts.uart_source)
@@ -116,7 +170,11 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> 
     let _uart_registration =
         unsafe { irq::register(uart_number, console::uart_handler, core::ptr::null_mut()) }
             .expect("UART IRQ action registration failed");
+    #[cfg(feature = "ktest")]
+    console::testing::restore_uart_registration(_uart_registration)
+        .expect("default UART registration cannot be installed");
     console::enable_receive_interrupts();
+    #[cfg(not(feature = "ktest"))]
     _uart_registration.enable();
     arch::enable_interrupts();
     cpu::publish_online();
@@ -220,6 +278,21 @@ fn init() -> i32 {
     {
         let inventory = drivers::discover().expect("device resource discovery failed");
         report_device_resources(&inventory);
+        let has_block = !inventory.mmio_blocks.is_empty()
+            || inventory.pci.devices().iter().any(|device| {
+                device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+            });
+        if has_block {
+            // SAFETY: init 是一次发现后全部块设备的唯一准备者；Bootstrap 永久映射仍 live，
+            // 固定 Storage 表在发表前持全部 owner，未确认停止的设备不会在 init 返回时丢失。
+            let storage = unsafe { storage::Storage::initialize(&inventory) }
+                .expect("storage initialization failed");
+            crate::klog!(
+                klog::Level::Info,
+                "STORAGE online devices={}",
+                storage.count()
+            );
+        }
         init_consumers();
         drop(inventory);
         0
@@ -433,12 +506,31 @@ fn init_consumers() {
 /// 在不可继续的内核错误中记录真实 panic 信息并停止当前核。
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    #[cfg(feature = "ktest")]
+    {
+        if cfg!(panic = "unwind") && !arch::cpu_local().is_null() {
+            ktest::panic::raise(info);
+        }
+        let kind = if info.can_unwind() { "panic" } else { "abi" };
+        ktest::fatal_event(kind, format_args!("{}", info));
+    }
+    #[cfg(not(feature = "ktest"))]
     console::panic(info)
 }
 
 /// 记录不可恢复的标准堆分配错误，复用不分配内存的有界应急 panic 输出。
 #[alloc_error_handler]
 fn allocation_error(layout: core::alloc::Layout) -> ! {
+    #[cfg(feature = "ktest")]
+    ktest::fatal_event(
+        "oom",
+        format_args!(
+            "heap allocation failed: size={} align={}",
+            layout.size(),
+            layout.align()
+        ),
+    );
+    #[cfg(not(feature = "ktest"))]
     panic!(
         "heap allocation failed: size={} align={}",
         layout.size(),

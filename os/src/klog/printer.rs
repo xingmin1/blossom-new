@@ -58,7 +58,7 @@ fn wait_for_tx() -> bool {
     let _registration = unsafe { console::tx_wait_queue().register(node.as_mut()) };
     if !console::arm_tx_interrupt() {
         waiter.park();
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         testing::after_tx_wait();
         true
     } else {
@@ -68,7 +68,7 @@ fn wait_for_tx() -> bool {
 
 /// 一份完整记录与固定头部留在本任务栈上，UART 只接收尚未接受的真实字节前缀。
 fn run() -> i32 {
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     testing::install_service();
     let mut cursor = Cursor::oldest();
     loop {
@@ -101,7 +101,7 @@ fn run() -> i32 {
         let body = record.text().as_bytes();
         let length = header.len() + body.len() + 1;
         let mut offset = 0;
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         testing::begin_record(record.seq, length, current.lost);
         while offset < length {
             let remaining = if offset < header.len() {
@@ -117,24 +117,24 @@ fn run() -> i32 {
                 "UART accepted an invalid prefix"
             );
             if accepted == 0 {
-                #[cfg(not(feature = "execution-tests"))]
+                #[cfg(not(any(feature = "execution-tests", feature = "ktest")))]
                 wait_for_tx();
-                #[cfg(feature = "execution-tests")]
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 if wait_for_tx() {
                     testing::pause_after_partial_write(offset, length);
                 }
             } else {
                 offset += accepted;
-                #[cfg(feature = "execution-tests")]
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 testing::advance(offset, accepted);
             }
         }
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         testing::finish_record(record.seq);
     }
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub mod testing {
     use alloc::sync::{Arc, Weak};
     use core::pin::pin;
@@ -241,7 +241,11 @@ pub mod testing {
             .is_ok()
         {
             RESUME.wait();
-            PAUSE.store(0, Ordering::Release);
+            assert_eq!(
+                PAUSE.compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire),
+                Ok(3),
+                "log resume token without release"
+            );
         }
     }
 
@@ -250,15 +254,20 @@ pub mod testing {
         *OBSERVED.lock()
     }
 
+    /// 取得唯一服务入口保存的真实弱观察；升级与最后强引用析构在观察锁外进行。
+    /// Thread 控制者只短暂持有返回观察，不取得常驻服务的退出或 join 责任。
+    pub(crate) fn service_task() -> Option<Arc<Task>> {
+        let service = SERVICE.lock().clone();
+        service.and_then(|weak| weak.upgrade())
+    }
+
     /// 弱观察在观察锁外升级，真实状态只由调度器锁域给出。
     pub(crate) fn service_state() -> Option<State> {
-        let service = SERVICE.lock().clone();
-        service
-            .and_then(|weak| weak.upgrade())
-            .map(|task| sched::test_state(&task))
+        service_task().map(|task| sched::test_state(&task))
     }
 
     /// 武装单次真实输出停点，不修改 UART 状态或生产记录消费路径。
+    /// 同一 fixture 的 Thread 控制者串行武装和清理；上一输出停点恢复且追平后才可复武装。
     pub(crate) fn arm_pause(point: PausePoint) {
         match point {
             PausePoint::AfterPartialWrite => {
@@ -277,10 +286,43 @@ pub mod testing {
         PAUSE.load(Ordering::Acquire) == 2
     }
 
-    /// 发布一个真实完成 token，让服务继续同一记录的尚未接受字节。
+    /// 仅赢得原停点 2→3 放行责任的控制者发布一个真实完成 token。
+    /// Thread 控制者不得持观察锁、调度锁、PORT 或服务恢复所需锁；不等待服务。
     pub(crate) fn release_pause() {
-        assert!(is_paused(), "log printer has not reached its pause");
+        assert_eq!(
+            PAUSE.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire),
+            Ok(2),
+            "log printer has not reached its pause"
+        );
         RESUME.complete();
+    }
+
+    /// 撤销未到达的武装，或通过原 RESUME 完成源恢复已暂停的同一输出记录。
+    ///
+    /// 仅 Thread 控制者无观察锁、调度锁、PORT 及服务恢复依赖锁时调用；同一 fixture
+    /// 串行负责武装和清理。1→0 不产生完成 token；只有赢得 2→3 的调用者 complete，
+    /// 0/已放行的 3 幂等返回，CAS 失败重读真实到达状态，不覆盖生产者或重复发送事件。
+    /// 不改输出偏移、记录责任或 UART 状态；返回不代表服务已恢复或全部记录已发送。
+    /// fixture 仍须停止自身生产者、真实 join 并 catch_up/等待服务停稳，再允许复武装。
+    pub(crate) fn cancel_pause() {
+        loop {
+            let state = PAUSE.load(Ordering::Acquire);
+            let next = match state {
+                0 | 3 => return,
+                1 => 0,
+                2 => 3,
+                _ => unreachable!("invalid log pause state"),
+            };
+            if PAUSE
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if state == 2 {
+                    RESUME.complete();
+                }
+                return;
+            }
+        }
     }
 
     /// 等待调用者给出的固定排他序号，不追赶之后的生产者或依赖周期轮询。

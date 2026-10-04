@@ -5,7 +5,7 @@ pub use core::time::Duration;
 use core::cell::UnsafeCell;
 use core::convert::TryFrom;
 use core::hint::spin_loop;
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{compiler_fence, fence, AtomicU64, Ordering};
 use spin::Once;
@@ -154,7 +154,7 @@ pub(crate) struct Timekeeper {
     base_ns: AtomicU64,
     cycle_last: AtomicU64,
     fraction: AtomicU64,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     updates: AtomicU64,
 }
 
@@ -168,7 +168,7 @@ impl Timekeeper {
             base_ns: AtomicU64::new(0),
             cycle_last: AtomicU64::new(initial_cycle & mask),
             fraction: AtomicU64::new(0),
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             updates: AtomicU64::new(0),
         }
     }
@@ -182,7 +182,7 @@ impl Timekeeper {
                 continue;
             }
             let base = self.base_ns.load(Ordering::Relaxed);
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             let overlap = testing::pause_snapshot(self);
             let last = self.cycle_last.load(Ordering::Relaxed);
             let fraction = self.fraction.load(Ordering::Relaxed);
@@ -194,7 +194,7 @@ impl Timekeeper {
             // 奇序号先于最后序号读取；原子一致性禁止后者仍接受旧偶序号。
             fence(Ordering::Acquire);
             if self.sequence.load(Ordering::Relaxed) != sequence {
-                #[cfg(feature = "execution-tests")]
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 if overlap {
                     testing::reject_snapshot();
                 }
@@ -243,7 +243,7 @@ impl Timekeeper {
         let complete = sequence
             .checked_add(2)
             .expect("timekeeper sequence exhausted");
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         let updates = self
             .updates
             .load(Ordering::Relaxed)
@@ -252,27 +252,27 @@ impl Timekeeper {
         // 全部可能失败的算术在奇序号前结束；写侧关 IRQ，不能被本核 reader 打断。
         self.sequence.store(sequence + 1, Ordering::Relaxed);
         fence(Ordering::Release);
-        #[cfg(feature = "execution-timekeeper-fault")]
+        #[cfg(any(feature = "execution-timekeeper-fault", feature = "ktest"))]
         testing::panic_writer(self, cycle);
         self.base_ns.store(sample.instant.0, Ordering::Relaxed);
         self.cycle_last.store(sample.cycle, Ordering::Relaxed);
         self.fraction.store(sample.fraction, Ordering::Relaxed);
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         self.updates.store(updates, Ordering::Relaxed);
         self.sequence.store(complete, Ordering::Release);
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         testing::publish_snapshot_update(self);
         sample.instant
     }
 
     /// 向专用验收公开注册后的真实换算参数。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(crate) fn scale(&self) -> Scale {
         self.scale
     }
 
     /// 返回稳定基准中的小数余数，不把观察操作当作维护更新。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(crate) fn fraction(&self) -> u64 {
         loop {
             let sequence = self.sequence.load(Ordering::Acquire);
@@ -328,9 +328,9 @@ struct EventState {
 /// CpuLocal 中预备的本核事件状态，只由所属 CPU 在 IRQ-off 边界访问。
 pub(crate) struct LocalEvent {
     state: UnsafeCell<EventState>,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     program_pause: AtomicUsize,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     last_programmed: AtomicU64,
 }
 
@@ -346,9 +346,9 @@ impl LocalEvent {
                 maintenance: MonotonicInstant::from_nanos(0),
                 quantum: None,
             }),
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             program_pause: AtomicUsize::new(0),
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             last_programmed: AtomicU64::new(0),
         }
     }
@@ -442,7 +442,7 @@ fn arm_quantum(event: &mut EventState) {
 
 /// 在同一本核 base 锁下最终重查两类 timer，并保持锁直到真实硬件编程结束。
 fn program(event: EventState) {
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     testing::pause_program();
     crate::timer::with_next_deadline(|timer_deadline| {
         let deadline = event
@@ -452,7 +452,7 @@ fn program(event: EventState) {
         let timekeeper = keeper();
         let sample = timekeeper.sample(arch::read_counter);
         arch::program_timer(timekeeper.scale.deadline_cycles(sample, deadline));
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         cpu::current()
             .time_event
             .last_programmed
@@ -461,7 +461,7 @@ fn program(event: EventState) {
 }
 
 /// 专用验收只公开生产对象与同一算法，不维护第二套时间模型。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) mod testing {
     pub(crate) use super::Timekeeper;
     use super::{arm_quantum, keeper, reprogram_current, MonotonicInstant};
@@ -480,17 +480,17 @@ pub(crate) mod testing {
     static OVERLAP_WRITER: AtomicUsize = AtomicUsize::new(0);
     static OVERLAPS: AtomicUsize = AtomicUsize::new(0);
     static RETRIES: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(feature = "execution-timekeeper-fault")]
+    #[cfg(any(feature = "execution-timekeeper-fault", feature = "ktest"))]
     static FAULT_WRITER: AtomicUsize = AtomicUsize::new(0);
 
     /// 将故障限定到已等待 printer 真阻塞的当前普通 Task，维护 IRQ 不消费停点。
-    #[cfg(feature = "execution-timekeeper-fault")]
+    #[cfg(any(feature = "execution-timekeeper-fault", feature = "ktest"))]
     pub(crate) fn arm_writer_fault() {
         FAULT_WRITER.store(task::current_task().id().as_usize(), Ordering::Release);
     }
 
-    /// 仅在生产写锁和真实奇序号内触发 panic，输出不读取单调时间或普通日志。
-    #[cfg(feature = "execution-timekeeper-fault")]
+    /// 仅在生产写锁和真实奇序号内报告写者故障；终结路径不读取单调时间或普通日志。
+    #[cfg(any(feature = "execution-timekeeper-fault", feature = "ktest"))]
     pub(super) fn panic_writer(timekeeper: &Timekeeper, raw: u64) {
         if core::ptr::eq(timekeeper, keeper())
             && cpu::current().hardirq_depth.load(Ordering::Relaxed) == 0
@@ -499,15 +499,27 @@ pub(crate) mod testing {
         {
             let sequence = timekeeper.sequence.load(Ordering::Relaxed);
             assert_eq!(sequence & 1, 1);
-            crate::console::testing::emergency_write(format_args!(
-                "EXECUTION X27 state fault=timekeeper sequence={} sequence_odd=1 raw={}\n",
-                sequence, raw
-            ));
-            panic!("execution timekeeper writer fault");
+            #[cfg(feature = "ktest")]
+            crate::ktest::fatal_event(
+                "timekeeper",
+                format_args!(
+                    "execution timekeeper writer fault sequence={} sequence_odd=1 raw={}",
+                    sequence, raw
+                ),
+            );
+            #[cfg(not(feature = "ktest"))]
+            {
+                crate::console::testing::emergency_write(format_args!(
+                    "EXECUTION X27 state fault=timekeeper sequence={} sequence_odd=1 raw={}\n",
+                    sequence, raw
+                ));
+                panic!("execution timekeeper writer fault");
+            }
         }
     }
 
     /// 为指定 CPU 的下一次真实硬件提交武装锁前停点，须由另一 CPU 释放。
+    /// 上一次停点的真实提交与 handler 已返回、相关生产子任务已 join 后才可重新武装。
     pub(crate) fn arm_program_pause(target: usize) {
         assert_ne!(
             target,
@@ -537,6 +549,28 @@ pub(crate) mod testing {
             .program_pause
             .compare_exchange(PAUSED, PUBLISHED, Ordering::Release, Ordering::Relaxed)
             .expect("clockevent program pause has not been reached");
+    }
+
+    /// 撤销未到达的提交停点，或放行已暂停的真实提交；不撤销硬件事件且不等待 handler。
+    /// 控制者须在另一 CPU 保持目标与相关 timer 存储有效，锁外完成真实 close/join 和
+    /// handler 尾部确认后才能重新武装；状态归零本身不证明提交或中断已结束。
+    pub(crate) fn cancel_program_pause(target: usize) {
+        let state = &cpu::get(target).time_event.program_pause;
+        loop {
+            let phase = state.load(Ordering::Acquire);
+            let next = match phase {
+                0 | PUBLISHED => return,
+                ARMED => 0,
+                PAUSED => PUBLISHED,
+                _ => panic!("invalid clockevent program pause state"),
+            };
+            if state
+                .compare_exchange(phase, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     /// 读取真实硬件编程结束后发表的统一纳秒期限，不把候选期限冒充提交证据。
@@ -597,7 +631,7 @@ pub(crate) mod testing {
     /// reader 必须在本核普通任务的 IRQ-off 段调用，并在同一段立即调用 now，
     /// 期间不切换或先调用其他时间读接口；writer 必须已在另一 CPU 可运行，
     /// 以原始 counter 有限等待 reader_paused 后调用 maintain。双方不得持有
-    /// 对方推进所需的锁；reader 的 now 返回并关闭握手前不得重新注册。
+    /// 对方推进所需的锁；reader 的 now 返回且双方真实 join 后才可重新注册。
     pub(crate) unsafe fn arm_snapshot_overlap(reader: TaskId, writer: TaskId) {
         assert_ordinary_task();
         assert_eq!(task::current_task_id(), Some(reader));
@@ -637,6 +671,29 @@ pub(crate) mod testing {
         OVERLAP_PHASE.store(0, Ordering::Release);
     }
 
+    /// 原 reader 离开 sample 后撤销本例快照握手；重复取消空状态不改变生产基准。
+    /// 只修改停点，不跳过 writer 的真实字段写或伪造 PUBLISHED，不等待 reader/writer。
+    ///
+    /// # Safety
+    /// 调用者须独占本例控制权，并证明原 reader 已退出本次 sample 或不会再进入它：
+    /// 本体 catch 退栈或 reader 子任务真实 join 可提供该证明。仍暂停的 reader 必须
+    /// 先由指定 writer 真实 maintain 发布 even 并放行，再在原同 CPU IRQ-off 段退出
+    /// sample；不得以取消替代这次生产写。取消后仍保活双方，真实 join 全部 writer
+    /// 和 reader 以前不得重新武装，避免旧 producer 的 CAS 消费下一例的同值状态。
+    pub(crate) unsafe fn cancel_snapshot_overlap() {
+        loop {
+            let phase = OVERLAP_PHASE.load(Ordering::Acquire);
+            assert!(phase <= REJECTED, "invalid snapshot overlap state");
+            if phase == 0
+                || OVERLAP_PHASE
+                    .compare_exchange(phase, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// 校验停点只位于本核普通执行段，IRQ 不能在等待期间重入时间读取。
     fn assert_ordinary_task() {
         assert!(!arch::irq_enabled(), "snapshot test requires IRQ-off");
@@ -673,7 +730,12 @@ pub(crate) mod testing {
             .checked_mul(5)
             .expect("snapshot raw timeout overflows");
         let start = arch::read_counter();
-        OVERLAP_PHASE.store(PAUSED, Ordering::Release);
+        if OVERLAP_PHASE
+            .compare_exchange(ARMED, PAUSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         while OVERLAP_PHASE.load(Ordering::Acquire) == PAUSED {
             assert!(
                 arch::read_counter().wrapping_sub(start) < limit,
@@ -686,12 +748,18 @@ pub(crate) mod testing {
     }
 
     /// 写者完成真实字段写和 even 发布以后才释放持旧 base 的 reader。
+    /// 原 reader 已退出时取消可先关闭握手；CAS 防止仍在真实 update 尾部的旧 writer 复活停点。
     pub(super) fn publish_snapshot_update(timekeeper: &Timekeeper) {
         if OVERLAP_PHASE.load(Ordering::Acquire) == PAUSED
             && matches_task(timekeeper, &OVERLAP_WRITER)
         {
             OVERLAPS.fetch_add(1, Ordering::Relaxed);
-            OVERLAP_PHASE.store(PUBLISHED, Ordering::Release);
+            let _ = OVERLAP_PHASE.compare_exchange(
+                PAUSED,
+                PUBLISHED,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
         }
     }
 

@@ -1,5 +1,9 @@
 //! 在生产任务与原页分配器上检查块设备准备、真实发表和确认停止。
 
+mod block_io;
+mod finalizer;
+mod prepare;
+
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use virtio_drivers::device::blk::PDU_STRIDE;
@@ -173,6 +177,8 @@ fn backend(
         "published backend controls did not return"
     );
     preparation_oom(&mut prepare, legacy, info.queue_depth, index);
+    prepare::run(&mut prepare, index);
+    block_io::run(&mut prepare, legacy, index);
     let mut device = prepare().expect("backend did not recover after preparation OOM");
     device
         .publish()
@@ -190,12 +196,17 @@ fn backend(
     );
 }
 
-/// 从一次真实库存逐个检查 MMIO 或 PCI 块设备，不读盘、不宣称文件通路或数据请求完成。
+/// 从一次真实库存检查两种后端及实际块数据路径，文件通路仍不属于本批。
 pub(crate) fn run() -> i32 {
     crate::early_println!(
-        "STORAGE READY arch={} cpus={} suite=backend",
+        "STORAGE READY arch={} cpus={} suite=block mode={}",
         crate::arch::NAME,
-        cpu::count()
+        cpu::count(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
     );
     let inventory = drivers::discover().expect("storage resource discovery failed");
     let mut count = 0;
@@ -226,8 +237,8 @@ pub(crate) fn run() -> i32 {
     assert!(0 < count, "storage backend suite requires an attached disk");
     drop(inventory);
     crate::early_println!(
-        "STORAGE BACKEND PASS devices={} scope=initialization-no-io",
+        "STORAGE BLOCK PASS devices={} scope=real-io-with-controlled-ledger",
         count
     );
-    0
+    crate::arch::shutdown()
 }

@@ -1,0 +1,23 @@
+upstream = "https://github.com/nbdd0121/unwinding"
+license = "MIT OR Apache-2.0"
+base_version = "0.2.5"
+base_commit = "181889db4b4c0f39021506e7a753036528cf8c73"
+base_archive_url = "https://codeload.github.com/nbdd0121/unwinding/tar.gz/181889db4b4c0f39021506e7a753036528cf8c73"
+base_archive_sha256 = "3b84123098147daf4a1f09ef71d0032ef4e76a4c9685c43cd47f25a62e1210e1"
+loongarch_commit = "5fd5fdcdd2d6b674db1af6cdd547771fcf670a72"
+loongarch_source_url = "https://raw.githubusercontent.com/nbdd0121/unwinding/5fd5fdcdd2d6b674db1af6cdd547771fcf670a72/src/unwinder/arch/loongarch64.rs"
+llvm_cfi_fix_commit = "3f1e7ef5344c3236bcabf3982dbdc985c43bc078"
+llvm_cfi_fix_url = "https://github.com/llvm/llvm-project/pull/117120"
+selected_gimli_version = "0.31.1"
+context7_resolution = "2026-10-04：两次精确请求未找到 nbdd0121/unwinding，只返回不相关 Framehop/Bytehound；实际接口以固定官方源码为准。"
+compatibility_status = "未运行构建或 QEMU；LLVM 19.1.7 / 固定 nightly 的真实双架构清理由集成者验证。"
+
+local_changes = [
+  "仅导入上游 src、Cargo.toml、README 和两份 License；移除指向未导入 cdylib/test_crates 的 workspace 成员。",
+  "gimli 固定 =0.31.1，保留 read-core 且关闭默认特性；未删除或伪造 MSRV。",
+  "加入固定上游 LoongArch 寄存器映射及真实 LP64D/LP64S 保存恢复。",
+  "LA CFI ra 名字改为 DWARF 数字 1；naked 函数用 0.2.5 时代 #[naked] 和 unsafe naked_asm 形式；固定输入使用 $r4。",
+  "RV/LA 完整初始化 Context 未保存槽，保持真实 ABI callee-saved 保存和两阶段展开算法。",
+  "kernel-percpu 禁止恢复 RV/LA tp；KS0 不参与展开现场。",
+  "fde-static 使用 __eh_frame_end 的真实长度；kernel-percpu personality 使用 __gcc_except_table_start/end 的真实 LSDA 界限。",
+]

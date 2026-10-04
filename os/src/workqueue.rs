@@ -12,7 +12,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::ptr;
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,7 +25,7 @@ use crate::wait::{WaitNode, WaitQueue, Waiter};
 // ponytail: 全域短元数据锁限制并行提交吞吐；仅在实际测得竞争后拆分域与池锁。
 pub(super) static STATE_LOCK: SpinLock<()> = SpinLock::new(());
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 static LIVE_DOMAINS: AtomicUsize = AtomicUsize::new(0);
 
 /// 普通域采用全域并发上限；严格有序域固定 CPU0 且只准入一个回调。
@@ -48,6 +48,8 @@ pub(super) struct DomainState {
     color: usize,
     counts: [usize; 2],
     active: usize,
+    reserved_active: usize,
+    reserved_workers: usize,
     rescue_stop: bool,
 }
 
@@ -94,6 +96,8 @@ impl WorkQueue {
                 color: 0,
                 counts: [0; 2],
                 active: 0,
+                reserved_active: 0,
+                reserved_workers: 0,
                 rescue_stop: false,
             }),
             flush_serial: SleepMutex::new(()),
@@ -102,7 +106,7 @@ impl WorkQueue {
             rescuers: UnsafeCell::new(Vec::new()),
         };
         // 在 fallible Arc 分配前计入完整 value；分配失败的普通 Drop 同样归还。
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         LIVE_DOMAINS.fetch_add(1, Ordering::Relaxed);
         let domain = Arc::try_new(value)?;
         let count = if config.ordered { 1 } else { cpu::count() };
@@ -145,7 +149,7 @@ impl WorkQueue {
         self.domain.flush();
     }
 
-    /// 一次永久拒绝新票，排空已接受票后停止并真实 join 本域所有救援任务。
+    /// 永久拒绝新票，排空后归还预留执行栈，再停止并真实 join 本域救援任务。
     pub fn close_sync(&self) {
         pool::assert_wait_allowed(&self.domain, ptr::null());
         let _serial = self.domain.close_serial.lock();
@@ -157,6 +161,12 @@ impl WorkQueue {
             state.closed = true;
         }
         self.domain.flush();
+        pool::release_domain_reservations(&self.domain);
+        wait_until(&self.domain.finished, || {
+            let _lock = STATE_LOCK.lock();
+            // SAFETY: 原 manager 只在真实 join 返回后于同锁扣除此计数。
+            unsafe { (*self.domain.state.get()).reserved_workers == 0 }
+        });
         {
             let _lock = STATE_LOCK.lock();
             // SAFETY: 短锁保护 rescuer 的退出谓词。
@@ -179,6 +189,14 @@ impl WorkQueue {
             assert_eq!(join.join(), 0);
         }
     }
+
+    /// 读取原域尚未经 manager 真实 join 的预留任务数，不把无票误当离栈。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_reserved_workers(&self) -> usize {
+        let _lock = STATE_LOCK.lock();
+        // SAFETY: 原域的登记和 manager 真实 join 归账均由同一状态锁串行。
+        unsafe { (*self.domain.state.get()).reserved_workers }
+    }
 }
 
 impl Drop for WorkQueue {
@@ -194,16 +212,17 @@ impl Drop for WorkQueue {
 }
 
 impl Domain {
-    /// 锁下读取全域准入容量；running 的睡眠不会释放 active。
-    pub(super) unsafe fn eligible(&self) -> bool {
+    /// 普通 running 睡眠仍占 active；预留 Work 已有独占执行栈，不借普通额度。
+    pub(super) unsafe fn eligible(&self, work: &Work) -> bool {
         // SAFETY: 调用者持 STATE_LOCK。
         let state = unsafe { &*self.state.get() };
-        state.active
-            < if self.config.ordered {
-                1
-            } else {
-                self.config.max_active
-            }
+        work.reserved_worker.is_some()
+            || state.active
+                < if self.config.ordered {
+                    1
+                } else {
+                    self.config.max_active
+                }
     }
 
     /// 单一 flush owner 等颜色完全归零后才允许复用它。
@@ -234,8 +253,10 @@ impl Drop for Domain {
         let state = unsafe { &*self.state.get() };
         assert_eq!(state.counts, [0; 2]);
         assert_eq!(state.active, 0);
+        assert_eq!(state.reserved_active, 0);
+        assert_eq!(state.reserved_workers, 0);
         assert!(!state.published || state.closed);
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         LIVE_DOMAINS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -263,6 +284,8 @@ pub struct Work {
     callback: fn(Pin<&Work>),
     context: usize,
     owned_raw: *const Work,
+    reserved_worker: Option<Arc<Worker>>,
+    one_shot: bool,
     state: UnsafeCell<WorkState>,
     stop_serial: SleepMutex<()>,
     finished: WaitQueue,
@@ -323,12 +346,88 @@ impl Work {
     ) -> Result<Pin<Arc<Self>>, AllocError> {
         assert!(cpu < cpu::count(), "work CPU is out of range");
         let cpu = if queue.domain.config.ordered { 0 } else { cpu };
+        Self::prepare(
+            Arc::clone(&queue.domain),
+            cpu,
+            callback,
+            context,
+            false,
+            false,
+        )
+    }
+
+    /// 块控制或重型完成在构造期预留一份真实执行栈，不与未知可睡回调竞争额度。
+    /// 每个 Work 仅由自己的执行者领取，普通域/ordered/reclaim 接口保持原语义。
+    pub(crate) fn try_new_reserved(
+        queue: &WorkQueue,
+        cpu: usize,
+        callback: fn(Pin<&Work>),
+        context: usize,
+    ) -> Result<Pin<Arc<Self>>, AllocError> {
+        assert!(cpu < cpu::count(), "work CPU is out of range");
+        Self::prepare(
+            Arc::clone(&queue.domain),
+            cpu,
+            callback,
+            context,
+            true,
+            false,
+        )
+    }
+
+    /// 一次性 Bio 完成克隆原域和 CPU，另备独占栈；回调返回即归还预留，不新建域 owner。
+    pub(crate) fn try_new_related_reserved(
+        &self,
+        callback: fn(Pin<&Work>),
+        context: usize,
+    ) -> Result<Pin<Arc<Self>>, AllocError> {
+        Self::prepare(
+            Arc::clone(&self.domain),
+            self.cpu,
+            callback,
+            context,
+            true,
+            true,
+        )
+    }
+
+    /// 克隆该 Work 原预留执行者的弱任务观察；尚未进入服务或已析构时为空。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_reserved_task(&self) -> Option<Arc<crate::task::Task>> {
+        self.reserved_worker
+            .as_ref()
+            .and_then(|worker| worker.ktest_task())
+    }
+
+    /// 原预留执行者只在其真实 JoinHandle 返回后标记 joined。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_reserved_joined(&self) -> bool {
+        self.reserved_worker
+            .as_ref()
+            .is_some_and(|worker| worker.ktest_joined())
+    }
+
+    /// 锁外完成全部 fallible 构造；预留执行者只在 Work 地址和关联写定后发表。
+    fn prepare(
+        domain: Arc<Domain>,
+        cpu: usize,
+        callback: fn(Pin<&Work>),
+        context: usize,
+        reserved: bool,
+        one_shot: bool,
+    ) -> Result<Pin<Arc<Self>>, AllocError> {
+        assert!(
+            !reserved || !domain.config.ordered,
+            "ordered work cannot reserve parallel execution"
+        );
         let raw = Arc::into_raw(Arc::try_new(Self {
-            domain: Arc::clone(&queue.domain),
+            domain,
             cpu,
             callback,
             context,
             owned_raw: ptr::null(),
+            reserved_worker: None,
+            one_shot,
             state: UnsafeCell::new(WorkState {
                 next: ptr::null(),
                 previous: ptr::null(),
@@ -348,11 +447,21 @@ impl Work {
             finished: WaitQueue::new(),
             _pinned: PhantomPinned,
         })?);
-        // SAFETY: 未发表且唯一的 into_raw 强引用允许补入原控制块指针，随后恰好恢复该引用并固定地址。
-        unsafe {
+        // SAFETY: 未发表且唯一的 into_raw 强引用允许补入原控制块指针，并立即恢复固定拥有。
+        let owner = unsafe {
             (*raw.cast_mut()).owned_raw = raw;
-            Ok(Pin::new_unchecked(Arc::from_raw(raw)))
+            Pin::new_unchecked(Arc::from_raw(raw))
+        };
+        if reserved {
+            // Task 原生准备包含 order4/16页栈；失败尚未发表执行者，原 Work 普通析构。
+            let (worker, prepared) = pool::prepare_reserved(cpu, &owner.domain, raw)?;
+            // SAFETY: 无票且尚无异步执行者；原固定分配内只初始化一次关联，不移动 Work。
+            unsafe {
+                (*raw.cast_mut()).reserved_worker = Some(Arc::clone(&worker));
+            }
+            pool::publish_worker(worker, prepared);
         }
+        Ok(owner)
     }
 
     /// delayed 在捕获边界期间与同步停止串行；先拒自等，再取得可睡锁。
@@ -418,7 +527,13 @@ impl Work {
                 .expect("work ticket exhausted");
             state.queued = state.next_ticket;
             state.color = domain.color;
-            state.assigned = state.worker;
+            state.assigned = if state.worker.is_null() {
+                self.reserved_worker
+                    .as_ref()
+                    .map_or(ptr::null(), Arc::as_ptr)
+            } else {
+                state.worker
+            };
             domain.counts[state.color] = domain.counts[state.color]
                 .checked_add(1)
                 .expect("work color count exhausted");
@@ -548,9 +663,13 @@ impl Work {
     pub fn cancel_sync(self: Pin<&Self>) -> bool {
         self.begin_stop(false).finish()
     }
-    /// 唯一 owner 永久关闭此 Work；Drop 不再执行第二次同步停止。
+    /// 唯一 owner 永久关闭 Work；预留执行者交原 manager 真实 join 后才返回。
     pub fn close_sync(self: Pin<&Self>) -> bool {
-        self.begin_stop(true).finish()
+        let affected = self.begin_stop(true).finish();
+        if let Some(worker) = &self.reserved_worker {
+            pool::close_reservation(worker);
+        }
+        affected
     }
 }
 
@@ -590,13 +709,17 @@ impl Drop for StopGuard<'_> {
 }
 
 impl Drop for Work {
-    /// 最后拥有者只核无活票，不等待或重复停止。
+    /// 最后拥有者只核无票并锁外释放预留，不隐式等待或重复同步停止。
     fn drop(&mut self) {
         let _lock = STATE_LOCK.lock();
         // SAFETY: 最后引用不能与任何拥有票并存；仍核对链状态。
         let state = unsafe { &*self.state.get() };
         assert_eq!(state.queued, 0, "dropping pending work");
         assert_eq!(state.running, 0, "dropping running work");
+        drop(_lock);
+        if let Some(worker) = &self.reserved_worker {
+            pool::release_reservation(worker);
+        }
     }
 }
 
@@ -634,11 +757,11 @@ pub fn initialize_services() -> Result<(), AllocError> {
     Ok(())
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) mod testing {
     pub(crate) use super::pool::testing::{
-        arm_pause, is_paused, is_rescuer, manager_blocked, pool_stats, release_pause,
-        wait_services_blocked, PausePoint, PoolStats,
+        arm_pause, cancel_pause, is_paused, is_rescuer, manager_blocked, pool_stats, release_pause,
+        service_count, service_task, wait_services_blocked, PausePoint, PoolStats,
     };
     use super::*;
     /// 当前仍存活的真实 payload 数；不代表 Weak 控制块或 allocator backing 已归还。

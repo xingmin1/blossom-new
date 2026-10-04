@@ -1,0 +1,224 @@
+//! 每个固件参数实例重新复制实际 DTB；副本锁不覆盖任何异步服务。
+
+use crate::sync::{SpinLock, SpinLockGuard};
+use crate::{arch, boot, platform};
+use ::ktest::{Fixture, TestContext, TestError};
+
+const CAPACITY: usize = 2 * 1024 * 1024;
+static COPY_LOCK: SpinLock<()> = SpinLock::new(());
+static mut COPY: [u8; CAPACITY] = [0; CAPACITY];
+
+struct Dtb {
+    bytes: &'static mut [u8],
+    _exclusive: SpinLockGuard<'static, ()>,
+}
+
+impl Fixture for Dtb {
+    /// 早期 IRQ 关闭且只有 BSP 使用此副本，锁拥有唯一可变借用。
+    fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+        let exclusive = COPY_LOCK.lock();
+        let info = boot::info();
+        let length = info
+            .dtb
+            .end
+            .checked_sub(info.dtb.start)
+            .filter(|&n| n <= CAPACITY)
+            .ok_or(TestError("DTB copy exceeds capacity"))?;
+        // SAFETY: BootInfo 的原始 DTB 已验证并永久保留；目标静态副本不重叠，
+        // 独占锁保活到 fixture 消费且任何其他访问 COPY 都取得同一锁。
+        let bytes = unsafe {
+            let copy = core::ptr::addr_of_mut!(COPY).cast::<u8>();
+            core::ptr::copy_nonoverlapping(
+                arch::phys_to_virt(info.dtb.start) as *const u8,
+                copy,
+                length,
+            );
+            core::slice::from_raw_parts_mut(copy, length)
+        };
+        Ok(Self {
+            bytes,
+            _exclusive: exclusive,
+        })
+    }
+}
+
+/// 从完整真实输入重新解析；不改写已发表 BootInfo。
+fn parse(bytes: &[u8], bsp: usize) -> boot::BootInfo {
+    let live = boot::info();
+    platform::ktest_discover_tree(bytes, live.raw_args, bsp, live.dtb.start)
+        .expect("actual DTB resource parse failed")
+}
+
+/// 比较实际资源发现结果，内核保留项由 publish 之前的独立 reserve 负责。
+fn same_resources(
+    context: &mut TestContext<'_>,
+    actual: &boot::BootInfo,
+    expected: &boot::BootInfo,
+) {
+    context.expect_eq(actual.cpu_count, expected.cpu_count);
+    context.expect_eq(actual.hardware_ids, expected.hardware_ids);
+    context.expect_eq(actual.memory, expected.memory);
+    context.expect_eq(actual.memory_count, expected.memory_count);
+    context.expect_eq(actual.dtb, expected.dtb);
+    context.expect_eq(actual.interrupts.uart, expected.interrupts.uart);
+    context.expect_eq(actual.interrupts.controller, expected.interrupts.controller);
+    context.expect_eq(
+        actual.interrupts.parent_controller,
+        expected.interrupts.parent_controller,
+    );
+    context.expect_eq(
+        actual.interrupts.uart_source,
+        expected.interrupts.uart_source,
+    );
+    context.expect_eq(
+        actual.interrupts.plic_contexts,
+        expected.interrupts.plic_contexts,
+    );
+    context.expect_eq(actual.pci.configuration, expected.pci.configuration);
+    context.expect_eq(actual.pci.range_count, expected.pci.range_count);
+    for (left, right) in actual.pci.ranges.iter().zip(&expected.pci.ranges) {
+        context.expect_eq(left.flags, right.flags);
+        context.expect_eq(left.bus_start, right.bus_start);
+        context.expect_eq(left.cpu, right.cpu);
+    }
+    context.expect_eq(actual.bootargs(), expected.bootargs());
+    context.expect_eq(actual.counter_frequency, expected.counter_frequency);
+}
+
+#[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware"), timeout_ms = 10000)]
+pub(crate) mod cases {
+    use super::*;
+
+    /// 固件原始参数和完整 DTB 的身份来自这次真实启动。
+    #[test]
+    fn raw_arguments(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let live = boot::info();
+        let parsed = parse(fixture.bytes, live.bsp_hardware_id);
+        same_resources(context, &parsed, live);
+        context.expect_eq(parsed.raw_args, live.raw_args);
+        context.expect_eq(parsed.bsp_hardware_id, live.bsp_hardware_id);
+        context.expect_eq(parsed.hardware_ids[0], live.bsp_hardware_id);
+        #[cfg(target_arch = "riscv64")]
+        {
+            context.expect_eq(live.raw_args[0], live.bsp_hardware_id);
+            context.expect_eq(live.raw_args[1], live.dtb.start);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        context.expect_eq(live.dtb.start, 0x10_0000);
+        context.diagnostic(format_args!(
+            "firmware bsp={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
+            live.bsp_hardware_id,
+            live.raw_args[0],
+            live.raw_args[1],
+            live.raw_args[2],
+            live.dtb.start,
+            live.dtb.end
+        ));
+    }
+
+    /// RAM、固件保留区和 PCI 地址域直接核对解析结果与永久输入。
+    #[test]
+    fn resource_regions(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let live = boot::info();
+        let parsed = parse(fixture.bytes, live.bsp_hardware_id);
+        same_resources(context, &parsed, live);
+        let kernel = boot::kernel_region();
+        assert!(live.memory[..live.memory_count]
+            .iter()
+            .any(|r| r.start <= kernel.start && kernel.end <= r.end));
+        assert!(live.reserved[..live.reserved_count].contains(&kernel));
+        assert!(live.reserved[..live.reserved_count].contains(&live.dtb));
+        assert!(parsed.reserved[..parsed.reserved_count]
+            .iter()
+            .all(|r| live.reserved[..live.reserved_count].contains(r)));
+        for region in &live.memory[..live.memory_count] {
+            assert!(region.start < region.end);
+            context.diagnostic(format_args!(
+                "RAM start={:#x} end={:#x}",
+                region.start, region.end
+            ));
+        }
+        for region in &live.reserved[..live.reserved_count] {
+            context.diagnostic(format_args!(
+                "RESERVED start={:#x} end={:#x}",
+                region.start, region.end
+            ));
+        }
+        context.diagnostic(format_args!(
+            "PCI config={:#x}..{:#x} windows={}",
+            live.pci.configuration.start, live.pci.configuration.end, live.pci.range_count
+        ));
+        for range in &live.pci.ranges[..live.pci.range_count] {
+            context.diagnostic(format_args!(
+                "PCI WINDOW flags={:#x} bus={:#x} physical={:#x}..{:#x}",
+                range.flags, range.bus_start, range.cpu.start, range.cpu.end
+            ));
+        }
+    }
+
+    /// 所有不完整前缀都必须由生产边界验证拒绝。
+    #[test]
+    fn truncated_prefixes(_: &mut TestContext<'_>, fixture: &mut Dtb) {
+        assert!(platform::ktest_validate(fixture.bytes).is_ok());
+        for end in 0..fixture.bytes.len() {
+            assert!(
+                platform::ktest_validate(&fixture.bytes[..end]).is_err(),
+                "accepted truncated DTB prefix {}",
+                end
+            );
+        }
+    }
+
+    /// 单个块字段损坏独立实例，真实总长保持不变。
+    #[test]
+    #[case("structure_offset", 8usize)]
+    #[case("strings_offset", 12usize)]
+    #[case("reservation_offset", 16usize)]
+    #[case("strings_size", 32usize)]
+    #[case("structure_size", 36usize)]
+    fn block_boundary(_: &mut TestContext<'_>, fixture: &mut Dtb, field: usize) {
+        fixture.bytes[field..field + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(
+            platform::ktest_validate(fixture.bytes).is_err(),
+            "accepted damaged DTB block {}",
+            field
+        );
+    }
+
+    /// 原输入支持把实际最后一个硬件核作为 BSP，不假设 BSP 硬件编号为零。
+    #[test]
+    #[case("first", false)]
+    #[case("last", true)]
+    fn bsp_order(context: &mut TestContext<'_>, fixture: &mut Dtb, last: bool) {
+        let live = boot::info();
+        let hardware = live.hardware_ids[if last { live.cpu_count - 1 } else { 0 }];
+        let actual = parse(fixture.bytes, hardware);
+        context.expect_eq(actual.cpu_count, live.cpu_count);
+        context.expect_eq(actual.hardware_ids[0], hardware);
+        for id in &live.hardware_ids[..live.cpu_count] {
+            assert!(actual.hardware_ids[..actual.cpu_count].contains(id));
+        }
+    }
+
+    /// 把真实根 compatible 属性替换为 FDT_NOP 后资源发现仍完整。
+    #[test]
+    fn nop_property(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let live = boot::info();
+        let hardware = live.hardware_ids[live.cpu_count - 1];
+        let original = parse(fixture.bytes, hardware);
+        let (start, end) = {
+            let tree = fdt::Fdt::new(fixture.bytes).expect("actual DTB invalid");
+            let property = tree
+                .find_node("/")
+                .and_then(|n| n.property("compatible"))
+                .expect("actual root compatible absent");
+            let value = property.value.as_ptr() as usize - fixture.bytes.as_ptr() as usize;
+            (value - 12, (value + property.value.len() + 3) & !3)
+        };
+        for token in fixture.bytes[start..end].chunks_exact_mut(4) {
+            token.copy_from_slice(&4u32.to_be_bytes());
+        }
+        let actual = parse(fixture.bytes, hardware);
+        same_resources(context, &actual, &original);
+    }
+}

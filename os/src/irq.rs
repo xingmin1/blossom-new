@@ -14,6 +14,14 @@ static SOURCE_COUNT: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrqNumber(u32);
 
+#[cfg(feature = "ktest")]
+impl IrqNumber {
+    /// 返回当前真实 domain 的源号，供硬件测试记录已核对的设备路由。
+    pub(crate) fn source(self) -> u32 {
+        self.0
+    }
+}
+
 /// IRQ 资源登记的有界失败原因。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IrqError {
@@ -54,6 +62,8 @@ struct Descriptor {
     count: usize,
     handling: bool,
     reported: bool,
+    #[cfg(feature = "ktest")]
+    dispatch_count: usize,
 }
 
 impl Descriptor {
@@ -65,6 +75,8 @@ impl Descriptor {
             count: 0,
             handling: false,
             reported: false,
+            #[cfg(feature = "ktest")]
+            dispatch_count: 0,
         }
     }
 
@@ -80,6 +92,54 @@ impl Descriptor {
 
 static SOURCES: [SpinLock<Descriptor>; MAX_INTERRUPT_SOURCES] =
     [const { SpinLock::new(Descriptor::empty()) }; MAX_INTERRUPT_SOURCES];
+
+/// 只在串行设备准备验收中数真实 action，包括尚未 enable 的登记，不推断全线状态。
+#[cfg(any(feature = "storage-tests", feature = "ktest"))]
+pub(crate) fn test_action_count(number: IrqNumber) -> usize {
+    SOURCES[number.0 as usize]
+        .lock()
+        .slots
+        .iter()
+        .filter(|slot| slot.action.is_some())
+        .count()
+}
+
+/// 真实共享 IRQ 的测试观测与双 action 准入；保持生产登记和同步停止责任。
+#[cfg(feature = "ktest")]
+pub(crate) mod testing {
+    use super::{IrqNumber, IrqRegistration, RegistrationState, SOURCES};
+
+    /// 读取此源在真实控制器成功 claim 后记录的分派次数，不推断任一设备 ISR。
+    pub(crate) fn dispatch_count(number: IrqNumber) -> usize {
+        SOURCES[number.0 as usize].lock().dispatch_count
+    }
+
+    /// 在同一 descriptor 临界区开放两个不同的 Live action，最后一次复查硬件屏蔽。
+    /// 源不同、token 或槽相同、任一 token 非 Live 时返回 false，不改变任何准入。
+    ///
+    /// 调用 fixture 必须独占两 token，不能并发 stop 或以逆序调用另一个 enable_pair。
+    /// 锁序为 first token→second token→descriptor→controller；不得在同线 handler 中
+    /// 调用，也不得持有 handler 退出依赖的锁。可持有原 Disk 的 token 存储锁，因为
+    /// 原 IRQ handler 不取得这些外部存储锁；设备状态须已按原 enable 合同准备完毕。
+    pub(crate) fn enable_pair(first: &IrqRegistration, second: &IrqRegistration) -> bool {
+        if core::ptr::eq(first, second)
+            || first.number != second.number
+            || first.slot == second.slot
+        {
+            return false;
+        }
+        let first_state = first.state.lock();
+        let second_state = second.state.lock();
+        if *first_state != RegistrationState::Live || *second_state != RegistrationState::Live {
+            return false;
+        }
+        let mut descriptor = SOURCES[first.number.0 as usize].lock();
+        descriptor.slots[first.slot].enabled = true;
+        descriptor.slots[second.slot].enabled = true;
+        descriptor.update_mask(first.number.0);
+        true
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RegistrationState {
@@ -251,6 +311,10 @@ pub fn handle_external() {
             arch::external_mask(source);
             assert!(!descriptor.handling, "IRQ source routed to concurrent CPUs");
             descriptor.handling = true;
+            #[cfg(feature = "ktest")]
+            {
+                descriptor.dispatch_count += 1;
+            }
             // 取得执行引用与准入检查不可拆锁，注销不能在快照与计数之间释放 context。
             for index in 0..descriptor.count {
                 let slot = descriptor.order[index];

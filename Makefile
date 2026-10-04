@@ -4,6 +4,8 @@ ARCH ?= riscv64
 CPUS ?= 4
 MEMORY ?= 1G
 MODE ?= debug
+PANIC ?= unwind
+KTEST_ARGS ?=
 FEATURES ?=
 FAULT ?= irq
 OUTPUT ?= build/$(ARCH)/kernel.elf
@@ -81,6 +83,26 @@ test-execution-fault:
 	@test "$(FAULT)" = irq -o "$(FAULT)" = preempt -o "$(FAULT)" = printer-oom -o "$(FAULT)" = timekeeper || { echo "FAULT must be irq, preempt, printer-oom, or timekeeper" >&2; exit 2; }
 	$(MAKE) build ARCH=$(ARCH) CPUS=$(CPUS) MEMORY="$(MEMORY)" MODE=$(MODE) FEATURES=execution-$(FAULT)-fault OUTPUT=build/$(ARCH)/kernel-execution-$(FAULT)-fault.elf
 	python3 scripts/test-execution.py --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --kernel build/$(ARCH)/kernel-execution-$(FAULT)-fault.elf --fault $(FAULT)
+
+ifeq ($(PANIC),unwind)
+KTEST_PROFILE := $(if $(filter release,$(MODE)),ktest-release,ktest-dev)
+else ifeq ($(PANIC),abort)
+KTEST_PROFILE := $(if $(filter release,$(MODE)),ktest-abort-release,ktest-abort-dev)
+else
+$(error PANIC 只支持 unwind 或 abort)
+endif
+
+.PHONY: ktest-build ktest-list ktest
+ktest-build:
+	cd os && CARGO_TARGET_DIR=../build/ktest-target RUSTFLAGS="-Cpanic=$(PANIC) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+	mkdir -p "$(dir $(OUTPUT))"
+	cp "build/ktest-target/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
+
+ktest-list:
+	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) $(KTEST_ARGS)
+
+ktest:
+	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) $(KTEST_ARGS)
 
 clean:
 	cd os && cargo clean

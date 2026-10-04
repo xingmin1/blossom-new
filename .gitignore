@@ -1,6 +1,8 @@
 .vscode
 
 os/target/
+/crates/*/target/
+/tools/**/__pycache__/
 /build/
 
 os/qemu.log

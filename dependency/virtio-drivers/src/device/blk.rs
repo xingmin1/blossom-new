@@ -4,7 +4,7 @@ use crate::hal::{BufferDirection, DmaRegion, Hal, MappedSegment};
 use crate::queue::{UsedElement, VirtQueue};
 use crate::transport::{DeviceStatus, InterruptStatus, Notification, Transport};
 use crate::{Error, Result};
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::write_volatile;
 
 const QUEUE: u16 = 0;
 const SIZE_MAX: u64 = 1 << 1;
@@ -174,41 +174,40 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         Ok(())
     }
 
-    /// 将稳定 tag PDU 与已映射 payload 写入 ring，返回真实 descriptor head。
-    /// 此调用不分配、不通知、不等待；协议拒绝与队列额度不足原样返回。
+    /// 将锁外预备的稳定 tag PDU 与已映射 payload 写入 ring，返回真实 descriptor head。
+    /// 此调用不分配、不改写 PDU、不通知、不等待；协议拒绝与额度不足原样返回。
     ///
     /// # Safety
-    /// 调用者必须独占该 tag，保证它已无设备访问；所有 payload owner 必须先交权，
-    /// 并保活至对应 used 或确认 reset。请求完整范围、sector/逻辑块对齐与能力由
-    /// 核心负责验证；成功后必须在释放队列锁前安装唯一 head→tag 请求记录。
-    /// 失败时没有新链被发表，调用者仍负责撤销尚未发表的 payload 交权。
+    /// 调用者必须独占该 tag，保证它已无设备访问，并已用 prepare_pdu 写入本轮
+    /// operation 与合法 sector。所有 payload owner 必须先交权并保活至 used 或
+    /// 确认 reset；完整范围、对齐与能力由核心验证。成功后须在释放队列锁前
+    /// 安装唯一 head→tag 记录；失败没有新链，调用者仍负责未发表范围的交权。
     pub unsafe fn submit(
         &mut self,
         tag: u16,
         operation: BlkOperation,
-        sector: u64,
         payload: &[MappedSegment],
     ) -> Result<u16> {
         if self.notification.is_none() {
             return Err(Error::NotReady);
         }
         let offset = self.tag_offset(tag)?;
-        let (request_type, direction) = match operation {
-            BlkOperation::Read => (0_u32, BufferDirection::DeviceToDriver),
+        let direction = match operation {
+            BlkOperation::Read => BufferDirection::DeviceToDriver,
             BlkOperation::Write => {
                 if self.info.readonly {
                     return Err(Error::Unsupported);
                 }
-                (1_u32, BufferDirection::DriverToDevice)
+                BufferDirection::DriverToDevice
             }
             BlkOperation::Flush => {
                 if !self.info.flush {
                     return Err(Error::Unsupported);
                 }
-                if !payload.is_empty() || sector != 0 {
+                if !payload.is_empty() {
                     return Err(Error::InvalidParam);
                 }
-                (4_u32, BufferDirection::DriverToDevice)
+                BufferDirection::DriverToDevice
             }
         };
         if (operation != BlkOperation::Flush && payload.is_empty())
@@ -236,15 +235,6 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             length: 1,
             direction: BufferDirection::DeviceToDriver,
         }];
-        // SAFETY: new 已验证完整 PDU 范围与 16 字节对齐；tag_offset 保证该槽在范围内。
-        // submit 的调用者独占该 tag，设备尚未访问它；只向稳定控制区写入原始整数。
-        unsafe {
-            let cpu = self.pdu.cpu.as_ptr().add(offset);
-            write_volatile(cpu.cast::<u32>(), request_type.to_le());
-            write_volatile(cpu.add(4).cast::<u32>(), 0);
-            write_volatile(cpu.add(8).cast::<u64>(), sector.to_le());
-            write_volatile(cpu.add(STATUS_OFFSET), 0xff);
-        }
         // SAFETY: 控制区满足 new 的保活约定；payload 的交权、方向与保活由调用者保证。
         // 临时数组仅保存地址元数据，queue.add 将真实设备地址复制进 descriptor。
         unsafe { self.queue.add(&[&header, payload, &status]) }
@@ -253,18 +243,6 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// 消费并验证真实 used head，descriptor 仅按队列可信 shadow 归还。
     pub fn pop_used(&mut self) -> Result<Option<UsedElement>> {
         self.queue.pop_used()
-    }
-
-    /// 在真实完成之后读取设备写入的原始状态字节，未知值按 IO 错误处理。
-    ///
-    /// # Safety
-    /// 调用者必须已通过 pop_used 消费对应 head 并完成设备读屏障，确认该 tag 的
-    /// 状态字节不再由设备写入；在读取结束前不得复用 tag 或释放 PDU。
-    pub unsafe fn completion_status(&self, tag: u16) -> Result<()> {
-        let offset = self.tag_offset(tag)? + STATUS_OFFSET;
-        // SAFETY: tag_offset 验证槽范围，new 保证 PDU 可读；完成及不再写入由调用者保证。
-        let status = unsafe { read_volatile(self.pdu.cpu.as_ptr().add(offset)) };
-        decode_status(status)
     }
 
     /// 返回实际 ring 深度。
@@ -329,6 +307,56 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     }
 }
 
+/// 在队列锁外写入本轮独占 tag 的稳定请求头和原始未完成状态。
+///
+/// # Safety
+/// region 必须是已验证的真实 coherent PDU，原页及 CPU 映射须覆盖所有访问；
+/// 调用者独占此 tag，设备及其他 CPU 均不能访问本槽。operation/sector 必须
+/// 已通过核心准入，后续 submit 使用同一 tag、operation 与同一个 PDU 区。
+pub unsafe fn prepare_pdu(
+    region: DmaRegion,
+    tag: u16,
+    operation: BlkOperation,
+    sector: u64,
+) -> Result<()> {
+    let offset = usize::from(tag)
+        .checked_mul(PDU_STRIDE)
+        .ok_or(Error::InvalidParam)?;
+    let end = offset
+        .checked_add(STATUS_OFFSET + 1)
+        .ok_or(Error::InvalidParam)?;
+    if end > region.len
+        || region.cpu.as_ptr() as usize % 16 != 0
+        || (region.cpu.as_ptr() as usize)
+            .checked_add(end - 1)
+            .is_none()
+        || region.device.value() % 16 != 0
+        || region.device.checked_add(end - 1).is_none()
+    {
+        return Err(Error::InvalidParam);
+    }
+    let request_type = match operation {
+        BlkOperation::Read => 0_u32,
+        BlkOperation::Write => 1,
+        BlkOperation::Flush => {
+            if sector != 0 {
+                return Err(Error::InvalidParam);
+            }
+            4
+        }
+    };
+    // SAFETY: 完整 CPU 范围及 tag 对齐已核对；调用者保证独占原始槽和设备未访问。
+    // 原始小端整数及 u8 状态不把任意设备写入解释为 Rust enum。
+    unsafe {
+        let cpu = region.cpu.as_ptr().add(offset);
+        write_volatile(cpu.cast::<u32>(), request_type.to_le());
+        write_volatile(cpu.add(4).cast::<u32>(), 0);
+        write_volatile(cpu.add(8).cast::<u64>(), sector.to_le());
+        write_volatile(cpu.add(STATUS_OFFSET), 0xff);
+    }
+    Ok(())
+}
+
 /// 将协议配置规范成有界事实；无容量或不可表示的字节几何直接拒绝。
 fn block_info(
     capacity_sectors: u64,
@@ -359,7 +387,7 @@ fn block_info(
 }
 
 /// 状态保持 raw u8，任何未定义或未完成值都不能被当作成功。
-fn decode_status(status: u8) -> Result<()> {
+pub fn decode_status(status: u8) -> Result<()> {
     match status {
         0 => Ok(()),
         2 => Err(Error::Unsupported),

@@ -82,7 +82,7 @@ global_asm!(include_str!("riscv64/switch.S"),
     context_sp = const offset_of!(TaskContext, sp),
     context_saved = const offset_of!(TaskContext, saved),
     word = const size_of::<usize>(),
-    execution_tests = const cfg!(feature = "execution-tests") as usize,
+    execution_tests = const cfg!(any(feature = "execution-tests", feature = "ktest")) as usize,
     yield_now = sym crate::sched::yield_now);
 
 extern "C" {
@@ -111,7 +111,7 @@ pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     unsafe { rv_switch_context(prev, next) };
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 extern "C" {
     /// 按普通调用 ABI 保存调用者寄存器，跨真实 yield 校验整数现场并恢复调用者。
     ///
@@ -121,7 +121,7 @@ extern "C" {
 }
 
 /// 在可调度的普通 Task 中跨真实 yield 检验全部 callee-saved、SP 与返回地址。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub fn test_task_context_preservation() -> bool {
     // SAFETY: Rust 入口提供对齐普通调用栈；生产 yield 统一检查 Task、IRQ 和原子上下文，
     // switch_context 检查 FS Off；汇编恢复调用者 callee-saved，并始终保留目的 CPU 的 tp。
@@ -479,14 +479,14 @@ pub fn wait_for_interrupt() {
 pub(crate) unsafe fn idle_once(
     kick_pending: &AtomicUsize,
     need_resched: &AtomicBool,
-    #[cfg(feature = "execution-tests")] wait_completions: &AtomicUsize,
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))] wait_completions: &AtomicUsize,
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
     if kick_pending.load(Ordering::Acquire) == 0 && !need_resched.load(Ordering::Acquire) {
         // SAFETY: 调用者保证 S-mode、本核有效 trap 栈与独立使能的 IRQ 源。
         // WFI 在全局 SIE 关闭时仍由独立使能源的 pending 唤醒，通知不会在检查与等待间被消费。
         unsafe { asm!("wfi", options(nostack)) };
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         wait_completions.fetch_add(1, Ordering::Release);
     }
     // SAFETY: 调用者保证无锁且可服务 IRQ；无论是否执行 WFI 都开放一次处理 pending，
@@ -677,7 +677,7 @@ pub fn shutdown() -> ! {
     sbi(0x53525354, 0, 0, 0, 0).expect("SBI SRST failed");
     panic!("SBI SRST unexpectedly returned");
 }
-#[cfg(feature = "fault-test")]
+#[cfg(any(feature = "fault-test", feature = "ktest"))]
 /// 触发真实非法指令异常供现场诊断。
 pub fn trigger_fault() -> ! {
     // SAFETY: 内核 trap 已安装；非法指令进入诊断入口并终止执行，不返回 Rust。
@@ -689,6 +689,19 @@ pub fn trigger_fault() -> ! {
 #[no_mangle]
 extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
     if frame.scause & (1usize << 63) == 0 {
+        #[cfg(feature = "ktest")]
+        crate::ktest::fatal_event(
+            if frame.scause == 2 {
+                "illegal"
+            } else {
+                "panic"
+            },
+            format_args!(
+                "synchronous trap pc={:#x} sp={:#x} cause={:#x} bad={:#x}",
+                frame.sepc, frame.gpr[2], frame.scause, frame.stval
+            ),
+        );
+        #[cfg(not(feature = "ktest"))]
         crate::console::fatal(frame.sepc, frame.gpr[2], frame.scause, frame.stval);
     }
     let _hard_irq = crate::cpu::HardIrqGuard::enter();
@@ -705,13 +718,24 @@ extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
             crate::cpu::handle_ipi();
         }
         value if value == (1usize << 63) | 9 => crate::irq::handle_external(),
-        _ => crate::console::fatal(frame.sepc, frame.gpr[2], frame.scause, frame.stval),
+        _ => {
+            #[cfg(feature = "ktest")]
+            crate::ktest::fatal_event(
+                "panic",
+                format_args!(
+                    "unknown interrupt pc={:#x} sp={:#x} cause={:#x} bad={:#x}",
+                    frame.sepc, frame.gpr[2], frame.scause, frame.stval
+                ),
+            );
+            #[cfg(not(feature = "ktest"))]
+            crate::console::fatal(frame.sepc, frame.gpr[2], frame.scause, frame.stval)
+        }
     }
 }
 
-#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
+#[cfg(any(feature = "boot-tests", feature = "execution-tests", feature = "ktest"))]
 global_asm!(include_str!("riscv64/registers.S"));
-#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
+#[cfg(any(feature = "boot-tests", feature = "execution-tests", feature = "ktest"))]
 extern "C" {
     /// 按整数调用 ABI 临时启用 IRQ，等待本核计数器推进并检验寄存器现场。
     ///
@@ -724,6 +748,27 @@ extern "C" {
         fp: usize,
     ) -> usize;
 }
+
+/// 以一次真实本核 timer IRQ 检查指定 FP 模式的原始寄存器图样；RV 没有 FCC，忽略该参数。
+///
+/// # Safety
+/// 本核 trap、timer IRQ 源、永久 CpuLocal 和当前栈必须已安装且可服务中断；调用期间
+/// 必须固定 CPU、禁止调度迁移，不能持有 IRQ-save 锁或中断处理器会取得的锁。
+/// CPU 必须支持 D，当前不得有活跃 FP 上下文：原汇编恢复 sstatus/FCSR 与整数 ABI
+/// 现场，但 fp=true 会覆盖 f0/f31。函数恢复进入时的 IRQ 位；调用者必须在同核
+/// IRQ-off 下用 time::reprogram_current 交还生产 deadline（包括断言失败后的清理）。
+#[cfg(feature = "ktest")]
+pub(crate) unsafe fn ktest_register_pattern(fp: bool, _fcc: u8) -> bool {
+    let _irq = crate::sync::IrqSaveGuard::new();
+    let counter = &crate::cpu::current().timer_interrupts;
+    let expected = counter.load(Ordering::Acquire) + 1;
+    program_timer(read_counter() + counter_frequency() / 100);
+    // SAFETY: 调用者保证固定本核、真实 timer/trap 已安装、无活跃 FP 和持锁现场；
+    // counter 为永久对齐的本核原子，fp 转换仅取 0/1，汇编恢复进入时的 IRQ-off 状态。
+    let good = unsafe { rv_register_roundtrip(counter, expected, usize::from(fp)) } != 0;
+    good && expected <= counter.load(Ordering::Acquire)
+}
+
 /// 真实 timer 异常验证 GPR/SP/TP 以及启用/关闭 FP 两种现场。
 ///
 /// # Safety
@@ -755,7 +800,7 @@ pub unsafe fn test_register_preservation() -> bool {
 /// # Safety
 /// 本核 trap/timer/CpuLocal 已安装；不得持锁或 guard，不得有活跃 FP 现场。
 /// 测试临时打开 IRQ 且改写本核 timer，期间不得切换或迁移任务。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) unsafe fn test_integer_register_preservation() -> usize {
     let saved = irq_save();
     let counter = &crate::cpu::current().timer_interrupts;

@@ -11,10 +11,17 @@ SECTIONS {
   .boot : { KEEP(*(.text.boot)) } :boot
   . = __kernel_virt_start + ALIGN(SIZEOF(.boot), 0x200000);
   .text : AT(ADDR(.text) - __kernel_virt_start + __kernel_phys_start) {
+    PROVIDE(__executable_start = .);
     *(.text .text.*)
+    PROVIDE(__etext = .);
   } :text
   . = ALIGN(4096);
-  .rodata : AT(ADDR(.rodata) - __kernel_virt_start + __kernel_phys_start) { *(.rodata .rodata.*) } :rodata
+  .rodata : AT(ADDR(.rodata) - __kernel_virt_start + __kernel_phys_start) {
+    PROVIDE(__rodata_start = .);
+    *(.rodata .rodata.*) *(.data.rel.ro .data.rel.ro.*)
+  } :rodata
+  INCLUDE ktest-sections.ld
+  PROVIDE(__rodata_end = .);
   . = ALIGN(4096);
   .data : AT(ADDR(.data) - __kernel_virt_start + __kernel_phys_start) {
     *(.data .data.*) *(.sdata .sdata.*)
@@ -39,7 +46,6 @@ SECTIONS {
   __bss_phys_start = __bss_start - __kernel_virt_start + __kernel_phys_start;
   __bss_phys_end = __bss_end - __kernel_virt_start + __kernel_phys_start;
   __secondary_entry_phys = rv_secondary_entry;
-  /DISCARD/ : { *(.eh_frame) }
 }
 ASSERT(SIZEOF(.boot) <= 0x200000, "physical entry exceeds bootstrap section")
 ASSERT(__kernel_phys_end - __kernel_phys_start < 0x40000000, "image exceeds bootstrap mapping")

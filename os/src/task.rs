@@ -4,17 +4,20 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::alloc::AllocError;
 use core::cell::UnsafeCell;
+use core::pin::pin;
 use core::ptr;
-use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "ktest")]
+use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::mm::{alloc_pages, OwnedPages};
 use crate::sched::context::TaskContext;
-use crate::sync::{Completion, IrqSaveGuard};
+use crate::sync::IrqSaveGuard;
 use crate::time::Duration;
-use crate::wait::WaitId;
+use crate::wait::{WaitId, WaitNode, WaitQueue, Waiter};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 static LIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +70,7 @@ pub(crate) struct Scheduling {
     pub live_next: *const Task,
     pub ready_previous: *const Task,
     pub ready_next: *const Task,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub next_cpu: Option<usize>,
 }
 
@@ -87,14 +90,42 @@ pub(crate) struct Resources {
 
 pub(crate) struct JoinState {
     result: AtomicI32,
-    completed: Completion,
+    completed: AtomicBool,
+    waiters: WaitQueue,
 }
 
 impl JoinState {
-    /// 栈与入口已在锁外释放后发布一次结果，由完成 token 保证结果可见性。
+    /// 栈与入口已锁外释放后发布一次粘性的结果，观察与原 join 不消费完成状态。
     pub(crate) fn complete(&self, result: i32) {
         self.result.store(result, Ordering::Relaxed);
-        self.completed.complete();
+        self.completed.store(true, Ordering::Release);
+        self.waiters.wake_all();
+    }
+
+    /// Acquire 观察真实离栈结果，任何 join 以后仍保留该完成事实。
+    fn try_join(&self) -> Option<i32> {
+        self.completed
+            .load(Ordering::Acquire)
+            .then(|| self.result.load(Ordering::Relaxed))
+    }
+
+    /// 原等待源先登记后复查，多个观察者均真实 park，不能竞争消费一次性结果。
+    fn wait_result(&self) -> i32 {
+        crate::sched::assert_switchable();
+        loop {
+            if let Some(result) = self.try_join() {
+                return result;
+            }
+            let waiter = Waiter::new();
+            let mut node = pin!(WaitNode::new(waiter.waker()));
+            // SAFETY: 当前共享借用保活原 JoinState/等待源；节点在原执行栈固定，
+            // registration 先于 node/waiter 析构撤链，登记后的复查关闭完成通知窗口。
+            let _registration = unsafe { self.waiters.register(node.as_mut()) };
+            if let Some(result) = self.try_join() {
+                return result;
+            }
+            waiter.park();
+        }
     }
 }
 
@@ -106,6 +137,10 @@ pub struct Task {
     pub(crate) resources: UnsafeCell<Resources>,
     pub(crate) join: Arc<JoinState>,
     pub(crate) worker: Option<Arc<crate::workqueue::Worker>>,
+    #[cfg(feature = "ktest")]
+    pub(crate) ktest_boundary: AtomicPtr<()>,
+    #[cfg(feature = "ktest")]
+    pub(crate) ktest_scope: AtomicPtr<()>,
 }
 
 // SAFETY: scheduling 仅在调度锁内访问；ctx 仅由 Running 的唯一 CPU 与其离栈交接访问。
@@ -137,7 +172,7 @@ impl Task {
     }
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 impl Drop for Task {
     /// 真正最后强拥有或未发表 Arc 分配失败归还 payload，克隆及弱观察不计。
     fn drop(&mut self) {
@@ -146,7 +181,7 @@ impl Drop for Task {
 }
 
 /// 仅供停稳后的真实 metadata 收敛观察，不代表弱控制块或栈 backing 已释放。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) fn test_live_tasks() -> usize {
     LIVE_TASKS.load(Ordering::Relaxed)
 }
@@ -159,20 +194,46 @@ pub struct JoinHandle {
 impl JoinHandle {
     /// 非阻塞地观察正常返回结果；Some 保证任务已经离栈并归还执行栈。
     pub fn try_join(&self) -> Option<i32> {
-        self.join
-            .completed
-            .is_ready()
-            .then(|| self.join.result.load(Ordering::Relaxed))
+        self.join.try_join()
     }
 
-    /// 消耗唯一句柄并真实等待正常返回，完成 token 在执行栈归还后才发布。
+    /// 消耗唯一句柄并真实等待离栈，结果在执行栈归还后永久可观察。
     pub fn join(self) -> i32 {
-        self.join.completed.wait();
-        self.join.result.load(Ordering::Relaxed)
+        self.join.wait_result()
     }
 
     /// 即使任务已退出，观察者仍保留原任务身份。
     pub fn task_id(&self) -> TaskId {
+        self.id
+    }
+    /// 创建仅保留原完成状态的观察者，不延长 Task 或执行栈寿命。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn observer(&self) -> JoinObserver {
+        JoinObserver {
+            id: self.id,
+            join: Arc::clone(&self.join),
+        }
+    }
+}
+
+/// 测试观察者保留原结果与身份；唯一原 JoinHandle 仍由作用域消费。
+#[cfg(feature = "ktest")]
+pub(crate) struct JoinObserver {
+    id: TaskId,
+    join: Arc<JoinState>,
+}
+#[cfg(feature = "ktest")]
+impl JoinObserver {
+    /// Some 只来自原粘性完成事实，已确认执行栈归还。
+    pub(crate) fn try_join(&self) -> Option<i32> {
+        self.join.try_join()
+    }
+    /// 等待原完成事实，不消费作用域的唯一 join 责任。
+    pub(crate) fn join(&self) -> i32 {
+        self.join.wait_result()
+    }
+    /// 已退出后仍返回实际原任务身份。
+    pub(crate) fn task_id(&self) -> TaskId {
         self.id
     }
 }
@@ -201,6 +262,14 @@ pub fn spawn_kernel(
     entry: impl FnOnce() -> i32 + Send + 'static,
 ) -> Result<JoinHandle, AllocError> {
     prepare(Placement::Any, None, entry).map(PreparedTask::publish)
+}
+
+/// 预备可由原调度器选择 CPU 的入口，不提前发表或固定其执行位置。
+#[cfg(feature = "ktest")]
+pub(crate) fn prepare_kernel(
+    entry: impl FnOnce() -> i32 + Send + 'static,
+) -> Result<PreparedTask, AllocError> {
+    prepare(Placement::Any, None, entry)
 }
 
 /// 将入口固定到已构造的有效 CPU；允许引导过程在该 CPU 上线之前准备任务。
@@ -239,7 +308,8 @@ fn prepare(
     let entry: Entry = Box::try_new(entry)?;
     let join = Arc::try_new(JoinState {
         result: AtomicI32::new(0),
-        completed: Completion::new(),
+        completed: AtomicBool::new(false),
+        waiters: WaitQueue::new(),
     })?;
     let mut stack = alloc_pages(4, false).ok_or(AllocError)?;
     let stack_top = stack.as_mut_ptr() as usize + stack.len();
@@ -260,7 +330,7 @@ fn prepare(
             live_next: ptr::null(),
             ready_previous: ptr::null(),
             ready_next: ptr::null(),
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             next_cpu: None,
         }),
         resources: UnsafeCell::new(Resources {
@@ -269,9 +339,13 @@ fn prepare(
         }),
         join: Arc::clone(&join),
         worker,
+        #[cfg(feature = "ktest")]
+        ktest_boundary: AtomicPtr::new(ptr::null_mut()),
+        #[cfg(feature = "ktest")]
+        ktest_scope: AtomicPtr::new(ptr::null_mut()),
     };
     // 完整 value 在 fallible Arc 分配前计入，失败时普通 Drop 精确配对。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     LIVE_TASKS.fetch_add(1, Ordering::Relaxed);
     let task = Arc::try_new(value)?;
     Ok(PreparedTask {
@@ -324,7 +398,7 @@ pub fn current_task_id() -> Option<TaskId> {
 }
 
 /// 在当前普通任务中取得真实执行栈的物理范围，不导出栈借用或拥有权。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub fn test_current_stack_range() -> (usize, usize) {
     let _irq = IrqSaveGuard::new();
     let task = current_task();

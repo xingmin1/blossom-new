@@ -184,13 +184,13 @@ impl WaitQueue {
     }
 
     /// 测试在每次真实摘离并锁外通知后控制重新登记，不替代源队列或调度器。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub fn test_wake_all_after_notify(&self, after: impl FnMut()) -> usize {
         self.wake_all_after_notify(after)
     }
 
     /// 只读源锁保护的实际登记数，不维护另一份观测状态。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(crate) fn test_members(&self) -> usize {
         self.inner.lock().members
     }

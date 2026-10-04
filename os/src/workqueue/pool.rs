@@ -6,7 +6,7 @@ use core::alloc::AllocError;
 use core::cell::UnsafeCell;
 use core::pin::Pin;
 use core::ptr;
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Domain, RemovedTicket, Work, STATE_LOCK};
@@ -15,7 +15,7 @@ use crate::task::{self, JoinHandle, PreparedTask};
 use crate::time::Duration;
 use crate::timer;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(super) static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 struct PoolState {
@@ -31,13 +31,13 @@ struct PoolState {
     manager_requested: bool,
     manager_blocked: bool,
     create_failed: bool,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     stats: Counters,
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     manager_task: Option<Weak<task::Task>>,
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 #[derive(Clone, Copy)]
 struct Counters {
     created: usize,
@@ -77,7 +77,7 @@ impl WorkerPool {
                 manager_requested: false,
                 manager_blocked: false,
                 create_failed: false,
-                #[cfg(feature = "execution-tests")]
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 stats: Counters {
                     created: 0,
                     retired: 0,
@@ -87,7 +87,7 @@ impl WorkerPool {
                     running: 0,
                     early_wake: 0,
                 },
-                #[cfg(feature = "execution-tests")]
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 manager_task: None,
             }),
             manager: WaitQueue::new(),
@@ -103,7 +103,10 @@ struct WorkerState {
     contributing: bool,
     idle: bool,
     join: Option<JoinHandle>,
-    #[cfg(feature = "execution-tests")]
+    reserved_work: *const Work,
+    reservation_open: bool,
+    joined: bool,
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     task: Option<Weak<task::Task>>,
 }
 
@@ -112,6 +115,7 @@ pub(crate) struct Worker {
     cpu: usize,
     base: bool,
     domain: Option<Weak<Domain>>,
+    reserved_domain: Option<Arc<Domain>>,
     state: UnsafeCell<WorkerState>,
     ready: WaitQueue,
 }
@@ -122,16 +126,18 @@ unsafe impl Send for Worker {}
 unsafe impl Sync for Worker {}
 
 impl Worker {
-    /// 准备未发表 worker 身份，救援角色只弱拥有域以避免寿命环。
+    /// 准备未发表身份；救援者弱保域，预留者强保域但只比较 Work 地址，不反向拥有 Work。
     fn try_new(
         cpu: usize,
         base: bool,
         domain: Option<Weak<Domain>>,
+        reservation: Option<(&Arc<Domain>, *const Work)>,
     ) -> Result<Arc<Self>, AllocError> {
         let value = Self {
             cpu,
             base,
             domain,
+            reserved_domain: reservation.map(|(domain, _)| Arc::clone(domain)),
             state: UnsafeCell::new(WorkerState {
                 next: ptr::null(),
                 task_id: 0,
@@ -140,13 +146,16 @@ impl Worker {
                 contributing: false,
                 idle: false,
                 join: None,
-                #[cfg(feature = "execution-tests")]
+                reserved_work: reservation.map_or(ptr::null(), |(_, work)| work),
+                reservation_open: reservation.is_some(),
+                joined: false,
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 task: None,
             }),
             ready: WaitQueue::new(),
         };
         // 完整 value 先计入，Arc 分配失败由相同 Drop 归还；克隆不经过这里。
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         LIVE_WORKERS.fetch_add(1, Ordering::Relaxed);
         Arc::try_new(value)
     }
@@ -162,7 +171,7 @@ impl Worker {
                     worker.contributing = false;
                     let pool = &mut *pool(self.cpu).state.get();
                     pool.nr_running -= 1;
-                    #[cfg(feature = "execution-tests")]
+                    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                     {
                         pool.stats.sleeping += 1;
                     }
@@ -191,7 +200,7 @@ impl Worker {
             worker.contributing = true;
             let pool = &mut *pool(self.cpu).state.get();
             pool.nr_running += 1;
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             {
                 pool.stats.running += 1;
             }
@@ -199,7 +208,7 @@ impl Worker {
     }
 
     /// 只记录实际 sleeping 后 prepare_switch 未提交的早唤醒路径。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub(crate) fn early_wake(&self) {
         let _lock = STATE_LOCK.lock();
         // SAFETY: 池测试计数同样受生产状态锁保护。
@@ -218,9 +227,25 @@ impl Worker {
         // SAFETY: 调用者持统一元数据锁。
         unsafe { (*self.state.get()).task_id }
     }
+
+    /// 在原状态锁内升级唯一服务入口保存的弱任务观察，不延长执行栈责任。
+    #[cfg(feature = "ktest")]
+    pub(super) fn ktest_task(&self) -> Option<Arc<task::Task>> {
+        let _lock = STATE_LOCK.lock();
+        // SAFETY: 服务入口登记和退休由同一状态锁串行，弱升级只保控制对象。
+        unsafe { (*self.state.get()).task.as_ref().and_then(Weak::upgrade) }
+    }
+
+    /// joined 位只由原 manager 在真实任务离栈并 join 返回后更新。
+    #[cfg(feature = "ktest")]
+    pub(super) fn ktest_joined(&self) -> bool {
+        let _lock = STATE_LOCK.lock();
+        // SAFETY: 原退休链和 joined 状态均在统一状态锁下读写。
+        unsafe { (*self.state.get()).joined }
+    }
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 impl Drop for Worker {
     /// Arc 的最后强拥有或未发表分配失败才归还 payload，弱观察不影响计数。
     fn drop(&mut self) {
@@ -344,15 +369,21 @@ unsafe fn candidate(
     // SAFETY: 调用者持 STATE_LOCK，队列节点由其 pending 强引用保活。
     unsafe {
         let mut deferred: *const Domain = ptr::null();
+        let reserved = if worker.is_null() {
+            ptr::null()
+        } else {
+            (*(*worker).state.get()).reserved_work
+        };
         if !worker.is_null() {
             let mut cursor = head;
             while !cursor.is_null() {
                 let work = &*cursor;
                 let node = &*work.state.get();
                 if node.assigned == worker
+                    && (reserved.is_null() || reserved == cursor)
                     && rescue.is_none_or(|domain| ptr::eq(domain, Arc::as_ptr(&work.domain)))
                 {
-                    if node.running == 0 && work.domain.eligible() && fifo_ready(head, cursor) {
+                    if node.running == 0 && work.domain.eligible(work) && fifo_ready(head, cursor) {
                         return cursor;
                     }
                     deferred = Arc::as_ptr(&work.domain);
@@ -368,6 +399,7 @@ unsafe fn candidate(
                 rescue.is_none_or(|domain| ptr::eq(domain, Arc::as_ptr(&work.domain)));
             // 关联票保留执行者；ordered 只允许推进本域合法前票，不能承接无关域回调。
             let correct_worker = unassigned
+                && reserved.is_null()
                 && node.assigned.is_null()
                 && (deferred.is_null()
                     || (work.domain.config.ordered
@@ -375,7 +407,7 @@ unsafe fn candidate(
             if correct_domain
                 && correct_worker
                 && node.running == 0
-                && work.domain.eligible()
+                && work.domain.eligible(work)
                 && fifo_ready(head, cursor)
             {
                 return cursor;
@@ -495,8 +527,9 @@ fn prepare_worker(
     cpu: usize,
     base: bool,
     domain: Option<&Arc<Domain>>,
+    reservation: Option<(&Arc<Domain>, *const Work)>,
 ) -> Result<(Arc<Worker>, PreparedTask), AllocError> {
-    let worker = Worker::try_new(cpu, base, domain.map(Arc::downgrade))?;
+    let worker = Worker::try_new(cpu, base, domain.map(Arc::downgrade), reservation)?;
     let role = Arc::clone(&worker);
     let keep_domain = domain.cloned();
     let prepared =
@@ -516,7 +549,75 @@ pub(super) fn prepare_rescuer(
     cpu: usize,
     domain: &Arc<Domain>,
 ) -> Result<(Arc<Worker>, PreparedTask), AllocError> {
-    prepare_worker(cpu, false, Some(domain))
+    prepare_worker(cpu, false, Some(domain), None)
+}
+
+/// Work 构造期准备自己的原生 Task/栈；未发表失败对象仍按原拥有关系归还。
+pub(super) fn prepare_reserved(
+    cpu: usize,
+    domain: &Arc<Domain>,
+    work: *const Work,
+) -> Result<(Arc<Worker>, PreparedTask), AllocError> {
+    prepare_worker(cpu, false, None, Some((domain, work)))
+}
+
+/// 只释放固定预留，不睡眠；所有状态锁外唤醒，原服务与 manager 承担退出和 join。
+pub(super) fn release_reservation(worker: &Worker) {
+    {
+        let _lock = STATE_LOCK.lock();
+        // SAFETY: 固定身份强拥有域，预留位与 retire 谓词只由此统一锁串行。
+        unsafe {
+            (*worker.state.get()).reservation_open = false;
+        }
+    }
+    // close 的等待者也登记在 ready，必须同时唤醒服务，不能让 wake_one 只命中等待者。
+    worker.ready.wake_all();
+}
+
+/// 外部 close 在真实 Work 票尾部之后等待原 manager 完成执行栈 join。
+pub(super) fn close_reservation(worker: &Worker) {
+    release_reservation(worker);
+    super::wait_until(&worker.ready, || {
+        let _lock = STATE_LOCK.lock();
+        // SAFETY: join 位只在 manager 确认原 Task 离栈后写入。
+        unsafe { (*worker.state.get()).joined }
+    });
+}
+
+/// 域已拒新票且颜色归零；从原 pool 链释放未提交 Work 的预留，不增注册表或分配。
+pub(super) fn release_domain_reservations(domain: &Arc<Domain>) {
+    for cpu in 0..cpu::count() {
+        loop {
+            let selected = {
+                let _lock = STATE_LOCK.lock();
+                // SAFETY: 原池链持每份身份强引用，锁内只比较固定域并克隆现存拥有。
+                unsafe {
+                    let mut cursor = (*pool(cpu).state.get()).workers_head;
+                    let mut selected = None;
+                    while !cursor.is_null() {
+                        let worker = &*cursor;
+                        let role = &mut *worker.state.get();
+                        if role.reservation_open
+                            && worker
+                                .reserved_domain
+                                .as_ref()
+                                .is_some_and(|own| Arc::ptr_eq(own, domain))
+                        {
+                            role.reservation_open = false;
+                            selected = Some(clone_worker(cursor));
+                            break;
+                        }
+                        cursor = role.next;
+                    }
+                    selected
+                }
+            };
+            let Some(worker) = selected else {
+                break;
+            };
+            worker.ready.wake_all();
+        }
+    }
 }
 
 /// 锁内发表 pool 拥有的真实 worker 强引用；Task 准备和调度发表都在锁外。
@@ -529,7 +630,14 @@ fn install(worker: Arc<Worker>) {
         (*(*raw).state.get()).next = state.workers_head;
         state.workers_head = raw;
         state.workers += 1;
-        #[cfg(feature = "execution-tests")]
+        if let Some(domain) = &(*raw).reserved_domain {
+            assert!(
+                !(*domain.state.get()).closed,
+                "reserved work constructed after domain close"
+            );
+            (*domain.state.get()).reserved_workers += 1;
+        }
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         {
             state.stats.created += 1;
         }
@@ -537,14 +645,15 @@ fn install(worker: Arc<Worker>) {
 }
 
 /// pool 先登记身份，再无分配发表；动态执行者保小完成句柄供 manager 在其正常退出后 join。
-fn publish_worker(worker: Arc<Worker>, prepared: PreparedTask) {
+pub(super) fn publish_worker(worker: Arc<Worker>, prepared: PreparedTask) {
     install(Arc::clone(&worker));
     let join = prepared.publish();
     if worker.base {
         drop(join);
     } else {
         let _lock = STATE_LOCK.lock();
-        // SAFETY: 动态任务固定当前 manager CPU，发表与记录之间没有调度安全点，不会抢先退休。
+        // SAFETY: 普通动态 worker 同 manager CPU 发表；预留者尚无票且 reservation_open
+        // 阻止跨 CPU 抢先退休，构造入口返回前就会在此锁下保存唯一 join。
         unsafe {
             (*worker.state.get()).join = Some(join);
         }
@@ -583,11 +692,19 @@ fn reap_retired(cpu: usize) {
             unsafe {
                 let state = &mut *pool(cpu).state.get();
                 state.retiring -= 1;
-                #[cfg(feature = "execution-tests")]
+                (*worker.state.get()).joined = true;
+                if let Some(domain) = &worker.reserved_domain {
+                    (*domain.state.get()).reserved_workers -= 1;
+                }
+                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                 {
                     state.stats.retired += 1;
                 }
             }
+        }
+        worker.ready.wake_all();
+        if let Some(domain) = &worker.reserved_domain {
+            domain.finished.wake_all();
         }
         drop(worker);
     }
@@ -604,7 +721,7 @@ pub(super) fn initialize() -> Result<(), AllocError> {
         .try_reserve_exact(cpu::count())
         .map_err(|_| AllocError)?;
     for cpu in 0..cpu::count() {
-        workers.push(prepare_worker(cpu, true, None)?);
+        workers.push(prepare_worker(cpu, true, None, None)?);
         managers.push(task::prepare_kernel_on(cpu, move || manager(cpu))?);
     }
     for (worker, prepared) in workers {
@@ -640,7 +757,7 @@ unsafe fn need_to_create_worker(state: &PoolState) -> bool {
 
 /// 管理者接受真实需求后保留创建责任；失败在锁外冷却，需求消失或执行者可用才结束重试。
 fn manager(cpu: usize) -> i32 {
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     {
         let observation = Arc::downgrade(&task::current_task());
         let _lock = STATE_LOCK.lock();
@@ -686,6 +803,8 @@ fn manager(cpu: usize) -> i32 {
             continue;
         }
         loop {
+            // 其它域持续 OOM 也不能阻止已退出预留者的真实 join 和域 close。
+            reap_retired(cpu);
             let needed = {
                 let _lock = STATE_LOCK.lock();
                 // SAFETY: 每次创建前在同锁内复查准入、实际进度和可执行 idle；队列拥有票始终保留。
@@ -702,7 +821,7 @@ fn manager(cpu: usize) -> i32 {
             if !needed {
                 break;
             }
-            match prepare_worker(cpu, false, None) {
+            match prepare_worker(cpu, false, None, None) {
                 Ok((worker, prepared)) => {
                     {
                         let _lock = STATE_LOCK.lock();
@@ -720,7 +839,7 @@ fn manager(cpu: usize) -> i32 {
                         // SAFETY: 只有真实 fallible 创建失败增加此计数并启用救援资格。
                         unsafe {
                             let state = &mut *pool(cpu).state.get();
-                            #[cfg(feature = "execution-tests")]
+                            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
                             {
                                 state.stats.create_failures += 1;
                             }
@@ -759,7 +878,16 @@ unsafe fn claim(worker: &Worker, domain: Option<&Domain>) -> Option<RemovedTicke
         node.running_color = node.color;
         node.worker = worker;
         node.assigned = ptr::null();
-        (*work.domain.state.get()).active += 1;
+        let admission = &mut *work.domain.state.get();
+        if work.reserved_worker.is_some() {
+            assert_eq!(
+                node.worker,
+                Arc::as_ptr(work.reserved_worker.as_ref().unwrap())
+            );
+            admission.reserved_active += 1;
+        } else {
+            admission.active += 1;
+        }
         let role = &mut *worker.state.get();
         if role.idle {
             role.idle = false;
@@ -771,7 +899,7 @@ unsafe fn claim(worker: &Worker, domain: Option<&Domain>) -> Option<RemovedTicke
         role.contributing = true;
         role.current = raw;
         (*pool(worker.cpu).state.get()).nr_running += 1;
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         if domain.is_some() {
             (*pool(worker.cpu).state.get()).stats.rescued += 1;
         }
@@ -792,7 +920,7 @@ unsafe fn claim(worker: &Worker, domain: Option<&Domain>) -> Option<RemovedTicke
 unsafe fn can_retire(worker: &Worker) -> bool {
     // SAFETY: 调用者持 STATE_LOCK，所有 pending 票与 worker 登记串行变化。
     unsafe {
-        if worker.base || worker.domain.is_some() {
+        if worker.base || worker.domain.is_some() || (*worker.state.get()).reservation_open {
             return false;
         }
         let mut work = (*pool(worker.cpu).state.get()).head;
@@ -845,7 +973,7 @@ unsafe fn retire(worker: &Worker) -> bool {
 
 /// callback 真实执行在锁外；空闲 worker 登记复查，动态余量正常返回而非泄漏 Task。
 fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     {
         let observation = Arc::downgrade(&task::current_task());
         let _lock = STATE_LOCK.lock();
@@ -863,7 +991,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             unsafe { claim(&worker, domain.as_deref()) }
         };
         if let Some(ticket) = ticket {
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             testing::pause(worker.cpu, testing::PausePoint::Started);
             // SAFETY: running 拥有票保活原 into_raw 的固定 Work 存储。
             let work = unsafe { Pin::new_unchecked(&*ticket.work) };
@@ -879,7 +1007,16 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
                     node.running = 0;
                     node.worker = ptr::null();
                     let state = &mut *work.domain.state.get();
-                    state.active -= 1;
+                    if work.reserved_worker.is_some() {
+                        state.reserved_active -= 1;
+                    } else {
+                        state.active -= 1;
+                    }
+                    if work.one_shot {
+                        assert_eq!(node.queued, 0, "one-shot work requeued");
+                        node.closed = true;
+                        role.reservation_open = false;
+                    }
                     state.counts[node.running_color] -= 1;
                     role.callback = false;
                     role.contributing = false;
@@ -890,7 +1027,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
                 }
             }
             drop(ticket);
-            #[cfg(feature = "execution-tests")]
+            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
             testing::pause(worker.cpu, testing::PausePoint::Finished);
             continue;
         }
@@ -911,7 +1048,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
         if stop {
             return 0;
         }
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         if !worker.base && domain.is_none() {
             // 首次 retire=false 已在锁下确认此动态普通 worker 仍有关联票；此处尚未登记 ready。
             testing::pause(worker.cpu, testing::PausePoint::BeforeWait);
@@ -980,7 +1117,7 @@ pub(super) fn assert_wait_allowed(domain: &Arc<Domain>, work: *const Work) {
     }
 }
 
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(super) mod testing {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -1036,6 +1173,42 @@ pub(super) mod testing {
         observation
             .and_then(|manager| manager.upgrade())
             .is_some_and(|manager| crate::sched::test_state(&manager) == task::State::Blocked)
+    }
+    /// 返回每 CPU 的原 manager 与基础 worker 数，不计动态执行者或域救援者。
+    /// 仅在服务初始化、入口登记及停稳之后用于常驻基线，不创建另一份任务统计。
+    pub(crate) fn service_count() -> usize {
+        2 * cpu::count()
+    }
+    /// 取得常驻服务的真实弱观察：2*CPU 为 manager，2*CPU+1 为基础 worker。
+    /// 入口尚未登记或索引越界返回 None；只在状态锁内复制 Weak，升级和最终 Drop 均在锁外。
+    /// Thread 控制者须在基线采样后归还观察强引用，不能将它当作执行栈的 join 责任。
+    pub(crate) fn service_task(index: usize) -> Option<Arc<task::Task>> {
+        if service_count() <= index {
+            return None;
+        }
+        let observation = {
+            let _lock = STATE_LOCK.lock();
+            // SAFETY: 索引对应真实永久池，活链的池强票保活节点；锁只保护遍历和复制原弱观察。
+            unsafe {
+                let state = &*pool(index / 2).state.get();
+                if index % 2 == 0 {
+                    state.manager_task.clone()
+                } else {
+                    let mut cursor = state.workers_head;
+                    let mut base = None;
+                    while !cursor.is_null() {
+                        let worker = &*cursor;
+                        if worker.base {
+                            base = (*worker.state.get()).task.clone();
+                            break;
+                        }
+                        cursor = (*worker.state.get()).next;
+                    }
+                    base
+                }
+            }
+        };
+        observation.and_then(|weak| weak.upgrade())
     }
     /// 观察真实角色，受控回收必须由预备域救援 Task 执行。
     pub(crate) fn is_rescuer() -> bool {
@@ -1093,6 +1266,7 @@ pub(super) mod testing {
         }
     }
     /// 为实际 CPU 与指定生产窗口独立建立一次停点。
+    /// 同一 fixture 的 Thread 控制者串行武装和清理，真实执行者退出旧停点后才可复武装。
     pub(crate) fn arm_pause(cpu: usize, point: PausePoint) {
         assert!(cpu < cpu::count());
         assert_eq!(
@@ -1104,12 +1278,38 @@ pub(super) mod testing {
     pub(crate) fn is_paused(cpu: usize, point: PausePoint) -> bool {
         PAUSE[cpu][point as usize].load(Ordering::Acquire) == 2
     }
-    /// 唯一控制者放行指定窗口的真实执行者。
+    /// 唯一 Thread 控制者放行指定窗口的真实执行者。
+    /// 不得持状态锁、调度锁或执行者退出依赖锁；与取消串行，返回不代表已经完成 close/join。
     pub(crate) fn release_pause(cpu: usize, point: PausePoint) {
         assert_eq!(
             PAUSE[cpu][point as usize].compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire),
             Ok(2)
         );
+    }
+    /// 取消尚未到达的武装，或按原 2→3 握手放行已经暂停的真实 worker。
+    ///
+    /// 仅 Thread 控制者在未持状态锁、调度锁或执行者退出所需锁时调用；同一停点
+    /// 的武装与清理由同一 fixture 串行负责。0 和已放行的 3 幂等返回，不等待离栈。
+    /// CAS 失败重读生产者的到达状态；不修改 queued/running、关联或 worker 额度。
+    /// 放行后仍须真实 close/join；上一执行者退出停点并完成清理前不得复武装。
+    pub(crate) fn cancel_pause(cpu: usize, point: PausePoint) {
+        assert!(cpu < cpu::count());
+        let pause = &PAUSE[cpu][point as usize];
+        loop {
+            let state = pause.load(Ordering::Acquire);
+            let next = match state {
+                0 | 3 => return,
+                1 => 0,
+                2 => 3,
+                _ => unreachable!("invalid work pause state"),
+            };
+            if pause
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
     /// 锁外使用有限硬件 counter 握手，绝不持状态锁等待另一 CPU。
     pub(super) fn pause(cpu: usize, point: PausePoint) {

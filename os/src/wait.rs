@@ -65,7 +65,7 @@ impl Waiter {
     }
 
     /// 真实提交 SwitchingOut 后通知，在保存 ctx 前验证没有提前发表 ready。
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     pub fn test_park_notify(&self) {
         assert_eq!(task::current_task_id(), Some(self.task.id()));
         let waker = self.waker();

@@ -374,7 +374,7 @@ fn transfer(timer: Pin<&Timer>) {
     let raw = timer.context() as *const DelayedWork;
     // SAFETY: 每次新增 timer queued 先取得真实 D raw 强票，take_due 原样转成这次运行上下文票。
     let owner = unsafe { Pin::new_unchecked(&*raw) };
-    #[cfg(feature = "execution-tests")]
+    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
     testing::pause(raw, testing::PausePoint::BeforeTransfer);
     let mut releases = Releases::new();
     let state = STATE_LOCK.lock();
@@ -407,7 +407,7 @@ fn transfer(timer: Pin<&Timer>) {
     drop(releases);
     if transferred {
         owner.work().notify();
-        #[cfg(feature = "execution-tests")]
+        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
         testing::pause(raw, testing::PausePoint::AfterTransfer);
     }
     // SAFETY: 这是本 callback 最后一次 D 访问，归还由新增 timer queued 转入的唯一运行上下文票。
@@ -416,7 +416,7 @@ fn transfer(timer: Pin<&Timer>) {
 }
 
 /// 仅观察真实生产状态并在真实移交的锁外窗口提供有限一次握手。
-#[cfg(feature = "execution-tests")]
+#[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) mod testing {
     use super::*;
     use core::hint::spin_loop;
@@ -455,6 +455,8 @@ pub(crate) mod testing {
     }
 
     /// 只武装另一真实 CPU 的一次移交窗口，不能在本核假造 callback 暂停。
+    /// 同一 fixture 的 Thread 控制者串行 configure/release/cancel；上一 callback
+    /// 退出停点并经真实同步关闭或取消确认尾部结束前不得复武装。
     pub(crate) fn configure(owner: Pin<&DelayedWork>, point: PausePoint) {
         assert_ne!(
             owner.cpu(),
@@ -476,16 +478,42 @@ pub(crate) mod testing {
         PAUSE_STATE.load(Ordering::Acquire) == 2
     }
 
-    /// 控制者确认真实同步调用未早返后放行 callback。
+    /// 控制者确认真实同步调用未早返后，以原 2→3 握手放行 callback。
+    /// Thread 控制者不得持状态锁或 callback 退出所需锁；与取消由同一 fixture 串行。
     pub(crate) fn release() {
         assert_eq!(
-            PAUSE_STATE.swap(3, Ordering::AcqRel),
-            2,
+            PAUSE_STATE.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire),
+            Ok(2),
             "delayed callback was not paused"
         );
     }
 
+    /// 取消未到达的武装，或用原 2→3 协议放行已暂停的真实 timer callback。
+    ///
+    /// 仅 Thread 控制者在无状态锁、调度锁及 callback 退出依赖锁时调用；同一 fixture
+    /// 串行负责武装和清理，0/已放行的 3 幂等返回。到达 CAS 的竞争只重读状态，
+    /// 不清 pending、Work/timer 票或上下文强票，也不等待 BH 或任务离栈。
+    /// 放行后仍由 fixture 真实 close/join 确认尾部，完成之前不得复武装。
+    pub(crate) fn cancel_pause() {
+        loop {
+            let state = PAUSE_STATE.load(Ordering::Acquire);
+            let next = match state {
+                0 | 3 => return,
+                1 => 0,
+                2 => 3,
+                _ => unreachable!("invalid delayed pause state"),
+            };
+            if PAUSE_STATE
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// 在真实 timer 上下文票保活下有限等待另一 CPU 控制者，不睡 BH 或持元数据锁。
+    /// 只有原到达者清除停点身份；控制者取消时只做 CAS，避免清除下一次武装的身份。
     pub(super) fn pause(raw: *const DelayedWork, point: PausePoint) {
         if PAUSE_STATE.load(Ordering::Acquire) != 1
             || PAUSE_OWNER.load(Ordering::Relaxed) != raw as usize
