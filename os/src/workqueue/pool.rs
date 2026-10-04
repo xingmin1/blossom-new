@@ -12,6 +12,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use super::{Domain, RemovedTicket, Work, STATE_LOCK};
 use crate::cpu;
 use crate::task::{self, JoinHandle, PreparedTask};
+use crate::time::Duration;
+use crate::timer;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 #[cfg(feature = "execution-tests")]
 pub(super) static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -614,7 +616,29 @@ pub(super) fn initialize() -> Result<(), AllocError> {
     Ok(())
 }
 
-/// 管理者只处理真实无进度需求，fallible 构造全在锁外；OOM 留票并激活域预备执行者。
+/// 只在有无进度准入票且没有可执行空闲 worker 时承担创建责任。
+///
+/// # Safety
+/// 调用者必须持 STATE_LOCK，state 必须来自本 CPU 永久池，链上节点由现存拥有票与池引用保活。
+unsafe fn need_to_create_worker(state: &PoolState) -> bool {
+    // SAFETY: 调用者持统一状态锁，队列、关联身份和 worker idle 位在整个判断期间保持有效。
+    unsafe {
+        if state.nr_running != 0 || candidate(state.head, ptr::null(), None, true).is_null() {
+            return false;
+        }
+        let mut cursor = state.workers_head;
+        while !cursor.is_null() {
+            let worker = &*cursor;
+            if (*worker.state.get()).idle && !candidate(state.head, cursor, None, true).is_null() {
+                return false;
+            }
+            cursor = (*worker.state.get()).next;
+        }
+        true
+    }
+}
+
+/// 管理者接受真实需求后保留创建责任；失败在锁外冷却，需求消失或执行者可用才结束重试。
 fn manager(cpu: usize) -> i32 {
     #[cfg(feature = "execution-tests")]
     {
@@ -647,40 +671,66 @@ fn manager(cpu: usize) -> i32 {
         }
         drop(registration);
         drop(waiter);
-        let needed = {
+        let requested = {
             let _lock = STATE_LOCK.lock();
-            // SAFETY: 抽走本次请求并按最新真实进度复查，避免醒后无需求仍创建。
+            // SAFETY: 消费本次事件；后续冷却责任由此 Task 保留，不能依赖再次提交来重发请求。
             unsafe {
                 let state = &mut *pool(cpu).state.get();
                 state.manager_blocked = false;
-                let needed = state.manager_requested
-                    && state.nr_running == 0
-                    && !candidate(state.head, ptr::null(), None, true).is_null();
+                let requested = state.manager_requested;
                 state.manager_requested = false;
-                needed
+                requested
             }
         };
-        if !needed {
+        if !requested {
             continue;
         }
-        match prepare_worker(cpu, false, None) {
-            Ok((worker, prepared)) => {
-                publish_worker(worker, prepared);
-            }
-            Err(_) => {
-                {
-                    let _lock = STATE_LOCK.lock();
-                    // SAFETY: 只有真实 fallible 创建失败增加此计数并启用救援资格。
-                    unsafe {
-                        let state = &mut *pool(cpu).state.get();
-                        #[cfg(feature = "execution-tests")]
-                        {
-                            state.stats.create_failures += 1;
-                        }
-                        state.create_failed = true;
+        loop {
+            let needed = {
+                let _lock = STATE_LOCK.lock();
+                // SAFETY: 每次创建前在同锁内复查准入、实际进度和可执行 idle；队列拥有票始终保留。
+                unsafe {
+                    let state = &mut *pool(cpu).state.get();
+                    let needed = need_to_create_worker(state);
+                    if !needed {
+                        // 结束本轮失败资格，使 callback 下次真实阻塞可以发起新的创建需求。
+                        state.create_failed = false;
                     }
+                    needed
                 }
-                wake_rescuers(cpu);
+            };
+            if !needed {
+                break;
+            }
+            match prepare_worker(cpu, false, None) {
+                Ok((worker, prepared)) => {
+                    {
+                        let _lock = STATE_LOCK.lock();
+                        // SAFETY: 唯一 manager 已成功准备普通执行者，本轮真实创建失败资格在发表前结束。
+                        unsafe {
+                            (*pool(cpu).state.get()).create_failed = false;
+                        }
+                    }
+                    publish_worker(worker, prepared);
+                    break;
+                }
+                Err(_) => {
+                    {
+                        let _lock = STATE_LOCK.lock();
+                        // SAFETY: 只有真实 fallible 创建失败增加此计数并启用救援资格。
+                        unsafe {
+                            let state = &mut *pool(cpu).state.get();
+                            #[cfg(feature = "execution-tests")]
+                            {
+                                state.stats.create_failures += 1;
+                            }
+                            state.create_failed = true;
+                        }
+                    }
+                    wake_rescuers(cpu);
+                    // 管理等待已撤销，固定栈 timer 独占下一代 Waiter；冷却期间不持 STATE_LOCK。
+                    timer::sleep(Duration::from_secs(1));
+                }
             }
         }
     }
@@ -975,6 +1025,17 @@ pub(super) mod testing {
                 early_wake: s.stats.early_wake,
             }
         }
+    }
+    /// 只观察管理 Task 的真实阻塞状态；弱引用升级、scheduler 查询与强引用析构均在状态锁外。
+    pub(crate) fn manager_blocked(cpu: usize) -> bool {
+        let observation = {
+            let _lock = STATE_LOCK.lock();
+            // SAFETY: 永久池中的弱观察由 STATE_LOCK 保护，只复制弱引用而不进入 scheduler。
+            unsafe { (*pool(cpu).state.get()).manager_task.clone() }
+        };
+        observation
+            .and_then(|manager| manager.upgrade())
+            .is_some_and(|manager| crate::sched::test_state(&manager) == task::State::Blocked)
     }
     /// 观察真实角色，受控回收必须由预备域救援 Task 执行。
     pub(crate) fn is_rescuer() -> bool {

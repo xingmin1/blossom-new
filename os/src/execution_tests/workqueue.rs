@@ -823,10 +823,10 @@ pub(super) fn exhaust_for_printer_fault() -> (usize, usize, usize) {
     (pages, objects, nulls)
 }
 
-/// 已发布压力前缀只由实际 rescuer callback 消费一次；归还全部发生在池锁和 MM 锁外。
+/// 已发表压力前缀只交给一个回收 callback 或独立 Task，归还时不持池锁。
 fn release_pressure(page_count: usize, object_count: usize) {
     for index in (0..object_count).rev() {
-        // SAFETY: 两个完整前缀由协调者初始化后 Release 发表给唯一回收 callback；
+        // SAFETY: 两个完整前缀由协调者初始化后 Release 发表给唯一回收者；
         // 协调者已结束压力表访问，每槽在此移动一次，未发生过归还。
         let (pointer, layout) = unsafe {
             core::ptr::addr_of_mut!(OBJECTS)
@@ -839,7 +839,7 @@ fn release_pressure(page_count: usize, object_count: usize) {
         unsafe { dealloc(pointer, layout) };
     }
     for index in (0..page_count).rev() {
-        // SAFETY: 已初始化原前缀的唯一页拥有者只在此移动消费，callback 外没有并发压力表访问。
+        // SAFETY: 已初始化原前缀的唯一页拥有者只在此移动消费，回收者外没有并发压力表访问。
         let pages = unsafe {
             core::ptr::addr_of_mut!(PRESSURE)
                 .cast::<MaybeUninit<mm::OwnedPages>>()
@@ -853,7 +853,7 @@ fn release_pressure(page_count: usize, object_count: usize) {
 
 /// 保持基础普通 worker 真正 Blocked，不能由它执行下一项受控解压工作。
 fn pressure_blocker(work: Pin<&Work>) {
-    // SAFETY: test_reclaim 在解除 blocker、同步关闭两项 Work 与 rescuer join/归票前保留 Probe Arc。
+    // SAFETY: 场景 owner 在解除 blocker、同步关闭 Work、join 独立任务并归票前保留 Probe Arc。
     let (probe, _) = unsafe { context(work.context()) };
     assert!(!testing::is_rescuer());
     probe.publish_task(0);
@@ -880,7 +880,7 @@ fn reclaim_callback(work: Pin<&Work>) {
     probe.done.store(true, Ordering::Release);
 }
 
-/// X20 对象、工作与预留 rescuer 全部先准备，真实 OOM 中只提交现有节点并观察生产创建失败。
+/// X20 先核预备 rescuer 的真实 OOM 救援与归还，再核普通域不依赖新提交的恢复责任。
 fn test_reclaim() {
     let initial = baseline();
     let queue = WorkQueue::try_new(WorkQueueConfig {
@@ -944,6 +944,204 @@ fn test_reclaim() {
     drop((blocker, recovery, queue, probe));
     let settled = reclaimed(initial);
     crate::test_println!("PASS execution-X20 page_null={} heap_null={} create_failures={} rescuer_callbacks={} worker_callbacks={} recovered={} reclaimed={}", page_null, heap_null, create_failures, rescuer_callbacks, worker_callbacks, recovered, settled);
+    test_ordinary_recovery();
+}
+
+/// 所有普通恢复阶段共用一个硬件计数期限，协调轮询不产生工作池事件。
+fn ordinary_until(end: u64, mut predicate: impl FnMut() -> bool, name: &str) {
+    while !predicate() {
+        assert!(arch::read_counter() < end, "ordinary OOM timeout: {}", name);
+        sched::yield_now();
+    }
+}
+
+/// 跨越一秒创建冷却并观察真实 Blocked，持续压力下失败增量必须有界，撤票后必须为零。
+fn ordinary_creation_window(
+    probe: &Probe,
+    pending: Pin<&Work>,
+    queued: bool,
+    failures: usize,
+    maximum: usize,
+    end: u64,
+) {
+    let window_end = arch::read_counter()
+        .checked_add(arch::counter_frequency().checked_mul(1250).unwrap() / 1000)
+        .unwrap();
+    let mut blocked = false;
+    while arch::read_counter() < window_end {
+        assert!(
+            arch::read_counter() < end,
+            "ordinary OOM observation timeout"
+        );
+        assert!(probe.blocked(0), "base worker escaped its completion wait");
+        assert!(
+            probe.blocked(2),
+            "independent release task ran before permission"
+        );
+        assert!(!probe.release.load(Ordering::Acquire));
+        assert_eq!(probe.ordinary.load(Ordering::Acquire), 0);
+        let snapshot = testing::snapshot(pending);
+        assert_eq!((snapshot.queued, snapshot.running), (queued, false));
+        let stats = testing::pool_stats(0);
+        assert_eq!((stats.workers, stats.idle, stats.nr_running), (1, 0, 0));
+        assert!(
+            stats.create_failures - failures <= maximum,
+            "worker creation spun during OOM or continued after cancellation"
+        );
+        blocked |= testing::manager_blocked(0);
+        sched::yield_now();
+    }
+    assert!(blocked, "manager never entered a real Blocked state");
+}
+
+/// 预建普通 Task 独占压力表的归还权，放压后继续真睡眠，避免离栈释放代替恢复条件。
+fn ordinary_release_task(probe: Arc<Probe>) -> i32 {
+    assert!(task::current_worker().is_none());
+    probe.publish_task(2);
+    probe.gates[2].wait();
+    let pages = probe.pages.load(Ordering::Acquire);
+    let objects = probe.objects.load(Ordering::Acquire);
+    assert!(0 < pages);
+    release_pressure(pages, objects);
+    let stack = mm::alloc_pages(4, false).expect("independent release did not recover stack pages");
+    drop(stack);
+    for size in mm::SLUB_SIZES {
+        let layout = Layout::from_size_align(size, 8).unwrap();
+        // SAFETY: 有效生产类布局，唯一普通 Task 取得并立即归还本轮分配，没有导出访问者。
+        let pointer = unsafe { alloc(layout) };
+        assert!(
+            !pointer.is_null(),
+            "independent release did not recover heap class"
+        );
+        // SAFETY: pointer/layout 是刚成功取得的原分配，唯一拥有尚未归还。
+        unsafe { dealloc(pointer, layout) };
+    }
+    // 此 Task 固定 CPU0，归还与验证期间没有调度点；发表恢复后才 park，让 CPU0 manager 继续。
+    probe.release.store(true, Ordering::Release);
+    probe.gates[3].wait();
+    20
+}
+
+/// B 只能由新普通执行者在独立放压后执行，业务完成随后唤醒始终等待的基础 A。
+fn ordinary_recovery_callback(work: Pin<&Work>) {
+    // SAFETY: ordinary_recovery_case 保活 Probe 到两项 Work 同步关闭、独立 Task join 及观察归票以后。
+    let (probe, _) = unsafe { context(work.context()) };
+    assert_eq!(cpu::current().id, 0);
+    assert!(task::current_worker().is_some());
+    assert!(!testing::is_rescuer());
+    assert!(
+        probe.release.load(Ordering::Acquire),
+        "ordinary B ran before independent release"
+    );
+    assert!(probe.blocked(0));
+    let base_id = probe.tasks[0].lock().as_ref().unwrap().id();
+    assert_ne!(task::current_task().id(), base_id);
+    probe.publish_task(1);
+    assert_eq!(probe.ordinary.fetch_add(1, Ordering::AcqRel), 0);
+    probe.done.store(true, Ordering::Release);
+    probe.gates[0].complete();
+}
+
+/// 普通域真实失败后保留 B 等独立恢复，或冷却中撤唯一 B；全部资源在 OOM 前准备。
+fn ordinary_recovery_case(cancel: bool) -> (usize, usize, usize) {
+    let initial = baseline();
+    let queue = WorkQueue::try_new(WorkQueueConfig {
+        max_active: 2,
+        ordered: false,
+        reclaim: false,
+    })
+    .unwrap();
+    let probe = Probe::new();
+    let blocker = probe.work(&queue, 0, 0, pressure_blocker);
+    let pending = probe.work(&queue, 1, 0, ordinary_recovery_callback);
+    let release_probe = Arc::clone(&probe);
+    let prepared = task::prepare_kernel_on(0, move || ordinary_release_task(release_probe))
+        .expect("prepare independent ordinary release task");
+    let release_task = prepared.publish();
+    until(
+        || probe.blocked(2),
+        "independent release task prepared and parked",
+    );
+    assert!(blocker.as_ref().queue().unwrap());
+    until(
+        || probe.blocked(0),
+        "base worker blocked before ordinary OOM",
+    );
+    let before = testing::pool_stats(0);
+    assert_eq!((before.workers, before.idle, before.nr_running), (1, 0, 0));
+    mm::shrink_all();
+    let pages = exhaust_pages();
+    let (objects, nulls) = exhaust_objects();
+    assert_eq!(nulls, mm::SLUB_SIZES.len());
+    assert!(mm::alloc_pages(0, false).is_none());
+    probe.pages.store(pages, Ordering::Release);
+    probe.objects.store(objects, Ordering::Release);
+    assert!(pending.as_ref().queue().unwrap());
+    let end = raw_deadline();
+    ordinary_until(
+        end,
+        || {
+            before.create_failures < testing::pool_stats(0).create_failures
+                && testing::manager_blocked(0)
+        },
+        "real ordinary create failure followed by manager Blocked",
+    );
+    let failed = testing::pool_stats(0).create_failures;
+    if cancel {
+        assert!(pending.as_ref().cancel_sync());
+        ordinary_creation_window(&probe, pending.as_ref(), false, failed, 0, end);
+    } else {
+        ordinary_creation_window(&probe, pending.as_ref(), true, failed, 2, end);
+    }
+    let failures = testing::pool_stats(0).create_failures - before.create_failures;
+    assert!(1 <= failures);
+    probe.gates[2].complete();
+    ordinary_until(
+        end,
+        || probe.release.load(Ordering::Acquire),
+        "independent task released real page and heap pressure",
+    );
+    if cancel {
+        assert!(probe.blocked(0));
+        assert_eq!(probe.ordinary.load(Ordering::Acquire), 0);
+        assert!(!probe.done.load(Ordering::Acquire));
+        assert_eq!(testing::pool_stats(0).created, before.created);
+        probe.gates[0].complete();
+    } else {
+        ordinary_until(
+            end,
+            || probe.done.load(Ordering::Acquire),
+            "accepted B stalled after independent memory release without new work",
+        );
+        assert_eq!(probe.ordinary.load(Ordering::Acquire), 1);
+        assert!(before.created < testing::pool_stats(0).created);
+    }
+    pending.as_ref().flush();
+    queue.flush();
+    probe.gates[3].complete();
+    assert_eq!(release_task.join(), 20);
+    blocker.as_ref().close_sync();
+    pending.as_ref().close_sync();
+    queue.close_sync();
+    let callbacks = probe.ordinary.load(Ordering::Acquire);
+    assert_eq!(probe.rescuer.load(Ordering::Acquire), 0);
+    probe.clear();
+    unique_work(&blocker);
+    unique_work(&pending);
+    drop((blocker, pending, queue, probe));
+    let settled = reclaimed(initial);
+    (failures, callbacks, settled)
+}
+
+/// X20 保留 reclaim 输出，另核普通域恢复与撤票冷却，诊断只在两场景完整归还后发表。
+fn test_ordinary_recovery() {
+    let (failures, callbacks, recovered) = ordinary_recovery_case(false);
+    let (canceled_failures, canceled_callbacks, settled) = ordinary_recovery_case(true);
+    assert_eq!(
+        (callbacks, canceled_callbacks, recovered, settled),
+        (1, 0, 1, 1)
+    );
+    crate::test_println!("PASS execution-X20-ordinary create_failures={} retry_blocked=1 independent_release=1 ordinary_callbacks={} recovered={} canceled_retry=1 reclaimed={}", failures + canceled_failures, callbacks, recovered, settled);
 }
 
 /// 较早 work 在指定真实 CPU 阻塞，较晚项完成后，未来项继续独立占据 pending/running。

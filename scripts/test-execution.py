@@ -111,7 +111,7 @@ def check_execution(args):
         require(not line.startswith("EXECUTION TESTS PASS") or line == "EXECUTION TESTS PASS",
                 "malformed execution success marker")
         if line.startswith("PASS execution-"):
-            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-9]|X2[0-6]|X28) (.+)", line)
+            match = re.fullmatch(r"PASS execution-(X0[1-8]|X1[0-9]|X2[0-6]|X28|X20-ordinary) (.+)", line)
             require(match is not None and begin < index < done, "unexpected execution pass: " + line)
             name, payload = match.groups()
             require(name not in records, "duplicate execution record: " + name)
@@ -130,7 +130,7 @@ def check_execution(args):
             holds.append(index)
     expected = ["X01"] + ([] if args.cpus == 1 else ["X02"]) + [
         "X03", "X04", "X05", "X06", "X07", "X08", "X10", "X11", "X12",
-        "X13", "X14", "X15", "X16", "X17", "X18", "X19", "X20", "X21", "X22", "X23",
+        "X13", "X14", "X15", "X16", "X17", "X18", "X19", "X20", "X20-ordinary", "X21", "X22", "X23",
         "X24", "X25", "X26", "X28"]
     require(list(records) == expected, "missing or out-of-order execution records")
     require(len(holds) == 1, "missing or duplicate UART hold")
@@ -343,6 +343,8 @@ def check_workqueue(args, records):
                 "retired", "reclaimed"},
         "X20": {"page_null", "heap_null", "create_failures", "rescuer_callbacks",
                 "worker_callbacks", "recovered", "reclaimed"},
+        "X20-ordinary": {"create_failures", "retry_blocked", "independent_release",
+                         "ordinary_callbacks", "recovered", "canceled_retry", "reclaimed"},
         "X21": {"remote", "earlier_blocked", "later_done", "future_submitted", "boundary_done",
                 "future_running", "ordered", "reclaimed"},
         "X22": {"delayed", "modified", "transfers", "cancelled", "sync_wait", "inflight",
@@ -374,6 +376,12 @@ def check_workqueue(args, records):
             and twentieth["worker_callbacks"] == 0
             and twentieth["recovered"] == 1 and twentieth["reclaimed"] == 1,
             "X20 did not exhaust real page/heap allocation, fail worker creation, execute the reserved rescuer, or recover resources")
+    ordinary = records["X20-ordinary"]
+    require(1 <= ordinary["create_failures"]
+            and all(ordinary[name] == 1 for name in
+                    ("retry_blocked", "independent_release", "ordinary_callbacks",
+                     "recovered", "canceled_retry", "reclaimed")),
+            "X20 ordinary work did not recover after independent pressure release, sleep between real OOM retries, or stop retrying withdrawn demand")
     twenty_first = records["X21"]
     require(1 <= twenty_first["earlier_blocked"] and 1 <= twenty_first["later_done"]
             and 4 <= twenty_first["future_submitted"] and 1 <= twenty_first["future_running"]

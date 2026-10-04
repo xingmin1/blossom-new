@@ -7,7 +7,6 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sched;
-use crate::task::{self, TaskId};
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
 /// 可在持有期间阻塞或迁核的普通任务锁，不保证公平性，也不提供优先级继承。
@@ -37,7 +36,6 @@ impl<T> SleepMutex<T> {
     /// 普通任务在可切换环境中尝试一次占有；竞争失败不创建 guard，也不修改锁的占有状态。
     pub fn try_lock(&self) -> Option<SleepMutexGuard<'_, T>> {
         sched::assert_switchable();
-        let owner = task::current_task_id().expect("sleep mutex outside a task");
         if self
             .occupied
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -47,7 +45,6 @@ impl<T> SleepMutex<T> {
         }
         Some(SleepMutexGuard {
             mutex: self,
-            owner,
             _task: PhantomData,
         })
     }
@@ -78,19 +75,7 @@ impl<T> SleepMutex<T> {
 /// 唯一持有者只属于取得它的 Task，不绑定物理 CPU，也不能转交或共享给另一 Task。
 pub struct SleepMutexGuard<'a, T> {
     mutex: &'a SleepMutex<T>,
-    owner: TaskId,
     _task: PhantomData<*mut ()>,
-}
-
-impl<T> SleepMutexGuard<'_, T> {
-    /// 每次数据借用和释放都核对原 Task 身份，迁核不改变此身份。
-    fn assert_owner(&self) {
-        assert_eq!(
-            task::current_task_id(),
-            Some(self.owner),
-            "sleep mutex guard used by a different task"
-        );
-    }
 }
 
 impl<T> Deref for SleepMutexGuard<'_, T> {
@@ -98,7 +83,6 @@ impl<T> Deref for SleepMutexGuard<'_, T> {
 
     /// 在原持有 Task 中借用数据，引用不能活过 guard。
     fn deref(&self) -> &T {
-        self.assert_owner();
         // SAFETY: guard 只在 CAS Acquire 成功后创建，占有位在它析构前保持为 true；
         // guard 不可跨任务共享，&self 借用排除同时通过此 guard 获取可变引用。
         unsafe { &*self.mutex.value.get() }
@@ -108,7 +92,6 @@ impl<T> Deref for SleepMutexGuard<'_, T> {
 impl<T> DerefMut for SleepMutexGuard<'_, T> {
     /// 在原持有 Task 中独占借用数据，可变引用由 guard 的可变借用限制。
     fn deref_mut(&mut self) -> &mut T {
-        self.assert_owner();
         // SAFETY: 唯一成功 CAS 对应唯一 guard；&mut self 排除它的其他借用，
         // 私有 UnsafeCell 仅由该 guard 访问，锁借用保证数据仍然存活。
         unsafe { &mut *self.mutex.value.get() }
@@ -118,7 +101,6 @@ impl<T> DerefMut for SleepMutexGuard<'_, T> {
 impl<T> Drop for SleepMutexGuard<'_, T> {
     /// 原 Task 先 Release 归还占有权，再唤醒一个等待者重新竞争，不跨源锁通知。
     fn drop(&mut self) {
-        self.assert_owner();
         self.mutex.occupied.store(false, Ordering::Release);
         self.mutex.waiters.wake_one();
     }

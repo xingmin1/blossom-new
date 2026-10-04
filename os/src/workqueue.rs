@@ -637,8 +637,8 @@ pub fn initialize_services() -> Result<(), AllocError> {
 #[cfg(feature = "execution-tests")]
 pub(crate) mod testing {
     pub(crate) use super::pool::testing::{
-        arm_pause, is_paused, is_rescuer, pool_stats, release_pause, wait_services_blocked,
-        PausePoint, PoolStats,
+        arm_pause, is_paused, is_rescuer, manager_blocked, pool_stats, release_pause,
+        wait_services_blocked, PausePoint, PoolStats,
     };
     use super::*;
     /// 当前仍存活的真实 payload 数；不代表 Weak 控制块或 allocator backing 已归还。
