@@ -41,6 +41,7 @@ mod accounting;
 mod arch;
 mod block;
 mod boot;
+mod cache;
 mod console;
 mod cpu;
 mod drivers;

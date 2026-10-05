@@ -250,9 +250,8 @@ fn remove_node(node: &mut NodePartial, head: usize, state: &mut SlabState) {
         node.head = state.next;
     } else {
         descriptor(state.previous)
-            .slab
-            .lock()
-            .as_mut()
+            .usage()
+            .slab_mut()
             .expect("node predecessor vanished")
             .next = state.next;
     }
@@ -261,9 +260,8 @@ fn remove_node(node: &mut NodePartial, head: usize, state: &mut SlabState) {
         node.tail = state.previous;
     } else {
         descriptor(state.next)
-            .slab
-            .lock()
-            .as_mut()
+            .usage()
+            .slab_mut()
             .expect("node successor vanished")
             .previous = state.previous;
     }
@@ -285,9 +283,8 @@ fn insert_node(node: &mut NodePartial, head: usize, state: &mut SlabState) {
         node.head = head;
     } else {
         descriptor(node.tail)
-            .slab
-            .lock()
-            .as_mut()
+            .usage()
+            .slab_mut()
             .expect("node tail vanished")
             .next = head;
     }
@@ -313,14 +310,14 @@ fn destroy(state: SlabState) {
 fn put_node(class: usize, head: usize, shrink: bool) {
     let discarded = {
         let mut node = cache(class).node.lock();
-        let mut slot = descriptor(head).slab.lock();
-        let state = slot.as_mut().expect("detached slab vanished");
+        let mut slot = descriptor(head).usage();
+        let state = slot.slab_mut().expect("detached slab vanished");
         assert!(
             matches!(state.location, SlabLocation::Detached),
             "detached slab has another owner"
         );
         if state.inuse == 0 && (shrink || MIN_PARTIAL <= node.count) {
-            slot.take()
+            slot.take_slab()
         } else {
             if state.shared == 0 {
                 state.location = SlabLocation::Full;
@@ -341,8 +338,8 @@ fn deactivate(class: usize, ticket: ActiveTicket) {
         return;
     }
     {
-        let mut slot = descriptor(ticket.head).slab.lock();
-        let state = slot.as_mut().expect("active ticket vanished");
+        let mut slot = descriptor(ticket.head).usage();
+        let state = slot.slab_mut().expect("active ticket vanished");
         assert!(
             matches!(state.location, SlabLocation::Active(_)),
             "ticket slab is not active"
@@ -363,8 +360,8 @@ fn deactivate(class: usize, ticket: ActiveTicket) {
 fn put_partials(class: usize, mut head: usize) {
     while head != NONE {
         let next = {
-            let mut slot = descriptor(head).slab.lock();
-            let state = slot.as_mut().expect("CPU partial ticket vanished");
+            let mut slot = descriptor(head).usage();
+            let state = slot.slab_mut().expect("CPU partial ticket vanished");
             assert!(
                 matches!(state.location, SlabLocation::CpuPartial(_)),
                 "partial ticket lost its owner"
@@ -407,9 +404,8 @@ fn new_slab(class: usize) -> Option<usize> {
         unsafe { (pointer as *mut usize).write(next) };
     }
     {
-        let mut slot = descriptor(head).slab.lock();
-        assert!(slot.is_none(), "new backing already has slab state");
-        *slot = Some(SlabState {
+        let mut slot = descriptor(head).usage();
+        slot.install_slab(SlabState {
             backing,
             cache: class,
             objects,
@@ -439,8 +435,8 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
                 return Some(pointer);
             }
             if local.active != NONE {
-                let mut slot = descriptor(local.active).slab.lock();
-                let state = slot.as_mut().expect("CPU active slab vanished");
+                let mut slot = descriptor(local.active).usage();
+                let state = slot.slab_mut().expect("CPU active slab vanished");
                 assert!(
                     state.location == SlabLocation::Active(owner),
                     "CPU active owner differs"
@@ -455,8 +451,8 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
             } else {
                 if local.partial != NONE {
                     let head = local.partial;
-                    let mut slot = descriptor(head).slab.lock();
-                    let state = slot.as_mut().expect("CPU partial slab vanished");
+                    let mut slot = descriptor(head).usage();
+                    let state = slot.slab_mut().expect("CPU partial slab vanished");
                     assert!(
                         state.location == SlabLocation::CpuPartial(owner),
                         "CPU partial owner differs"
@@ -469,8 +465,8 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
                 let mut node = cache.node.lock();
                 if node.head != NONE {
                     let head = node.head;
-                    let mut slot = descriptor(head).slab.lock();
-                    let state = slot.as_mut().expect("node partial slab vanished");
+                    let mut slot = descriptor(head).usage();
+                    let state = slot.slab_mut().expect("node partial slab vanished");
                     remove_node(&mut node, head, state);
                     install(&mut local, owner, head, state);
                     return local.pop();
@@ -488,12 +484,12 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
             let owner = cpu::current().id;
             let mut local = cache.cpus[owner].lock();
             if local.active == NONE {
-                let mut slot = descriptor(head).slab.lock();
+                let mut slot = descriptor(head).usage();
                 install(
                     &mut local,
                     owner,
                     head,
-                    slot.as_mut().expect("prepared slab vanished"),
+                    slot.slab_mut().expect("prepared slab vanished"),
                 );
                 return local.pop();
             }
@@ -516,8 +512,8 @@ fn put_cpu_partial(class: usize, owner: usize, head: usize) -> usize {
         NONE
     };
     {
-        let mut slot = descriptor(head).slab.lock();
-        let state = slot.as_mut().expect("claimed CPU partial vanished");
+        let mut slot = descriptor(head).usage();
+        let state = slot.slab_mut().expect("claimed CPU partial vanished");
         assert!(
             state.location == SlabLocation::CpuPartial(owner),
             "CPU partial claim changed"
@@ -554,9 +550,8 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
     let head = descriptor(pfn).slab_head.load(Ordering::Acquire);
     assert!(head != NONE, "object has no slab head");
     let class = descriptor(head)
-        .slab
-        .lock()
-        .as_ref()
+        .usage()
+        .slab()
         .expect("live object has no slab state")
         .cache;
     let drained = {
@@ -576,15 +571,15 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
                 return;
             }
         }
-        let mut slot = descriptor(head).slab.lock();
-        let state = slot.as_mut().expect("live object slab vanished");
+        let mut slot = descriptor(head).usage();
+        let state = slot.slab_mut().expect("live object slab vanished");
         if matches!(state.location, SlabLocation::NodePartial) {
             // 对象尚未计入 free，保证放开快照锁后 backing 仍 live；按 node→slab 重取。
             drop(slot);
             let (discarded, claimed) = {
                 let mut node = cache(class).node.lock();
-                let mut slot = descriptor(head).slab.lock();
-                let state = slot.as_mut().expect("live node object vanished");
+                let mut slot = descriptor(head).usage();
+                let state = slot.slab_mut().expect("live node object vanished");
                 // SAFETY: caller 保留唯一待释放对象权，尚未提交 shared；当前 slab 锁
                 // 覆盖重新读取的角色和计数，node 锁允许成员变化。
                 unsafe { free_shared(state, address) };
@@ -597,7 +592,7 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
                     && MIN_PARTIAL < node.count
                 {
                     remove_node(&mut node, head, state);
-                    (slot.take(), false)
+                    (slot.take_slab(), false)
                 } else {
                     (None, false)
                 }
@@ -678,11 +673,11 @@ pub fn shrink_all() {
                     break;
                 }
                 let head = node.head;
-                let mut slot = descriptor(head).slab.lock();
+                let mut slot = descriptor(head).usage();
                 remove_node(
                     &mut node,
                     head,
-                    slot.as_mut().expect("shrink node slab vanished"),
+                    slot.slab_mut().expect("shrink node slab vanished"),
                 );
                 head
             };
@@ -743,11 +738,11 @@ pub(crate) fn slab_snapshot(pointer: NonNull<u8>) -> SlabSnapshot {
     slab_head_snapshot(head).expect("snapshot live slab vanished")
 }
 
-/// 持真实头 descriptor 的 slab 锁观察成员或已归页的 None，不读取空闲页内容。
+/// 持真实头 descriptor 的用途锁观察 slab 成员，其他用途与已归页状态不授予 slab 视图。
 #[cfg(any(feature = "memory-tests", feature = "ktest"))]
 pub(crate) fn slab_head_snapshot(head: usize) -> Option<SlabSnapshot> {
-    let slot = pages().get(head)?.slab.lock();
-    let state = slot.as_ref()?;
+    let slot = pages().get(head)?.usage();
+    let state = slot.slab()?;
     Some(SlabSnapshot {
         head_pfn: head,
         cache: state.cache,

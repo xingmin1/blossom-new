@@ -1,9 +1,10 @@
 //! 当前 QEMU coherent 直连 DMA：页拥有权、设备地址与访问期分别保存。
 
 use crate::arch;
+use crate::block::IoResult;
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
-use crate::mm::{alloc_pages, pages as page_map, OwnedPages};
+use crate::mm::{alloc_pages, pages as page_map, FolioRead, OwnedPages};
 use core::convert::TryFrom;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::NonNull;
@@ -63,7 +64,7 @@ impl CoherentDma {
             return Err(DmaError::NoMemory);
         }
         let pages = alloc_pages(order, true).ok_or(DmaError::NoMemory)?;
-        let device = direct_device_address(&pages, 0, pages.len())?;
+        let device = direct_device_address(pages.phys_addr(), pages.len(), 0, pages.len())?;
         Ok(Self { pages, device })
     }
 
@@ -89,11 +90,27 @@ impl CoherentDma {
     }
 }
 
+/// 映射始终保留原来源的完整拥有者，不将共享 folio 还原为独占原页。
+enum PayloadBacking {
+    Pages(OwnedPages),
+    Folio(FolioRead),
+}
+
+impl PayloadBacking {
+    /// 两种来源都返回 allocator 管理的原页地址，不授予 CPU 内容访问权。
+    fn phys_addr(&self) -> usize {
+        match self {
+            Self::Pages(pages) => pages.phys_addr(),
+            Self::Folio(read) => read.phys_addr(),
+        }
+    }
+}
+
 /// 在同一原页块内映射一个非空 payload 范围，不复制数据或拆散原阶。
 /// 设备拥有期间 CPU 数据入口和归还入口均拒绝访问。
 pub struct MappedPages {
     // 活动析构即使因断言进入 unwind，也不能让字段自动释放设备仍访问的页。
-    pages: ManuallyDrop<OwnedPages>,
+    backing: ManuallyDrop<PayloadBacking>,
     offset: usize,
     segment: MappedSegment,
     device_owned: bool,
@@ -109,14 +126,37 @@ impl MappedPages {
         direction: BufferDirection,
     ) -> Result<Self, DmaError> {
         let length = u32::try_from(len).map_err(|_| DmaError::InvalidRange)?;
-        let address = direct_device_address(&pages, offset, len)?;
+        let address = direct_device_address(pages.phys_addr(), pages.len(), offset, len)?;
         Ok(Self {
-            pages: ManuallyDrop::new(pages),
+            backing: ManuallyDrop::new(PayloadBacking::Pages(pages)),
             offset,
             segment: MappedSegment {
                 address,
                 length,
                 direction,
+            },
+            device_owned: false,
+        })
+    }
+
+    /// 原 folio 直接映射其已验证页内读入范围；准备失败完整返回唯一读入责任。
+    pub(crate) fn from_folio(read: FolioRead) -> Result<Self, (DmaError, FolioRead)> {
+        if read.is_completed() {
+            return Err((DmaError::InvalidRange, read));
+        }
+        let offset = read.offset();
+        let len = read.len();
+        let address = match direct_device_address(read.phys_addr(), PAGE_SIZE, offset, len) {
+            Ok(address) => address,
+            Err(error) => return Err((error, read)),
+        };
+        Ok(Self {
+            backing: ManuallyDrop::new(PayloadBacking::Folio(read)),
+            offset,
+            segment: MappedSegment {
+                address,
+                length: len as u32,
+                direction: BufferDirection::DeviceToDriver,
             },
             device_owned: false,
         })
@@ -148,13 +188,23 @@ impl MappedPages {
         self.device_owned
     }
 
-    /// 在 CPU 拥有期间独占 payload 字节存储；MaybeUninit 不读取未初始化页。
+    /// 已发布结果的 folio 只允许读取，不能作为新 Bio 的可写 DMA 来源。
+    pub(crate) fn is_folio_complete(&self) -> bool {
+        matches!(&*self.backing, PayloadBacking::Folio(read) if read.is_completed())
+    }
+
+    /// 在 CPU 拥有期间独占 payload 字节存储；folio 完成后禁止再次可变访问。
     pub fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         assert!(!self.device_owned, "CPU access during DMA device ownership");
         let len = self.len();
-        // SAFETY: new 已核对完整原块与 offset/len；本对象保有唯一页拥有权，
-        // 当前处于 CPU 状态且可变借用禁止同时交权，MaybeUninit 不要求字节已初始化。
-        unsafe { slice::from_raw_parts_mut(self.pages.as_mut_ptr().add(self.offset), len) }
+        match &mut *self.backing {
+            PayloadBacking::Pages(pages) => {
+                // SAFETY: new 核对完整原块和 offset/len，当前 CPU-owned；
+                // 可变借用排除并发交权，MaybeUninit 不要求字节已经初始化。
+                unsafe { slice::from_raw_parts_mut(pages.as_mut_ptr().add(self.offset), len) }
+            }
+            PayloadBacking::Folio(read) => read.bytes_mut(),
+        }
     }
 
     /// 在 CPU 拥有期间读取已初始化的 payload，不根据完成状态猜测实际写入量。
@@ -164,7 +214,7 @@ impl MappedPages {
     /// 所有先前导出的裸别名必须遵守本对象的独占设备访问期，不能并发写此借用。
     pub unsafe fn bytes(&self) -> &[u8] {
         assert!(!self.device_owned, "CPU access during DMA device ownership");
-        let pointer = (arch::phys_to_virt(self.pages.phys_addr()) + self.offset) as *const u8;
+        let pointer = (arch::phys_to_virt(self.backing.phys_addr()) + self.offset) as *const u8;
         // SAFETY: new 已核对原块和 CPU 直映范围，本对象保活且处于 CPU 状态；
         // 调用者保证全部字节初始化及没有并发写者，借用不能超出本对象寿命。
         unsafe { slice::from_raw_parts(pointer, self.len()) }
@@ -178,6 +228,10 @@ impl MappedPages {
     /// 子请求只可引用本映射的有界范围，不能自行收权、并发 CPU 访问或重复交权。
     pub unsafe fn begin_device_access(&mut self) {
         assert!(!self.device_owned, "DMA payload is already device owned");
+        assert!(
+            !self.is_folio_complete(),
+            "completed folio cannot enter DMA"
+        );
         arch::dma_write_barrier();
         self.device_owned = true;
     }
@@ -194,40 +248,44 @@ impl MappedPages {
         self.device_owned = false;
     }
 
-    /// 在非设备拥有状态恢复同一个原页拥有者，不按 payload 长度重算归还阶。
-    pub fn into_pages(self) -> OwnedPages {
-        let mut mapped = ManuallyDrop::new(self);
-        assert!(!mapped.device_owned, "reclaiming device-owned DMA pages");
-        // SAFETY: mapped 不再析构，且上面拒绝活动 DMA；take 只移动仍 live 的
-        // 唯一原 OwnedPages，一次交还原阶归还权，之后不再访问 mapped 的页字段。
-        unsafe { ManuallyDrop::take(&mut mapped.pages) }
+    /// Bio 全部义务结束且 CPU 收权后发布 folio 结果；独占原页来源不含填充责任。
+    ///
+    /// # Safety
+    /// 本映射的全部设备访问和可变 CPU 别名必须已经结束；完整成功必须保证
+    /// payload 全范围已经初始化，completed 必须属于本映射的连续成功前缀。
+    pub(crate) unsafe fn complete_folio(&mut self, result: IoResult) {
+        assert!(!self.device_owned, "completing device-owned folio");
+        if let PayloadBacking::Folio(read) = &mut *self.backing {
+            // SAFETY: 调用者保证真实收权和初始化，本映射固定为 read 的完整原范围。
+            unsafe { read.complete(result) };
+        }
     }
 }
 
 impl Drop for MappedPages {
-    /// 只有结束设备访问期的 payload 才按原阶归还；活动状态立即报告协议错误。
+    /// 只有结束设备访问期的 payload 才释放原来源；活动状态报告错误并保留整个拥有者。
     fn drop(&mut self) {
         assert!(!self.device_owned, "dropping device-owned DMA pages");
-        // SAFETY: 原拥有者只由 new 移入且未取出；状态检查确认设备访问已停止，
-        // 安全 CPU 借用随本对象结束，unsafe 裸别名使用者承担访问期义务。
-        unsafe { ManuallyDrop::drop(&mut self.pages) };
+        // SAFETY: 原来源只由构造器移入且未取出；设备访问已停止，CPU 借用已结束。
+        // folio 的读入责任由 Bio 发布，未提交者由其原 Drop 结束；不转换原页归还权。
+        unsafe { ManuallyDrop::drop(&mut self.backing) };
     }
 }
 
 /// 当前 coherent 直连后端只接受原 allocator 管理的真实 RAM，设备地址使用独立值类型。
 /// 校验完整原块避免范围越过 RAM 孔洞或保留区，再验证 payload 与 CPU/device 末端。
 fn direct_device_address(
-    pages: &OwnedPages,
+    physical: usize,
+    allocation_len: usize,
     offset: usize,
     len: usize,
 ) -> Result<DmaAddr, DmaError> {
     let end = offset.checked_add(len).ok_or(DmaError::InvalidRange)?;
-    if len == 0 || pages.len() < end {
+    if len == 0 || allocation_len < end {
         return Err(DmaError::InvalidRange);
     }
-    let physical = pages.phys_addr();
     let block_end = physical
-        .checked_add(pages.len())
+        .checked_add(allocation_len)
         .ok_or(DmaError::AddressLimit)?;
     let head_pfn = physical / PAGE_SIZE;
     let end_pfn = block_end / PAGE_SIZE;
@@ -239,7 +297,7 @@ fn direct_device_address(
         return Err(DmaError::AddressLimit);
     }
     let cpu = arch::phys_to_virt(physical);
-    if cpu == 0 || cpu.checked_add(pages.len()).is_none() {
+    if cpu == 0 || cpu.checked_add(allocation_len).is_none() {
         return Err(DmaError::AddressLimit);
     }
     let address = DmaAddr::new(u64::try_from(physical).map_err(|_| DmaError::AddressLimit)?)

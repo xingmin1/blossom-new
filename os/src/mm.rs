@@ -1,6 +1,7 @@
 mod bootmem;
 mod buddy;
 pub mod dma;
+pub mod folio;
 mod frame_allocator;
 mod heap_allocator;
 #[cfg(feature = "ktest")]
@@ -12,6 +13,7 @@ mod slub;
 pub(crate) mod tests;
 
 pub(crate) use bootmem::PAGE_SIZE;
+pub use folio::{FolioRead, FolioRef};
 pub use frame_allocator::{alloc_pages, OwnedPages};
 #[cfg(any(feature = "execution-tests", feature = "ktest"))]
 pub(crate) use heap_allocator::allocation_attempts;

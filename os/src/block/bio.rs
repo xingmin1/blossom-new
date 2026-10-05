@@ -62,13 +62,14 @@ pub(super) struct BioInner {
 }
 
 impl Bio {
-    /// 在普通可切换 Task、所有队列锁外消费 CPU 拥有的原映射并校验逻辑范围。
-    /// 分配失败不发表请求，原页由输入拥有者正常归还。
+    /// 在普通可切换 Task、所有队列锁外校验原映射并准备全部 fallible 完成存储。
+    /// 失败不发表请求，folio 以原错误结束读入责任，原页来源按原阶归还。
     ///
     /// # Safety
     /// Write 的整个传输范围必须已初始化；所有此前导出的 CPU 裸别名必须结束访问，
     /// 直到完成回调或完成观察者重新取得 CPU 拥有权。Read 不要求未写尾部初始化，
-    /// 每个输入映射都必须当前 CPU-owned，且由本次调用移交唯一原页归还权。
+    /// 每个输入映射必须当前 CPU-owned，并移交原来源完整拥有与设备交权责任；
+    /// folio 的读入责任必须尚未完成，已发布的只读内容不得再次用于设备写入。
     /// 回调若调用 MappedPages::bytes，仍须独立证明整个映射初始化。
     /// Inline 回调不得睡眠、动态准备或递归停止本 Disk；Task 回调可以睡眠，
     /// 但不得等待自身父完成、等待本 Disk 停止或复用仍由回调访问的 slot。
@@ -79,63 +80,83 @@ impl Bio {
         disk: &Disk,
         operation: BlkOperation,
         sector: u64,
-        memory: Vec<MappedPages>,
+        mut memory: Vec<MappedPages>,
         attributes: u32,
         end_io: Option<EndIo>,
     ) -> Result<Self, BlockError> {
         sched::assert_switchable();
-        let mut len = 0_usize;
-        for mapped in &memory {
-            if mapped.is_device_owned() {
-                return Err(BlockError::Busy);
+        let prepared = (|| {
+            let mut len = 0_usize;
+            for mapped in &memory {
+                if mapped.is_device_owned() || mapped.is_folio_complete() {
+                    return Err(BlockError::Busy);
+                }
+                len = len
+                    .checked_add(mapped.len())
+                    .ok_or(BlockError::InvalidRange)?;
             }
-            len = len
-                .checked_add(mapped.len())
-                .ok_or(BlockError::InvalidRange)?;
-        }
-        disk.limits().validate(
-            operation,
-            sector,
-            len,
-            memory.iter().map(MappedPages::segment),
-            attributes,
-        )?;
-        let segment_count = memory.len();
-        let inner = Arc::try_new(BioInner {
-            target: disk.identity(),
-            operation,
-            sector,
-            len,
-            segment_count,
-            end_io,
-            finalizer_work: None,
-            state: SpinLock::new(BioState {
-                phase: Phase::New,
-                memory: Some(memory),
-                remaining: 0,
-                generating: false,
-                registered_end: 0,
-                registered_children: 0,
-                first_error: None,
-                result: None,
-                completion_owner: None,
-            }),
-            ready: AtomicBool::new(false),
-            waiters: WaitQueue::new(),
-        })
-        .map_err(|_| BlockError::NoMemory)?;
-        if inner.needs_task() {
-            let raw = Arc::into_raw(inner);
-            // SAFETY: 此原 Arc 尚未发表、未创建弱引用，局部恢复唯一构造拥有。
-            let owner = unsafe { Arc::from_raw(raw) };
-            let work = disk.prepare_finalizer(finalizer_callback, raw as usize)?;
-            // SAFETY: Work 尚无票，没有任何回调或第二份 Bio 引用，固定分配内初始化一次。
-            unsafe {
-                (*raw.cast_mut()).finalizer_work = Some(work);
+            disk.limits().validate(
+                operation,
+                sector,
+                len,
+                memory.iter().map(MappedPages::segment),
+                attributes,
+            )?;
+            let inner = Arc::try_new(BioInner {
+                target: disk.identity(),
+                operation,
+                sector,
+                len,
+                segment_count: memory.len(),
+                end_io,
+                finalizer_work: None,
+                state: SpinLock::new(BioState {
+                    phase: Phase::New,
+                    memory: None,
+                    remaining: 0,
+                    generating: false,
+                    registered_end: 0,
+                    registered_children: 0,
+                    first_error: None,
+                    result: None,
+                    completion_owner: None,
+                }),
+                ready: AtomicBool::new(false),
+                waiters: WaitQueue::new(),
+            })
+            .map_err(|_| BlockError::NoMemory)?;
+            if inner.needs_task() {
+                let raw = Arc::into_raw(inner);
+                // SAFETY: 此原 Arc 尚未发表、未创建弱引用，局部恢复唯一构造拥有。
+                let owner = unsafe { Arc::from_raw(raw) };
+                let work = disk.prepare_finalizer(finalizer_callback, raw as usize)?;
+                // SAFETY: Work 尚无票，原映射未移入，没有任何回调或第二份 Bio 引用。
+                unsafe { (*raw.cast_mut()).finalizer_work = Some(work) };
+                return Ok(owner);
             }
-            return Ok(Self { inner: owner });
+            Ok(inner)
+        })();
+        match prepared {
+            Ok(inner) => {
+                inner.state.lock().memory = Some(memory);
+                Ok(Self { inner })
+            }
+            Err(error) => {
+                for mapped in &mut memory {
+                    if !mapped.is_device_owned() {
+                        // SAFETY: 请求未发表，构造义务保证 CPU 别名结束；
+                        // 错误结果不授予初始化范围，保留真正准备错误而非析构取消错误。
+                        unsafe {
+                            mapped.complete_folio(IoResult {
+                                completed: 0,
+                                error: Some(error),
+                            })
+                        };
+                    }
+                }
+                Err(error)
+            }
         }
-        Ok(Self { inner })
     }
 
     /// 克隆现存父引用供提交后的观察，不分配或复制 payload。
@@ -446,8 +467,8 @@ impl BioInner {
         false
     }
 
-    /// 唯一完成者在锁外执行回调，回调返回后才 Release 发布 memory 与完成结果。
-    fn finalize(&self, memory: Vec<MappedPages>, result: IoResult) {
+    /// 唯一完成者在锁外执行回调，随后发布 folio 终态，最后 Release 发布父完成。
+    fn finalize(&self, mut memory: Vec<MappedPages>, result: IoResult) {
         match self.end_io {
             Some(EndIo::Inline(callback)) => callback(&result, &memory),
             Some(EndIo::Task(callback)) => {
@@ -456,6 +477,19 @@ impl BioInner {
                 callback(&result, &memory);
             }
             None => {}
+        }
+        let mut remaining = result.completed;
+        for mapped in &mut memory {
+            let completed = remaining.min(mapped.len());
+            remaining = remaining.saturating_sub(mapped.len());
+            // SAFETY: complete 已结束全部 child 与生成者并真实收权；回调全部返回。
+            // 仅无错误的完整连续前缀证明相应范围已初始化，失败保原错误且不授予内容。
+            unsafe {
+                mapped.complete_folio(IoResult {
+                    completed,
+                    error: result.error,
+                })
+            };
         }
         {
             let mut state = self.state.lock();

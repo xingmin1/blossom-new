@@ -8,9 +8,11 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 
 use crate::block::bio::BioInner;
 use crate::block::disk::{ActiveBio, PreparingSlot};
-use crate::block::{Bio, BlkOperation, BlockError, Disk, QueueLimits, MAX_BATCH, SECTOR_BYTES};
+use crate::block::{
+    Bio, BlkOperation, BlockError, Disk, IoResult, QueueLimits, MAX_BATCH, SECTOR_BYTES,
+};
 use crate::mm::dma::{DmaError, MappedPages};
-use crate::mm::{alloc_pages, PAGE_SIZE};
+use crate::mm::{alloc_pages, FolioRead, PAGE_SIZE};
 use crate::task;
 
 /// 当前位置只引用父 Bio 的段编号，跨 child 保留游标避免从首页反复扫描。
@@ -222,6 +224,69 @@ impl Disk {
         debug_assert!(0 < bytes && !slot.sg().is_empty());
         slot.configure(operation, sector, bytes)?;
         Ok(plan)
+    }
+
+    /// 将原 folio 的页内范围交给现有 Bio，等待真实 DMA 全尾；磁盘位置不再加页内偏移。
+    pub fn load_folio(&self, byte_offset: u64, mut read: FolioRead) -> Result<(), BlockError> {
+        drop(task::current_task());
+        let len = read.len();
+        let mut memory = Vec::new();
+        let prepared = if byte_offset % SECTOR_BYTES != 0 {
+            Err(BlockError::Misaligned)
+        } else {
+            memory
+                .try_reserve_exact(1)
+                .map_err(|_| BlockError::NoMemory)
+        };
+        if let Err(error) = prepared {
+            // SAFETY: read 尚未映射或交设备，调用期间 CPU 可变借用已结束；
+            // 错误不授予任何初始化范围，所有等待者取得同一真实错误。
+            unsafe {
+                read.complete(IoResult {
+                    completed: 0,
+                    error: Some(error),
+                })
+            };
+            return Err(error);
+        }
+        let mapped = match MappedPages::from_folio(read) {
+            Ok(mapped) => mapped,
+            Err((error, mut read)) => {
+                let error = map_error(error);
+                // SAFETY: 映射准备失败，设备从未取得范围，失败不发布可读内容。
+                unsafe {
+                    read.complete(IoResult {
+                        completed: 0,
+                        error: Some(error),
+                    })
+                };
+                return Err(error);
+            }
+        };
+        memory.push(mapped);
+        // SAFETY: 唯一 read owner 保活并独占原 folio 的内容锁，全部 CPU 借用已经结束；
+        // Read 无回调，不要求初始内容已初始化，Bio 唯一全尾发布真实结果并收权。
+        let bio = unsafe {
+            Bio::try_new(
+                self,
+                BlkOperation::Read,
+                byte_offset / SECTOR_BYTES,
+                memory,
+                0,
+                None,
+            )
+        }?;
+        let completion = bio.completion();
+        self.submit_bio(bio);
+        self.unplug();
+        let result = completion.wait();
+        if let Some(error) = result.error {
+            return Err(error);
+        }
+        if result.completed != len {
+            return Err(BlockError::ShortIo);
+        }
+        Ok(())
     }
 
     /// 普通 Task 用请求自有零页完成字节范围读取，只有全长成功才修改调用者缓冲区。

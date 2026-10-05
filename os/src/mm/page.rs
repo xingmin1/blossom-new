@@ -1,6 +1,7 @@
 //! 从实际 RAM 直映建立永久页描述符；空洞仅占 section 索引。
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomPinned;
 use core::mem::size_of;
 #[cfg(feature = "memory-tests")]
 use core::mem::size_of_val;
@@ -11,8 +12,9 @@ use core::sync::atomic::AtomicUsize;
 use crate::boot::BootInfo;
 use crate::boot::MAX_MEMORY_REGIONS;
 use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
+use crate::mm::folio::FolioState;
 use crate::mm::OwnedPages;
-use crate::sync::SpinLock;
+use crate::sync::{SpinLock, SpinLockGuard};
 
 const PAGES_PER_SECTION: usize = (128 * 1024 * 1024) / PAGE_SIZE;
 type Section<'a> = Option<&'a [PageDesc]>;
@@ -32,8 +34,118 @@ pub(crate) struct PageDesc {
     /// 块内每个 PFN 关联实际头；SLUB 独占建块后以 Release 发布，定位方以 Acquire 读取。
     /// 无关联时为 usize::MAX；销毁时须先结束所有对象与成员责任，再清除整块关联。
     pub(crate) slab_head: AtomicUsize,
-    /// 仅实际头保存拥有与共享状态，所有普通字段读写均在此锁域内。
-    pub(crate) slab: SpinLock<Option<SlabState>>,
+    /// 只锁定用途访问令牌，取锁不会借用槽内的 folio 或等待源。
+    usage_lock: SpinLock<()>,
+    /// Empty 只表示没有 SLUB 或 folio 用途，不表示属于自由链。
+    usage: UnsafeCell<PageUse>,
+    _pinned: PhantomPinned,
+}
+
+/// 同一页头只能拥有一种用途，原始连续块归还权保留在实际用途内。
+enum PageUse {
+    Empty,
+    Slab(SlabState),
+    Folio(FolioState),
+}
+
+/// 页用途的短锁令牌；只授予已确认用途的视图，不暴露整个槽的可变借用。
+pub(crate) struct PageUseGuard<'a> {
+    descriptor: &'a PageDesc,
+    _lock: SpinLockGuard<'a, ()>,
+}
+
+impl PageUseGuard<'_> {
+    /// 持令牌读取用途标签；活 folio 的共享投影不会因再次取锁而失效。
+    fn value(&self) -> &PageUse {
+        // SAFETY: guard 持有本描述符唯一用途锁，安装和移出也持同锁；
+        // 活 folio 只修改内部 UnsafeCell，不创建整个用途槽的可变借用。
+        unsafe { &*self.descriptor.usage.get() }
+    }
+
+    /// 借用真实 SLUB 视图；其他用途不暴露 slab 字段。
+    pub(crate) fn slab(&self) -> Option<&SlabState> {
+        match self.value() {
+            PageUse::Slab(state) => Some(state),
+            PageUse::Empty | PageUse::Folio(_) => None,
+        }
+    }
+
+    /// 确认 Slab 后才授予独占视图，保持原 CPU/node 成员锁顺序。
+    pub(crate) fn slab_mut(&mut self) -> Option<&mut SlabState> {
+        self.slab()?;
+        // SAFETY: 用途锁排除安装和移出，标签已确认为 Slab，没有活 folio 投影；
+        // 可变 guard 借用结束全部先前视图，返回借用不能超出当前 guard。
+        match unsafe { &mut *self.descriptor.usage.get() } {
+            PageUse::Slab(state) => Some(state),
+            PageUse::Empty | PageUse::Folio(_) => unreachable!(),
+        }
+    }
+
+    /// 借用固定 folio 的共享状态，内部共享头仍须由本令牌保护。
+    pub(crate) fn folio(&self) -> &FolioState {
+        match self.value() {
+            PageUse::Folio(state) => state,
+            PageUse::Empty | PageUse::Slab(_) => panic!("live folio lost its page use"),
+        }
+    }
+
+    /// 仅在空槽安装用途，已有用途必须先结束全部访问责任并移出。
+    fn install(&mut self, value: PageUse) {
+        assert!(
+            matches!(self.value(), PageUse::Empty),
+            "owned page already has a use"
+        );
+        // SAFETY: 当前槽为空，锁排除竞争安装；可变 guard 借用结束已有短视图，
+        // 空槽没有 folio 投影或等待源责任，写入不覆盖活拥有者。
+        unsafe { self.descriptor.usage.get().write(value) };
+    }
+
+    /// 在未发布对象的空槽安装唯一 slab 拥有者。
+    pub(crate) fn install_slab(&mut self, state: SlabState) {
+        self.install(PageUse::Slab(state));
+    }
+
+    /// 在首引用发布前将 folio 拥有者固定到空槽。
+    pub(crate) fn install_folio(&mut self, state: FolioState) {
+        self.install(PageUse::Folio(state));
+    }
+
+    /// 移出已摘离且没有活对象的 slab，原页须在全部 MM 锁外归还。
+    pub(crate) fn take_slab(&mut self) -> Option<SlabState> {
+        let state = self.slab()?;
+        assert_eq!(state.inuse, 0, "removed slab retains live objects");
+        assert_eq!(
+            state.location,
+            SlabLocation::Detached,
+            "removed slab retains a list owner"
+        );
+        // SAFETY: 已确认 Slab，没有 folio 共享投影；活对象与成员责任均已结束，
+        // 可变 guard 借用结束全部短视图，锁排除其他 slab 访问和用途变化。
+        match unsafe { self.descriptor.usage.get().replace(PageUse::Empty) } {
+            PageUse::Slab(state) => Some(state),
+            PageUse::Empty | PageUse::Folio(_) => unreachable!(),
+        }
+    }
+
+    /// 最后引用结束后取走原页归还权并原地析构固定 folio，原页须在用途锁外归还。
+    ///
+    /// # Safety
+    /// 引用数必须为零，读入、等待登记、内容借用与所有固定共享投影必须已经结束。
+    pub(crate) unsafe fn take_folio(&mut self) -> OwnedPages {
+        // SAFETY: caller 已结束全部 folio 访问责任，当前锁排除用途变化；
+        // 可变 guard 借用结束锁内视图，只取走未被固定的 backing，不移动等待源。
+        let backing = match unsafe { &mut *self.descriptor.usage.get() } {
+            PageUse::Folio(state) => state.take_backing(),
+            PageUse::Empty | PageUse::Slab(_) => panic!("live folio lost its page use"),
+        };
+        // SAFETY: backing 已移交返回值，所有其他责任已结束；原地析构满足
+        // 等待源的 Pin 承诺，随后在已析构槽写入 Empty，不析构或移动原页。
+        unsafe {
+            self.descriptor.usage.get().drop_in_place();
+            self.descriptor.usage.get().write(PageUse::Empty);
+        }
+        backing
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -71,11 +183,13 @@ pub(crate) struct SlabState {
 }
 
 // SAFETY: kind 发布后不可变，buddy 的全部读写由唯一所属 zone 锁互斥；
-// slab_head 仅原子访问，slab 普通状态仅通过其 SpinLock guard 访问，锁域互不重叠。
+// slab_head 仅原子访问，SLUB 状态由独立 usage_lock 互斥；folio 固定用途仅修改
+// 同锁保护的内部共享头，取锁只借用独立令牌，内容锁与等待源维持固定地址。
+// 生产描述符永久发布后不移动；最后引用才原地析构 folio，原页归还在用途锁外。
 unsafe impl Sync for PageDesc {}
 
 impl PageDesc {
-    /// 写入不可变启动类别、未加入 buddy 链的状态及无 slab 关联的有效原子/锁初值。
+    /// 建立无用途、无内容锁责任的描述符；生产发布后永久固定其地址。
     pub(crate) const fn new(kind: PageKind) -> Self {
         Self {
             kind,
@@ -85,7 +199,17 @@ impl PageDesc {
                 next: usize::MAX,
             }),
             slab_head: AtomicUsize::new(usize::MAX),
-            slab: SpinLock::new(None),
+            usage_lock: SpinLock::new(()),
+            usage: UnsafeCell::new(PageUse::Empty),
+            _pinned: PhantomPinned,
+        }
+    }
+
+    /// 取得用途短锁令牌，不创建覆盖槽内 folio 的独占借用。
+    pub(crate) fn usage(&self) -> PageUseGuard<'_> {
+        PageUseGuard {
+            descriptor: self,
+            _lock: self.usage_lock.lock(),
         }
     }
 
@@ -360,7 +484,8 @@ unsafe fn write_ranges(address: usize, ranges: &[PageRange]) -> &'static [PageRa
 /// 起址非空且按 PAGE_SIZE 对齐，整个分配的虚拟地址范围不得回绕。
 /// 本函数取得的页必须独占，不得与 memory 自身或其他存活引用重叠，之后
 /// backing 不得释放或重新分配，kind/索引/区间快照不得修改；buddy 字段仅允许
-/// 由唯一所属 zone 锁域改变，slab 共享状态仅允许由其头锁访问，head 关联采用原子协议。
+/// 由唯一所属 zone 锁域改变，页用途仅允许由其头锁访问，head 关联采用原子协议；
+/// 永久发布后不得移动描述符；folio 等待源在活用途期间按引用协议固定。
 /// 失败时已扣除的 backing 仍保留，调用者必须终止启动。
 pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'static>, &'static str> {
     let mut groups = [SectionGroup {
