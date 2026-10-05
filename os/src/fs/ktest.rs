@@ -10,7 +10,7 @@ use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{Ext4Volume, InodeKind};
 use crate::fs::inode::{InodeCache, InodeRef};
-use crate::fs::FsError;
+use crate::fs::{DentryRef, FsContext, FsError, Path, ResolveMode, Vfs};
 use crate::mm::{FolioRead, FolioRef};
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
@@ -19,35 +19,42 @@ use crate::{cpu, drivers, mm, sched, time, timer};
 
 mod concurrency;
 mod format;
+mod path;
 
 const PATTERN_SIZE: u64 = 65573;
 const DIRECTORY_ENTRIES: usize = 12000;
 const DEEP_EXTENTS: u64 = 1500;
 
-/// 父入口只引用真实宏锚点，编号仅属于用例标签。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 20] {
-    [
-        format::codec::__ktest_anchor(),
-        format::volume::__ktest_anchor(),
-        format::identity::__ktest_anchor(),
-        format::bounded::__ktest_anchor(),
-        format::oom::__ktest_anchor(),
-        format::bad_super::__ktest_anchor(),
-        format::bad_group::__ktest_anchor(),
-        format::bad_inode::__ktest_anchor(),
-        format::bad_extent::__ktest_anchor(),
-        format::bad_directory::__ktest_anchor(),
-        format::bad_dx::__ktest_anchor(),
-        format::bad_directory_layout::__ktest_anchor(),
-        format::bad_dx_layout::__ktest_anchor(),
-        format::bad_geometry::__ktest_anchor(),
-        format::bad_features::__ktest_anchor(),
-        format::bad_mapping::__ktest_anchor(),
-        format::prefix::__ktest_anchor(),
-        concurrency::inode_loading::__ktest_anchor(),
-        concurrency::file_loading::__ktest_anchor(),
-        concurrency::failed_loading::__ktest_anchor(),
-    ]
+/// 保留格式、inode 与路径模块的实际宏锚点，不维护中央用例列表。
+pub(crate) fn anchors() -> (
+    [&'static ::ktest::SuiteSlot; 20],
+    [&'static ::ktest::SuiteSlot; 7],
+) {
+    (
+        [
+            format::codec::__ktest_anchor(),
+            format::volume::__ktest_anchor(),
+            format::identity::__ktest_anchor(),
+            format::bounded::__ktest_anchor(),
+            format::oom::__ktest_anchor(),
+            format::bad_super::__ktest_anchor(),
+            format::bad_group::__ktest_anchor(),
+            format::bad_inode::__ktest_anchor(),
+            format::bad_extent::__ktest_anchor(),
+            format::bad_directory::__ktest_anchor(),
+            format::bad_dx::__ktest_anchor(),
+            format::bad_directory_layout::__ktest_anchor(),
+            format::bad_dx_layout::__ktest_anchor(),
+            format::bad_geometry::__ktest_anchor(),
+            format::bad_features::__ktest_anchor(),
+            format::bad_mapping::__ktest_anchor(),
+            format::prefix::__ktest_anchor(),
+            concurrency::inode_loading::__ktest_anchor(),
+            concurrency::file_loading::__ktest_anchor(),
+            concurrency::failed_loading::__ktest_anchor(),
+        ],
+        path::anchors(),
+    )
 }
 
 /// 有限等待仅观察真实状态，sleep 不充当 Blocked、IRQ 或离栈证据。
@@ -193,10 +200,30 @@ enum Job {
         empty_number: u64,
         pressure: crate::cache::ktest::HeapPressure,
     },
+    Lookup {
+        vfs: Arc<Vfs>,
+        parent: DentryRef,
+        name: &'static [u8],
+    },
+    Resolve {
+        vfs: Arc<Vfs>,
+        context: FsContext,
+        pathname: &'static [u8],
+        mode: ResolveMode,
+    },
+    LookupOom {
+        vfs: Arc<Vfs>,
+        parent: DentryRef,
+        cached: DentryRef,
+        name: &'static [u8],
+        pressure: crate::cache::ktest::HeapPressure,
+    },
 }
 
 enum Returned {
     Inode(InodeRef),
+    Dentry(DentryRef),
+    Path(Path),
     Page {
         folio: FolioRef,
         bytes: usize,
@@ -212,6 +239,16 @@ enum Returned {
         inode_error: Option<FsError>,
         page_error: Option<FsError>,
         address: usize,
+        submitted_before: usize,
+        submitted_after: usize,
+    },
+    LookupOom {
+        producer_cpu: usize,
+        evidence: (bool, bool),
+        same_dentry: bool,
+        error: Option<FsError>,
+        len_before: usize,
+        len_after: usize,
         submitted_before: usize,
         submitted_after: usize,
     },
@@ -257,6 +294,42 @@ impl Observation {
 /// 普通原生任务消费真实 API；结果只观察已初始化内容或实际原错误。
 fn perform(job: Job) -> Result<Returned, FsError> {
     match job {
+        Job::Lookup { vfs, parent, name } => vfs
+            .dcache()
+            .lookup(vfs.inodes(), &parent, name)
+            .map(Returned::Dentry),
+        Job::Resolve {
+            vfs,
+            context,
+            pathname,
+            mode,
+        } => vfs.resolve(&context, pathname, mode).map(Returned::Path),
+        Job::LookupOom {
+            vfs,
+            parent,
+            cached,
+            name,
+            mut pressure,
+        } => {
+            let disk = parent.inode()?.filesystem().disk();
+            let submitted_before = disk.test_snapshot().submitted;
+            let len_before = vfs.dcache().len();
+            let evidence = pressure.exhaust();
+            let same = vfs.dcache().lookup(vfs.inodes(), &parent, cached.name())?;
+            let error = vfs.dcache().lookup(vfs.inodes(), &parent, name).err();
+            let returned = Returned::LookupOom {
+                producer_cpu: cpu::current().id,
+                evidence,
+                same_dentry: same.ptr_eq(&cached),
+                error,
+                len_before,
+                len_after: vfs.dcache().len(),
+                submitted_before,
+                submitted_after: disk.test_snapshot().submitted,
+            };
+            drop(pressure);
+            Ok(returned)
+        }
         Job::Get {
             cache,
             volume,
@@ -402,8 +475,20 @@ impl Owner {
             } else {
                 None
             };
+            let inode_capacity = if context
+                .case
+                .attributes
+                .tags
+                .contains(&"fs-path-cache-budget")
+            {
+                2
+            } else if context.case.attributes.tags.contains(&"fs-path") {
+                64
+            } else {
+                8
+            };
             let cache = Arc::try_new(
-                InodeCache::try_new(8, 8)
+                InodeCache::try_new(inode_capacity, 8)
                     .map_err(|_| TestError("inode cache preparation failed"))?,
             )
             .map_err(|_| TestError("inode cache owner OOM"))?;
@@ -549,8 +634,8 @@ impl Owner {
         Ok(())
     }
 
-    /// 控制者取消入口、放行 gate/used、真 join，再释放全部 claim，最后 stop/IRQ/Work。
-    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+    /// 停止控制者并等待原生任务离栈，归还结果和缓存引用后仍保活设备。
+    fn quiesce_jobs(&mut self) -> TestResult {
         let observer = self.observer().clone();
         observer.cancelled.store(true, Ordering::Release);
         observer.hold_loader.store(false, Ordering::Release);
@@ -577,6 +662,11 @@ impl Owner {
         drop(self.observation.take());
         drop(observer);
         drop(core::mem::take(&mut self.joins));
+        Ok(())
+    }
+
+    /// 文件系统拥有者已释放后核原六域，再停止 Disk、IRQ 和完成 Work。
+    fn quiesce_devices(&mut self, context: &mut TestContext<'_>) -> TestResult {
         recovered(
             context,
             "filesystem-before-disk-stop",
@@ -590,6 +680,12 @@ impl Owner {
         }
         self.queue.close_sync();
         Ok(())
+    }
+
+    /// 先结束全部异步拥有，再释放设备；派生夹具可在两段之间释放路径和卷。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.quiesce_jobs()?;
+        self.quiesce_devices(context)
     }
 
     /// 原 claim、Task、IRQ 与 Work 均结束后销毁设备，再核完整初始六域。

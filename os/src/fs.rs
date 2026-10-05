@@ -1,12 +1,16 @@
 //! 只读文件后端与唯一 inode 身份共用原页缓存和块 I/O。
 
+mod dentry;
 pub(crate) mod ext4;
 mod inode;
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
+mod path;
 
+pub use dentry::{DentryCache, DentryRef};
 pub use ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind};
 pub use inode::{InodeCache, InodeRef};
+pub use path::{FsContext, Path, ResolveMode, Vfs};
 
 use crate::block::BlockError;
 
@@ -21,6 +25,8 @@ pub enum FsError {
     NotDirectory,
     InvalidName,
     InvalidOperation,
+    Busy,
+    TooManySymlinks,
     LoadAborted,
     Io(BlockError),
 }
@@ -39,6 +45,8 @@ impl FsError {
             | Self::NotDirectory
             | Self::InvalidName
             | Self::InvalidOperation
+            | Self::Busy
+            | Self::TooManySymlinks
             | Self::LoadAborted => panic!("non-fill error published to a folio: {:?}", self),
         }
     }

@@ -188,6 +188,11 @@ impl InodeCache {
         self.len() == 0
     }
 
+    /// 观察包含加载中对象的固定槽预算，名字索引可先释放静止绑定持有的 inode 引用。
+    pub(crate) fn is_full(&self) -> bool {
+        self.capacity <= self.len()
+    }
+
     /// 双查同身份后发表 Loading；锁内只增加引用和占槽，不分配、加载或释放页。
     fn publish(
         &self,

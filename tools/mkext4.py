@@ -98,6 +98,21 @@ def staging(directory, block_size):
     raw = os.fsencode(directory) + b"/name-\xff\xfe"
     with open(raw, "xb") as stream:
         stream.write(b"raw-name\n")
+    walk = directory / "walk"
+    walk.mkdir()
+    (walk / "sub").mkdir()
+    (directory / "mnt").mkdir()
+    (directory / "mnt" / "extra").mkdir()
+    for name, target in (
+        ("relative", "../pattern"),
+        ("absolute", "/pattern"),
+        ("directory", "sub"),
+        ("loop", "loop"),
+    ):
+        os.symlink(target, walk / name)
+    for index in range(1, 42):
+        target = f"chain{index + 1:02d}" if index < 41 else "../pattern"
+        os.symlink(target, walk / f"chain{index:02d}")
     with (directory / "sparse").open("xb") as stream:
         stream.write(pattern(0, 4096))
         stream.seek(12288)
