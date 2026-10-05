@@ -24,16 +24,18 @@ mod concurrency;
 mod file;
 mod format;
 mod path;
+mod system;
 
 const PATTERN_SIZE: u64 = 65573;
 const DIRECTORY_ENTRIES: usize = 12000;
 const DEEP_EXTENTS: u64 = 1500;
 
-/// 保留格式、inode、路径与文件模块的实际宏锚点，不维护中央用例列表。
+/// 保留格式、inode、路径、文件与系统盘模块的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
     [&'static ::ktest::SuiteSlot; 20],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 7],
+    [&'static ::ktest::SuiteSlot; 6],
 ) {
     (
         [
@@ -60,6 +62,7 @@ pub(crate) fn anchors() -> (
         ],
         path::anchors(),
         file::anchors(),
+        system::anchors(),
     )
 }
 
@@ -538,11 +541,10 @@ impl Owner {
         inventory: &DeviceInventory,
     ) -> Result<Self, TestError> {
         let initial = settled()?;
-        let count = if context.case.attributes.resources.contains(&Resource::Extra) {
-            2
-        } else {
-            1
-        };
+        let count = [Resource::Root, Resource::Extra, Resource::Scratch]
+            .iter()
+            .filter(|role| context.case.attributes.resources.contains(*role))
+            .count();
         let devices = devices(context, inventory, count)?;
         let max_tags = devices
             .iter()
@@ -590,7 +592,9 @@ impl Owner {
                 .contains(&"fs-path-cache-budget")
             {
                 2
-            } else if context.case.attributes.tags.contains(&"fs-path") {
+            } else if context.case.attributes.tags.contains(&"fs-path")
+                || context.case.attributes.tags.contains(&"fs-system")
+            {
                 64
             } else {
                 8

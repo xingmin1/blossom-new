@@ -2,22 +2,31 @@
 
 ARCH ?= riscv64
 CPUS ?= 4
-MEMORY ?= 1G
+MEMORY ?= $(if $(filter riscv64,$(ARCH)),512M,768M)
 MODE ?= debug
 PANIC ?= unwind
 KTEST_ARGS ?=
 FEATURES ?=
 FAULT ?= irq
 OUTPUT ?= build/$(ARCH)/kernel.elf
+TEST ?=
+ROOT ?= /dev/vda
+EXTRA_ROOT ?=
+IDENTITY ?= root
+IMAGE ?= build/$(if $(filter extra,$(IDENTITY)),extra,system)-$(ARCH).img
+STAGING ?= build/system-$(ARCH)-$(IDENTITY)
+SOURCE ?=
+EXTRA_IMAGE ?=
+SCRATCH_IMAGE ?=
+WORK_DIR ?= build/run-$(ARCH)
+RESUME ?= 0
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
 QEMU := qemu-system-riscv64
-BIOS := -bios default
 else ifeq ($(ARCH),loongarch64)
 TARGET := loongarch64-unknown-none
 QEMU := qemu-system-loongarch64
-BIOS :=
 else
 $(error ARCH 只支持 riscv64 或 loongarch64)
 endif
@@ -35,10 +44,9 @@ else ifneq ($(MODE),debug)
 $(error MODE 只支持 debug 或 release)
 endif
 
-QEMU_ARGS := -machine virt -accel tcg $(BIOS) -m $(MEMORY) -smp $(CPUS) -nographic -monitor none -no-reboot -nic none
 CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
 
-.PHONY: all kernel-rv kernel-la build run debug test test-memory test-execution test-execution-fault clean
+.PHONY: all kernel-rv kernel-la build image run debug test test-memory test-execution test-execution-fault clean
 
 all: kernel-rv kernel-la
 
@@ -55,11 +63,12 @@ build:
 	mkdir -p $(dir $(OUTPUT))
 	cp os/target/$(TARGET)/$(MODE)/os $(OUTPUT)
 
-run: build
-	$(QEMU) $(QEMU_ARGS) -kernel $(OUTPUT)
+image:
+	python3 tools/mkext4.py --arch $(ARCH) --output "$(IMAGE)" --identity $(IDENTITY) --profile seed4k --size-mib 256 $(if $(SOURCE),--source "$(SOURCE)",--staging "$(STAGING)")
 
-debug: build
-	$(QEMU) $(QEMU_ARGS) -kernel $(OUTPUT) -S -gdb tcp:127.0.0.1:1234
+run debug: build
+	@test "$(RESUME)" = 0 -o "$(RESUME)" = 1 || { echo "RESUME 只支持 0 或 1"; exit 2; }
+	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(ROOT)" --work-dir "$(WORK_DIR)" $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter 1,$(RESUME)),--resume) $(if $(filter debug,$@),--debug)
 
 test:
 	$(MAKE) build FEATURES=boot-tests OUTPUT=build/$(ARCH)/kernel-boot-tests.elf
@@ -99,10 +108,10 @@ ktest-build:
 	cp "build/ktest-target/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
 
 ktest-list:
-	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) $(KTEST_ARGS)
+	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 ktest:
-	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) $(KTEST_ARGS)
+	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 clean:
 	cd os && cargo clean

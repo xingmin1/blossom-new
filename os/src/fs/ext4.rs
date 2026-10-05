@@ -1,7 +1,7 @@
 //! ext4 只读卷拥有实际设备声明；元数据与文件内容使用共享原页。
 
 pub(crate) mod codec;
-mod crc;
+pub(crate) mod crc;
 mod directory;
 mod mapping;
 

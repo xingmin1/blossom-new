@@ -13,11 +13,13 @@ import tempfile
 import time
 import threading
 
+from storage import disk_arguments
+
 from . import ap_freeze, boot
 from .catalog import Catalog, HostError, require, run_command
 from .protocol import KTAP, ready
 from .execution_uart import ExecutionUART
-from .resources import (crc32c_update, disk_arguments, prepare_disks,
+from .resources import (crc32c_update, prepare_disks,
                         resource_names, validate_resources)
 
 CANCELLED = threading.Event()

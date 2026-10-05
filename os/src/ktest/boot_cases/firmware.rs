@@ -49,7 +49,7 @@ fn parse(bytes: &[u8], bsp: usize) -> boot::BootInfo {
         .expect("actual DTB resource parse failed")
 }
 
-/// 比较实际资源发现结果，内核保留项由 publish 之前的独立 reserve 负责。
+/// 比较 DTB 来源资源；LA 寄存器命令行与内核保留项由独立启动步骤取得。
 fn same_resources(
     context: &mut TestContext<'_>,
     actual: &boot::BootInfo,
@@ -81,6 +81,7 @@ fn same_resources(
         context.expect_eq(left.bus_start, right.bus_start);
         context.expect_eq(left.cpu, right.cpu);
     }
+    #[cfg(target_arch = "riscv64")]
     context.expect_eq(actual.bootargs(), expected.bootargs());
     context.expect_eq(actual.counter_frequency, expected.counter_frequency);
 }

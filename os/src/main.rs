@@ -114,7 +114,8 @@ unsafe fn initialize_boot(arguments: [usize; 3]) {
 /// # Safety
 /// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
 /// 汇编已建立内核/RAM/早期 UART 映射、独占启动栈，并清理普通 BSS。
-/// 原始参数遵守固件协议，DTB 头部及声明的完整存储范围可读且不覆盖内核。
+/// 原始参数遵守固件协议，DTB 头部及声明的完整存储范围可读且不覆盖内核；
+/// LA 的 a1 命令行在 BootInfo 容量内可读，并由固件低 RAM 保留区保护。
 #[no_mangle]
 pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
     // 引导构造帧先真实返回，避免 LTO 把大数组留在 Boot 展开的 64KiB 栈上。
@@ -269,7 +270,7 @@ fn enter_scheduler() -> ! {
     sched::run()
 }
 
-/// 在普通任务栈一次发现设备并报告真实资源，再完成有限内核消费者；测试镜像保持独立入口。
+/// 在普通任务栈一次发现并保活存储，按明确启动参数读取系统盘，再完成有限消费者。
 #[cfg(not(feature = "boot-tests"))]
 fn init() -> i32 {
     #[cfg(feature = "execution-tests")]
@@ -284,21 +285,86 @@ fn init() -> i32 {
             || inventory.pci.devices().iter().any(|device| {
                 device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
             });
-        if has_block {
-            // SAFETY: init 是一次发现后全部块设备的唯一准备者；Bootstrap 永久映射仍 live，
-            // 固定 Storage 表在发表前持全部 owner，未确认停止的设备不会在 init 返回时丢失。
-            let storage = unsafe { storage::Storage::initialize(&inventory) }
-                .expect("storage initialization failed");
-            crate::klog!(
-                klog::Level::Info,
-                "STORAGE online devices={}",
-                storage.count()
-            );
-        }
+        assert!(
+            has_block,
+            "filesystem boot initialization failed: {:?}",
+            fs::FsError::MissingRoot
+        );
+        // SAFETY: init 是一次发现后全部块设备的唯一准备者；Bootstrap 永久映射仍 live，
+        // 固定 Storage 表在发表前持全部 owner，未确认停止的设备不会在 init 返回时丢失。
+        let storage = unsafe { storage::Storage::initialize(&inventory) }
+            .expect("storage initialization failed");
+        crate::klog!(
+            klog::Level::Info,
+            "STORAGE online devices={}",
+            storage.count()
+        );
+        init_filesystems(storage).expect("filesystem boot initialization failed");
         init_consumers();
         drop(inventory);
         0
     }
+}
+
+/// 普通 init 用真实磁盘槽读取固定系统文件，结束后释放临时路径、打开文件和缓存。
+#[cfg(not(any(
+    feature = "boot-tests",
+    feature = "execution-tests",
+    feature = "storage-tests"
+)))]
+fn init_filesystems(storage: &storage::Storage) -> Result<(), fs::FsError> {
+    use alloc::sync::Arc;
+
+    let selected = fs::system::boot_devices(boot::info().bootargs())?;
+    let root = storage
+        .disk(selected.root)
+        .ok_or(fs::FsError::MissingRoot)?;
+    let extra = selected
+        .extra
+        .map(|index| storage.disk(index).ok_or(fs::FsError::MissingRoot))
+        .transpose()?;
+    let inodes =
+        Arc::try_new(fs::InodeCache::try_new(64, 16)?).map_err(|_| fs::FsError::NoMemory)?;
+    let vfs = fs::system::mount_disks(root, extra, inodes)?;
+    let context = fs::FsContext::new(vfs.root(), vfs.root())?;
+    let files = fs::FileTable::try_new(4)?;
+    crate::klog!(
+        klog::Level::Info,
+        "ROOTFS selected root={} extra={:?}",
+        selected.root,
+        selected.extra
+    );
+    const PATHS: &[(&str, bool)] = &[
+        ("/test/identity", false),
+        ("/test/data.bin", false),
+        ("/test/empty", false),
+        ("/test/sparse.bin", false),
+        ("/test/bin/probe.elf", false),
+        ("/mnt/extra/test/identity", true),
+        ("/mnt/extra/test/data.bin", true),
+        ("/mnt/extra/test/empty", true),
+        ("/mnt/extra/test/sparse.bin", true),
+        ("/mnt/extra/test/bin/probe.elf", true),
+    ];
+    for &(pathname, extra) in PATHS {
+        if extra && selected.extra.is_none() {
+            continue;
+        }
+        let summary = fs::system::read_summary(&files, &vfs, &context, pathname.as_bytes())?;
+        crate::klog!(
+            klog::Level::Info,
+            "fs-system-summary path={} bytes={} crc32c={:08x}",
+            pathname,
+            summary.bytes,
+            summary.crc32c
+        );
+    }
+    drop(files);
+    drop(context);
+    vfs.prune_unused();
+    drop(vfs);
+    crate::klog!(klog::Level::Info, "ROOTFS completed");
+    Ok(())
 }
 
 /// 只记录启用 MMIO 槽、实际 block 候选与 PCI 功能资源，不触碰设备队列或读取磁盘。

@@ -772,11 +772,12 @@ fn discover_plic(
     Ok(())
 }
 
-/// 从所选 QEMU 引导协议读取唯一 DTB，返回完整的无堆启动资源快照。
+/// 从所选 QEMU 引导协议读取唯一 DTB 和实际命令行，返回完整的无堆启动资源快照。
 ///
 /// # Safety
 /// 固件必须提供至少可读的 FDT 头部及头部所声明的完整存储范围；本函数检查内容边界，
-/// 不能验证任意物理指针是否实际可读。调用时 BSP 必须已建立对应 RAM 访问映射。
+/// 不能验证任意物理指针是否实际可读。调用时 BSP 必须已建立对应 RAM 访问映射；
+/// LA 的 a1 是命令行物理地址，当前 BootInfo 容量内的字节必须由固件保留且可读。
 pub unsafe fn discover(
     raw_args: [usize; 3],
     bsp_hardware_id: usize,
@@ -803,7 +804,26 @@ pub unsafe fn discover(
     }
     // SAFETY: caller 保证固件声明的完整存储可读；长度、物理和虚拟地址范围已验证。
     let bytes = unsafe { core::slice::from_raw_parts(pointer, total) };
-    discover_tree(bytes, raw_args, bsp_hardware_id, physical)
+    let info = discover_tree(bytes, raw_args, bsp_hardware_id, physical)?;
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mut info = info;
+        // LA 直接装载协议把命令行放在 a1 指向的低 RAM，不写入 DTB /chosen。
+        let command = crate::arch::phys_to_virt(raw_args[1]) as *const u8;
+        for index in 0..info.bootargs.len() {
+            // SAFETY: caller 保证固件命令行在当前 RAM 映射可读；QEMU 保留其低 RAM，
+            // 地址零也是有效物理地址。读取受快照容量限制，遇到终止 NUL 立即停止。
+            let byte = unsafe { command.add(index).read() };
+            if byte == 0 {
+                info.bootargs_len = index;
+                return Ok(info);
+            }
+            info.bootargs[index] = byte;
+        }
+        Err("firmware command line exceeds boot snapshot capacity")
+    }
+    #[cfg(target_arch = "riscv64")]
+    Ok(info)
 }
 
 /// 在独占副本上检验实际 DTB 的截断、块边界和 NOP 属性处理。

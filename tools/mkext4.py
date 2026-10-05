@@ -20,15 +20,16 @@ DIRECTORY_ENTRIES = 12000
 DEEP_EXTENTS = 1500
 
 
-def output_path(value):
-    """拒绝既有文件、归档与符号链接祖先，仅允许仓库 build 子目录。"""
+def output_path(value, replace=False):
+    """仅允许 build 内普通输出；生产镜像可替换，夹具仍要求全新目录。"""
     path = Path(os.path.abspath(value))
     base = ROOT / "build"
-    if base not in path.parents or path.exists() or path.is_symlink():
-        raise ValueError("--output must be a new path below repository build/")
+    if (base not in path.parents or path.is_symlink()
+            or (path.exists() and (not replace or not path.is_file()))):
+        raise ValueError("--output must be a regular path below repository build/")
     log = path.with_suffix(".log")
-    if log.exists() or log.is_symlink():
-        raise ValueError("output log must not already exist")
+    if log.is_symlink() or (log.exists() and (not replace or not log.is_file())):
+        raise ValueError("output log must be a regular file")
     if any(parent.is_symlink() for parent in path.parents):
         raise ValueError("output ancestors must not be symbolic links")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +86,75 @@ def write_pattern(path, length):
         for offset in range(0, length, 65536):
             stream.write(pattern(offset, min(65536, length - offset)))
 
+
+
+def system_staging(directory, arch, identity):
+    """只在首次使用时创建可编辑普通系统树，现有目录的内容保持不变。"""
+    if directory.exists():
+        if not directory.is_dir():
+            raise ValueError("--staging must be a directory")
+        return directory
+    probe = ROOT / "os" / ("bash-rv" if arch == "riscv64" else "bash-la")
+    if not probe.is_file():
+        raise ValueError(f"repository ELF missing: {probe}")
+    with probe.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            raise ValueError(f"repository probe is not an ELF: {probe}")
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="system-staging-", dir=directory.parent) as temporary:
+        tree = Path(temporary) / "root"
+        test = tree / "test"
+        (test / "bin").mkdir(parents=True)
+        (test / "links").mkdir()
+        (tree / "mnt" / "extra").mkdir(parents=True)
+        (test / "identity").write_bytes(f"blossom-{identity}\n".encode("ascii"))
+        write_pattern(test / "data.bin", PATTERN_SIZE)
+        (test / "empty").touch()
+        with (test / "sparse.bin").open("xb") as stream:
+            stream.write(pattern(0, 4096))
+            stream.seek(12288)
+            stream.write(pattern(12288, 37))
+        shutil.copyfile(probe, test / "bin" / "probe.elf")
+        os.link(test / "data.bin", test / "links" / "hard")
+        for name, target in (("relative", "../data.bin"), ("absolute", "/test/data.bin"),
+                             ("loop", "loop")):
+            os.symlink(target, test / "links" / name)
+        os.rename(tree, directory)
+    return directory
+
+
+def check_system_image(image, profile):
+    """核实际超级块几何，并保留正式只读工具的格式与目录检查结果。"""
+    with image.open("rb") as stream:
+        stream.seek(1024)
+        superblock = stream.read(1024)
+    block_size, inode_size, _ = PROFILES[profile]
+    if (len(superblock) != 1024 or superblock[56:58] != b"\x53\xef"
+            or int.from_bytes(superblock[24:28], "little") != block_size.bit_length() - 11
+            or int.from_bytes(superblock[88:90], "little") != inode_size):
+        raise ValueError("generated superblock does not match requested geometry")
+    log = image.with_suffix(".log")
+    command(["dumpe2fs", "-h", image], log)
+    debug_result(command(["debugfs", "-R", "stat /", image], log), "stat /")
+    command(["e2fsck", "-fn", image], log)
+
+
+def system_image(source, output, profile, size_mib):
+    """新镜像完整制盘并检查后才原子替换目标，失败时保留原输入与输出。"""
+    if source == output.parent or source in output.parents:
+        raise ValueError("output must not be inside the source tree")
+    with tempfile.TemporaryDirectory(prefix="system-image-", dir=output.parent) as temporary:
+        image = Path(temporary) / "system.img"
+        try:
+            create_image(source, image, profile, size_mib)
+            check_system_image(image, profile)
+        except (ValueError, OSError, subprocess.CalledProcessError):
+            log = image.with_suffix(".log")
+            if log.exists():
+                os.replace(log, output.with_suffix(".log"))
+            raise
+        os.replace(image.with_suffix(".log"), output.with_suffix(".log"))
+        os.replace(image, output)
 
 def staging(directory, block_size):
     """从普通文件构造链接、字节名、稀疏文件和真实多层映射的输入树。"""
@@ -297,22 +367,27 @@ def damaged_images(directory):
 
 
 def main(argv=None):
-    """同一命令提供生产制盘与完整夹具集，不执行内核测试或维护用例清单。"""
+    """普通系统盘读取可编辑树后原子换盘；既有完整夹具仍由独立选项生成。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile", choices=PROFILES, default="seed4k")
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--arch", choices=("riscv64", "loongarch64"), default="riscv64")
+    parser.add_argument("--staging", type=Path)
+    parser.add_argument("--identity", choices=("root", "extra"), default="root")
     parser.add_argument("--size-mib", type=int, default=256)
     parser.add_argument("--fixtures", action="store_true")
     args = parser.parse_args(argv)
     if args.size_mib < 128:
         parser.error("--size-mib must be at least 128")
-    if args.fixtures and args.source is not None:
+    if args.fixtures and (args.source is not None or args.staging is not None):
         parser.error("--fixtures creates its own ordinary staging tree")
+    if args.source is not None and args.staging is not None:
+        parser.error("--source and --staging are mutually exclusive")
     if not args.fixtures and Path(args.output).suffix != ".img":
         parser.error("production --output must end in .img")
     try:
-        output = output_path(args.output)
+        output = output_path(args.output, replace=not args.fixtures)
         for binary in ("mke2fs", "debugfs", "e2fsck", "dumpe2fs"):
             if shutil.which(binary) is None:
                 raise ValueError(f"required tool missing: {binary}")
@@ -324,11 +399,14 @@ def main(argv=None):
                 print(f"valid root={image} profile={profile}")
             damaged_images(output)
         else:
-            if args.source is None or not args.source.is_dir():
-                raise ValueError("production images require --source DIRECTORY")
-            create_image(args.source.resolve(), output, args.profile, args.size_mib)
-            command(["e2fsck", "-fn", output], output.with_suffix(".log"))
-            print(f"valid root={output} profile={args.profile}")
+            source = args.source
+            if source is None:
+                directory = args.staging or ROOT / "build" / f"system-{args.arch}-{args.identity}"
+                source = system_staging(directory, args.arch, args.identity)
+            if not source.is_dir():
+                raise ValueError("--source must be an existing directory")
+            system_image(source.resolve(), output, args.profile, args.size_mib)
+            print(f"valid root={output} profile={args.profile} source={source.resolve()}")
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"mkext4: {error}\n")
 

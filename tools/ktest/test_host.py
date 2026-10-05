@@ -24,7 +24,7 @@ from ktest.catalog import (Catalog, HostError, Invocation, batches, case_seed, i
                            run_command, select, stable_hash)
 from ktest.protocol import KTAP, ready
 from ktest.execution_uart import ExecutionUART
-from ktest.resources import (aliases, crc32c_update, disk_arguments, prepare_disks,
+from ktest.resources import (aliases, crc32c_update, prepare_disks,
                              resource_names, validate_resources)
 from ktest.runner import DeadlineExpired, VM, VMExited, execute_batch, finish_vm
 
@@ -70,7 +70,7 @@ def options(**overrides):
                            arch="riscv64", cpus=2, mode="debug", panic="unwind", disks={}, read_only=[],
                            uart_payload=None, uart_expect=None, scratch_bytes=4096, logical_block_size=512,
                            ap_freeze=False, gdb=None,
-                           iommu_platform=False, modern=False,
+                           iommu_platform=False, modern=False, root=None, extra_root=None,
                            startup_timeout=10, setup_timeout=5, case_timeout=10, cleanup_timeout=5)
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -517,12 +517,10 @@ class ProtocolTests(unittest.TestCase):
 class ResourceAndUARTTests(unittest.TestCase):
     """资源隔离和真实 socket 的 raw 段检查。"""
 
-    def test_missing_root_is_error_and_no_disks_means_no_root_argument(self):
-        """没有选中磁盘时不能隐式附根盘。"""
+    def test_missing_declared_root_is_error(self):
+        """声明根盘资源后必须提供真实输入镜像。"""
         with self.assertRaises(HostError):
             validate_resources({"root"}, options())
-        self.assertEqual(disk_arguments([], options(), set()), [])
-        self.assertEqual(resource_names(suite_record(), [Invocation(case_record(), 0, 1, 0)]), set())
 
     def test_work_copy_does_not_modify_source_and_rejects_alias(self):
         """硬链接和符号链接不能成为可写工作盘。"""

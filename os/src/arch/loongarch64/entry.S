@@ -8,6 +8,10 @@ __primary_entry:
     csrxchg $zero, $t0, 0
     # KS0 的零值表示尚未安装本核 CpuLocal。
     csrwr $zero, 0x30
+    # BSP 的固件入口也可能是物理 PC；先切到高别名，再开启分页。
+    la.abs $t0, .Lprimary_high
+    jirl $zero, $t0, 0
+.Lprimary_high:
     la.abs $t0, __direct_base
     ori $t0, $t0, 0x11
     csrwr $t0, 0x181

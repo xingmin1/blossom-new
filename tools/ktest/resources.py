@@ -101,26 +101,3 @@ def prepare_disks(names, args, directory):
         disks.append((name, target))
     return disks
 
-
-def disk_arguments(disks, args, names):
-    """RV 使用实际 MMIO 槽，LA 使用稳定 PCI BDF；没有盘就不附 root。"""
-    command = []
-    for index, (name, path) in enumerate(disks):
-        drive = f"if=none,id=disk{index},format=raw,file={str(path).replace(',', ',,')}"
-        if name in args.read_only:
-            drive += ",readonly=on"
-        command += ["-drive", drive]
-        if args.arch == "riscv64":
-            device = f"virtio-blk-device,drive=disk{index},bus=virtio-mmio-bus.{index}"
-        else:
-            device = f"virtio-blk-pci,drive=disk{index},addr=0x{5 + 4 * index:x}"
-        device += f",logical_block_size={args.logical_block_size},physical_block_size={args.logical_block_size}"
-        if "virtio-access-platform" in names:
-            device += ",iommu_platform=on"
-            if args.arch == "loongarch64":
-                device += ",disable-legacy=on"
-        command += ["-device", device]
-    root = next((index for index, (name, _) in enumerate(disks) if name == "root"), None)
-    if root is not None:
-        command += ["-append", f"root=/dev/vd{chr(ord('a') + root)}"]
-    return command

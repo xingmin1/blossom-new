@@ -8,6 +8,7 @@ mod inode;
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
 mod path;
+pub(crate) mod system;
 
 pub use dentry::{DentryCache, DentryRef};
 pub use ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind};
@@ -26,6 +27,7 @@ pub enum FsError {
     Checksum,
     Unsupported,
     NotFound,
+    MissingRoot,
     NotDirectory,
     InvalidName,
     InvalidOperation,
@@ -41,7 +43,7 @@ pub enum FsError {
 
 impl FsError {
     /// 将页填充的实际格式或 I/O 错误写入共享 folio，等待者读取同一原因。
-    /// 名字查找、文件能力和 inode 加载取消不属于页填充结果。
+    /// 根选择、名字查找、文件能力和 inode 加载取消不属于页填充结果。
     pub(crate) fn folio_error(self) -> BlockError {
         match self {
             Self::NoMemory => BlockError::NoMemory,
@@ -54,6 +56,7 @@ impl FsError {
             | Self::ReadOnly
             | Self::IsDirectory
             | Self::NotFound
+            | Self::MissingRoot
             | Self::NotDirectory
             | Self::InvalidName
             | Self::InvalidOperation

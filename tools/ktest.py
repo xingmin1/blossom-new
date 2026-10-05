@@ -58,7 +58,7 @@ def shard_value(value):
 
 
 def arguments(argv=None):
-    """两个子命令共享构建、资源和选择接口，不维护第二 Cargo 规则。"""
+    """两个子命令共享构建、资源与明确设备选择，不维护第二套规则。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("list", "run"))
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
@@ -81,6 +81,8 @@ def arguments(argv=None):
     parser.add_argument("--jobs", type=natural, default=1)
     parser.add_argument("--isolation", choices=("suite", "case"), default="suite")
     parser.add_argument("--disk", action="append", default=[], metavar="root|extra|scratch=PATH")
+    parser.add_argument("--root", help="explicit root block name, such as /dev/vda")
+    parser.add_argument("--extra-root", help="explicit extra filesystem block name")
     parser.add_argument("--read-only", action="append", default=[], choices=("root", "extra", "scratch"))
     parser.add_argument("--scratch-bytes", type=natural, default=64 * 1024 * 1024)
     parser.add_argument("--logical-block-size", type=int, choices=(512, 1024, 2048, 4096), default=512)
