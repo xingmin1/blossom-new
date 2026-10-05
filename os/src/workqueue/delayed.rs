@@ -374,7 +374,7 @@ fn transfer(timer: Pin<&Timer>) {
     let raw = timer.context() as *const DelayedWork;
     // SAFETY: 每次新增 timer queued 先取得真实 D raw 强票，take_due 原样转成这次运行上下文票。
     let owner = unsafe { Pin::new_unchecked(&*raw) };
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     testing::pause(raw, testing::PausePoint::BeforeTransfer);
     let mut releases = Releases::new();
     let state = STATE_LOCK.lock();
@@ -407,7 +407,7 @@ fn transfer(timer: Pin<&Timer>) {
     drop(releases);
     if transferred {
         owner.work().notify();
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         testing::pause(raw, testing::PausePoint::AfterTransfer);
     }
     // SAFETY: 这是本 callback 最后一次 D 访问，归还由新增 timer queued 转入的唯一运行上下文票。
@@ -416,7 +416,7 @@ fn transfer(timer: Pin<&Timer>) {
 }
 
 /// 仅观察真实生产状态并在真实移交的锁外窗口提供有限一次握手。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) mod testing {
     use super::*;
     use core::hint::spin_loop;

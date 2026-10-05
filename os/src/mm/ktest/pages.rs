@@ -238,36 +238,39 @@ mod lock_state {
         fixture: &mut FixedPages,
         enabled: bool,
     ) -> TestResult {
-        fixture.run(move |_| {
-            use crate::{
-                arch,
-                sync::{IrqSaveGuard, PreemptGuard, SpinLock},
-            };
-            let _preempt = PreemptGuard::new();
-            let lock = SpinLock::new(0usize);
-            assert!(arch::irq_enabled());
-            let disabled = if enabled {
-                None
-            } else {
-                Some(IrqSaveGuard::new())
-            };
-            let guard = lock.try_lock().unwrap();
-            assert!(!arch::irq_enabled());
-            drop(guard);
-            assert_eq!(arch::irq_enabled(), enabled);
-            let saved = arch::irq_save();
-            // SAFETY: saved 来自当前核，私有锁无 IRQ/异核用户，短 preempt guard 保同核。
-            unsafe { arch::irq_restore(saved) };
-            let owner = lock.lock();
-            // SAFETY: 私有锁仅本 Task 尝试非阻塞取得，短不可抢占段不睡眠，退出 owner 前重新关 IRQ。
-            unsafe { arch::irq_restore(saved) };
-            assert!(lock.try_lock().is_none());
-            assert_eq!(arch::irq_enabled(), enabled);
-            arch::irq_save();
-            drop(owner);
-            assert_eq!(arch::irq_enabled(), enabled);
-            drop(disabled);
-            assert!(arch::irq_enabled());
-        })
+        fixture.run(move |_| check_try_lock_restore(enabled))
     }
+}
+
+/// 在当前真实 CPU 复用原锁断言；短不可抢占段保住私有锁的 IRQ 状态来源。
+pub(super) fn check_try_lock_restore(enabled: bool) {
+    use crate::{
+        arch,
+        sync::{IrqSaveGuard, PreemptGuard, SpinLock},
+    };
+    let _preempt = PreemptGuard::new();
+    let lock = SpinLock::new(0usize);
+    assert!(arch::irq_enabled());
+    let disabled = if enabled {
+        None
+    } else {
+        Some(IrqSaveGuard::new())
+    };
+    let guard = lock.try_lock().unwrap();
+    assert!(!arch::irq_enabled());
+    drop(guard);
+    assert_eq!(arch::irq_enabled(), enabled);
+    let saved = arch::irq_save();
+    // SAFETY: saved 来自当前核，私有锁无 IRQ/异核用户，短 preempt guard 保同核。
+    unsafe { arch::irq_restore(saved) };
+    let owner = lock.lock();
+    // SAFETY: 私有锁仅本 Task 尝试非阻塞取得，短不可抢占段不睡眠，退出 owner 前重新关 IRQ。
+    unsafe { arch::irq_restore(saved) };
+    assert!(lock.try_lock().is_none());
+    assert_eq!(arch::irq_enabled(), enabled);
+    arch::irq_save();
+    drop(owner);
+    assert_eq!(arch::irq_enabled(), enabled);
+    drop(disabled);
+    assert!(arch::irq_enabled());
 }

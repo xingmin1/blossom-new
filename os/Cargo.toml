@@ -13,16 +13,6 @@ unwinding = { path = "../dependency/unwinding", optional = true, default-feature
 
 [features]
 ktest = ["dep:ktest", "dep:unwinding", "virtio-drivers/ktest"]
-boot-tests = []
-execution-tests = []
-storage-tests = []
-execution-irq-fault = ["execution-tests"]
-execution-preempt-fault = ["execution-tests"]
-execution-printer-oom-fault = ["execution-tests"]
-execution-timekeeper-fault = ["execution-tests"]
-memory-tests = ["boot-tests"]
-fault-test = ["boot-tests"]
-refill-test = ["fault-test"]
 
 [profile.dev]
 opt-level = 1

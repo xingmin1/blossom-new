@@ -1,10 +1,10 @@
 //! 单 Normal zone 的连续页块自由链，元数据仅在 zone 锁域内改变。
 
-#[cfg(any(feature = "memory-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 use core::mem::MaybeUninit;
 use spin::Once;
 
-#[cfg(any(feature = "memory-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 use crate::mm::page::PageDesc;
 use crate::mm::page::{BuddyLink, PageKind, PageMap};
 use crate::sync::SpinLock;
@@ -185,7 +185,7 @@ static ZONE: Once<SpinLock<Zone<'static>>> = Once::new();
 
 // 独立测试元数据仅在借用期间由此锁独占，初始化不构造或复制巨型栈数组。
 // 该 arena 不发布到全局 PageMap、不提供物理页 backing，也不参加生产页分配。
-#[cfg(any(feature = "memory-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 static TEST_DESCRIPTORS: SpinLock<[MaybeUninit<PageDesc>; 1 << MAX_ORDER]> =
     SpinLock::new([const { MaybeUninit::uninit() }; 1 << MAX_ORDER]);
 
@@ -273,182 +273,6 @@ pub(crate) unsafe fn release(head_pfn: usize, order: usize) {
 /// 在 zone 锁内取得 buddy 自由页快照，不包括其他缓存保留页。
 pub(crate) fn free_pages() -> usize {
     ZONE.get().expect("buddy is not initialized").lock().free
-}
-
-/// 使用生产 Zone 方法验证全部阶、非顺序归还、碎片失败及受控池真实穷尽。
-#[cfg(feature = "memory-tests")]
-pub(crate) fn test_orders_and_fragmentation() -> bool {
-    test_orders() && test_fragmentation()
-}
-
-/// 消耗独立受控池唯一块句柄，避免测试复制裸 PFN 的释放责任。
-#[cfg(feature = "memory-tests")]
-fn return_block(zone: &mut Zone<'_>, block: Block) {
-    // SAFETY: 测试只传入该 zone 刚分配且未访问物理内容的唯一 Block，消耗后不再归还。
-    unsafe { zone.release(block.head, block.order) };
-}
-
-/// 独占静态 1024 槽 arena，覆盖 order0–10、混合阶不重叠与最大块恢复；zone 借用结束前不复用槽。
-#[cfg(feature = "memory-tests")]
-fn test_orders() -> bool {
-    use crate::mm::bootmem::PageRange;
-
-    let mut storage = TEST_DESCRIPTORS.lock();
-    for slot in storage.iter_mut() {
-        slot.write(PageDesc::new(PageKind::Available));
-    }
-    // SAFETY: 静态 arena 在 storage guard 存活期间独占，1024 槽已逐项写入有效值；
-    // 切片仅覆盖本数组，全部 map/zone 借用先于 guard 销毁；测试从不设置 slab 拥有状态。
-    let descriptors =
-        unsafe { core::slice::from_raw_parts(storage.as_ptr().cast(), storage.len()) };
-    let sections = [Some(descriptors)];
-    let ranges = [PageRange {
-        start: 0,
-        end: 1 << MAX_ORDER,
-    }];
-    let memory = PageMap::test_map(&sections, &ranges);
-    // SAFETY: 此局部 PageMap 仅交给一把测试 zone 锁，描述符与全局 PageMap 不重叠。
-    let lock = SpinLock::new(unsafe { Zone::empty(&memory) });
-    let mut zone = lock.lock();
-    zone.initialize();
-    if zone.allocate(MAX_ORDER + 1).is_some() || zone.free != 1 << MAX_ORDER {
-        return false;
-    }
-    let Some(maximum) = zone.allocate(MAX_ORDER) else {
-        return false;
-    };
-    if maximum.head_pfn() != 0 || maximum.order() != MAX_ORDER || zone.free != 0 {
-        return false;
-    }
-    return_block(&mut zone, maximum);
-
-    let mut blocks: [Option<Block>; MAX_ORDER + 1] = core::array::from_fn(|_| None);
-    for (index, slot) in blocks.iter_mut().enumerate() {
-        let order = if index == MAX_ORDER { 0 } else { index };
-        let before = zone.free;
-        let Some(block) = zone.allocate(order) else {
-            return false;
-        };
-        if block.order() != order
-            || block.head_pfn() & ((1 << order) - 1) != 0
-            || storage.len() < block.head_pfn() + (1 << order)
-            || zone.free != before - (1 << order)
-        {
-            return false;
-        }
-        *slot = Some(block);
-    }
-    for (index, first) in blocks.iter().enumerate() {
-        let first = first.as_ref().unwrap();
-        for second in blocks[index + 1..].iter().flatten() {
-            if first.head + (1 << first.order) <= second.head
-                || second.head + (1 << second.order) <= first.head
-            {
-                continue;
-            }
-            return false;
-        }
-    }
-    if zone.free != 0 || zone.allocate(0).is_some() {
-        return false;
-    }
-    for index in [9, 0, 7, 2, 10, 4, 1, 8, 3, 6, 5] {
-        return_block(&mut zone, blocks[index].take().unwrap());
-    }
-    if zone.free != 1 << MAX_ORDER {
-        return false;
-    }
-    let Some(restored) = zone.allocate(MAX_ORDER) else {
-        return false;
-    };
-    if restored.head != 0 || restored.order != MAX_ORDER || zone.free != 0 {
-        return false;
-    }
-    return_block(&mut zone, restored);
-    zone.free == 1 << MAX_ORDER
-}
-
-/// 以保留槽与空洞切断连续块，在总量足够时失败并逐页耗尽、归还恢复。
-#[cfg(feature = "memory-tests")]
-fn test_fragmentation() -> bool {
-    use crate::mm::bootmem::PageRange;
-
-    let descriptors: [PageDesc; 16] = core::array::from_fn(|pfn| {
-        PageDesc::new(match pfn {
-            3 | 11 => PageKind::Reserved,
-            7 | 15 => PageKind::Absent,
-            _ => PageKind::Available,
-        })
-    });
-    // 中间整 section 无描述符；高 section 使用另一独立数组，伙伴仍按绝对 PFN 定位。
-    let high = [const { PageDesc::new(PageKind::Available) }; 2];
-    let sections = [Some(descriptors.as_slice()), None, Some(high.as_slice())];
-    let ranges = [
-        PageRange { start: 0, end: 3 },
-        PageRange { start: 4, end: 7 },
-        PageRange { start: 8, end: 11 },
-        PageRange { start: 12, end: 15 },
-        PageRange {
-            start: 65536,
-            end: 65538,
-        },
-    ];
-    let memory = PageMap::test_map(&sections, &ranges);
-    // SAFETY: 两个数组均为本测试独立元数据，仅此 zone 访问其 buddy 字段。
-    let lock = SpinLock::new(unsafe { Zone::empty(&memory) });
-    let mut zone = lock.lock();
-    zone.initialize();
-    if zone.free != 14 {
-        return false;
-    }
-    if zone.allocate(3).is_some() || zone.free != 14 {
-        return false;
-    }
-    let mut blocks: [Option<Block>; 14] = core::array::from_fn(|_| None);
-    for index in 0..blocks.len() {
-        let Some(block) = zone.allocate(0) else {
-            return false;
-        };
-        if !ranges
-            .iter()
-            .any(|range| range.start <= block.head && block.head < range.end)
-            || blocks[..index]
-                .iter()
-                .flatten()
-                .any(|previous| previous.head == block.head)
-        {
-            return false;
-        }
-        blocks[index] = Some(block);
-    }
-    if zone.free != 0 || zone.allocate(0).is_some() {
-        return false;
-    }
-    // 互质步长覆盖所有句柄，归还顺序与申请顺序不同。
-    for step in 0..blocks.len() {
-        let index = (step * 5) % blocks.len();
-        return_block(&mut zone, blocks[index].take().unwrap());
-    }
-    if zone.free != 14 {
-        return false;
-    }
-    if zone.allocate(2).is_some() || zone.free != 14 {
-        return false;
-    }
-    let mut pairs: [Option<Block>; 5] = core::array::from_fn(|_| None);
-    for slot in &mut pairs {
-        let Some(block) = zone.allocate(1) else {
-            return false;
-        };
-        *slot = Some(block);
-    }
-    if zone.allocate(1).is_some() || zone.free != 4 {
-        return false;
-    }
-    for slot in &mut pairs {
-        return_block(&mut zone, slot.take().unwrap());
-    }
-    zone.free == 14
 }
 
 /// 独立受控 zone 的唯一句柄表，析构在原 zone guard 下归还尚存的所有块。

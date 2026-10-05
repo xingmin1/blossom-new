@@ -1,11 +1,13 @@
 """宿主正式回归；运行方式为 python3 -m unittest discover -s tools/ktest。"""
 
 import copy
+import errno
 import importlib.util
 import hashlib
 import io
 import json
 from pathlib import Path
+import select as select_io
 import socket
 import struct
 import subprocess
@@ -547,6 +549,113 @@ class ResourceAndUARTTests(unittest.TestCase):
                     prepare_disks({"root"}, args, alias_dir)
                 self.assertEqual(source.read_bytes(), b"original disk")
 
+    def test_vm_disks_live_until_process_wait_and_cleanup_partial_construction(self):
+        """真实进程退出前保盘，隔离并行实例并清掉半复制，保留输入及原文日志。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source.raw"
+            source.write_bytes(b"original disk")
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            executable = base / "disk-user"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json,signal,subprocess,sys,time\n"
+                "from pathlib import Path\n"
+                "child_mode=sys.argv[1:2]==['--child']\n"
+                "paths=[Path(p) for p in sys.argv[2:]] if child_mode else "
+                "[Path(a.split('file=',1)[1].split(',readonly=',1)[0]) "
+                "for a in sys.argv[1:] if a.startswith('if=none,')]\n"
+                "report=paths[0].parent.parent\n"
+                "handles=[p.open('r+b') for p in paths]\n"
+                "child=None if child_mode else subprocess.Popen("
+                "[sys.executable,__file__,'--child',*[str(p) for p in paths]])\n"
+                "def stop(*unused):\n"
+                "    if child is not None: child.wait(timeout=1)\n"
+                "    (report/('child-stopped' if child_mode else 'stopped')).write_text("
+                "json.dumps([p.exists() for p in paths]))\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM,stop)\n"
+                "if child_mode:\n"
+                "    (report/'child-ready').write_text('ready')\n"
+                "else:\n"
+                "    while not (report/'child-ready').exists(): time.sleep(0.001)\n"
+                "    print('working disks opened',flush=True)\n"
+                "    (report/'ready').write_text('ready')\n"
+                "while True: time.sleep(1)\n", encoding="utf-8")
+            executable.chmod(0o700)
+            args = options(qemu=str(executable), memory="128M", disks={"root": source, "extra": source})
+            vms = []
+            working_disks = []
+            try:
+                for index in range(2):
+                    directory = base / str(index)
+                    directory.mkdir()
+                    (directory / "uart-segment.raw").write_bytes(b"raw UART evidence")
+                    (directory / "root.raw").write_bytes(b"unowned report evidence")
+                    vm = VM(args, Path("kernel.elf"), directory, {"root", "extra", "scratch"})
+                    vms.append(vm)
+                    deadline = time.monotonic() + 5
+                    while not (directory / "ready").exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue((directory / "ready").exists())
+                    self.assertIsNone(vm.process.poll())
+                    command = json.loads((directory / "command.json").read_text())
+                    paths = [Path(a.split("file=", 1)[1]) for a in command if a.startswith("if=none,")]
+                    working_disks.append(paths)
+                    for path in paths:
+                        self.assertTrue(path.is_file())
+                    vm.raw.write(b"UART original log\n")
+                self.assertTrue(set(working_disks[0]).isdisjoint(working_disks[1]))
+                working_disks[0][0].write_bytes(b"guest mutation")
+                for index, vm in enumerate(vms):
+                    vm.close()
+                    self.assertEqual(vm.process.returncode, 0)
+                    for path in working_disks[index]:
+                        self.assertFalse(path.exists())
+                    self.assertEqual(json.loads((vm.directory / "stopped").read_text()), [True] * 3)
+                    self.assertEqual(json.loads((vm.directory / "child-stopped").read_text()), [True] * 3)
+                    self.assertEqual((vm.directory / "uart.log").read_bytes(), b"UART original log\n")
+                    self.assertEqual((vm.directory / "qemu.log").read_bytes(), b"working disks opened\n")
+                    self.assertTrue((vm.directory / "command.json").is_file())
+                    self.assertEqual((vm.directory / "uart-segment.raw").read_bytes(), b"raw UART evidence")
+                    self.assertEqual((vm.directory / "root.raw").read_bytes(), b"unowned report evidence")
+                    if index == 0:
+                        for path in working_disks[1]:
+                            self.assertTrue(path.is_file())
+                        self.assertIsNone(vms[1].process.poll())
+            finally:
+                for vm in vms:
+                    vm.close()
+            partial = []
+            no_space = OSError(errno.ENOSPC, "No space left on device")
+
+            def fail_copy(source_file, target_file, length):
+                """已实际写出半盘时注入原始宿主 ENOSPC。"""
+                target_file.write(source_file.read(3))
+                partial.append(Path(target_file.name))
+                raise no_space
+
+            directory = base / "partial"
+            directory.mkdir()
+            (directory / "uart-segment.raw").write_bytes(b"keep")
+            with patch("ktest.resources.shutil.copyfileobj", side_effect=fail_copy):
+                with self.assertRaises(OSError) as caught:
+                    VM(args, Path("kernel.elf"), directory, {"root"})
+            self.assertIs(caught.exception, no_space)
+            self.assertFalse(partial[0].parent.exists())
+            self.assertTrue((directory / "uart.log").is_file())
+            self.assertTrue((directory / "qemu.log").is_file())
+            self.assertEqual((directory / "uart-segment.raw").read_bytes(), b"keep")
+            directory = base / "launch-failure"
+            directory.mkdir()
+            args.qemu = str(base / "missing-executable")
+            with self.assertRaises(FileNotFoundError):
+                VM(args, Path("kernel.elf"), directory, {"root"})
+            command = json.loads((directory / "command.json").read_text())
+            working = Path(next(a.split("file=", 1)[1] for a in command if a.startswith("if=none,")))
+            self.assertFalse(working.parent.exists())
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_hash)
+
     def test_crc32c_castagnoli_vector(self):
         """标准向量能区分 Castagnoli 与 IEEE crc32。"""
         self.assertEqual(crc32c_update(0xFFFFFFFF, b"123456789") ^ 0xFFFFFFFF, 0xe3069283)
@@ -849,6 +958,64 @@ class ResourceAndUARTTests(unittest.TestCase):
                 finally:
                     host.close()
                     guest.close()
+
+    def test_uart_exit_does_not_skip_bytes_after_readiness_check(self):
+        """真实退出发生在空就绪检查后，普通尾文仍落盘，迟到及半条控制仍拒绝。"""
+        for payload, rejected in ((b"final diagnostic\n", False),
+                                  (b"# KTEST complete\n", True), (b"  ok 1", True)):
+            with self.subTest(payload=payload):
+                row = case_record()
+                parser = parser_for([row])
+                for line in case_lines(row):
+                    parser.feed(line)
+                parser.feed("ok 1 os::tests0")
+                parser.feed("# KTEST complete")
+                host, guest = socket.socketpair()
+                script = ("import socket,sys\n"
+                          "uart=socket.socket(fileno=int(sys.argv[1]))\n"
+                          "sys.stdin.buffer.read(1)\n"
+                          "uart.sendall(bytes.fromhex(sys.argv[2]))\n"
+                          "uart.close()\n")
+                process = subprocess.Popen(
+                    [sys.executable, "-c", script, str(guest.fileno()), payload.hex()],
+                    stdin=subprocess.PIPE, pass_fds=(guest.fileno(),))
+                guest.close()
+                original_select = select_io.select
+                crossed = False
+
+                def exit_after_readiness(readers, writers, errors, timeout):
+                    """先取真实空就绪结果，再放子进程写尾文并等待其真实退出。"""
+                    nonlocal crossed
+                    if not crossed:
+                        crossed = True
+                        result = original_select(readers, writers, errors, 0)
+                        self.assertEqual(result, ([], [], []))
+                        process.stdin.write(b"G")
+                        process.stdin.flush()
+                        self.assertEqual(process.wait(timeout=2), 0)
+                        return result
+                    return original_select(readers, writers, errors, timeout)
+
+                try:
+                    vm = vm_fixture()
+                    vm.serial = host
+                    host.setblocking(False)
+                    vm.buffer = bytearray()
+                    vm.raw = io.BytesIO()
+                    vm.process = process
+                    with patch("ktest.runner.select.select", side_effect=exit_after_readiness):
+                        if rejected:
+                            with self.assertRaises(HostError):
+                                finish_vm(vm, time.monotonic() + 2, parser)
+                        else:
+                            finish_vm(vm, time.monotonic() + 2, parser)
+                            self.assertEqual(vm.raw.getvalue(), payload)
+                finally:
+                    host.close()
+                    process.stdin.close()
+                    if process.poll() is None:
+                        process.terminate()
+                    process.wait(timeout=2)
 
 
 

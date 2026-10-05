@@ -4,7 +4,7 @@ mod queue;
 mod sleep;
 mod wheel;
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) use sleep::test_sleep_until;
 pub use sleep::{after, periodic_deadline, sleep, sleep_until};
 
@@ -314,7 +314,7 @@ struct BaseState {
     precise: queue::Queue,
     wheel: wheel::Wheel,
     service_pending: bool,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     stats: testing::TimerStats,
 }
 
@@ -328,7 +328,7 @@ impl BaseState {
             precise: queue::Queue::new(),
             wheel: wheel::Wheel::new(),
             service_pending: false,
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             stats: testing::TimerStats::new(),
         }
     }
@@ -377,7 +377,7 @@ pub(crate) struct TimerBase {
     state: SpinLock<BaseState>,
     service: WaitQueue,
     finished: WaitQueue,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     service_task: SpinLock<Option<Arc<crate::task::Task>>>,
 }
 
@@ -388,7 +388,7 @@ impl TimerBase {
             state: SpinLock::new(BaseState::new()),
             service: WaitQueue::new(),
             finished: WaitQueue::new(),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             service_task: SpinLock::new(None),
         }
     }
@@ -473,24 +473,24 @@ fn take_due(base: &TimerBase, kind: TimerKind) -> Option<(*const Timer, bool)> {
 /// 完成时锁内清 running 是最后一次借用节点访问；锁外仅唤醒永久 finished 并释放运行强引用。
 /// base、节点归属和 kind 必须匹配；owned 只表示此次转入的运行引用，不包含重排的 queued 引用。
 fn run_callback(base: &'static TimerBase, timer: *const Timer, owned: bool, kind: TimerKind) {
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     testing::pause(timer, testing::PausePoint::Dequeued);
     // SAFETY: running 独占执行权和 transferred Arc 或 borrowed 停止责任保活，回调仅共享固定节点。
     unsafe {
         let pinned = Pin::new_unchecked(&*timer);
         ((*timer).callback)(pinned);
     }
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     testing::pause(timer, testing::PausePoint::Tail);
     let state = base.state.lock();
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     let mut state = state;
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     match kind {
         TimerKind::Precise => state.stats.hard_callbacks += 1,
         TimerKind::Coarse => state.stats.bh_callbacks += 1,
     }
-    #[cfg(not(any(feature = "execution-tests", feature = "ktest")))]
+    #[cfg(not(feature = "ktest"))]
     let _ = kind;
     // SAFETY: 仍持 running 执行权及 base 锁；清 running 是 runner 对 borrowed 节点最后一次访问。
     unsafe { (*(*timer).node.get()).running = false };
@@ -536,7 +536,7 @@ pub fn initialize_services() -> Result<(), AllocError> {
 /// 粗回调在不可睡底半部中按预算执行；先退出底半部并重编程，再 yield 续批。
 fn service(cpu: usize) -> i32 {
     let base = base(cpu);
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     {
         let task = crate::task::current_task();
         let mut observation = base.service_task.lock();
@@ -567,7 +567,7 @@ fn service(cpu: usize) -> i32 {
             let mut state = base.state.lock();
             let more = state.coarse_due(time::now());
             state.service_pending = more;
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             if 0 < callbacks {
                 state.stats.bh_batches += 1;
                 state.stats.max_bh_callbacks = state.stats.max_bh_callbacks.max(callbacks);
@@ -587,7 +587,7 @@ fn service(cpu: usize) -> i32 {
 }
 
 /// 验收仅观察真实队列、执行计数与固定服务任务，不提供另一套后端。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) mod testing {
     use super::*;
     use core::hint::spin_loop;

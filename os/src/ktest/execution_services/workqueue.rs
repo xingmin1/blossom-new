@@ -1718,6 +1718,24 @@ impl ::ktest::Fixture for ServiceFixture {
     }
 }
 
+impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
+    /// 普通工作suite沿用同一具体拥有；两个不可恢复fatal仍使用Unit资源。
+    fn set_up(
+        context: &mut ::ktest::TestContext<'_>,
+        _: &super::SuiteBaseline,
+    ) -> Result<Self, ::ktest::TestError> {
+        <Self as ::ktest::Fixture<()>>::set_up(context, &())
+    }
+    /// suite基线不产生工作票，原压力、gate和节点责任只停止一次。
+    fn quiesce(&mut self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
+        <Self as ::ktest::Fixture<()>>::quiesce(self, context)
+    }
+    /// case原join及强票清理不变，最后由suite资源检查跨例账务。
+    fn tear_down(self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
+        <Self as ::ktest::Fixture<()>>::tear_down(self, context)
+    }
+}
+
 impl Scenario {
     /// 动作已退栈后先解除各CPU真实停点，再一次关闭业务生产条件并放行原gate。
     fn stop_sources(&self) {
@@ -1805,7 +1823,7 @@ pub(super) fn exhaust_fault() -> (usize, usize, usize) {
     (pages, objects, nulls)
 }
 
-#[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "work"), timeout_ms = 45000)]
+#[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "work"), timeout_ms = 45000)]
 pub(crate) mod cases {
     use super::*;
     /// pending前后重复提交、真实业务16次合并与同Work下一轮保持唯一Worker。

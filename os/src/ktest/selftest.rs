@@ -520,17 +520,25 @@ mod setup_failure {
 
 struct CleanupError {
     in_quiesce: bool,
+    panics: bool,
 }
 impl Fixture for CleanupError {
-    /// 无异步资源的具体对象用参数选择哪一个真实清理函数返回错误。
+    /// 无异步资源的具体对象按参数选择真实清理阶段和失败形式。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         Ok(Self {
-            in_quiesce: context.case.parameter == Some("quiesce"),
+            in_quiesce: matches!(context.case.parameter, Some("quiesce" | "quiesce_panic")),
+            panics: matches!(
+                context.case.parameter,
+                Some("quiesce_panic" | "tear_down_panic")
+            ),
         })
     }
     /// 清理失败由框架 terminate 结束 VM，不在用例中伪造 fatal。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         if self.in_quiesce {
+            if self.panics {
+                panic!("vertical cleanup panic");
+            }
             Err(TestError("vertical quiesce error"))
         } else {
             Ok(())
@@ -538,6 +546,9 @@ impl Fixture for CleanupError {
     }
     /// 消费函数同样保留主体错误并终止，不把清理错误压成普通 Pass。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
+        if self.panics {
+            panic!("vertical cleanup panic");
+        }
         Err(TestError("vertical tear_down error"))
     }
 }
@@ -564,6 +575,15 @@ mod cleanup_failure {
             crate::sched::yield_now();
         }
         Err(TestError("vertical primary before child cleanup error"))
+    }
+
+    /// 主体缺失 panic，不能由清理阶段的相同预期消息补成成功。
+    #[test]
+    #[case("quiesce_panic", ())]
+    #[case("tear_down_panic", ())]
+    #[should_panic(expected = "vertical cleanup panic")]
+    fn cleanup_panic_is_not_body_panic(context: &mut TestContext<'_>, _: &mut CleanupError, _: ()) {
+        context.diagnostic(format_args!("vertical body returned before cleanup panic"));
     }
 }
 
@@ -609,6 +629,21 @@ mod fatal {
     )]
     fn abi() {
         panic_across_abi();
+    }
+
+    /// 同核同步动作也必须守真实不可展开边界，不能借原Task捕获槽返回主体。
+    #[test]
+    #[ktest(
+        expected_fatal = "panic",
+        fatal_message = "vertical local synchronous call panic"
+    )]
+    fn local_sync_call() {
+        /// 回调不访问参数或调度，唯一故障是原同步分派中的真实panic。
+        unsafe fn fail(_: *mut ()) {
+            panic!("vertical local synchronous call panic");
+        }
+        // SAFETY: 当前在线CPU有效；回调不使用空参数、不睡眠或递归调用，未持callback锁。
+        unsafe { crate::cpu::call(crate::cpu::current().id, fail, core::ptr::null_mut()) };
     }
 
     /// 只在显式 abort 策略 VM 选择；unwind 策略中这是普通被捕获的失败。

@@ -56,7 +56,9 @@ fn with_task<T>(body: impl FnOnce(Option<&crate::task::Task>) -> T) -> T {
 /// 硬 IRQ、BH/IPI/CSD 和无登记 worker 不得捕获被打断的 Task 边界。
 fn boundary_allowed() -> bool {
     let local = crate::cpu::current();
-    local.hardirq_depth.load(Ordering::Relaxed) == 0 && local.bh_depth.load(Ordering::Relaxed) == 0
+    local.hardirq_depth.load(Ordering::Relaxed) == 0
+        && local.bh_depth.load(Ordering::Relaxed) == 0
+        && !local.ktest_callback_active.load(Ordering::Relaxed)
 }
 /// 低层 panic 仅读取原槽，不取调度锁、不分配、不遍历。
 pub(crate) fn current_boundary() -> *mut Boundary {

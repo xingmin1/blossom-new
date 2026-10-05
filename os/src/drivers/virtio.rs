@@ -117,7 +117,7 @@ pub struct VirtioDevice {
 }
 
 /// 仅验收镜像读取仍由本实例拥有的 transport 与 ring，不更改设备状态。
-#[cfg(any(feature = "storage-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TestPrepareSnapshot {
     pub identity: VirtioIdentity,
@@ -264,7 +264,7 @@ impl VirtioDevice {
     }
 
     /// 在真实准备失败点、实例销毁前读取硬件 status 与本实例原 ring 的 avail.idx。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_prepare_snapshot(&self) -> TestPrepareSnapshot {
         let depth = self.info().queue_depth;
         let ring = self.ring.region();

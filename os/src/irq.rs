@@ -94,7 +94,7 @@ static SOURCES: [SpinLock<Descriptor>; MAX_INTERRUPT_SOURCES] =
     [const { SpinLock::new(Descriptor::empty()) }; MAX_INTERRUPT_SOURCES];
 
 /// 只在串行设备准备验收中数真实 action，包括尚未 enable 的登记，不推断全线状态。
-#[cfg(any(feature = "storage-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_action_count(number: IrqNumber) -> usize {
     SOURCES[number.0 as usize]
         .lock()

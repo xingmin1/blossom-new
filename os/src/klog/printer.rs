@@ -58,7 +58,7 @@ fn wait_for_tx() -> bool {
     let _registration = unsafe { console::tx_wait_queue().register(node.as_mut()) };
     if !console::arm_tx_interrupt() {
         waiter.park();
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         testing::after_tx_wait();
         true
     } else {
@@ -68,7 +68,7 @@ fn wait_for_tx() -> bool {
 
 /// 一份完整记录与固定头部留在本任务栈上，UART 只接收尚未接受的真实字节前缀。
 fn run() -> i32 {
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     testing::install_service();
     let mut cursor = Cursor::oldest();
     loop {
@@ -101,7 +101,7 @@ fn run() -> i32 {
         let body = record.text().as_bytes();
         let length = header.len() + body.len() + 1;
         let mut offset = 0;
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         testing::begin_record(record.seq, length, current.lost);
         while offset < length {
             let remaining = if offset < header.len() {
@@ -117,24 +117,24 @@ fn run() -> i32 {
                 "UART accepted an invalid prefix"
             );
             if accepted == 0 {
-                #[cfg(not(any(feature = "execution-tests", feature = "ktest")))]
+                #[cfg(not(feature = "ktest"))]
                 wait_for_tx();
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 if wait_for_tx() {
                     testing::pause_after_partial_write(offset, length);
                 }
             } else {
                 offset += accepted;
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 testing::advance(offset, accepted);
             }
         }
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         testing::finish_record(record.seq);
     }
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub mod testing {
     use alloc::sync::{Arc, Weak};
     use core::pin::pin;

@@ -28,7 +28,7 @@ fn allowed_on(data: &Scheduling, owner: usize) -> bool {
         Placement::Any => true,
         Placement::Cpu(cpu) => cpu == owner,
     };
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     let allowed = allowed && data.next_cpu.is_none_or(|cpu| cpu == owner);
     allowed
 }
@@ -110,7 +110,7 @@ impl Scheduler {
                 // SAFETY: task 仍由 live 强拥有且锁尚未释放；摘离 ready 后只给本 CPU 执行权。
                 let data = unsafe { &mut *(*task).scheduling.get() };
                 data.state = State::Running(owner);
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 {
                     data.next_cpu = None;
                 }
@@ -333,7 +333,7 @@ pub(crate) fn park(id: WaitId) {
     // 池反馈和其中的通知先于最终 IRQ-off/SCHED 段，任何普通 guard 已在调用返回时析构。
     let was_running = worker.as_ref().is_some_and(|worker| worker.sleeping());
     let contexts = prepare_switch(SwitchIntent::Park(id));
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     if contexts.is_none() && was_running {
         worker
             .as_ref()
@@ -413,7 +413,7 @@ pub(crate) fn notify(task: &Task, id: WaitId) -> bool {
 }
 
 /// 在真实 SwitchingOut 放锁后、ctx 保存前通知，并继续同一汇编与 finish 路径。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Waker) {
     assert_switchable();
     let worker = crate::task::current_worker();
@@ -447,11 +447,7 @@ pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Wak
 }
 
 /// 在唯一调度锁内读取真实状态，不向测试导出写权限。
-#[cfg(any(
-    feature = "execution-tests",
-    feature = "storage-tests",
-    feature = "ktest"
-))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_state(task: &Task) -> State {
     let _scheduler = SCHED_LOCK.lock();
     // SAFETY: 调度锁保护 scheduling，调用者借用保持 task 有效，只复制状态值。
@@ -459,14 +455,14 @@ pub(crate) fn test_state(task: &Task) -> State {
 }
 
 /// 在真实调度短锁内仅记录标量，不重取调度状态或直接唤醒服务任务。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_klog() -> u64 {
     let _scheduler = SCHED_LOCK.lock();
     crate::klog!(crate::klog::Level::Debug, "X25 scheduler locked")
 }
 
 /// 遍历实际 ready 链并计算同一 Task 的成员次数。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_ready_occurrences(task: &Task) -> usize {
     let scheduler = SCHED_LOCK.lock();
     let mut member = scheduler.ready_head;
@@ -582,7 +578,7 @@ pub fn run() -> ! {
 
 /// idle 已在队列锁下发表；放锁后最终重检，等待入口保持 IRQ-off 且不携带 guard。
 fn idle_once() {
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     cpu::test_idle_boundary();
     let local = cpu::current();
     let should_wait = {
@@ -592,7 +588,7 @@ fn idle_once() {
             && !local.need_resched.load(Ordering::Relaxed)
     };
     if should_wait {
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         accounting::test_idle_checked();
         accounting::idle_enter();
         // SAFETY: 本核已在锁下发表 idle 且最终重检无工作；IRQ 关闭、没有普通 Task 或锁，
@@ -609,7 +605,7 @@ fn idle_once() {
 }
 
 /// Any 任务只将下一次真实分派指定为在线目标 CPU，pick 后立即恢复 Any 选择。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn test_migrate_to(target: usize) {
     assert_switchable();
     assert!(target < cpu::count(), "migration CPU is out of range");

@@ -6,7 +6,7 @@ use core::alloc::AllocError;
 use core::cell::UnsafeCell;
 use core::pin::Pin;
 use core::ptr;
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Domain, RemovedTicket, Work, STATE_LOCK};
@@ -15,7 +15,7 @@ use crate::task::{self, JoinHandle, PreparedTask};
 use crate::time::Duration;
 use crate::timer;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(super) static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 struct PoolState {
@@ -31,13 +31,13 @@ struct PoolState {
     manager_requested: bool,
     manager_blocked: bool,
     create_failed: bool,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     stats: Counters,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     manager_task: Option<Weak<task::Task>>,
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy)]
 struct Counters {
     created: usize,
@@ -77,7 +77,7 @@ impl WorkerPool {
                 manager_requested: false,
                 manager_blocked: false,
                 create_failed: false,
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 stats: Counters {
                     created: 0,
                     retired: 0,
@@ -87,7 +87,7 @@ impl WorkerPool {
                     running: 0,
                     early_wake: 0,
                 },
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 manager_task: None,
             }),
             manager: WaitQueue::new(),
@@ -106,7 +106,7 @@ struct WorkerState {
     reserved_work: *const Work,
     reservation_open: bool,
     joined: bool,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     task: Option<Weak<task::Task>>,
 }
 
@@ -149,13 +149,13 @@ impl Worker {
                 reserved_work: reservation.map_or(ptr::null(), |(_, work)| work),
                 reservation_open: reservation.is_some(),
                 joined: false,
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 task: None,
             }),
             ready: WaitQueue::new(),
         };
         // 完整 value 先计入，Arc 分配失败由相同 Drop 归还；克隆不经过这里。
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         LIVE_WORKERS.fetch_add(1, Ordering::Relaxed);
         Arc::try_new(value)
     }
@@ -171,7 +171,7 @@ impl Worker {
                     worker.contributing = false;
                     let pool = &mut *pool(self.cpu).state.get();
                     pool.nr_running -= 1;
-                    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                    #[cfg(feature = "ktest")]
                     {
                         pool.stats.sleeping += 1;
                     }
@@ -200,7 +200,7 @@ impl Worker {
             worker.contributing = true;
             let pool = &mut *pool(self.cpu).state.get();
             pool.nr_running += 1;
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             {
                 pool.stats.running += 1;
             }
@@ -208,7 +208,7 @@ impl Worker {
     }
 
     /// 只记录实际 sleeping 后 prepare_switch 未提交的早唤醒路径。
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn early_wake(&self) {
         let _lock = STATE_LOCK.lock();
         // SAFETY: 池测试计数同样受生产状态锁保护。
@@ -245,7 +245,7 @@ impl Worker {
     }
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 impl Drop for Worker {
     /// Arc 的最后强拥有或未发表分配失败才归还 payload，弱观察不影响计数。
     fn drop(&mut self) {
@@ -637,7 +637,7 @@ fn install(worker: Arc<Worker>) {
             );
             (*domain.state.get()).reserved_workers += 1;
         }
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         {
             state.stats.created += 1;
         }
@@ -696,7 +696,7 @@ fn reap_retired(cpu: usize) {
                 if let Some(domain) = &worker.reserved_domain {
                     (*domain.state.get()).reserved_workers -= 1;
                 }
-                #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 {
                     state.stats.retired += 1;
                 }
@@ -757,7 +757,7 @@ unsafe fn need_to_create_worker(state: &PoolState) -> bool {
 
 /// 管理者接受真实需求后保留创建责任；失败在锁外冷却，需求消失或执行者可用才结束重试。
 fn manager(cpu: usize) -> i32 {
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     {
         let observation = Arc::downgrade(&task::current_task());
         let _lock = STATE_LOCK.lock();
@@ -839,7 +839,7 @@ fn manager(cpu: usize) -> i32 {
                         // SAFETY: 只有真实 fallible 创建失败增加此计数并启用救援资格。
                         unsafe {
                             let state = &mut *pool(cpu).state.get();
-                            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+                            #[cfg(feature = "ktest")]
                             {
                                 state.stats.create_failures += 1;
                             }
@@ -899,7 +899,7 @@ unsafe fn claim(worker: &Worker, domain: Option<&Domain>) -> Option<RemovedTicke
         role.contributing = true;
         role.current = raw;
         (*pool(worker.cpu).state.get()).nr_running += 1;
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         if domain.is_some() {
             (*pool(worker.cpu).state.get()).stats.rescued += 1;
         }
@@ -973,7 +973,7 @@ unsafe fn retire(worker: &Worker) -> bool {
 
 /// callback 真实执行在锁外；空闲 worker 登记复查，动态余量正常返回而非泄漏 Task。
 fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     {
         let observation = Arc::downgrade(&task::current_task());
         let _lock = STATE_LOCK.lock();
@@ -991,7 +991,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             unsafe { claim(&worker, domain.as_deref()) }
         };
         if let Some(ticket) = ticket {
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             testing::pause(worker.cpu, testing::PausePoint::Started);
             // SAFETY: running 拥有票保活原 into_raw 的固定 Work 存储。
             let work = unsafe { Pin::new_unchecked(&*ticket.work) };
@@ -1027,7 +1027,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
                 }
             }
             drop(ticket);
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             testing::pause(worker.cpu, testing::PausePoint::Finished);
             continue;
         }
@@ -1048,7 +1048,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
         if stop {
             return 0;
         }
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         if !worker.base && domain.is_none() {
             // 首次 retire=false 已在锁下确认此动态普通 worker 仍有关联票；此处尚未登记 ready。
             testing::pause(worker.cpu, testing::PausePoint::BeforeWait);
@@ -1117,7 +1117,7 @@ pub(super) fn assert_wait_allowed(domain: &Arc<Domain>, work: *const Work) {
     }
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(super) mod testing {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};

@@ -193,10 +193,10 @@ impl SmpFixture {
     }
 }
 
-#[ktest::suite(fixture = SmpFixture, tags("mm", "smp", "pcp"), min_cpus = 2, timeout_ms = 30000)]
+#[ktest::suite(fixture = SmpFixture, tags("mm", "smp", "pcp"), timeout_ms = 30000)]
 mod pages {
     use super::*;
-    /// 每核真实页保 live 去重，邻核最后 Drop 只增加实际释放 CPU 的 PCP。
+    /// 每核真实页保 live 去重，邻核最后 Drop 只增加实际释放 CPU 的 PCP；单核保原 local 路径。
     #[test]
     fn final_drop_cpu(_: &mut TestContext<'_>, f: &mut SmpFixture) -> TestResult {
         for id in 0..cpu::count() {
@@ -220,16 +220,19 @@ mod pages {
                 assert_eq!(pcp::cpu_cached_pages(id), 0);
                 let source = (id + cpu::count() - 1) % cpu::count();
                 for index in 0..8 {
-                    let mut pages = state.pages[source * WORK + index].lock().take().unwrap();
+                    let mut slot = state.pages[source * WORK + index].lock();
+                    let pages = slot.as_mut().unwrap();
                     assert_eq!(
                         pages.phys_addr(),
                         state.identities[source * WORK + index].load(Ordering::Relaxed)
                     );
-                    // SAFETY: owning 槽移交原页且 source 已初始化首 word，全部源访问结束。
+                    // SAFETY: owning 槽保原页到内容检查结束，source 已初始化首 word，全部源访问结束。
                     assert_eq!(
                         unsafe { pages.as_mut_ptr().cast::<usize>().read() },
                         source * 8 + index
                     );
+                    let pages = slot.take();
+                    drop(slot);
                     drop(pages);
                     expected += 1;
                     if high <= expected {
@@ -300,6 +303,7 @@ mod pages {
     }
     /// 远端留真实 batch 缓存并停稳，控制者直接 drain 不依赖 IPI。
     #[test]
+    #[ktest(min_cpus = 2)]
     fn remote_cache_drain(_: &mut TestContext<'_>, f: &mut SmpFixture) -> TestResult {
         for id in 0..cpu::count() {
             f.spawn(id, |state, token| {
@@ -338,6 +342,7 @@ mod pages {
     }
     /// 十六轮真实 AP 分配/释放与直接 drain 同时运行，停点仍核 live 唯一及完整账务。
     #[test]
+    #[ktest(min_cpus = 2)]
     fn parallel_drain_stream(_: &mut TestContext<'_>, f: &mut SmpFixture) -> TestResult {
         for id in 1..cpu::count() {
             f.spawn(id, |state, token| {
@@ -402,6 +407,24 @@ mod pages {
             assert_eq!(buddy::free_pages(), initial);
         }
         Ok(())
+    }
+    /// 每在线 CPU 的原 Task 分别复用 IRQ 开/关两种锁恢复断言，不借用控制者栈。
+    #[test]
+    #[case("enabled", true)]
+    #[case("disabled", false)]
+    fn every_cpu_lock_restore(
+        _: &mut TestContext<'_>,
+        f: &mut SmpFixture,
+        enabled: bool,
+    ) -> TestResult {
+        for id in 0..cpu::count() {
+            f.spawn(id, move |state, token| {
+                crate::mm::ktest::pages::check_try_lock_restore(enabled);
+                state.done[id].store(1, Ordering::Release);
+                state.park(&token)
+            })?;
+        }
+        f.all_done(1)
     }
 }
 
@@ -524,9 +547,12 @@ mod arc_ownership {
         if target != 0 {
             f.spawn(target, move |state, token| {
                 state.wait(&token, || state.command.load(Ordering::Acquire) == 1)?;
-                let payload = state.payload.lock().take().unwrap();
-                assert_eq!(Arc::strong_count(&payload), 1);
+                let mut slot = state.payload.lock();
+                let payload = slot.as_ref().unwrap();
+                assert_eq!(Arc::strong_count(payload), 1);
                 payload.check();
+                let payload = slot.take();
+                drop(slot);
                 drop(payload);
                 state.done[target].store(1, Ordering::Release);
                 state.park(&token)
@@ -538,15 +564,18 @@ mod arc_ownership {
                 state: Arc::downgrade(&state),
             })
             .map_err(|_| TestError("NoMemory: Arc payload"))?;
-            payload.check();
-            let last = Arc::clone(&payload);
-            drop(payload);
+            *state.payload.lock() = Some(payload);
+            let mut slot = state.payload.lock();
+            slot.as_ref().unwrap().check();
+            let first = slot.take().unwrap();
+            *slot = Some(Arc::clone(&first));
+            drop(first);
             assert_eq!(state.drops.load(Ordering::Acquire), 0);
-            assert_eq!(Arc::strong_count(&last), 1);
-            *state.payload.lock() = Some(last);
+            assert_eq!(Arc::strong_count(slot.as_ref().unwrap()), 1);
+            drop(slot);
             if target == 0 {
-                let payload = state.payload.lock().take().unwrap();
-                payload.check();
+                state.payload.lock().as_ref().unwrap().check();
+                let payload = state.payload.lock().take();
                 drop(payload);
                 state.done[0].store(1, Ordering::Release);
             } else {

@@ -6,34 +6,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(feature = "ktest", feature(panic_can_unwind))]
 
-#[cfg(all(
-    feature = "ktest",
-    any(
-        feature = "boot-tests",
-        feature = "execution-tests",
-        feature = "storage-tests"
-    )
-))]
-compile_error!("ktest requires a separate image from legacy test features");
-
-#[cfg(all(feature = "refill-test", not(target_arch = "loongarch64")))]
-compile_error!("refill-test requires the loongarch64 target");
-#[cfg(all(feature = "execution-tests", feature = "boot-tests"))]
-compile_error!("execution-tests cannot be combined with boot-tests");
-#[cfg(all(
-    feature = "storage-tests",
-    any(feature = "boot-tests", feature = "execution-tests")
-))]
-compile_error!("storage-tests requires a separate image from boot-tests and execution-tests");
-const _: () = assert!(
-    cfg!(feature = "execution-irq-fault") as usize
-        + cfg!(feature = "execution-preempt-fault") as usize
-        + cfg!(feature = "execution-printer-oom-fault") as usize
-        + cfg!(feature = "execution-timekeeper-fault") as usize
-        <= 1,
-    "execution faults require separate images"
-);
-
 extern crate alloc;
 extern crate rlibc;
 
@@ -61,21 +33,9 @@ mod timer;
 mod wait;
 mod workqueue;
 
-#[cfg(feature = "boot-tests")]
-mod boot_tests;
-#[cfg(feature = "execution-tests")]
-mod execution_tests;
-#[cfg(feature = "storage-tests")]
-mod storage_tests;
-
-#[cfg(not(any(
-    feature = "boot-tests",
-    feature = "execution-tests",
-    feature = "storage-tests"
-)))]
+#[cfg(not(feature = "ktest"))]
 use crate::drivers::DeviceInventory;
 
-#[cfg(not(feature = "boot-tests"))]
 static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// 完成一次性固件资源与 CPU 准备，返回后不再保留构造数组。
@@ -154,13 +114,10 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     unsafe { mm::initialize(resources) };
     // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前发表 BootInfo 的计数器频率。
     unsafe { time::initialize(resources) };
-    #[cfg(not(feature = "boot-tests"))]
     timer::initialize_services().expect("timer service task allocation failed");
-    #[cfg(not(feature = "boot-tests"))]
     workqueue::initialize_services().expect("worker pool service task allocation failed");
-    #[cfg(not(feature = "boot-tests"))]
     klog::initialize_service().expect("log printer task allocation failed");
-    #[cfg(not(any(feature = "boot-tests", feature = "ktest")))]
+    #[cfg(not(feature = "ktest"))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     #[cfg(feature = "ktest")]
     let _test_task = ktest::spawn_thread(test_command).expect("test suite Task allocation failed");
@@ -228,16 +185,8 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     }
     early_println!("READY arch={} cpus={}", arch::NAME, cpu::count());
 
-    #[cfg(feature = "boot-tests")]
-    // SAFETY: 唯一 BSP 在全部 CPU 上线以后运行一次；测试缓冲区与串口协议由它独占。
-    unsafe {
-        boot_tests::primary(_uart_registration)
-    };
-    #[cfg(not(feature = "boot-tests"))]
-    {
-        EXECUTION_READY.store(true, core::sync::atomic::Ordering::Release);
-        enter_scheduler();
-    }
+    EXECUTION_READY.store(true, core::sync::atomic::Ordering::Release);
+    enter_scheduler();
 }
 
 /// 使用 BSP 发布的 CpuLocal 安装本核执行状态，只初始化本地中断。
@@ -252,17 +201,10 @@ pub unsafe extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
     arch::init_current_cpu();
     arch::enable_interrupts();
     cpu::publish_online();
-    #[cfg(feature = "boot-tests")]
-    // SAFETY: 本核对象、异常入口和 IRQ 已就绪；仅当前 AP 使用自身的测试状态。
-    unsafe {
-        boot_tests::secondary()
-    };
-    #[cfg(not(feature = "boot-tests"))]
     enter_scheduler();
 }
 
 /// 全部 CPU 已上线且启动输出完成后才允许分派，等待中的 AP 仍能服务 IRQ/IPI。
-#[cfg(not(feature = "boot-tests"))]
 fn enter_scheduler() -> ! {
     while !EXECUTION_READY.load(core::sync::atomic::Ordering::Acquire) {
         core::hint::spin_loop();
@@ -271,47 +213,36 @@ fn enter_scheduler() -> ! {
 }
 
 /// 在普通任务栈一次发现并保活存储，按明确启动参数读取系统盘，再完成有限消费者。
-#[cfg(not(feature = "boot-tests"))]
+#[cfg(not(feature = "ktest"))]
 fn init() -> i32 {
-    #[cfg(feature = "execution-tests")]
-    execution_tests::run();
-    #[cfg(feature = "storage-tests")]
-    return storage_tests::run();
-    #[cfg(not(any(feature = "execution-tests", feature = "storage-tests")))]
-    {
-        let inventory = drivers::discover().expect("device resource discovery failed");
-        report_device_resources(&inventory);
-        let has_block = !inventory.mmio_blocks.is_empty()
-            || inventory.pci.devices().iter().any(|device| {
-                device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-            });
-        assert!(
-            has_block,
-            "filesystem boot initialization failed: {:?}",
-            fs::FsError::MissingRoot
-        );
-        // SAFETY: init 是一次发现后全部块设备的唯一准备者；Bootstrap 永久映射仍 live，
-        // 固定 Storage 表在发表前持全部 owner，未确认停止的设备不会在 init 返回时丢失。
-        let storage = unsafe { storage::Storage::initialize(&inventory) }
-            .expect("storage initialization failed");
-        crate::klog!(
-            klog::Level::Info,
-            "STORAGE online devices={}",
-            storage.count()
-        );
-        init_filesystems(storage).expect("filesystem boot initialization failed");
-        init_consumers();
-        drop(inventory);
-        0
-    }
+    let inventory = drivers::discover().expect("device resource discovery failed");
+    report_device_resources(&inventory);
+    let has_block = !inventory.mmio_blocks.is_empty()
+        || inventory.pci.devices().iter().any(|device| {
+            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+        });
+    assert!(
+        has_block,
+        "filesystem boot initialization failed: {:?}",
+        fs::FsError::MissingRoot
+    );
+    // SAFETY: init 是一次发现后全部块设备的唯一准备者；Bootstrap 永久映射仍 live，
+    // 固定 Storage 表在发表前持全部 owner，未确认停止的设备不会在 init 返回时丢失。
+    let storage =
+        unsafe { storage::Storage::initialize(&inventory) }.expect("storage initialization failed");
+    crate::klog!(
+        klog::Level::Info,
+        "STORAGE online devices={}",
+        storage.count()
+    );
+    init_filesystems(storage).expect("filesystem boot initialization failed");
+    init_consumers();
+    drop(inventory);
+    0
 }
 
 /// 普通 init 用真实磁盘槽读取固定系统文件，结束后释放临时路径、打开文件和缓存。
-#[cfg(not(any(
-    feature = "boot-tests",
-    feature = "execution-tests",
-    feature = "storage-tests"
-)))]
+#[cfg(not(feature = "ktest"))]
 fn init_filesystems(storage: &storage::Storage) -> Result<(), fs::FsError> {
     use alloc::sync::Arc;
 
@@ -368,11 +299,7 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), fs::FsError> {
 }
 
 /// 只记录启用 MMIO 槽、实际 block 候选与 PCI 功能资源，不触碰设备队列或读取磁盘。
-#[cfg(not(any(
-    feature = "boot-tests",
-    feature = "execution-tests",
-    feature = "storage-tests"
-)))]
+#[cfg(not(feature = "ktest"))]
 fn report_device_resources(inventory: &DeviceInventory) {
     let resources = boot::info();
     for (slot, resource) in resources.virtio_mmio[..resources.virtio_mmio_count]
@@ -438,11 +365,7 @@ fn report_device_resources(inventory: &DeviceInventory) {
 }
 
 /// 在普通任务之间传送有限数据，源登记后复查槽状态，结束时消费真实 join。
-#[cfg(not(any(
-    feature = "boot-tests",
-    feature = "execution-tests",
-    feature = "storage-tests"
-)))]
+#[cfg(not(feature = "ktest"))]
 fn init_consumers() {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};

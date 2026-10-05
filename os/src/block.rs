@@ -12,7 +12,7 @@ mod ktest_queue;
 mod ktest_quota;
 mod stop;
 mod submit;
-#[cfg(any(feature = "storage-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) mod tests;
 
 pub use bio::{Bio, BioCompletion};

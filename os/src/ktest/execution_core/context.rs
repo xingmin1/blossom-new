@@ -1,6 +1,7 @@
 //! 原 Task 上的寄存器、深栈、正常返回、离栈观察与迁核身份。
 
 use crate::ktest::execution_core::{baseline, reclaimed, until, Baseline};
+use crate::ktest::execution_services::SuiteBaseline;
 use crate::ktest::{spawn_result, spawn_result_on, ChildHandle, ChildToken};
 use crate::sync::{Completion, SpinLock};
 use crate::{arch, cpu, mm, sched, task};
@@ -34,9 +35,9 @@ struct Tasks {
     state: Arc<Control>,
     handles: [Option<ChildHandle>; 2],
 }
-impl Fixture for Tasks {
+impl Fixture<SuiteBaseline> for Tasks {
     /// 在发表真实 Task 前建立每例独立控制拥有与本次停稳基线。
-    fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+    fn set_up(_: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
         let initial = baseline()?;
         let state = Arc::try_new(Control {
             go: AtomicBool::new(false),
@@ -215,7 +216,7 @@ fn page_total() -> usize {
     stats.buddy_free_pages + stats.pcp_cached_pages + stats.slab_backing_pages
 }
 
-#[::ktest::suite(fixture = Tasks, tags("execution", "context"), timeout_ms = 15000)]
+#[::ktest::suite(fixture = Tasks, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "context"), timeout_ms = 15000)]
 pub(crate) mod context {
     use super::*;
     /// 两个固定CPU0 Task独立深栈交替并保留原20/21观察结果，离栈后归还32页。
@@ -331,7 +332,7 @@ pub(crate) mod context {
     }
 }
 
-#[::ktest::suite(fixture = Tasks, tags("execution", "migration"), min_cpus = 2, timeout_ms = 15000)]
+#[::ktest::suite(fixture = Tasks, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "migration"), min_cpus = 2, timeout_ms = 15000)]
 pub(crate) mod migration {
     use super::*;
     /// 同一真实Any子Task往返全部在线核两轮，身份、硬件CPU基址与栈局部地址不变，原join返回31。

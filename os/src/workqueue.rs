@@ -12,7 +12,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::ptr;
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,7 +25,7 @@ use crate::wait::{WaitNode, WaitQueue, Waiter};
 // ponytail: 全域短元数据锁限制并行提交吞吐；仅在实际测得竞争后拆分域与池锁。
 pub(super) static STATE_LOCK: SpinLock<()> = SpinLock::new(());
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 static LIVE_DOMAINS: AtomicUsize = AtomicUsize::new(0);
 
 /// 普通域采用全域并发上限；严格有序域固定 CPU0 且只准入一个回调。
@@ -106,7 +106,7 @@ impl WorkQueue {
             rescuers: UnsafeCell::new(Vec::new()),
         };
         // 在 fallible Arc 分配前计入完整 value；分配失败的普通 Drop 同样归还。
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         LIVE_DOMAINS.fetch_add(1, Ordering::Relaxed);
         let domain = Arc::try_new(value)?;
         let count = if config.ordered { 1 } else { cpu::count() };
@@ -256,7 +256,7 @@ impl Drop for Domain {
         assert_eq!(state.reserved_active, 0);
         assert_eq!(state.reserved_workers, 0);
         assert!(!state.published || state.closed);
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         LIVE_DOMAINS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -757,7 +757,7 @@ pub fn initialize_services() -> Result<(), AllocError> {
     Ok(())
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) mod testing {
     pub(crate) use super::pool::testing::{
         arm_pause, cancel_pause, is_paused, is_rescuer, manager_blocked, pool_stats, release_pause,

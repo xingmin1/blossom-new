@@ -83,6 +83,8 @@ pub(crate) mod mapping {
         for address in [stack, code] {
             let physical = arch::virt_to_phys(address);
             assert!(kernel.start <= physical && physical < kernel.end);
+            #[cfg(target_arch = "loongarch64")]
+            context.expect_eq(address, arch::phys_to_virt(physical));
             #[cfg(target_arch = "riscv64")]
             {
                 let (mapped, _) = translation(address).expect("current address not mapped");
@@ -138,6 +140,29 @@ pub(crate) mod mapping {
     #[case("ready", 2u8)]
     fn emergency_output_budget(mode: u8) {
         assert!(crate::console::testing::emergency_budget(mode));
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[::ktest::suite(context = "Boot", tags("boot", "mapping"), timeout_ms = 1000)]
+pub(crate) mod rv_mapping {
+    use super::*;
+
+    /// 生产 LocalEvent 尚未激活时保留原精确一次 timer IRQ 与完整寄存器图样断言。
+    #[test]
+    #[case("fp_off", false)]
+    #[case("fp_on", true)]
+    fn register_exact_irq(context: &mut TestContext<'_>, fp: bool) {
+        assert_eq!(cpu::current().id, 0);
+        assert!(!arch::irq_enabled());
+        let _irq = IrqSaveGuard::new();
+        let counter = &cpu::current().timer_interrupts;
+        let before = counter.load(Ordering::Acquire);
+        // SAFETY: 既有 Boot 路径已安装本核 trap/timer 源和永久 CpuLocal；AP/MM/调度
+        // 尚未启动，IRQ 关闭且无活跃 FP，原汇编暂开 IRQ 后恢复同核现场。
+        assert!(unsafe { arch::ktest_register_pattern(fp, 0) });
+        context.expect_eq(counter.load(Ordering::Acquire), before + 1);
+        assert!(!arch::irq_enabled());
     }
 }
 

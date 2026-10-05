@@ -7,10 +7,13 @@ mod hardware;
 mod uart;
 
 /// 保留真实注册槽锚点，具体目录仍由链接节发现。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 8] {
+pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 8 + cfg!(target_arch = "riscv64") as usize]
+{
     [
         firmware::cases::__ktest_anchor(),
         hardware::mapping::__ktest_anchor(),
+        #[cfg(target_arch = "riscv64")]
+        hardware::rv_mapping::__ktest_anchor(),
         hardware::cpus::__ktest_anchor(),
         #[cfg(target_arch = "riscv64")]
         hardware::rv_fp::__ktest_anchor(),

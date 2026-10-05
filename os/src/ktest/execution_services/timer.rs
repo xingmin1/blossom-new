@@ -243,20 +243,23 @@ fn lifecycle_callback(timer: Pin<&Timer>) {
 
 /// 真实同步停止者通过现有 Completion 起跑，再在永久 finished 源上阻塞。
 fn cancel_worker(timer: Pin<Arc<Timer>>, close: bool) -> i32 {
-    let old = scenario().cancel_task.lock().replace(task::current_task());
-    assert!(old.is_none());
-    if scenario().stop.load(Ordering::Acquire) {
+    let state = scenario();
+    let mut publication = state.cancel_task.lock();
+    if state.stop.load(Ordering::Acquire) {
         return 114;
     }
-    scenario().cancel_gate.wait();
-    scenario().cancel_started.store(true, Ordering::Release);
+    let old = publication.replace(task::current_task());
+    assert!(old.is_none());
+    drop(publication);
+    state.cancel_gate.wait();
+    state.cancel_started.store(true, Ordering::Release);
     if close {
         timer.as_ref().close_sync();
     } else {
         timer.as_ref().cancel_sync();
     }
     assert!(!testing::snapshot(timer.as_ref()).running);
-    scenario().cancel_done.store(true, Ordering::Release);
+    state.cancel_done.store(true, Ordering::Release);
     114
 }
 
@@ -270,6 +273,7 @@ fn paused_stop(
     assert!(1 < cpu::count());
     scenario().cancel_started.store(false, Ordering::Relaxed);
     scenario().cancel_done.store(false, Ordering::Relaxed);
+    scenario().cancel_gate_sent.store(false, Ordering::Relaxed);
     let worker_timer = clone_timer(timer);
     let handle = crate::ktest::spawn_result_on(0, move |_| Ok(cancel_worker(worker_timer, close)))
         .expect("sync cancel task");
@@ -301,7 +305,7 @@ fn paused_stop(
         assert!(state.running && state.queued);
     }
     assert_eq!(timer.as_ref().try_cancel(), CancelResult::Busy);
-    scenario().cancel_gate.complete();
+    scenario().release_cancel();
     wait_before(
         || {
             if !scenario().cancel_started.load(Ordering::Acquire) {
@@ -327,6 +331,10 @@ fn paused_stop(
             Err(ArmError::Closed)
         );
     }
+    assert!(
+        !scenario().fail_after_cancel.load(Ordering::Acquire),
+        "controlled timer coordinator failure"
+    );
     testing::release_pause();
     wait_before(
         || handle.try_join().is_some(),
@@ -805,8 +813,10 @@ struct Scenario {
     rearmed: AtomicUsize,
     cancel_task: SpinLock<Option<Arc<Task>>>,
     cancel_gate: Completion,
+    cancel_gate_sent: AtomicBool,
     cancel_started: AtomicBool,
     cancel_done: AtomicBool,
+    fail_after_cancel: AtomicBool,
     remote_fired: AtomicUsize,
     remote_early: AtomicUsize,
     remote_deadline: AtomicU64,
@@ -832,9 +842,12 @@ struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
-impl ::ktest::Fixture for ServiceFixture {
+impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
-    fn set_up(_: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
+    fn set_up(
+        _: &mut ::ktest::TestContext<'_>,
+        _: &super::SuiteBaseline,
+    ) -> Result<Self, ::ktest::TestError> {
         sched::test_migrate_to(0);
         let initial = super::baseline();
         let state = Arc::try_new(Scenario {
@@ -852,8 +865,10 @@ impl ::ktest::Fixture for ServiceFixture {
             rearmed: AtomicUsize::new(0),
             cancel_task: SpinLock::new(None),
             cancel_gate: Completion::new(),
+            cancel_gate_sent: AtomicBool::new(false),
             cancel_started: AtomicBool::new(false),
             cancel_done: AtomicBool::new(false),
+            fail_after_cancel: AtomicBool::new(false),
             remote_fired: AtomicUsize::new(0),
             remote_early: AtomicUsize::new(0),
             remote_deadline: AtomicU64::new(0),
@@ -907,6 +922,13 @@ impl ::ktest::Fixture for ServiceFixture {
 }
 
 impl Scenario {
+    /// 主体与失败清理共享一次gate移交，原取消者消费后不会收到第二张票。
+    fn release_cancel(&self) {
+        if !self.cancel_gate_sent.swap(true, Ordering::AcqRel) {
+            self.cancel_gate.complete();
+        }
+    }
+
     /// 已退出fixed协调动作后，一次释放真实IRQ/BH停点和独立停止者的完成源。
     fn stop_sources(&self) {
         if self.stop.swap(true, Ordering::AcqRel) {
@@ -918,7 +940,7 @@ impl Scenario {
             .as_ref()
             .is_some_and(|task| sched::test_state(task) != State::Exited)
         {
-            self.cancel_gate.complete();
+            self.release_cancel();
         }
         let waker = self.sleep_waker.lock().as_ref().cloned();
         if let Some(waker) = waker {
@@ -939,7 +961,7 @@ impl ServiceFixture {
     }
 }
 
-#[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "timer"), timeout_ms = 30000)]
+#[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "timer"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
     /// 已过期和零延迟不创建多余WaitId；每种输入重新准备fixture。
@@ -1001,6 +1023,22 @@ pub(crate) mod cases {
     ) -> ::ktest::TestResult {
         fixture.fixed(move || {
             test_cancel(Some(point));
+            Ok(())
+        })
+    }
+    /// 原取消者已消费gate并等待真实回调尾时令控制者失败，cleanup不得再制造第二票。
+    #[test]
+    #[ktest(
+        min_cpus = 2,
+        ignore = "controlled timer coordinator failure must remain Fail after complete cleanup"
+    )]
+    fn cancel_coordinator_failure(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(|| {
+            scenario().fail_after_cancel.store(true, Ordering::Release);
+            test_cancel(Some(testing::PausePoint::Tail));
             Ok(())
         })
     }

@@ -115,15 +115,15 @@ pub struct CpuLocal {
     pub(crate) need_resched: AtomicBool,
     pub(crate) idle: AtomicBool,
     kick_reasons: AtomicUsize,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_idle_pause: AtomicUsize,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_ipi_pause: AtomicUsize,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_idle_waits: AtomicUsize,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_wait_completions: AtomicUsize,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_timer_reprograms: AtomicUsize,
     calls: SpinLock<CallQueue>,
     #[cfg(feature = "ktest")]
@@ -132,6 +132,8 @@ pub struct CpuLocal {
     pub(crate) boot_local_probe: AtomicUsize,
     #[cfg(feature = "ktest")]
     pub(crate) boot_irq_ready: AtomicBool,
+    #[cfg(feature = "ktest")]
+    pub(crate) ktest_callback_active: AtomicBool,
 }
 
 // SAFETY: scheduler_ctx/current_task 仅由所属 CPU 在 IRQ 关闭的调度交接中访问；
@@ -165,15 +167,15 @@ impl CpuLocal {
             need_resched: AtomicBool::new(false),
             idle: AtomicBool::new(false),
             kick_reasons: AtomicUsize::new(0),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             test_idle_pause: AtomicUsize::new(0),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             test_ipi_pause: AtomicUsize::new(0),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             test_idle_waits: AtomicUsize::new(0),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             test_wait_completions: AtomicUsize::new(0),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             test_timer_reprograms: AtomicUsize::new(0),
             calls: SpinLock::new(CallQueue::new()),
             #[cfg(feature = "ktest")]
@@ -182,6 +184,8 @@ impl CpuLocal {
             boot_local_probe: AtomicUsize::new(0),
             #[cfg(feature = "ktest")]
             boot_irq_ready: AtomicBool::new(false),
+            #[cfg(feature = "ktest")]
+            ktest_callback_active: AtomicBool::new(false),
         }
     }
 
@@ -197,18 +201,18 @@ impl CpuLocal {
     /// IRQ/preempt guard 时调用。调用者已发表 idle 并复查队列，允许临时服务 IRQ。
     pub(crate) unsafe fn idle_once(&self) {
         assert!(core::ptr::eq(self, current()), "idle uses another CPU");
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         self.test_idle_waits.fetch_add(1, Ordering::Release);
         // SAFETY: 调用者保证本核无锁 IRQ-off 边界；字段永久有效，架构重查但不清通知，
         // 临时开放 IRQ 时不存在依赖 IRQ 关闭的普通借用；测试计数仅以原子访问。
         unsafe {
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             crate::arch::idle_once(
                 &self.kick_reasons,
                 &self.need_resched,
                 &self.test_wait_completions,
             );
-            #[cfg(not(any(feature = "execution-tests", feature = "ktest")))]
+            #[cfg(not(feature = "ktest"))]
             crate::arch::idle_once(&self.kick_reasons, &self.need_resched);
         };
     }
@@ -337,10 +341,40 @@ pub fn handle_timer() {
         local.need_resched.store(true, Ordering::Release);
     }
     crate::time::handle_timer();
-    #[cfg(feature = "memory-tests")]
-    crate::mm::tests::timer_irq();
     #[cfg(feature = "ktest")]
     crate::mm::ktest::timer_irq();
+}
+
+/// 仅测试镜像屏蔽同步callback内捕获；不改变硬IRQ或BH的生产记账。
+#[cfg(feature = "ktest")]
+struct CallbackGuard {
+    local: &'static CpuLocal,
+    previous: bool,
+    _local: PhantomData<*mut ()>,
+}
+
+#[cfg(feature = "ktest")]
+impl CallbackGuard {
+    /// 原callback分派已关IRQ，标志只属于当前固定CPU并保存嵌套原状态。
+    fn enter() -> Self {
+        assert!(!crate::arch::irq_enabled());
+        let local = current();
+        Self {
+            previous: local.ktest_callback_active.swap(true, Ordering::Relaxed),
+            local,
+            _local: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for CallbackGuard {
+    /// 先解除本次callback的捕获屏蔽，再由外层IRQ guard恢复原状态。
+    fn drop(&mut self) {
+        self.local
+            .ktest_callback_active
+            .store(self.previous, Ordering::Relaxed);
+    }
 }
 
 /// 在硬件通知已清除后取出真实请求，锁外执行并发布完成。
@@ -349,14 +383,14 @@ pub fn handle_ipi() {
     local.ipi_interrupts.fetch_add(1, Ordering::Relaxed);
     // 硬件已确认后一次取走旧位；处理期间远端再置位仍留在原子中，并发送新的 IPI。
     let reasons = local.kick_reasons.swap(0, Ordering::AcqRel);
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_pause_boundary(&local.test_ipi_pause);
     if reasons & KICK_RESCHEDULE != 0 {
         local.need_resched.store(true, Ordering::Release);
     }
     if reasons & KICK_TIMER_REPROGRAM != 0 {
         crate::time::reprogram_current();
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         local.test_timer_reprograms.fetch_add(1, Ordering::Release);
     }
     if reasons & KICK_LOG_PRINTER != 0 {
@@ -369,6 +403,8 @@ pub fn handle_ipi() {
             Some(request) => request,
             None => break,
         };
+        #[cfg(feature = "ktest")]
+        let _callback = CallbackGuard::enter();
         // SAFETY: 请求已取出但尚未发布完成，发送者仍保留节点和参数；动作由 call 的
         // unsafe 契约约束。完成是最后一次访问节点，随后仅继续处理队列。
         unsafe {
@@ -387,6 +423,8 @@ pub fn handle_ipi() {
 pub unsafe fn call(target: usize, callback: unsafe fn(*mut ()), argument: *mut ()) {
     if target == current().id {
         let _irq = IrqSaveGuard::new();
+        #[cfg(feature = "ktest")]
+        let _callback = CallbackGuard::enter();
         // SAFETY: caller 提供有效动作和参数；本核短 IRQ-save 域覆盖整个直接动作。
         unsafe { callback(argument) };
         return;
@@ -410,7 +448,7 @@ pub unsafe fn call(target: usize, callback: unsafe fn(*mut ()), argument: *mut (
 }
 
 /// 测试只读真实队列深度，用于确定交错已经发生，不维护第二份计数。
-#[cfg(any(feature = "boot-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn pending_calls(target: usize) -> usize {
     let queue = get(target).calls.lock();
     let mut node = queue.head;
@@ -518,7 +556,7 @@ pub(crate) fn decrement_depth(depth: &AtomicUsize) {
 }
 
 /// 可武装的一次真实边界停点，状态不参与生产调度或通知协议。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy)]
 pub(crate) enum TestPause {
     Idle,
@@ -526,7 +564,7 @@ pub(crate) enum TestPause {
 }
 
 /// 选择固定 CPU 上独立的验收停点状态。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 fn test_pause_state(target: usize, boundary: TestPause) -> &'static AtomicUsize {
     let local = get(target);
     match boundary {
@@ -536,7 +574,7 @@ fn test_pause_state(target: usize, boundary: TestPause) -> &'static AtomicUsize 
 }
 
 /// 武装尚未使用的单次停点，测试必须由另一 CPU 负责及时释放。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_arm_pause(target: usize, boundary: TestPause) {
     test_pause_state(target, boundary)
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -544,13 +582,13 @@ pub(crate) fn test_arm_pause(target: usize, boundary: TestPause) {
 }
 
 /// 观察目标是否已经在真实 IRQ-off 边界停下。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_is_paused(target: usize, boundary: TestPause) -> bool {
     test_pause_state(target, boundary).load(Ordering::Acquire) == 2
 }
 
 /// 释放已经到达的停点，不改变软件通知或硬件 pending。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_release_pause(target: usize, boundary: TestPause) {
     test_pause_state(target, boundary)
         .compare_exchange(2, 3, Ordering::Release, Ordering::Relaxed)
@@ -559,7 +597,7 @@ pub(crate) fn test_release_pause(target: usize, boundary: TestPause) {
 
 /// 撤未到达的停点或放行实际暂停者；不消费 pending，也不等待旧执行者退出。
 /// 控制者在另一普通 Task、无退出依赖锁；原 handler/idle 真收敛以前不得重新武装。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_cancel_pause(target: usize, boundary: TestPause) {
     let state = test_pause_state(target, boundary);
     loop {
@@ -580,7 +618,7 @@ pub(crate) fn test_cancel_pause(target: usize, boundary: TestPause) {
 }
 
 /// 仅在已武装时停留于本核无锁边界，以统一单调时钟限制验收等待。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 fn test_pause_boundary(state: &AtomicUsize) {
     if state
         .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
@@ -603,31 +641,31 @@ fn test_pause_boundary(state: &AtomicUsize) {
 }
 
 /// 在 idle 发表且放开调度锁后、最终队列与提示检查之前提供单次停点。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_idle_boundary() {
     test_pause_boundary(&current().test_idle_pause);
 }
 
 /// 读取真实原因位以验证 handler 处理期间新通知未被抹掉。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_pending_kicks(target: usize) -> usize {
     get(target).kick_reasons.load(Ordering::Acquire)
 }
 
 /// 读取真实重编程原因的已处理次数，不以置位次数代替收件执行。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_timer_reprograms(target: usize) -> usize {
     get(target).test_timer_reprograms.load(Ordering::Acquire)
 }
 
 /// 读取进入架构等待协议的次数，软件 pending 可使入口直接返回而不执行等待指令。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_idle_waits(target: usize) -> usize {
     get(target).test_idle_waits.load(Ordering::Acquire)
 }
 
 /// 读取本核真正执行 WFI/IDLE 并返回的次数，软件提示跳过等待时不增加。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_wait_completions(owner: usize) -> usize {
     get(owner).test_wait_completions.load(Ordering::Acquire)
 }

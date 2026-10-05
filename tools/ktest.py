@@ -206,7 +206,7 @@ def export_reports(directory, report):
 
 
 def main(argv=None):
-    """完整 list/run 生命周期只产生本次证据，原输入不修改。"""
+    """完整 list/run 保留本次证据；进程回收和最终校验后删除临时 ELF，不修改原输入。"""
     args = arguments(argv)
     CANCELLED.clear()
     try:
@@ -218,6 +218,7 @@ def main(argv=None):
     report = dict(version=1, command=sys.argv if argv is None else argv, seed=args.seed,
                   memory=args.memory, jobs=args.jobs, isolation=args.isolation,
                   **config(args), results=[], report_dir=str(directory))
+    kernel = directory / "kernel.elf"
     try:
         kernel, digest = fixed_kernel(args, directory)
         report["elf_sha256"] = digest
@@ -248,6 +249,14 @@ def main(argv=None):
     except (HostError, OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         report["error"] = str(error) or "host run interrupted"
         report["exit_code"] = 2
+    finally:
+        # discover/execute 已回收构建和全部 VM；只删本次独占输入，不删报告或原 ELF。
+        try:
+            kernel.unlink(missing_ok=True)
+        except OSError as error:
+            report.setdefault("error", f"fixed ELF cleanup failed: {error}")
+            report["exit_code"] = 2
+            print(f"KTEST cleanup error: {error}", file=sys.stderr)
     export_reports(directory, report)
     print(f"KTEST report={directory} seed={args.seed} exit={report['exit_code']}", file=sys.stderr)
     return report["exit_code"]

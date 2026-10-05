@@ -222,7 +222,7 @@ impl Wheel {
     }
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 /// 对生产入桶、位图、撤链和推进执行边界断言；不替代真实客体回调计数。
 pub(super) fn self_check() -> usize {
     use core::pin::{pin, Pin};

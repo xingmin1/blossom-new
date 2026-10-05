@@ -53,10 +53,12 @@ class VM:
         self.endpoint = str(Path(self.socket_directory.name) / "uart.sock")
         self.raw = None
         self.console = None
+        self.disk_directory = None
         try:
             self.raw = (directory / "uart.log").open("xb", buffering=0)
             self.console = (directory / "qemu.log").open("xb", buffering=0)
-            disks = prepare_disks(names, args, directory)
+            self.disk_directory = tempfile.TemporaryDirectory(prefix="disks-", dir=directory)
+            disks = prepare_disks(names, args, Path(self.disk_directory.name))
             command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
                        "-kernel", str(kernel), "-m", args.memory, "-smp", str(args.cpus),
                        "-display", "none", "-monitor", "none", "-no-reboot", "-nic", "none",
@@ -110,14 +112,12 @@ class VM:
             require(self.debugger.poll() in (None, 0), "AP freeze GDB failed; inspect ap-freeze-gdb.log")
 
     def receive(self, deadline, limit=65536):
-        """逐块落盘 UART 原文，解析层只保留有界未完成行。"""
+        """逐块落盘 UART 原文；只认 recv 的真实 EOF，进程退出不代表 socket 已读尽。"""
         while True:
             self.check(deadline)
             readable, _, _ = select.select([self.serial], [], [], max(0, min(0.1, deadline - time.monotonic())))
             self.check(deadline)
             if not readable:
-                if self.process.poll() is not None:
-                    raise VMExited(f"QEMU exited {self.process.returncode}")
                 continue
             data = self.serial.recv(limit)
             if not data:
@@ -263,7 +263,7 @@ class VM:
             ap_freeze.verify(self.directory)
 
     def close(self):
-        """无论成功、异常或取消，都终结 QEMU 及其同组子进程。"""
+        """先终结并 wait 各进程组，再关闭句柄及清理本实例独占工作盘。"""
         for process in (self.debugger, self.process):
             if process is None:
                 continue
@@ -289,6 +289,8 @@ class VM:
         if self.debug_log is not None:
             self.debug_log.close()
         self.socket_directory.cleanup()
+        if self.disk_directory is not None:
+            self.disk_directory.cleanup()
 
 
 def config(args):

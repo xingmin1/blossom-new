@@ -1,6 +1,7 @@
 """普通运行和测试共用的 QEMU 块设备槽位与明确启动参数。"""
 
 
+
 def disk_arguments(disks, args, names):
     """按实际 MMIO 槽或 PCI BDF 附盘；显式 root 不存在时也原样交给内核。"""
     command = []

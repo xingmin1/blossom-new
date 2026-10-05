@@ -11,11 +11,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::block::{self, BlockError, Disk, DiskRef};
 use crate::cache::{BufferRef, FileMapping, MetadataCache};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::DeviceInventory;
 use crate::mm::folio::{FolioRead, FolioRef};
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
-use crate::{cpu, drivers, mm, sched, time, timer};
+use crate::{cpu, mm, sched, time, timer};
 
 const OFFSET: u64 = 64 * mm::PAGE_SIZE as u64;
 const PRESSURE_CAPACITY: usize = 65536;
@@ -93,9 +94,8 @@ fn patterned(bytes: &[u8], tag: u8, offset: u64, len: usize) -> bool {
         })
 }
 
-/// 只从本例声明的 root/extra 工作副本库存准备设备，不写原输入盘。
-fn devices(count: usize) -> Result<Vec<VirtioDevice>, TestError> {
-    let inventory = drivers::discover().map_err(|_| TestError("cache discovery failed"))?;
+/// 每例借整组保活库存准备 root/extra 工作副本；前例已完成 stop，不重复一次性发现。
+fn devices(inventory: &DeviceInventory, count: usize) -> Result<Vec<VirtioDevice>, TestError> {
     let pci =
         inventory.pci.devices().iter().filter(|device| {
             device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
@@ -110,14 +110,14 @@ fn devices(count: usize) -> Result<Vec<VirtioDevice>, TestError> {
         .try_reserve_exact(count)
         .map_err(|_| TestError("cache device owner allocation failed"))?;
     for candidate in &inventory.mmio_blocks {
-        // SAFETY: 本例独占宿主声明的工作副本；候选来自真实库存，永久映射保活至真实 stop。
+        // SAFETY: 库存由 suite 保活；前例 stop 已结束设备访问，本例独占候选直到真实 stop。
         prepared.push(
             unsafe { VirtioDevice::prepare_mmio(candidate) }
                 .map_err(|_| TestError("cache MMIO preparation failed"))?,
         );
     }
     for device in pci {
-        // SAFETY: BDF 属于同一真实库存，fixture 唯一拥有至 reset、IRQ 与 Work 同步结束。
+        // SAFETY: BDF 借自整组库存；前例已 reset/同步尾部，本例独占至自身 IRQ/Work 结束。
         prepared.push(
             unsafe { VirtioDevice::prepare_pci(&inventory.pci, device) }
                 .map_err(|_| TestError("cache PCI preparation failed"))?,
@@ -408,10 +408,10 @@ struct Owner {
 }
 
 impl Owner {
-    /// 完整 fallible 控制存储与原生 Task 先于 start，失败只释放未发表对象。
-    fn prepare(scenario: Scenario) -> Result<Self, TestError> {
+    /// 借本组真实库存，完整 fallible 控制存储与原生 Task 先于 start。
+    fn prepare(scenario: Scenario, resources: &DeviceInventory) -> Result<Self, TestError> {
         let baseline = settled()?;
-        let mut inventory = devices(if scenario == Scenario::Views { 2 } else { 1 })?;
+        let mut inventory = devices(resources, if scenario == Scenario::Views { 2 } else { 1 })?;
         let device = inventory.remove(0);
         let info = device.info();
         let unit = info.logical_block_size as usize;
@@ -1157,10 +1157,13 @@ impl Owner {
 macro_rules! fixture {
     ($name:ident, $scenario:ident) => {
         struct $name(Owner);
-        impl Fixture for $name {
-            /// 每例完整准备自己的真实设备、控制存储与 Task，再发表硬件。
-            fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
-                Owner::prepare(Scenario::$scenario).map(Self)
+        impl Fixture<DeviceInventory> for $name {
+            /// 每例只借组库存，独立准备真实设备、控制存储与 Task，再发表硬件。
+            fn set_up(
+                _: &mut TestContext<'_>,
+                inventory: &DeviceInventory,
+            ) -> Result<Self, TestError> {
+                Owner::prepare(Scenario::$scenario, inventory).map(Self)
             }
             /// 具体 owner 无法收敛时返回错误，typed case-abort 保留原 fixture。
             fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
@@ -1193,7 +1196,7 @@ mod folio {
     }
 }
 
-#[ktest::suite(fixture = Views, context = "Thread", tags("cache", "metadata"), resources("root", "extra"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Views, suite_resources = DeviceInventory, context = "Thread", tags("cache", "metadata"), resources("root", "extra"), timeout_ms = 15000)]
 mod metadata_views {
     use super::*;
     /// 两个真实设备各自提供完整 1/2/4KiB 非零短视图。
@@ -1203,7 +1206,7 @@ mod metadata_views {
     }
 }
 
-#[ktest::suite(fixture = MetadataFlight, context = "Thread", min_cpus = 2, tags("cache", "metadata", "B14"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = MetadataFlight, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("cache", "metadata", "B14"), resources("root"), timeout_ms = 15000)]
 mod metadata_singleflight {
     use super::*;
     /// 同 key 唯一真实提交，原生等待者 Blocked 后读同 PFN。
@@ -1216,7 +1219,7 @@ mod metadata_singleflight {
     }
 }
 
-#[ktest::suite(fixture = FileFlight, context = "Thread", min_cpus = 2, tags("cache", "file", "B14"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = FileFlight, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("cache", "file", "B14"), resources("root"), timeout_ms = 15000)]
 mod file_singleflight {
     use super::*;
     /// 唯一 file read owner 由实际 Disk 填充，同 key waiter 复用原页。
@@ -1229,7 +1232,7 @@ mod file_singleflight {
     }
 }
 
-#[ktest::suite(fixture = MetadataIndependent, context = "Thread", min_cpus = 2, tags("cache", "metadata", "B15"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = MetadataIndependent, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("cache", "metadata", "B15"), resources("root"), timeout_ms = 15000)]
 mod metadata_parallel {
     use super::*;
     /// 元数据不同 key 同时持有真实设备请求，各自消费完整图样。
@@ -1242,7 +1245,7 @@ mod metadata_parallel {
     }
 }
 
-#[ktest::suite(fixture = Independent, context = "Thread", min_cpus = 2, tags("cache", "file", "B15"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Independent, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("cache", "file", "B15"), resources("root"), timeout_ms = 15000)]
 mod file_parallel {
     use super::*;
     /// 两个独立 key 真正在途，恢复真实 used 后各读完整图样。
@@ -1255,7 +1258,7 @@ mod file_parallel {
     }
 }
 
-#[ktest::suite(fixture = Failure, context = "Thread", min_cpus = 2, tags("cache", "file", "QueueStopped", "B11", "B14"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Failure, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("cache", "file", "QueueStopped", "B11", "B14"), resources("root"), timeout_ms = 15000)]
 mod stopped_failure {
     use super::*;
     /// 真实 stopped Disk 拒绝 read owner，两个原生 waiter 同错误醒来且内容不可读。
@@ -1265,7 +1268,7 @@ mod stopped_failure {
     }
 }
 
-#[ktest::suite(fixture = Bounded, context = "Thread", tags("cache", "prune", "B23"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Bounded, suite_resources = DeviceInventory, context = "Thread", tags("cache", "prune", "B23"), resources("root"), timeout_ms = 15000)]
 mod bounded {
     use super::*;
     /// 两种缓存预算内 clean 回收，全活 miss 明确 NoMemory。
@@ -1278,7 +1281,7 @@ mod bounded {
     }
 }
 
-#[ktest::suite(fixture = Oom, context = "Thread", tags("cache", "oom", "B23"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Oom, suite_resources = DeviceInventory, context = "Thread", tags("cache", "oom", "B23"), resources("root"), timeout_ms = 15000)]
 mod oom {
     use super::*;
     /// 真实物理页耗尽时旧 hit 仍读取原数据，新 miss 保 NoMemory。
@@ -1299,7 +1302,7 @@ mod oom {
     }
 }
 
-#[ktest::suite(fixture = PrepareOom, context = "Thread", min_cpus = 2,
+#[ktest::suite(fixture = PrepareOom, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2,
     tags("cache", "file", "prepare-oom", "B14"), resources("root"), timeout_ms = 60000)]
 mod prepare_oom {
     use super::*;

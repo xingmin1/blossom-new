@@ -24,6 +24,8 @@ struct KickSlot {
     rounds: AtomicUsize,
     timer_before: AtomicUsize,
     stop: AtomicBool,
+    pause_after_round: AtomicBool,
+    round_paused: AtomicBool,
 }
 
 impl KickSlot {
@@ -35,12 +37,28 @@ impl KickSlot {
             rounds: AtomicUsize::new(0),
             timer_before: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
+            pause_after_round: AtomicBool::new(false),
+            round_paused: AtomicBool::new(false),
         }
     }
 
     /// 克隆现存真实任务控制块，调度状态观察不保留测试锁。
     fn task(&self) -> Arc<Task> {
         Arc::clone(self.task.lock().as_ref().expect("kick task not published"))
+    }
+
+    /// 同一停止请求只发表一张票；未登记执行者由登记锁内的停止检查直接退出。
+    fn request_stop(&self) {
+        if self.stop.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let task = self.task.lock().as_ref().map(Arc::clone);
+        if task
+            .as_ref()
+            .is_some_and(|task| sched::test_state(task) != State::Exited)
+        {
+            self.wake.complete();
+        }
     }
 }
 
@@ -423,13 +441,14 @@ fn account_task() -> Arc<Task> {
 /// 绑定 Task 真等待后由远端 ready 提醒执行，每轮核对目标 timer IRQ 未提供进度。
 fn kick_worker(target: usize) -> i32 {
     let slot = &scenario().kicks[target];
-    let current = task::current_task();
-    let old = slot.task.lock().replace(current);
+    let mut publication = slot.task.lock();
+    if slot.stop.load(Ordering::Acquire) {
+        return 114;
+    }
+    let old = publication.replace(task::current_task());
     assert!(old.is_none());
+    drop(publication);
     loop {
-        if slot.stop.load(Ordering::Acquire) {
-            break;
-        }
         slot.wake.wait();
         if slot.stop.load(Ordering::Acquire) {
             break;
@@ -441,6 +460,14 @@ fn kick_worker(target: usize) -> i32 {
             slot.timer_before.load(Ordering::Acquire)
         );
         slot.rounds.fetch_add(1, Ordering::Release);
+        if slot.pause_after_round.load(Ordering::Acquire) {
+            slot.round_paused.store(true, Ordering::Release);
+            spin_until(
+                || !slot.pause_after_round.load(Ordering::Acquire),
+                "idle round checkpoint",
+            );
+            slot.round_paused.store(false, Ordering::Release);
+        }
     }
     114
 }
@@ -596,8 +623,7 @@ fn test_idle_kicks() -> (usize, usize) {
         );
         rounds += verified;
         waits += completed_waits;
-        scenario().kicks[target].stop.store(true, Ordering::Release);
-        scenario().kicks[target].wake.complete();
+        scenario().kicks[target].request_stop();
         let handle = handles[target].take().expect("idle kick handle missing");
         until(|| handle.try_join().is_some(), "kick-task-return");
         assert_eq!(handle.join().unwrap(), 114);
@@ -706,9 +732,12 @@ struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
-impl ::ktest::Fixture for ServiceFixture {
+impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
-    fn set_up(_: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
+    fn set_up(
+        _: &mut ::ktest::TestContext<'_>,
+        _: &super::SuiteBaseline,
+    ) -> Result<Self, ::ktest::TestError> {
         sched::test_migrate_to(0);
         let initial = super::baseline();
         let state = Arc::try_new(Scenario {
@@ -792,14 +821,8 @@ impl Scenario {
             self.account_wake.complete();
         }
         for slot in &self.kicks {
-            slot.stop.store(true, Ordering::Release);
-            let task = slot.task.lock().as_ref().map(Arc::clone);
-            if task
-                .as_ref()
-                .is_some_and(|task| sched::test_state(task) != State::Exited)
-            {
-                slot.wake.complete();
-            }
+            slot.pause_after_round.store(false, Ordering::Release);
+            slot.request_stop();
         }
         for id in 0..cpu::count() {
             clock::testing::cancel_program_pause(id);
@@ -822,7 +845,7 @@ impl ServiceFixture {
     }
 }
 
-#[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "time"), timeout_ms = 30000)]
+#[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "time"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
     /// 重新武装真实quantum后验证硬IRQ仅置请求、合法安全点切换与整数寄存器保存。
@@ -916,6 +939,45 @@ pub(crate) mod cases {
             assert_eq!(rounds, 4 * (cpu::count() - 1));
             assert!(rounds <= waits);
             Ok(())
+        })
+    }
+    /// 末轮执行者仍在原栈时发停止票；控制者失败后也必须真join且耗尽完成源。
+    #[test]
+    #[ktest(
+        min_cpus = 2,
+        ignore = "controlled idle coordinator failure must remain Fail after complete cleanup"
+    )]
+    fn idle_stop_during_round(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(|| {
+            let state = scenario();
+            let slot = &state.kicks[1];
+            slot.pause_after_round.store(true, Ordering::Release);
+            let worker = crate::ktest::spawn_result_on(1, |_| Ok(kick_worker(1)))
+                .expect("idle stop worker allocation failed");
+            until(
+                || {
+                    let observed = slot.task.lock().as_ref().map(Arc::clone);
+                    observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+                },
+                "idle stop worker prepared",
+            );
+            slot.timer_before.store(
+                cpu::get(1).timer_interrupts.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            slot.wake.complete();
+            spin_until(
+                || slot.round_paused.load(Ordering::Acquire),
+                "idle stop round paused",
+            );
+            slot.request_stop();
+            slot.pause_after_round.store(false, Ordering::Release);
+            until(|| worker.try_join().is_some(), "idle stop worker returned");
+            assert_eq!(worker.join().unwrap(), 114);
+            Err(::ktest::TestError("controlled idle coordinator failure"))
         })
     }
 }

@@ -170,8 +170,8 @@ fn test_records() {
                     assert_eq!(record.text().chars().count(), 170);
                     assert!(record.text().chars().all(|character| character == '界'));
                 }
-                2 => assert_eq!(record.text(), "X25 scheduler locked"),
-                3 => assert_eq!(record.text(), "X25 pool locked"),
+                // 锁内标签不是业务合同；下方独立环正文供宿主逐字节核对真实UART。
+                2 | 3 => {}
                 _ => assert_eq!(record.text(), "X25 precise timer"),
             }
         }
@@ -676,6 +676,24 @@ impl ::ktest::Fixture for ServiceFixture {
     }
 }
 
+impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
+    /// 普通日志suite复用同一具体case拥有；UART的独立Case仍使用Unit资源。
+    fn set_up(
+        context: &mut ::ktest::TestContext<'_>,
+        _: &super::SuiteBaseline,
+    ) -> Result<Self, ::ktest::TestError> {
+        <Self as ::ktest::Fixture<()>>::set_up(context, &())
+    }
+    /// suite账务不改变原printer、UART及Timer的具体停止次序。
+    fn quiesce(&mut self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
+        <Self as ::ktest::Fixture<()>>::quiesce(self, context)
+    }
+    /// case原拥有全部归还后，suite资源另承担跨例的最终账务。
+    fn tear_down(self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
+        <Self as ::ktest::Fixture<()>>::tear_down(self, context)
+    }
+}
+
 impl Scenario {
     /// 当前动作已退栈后一次释放真实printer停点与业务gate，不关闭端口TX或释放任何原owner。
     fn stop_sources(&self) {
@@ -706,7 +724,7 @@ impl ServiceFixture {
     }
 }
 
-#[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "klog"), timeout_ms = 30000)]
+#[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "klog"), timeout_ms = 30000)]
 pub(crate) mod records {
     use super::*;
     /// 五条真实Task/调度锁/pool锁/精确IRQ记录同环发表、零allocation_attempts并保持UTF8截断与独立游标。

@@ -7,7 +7,7 @@ mod printer;
 mod ring;
 
 pub use printer::initialize_service;
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub use printer::testing;
 pub(crate) use printer::wake_printer;
 pub use ring::{next_sequence, Cursor, ReadRecord, Record};

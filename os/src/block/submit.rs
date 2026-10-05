@@ -52,7 +52,7 @@ struct GenerationPlan {
     lengths: [usize; MAX_BATCH],
     cursors: [SegmentCursor; MAX_BATCH],
     count: usize,
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     splits: usize,
 }
 
@@ -126,7 +126,7 @@ impl Disk {
             let mut slot = self.reserve_slot()?;
             let plan = self.prepare_child(&mut slot, active, cursors, next)?;
             slot.publish()?;
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             self.record_generation(plan.splits, plan.count - 1);
             for part in 0..plan.count {
                 let index = plan.indices[part];
@@ -165,7 +165,7 @@ impl Disk {
             lengths: [0; MAX_BATCH],
             cursors,
             count: 0,
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             splits: 0,
         };
         if operation == BlkOperation::Flush {
@@ -212,7 +212,7 @@ impl Disk {
             plan.indices[plan.count] = index;
             plan.lengths[plan.count] = length;
             plan.count += 1;
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             {
                 plan.splits += usize::from(0 < accepted.offset);
             }

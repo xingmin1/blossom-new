@@ -1,6 +1,7 @@
 //! 页与原布局堆对象由具体 fixture 保活，真实迁核后在目的核归还。
 
 use crate::ktest::execution_core::{baseline, reclaimed, Baseline};
+use crate::ktest::execution_services::SuiteBaseline;
 use crate::ktest::{spawn_result, ChildHandle};
 use crate::mm::SLUB_SIZES as CLASSES;
 use crate::sync::SleepMutex;
@@ -217,9 +218,9 @@ struct Memory {
     state: Arc<Control>,
     handle: Option<ChildHandle>,
 }
-impl Fixture for Memory {
+impl Fixture<SuiteBaseline> for Memory {
     /// 记录槽先于主体捕获存在，任何页或原布局对象的归还权不会随主体panic消失。
-    fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+    fn set_up(_: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
         let initial = baseline()?;
         let state = Arc::try_new(Control {
             payload: SleepMutex::new(Payload {
@@ -327,7 +328,7 @@ fn consume(fixture: &mut Payload, migrate: bool, stop: &AtomicBool) {
     assert!(counts.hops + 3 <= counts.cpu_checks);
 }
 
-#[::ktest::suite(fixture = Memory, tags("execution", "mm"), timeout_ms = 20000)]
+#[::ktest::suite(fixture = Memory, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "mm"), timeout_ms = 20000)]
 pub(crate) mod memory {
     use super::*;
     /// 两轮本核真页、order3和十二堆类内容与归还，不要求多核或前例准备。

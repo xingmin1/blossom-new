@@ -4,8 +4,8 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{format_ident, quote, ToTokens};
 use syn::{
-    parse::Parser, punctuated::Punctuated, spanned::Spanned, Expr, FnArg, Item, ItemFn, ItemMod,
-    Lit, LitStr, Meta, ReturnType, Token, Type,
+    parse::Parser, punctuated::Punctuated, spanned::Spanned, visit::Visit, Expr, FnArg, Item,
+    ItemFn, ItemMod, Lit, LitStr, Meta, ReturnType, Token, Type,
 };
 
 /// 将内联 suite 模块展开为静态描述符与具体类型的生命周期 wrapper。
@@ -236,6 +236,19 @@ struct Test {
     fixture: bool,
 }
 
+struct AnonymousGeneric {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for AnonymousGeneric {
+    fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
+        self.found = true;
+    }
+
+    // 常量表达式中的局部函数不属于测试参数的匿名泛型。
+    fn visit_expr(&mut self, _: &'ast Expr) {}
+}
+
 /// 消费测试专用属性，保留作者函数及其断言不变。
 fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
     let signature = &function.sig;
@@ -246,6 +259,14 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
         || !signature.generics.params.is_empty()
         || signature.generics.where_clause.is_some()
         || signature.variadic.is_some()
+        || signature.inputs.iter().any(|argument| {
+            let FnArg::Typed(argument) = argument else {
+                return false;
+            };
+            let mut anonymous = AnonymousGeneric { found: false };
+            anonymous.visit_type(&argument.ty);
+            anonymous.found
+        })
     {
         return Err(syn::Error::new(
             signature.span(),

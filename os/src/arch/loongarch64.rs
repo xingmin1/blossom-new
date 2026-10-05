@@ -60,12 +60,12 @@ global_asm!(include_str!("loongarch64/switch.S"),
     context_sp = const offset_of!(TaskContext, sp),
     context_saved = const offset_of!(TaskContext, saved),
     word_size = const size_of::<usize>(),
-    execution_tests = const cfg!(any(feature = "execution-tests", feature = "ktest")) as usize,
+    execution_tests = const cfg!(feature = "ktest") as usize,
 );
 
 global_asm!(
     include_str!("loongarch64/idle.S"),
-    execution_tests = const cfg!(any(feature = "execution-tests", feature = "ktest")) as usize,
+    execution_tests = const cfg!(feature = "ktest") as usize,
 );
 extern "C" {
     static __direct_base: u8;
@@ -81,8 +81,7 @@ extern "C" {
     fn la_idle_once_asm(
         kick_pending: *const AtomicUsize,
         need_resched: *const AtomicBool,
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
-        wait_completions: *const AtomicUsize,
+        #[cfg(feature = "ktest")] wait_completions: *const AtomicUsize,
     );
     static la_idle_window_start: u8;
     static la_idle_window_end: u8;
@@ -307,7 +306,7 @@ pub fn wait_for_interrupt() {
 pub(crate) unsafe fn idle_once(
     kick_pending: &AtomicUsize,
     need_resched: &AtomicBool,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))] wait_completions: &AtomicUsize,
+    #[cfg(feature = "ktest")] wait_completions: &AtomicUsize,
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
     // SAFETY: 调用者保证本核稳定原子与无锁 scheduler 栈；汇编遵守整数 ABI，
@@ -315,9 +314,9 @@ pub(crate) unsafe fn idle_once(
     // 测试计数指针经 a2 传入；amadd_db.d 的输出 t1、增量 t0、地址 a2 互不重叠，
     // 64 位原子 RMW 的完整屏障与远端 Acquire 读取匹配，trap 保留全部参数和临时寄存器。
     unsafe {
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         la_idle_once_asm(kick_pending, need_resched, wait_completions);
-        #[cfg(not(any(feature = "execution-tests", feature = "ktest")))]
+        #[cfg(not(feature = "ktest"))]
         la_idle_once_asm(kick_pending, need_resched);
     };
     assert!(!irq_enabled(), "idle exit has IRQ enabled");
@@ -560,10 +559,7 @@ pub fn shutdown() -> ! {
         wait_for_interrupt();
     }
 }
-#[cfg(any(
-    feature = "ktest",
-    all(feature = "fault-test", not(feature = "refill-test"))
-))]
+#[cfg(feature = "ktest")]
 /// 触发明确的非法指令，保留真实 kernel fault 现场。
 pub fn trigger_fault() -> ! {
     // SAFETY: 此接口有意执行非法指令并由已安装的内核异常入口终止，不访问 Rust 内存。
@@ -573,7 +569,7 @@ pub fn trigger_fault() -> ! {
 }
 
 /// 读取 DMW 之外的低虚拟地址，触发真实 TLB refill 并保留 TLBRBADV 现场。
-#[cfg(any(feature = "refill-test", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn trigger_unmapped_fault() -> ! {
     // SAFETY: 两种引导入口均启用 PG；0x1000 不属于任何 DMW，内核没有安装低地址 TLB 映射。
     // 使用汇编执行故障 load，避免用 Rust 指针解引用表达无效地址访问。
@@ -645,9 +641,9 @@ extern "C" fn loongarch_refill(frame: &RefillFrame) -> ! {
     crate::console::fatal(frame.era & !1, frame.gpr[3], frame.era & 1, frame.badv)
 }
 
-#[cfg(any(feature = "boot-tests", feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 global_asm!(include_str!("loongarch64/register_test.S"));
-#[cfg(any(feature = "boot-tests", feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 extern "C" {
     /// 在有效本核计数器与异常入口下暂时改写寄存器，等待真实 timer IRQ 后恢复调用现场。
     fn la_test_register_preservation(
@@ -682,43 +678,14 @@ pub(crate) unsafe fn ktest_register_pattern(fp: bool, fcc: u8) -> bool {
     good && before < counter.load(Ordering::Acquire)
 }
 
-/// 以真实 timer 返回检查寄存器、FP/FCSR、全部 FCC 图样及 FP 关闭路径。
-///
-/// # Safety
-/// 必须在已安装本核 CpuLocal、异常入口和 timer IRQ 后调用，不得持有会被中断处理器获取的锁。
-/// 当前栈和计数器必须保持有效；此函数临时使能 IRQ，期间不得迁移 CPU。
-#[cfg(feature = "boot-tests")]
-pub unsafe fn test_register_preservation() -> bool {
-    let counter = &crate::cpu::current().timer_interrupts;
-    let saved = irq_save();
-    let ticks = ((counter_frequency() / 10000).max(0x600) as usize + 3) & !3;
-    let mut good = true;
-    for fcc in 0..256 {
-        // SAFETY: 调用者保证本核异常与 timer 已就绪；counter 来自永久本核对象，图样在八位范围内。
-        if unsafe { la_test_register_preservation(counter, ticks, fcc, 1) } == 0 {
-            good = false;
-            break;
-        }
-    }
-    // SAFETY: 同一永久本核计数器仍有效；FP 关闭图样使汇编跳过所有 FPR/FCSR/FCC 指令。
-    if unsafe { la_test_register_preservation(counter, ticks, 0, 0) } == 0 {
-        good = false;
-    }
-    // SAFETY: saved 来自本核 irq_save；汇编已经恢复本核现场，此函数未持锁且未迁移 CPU。
-    unsafe {
-        irq_restore(saved);
-    }
-    good
-}
-
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 extern "C" {
     /// 保留调用者整数现场，调用真实 yield 并检查恢复现场，期间不读写 KS0。
     fn la_test_task_context_preservation(yield_fn: usize) -> usize;
 }
 
 /// 在真实普通 Task 中检查 yield 的 callee-saved、栈及返回路径，并恢复调用者现场。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn test_task_context_preservation() -> bool {
     assert!(
         crate::task::current_task_id().is_some(),
@@ -734,7 +701,7 @@ pub fn test_task_context_preservation() -> bool {
 /// # Safety
 /// 本核异常入口、timer IRQ、CpuLocal 已安装；不得持锁或 guard，不得有活跃 FP 现场。
 /// 测试临时开放 IRQ 并覆盖本核 timer，期间不得调度或迁移。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) unsafe fn test_integer_register_preservation() -> usize {
     let saved = irq_save();
     let counter = &crate::cpu::current().timer_interrupts;

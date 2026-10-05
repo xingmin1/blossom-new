@@ -3,13 +3,9 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomPinned;
 use core::mem::size_of;
-#[cfg(feature = "memory-tests")]
-use core::mem::size_of_val;
 use core::slice;
 use core::sync::atomic::AtomicUsize;
 
-#[cfg(feature = "memory-tests")]
-use crate::boot::BootInfo;
 use crate::boot::MAX_MEMORY_REGIONS;
 use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
 use crate::mm::folio::FolioState;
@@ -224,7 +220,7 @@ pub(crate) struct PageMap<'a> {
     free: &'a [PageRange],
     stats: BootStats,
     present_sections: usize,
-    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     metadata: &'a [PageRange],
 }
 
@@ -271,7 +267,7 @@ impl<'a> PageMap<'a> {
     }
 
     /// 借用独立测试描述符与范围；不发布，也不授予物理页访问权限。
-    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_map(sections: &'a [Section<'a>], free: &'a [PageRange]) -> Self {
         Self {
             sections,
@@ -285,132 +281,6 @@ impl<'a> PageMap<'a> {
             present_sections: sections.iter().filter(|section| section.is_some()).count(),
             metadata: &[],
         }
-    }
-
-    /// 用实际启动资源逐 PFN 核对分类、空洞、保留资源和计数。
-    #[cfg(feature = "memory-tests")]
-    pub(crate) fn test_layout(&self, info: &BootInfo) -> bool {
-        let mut present = 0;
-        let mut reserved = 0;
-        let mut metadata = 0;
-        let mut free = 0;
-        let mut present_sections = 0;
-        for (section_index, section) in self.sections.iter().enumerate() {
-            let first = section_index * PAGES_PER_SECTION;
-            let mut section_has_ram = false;
-            for offset in 0..PAGES_PER_SECTION {
-                let pfn = first + offset;
-                let ram = page_is_ram(info, pfn);
-                section_has_ram |= ram;
-                let is_reserved = ram
-                    && info.reserved[..info.reserved_count].iter().any(|region| {
-                        region.start / PAGE_SIZE <= pfn && pfn < region.end.div_ceil(PAGE_SIZE)
-                    });
-                let is_metadata = contains(self.metadata, pfn);
-                let is_free = contains(self.free, pfn);
-                if ((is_reserved || !ram) && (is_metadata || is_free)) || (is_metadata && is_free) {
-                    return false;
-                }
-                let expected = if !ram {
-                    PageKind::Absent
-                } else if is_reserved {
-                    reserved += 1;
-                    PageKind::Reserved
-                } else if is_metadata {
-                    metadata += 1;
-                    PageKind::Metadata
-                } else {
-                    if !is_free {
-                        return false;
-                    }
-                    free += 1;
-                    PageKind::Available
-                };
-                if ram {
-                    present += 1;
-                }
-                match self.get(pfn) {
-                    Some(desc) if desc.kind() == expected => {}
-                    None if !ram && section.is_none() => {}
-                    _ => return false,
-                }
-            }
-            if section_has_ram != section.is_some() {
-                return false;
-            }
-            if let Some(descriptors) = section {
-                present_sections += 1;
-                if descriptors.len() != PAGES_PER_SECTION
-                    || !self
-                        .metadata_covers(descriptors.as_ptr() as usize, size_of_val(*descriptors))
-                {
-                    return false;
-                }
-            }
-        }
-        let mut previous_end = 0;
-        let mut listed_free = 0;
-        for range in self.free {
-            if range.end <= range.start || range.start < previous_end {
-                return false;
-            }
-            previous_end = range.end;
-            listed_free += range.end - range.start;
-        }
-        let maximum = info.memory[..info.memory_count]
-            .iter()
-            .filter_map(|region| {
-                let end = region.end / PAGE_SIZE;
-                end.checked_sub(1)
-                    .filter(|&pfn| page_is_ram(info, pfn))
-                    .map(|_| end)
-            })
-            .max()
-            .unwrap_or(0);
-        self.sections.len() == maximum.div_ceil(PAGES_PER_SECTION)
-            && self.get(self.sections.len() * PAGES_PER_SECTION).is_none()
-            && self.get(usize::MAX).is_none()
-            && present_sections == self.present_sections
-            && present == self.stats.present_pages
-            && reserved == self.stats.reserved_pages
-            && metadata == self.stats.metadata_pages
-            && free == self.stats.free_pages
-            && listed_free == free
-            && present == reserved + metadata + free
-            && self.resource_is_reserved(crate::boot::kernel_region())
-            && self.resource_is_reserved(info.dtb)
-            && self.metadata_covers(self.sections.as_ptr() as usize, size_of_val(self.sections))
-            && self.metadata_covers(self.free.as_ptr() as usize, size_of_val(self.free))
-            && self.metadata_covers(self.metadata.as_ptr() as usize, size_of_val(self.metadata))
-    }
-
-    /// 核对静态内核资源与 DTB 的 RAM 交集不出现在自由范围中。
-    #[cfg(feature = "memory-tests")]
-    fn resource_is_reserved(&self, region: crate::boot::Region) -> bool {
-        if region.start == region.end {
-            return true;
-        }
-        (region.start / PAGE_SIZE..region.end.div_ceil(PAGE_SIZE)).all(|pfn| {
-            !contains(self.free, pfn)
-                && self
-                    .get(pfn)
-                    .is_none_or(|desc| matches!(desc.kind(), PageKind::Absent | PageKind::Reserved))
-        })
-    }
-
-    /// 核对永久控制对象的每个 backing 页均由元数据分类覆盖。
-    #[cfg(feature = "memory-tests")]
-    fn metadata_covers(&self, address: usize, bytes: usize) -> bool {
-        if bytes == 0 {
-            return true;
-        }
-        let physical = crate::arch::virt_to_phys(address);
-        (physical / PAGE_SIZE..(physical + bytes).div_ceil(PAGE_SIZE)).all(|pfn| {
-            self.get(pfn)
-                .is_some_and(|desc| desc.kind() == PageKind::Metadata)
-                && contains(self.metadata, pfn)
-                && !contains(self.free, pfn)
-        })
     }
 }
 
@@ -428,34 +298,6 @@ fn cursor_contains(ranges: &[PageRange], cursor: &mut usize, pfn: usize) -> bool
         *cursor += 1;
     }
     *cursor < ranges.len() && ranges[*cursor].start <= pfn
-}
-
-/// 检查测试快照中是否存在包含该 PFN 的范围。
-#[cfg(feature = "memory-tests")]
-fn contains(ranges: &[PageRange], pfn: usize) -> bool {
-    ranges
-        .iter()
-        .any(|range| range.start <= pfn && pfn < range.end)
-}
-
-/// 从原始字节资源的覆盖关系判断整页 RAM，允许相邻未对齐资源共同覆盖一页。
-#[cfg(feature = "memory-tests")]
-fn page_is_ram(info: &BootInfo, pfn: usize) -> bool {
-    let mut covered = pfn * PAGE_SIZE;
-    let end = covered + PAGE_SIZE;
-    while covered < end {
-        let next = info.memory[..info.memory_count]
-            .iter()
-            .filter(|region| region.start <= covered && covered < region.end)
-            .map(|region| region.end)
-            .max()
-            .unwrap_or(covered);
-        if next == covered {
-            return false;
-        }
-        covered = next;
-    }
-    true
 }
 
 /// 在独占 backing 中逐项写入范围后，创建永久只读快照。
@@ -519,7 +361,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     let root_bytes = section_bytes
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
-    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     let root_bytes = root_bytes
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
@@ -587,7 +429,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     // SAFETY: root 后部留有 RANGE_CAPACITY 个对齐槽，不与 sections 重叠；
     // BootMemory 的范围容量不超过该上界，写完后仅发布只读引用。
     let free = unsafe { write_ranges(root_address + section_bytes, memory.free()) };
-    #[cfg(any(feature = "memory-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     // SAFETY: 测试布局额外预留另一组 RANGE_CAPACITY 槽，与根和 free 快照不重叠。
     let metadata = unsafe {
         write_ranges(
@@ -600,7 +442,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
         free,
         stats: memory.stats(),
         present_sections,
-        #[cfg(any(feature = "memory-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         metadata,
     })
 }

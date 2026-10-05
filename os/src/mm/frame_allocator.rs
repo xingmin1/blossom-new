@@ -72,8 +72,6 @@ impl Drop for OwnedPages {
 /// 不足或阶数超限返回 None，不睡眠或自动回收；清零在全部锁及 IRQ guard 退出后执行。
 /// 内存验收武装时，成功清零的普通 BSP 调用还须在锁外等待对应 AP 同票完成，才允许返回。
 pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
-    #[cfg(feature = "memory-tests")]
-    let mut window = crate::mm::tests::AllocationWindow::enter();
     #[cfg(feature = "ktest")]
     let mut test_window = crate::mm::ktest::AllocationWindow::enter();
     let block = if order == 0 {
@@ -84,8 +82,6 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
     let mut pages = OwnedPages { block };
     if zeroed {
         let len = pages.len();
-        #[cfg(feature = "memory-tests")]
-        window.arm_timer();
         #[cfg(feature = "ktest")]
         test_window.arm_timer();
         // SAFETY: 页入口返回已离开全部空闲链的真实连续 RAM 块，当前拥有者独占
@@ -93,77 +89,4 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
         unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0, len) };
     }
     Some(pages)
-}
-
-/// 在 BSP 独占期间检查各阶拥有、真实分类与清零，计入缓存并在排空后核对 buddy 账务。
-#[cfg(feature = "memory-tests")]
-pub(crate) fn test_owned_pages() -> bool {
-    use crate::mm::page::PageKind;
-    use crate::mm::{alloc_pages, drain_all_pages, OwnedPages};
-
-    drain_all_pages();
-    let initial = buddy::free_pages();
-    if alloc_pages(buddy::MAX_ORDER + 1, false).is_some()
-        || alloc_pages(usize::MAX, true).is_some()
-        || buddy::free_pages() + pcp::cached_pages() != initial
-    {
-        return false;
-    }
-    let mut held: [Option<OwnedPages>; buddy::MAX_ORDER + 1] =
-        [const { None }; buddy::MAX_ORDER + 1];
-    let mut allocated = 0;
-    for order in 0..=buddy::MAX_ORDER {
-        let Some(mut pages) = alloc_pages(order, false) else {
-            return false;
-        };
-        let len = PAGE_SIZE << order;
-        let start = pages.phys_addr();
-        if pages.order() != order || pages.len() != len || start % len != 0 {
-            return false;
-        }
-        for pfn in start / PAGE_SIZE..start / PAGE_SIZE + (1 << order) {
-            if crate::mm::pages().get(pfn).map(|page| page.kind()) != Some(PageKind::Available) {
-                return false;
-            }
-        }
-        for other in held.iter().flatten() {
-            if start < other.phys_addr() + other.len() && other.phys_addr() < start + len {
-                return false;
-            }
-        }
-        // SAFETY: pages 独占真实连续块且 len 是完整长度；只写入原始字节，
-        // 不从尚未初始化的页构造正常引用；写入结束后才允许归还。
-        unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0xa5, len) };
-        allocated += 1 << order;
-        if buddy::free_pages() + pcp::cached_pages() != initial - allocated {
-            return false;
-        }
-        held[order] = Some(pages);
-    }
-    for slot in held.iter_mut().rev() {
-        drop(slot.take());
-    }
-    if buddy::free_pages() + pcp::cached_pages() != initial {
-        return false;
-    }
-    for order in 0..=buddy::MAX_ORDER {
-        let Some(mut pages) = alloc_pages(order, true) else {
-            return false;
-        };
-        let len = pages.len();
-        // SAFETY: 此调用点明确请求 zeroed，生产入口已写满 len 字节；pages 在
-        // 读取期间持有唯一拥有权且没有并发写者，切片借用在归还前结束。
-        let bytes = unsafe { core::slice::from_raw_parts(pages.as_mut_ptr().cast::<u8>(), len) };
-        if bytes.iter().any(|byte| *byte != 0)
-            || buddy::free_pages() + pcp::cached_pages() != initial - (1 << order)
-        {
-            return false;
-        }
-        drop(pages);
-        if buddy::free_pages() + pcp::cached_pages() != initial {
-            return false;
-        }
-    }
-    drain_all_pages();
-    buddy::free_pages() == initial
 }

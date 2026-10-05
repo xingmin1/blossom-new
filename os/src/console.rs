@@ -16,7 +16,7 @@ const DATA_READY: u8 = 1;
 const TRANSMIT_READY: u8 = 0x20;
 const RECEIVE_INTERRUPT: u8 = 1;
 const TRANSMIT_INTERRUPT: u8 = 2;
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 const THRE_INTERRUPT: u8 = 2;
 const TX_BUDGET: usize = 16;
 
@@ -101,14 +101,8 @@ fn emergency_writer() -> impl Write {
     }
 }
 
-/// 用可控 LSR 输入验证真实应急 writer 的停止条件和跨字节、跨字符串预算，不访问硬件。
-#[cfg(any(feature = "boot-tests", feature = "ktest"))]
-pub fn test_emergency_budget() -> bool {
-    (0..3).all(emergency_budget)
-}
-
 /// 独立验证一种真实 writer 预算场景，不将多个旧断言组绑定为一个测试实例。
-#[cfg(any(feature = "boot-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 fn emergency_budget(mode: u8) -> bool {
     match mode {
         0 => {
@@ -220,15 +214,9 @@ pub(crate) fn ktest_disable_receive_interrupts() {
 }
 
 /// 真实故障控制者使用整条消息的有界预算，不等待 PORT 或任何任务进度。
-#[cfg(any(feature = "ktest", feature = "execution-tests"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn emergency_write(arguments: fmt::Arguments<'_>) {
     let _ = emergency_writer().write_fmt(arguments);
-}
-
-/// 测试协议复用原始同步输出，不将测试标记送入普通日志环。
-#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
-pub fn test_write(arguments: fmt::Arguments<'_>) {
-    early_write(arguments);
 }
 
 /// 在端口短锁内最多提交十六个实际可接受字节，无等待、格式化或换行转换。
@@ -242,7 +230,7 @@ pub fn try_write(bytes: &[u8]) -> usize {
         write_register(DATA, byte);
         accepted += 1;
     }
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     {
         testing::COUNTERS
             .accepted
@@ -280,7 +268,7 @@ pub fn enable_receive_interrupts() {
 }
 
 /// 在同步注销 action 前停止 UART 的 RX/TX 中断产生，不消费 FIFO 中的待收字节。
-#[cfg(any(feature = "boot-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn disable_interrupts() {
     let _port = PORT.lock();
     write_register(IER, 0);
@@ -335,7 +323,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
         let notify_tx = ier & TRANSMIT_INTERRUPT != 0 && ready;
         if notify_tx {
             write_register(IER, ier & !TRANSMIT_INTERRUPT);
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             if first_interrupt == THRE_INTERRUPT || last_interrupt == THRE_INTERRUPT {
                 testing::COUNTERS
                     .tx_interrupts
@@ -348,7 +336,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     };
     if notify_tx {
         let woken = TX_WAIT.wake_all();
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         testing::COUNTERS.wakes.fetch_add(woken, Ordering::Relaxed);
         let _ = woken;
     }
@@ -366,7 +354,7 @@ pub fn last_byte() -> u8 {
 }
 
 /// 测试仅观察硬件已到达的数据，不从轮询路径消费 RX。
-#[cfg(any(feature = "boot-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn receive_pending() -> bool {
     let _port = PORT.lock();
     read_register(LSR) & DATA_READY != 0
@@ -402,18 +390,8 @@ macro_rules! early_println {
     };
 }
 
-/// 使用原始同步串口输出测试协议，不存在普通日志的兼容别名。
-#[cfg(any(feature = "boot-tests", feature = "execution-tests"))]
-#[macro_export]
-macro_rules! test_println {
-    () => { $crate::console::test_write(format_args!("\n")) };
-    ($($argument:tt)*) => {
-        $crate::console::test_write(format_args!("{}\n", format_args!($($argument)*)))
-    };
-}
-
 /// 测试观察唯一真实端口活动；ktest 另保存可移动的 default action 责任，不建立第二套驱动。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub mod testing {
     /// 测试故障现场复用原始应急消息预算，不取端口锁、时间或任务信息。
     pub fn emergency_write(arguments: fmt::Arguments<'_>) {
@@ -471,7 +449,7 @@ pub mod testing {
         super::emergency_budget(mode)
     }
 
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(super) struct Counters {
         pub(super) accepted: AtomicUsize,
         pub(super) zero_writes: AtomicUsize,
@@ -479,7 +457,7 @@ pub mod testing {
         pub(super) wakes: AtomicUsize,
     }
 
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(super) static COUNTERS: Counters = Counters {
         accepted: AtomicUsize::new(0),
         zero_writes: AtomicUsize::new(0),
@@ -487,7 +465,7 @@ pub mod testing {
         wakes: AtomicUsize::new(0),
     };
 
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     #[derive(Clone, Copy)]
     pub struct Snapshot {
         pub accepted: usize,
@@ -497,7 +475,7 @@ pub mod testing {
     }
 
     /// 读取实际接受、拒写、THRE 中断与成功通知计数，不读取或消费 RX。
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub fn snapshot() -> Snapshot {
         Snapshot {
             accepted: COUNTERS.accepted.load(Ordering::Relaxed),

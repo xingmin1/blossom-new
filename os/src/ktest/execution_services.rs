@@ -19,6 +19,32 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) type Baseline = (mm::MemoryStats, crate::workqueue::testing::MetadataStats);
 
+/// 套件准备后到最后用例控制对象释放后，实际比较跨例的内存与任务资源账。
+pub(crate) struct SuiteBaseline(Baseline);
+
+impl ::ktest::Fixture for SuiteBaseline {
+    /// 常驻服务停稳后保存实际六域和元数据基线，不持有或重置生产资源。
+    fn set_up(context: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
+        let initial = baseline();
+        context.diagnostic(format_args!("EXECUTION SUITE initial={:?}", initial));
+        Ok(Self(initial))
+    }
+
+    /// 原suite作用域已join后检查全部case控制对象归还，保真实前后值用于定位。
+    fn tear_down(self, context: &mut ::ktest::TestContext<'_>) -> TestResult {
+        let actual = baseline();
+        context.diagnostic(format_args!(
+            "EXECUTION SUITE initial={:?} final={:?}",
+            self.0, actual
+        ));
+        if actual == self.0 {
+            Ok(())
+        } else {
+            Err(TestError("execution suite resources did not converge"))
+        }
+    }
+}
+
 /// 只沿原始硬件counter限制协调等待，生产进度仍经过真实IRQ、等待源与scheduler。
 pub(crate) fn wait(mut predicate: impl FnMut() -> bool, name: &'static str) -> TestResult {
     let end = arch::read_counter()

@@ -82,7 +82,7 @@ global_asm!(include_str!("riscv64/switch.S"),
     context_sp = const offset_of!(TaskContext, sp),
     context_saved = const offset_of!(TaskContext, saved),
     word = const size_of::<usize>(),
-    execution_tests = const cfg!(any(feature = "execution-tests", feature = "ktest")) as usize,
+    execution_tests = const cfg!(feature = "ktest") as usize,
     yield_now = sym crate::sched::yield_now);
 
 extern "C" {
@@ -111,7 +111,7 @@ pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     unsafe { rv_switch_context(prev, next) };
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 extern "C" {
     /// 按普通调用 ABI 保存调用者寄存器，跨真实 yield 校验整数现场并恢复调用者。
     ///
@@ -121,7 +121,7 @@ extern "C" {
 }
 
 /// 在可调度的普通 Task 中跨真实 yield 检验全部 callee-saved、SP 与返回地址。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn test_task_context_preservation() -> bool {
     // SAFETY: Rust 入口提供对齐普通调用栈；生产 yield 统一检查 Task、IRQ 和原子上下文，
     // switch_context 检查 FS Off；汇编恢复调用者 callee-saved，并始终保留目的 CPU 的 tp。
@@ -479,14 +479,14 @@ pub fn wait_for_interrupt() {
 pub(crate) unsafe fn idle_once(
     kick_pending: &AtomicUsize,
     need_resched: &AtomicBool,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))] wait_completions: &AtomicUsize,
+    #[cfg(feature = "ktest")] wait_completions: &AtomicUsize,
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
     if kick_pending.load(Ordering::Acquire) == 0 && !need_resched.load(Ordering::Acquire) {
         // SAFETY: 调用者保证 S-mode、本核有效 trap 栈与独立使能的 IRQ 源。
         // WFI 在全局 SIE 关闭时仍由独立使能源的 pending 唤醒，通知不会在检查与等待间被消费。
         unsafe { asm!("wfi", options(nostack)) };
-        #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         wait_completions.fetch_add(1, Ordering::Release);
     }
     // SAFETY: 调用者保证无锁且可服务 IRQ；无论是否执行 WFI 都开放一次处理 pending，
@@ -677,7 +677,7 @@ pub fn shutdown() -> ! {
     sbi(0x53525354, 0, 0, 0, 0).expect("SBI SRST failed");
     panic!("SBI SRST unexpectedly returned");
 }
-#[cfg(any(feature = "fault-test", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 /// 触发真实非法指令异常供现场诊断。
 pub fn trigger_fault() -> ! {
     // SAFETY: 内核 trap 已安装；非法指令进入诊断入口并终止执行，不返回 Rust。
@@ -733,9 +733,9 @@ extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
     }
 }
 
-#[cfg(any(feature = "boot-tests", feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 global_asm!(include_str!("riscv64/registers.S"));
-#[cfg(any(feature = "boot-tests", feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 extern "C" {
     /// 按整数调用 ABI 临时启用 IRQ，等待本核计数器推进并检验寄存器现场。
     ///
@@ -769,38 +769,12 @@ pub(crate) unsafe fn ktest_register_pattern(fp: bool, _fcc: u8) -> bool {
     good && expected <= counter.load(Ordering::Acquire)
 }
 
-/// 真实 timer 异常验证 GPR/SP/TP 以及启用/关闭 FP 两种现场。
-///
-/// # Safety
-/// 只能在本核 trap/timer 已安装、CpuLocal 永久有效且未持有 IRQ-save 锁时调用；
-/// 当前不能有活跃浮点上下文，QEMU CPU 必须支持 D，测试会启用 IRQ 并临时覆盖 timer。
-#[cfg(feature = "boot-tests")]
-pub unsafe fn test_register_preservation() -> bool {
-    use core::sync::atomic::Ordering;
-    let saved = irq_save();
-    let mut success = true;
-    for fp in [0, 1] {
-        let counter = &crate::cpu::current().timer_interrupts;
-        let expected = counter.load(Ordering::Acquire) + 1;
-        program_timer(read_counter() + counter_frequency() / 100);
-        // SAFETY: counter 来自永久本核对象且按 AtomicUsize 对齐；调用者保证 timer
-        // trap 可运行、没有活跃浮点上下文，汇编遵守整数 ABI 并恢复原 sstatus/FCSR。
-        success &= unsafe { rv_register_roundtrip(counter, expected, fp) } != 0;
-        success &= counter.load(Ordering::Acquire) == expected;
-    }
-    // SAFETY: saved 在本函数同核保存，汇编测试已返回且没有尚未释放的临界区锁。
-    unsafe {
-        irq_restore(saved);
-    }
-    success
-}
-
 /// 在普通 Task 内以两次真实 timer trap 检验整数、SP、TP 与返回路径，不启用 FP。
 ///
 /// # Safety
 /// 本核 trap/timer/CpuLocal 已安装；不得持锁或 guard，不得有活跃 FP 现场。
 /// 测试临时打开 IRQ 且改写本核 timer，期间不得切换或迁移任务。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) unsafe fn test_integer_register_preservation() -> usize {
     let saved = irq_save();
     let counter = &crate::cpu::current().timer_interrupts;

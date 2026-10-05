@@ -380,9 +380,12 @@ struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
-impl ::ktest::Fixture for ServiceFixture {
+impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
-    fn set_up(_: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
+    fn set_up(
+        _: &mut ::ktest::TestContext<'_>,
+        _: &super::SuiteBaseline,
+    ) -> Result<Self, ::ktest::TestError> {
         let initial = super::baseline();
         let state = Arc::try_new(Scenario {
             nodes: super::Nodes::new(MAX_CPUS, MAX_CPUS, 0, 1)?,
@@ -454,7 +457,7 @@ impl ServiceFixture {
     }
 }
 
-#[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "integration", "klog"), timeout_ms = 45000)]
+#[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "integration", "klog"), timeout_ms = 45000)]
 pub(crate) mod cases {
     use super::*;
     /// 全部PreparedChild和原节点先准备后发表；每核八轮timer/work/Task完成与所有容量内日志逐条守恒。

@@ -9,16 +9,14 @@ pub(crate) mod ktest;
 mod page;
 mod pcp;
 mod slub;
-#[cfg(feature = "memory-tests")]
-pub(crate) mod tests;
 
 pub(crate) use bootmem::PAGE_SIZE;
 pub use folio::{FolioRead, FolioRef};
 pub use frame_allocator::{alloc_pages, OwnedPages};
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) use heap_allocator::allocation_attempts;
 pub use pcp::drain_all_pages;
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) use slub::SIZES as SLUB_SIZES;
 pub use slub::{flush_all, shrink_all};
 
@@ -73,14 +71,6 @@ pub unsafe fn initialize(info: &BootInfo) {
         MEMORY.get().is_none(),
         "physical memory is already initialized"
     );
-    #[cfg(feature = "memory-tests")]
-    {
-        assert!(
-            bootmem::test_input_boundaries(),
-            "memory boot range checks failed"
-        );
-        crate::early_println!("PASS memory-boot-ranges");
-    }
 
     let mut memory = BootMemory::new(info)
         .unwrap_or_else(|error| panic!("memory boot range initialization failed: {}", error));
@@ -101,12 +91,6 @@ pub unsafe fn initialize(info: &BootInfo) {
     map.present_sections(),
     size_of::<PageDesc>());
 
-    #[cfg(feature = "memory-tests")]
-    {
-        assert!(map.test_layout(info), "memory page map checks failed");
-        crate::early_println!("PASS memory-page-map");
-    }
-
     // SAFETY: 调用者保证 BSP 唯一初始化、IRQ 关闭且 AP 未释放；map 及全部
     // 描述符已永久发布，最终 free 范围尚未交给其他 owner，也没有并发分配或归还。
     unsafe { buddy::initialize(map) };
@@ -124,18 +108,4 @@ pub unsafe fn initialize(info: &BootInfo) {
     // SAFETY: 永久描述符、buddy 与 PCP 均已建立；BSP 仍独占启动，IRQ 关闭、
     // AP 未释放且没有 SLUB 对象使用者，仅一次构造固定 cache/CPU/node 控制对象。
     unsafe { slub::initialize() };
-
-    #[cfg(feature = "memory-tests")]
-    {
-        assert!(
-            buddy::test_orders_and_fragmentation(),
-            "memory buddy checks failed"
-        );
-        crate::early_println!("PASS memory-buddy");
-        assert!(
-            frame_allocator::test_owned_pages(),
-            "memory owned pages checks failed"
-        );
-        crate::early_println!("PASS memory-owned-pages");
-    }
 }

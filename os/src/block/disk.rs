@@ -57,9 +57,9 @@ pub(super) struct QueueState {
     pub(super) mounts: usize,
     pub(super) slot_states: Vec<SlotState>,
     pub(super) heads: Vec<Option<u16>>,
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     counters: TestSnapshot,
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     test_paused: bool,
     #[cfg(feature = "ktest")]
     pub(super) ktest_stop: StopTestState,
@@ -132,7 +132,7 @@ unsafe impl Send for Disk {}
 unsafe impl Sync for Disk {}
 
 /// 仅验收镜像保存真实队列事件计数，不参与正常请求协议。
-#[cfg(any(feature = "storage-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TestSnapshot {
     pub submitted: usize,
@@ -175,13 +175,13 @@ impl Disk {
             device,
             workqueue,
             limits,
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             None,
         )
     }
 
     /// 只有构造期能降低测试限额，固定 Disk 发表后不再修改共享能力。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_prepare_with_limits(
         device: VirtioDevice,
         workqueue: &WorkQueue,
@@ -211,13 +211,13 @@ impl Disk {
             device,
             workqueue,
             limits,
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             None,
         )
     }
 
     /// 串行验收通过本次调用的栈输出保存实际 SG reserve 失败，不武装全局分配器。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_prepare_observed(
         device: VirtioDevice,
         workqueue: &WorkQueue,
@@ -233,7 +233,7 @@ impl Disk {
         device: VirtioDevice,
         workqueue: &WorkQueue,
         limits: QueueLimits,
-        #[cfg(any(feature = "storage-tests", feature = "ktest"))] mut observation: Option<
+        #[cfg(feature = "ktest")] mut observation: Option<
             &mut Option<(u16, crate::drivers::virtio::TestPrepareSnapshot)>,
         >,
     ) -> Result<DiskRef, BlockError> {
@@ -258,7 +258,7 @@ impl Disk {
         for tag in 0..limits.tag_count {
             let mut sg = Vec::new();
             sg.try_reserve_exact(limits.max_segments).map_err(|_| {
-                #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 if let Some(output) = observation.as_deref_mut() {
                     // 此时前三张固定表已成功，device 尚未移入 Disk，未登记 IRQ 或发表队列。
                     *output = Some((tag, device.test_prepare_snapshot()));
@@ -299,9 +299,9 @@ impl Disk {
                 mounts: 0,
                 slot_states,
                 heads,
-                #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 counters: TestSnapshot::default(),
-                #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 test_paused: false,
                 #[cfg(feature = "ktest")]
                 ktest_stop: StopTestState::default(),
@@ -537,7 +537,7 @@ impl Disk {
         {
             let mut q = self.queue.lock();
             q.notify_active -= 1;
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             {
                 q.counters.notifications += 1;
             }
@@ -625,7 +625,7 @@ impl Disk {
             if !q.accepts_children() {
                 return;
             }
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             if q.test_paused {
                 return;
             }
@@ -688,7 +688,7 @@ impl Disk {
                         .driver_mut()
                 }
                 .enable_interrupts_and_recheck();
-                #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 if continuation {
                     q.counters.budget_continuations += 1;
                 }
@@ -773,7 +773,7 @@ impl Disk {
             {
                 q.ktest_stop.finished += 1;
             }
-            #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             {
                 q.counters.completed += 1;
                 q.counters.inflight -= 1;
@@ -810,13 +810,13 @@ impl Disk {
     }
 
     /// 返回验收镜像的真实计数快照，不读取活动 DMA。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_snapshot(&self) -> TestSnapshot {
         self.queue.lock().counters
     }
 
     /// 只在本例全部请求和回调结束后捕获实际 Work 票尾，不能用 idle 或定长sleep代替。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_flush_completions(&self) {
         if let Some(work) = &self.progress_work {
             work.as_ref().flush();
@@ -829,7 +829,7 @@ impl Disk {
     }
 
     /// 成功发表后才累计额外 child 与跨 Bio 合并的真实数量。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(super) fn record_generation(&self, splits: usize, merges: usize) {
         let mut q = self.queue.lock();
         q.counters.splits += splits;
@@ -837,7 +837,7 @@ impl Disk {
     }
 
     /// 暂停本 queue 的完成消费，仍确认真实 ISR，不 mask 共享源也不伪造 used。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_suspend_completions(&self) {
         let mut q = self.queue.lock();
         assert!(q.accepts_children(), "pausing a stopped disk");
@@ -853,7 +853,7 @@ impl Disk {
     }
 
     /// 重装真实 queue flags 后复查已发表的 used，用预建 Work 保证恢复进度。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_resume_completions(&self) {
         let pending = {
             let mut q = self.queue.lock();
@@ -876,7 +876,7 @@ impl Disk {
     }
 
     /// 已有真实 used 时交预建进度 Work；保持 NO_INTERRUPT 到生产 drain 重装。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_resume_via_progress(&self) {
         self.queue.lock().test_paused = false;
         self.queue_progress();
@@ -908,7 +908,7 @@ impl Disk {
 
     /// 只在登记后复查仍无额度、即将调用真实 park 时计数。
     fn count_park(&self) {
-        #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+        #[cfg(feature = "ktest")]
         {
             self.queue.lock().counters.resource_parks += 1;
         }
@@ -1156,7 +1156,7 @@ impl PreparingSlot<'_> {
                         }
                     }
                 }
-                #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+                #[cfg(feature = "ktest")]
                 {
                     q.counters.submitted += 1;
                     q.counters.inflight += 1;

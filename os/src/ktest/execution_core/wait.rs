@@ -1,6 +1,7 @@
 //! 每例独立的源队列、原Task观察、完成token、互斥占有与真实OOM压力。
 
 use crate::ktest::execution_core::{baseline, reclaimed, Baseline};
+use crate::ktest::execution_services::SuiteBaseline;
 use crate::ktest::{spawn_result, spawn_result_on, ChildHandle, ChildToken};
 use crate::mm::SLUB_SIZES as CLASSES;
 use crate::sync::{Completion, SleepMutex, SpinLock};
@@ -144,9 +145,9 @@ struct Waiting {
     objects: Vec<HeapOwner>,
     oom_pages: Option<usize>,
 }
-impl Fixture for Waiting {
+impl Fixture<SuiteBaseline> for Waiting {
     /// 每case全新源与计数；只有OOM例在仍有内存时预备全部压力拥有槽。
-    fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+    fn set_up(context: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
         let initial = baseline()?;
         let state = Arc::try_new(Control {
             slots: core::array::from_fn(|_| Slot::new()),
@@ -583,7 +584,7 @@ fn page_total() -> usize {
     stats.buddy_free_pages + stats.pcp_cached_pages + stats.slab_backing_pages
 }
 
-#[::ktest::suite(fixture = Waiting, tags("execution", "wait"), timeout_ms = 20000)]
+#[::ktest::suite(fixture = Waiting, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "wait"), timeout_ms = 20000)]
 pub(crate) mod queue {
     use super::*;
     /// 四个生产Task共32次真实恢复，active最大一且ready成员不会重复。
@@ -858,7 +859,7 @@ pub(crate) mod queue {
     }
 }
 
-#[::ktest::suite(fixture = Waiting, tags("execution", "sync"), timeout_ms = 20000)]
+#[::ktest::suite(fixture = Waiting, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "sync"), timeout_ms = 20000)]
 pub(crate) mod mutex {
     use super::*;
     /// 四真实竞争者在Acquire/Release下更新非原子payload，持guard park也不移交占有。

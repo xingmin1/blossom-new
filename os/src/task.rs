@@ -17,7 +17,7 @@ use crate::time::Duration;
 use crate::wait::{WaitId, WaitNode, WaitQueue, Waiter};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 static LIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +70,7 @@ pub(crate) struct Scheduling {
     pub live_next: *const Task,
     pub ready_previous: *const Task,
     pub ready_next: *const Task,
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub next_cpu: Option<usize>,
 }
 
@@ -172,7 +172,7 @@ impl Task {
     }
 }
 
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 impl Drop for Task {
     /// 真正最后强拥有或未发表 Arc 分配失败归还 payload，克隆及弱观察不计。
     fn drop(&mut self) {
@@ -181,7 +181,7 @@ impl Drop for Task {
 }
 
 /// 仅供停稳后的真实 metadata 收敛观察，不代表弱控制块或栈 backing 已释放。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn test_live_tasks() -> usize {
     LIVE_TASKS.load(Ordering::Relaxed)
 }
@@ -330,7 +330,7 @@ fn prepare(
             live_next: ptr::null(),
             ready_previous: ptr::null(),
             ready_next: ptr::null(),
-            #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+            #[cfg(feature = "ktest")]
             next_cpu: None,
         }),
         resources: UnsafeCell::new(Resources {
@@ -345,7 +345,7 @@ fn prepare(
         ktest_scope: AtomicPtr::new(ptr::null_mut()),
     };
     // 完整 value 在 fallible Arc 分配前计入，失败时普通 Drop 精确配对。
-    #[cfg(any(feature = "execution-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     LIVE_TASKS.fetch_add(1, Ordering::Relaxed);
     let task = Arc::try_new(value)?;
     Ok(PreparedTask {
@@ -398,7 +398,7 @@ pub fn current_task_id() -> Option<TaskId> {
 }
 
 /// 在当前普通任务中取得真实执行栈的物理范围，不导出栈借用或拥有权。
-#[cfg(any(feature = "execution-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub fn test_current_stack_range() -> (usize, usize) {
     let _irq = IrqSaveGuard::new();
     let task = current_task();

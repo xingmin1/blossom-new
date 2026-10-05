@@ -38,6 +38,29 @@ fn rejects_unsupported_signatures() {
     }
 }
 
+/// 匿名泛型同样不属于有限作者签名，引用或括号不能绕过宏边界。
+#[test]
+fn rejects_anonymous_generic_parameters() {
+    for parameter in [
+        quote!(impl core::fmt::Debug),
+        quote!(&impl core::fmt::Debug),
+        quote!(&mut impl core::fmt::Debug),
+        quote!((impl core::fmt::Debug)),
+    ] {
+        assert!(expand(
+            quote!(),
+            quote!(
+                mod tests {
+                    #[test]
+                    #[case("one", 1u32)]
+                    fn example(value: #parameter) {}
+                }
+            )
+        )
+        .is_err());
+    }
+}
+
 /// 参数名重名与包含分隔符都会使外部身份产生歧义。
 #[test]
 fn rejects_ambiguous_parameter_instances() {

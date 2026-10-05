@@ -216,7 +216,7 @@ impl BioCompletion {
     }
 
     /// 验收等待已预备父 finalizer 的真实票尾，不以 ready 推测 worker 已返还。
-    #[cfg(any(feature = "storage-tests", feature = "ktest"))]
+    #[cfg(feature = "ktest")]
     pub(crate) fn test_flush_finalizer(&self) {
         if let Some(work) = &self.inner.finalizer_work {
             work.as_ref().flush();

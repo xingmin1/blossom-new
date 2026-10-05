@@ -181,7 +181,7 @@ pub(crate) fn cached_pages() -> usize {
 }
 
 /// 持指定 CPU 的 PCP 锁读取真实缓存计数，不将并发快照当成全局账务。
-#[cfg(any(feature = "memory-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn cpu_cached_pages(cpu: usize) -> usize {
     assert!(cpu < cpu::count(), "PCP CPU index is out of range");
     PAGESETS.get().expect("PCP is not initialized")[cpu]
@@ -190,7 +190,7 @@ pub(crate) fn cpu_cached_pages(cpu: usize) -> usize {
 }
 
 /// 提供生产固定参数供正常流测试核对真实 partial refill 与 high 边界。
-#[cfg(any(feature = "memory-tests", feature = "ktest"))]
+#[cfg(feature = "ktest")]
 pub(crate) fn parameters() -> (usize, usize) {
     let pageset = PAGESETS.get().expect("PCP is not initialized")[0].lock();
     (pageset.batch, pageset.high)
