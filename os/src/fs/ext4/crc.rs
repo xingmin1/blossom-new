@@ -1,20 +1,4 @@
-/* */
-/* CRC LOOKUP TABLE */
-/* ================ */
-/* The following CRC lookup table was generated automagically */
-/* by the Rocksoft^tm Model CRC Algorithm Table Generation */
-/* Program V1.0 using the following model parameters: */
-/* */
-/* Width : 4 bytes. */
-/* Poly : 0x1EDC6F41L */
-/* Reverse : TRUE. */
-/* */
-/* For more information on the Rocksoft^tm Model CRC Algorithm, */
-/* see the document titled "A Painless Guide to CRC Error */
-/* Detection Algorithms" by Ross Williams */
-/* (ross@guest.adelaide.edu.au.). This document is likely to be */
-/* in the FTP archive "ftp.adelaide.edu.au/pub/rocksoft". */
-/* */
+//! 反射 Castagnoli 表与逐字节更新不包含最终取反，便于连续元数据种子计算。
 pub const CRC32C_TAB: [u32; 256] = [
     0x00000000, 0xF26B8303, 0xE13B70F7, 0x1350F3F4, 0xC79A971F, 0x35F1141C, 0x26A1E7E8, 0xD4CA64EB,
     0x8AD958CF, 0x78B2DBCC, 0x6BE22838, 0x9989AB3B, 0x4D43CFD0, 0xBF284CD3, 0xAC78BF27, 0x5E133C24,
@@ -50,28 +34,21 @@ pub const CRC32C_TAB: [u32; 256] = [
     0x79B737BA, 0x8BDCB4B9, 0x988C474D, 0x6AE7C44E, 0xBE2DA0A5, 0x4C4623A6, 0x5F16D052, 0xAD7D5351,
 ];
 
-pub const EXT4_CRC32_INIT: u32 = 0xFFFFFFFF;
-
-/// 计算CRC32校验和
-/// 参数 crc 初始值
-/// 参数 buf 缓冲区
-/// 参数 size 缓冲区大小
-/// 参数 tab 查找表
-pub fn crc32(crc: u32, buf: &[u8], size: u32, tab: &[u32]) -> u32 {
-    let mut crc = crc;
-    let mut p = buf;
-    let mut size = size as usize;
-
-    // 循环更新crc值
-    while size > 0 {
-        crc = tab[(crc as u8 ^ p[0]) as usize] ^ (crc >> 8);
-        p = &p[1..];
-        size -= 1;
+/// 计算不带最终取反的 CRC32C，切片本身限定全部输入长度。
+pub fn crc32c(mut seed: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        seed = CRC32C_TAB[usize::from(seed as u8 ^ byte)] ^ (seed >> 8);
     }
-
-    crc
+    seed
 }
 
-pub fn ext4_crc32c(crc: u32, buf: &[u8], size: u32) -> u32 {
-    crc32(crc, buf, size, &CRC32C_TAB)
+/// 计算旧组描述符采用的反射 CRC16，生成多项式为 0x8005。
+pub fn crc16(mut seed: u16, bytes: &[u8]) -> u16 {
+    for &byte in bytes {
+        seed ^= u16::from(byte);
+        for _ in 0..8 {
+            seed = (seed >> 1) ^ if seed & 1 != 0 { 0xa001 } else { 0 };
+        }
+    }
+    seed
 }

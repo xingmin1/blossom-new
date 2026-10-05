@@ -6,7 +6,7 @@ use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
 use crate::mm::{alloc_pages, pages as page_map, FolioRead, OwnedPages};
 use core::convert::TryFrom;
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ptr::NonNull;
 use core::slice;
 use virtio_drivers::{BufferDirection, DmaAddr, DmaRegion, Hal, MappedSegment};
@@ -93,7 +93,10 @@ impl CoherentDma {
 /// 映射始终保留原来源的完整拥有者，不将共享 folio 还原为独占原页。
 enum PayloadBacking {
     Pages(OwnedPages),
-    Folio(FolioRead),
+    Folio {
+        read: FolioRead,
+        publish_on_success: bool,
+    },
 }
 
 impl PayloadBacking {
@@ -101,7 +104,7 @@ impl PayloadBacking {
     fn phys_addr(&self) -> usize {
         match self {
             Self::Pages(pages) => pages.phys_addr(),
-            Self::Folio(read) => read.phys_addr(),
+            Self::Folio { read, .. } => read.phys_addr(),
         }
     }
 }
@@ -141,17 +144,44 @@ impl MappedPages {
 
     /// 原 folio 直接映射其已验证页内读入范围；准备失败完整返回唯一读入责任。
     pub(crate) fn from_folio(read: FolioRead) -> Result<Self, (DmaError, FolioRead)> {
-        if read.is_completed() {
-            return Err((DmaError::InvalidRange, read));
-        }
         let offset = read.offset();
         let len = read.len();
+        Self::map_folio(read, offset, len, true)
+    }
+
+    /// 消耗整份读入责任，只将指定页内子范围交设备；成功后仍由来源结束整页填充。
+    pub(crate) fn from_folio_range(
+        read: FolioRead,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self, (DmaError, FolioRead)> {
+        Self::map_folio(read, offset, len, false)
+    }
+
+    /// 验证当前可写范围并保存真实完成责任，不拆分读入者或复制原页。
+    fn map_folio(
+        read: FolioRead,
+        offset: usize,
+        len: usize,
+        publish_on_success: bool,
+    ) -> Result<Self, (DmaError, FolioRead)> {
+        if read.is_completed()
+            || offset < read.offset()
+            || offset
+                .checked_add(len)
+                .is_none_or(|end| read.offset() + read.len() < end)
+        {
+            return Err((DmaError::InvalidRange, read));
+        }
         let address = match direct_device_address(read.phys_addr(), PAGE_SIZE, offset, len) {
             Ok(address) => address,
             Err(error) => return Err((error, read)),
         };
         Ok(Self {
-            backing: ManuallyDrop::new(PayloadBacking::Folio(read)),
+            backing: ManuallyDrop::new(PayloadBacking::Folio {
+                read,
+                publish_on_success,
+            }),
             offset,
             segment: MappedSegment {
                 address,
@@ -160,6 +190,29 @@ impl MappedPages {
             },
             device_owned: false,
         })
+    }
+
+    /// 全部设备责任结束后取回分段读入者，内容锁继续由该拥有者保存。
+    pub(crate) fn into_folio(mut self) -> FolioRead {
+        assert!(!self.device_owned, "taking a device-owned folio");
+        assert!(
+            matches!(
+                &*self.backing,
+                PayloadBacking::Folio {
+                    publish_on_success: false,
+                    ..
+                }
+            ),
+            "taking a payload without continuing folio ownership"
+        );
+        // SAFETY: 本映射独占原来源且已真实收权；取出后立即跳过外壳析构，
+        // 不再读取已移出字段，读入者仍持原页及尚未发表的内容锁责任。
+        let backing = unsafe { ManuallyDrop::take(&mut self.backing) };
+        mem::forget(self);
+        match backing {
+            PayloadBacking::Folio { read, .. } => read,
+            PayloadBacking::Pages(_) => unreachable!(),
+        }
     }
 
     /// 取得已验证的设备范围；复制此值不复制拥有权，也不允许独立结束访问期。
@@ -190,7 +243,16 @@ impl MappedPages {
 
     /// 已发布结果的 folio 只允许读取，不能作为新 Bio 的可写 DMA 来源。
     pub(crate) fn is_folio_complete(&self) -> bool {
-        matches!(&*self.backing, PayloadBacking::Folio(read) if read.is_completed())
+        matches!(&*self.backing, PayloadBacking::Folio { read, .. } if read.is_completed())
+    }
+
+    /// 只观察 folio 原页地址，不借用设备仍可写的内容。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_folio_phys_addr(&self) -> Option<usize> {
+        match &*self.backing {
+            PayloadBacking::Folio { read, .. } => Some(read.phys_addr()),
+            PayloadBacking::Pages(_) => None,
+        }
     }
 
     /// 在 CPU 拥有期间独占 payload 字节存储；folio 完成后禁止再次可变访问。
@@ -203,7 +265,10 @@ impl MappedPages {
                 // 可变借用排除并发交权，MaybeUninit 不要求字节已经初始化。
                 unsafe { slice::from_raw_parts_mut(pages.as_mut_ptr().add(self.offset), len) }
             }
-            PayloadBacking::Folio(read) => read.bytes_mut(),
+            PayloadBacking::Folio { read, .. } => {
+                let start = self.offset - read.offset();
+                &mut read.bytes_mut()[start..start + len]
+            }
         }
     }
 
@@ -248,16 +313,22 @@ impl MappedPages {
         self.device_owned = false;
     }
 
-    /// Bio 全部义务结束且 CPU 收权后发布 folio 结果；独占原页来源不含填充责任。
+    /// Bio 全尾收权后发布完整读；分段成功保留内容锁，失败立即发布原错误。
     ///
     /// # Safety
     /// 本映射的全部设备访问和可变 CPU 别名必须已经结束；完整成功必须保证
     /// payload 全范围已经初始化，completed 必须属于本映射的连续成功前缀。
     pub(crate) unsafe fn complete_folio(&mut self, result: IoResult) {
         assert!(!self.device_owned, "completing device-owned folio");
-        if let PayloadBacking::Folio(read) = &mut *self.backing {
-            // SAFETY: 调用者保证真实收权和初始化，本映射固定为 read 的完整原范围。
-            unsafe { read.complete(result) };
+        if let PayloadBacking::Folio {
+            read,
+            publish_on_success,
+        } = &mut *self.backing
+        {
+            if *publish_on_success || result.error.is_some() {
+                // SAFETY: 已真实收权；完整读覆盖 read 原范围，分段失败不授予内容访问。
+                unsafe { read.complete(result) };
+            }
         }
     }
 }

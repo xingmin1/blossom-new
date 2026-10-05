@@ -45,6 +45,7 @@ mod cache;
 mod console;
 mod cpu;
 mod drivers;
+mod fs;
 mod irq;
 mod klog;
 #[cfg(feature = "ktest")]

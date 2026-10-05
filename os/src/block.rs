@@ -38,6 +38,8 @@ pub enum BlockError {
     Misaligned,
     ReadOnly,
     Unsupported,
+    Corrupt,
+    Checksum,
     NotReady,
     QueueStopped,
     Busy,

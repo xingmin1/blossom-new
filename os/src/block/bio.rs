@@ -278,6 +278,16 @@ impl BioInner {
             .map(MappedPages::segment)
     }
 
+    /// 已登记 child 观察单个 folio 原页与页内起点，不导出 DMA 内容借用。
+    #[cfg(feature = "ktest")]
+    pub(super) fn ktest_folio_origin(&self, offset: usize) -> Option<(usize, usize)> {
+        let state = self.state.lock();
+        let [mapped] = state.memory.as_deref()? else {
+            return None;
+        };
+        Some((mapped.ktest_folio_phys_addr()?, mapped.offset() + offset))
+    }
+
     /// slot 在 IRQ 分派前检查是否必须使用预建完成 Work。
     pub(super) fn needs_task(&self) -> bool {
         matches!(self.end_io, Some(EndIo::Task(_)))

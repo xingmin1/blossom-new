@@ -241,7 +241,7 @@ impl Returned {
     }
 }
 
-struct HeapPressure {
+pub(crate) struct HeapPressure {
     pages: Vec<mm::OwnedPages>,
     // 每个独占原堆对象的首字保存本类别下一节点，压力期间不申请链表节点。
     heap: [usize; 12],
@@ -249,7 +249,7 @@ struct HeapPressure {
 
 impl HeapPressure {
     /// 控制 Task 的真实页凭证容量先于设备 start 预留，堆类别链头常驻本 owner。
-    fn prepare() -> Result<Self, TestError> {
+    pub(crate) fn prepare() -> Result<Self, TestError> {
         let mut pages = Vec::new();
         pages
             .try_reserve_exact(mm::stats().present_pages)
@@ -261,7 +261,7 @@ impl HeapPressure {
     }
 
     /// 固定 CPU 控制者耗尽真实页及全部 SLUB 类，再用原 allocator 观察真实 NULL。
-    fn exhaust(&mut self) -> (bool, bool) {
+    pub(crate) fn exhaust(&mut self) -> (bool, bool) {
         mm::shrink_all();
         mm::drain_all_pages();
         for order in [10, 0] {

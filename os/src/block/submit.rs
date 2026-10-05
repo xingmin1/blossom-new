@@ -9,7 +9,8 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 use crate::block::bio::BioInner;
 use crate::block::disk::{ActiveBio, PreparingSlot};
 use crate::block::{
-    Bio, BlkOperation, BlockError, Disk, IoResult, QueueLimits, MAX_BATCH, SECTOR_BYTES,
+    Bio, BioCompletion, BlkOperation, BlockError, Disk, IoResult, QueueLimits, MAX_BATCH,
+    SECTOR_BYTES,
 };
 use crate::mm::dma::{DmaError, MappedPages};
 use crate::mm::{alloc_pages, FolioRead, PAGE_SIZE};
@@ -226,10 +227,60 @@ impl Disk {
         Ok(plan)
     }
 
-    /// 将原 folio 的页内范围交给现有 Bio，等待真实 DMA 全尾；磁盘位置不再加页内偏移。
-    pub fn load_folio(&self, byte_offset: u64, mut read: FolioRead) -> Result<(), BlockError> {
-        drop(task::current_task());
+    /// 将原 folio 的完整读入范围交给 Bio，等待真实 DMA 全尾及内容结果发布。
+    pub fn load_folio(&self, byte_offset: u64, read: FolioRead) -> Result<(), BlockError> {
         let len = read.len();
+        let (_, result) = self.read_folio_bio(byte_offset, read, None)?;
+        if let Some(error) = result.error {
+            return Err(error);
+        }
+        if result.completed != len {
+            return Err(BlockError::ShortIo);
+        }
+        Ok(())
+    }
+
+    /// 普通 Task 将一个页内子范围直接读到原页，全尾收权后返回仍锁定的整份读入者。
+    /// 磁盘位置与页内偏移独立；失败发布原错误，成功不提前授予整页读取权。
+    pub fn fill_folio_range(
+        &self,
+        byte_offset: u64,
+        read: FolioRead,
+        offset: usize,
+        len: usize,
+    ) -> Result<FolioRead, BlockError> {
+        let (completion, result) = self.read_folio_bio(byte_offset, read, Some((offset, len)))?;
+        if let Some(error) = result.error {
+            return Err(error);
+        }
+        let mut read = completion
+            .take_memory()
+            .expect("completed folio payload was already taken")
+            .pop()
+            .expect("single folio payload is missing")
+            .into_folio();
+        if result.completed != len {
+            // SAFETY: completion 已确认全部子请求结束及 CPU 收权；
+            // 短结果不授予内容读取权，整份读入责任仍由返回的 read 独占。
+            unsafe {
+                read.complete(IoResult {
+                    completed: result.completed,
+                    error: Some(BlockError::ShortIo),
+                })
+            };
+            return Err(BlockError::ShortIo);
+        }
+        Ok(read)
+    }
+
+    /// 锁外准备原页 Bio 并同步等待；None 结束完整读，子范围成功后由来源继续填页。
+    fn read_folio_bio(
+        &self,
+        byte_offset: u64,
+        mut read: FolioRead,
+        range: Option<(usize, usize)>,
+    ) -> Result<(BioCompletion, IoResult), BlockError> {
+        drop(task::current_task());
         let mut memory = Vec::new();
         let prepared = if byte_offset % SECTOR_BYTES != 0 {
             Err(BlockError::Misaligned)
@@ -249,7 +300,11 @@ impl Disk {
             };
             return Err(error);
         }
-        let mapped = match MappedPages::from_folio(read) {
+        let mapped = match range {
+            Some((offset, len)) => MappedPages::from_folio_range(read, offset, len),
+            None => MappedPages::from_folio(read),
+        };
+        let mapped = match mapped {
             Ok(mapped) => mapped,
             Err((error, mut read)) => {
                 let error = map_error(error);
@@ -264,8 +319,8 @@ impl Disk {
             }
         };
         memory.push(mapped);
-        // SAFETY: 唯一 read owner 保活并独占原 folio 的内容锁，全部 CPU 借用已经结束；
-        // Read 无回调，不要求初始内容已初始化，Bio 唯一全尾发布真实结果并收权。
+        // SAFETY: 唯一 read owner 保活并独占内容锁，全部 CPU 借用已经结束；
+        // Read 无回调且不要求初始内容有效，Bio 全尾真实收权后才结束本段责任。
         let bio = unsafe {
             Bio::try_new(
                 self,
@@ -280,13 +335,7 @@ impl Disk {
         self.submit_bio(bio);
         self.unplug();
         let result = completion.wait();
-        if let Some(error) = result.error {
-            return Err(error);
-        }
-        if result.completed != len {
-            return Err(BlockError::ShortIo);
-        }
-        Ok(())
+        Ok((completion, result))
     }
 
     /// 普通 Task 用请求自有零页完成字节范围读取，只有全长成功才修改调用者缓冲区。

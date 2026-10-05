@@ -63,6 +63,8 @@ pub(super) struct QueueState {
     test_paused: bool,
     #[cfg(feature = "ktest")]
     pub(super) ktest_stop: StopTestState,
+    #[cfg(feature = "ktest")]
+    ktest_folio_dma: Option<(usize, u64, usize, usize)>,
 }
 
 impl QueueState {
@@ -303,6 +305,8 @@ impl Disk {
                 test_paused: false,
                 #[cfg(feature = "ktest")]
                 ktest_stop: StopTestState::default(),
+                #[cfg(feature = "ktest")]
+                ktest_folio_dma: None,
             }),
             control: SleepMutex::new(()),
             irq: SpinLock::new(None),
@@ -895,6 +899,13 @@ impl Disk {
         self.queue_progress();
     }
 
+    /// 返回最近成功发表的单 folio 首 SG：原页物理地址、设备地址、页内偏移和字节数。
+    /// 观测者须串行安排该盘 producer，后续原页 I/O 会替换这一记录。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_last_folio_dma(&self) -> Option<(usize, u64, usize, usize)> {
+        self.queue.lock().ktest_folio_dma
+    }
+
     /// 只在登记后复查仍无额度、即将调用真实 park 时计数。
     fn count_park(&self) {
         #[cfg(any(feature = "storage-tests", feature = "ktest"))]
@@ -1132,6 +1143,18 @@ impl PreparingSlot<'_> {
                 #[cfg(feature = "ktest")]
                 {
                     q.ktest_stop.published += 1;
+                    if let Some((part, segment)) =
+                        resources.parts[0].as_ref().zip(resources.sg.first())
+                    {
+                        if let Some((physical, offset)) = part.bio.ktest_folio_origin(part.offset) {
+                            q.ktest_folio_dma = Some((
+                                physical,
+                                segment.address.value(),
+                                offset,
+                                segment.length as usize,
+                            ));
+                        }
+                    }
                 }
                 #[cfg(any(feature = "storage-tests", feature = "ktest"))]
                 {

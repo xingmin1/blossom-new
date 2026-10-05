@@ -1,0 +1,621 @@
+//! 真实 ext4 镜像、唯一 inode 与原文件页的具名消费回归。
+
+use ::ktest::{self, Fixture, Resource, TestContext, TestError, TestResult};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use crate::block::{self, BlockError, Disk, DiskRef};
+use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::DeviceInventory;
+use crate::fs::ext4::{Ext4Volume, InodeKind};
+use crate::fs::inode::{InodeCache, InodeRef};
+use crate::fs::FsError;
+use crate::mm::{FolioRead, FolioRef};
+use crate::sync::{Completion, SpinLock};
+use crate::task::{self, JoinHandle, PreparedTask, State, Task};
+use crate::workqueue::{WorkQueue, WorkQueueConfig};
+use crate::{cpu, drivers, mm, sched, time, timer};
+
+mod concurrency;
+mod format;
+
+const PATTERN_SIZE: u64 = 65573;
+const DIRECTORY_ENTRIES: usize = 12000;
+const DEEP_EXTENTS: u64 = 1500;
+
+/// 父入口只引用真实宏锚点，编号仅属于用例标签。
+pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 20] {
+    [
+        format::codec::__ktest_anchor(),
+        format::volume::__ktest_anchor(),
+        format::identity::__ktest_anchor(),
+        format::bounded::__ktest_anchor(),
+        format::oom::__ktest_anchor(),
+        format::bad_super::__ktest_anchor(),
+        format::bad_group::__ktest_anchor(),
+        format::bad_inode::__ktest_anchor(),
+        format::bad_extent::__ktest_anchor(),
+        format::bad_directory::__ktest_anchor(),
+        format::bad_dx::__ktest_anchor(),
+        format::bad_directory_layout::__ktest_anchor(),
+        format::bad_dx_layout::__ktest_anchor(),
+        format::bad_geometry::__ktest_anchor(),
+        format::bad_features::__ktest_anchor(),
+        format::bad_mapping::__ktest_anchor(),
+        format::prefix::__ktest_anchor(),
+        concurrency::inode_loading::__ktest_anchor(),
+        concurrency::file_loading::__ktest_anchor(),
+        concurrency::failed_loading::__ktest_anchor(),
+    ]
+}
+
+/// 有限等待仅观察真实状态，sleep 不充当 Blocked、IRQ 或离栈证据。
+fn until(label: &'static str, mut ready: impl FnMut() -> bool) -> TestResult {
+    let deadline = time::now()
+        .checked_add(time::Duration::from_secs(10))
+        .ok_or(TestError("filesystem observation deadline overflow"))?;
+    while !ready() {
+        if deadline <= time::now() {
+            return Err(TestError(label));
+        }
+        timer::sleep(time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// 无参与者使用资源时整理 SLUB/PCP，保留框架与共享服务的常驻六域。
+fn settled() -> Result<mm::MemoryStats, TestError> {
+    until("filesystem resource CPUs did not settle", || {
+        (0..cpu::count())
+            .all(|id| id == cpu::current().id || cpu::get(id).idle.load(Ordering::Acquire))
+    })?;
+    mm::flush_all();
+    mm::shrink_all();
+    mm::drain_all_pages();
+    Ok(mm::stats())
+}
+
+/// 销毁原拥有者后逐字段等原六域基线，不重置统计或掩盖余留资源。
+fn recovered(
+    context: &mut TestContext<'_>,
+    label: &'static str,
+    before: mm::MemoryStats,
+) -> TestResult {
+    let mut after = settled()?;
+    until(label, || {
+        mm::shrink_all();
+        mm::drain_all_pages();
+        after = mm::stats();
+        after == before
+    })?;
+    context.expect_eq(after, before);
+    context.diagnostic(format_args!(
+        "fs-resources boundary={} six-domains-before={:?} six-domains-after={:?}",
+        label, before, after
+    ));
+    Ok(())
+}
+
+/// 比较文件逻辑偏移上的完整外部图样，零数据和短读取都不能代替成功。
+fn patterned(bytes: &[u8], offset: u64) -> bool {
+    bytes.iter().enumerate().all(|(index, byte)| {
+        let at = offset + index as u64;
+        *byte
+            == 37u8
+                .wrapping_add(((at / 512) as u8).wrapping_mul(17))
+                .wrapping_add((at % 512) as u8)
+    })
+}
+
+/// 将真实文件系统错误保留在诊断中，同时返回框架静态失败消息。
+fn checked<T>(context: &TestContext<'_>, result: Result<T, FsError>) -> Result<T, TestError> {
+    result.map_err(|error| {
+        context.diagnostic(format_args!("fs-operation error={:?}", error));
+        TestError("filesystem operation failed")
+    })
+}
+
+impl Fixture for DeviceInventory {
+    /// 整组用例只发现一次真实库存，并在首例基线前等待常驻工作服务进入阻塞稳态。
+    fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+        let inventory = drivers::discover().map_err(|error| {
+            context.diagnostic(format_args!("fs-discovery error={:?}", error));
+            TestError("filesystem discovery failed")
+        })?;
+        crate::workqueue::testing::wait_services_blocked();
+        Ok(inventory)
+    }
+}
+
+/// 每例借用整组保活的真实库存，上一例完成 reset、IRQ 与 Work 后才重新准备独占设备。
+fn devices(
+    context: &TestContext<'_>,
+    inventory: &DeviceInventory,
+    count: usize,
+) -> Result<Vec<VirtioDevice>, TestError> {
+    let pci =
+        inventory.pci.devices().iter().filter(|device| {
+            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+        });
+    if inventory.mmio_blocks.len() + pci.clone().count() != count {
+        return Err(TestError(
+            "filesystem attached disks differ from declared roles",
+        ));
+    }
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(count)
+        .map_err(|_| TestError("filesystem device slots OOM"))?;
+    for candidate in &inventory.mmio_blocks {
+        prepared.push(
+            // SAFETY: 框架串行分派用例，前例已完成 stop/reset/IRQ/Work；本组库存与永久映射
+            // 保活到全部用例结束，本例独占该候选的传输和控制页。
+            unsafe { VirtioDevice::prepare_mmio(candidate) }.map_err(|error| {
+                context.diagnostic(format_args!("fs-MMIO-prepare error={:?}", error));
+                TestError("filesystem MMIO preparation failed")
+            })?,
+        );
+    }
+    for device in pci {
+        prepared.push(
+            // SAFETY: BDF 借自本组真实库存；前例已归还设备访问权，本例独占传输并保活
+            // 到 reset、IRQ 和完成 Work 全尾，库存由外层 suite 继续拥有。
+            unsafe { VirtioDevice::prepare_pci(&inventory.pci, device) }.map_err(|error| {
+                context.diagnostic(format_args!("fs-PCI-prepare error={:?}", error));
+                TestError("filesystem PCI preparation failed")
+            })?,
+        );
+    }
+    Ok(prepared)
+}
+
+enum Job {
+    Get {
+        cache: Arc<InodeCache>,
+        volume: Arc<Ext4Volume>,
+        number: u64,
+    },
+    Read {
+        inode: InodeRef,
+        page: u64,
+    },
+    Fill {
+        inode: InodeRef,
+        page: u64,
+        read: FolioRead,
+        folio: FolioRef,
+    },
+    Oom {
+        cache: Arc<InodeCache>,
+        volume: Arc<Ext4Volume>,
+        inode: InodeRef,
+        empty_number: u64,
+        pressure: crate::cache::ktest::HeapPressure,
+    },
+}
+
+enum Returned {
+    Inode(InodeRef),
+    Page {
+        folio: FolioRef,
+        bytes: usize,
+        valid: bool,
+    },
+    Oom {
+        producer_cpu: usize,
+        evidence: (bool, bool),
+        same_inode: bool,
+        same_mapping: bool,
+        bytes: usize,
+        valid: bool,
+        inode_error: Option<FsError>,
+        page_error: Option<FsError>,
+        address: usize,
+        submitted_before: usize,
+        submitted_after: usize,
+    },
+}
+
+struct Observation {
+    cancelled: AtomicBool,
+    gate: Completion,
+    hold_loader: AtomicBool,
+    loader_entered: AtomicUsize,
+    entered: [AtomicBool; 3],
+    tasks: SpinLock<[Option<Arc<Task>>; 3]>,
+    jobs: SpinLock<[Option<Job>; 3]>,
+    results: SpinLock<[Option<Result<Returned, FsError>>; 3]>,
+}
+
+impl Observation {
+    /// 每例预备自己的 gate、任务和结果槽，异步正文无需再分配控制存储。
+    fn prepare() -> Result<Arc<Self>, TestError> {
+        Arc::try_new(Self {
+            cancelled: AtomicBool::new(false),
+            gate: Completion::new(),
+            hold_loader: AtomicBool::new(false),
+            loader_entered: AtomicUsize::new(0),
+            entered: [const { AtomicBool::new(false) }; 3],
+            tasks: SpinLock::new([const { None }; 3]),
+            jobs: SpinLock::new([const { None }; 3]),
+            results: SpinLock::new([const { None }; 3]),
+        })
+        .map_err(|_| TestError("filesystem observation OOM"))
+    }
+
+    /// 正式调用入口已经进入且生产调度器报告 Blocked，才算被测源的等待者。
+    fn blocked(&self, index: usize) -> bool {
+        if !self.entered[index].load(Ordering::Acquire) {
+            return false;
+        }
+        let task = self.tasks.lock()[index].clone();
+        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+    }
+}
+
+/// 普通原生任务消费真实 API；结果只观察已初始化内容或实际原错误。
+fn perform(job: Job) -> Result<Returned, FsError> {
+    match job {
+        Job::Get {
+            cache,
+            volume,
+            number,
+        } => cache.iget(&volume, number).map(Returned::Inode),
+        Job::Read { inode, page } => {
+            let offset = page
+                .checked_mul(mm::PAGE_SIZE as u64)
+                .ok_or(FsError::Corrupt)?;
+            let mut bytes = [0xa7; mm::PAGE_SIZE];
+            let count = inode.read_at(offset, &mut bytes)?;
+            let (folio, read) = inode.mapping().get_or_prepare(page)?;
+            if read.is_some() {
+                return Err(FsError::Corrupt);
+            }
+            folio.wait_ready()?;
+            Ok(Returned::Page {
+                folio,
+                bytes: count,
+                valid: patterned(&bytes[..count], offset),
+            })
+        }
+        Job::Fill {
+            inode,
+            page,
+            read,
+            folio,
+        } => {
+            inode
+                .filesystem()
+                .fill_page(inode.metadata()?, page, read)?;
+            folio.wait_ready()?;
+            let valid = folio.with_bytes(0, mm::PAGE_SIZE, |bytes| {
+                patterned(bytes, page * mm::PAGE_SIZE as u64)
+            })?;
+            Ok(Returned::Page {
+                folio,
+                bytes: mm::PAGE_SIZE,
+                valid,
+            })
+        }
+        Job::Oom {
+            cache,
+            volume,
+            inode,
+            empty_number,
+            mut pressure,
+        } => {
+            let submitted_before = volume.disk().test_snapshot().submitted;
+            let evidence = pressure.exhaust();
+            let same = cache.iget(&volume, inode.number())?;
+            let mut data = [0xa7; mm::PAGE_SIZE];
+            let bytes = same.read_at(0, &mut data)?;
+            let valid = patterned(&data[..bytes], 0);
+            let inode_error = cache.iget(&volume, empty_number).err();
+            let page_error = inode.read_at(mm::PAGE_SIZE as u64, &mut data).err();
+            let (folio, read) = inode.mapping().get_or_prepare(0)?;
+            if read.is_some() {
+                return Err(FsError::Corrupt);
+            }
+            folio.wait_ready()?;
+            let returned = Returned::Oom {
+                producer_cpu: cpu::current().id,
+                evidence,
+                same_inode: same.ptr_eq(&inode),
+                same_mapping: core::ptr::eq(same.mapping(), inode.mapping()),
+                bytes,
+                valid,
+                inode_error,
+                page_error,
+                address: folio.phys_addr(),
+                submitted_before,
+                submitted_after: volume.disk().test_snapshot().submitted,
+            };
+            drop(pressure);
+            Ok(returned)
+        }
+    }
+}
+
+struct Owner {
+    initial: mm::MemoryStats,
+    filesystem_baseline: mm::MemoryStats,
+    disks: Vec<DiskRef>,
+    queue: WorkQueue,
+    cache: Option<Arc<InodeCache>>,
+    observation: Option<Arc<Observation>>,
+    pressure: Option<crate::cache::ktest::HeapPressure>,
+    prepared: Vec<PreparedTask>,
+    joins: Vec<JoinHandle>,
+    activation_error: Option<BlockError>,
+}
+
+impl Owner {
+    /// 库存与常驻服务已由整组预备，每例建立自己的资源与两层完整基线后才发表设备。
+    fn prepare(
+        context: &mut TestContext<'_>,
+        inventory: &DeviceInventory,
+    ) -> Result<Self, TestError> {
+        let initial = settled()?;
+        let count = if context.case.attributes.resources.contains(&Resource::Extra) {
+            2
+        } else {
+            1
+        };
+        let devices = devices(context, inventory, count)?;
+        let max_tags = devices
+            .iter()
+            .map(|device| usize::from(device.info().tag_count))
+            .max()
+            .expect("filesystem attached disk count validated before preparation");
+        let queue = WorkQueue::try_new(WorkQueueConfig {
+            max_active: max_tags + 1,
+            ordered: false,
+            reclaim: true,
+        })
+        .map_err(|_| TestError("filesystem completion domain OOM"))?;
+        let mut disks = Vec::new();
+        let disk_result = (|| {
+            disks
+                .try_reserve_exact(count)
+                .map_err(|_| TestError("filesystem Disk slots OOM"))?;
+            for device in devices {
+                disks.push(
+                    Disk::prepare(device, &queue)
+                        .map_err(|_| TestError("filesystem Disk preparation failed"))?,
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = disk_result {
+            for disk in &disks {
+                disk.stop()
+                    .map_err(|_| TestError("unpublished filesystem Disk stop failed"))?;
+            }
+            queue.close_sync();
+            return Err(error);
+        }
+        let resources = (|| {
+            let filesystem_baseline = settled()?;
+            let pressure = if context.case.attributes.tags.contains(&"fs-oom") {
+                Some(crate::cache::ktest::HeapPressure::prepare()?)
+            } else {
+                None
+            };
+            let cache = Arc::try_new(
+                InodeCache::try_new(8, 8)
+                    .map_err(|_| TestError("inode cache preparation failed"))?,
+            )
+            .map_err(|_| TestError("inode cache owner OOM"))?;
+            let observation = Observation::prepare()?;
+            let loader = observation.clone();
+            let hook: Arc<dyn Fn(&InodeRef) + Send + Sync> = Arc::try_new(move |_: &InodeRef| {
+                if loader.hold_loader.load(Ordering::Acquire) {
+                    loader.loader_entered.fetch_add(1, Ordering::AcqRel);
+                    loader.gate.wait();
+                }
+            })
+            .map_err(|_| TestError("inode load observer OOM"))?;
+            cache.ktest_set_load_hook(Some(hook));
+            let mut prepared = Vec::new();
+            let mut joins = Vec::new();
+            prepared
+                .try_reserve_exact(3)
+                .map_err(|_| TestError("filesystem native task slots OOM"))?;
+            joins
+                .try_reserve_exact(3)
+                .map_err(|_| TestError("filesystem native join slots OOM"))?;
+            for index in 0..3 {
+                let observer = observation.clone();
+                prepared.push(
+                    task::prepare_kernel_on(index % cpu::count(), move || {
+                        observer.tasks.lock()[index] = Some(task::current_task());
+                        if index == 0 && observer.hold_loader.load(Ordering::Acquire) {
+                            let is_fill =
+                                matches!(&observer.jobs.lock()[index], Some(Job::Fill { .. }));
+                            if is_fill {
+                                observer.gate.wait();
+                            }
+                        }
+                        let job = observer.jobs.lock()[index].take();
+                        if observer.cancelled.load(Ordering::Acquire) {
+                            drop(job);
+                            return 0;
+                        }
+                        observer.entered[index].store(true, Ordering::Release);
+                        let Some(job) = job else {
+                            return 1;
+                        };
+                        let result = perform(job);
+                        observer.results.lock()[index] = Some(result);
+                        0
+                    })
+                    .map_err(|_| TestError("filesystem native task preparation failed"))?,
+                );
+            }
+            Ok((
+                filesystem_baseline,
+                cache,
+                observation,
+                pressure,
+                prepared,
+                joins,
+            ))
+        })();
+        let (filesystem_baseline, cache, observation, pressure, prepared, joins) = match resources {
+            Ok(resources) => resources,
+            Err(error) => {
+                for disk in &disks {
+                    disk.stop()
+                        .map_err(|_| TestError("unpublished filesystem resources stop failed"))?;
+                }
+                queue.close_sync();
+                return Err(error);
+            }
+        };
+        let activation_error = disks.iter().find_map(|disk| disk.start().err());
+        Ok(Self {
+            initial,
+            filesystem_baseline,
+            disks,
+            queue,
+            cache: Some(cache),
+            observation: Some(observation),
+            pressure,
+            prepared,
+            joins,
+            activation_error,
+        })
+    }
+
+    /// 正文只借成功发表的 root；激活失败仍由原 fixture 静止化。
+    fn disk(&self) -> Result<&DiskRef, TestError> {
+        if self.activation_error.is_some() {
+            return Err(TestError("filesystem Disk activation failed"));
+        }
+        self.disks
+            .first()
+            .ok_or(TestError("filesystem root Disk missing"))
+    }
+
+    /// 正式缓存原拥有者在 fixture 存活，异步克隆只扩展当前例寿命。
+    fn cache(&self) -> &Arc<InodeCache> {
+        self.cache
+            .as_ref()
+            .expect("filesystem cache consumed before body")
+    }
+
+    /// 观察控制存储在主体捕获外固定存活，不借任何主体栈。
+    fn observer(&self) -> &Arc<Observation> {
+        self.observation
+            .as_ref()
+            .expect("filesystem observation consumed before body")
+    }
+
+    /// 打开真实只读卷；所有格式检查使用生产 codec 与共享 metadata cache。
+    fn open(&self, context: &TestContext<'_>) -> Result<Arc<Ext4Volume>, TestError> {
+        checked(context, Ext4Volume::open(self.disk()?.clone(), 64))
+    }
+
+    /// 只用正式 root inode 按原字节组件查找，不维护宿主 inode 编号表。
+    fn file(
+        &self,
+        context: &TestContext<'_>,
+        volume: &Arc<Ext4Volume>,
+        name: &[u8],
+    ) -> Result<InodeRef, TestError> {
+        let root = checked(context, self.cache().iget(volume, 2))?;
+        checked(context, root.lookup(self.cache(), name))
+    }
+
+    /// 给尚未发表的原 Task 转交拥有型工作，push 仅消费预留槽。
+    fn publish(&mut self, index: usize, job: Job) {
+        self.observer().jobs.lock()[index] = Some(job);
+        self.joins.push(self.prepared.remove(0).publish());
+    }
+
+    /// 全部原生 Task 真正离栈，才能消费 JoinHandle 和释放它们的观察存储。
+    fn join_tasks(&mut self) -> TestResult {
+        for join in &self.joins {
+            until("filesystem producer did not leave original stack", || {
+                join.try_join().is_some()
+            })?;
+        }
+        for join in self.joins.drain(..) {
+            if join.join() != 0 {
+                return Err(TestError("filesystem native producer failed"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 控制者取消入口、放行 gate/used、真 join，再释放全部 claim，最后 stop/IRQ/Work。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        let observer = self.observer().clone();
+        observer.cancelled.store(true, Ordering::Release);
+        observer.hold_loader.store(false, Ordering::Release);
+        observer.gate.complete();
+        drop(core::mem::take(&mut self.prepared));
+        drop(self.pressure.take());
+        for disk in &self.disks {
+            disk.test_resume_completions();
+        }
+        self.join_tasks()?;
+        for disk in &self.disks {
+            disk.test_flush_completions();
+        }
+        let jobs = core::mem::replace(&mut *observer.jobs.lock(), [const { None }; 3]);
+        let results = core::mem::replace(&mut *observer.results.lock(), [const { None }; 3]);
+        let tasks = core::mem::replace(&mut *observer.tasks.lock(), [const { None }; 3]);
+        drop(jobs);
+        drop(results);
+        drop(tasks);
+        if let Some(cache) = self.cache.take() {
+            cache.ktest_set_load_hook(None);
+            drop(cache);
+        }
+        drop(self.observation.take());
+        drop(observer);
+        drop(core::mem::take(&mut self.joins));
+        recovered(
+            context,
+            "filesystem-before-disk-stop",
+            self.filesystem_baseline,
+        )?;
+        for disk in &self.disks {
+            disk.stop().map_err(|_| {
+                TestError("filesystem stop cannot converge; retaining original DMA owner")
+            })?;
+            context.expect_eq(disk.test_snapshot().inflight, 0);
+        }
+        self.queue.close_sync();
+        Ok(())
+    }
+
+    /// 原 claim、Task、IRQ 与 Work 均结束后销毁设备，再核完整初始六域。
+    fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
+        let initial = self.initial;
+        drop(self);
+        recovered(context, "filesystem-after-disk-drop", initial)
+    }
+}
+
+impl Fixture<DeviceInventory> for Owner {
+    /// 每例借用外层保活库存，先持有完整停止责任，激活错误仍保留原设备供清理。
+    fn set_up(
+        context: &mut TestContext<'_>,
+        inventory: &DeviceInventory,
+    ) -> Result<Self, TestError> {
+        Self::prepare(context, inventory)
+    }
+
+    /// typed case-abort 在无法收敛时保留原 fixture，不假 join 或丢 DMA owner。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        Owner::quiesce(self, context)
+    }
+
+    /// 两层真实资源比较都属于当前例，不拿全客体 PASS 替代局部判定。
+    fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
+        Owner::tear_down(self, context)
+    }
+}
