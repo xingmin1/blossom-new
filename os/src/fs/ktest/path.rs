@@ -4,8 +4,8 @@ use crate::fs::dentry::DentryRef;
 use crate::fs::ktest::*;
 use crate::fs::{FsContext, Path, ResolveMode, Vfs};
 
-struct PathOwner {
-    owner: Owner,
+pub(super) struct PathOwner {
+    pub(super) owner: Owner,
     vfs: Option<Arc<Vfs>>,
     context: Option<FsContext>,
     volume: Option<Arc<Ext4Volume>>,
@@ -13,7 +13,7 @@ struct PathOwner {
 
 impl PathOwner {
     /// 正文开始才打开卷并构造完整视图，失败时原设备仍交给框架正常静止化。
-    fn prepare_path(&mut self, context: &TestContext<'_>) -> TestResult {
+    pub(super) fn prepare_path(&mut self, context: &TestContext<'_>) -> TestResult {
         // 同一 gate 只观察名字加载，不能同时暂停另一个名字的 inode 后端。
         self.owner.cache().ktest_set_load_hook(None);
         let volume = self.owner.open(context)?;
@@ -40,12 +40,12 @@ impl PathOwner {
     }
 
     /// 正文借用完整视图，静止化之后不再允许取得新的路径。
-    fn vfs(&self) -> &Arc<Vfs> {
+    pub(super) fn vfs(&self) -> &Arc<Vfs> {
         self.vfs.as_ref().expect("path view consumed before body")
     }
 
     /// 根与工作目录均持有真实 Path，不从当前任务推导查找上下文。
-    fn context(&self) -> &FsContext {
+    pub(super) fn context(&self) -> &FsContext {
         self.context
             .as_ref()
             .expect("path context consumed before body")

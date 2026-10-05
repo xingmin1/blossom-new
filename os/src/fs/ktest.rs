@@ -10,7 +10,10 @@ use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{Ext4Volume, InodeKind};
 use crate::fs::inode::{InodeCache, InodeRef};
-use crate::fs::{DentryRef, FsContext, FsError, Path, ResolveMode, Vfs};
+use crate::fs::{
+    DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, OpenOptions, Path,
+    ResolveMode, Vfs,
+};
 use crate::mm::{FolioRead, FolioRef};
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
@@ -18,6 +21,7 @@ use crate::workqueue::{WorkQueue, WorkQueueConfig};
 use crate::{cpu, drivers, mm, sched, time, timer};
 
 mod concurrency;
+mod file;
 mod format;
 mod path;
 
@@ -25,9 +29,10 @@ const PATTERN_SIZE: u64 = 65573;
 const DIRECTORY_ENTRIES: usize = 12000;
 const DEEP_EXTENTS: u64 = 1500;
 
-/// 保留格式、inode 与路径模块的实际宏锚点，不维护中央用例列表。
+/// 保留格式、inode、路径与文件模块的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
     [&'static ::ktest::SuiteSlot; 20],
+    [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 7],
 ) {
     (
@@ -54,6 +59,7 @@ pub(crate) fn anchors() -> (
             concurrency::failed_loading::__ktest_anchor(),
         ],
         path::anchors(),
+        file::anchors(),
     )
 }
 
@@ -218,6 +224,26 @@ enum Job {
         name: &'static [u8],
         pressure: crate::cache::ktest::HeapPressure,
     },
+    FileRead {
+        table: Arc<FileTable>,
+        fd: usize,
+        len: usize,
+        expected_offset: u64,
+    },
+    FileDupExact {
+        table: Arc<FileTable>,
+        source: usize,
+        target: usize,
+    },
+    FileOom {
+        table: Arc<FileTable>,
+        vfs: Arc<Vfs>,
+        context: FsContext,
+        fd: usize,
+        cached: FileRef,
+        pathname: &'static [u8],
+        pressure: crate::cache::ktest::HeapPressure,
+    },
 }
 
 enum Returned {
@@ -249,6 +275,23 @@ enum Returned {
         error: Option<FsError>,
         len_before: usize,
         len_after: usize,
+        submitted_before: usize,
+        submitted_after: usize,
+    },
+    FileRead {
+        bytes: usize,
+        valid: bool,
+    },
+    FileDescriptor(usize),
+    FileOom {
+        producer_cpu: usize,
+        evidence: (bool, bool),
+        same_ofd: bool,
+        bytes: usize,
+        valid: bool,
+        new_error: Option<FsError>,
+        reserved_fd: usize,
+        reused_fd: usize,
         submitted_before: usize,
         submitted_after: usize,
     },
@@ -294,6 +337,71 @@ impl Observation {
 /// 普通原生任务消费真实 API；结果只观察已初始化内容或实际原错误。
 fn perform(job: Job) -> Result<Returned, FsError> {
     match job {
+        Job::FileRead {
+            table,
+            fd,
+            len,
+            expected_offset,
+        } => {
+            if mm::PAGE_SIZE < len {
+                return Err(FsError::InvalidOperation);
+            }
+            let mut data = [0xa7; mm::PAGE_SIZE];
+            let bytes = table.read(fd, &mut data[..len])?;
+            Ok(Returned::FileRead {
+                bytes,
+                valid: patterned(&data[..bytes], expected_offset),
+            })
+        }
+        Job::FileDupExact {
+            table,
+            source,
+            target,
+        } => table
+            .dup_exact(source, target)
+            .map(Returned::FileDescriptor),
+        Job::FileOom {
+            table,
+            vfs,
+            context,
+            fd,
+            cached,
+            pathname,
+            mut pressure,
+        } => {
+            let root = vfs.root();
+            let disk = root.filesystem().disk();
+            let submitted_before = disk.test_snapshot().submitted;
+            let evidence = pressure.exhaust();
+            let same = table.lookup(fd)?;
+            let mut data = [0xa7; mm::PAGE_SIZE];
+            let bytes = same.read_at(0, &mut data)?;
+            let reservation = table.reserve()?;
+            let reserved_fd = reservation.publish(cached.clone(), DescriptorFlags::default());
+            let published = table.lookup(reserved_fd)?;
+            let same_ofd = Arc::ptr_eq(&same, &cached) && Arc::ptr_eq(&published, &cached);
+            table.close(reserved_fd)?;
+            let new_error = table
+                .open(&vfs, &context, pathname, OpenOptions::default())
+                .err();
+            let reservation = table.reserve()?;
+            let reused_fd = reservation.fd();
+            drop(reservation);
+            let returned = Returned::FileOom {
+                producer_cpu: cpu::current().id,
+                evidence,
+                same_ofd,
+                bytes,
+                valid: patterned(&data[..bytes], 0),
+                new_error,
+                reserved_fd,
+                reused_fd,
+                submitted_before,
+                submitted_after: disk.test_snapshot().submitted,
+            };
+            drop(pressure);
+            Ok(returned)
+        }
         Job::Lookup { vfs, parent, name } => vfs
             .dcache()
             .lookup(vfs.inodes(), &parent, name)

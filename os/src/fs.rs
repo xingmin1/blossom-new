@@ -2,6 +2,8 @@
 
 mod dentry;
 pub(crate) mod ext4;
+mod file;
+mod file_table;
 mod inode;
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
@@ -9,12 +11,14 @@ mod path;
 
 pub use dentry::{DentryCache, DentryRef};
 pub use ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind};
+pub use file::{open_path, DirectoryFile, FileLike, FileRef, FileStat, InodeFile, SeekFrom};
+pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
 pub use inode::{InodeCache, InodeRef};
 pub use path::{FsContext, Path, ResolveMode, Vfs};
 
 use crate::block::BlockError;
 
-/// 格式、名字与块 I/O 错误保留各自原因，不以零内容代替失败。
+/// 文件能力、格式、名字与块 I/O 错误保留各自原因，不以零内容代替失败。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
     NoMemory,
@@ -27,13 +31,17 @@ pub enum FsError {
     InvalidOperation,
     Busy,
     TooManySymlinks,
+    BadFd,
+    TooManyFiles,
+    ReadOnly,
+    IsDirectory,
     LoadAborted,
     Io(BlockError),
 }
 
 impl FsError {
     /// 将页填充的实际格式或 I/O 错误写入共享 folio，等待者读取同一原因。
-    /// 名字查找和 inode 加载取消不属于页填充结果。
+    /// 名字查找、文件能力和 inode 加载取消不属于页填充结果。
     pub(crate) fn folio_error(self) -> BlockError {
         match self {
             Self::NoMemory => BlockError::NoMemory,
@@ -41,7 +49,11 @@ impl FsError {
             Self::Checksum => BlockError::Checksum,
             Self::Unsupported => BlockError::Unsupported,
             Self::Io(error) => error,
-            Self::NotFound
+            Self::BadFd
+            | Self::TooManyFiles
+            | Self::ReadOnly
+            | Self::IsDirectory
+            | Self::NotFound
             | Self::NotDirectory
             | Self::InvalidName
             | Self::InvalidOperation

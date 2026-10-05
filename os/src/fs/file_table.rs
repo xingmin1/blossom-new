@@ -1,0 +1,253 @@
+//! 固定描述符槽负责编号与发表，具体文件独立拥有路径和共享位置。
+
+use alloc::vec::Vec;
+use core::mem;
+
+use crate::fs::{
+    open_path, DirectoryEntry, FileRef, FileStat, FsContext, FsError, InodeKind, ResolveMode,
+    SeekFrom, Vfs,
+};
+use crate::sync::SpinLock;
+
+/// 描述符自己的属性，不随共享文件位置传播。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DescriptorFlags {
+    pub close_on_exec: bool,
+}
+
+/// 只读打开的路径约束与新描述符属性。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OpenOptions {
+    pub directory: bool,
+    pub no_follow: bool,
+    pub close_on_exec: bool,
+}
+
+/// 槽尚未发表时没有文件引用，只有取得预留责任的对象能完成或取消它。
+enum Slot {
+    Vacant,
+    Reserved,
+    Open {
+        file: FileRef,
+        flags: DescriptorFlags,
+    },
+}
+
+/// 固定上限的内核描述符表；具体文件调用与最后引用释放均在短锁外。
+/// ponytail: 有限槽内线性选择最小空号，容量显著增大时改用空槽位图。
+pub struct FileTable {
+    slots: SpinLock<Vec<Slot>>,
+    capacity: usize,
+}
+
+/// 借用原表的单次预留责任；移动后只能发表一次，未发表的析构释放原槽。
+pub struct FileReservation<'a> {
+    table: &'a FileTable,
+    fd: usize,
+    active: bool,
+}
+
+impl FileTable {
+    /// 在锁外一次预留并初始化全部槽位，零容量无可用描述符而返回 InvalidOperation。
+    pub fn try_new(capacity: usize) -> Result<Self, FsError> {
+        if capacity == 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| FsError::NoMemory)?;
+        slots.resize_with(capacity, || Slot::Vacant);
+        Ok(Self {
+            slots: SpinLock::new(slots),
+            capacity,
+        })
+    }
+
+    /// 返回构造时固定的槽数，预留和复制描述符都不能扩大它。
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// 同一短锁内选最小空槽并交出独占发表责任，表满不改变已有槽。
+    pub fn reserve(&self) -> Result<FileReservation<'_>, FsError> {
+        let mut slots = self.slots.lock();
+        let fd = slots
+            .iter()
+            .position(|slot| matches!(slot, Slot::Vacant))
+            .ok_or(FsError::TooManyFiles)?;
+        slots[fd] = Slot::Reserved;
+        Ok(FileReservation {
+            table: self,
+            fd,
+            active: true,
+        })
+    }
+
+    /// 短锁内取得已发表文件的强引用；调用者随后不重查可复用的整数编号。
+    pub fn lookup(&self, fd: usize) -> Result<FileRef, FsError> {
+        let slots = self.slots.lock();
+        match slots.get(fd) {
+            Some(Slot::Open { file, .. }) => Ok(file.clone()),
+            _ => Err(FsError::BadFd),
+        }
+    }
+
+    /// 读取当前描述符的属性，未发表的预留与空槽均不作为打开文件。
+    pub fn flags(&self, fd: usize) -> Result<DescriptorFlags, FsError> {
+        let slots = self.slots.lock();
+        match slots.get(fd) {
+            Some(Slot::Open { flags, .. }) => Ok(*flags),
+            _ => Err(FsError::BadFd),
+        }
+    }
+
+    /// 普通可睡眠 Task 先预留，再解析真实路径并构造完整文件；任何失败由预留析构取消。
+    pub fn open(
+        &self,
+        vfs: &Vfs,
+        context: &FsContext,
+        pathname: &[u8],
+        options: OpenOptions,
+    ) -> Result<usize, FsError> {
+        let reservation = self.reserve()?;
+        let mode = if options.no_follow {
+            ResolveMode::NoFollow
+        } else {
+            ResolveMode::Follow
+        };
+        let path = vfs.resolve(context, pathname, mode)?;
+        if options.directory && path.inode()?.metadata()?.kind != InodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let file = open_path(path)?;
+        Ok(reservation.publish(
+            file,
+            DescriptorFlags {
+                close_on_exec: options.close_on_exec,
+            },
+        ))
+    }
+
+    /// 在表锁外读取原文件并推进其共享位置，关闭或复用 fd 不改变本次文件身份。
+    pub fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FsError> {
+        let file = self.lookup(fd)?;
+        file.read(buffer)
+    }
+
+    /// 在表锁外按 byte offset 读取原文件，不修改其共享位置。
+    pub fn read_at(&self, fd: usize, offset: u64, buffer: &mut [u8]) -> Result<usize, FsError> {
+        let file = self.lookup(fd)?;
+        file.read_at(offset, buffer)
+    }
+
+    /// 在表锁外修改具体文件的共享位置，保留它的边界和类型错误。
+    pub fn seek(&self, fd: usize, from: SeekFrom) -> Result<u64, FsError> {
+        let file = self.lookup(fd)?;
+        file.seek(from)
+    }
+
+    /// 在表锁外读取真实 inode 元数据，不占用文件位置锁。
+    pub fn stat(&self, fd: usize) -> Result<FileStat, FsError> {
+        let file = self.lookup(fd)?;
+        file.stat()
+    }
+
+    /// 在表锁外消费目录的下一项，共享枚举位置由具体目录文件保护。
+    pub fn readdir(&self, fd: usize) -> Result<Option<DirectoryEntry>, FsError> {
+        let file = self.lookup(fd)?;
+        file.readdir()
+    }
+
+    /// 在表锁外调用真实文件的写接口，由只读文件返回 ReadOnly。
+    pub fn write(&self, fd: usize, buffer: &[u8]) -> Result<usize, FsError> {
+        let file = self.lookup(fd)?;
+        file.write(buffer)
+    }
+
+    /// 先移出打开槽并使编号立即可复用，解锁后才释放表拥有的文件引用。
+    pub fn close(&self, fd: usize) -> Result<(), FsError> {
+        let old = {
+            let mut slots = self.slots.lock();
+            let slot = slots.get_mut(fd).ok_or(FsError::BadFd)?;
+            if !matches!(slot, Slot::Open { .. }) {
+                return Err(FsError::BadFd);
+            }
+            mem::replace(slot, Slot::Vacant)
+        };
+        drop(old);
+        Ok(())
+    }
+
+    /// 同一短锁内验证源并复制到最小空槽，共享同一文件但清除新描述符的 CLOEXEC。
+    pub fn dup(&self, fd: usize) -> Result<usize, FsError> {
+        let mut slots = self.slots.lock();
+        let Some(Slot::Open { file, .. }) = slots.get(fd) else {
+            return Err(FsError::BadFd);
+        };
+        let target = slots
+            .iter()
+            .position(|slot| matches!(slot, Slot::Vacant))
+            .ok_or(FsError::TooManyFiles)?;
+        let file = file.clone();
+        slots[target] = Slot::Open {
+            file,
+            flags: DescriptorFlags::default(),
+        };
+        Ok(target)
+    }
+
+    /// 同一短锁内验证并原子替换目标；自己的编号保持属性，其他目标的新属性清空。
+    /// Reserved 只属于其预留对象，替换返回 Busy；旧目标文件在解锁后释放。
+    pub fn dup_exact(&self, source: usize, target: usize) -> Result<usize, FsError> {
+        let old = {
+            let mut slots = self.slots.lock();
+            let Some(Slot::Open { file, .. }) = slots.get(source) else {
+                return Err(FsError::BadFd);
+            };
+            let target_slot = slots.get(target).ok_or(FsError::BadFd)?;
+            if matches!(target_slot, Slot::Reserved) {
+                return Err(FsError::Busy);
+            }
+            if source == target {
+                return Ok(target);
+            }
+            let replacement = Slot::Open {
+                file: file.clone(),
+                flags: DescriptorFlags::default(),
+            };
+            mem::replace(&mut slots[target], replacement)
+        };
+        drop(old);
+        Ok(target)
+    }
+}
+
+impl FileReservation<'_> {
+    /// 返回自己保留的整数编号，该槽在发表前仍不能查找或关闭。
+    pub fn fd(&self) -> usize {
+        self.fd
+    }
+
+    /// 消费唯一预留责任并移动完整文件入槽，既有固定槽无需分配且不能被外人替换。
+    pub fn publish(mut self, file: FileRef, flags: DescriptorFlags) -> usize {
+        {
+            let mut slots = self.table.slots.lock();
+            debug_assert!(matches!(slots[self.fd], Slot::Reserved));
+            slots[self.fd] = Slot::Open { file, flags };
+            self.active = false;
+        }
+        self.fd
+    }
+}
+
+impl Drop for FileReservation<'_> {
+    /// 只取消自己尚未发表的原槽；已发表文件的引用由描述符表独立拥有。
+    fn drop(&mut self) {
+        if self.active {
+            let mut slots = self.table.slots.lock();
+            debug_assert!(matches!(slots[self.fd], Slot::Reserved));
+            slots[self.fd] = Slot::Vacant;
+        }
+    }
+}
