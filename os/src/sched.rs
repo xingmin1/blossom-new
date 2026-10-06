@@ -512,8 +512,8 @@ pub(crate) extern "C" fn task_trampoline() -> ! {
     panic!("exited task resumed");
 }
 
-/// 在调度栈上清除本 CPU 当前身份，再完成旧 Task 的 ctx 交接与锁外资源回收。
-fn finish_current() {
+/// 在调度栈清除身份并结束旧根使用，再于锁外释放运行资源和发布离栈结果。
+fn finish_current(previous_mm: Option<Arc<crate::mm::space::Mm>>) {
     let (task, owner) = {
         let local = cpu::current();
         // SAFETY: 从 Task 回到本 CPU 调度栈且 IRQ 关闭，只有所属 CPU 访问 current_task。
@@ -527,11 +527,21 @@ fn finish_current() {
         // SAFETY: finish 已摘离活登记；task 对应此前 into_raw 的那一份强拥有，仅在此恢复一次。
         let task = unsafe { Arc::from_raw(task) };
         let join = Arc::clone(&task.join);
+        let user = task.user.lock().take();
         crate::arch::enable_interrupts();
+        drop(previous_mm);
+        if let Some(user) = user {
+            user.release_mm();
+            drop(user);
+        }
         drop(resources);
         drop(task);
         join.complete(result);
         drop(join);
+        crate::arch::irq_save();
+    } else if previous_mm.is_some() {
+        crate::arch::enable_interrupts();
+        drop(previous_mm);
         crate::arch::irq_save();
     }
 }
@@ -562,6 +572,9 @@ pub fn run() -> ! {
             // SAFETY: 活 Task 不可被其他 CPU 摘离，身份为不可变字段。
             let id = unsafe { (*task).id().as_usize() };
             local.current_task_id.store(id, Ordering::Relaxed);
+            // SAFETY: 目标 Task 具有唯一 Running 执行权且由活登记保活，调度锁已释放。
+            let mm = unsafe { (*task).user_thread() }.and_then(|user| user.mm());
+            crate::mm::space::enter_current(mm);
             // SAFETY: 本核独占 scheduler ctx；pick 独占目标 Task ctx，二者有效且 IRQ 关闭、调度锁已释放。
             unsafe {
                 crate::arch::switch_context(
@@ -569,7 +582,8 @@ pub fn run() -> ! {
                     (*task).ctx.get().cast_const(),
                 )
             };
-            finish_current();
+            let previous_mm = crate::mm::space::leave_current();
+            finish_current(previous_mm);
         } else {
             idle_once();
         }

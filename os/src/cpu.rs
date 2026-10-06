@@ -1,5 +1,6 @@
 //! 固定在线 CPU 的执行基础；请求节点由同步调用者拥有，完成前不离开其栈。
 
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ptr;
@@ -105,6 +106,7 @@ pub struct CpuLocal {
     pub(crate) scheduler_ctx: UnsafeCell<TaskContext>,
     pub(crate) current_task: UnsafeCell<*const Task>,
     pub(crate) current_task_id: AtomicUsize,
+    pub(crate) active_mm: UnsafeCell<Option<Arc<crate::mm::space::Mm>>>,
     pub(crate) hardirq_depth: AtomicUsize,
     pub(crate) bh_depth: AtomicUsize,
     pub(crate) preempt_depth: AtomicUsize,
@@ -137,6 +139,7 @@ pub struct CpuLocal {
 }
 
 // SAFETY: scheduler_ctx/current_task 仅由所属 CPU 在 IRQ 关闭的调度交接中访问；
+// active_mm 仅由所属 CPU 的 IRQ-off 交接修改，旧根失效后移出，最后拥有在锁外释放。
 // 其余共享字段为原子或短锁，远端 CPU 不读写所属 CPU 的私有现场。
 unsafe impl Sync for CpuLocal {}
 
@@ -157,6 +160,7 @@ impl CpuLocal {
             scheduler_ctx: UnsafeCell::new(TaskContext::empty()),
             current_task: UnsafeCell::new(ptr::null()),
             current_task_id: AtomicUsize::new(0),
+            active_mm: UnsafeCell::new(None),
             hardirq_depth: AtomicUsize::new(0),
             bh_depth: AtomicUsize::new(0),
             preempt_depth: AtomicUsize::new(0),

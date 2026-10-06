@@ -417,6 +417,11 @@ pub(crate) struct PreparedChild {
     prepared: crate::task::PreparedTask,
 }
 impl PreparedChild {
+    /// 在 scope 发表之前关联真实用户拥有，仍由原子任务捕获和 join 协议负责退出。
+    pub(crate) fn bind_user(&self, user: Arc<crate::task::UserThread>) {
+        self.prepared.bind_user(user);
+    }
+
     /// 同一短锁线性化 stop、容量检查与真实发表；拒绝对象在锁外归还。
     pub(crate) fn publish(self) -> Result<ChildHandle, TestError> {
         let mut slots = self.scope.children.lock();

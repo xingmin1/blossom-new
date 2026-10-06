@@ -11,6 +11,18 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+mod mmu;
+mod user;
+pub use mmu::{
+    activate_kernel_root, activate_user_root, flush_user_translations, initialize_user_root,
+    sync_user_icache, user_empty_entry, user_entry_is_table, user_entry_physical, user_leaf_entry,
+    user_leaf_permissions, user_table_entry, SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS,
+    USER_STACK_TOP,
+};
+#[cfg(feature = "ktest")]
+pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
+pub use user::{run_user, UserContext};
+
 /// 当前唯一编译目标的架构名称。
 pub const NAME: &str = "riscv64";
 extern "C" {
@@ -689,23 +701,29 @@ pub fn trigger_fault() -> ! {
 #[no_mangle]
 extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
     if frame.scause & (1usize << 63) == 0 {
-        #[cfg(feature = "ktest")]
-        crate::ktest::fatal_event(
-            if frame.scause == 2 {
-                "illegal"
-            } else {
-                "panic"
-            },
-            format_args!(
-                "synchronous trap pc={:#x} sp={:#x} cause={:#x} bad={:#x}",
-                frame.sepc, frame.gpr[2], frame.scause, frame.stval
-            ),
-        );
-        #[cfg(not(feature = "ktest"))]
-        crate::console::fatal(frame.sepc, frame.gpr[2], frame.scause, frame.stval);
+        rv_kernel_fault(frame.sepc, frame.gpr[2], frame.scause, frame.stval);
     }
+    rv_dispatch_interrupt(frame.scause, frame.sepc, frame.gpr[2], frame.stval);
+}
+
+/// 以真实 S 来源现场保持同步异常的原致命性质，不把内核故障转换成用户 trap。
+extern "C" fn rv_kernel_fault(pc: usize, sp: usize, cause: usize, bad: usize) -> ! {
+    #[cfg(feature = "ktest")]
+    crate::ktest::fatal_event(
+        if cause == 2 { "illegal" } else { "panic" },
+        format_args!(
+            "synchronous trap pc={:#x} sp={:#x} cause={:#x} bad={:#x}",
+            pc, sp, cause, bad
+        ),
+    );
+    #[cfg(not(feature = "ktest"))]
+    crate::console::fatal(pc, sp, cause, bad);
+}
+
+/// 在当前本核 IRQ-off 栈分派真实硬件中断，返回前释放 HardIrqGuard。
+fn rv_dispatch_interrupt(cause: usize, pc: usize, sp: usize, bad: usize) {
     let _hard_irq = crate::cpu::HardIrqGuard::enter();
-    match frame.scause {
+    match cause {
         value if value == (1usize << 63) | 5 => {
             disable_timer();
             crate::cpu::handle_timer();
@@ -724,11 +742,11 @@ extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
                 "panic",
                 format_args!(
                     "unknown interrupt pc={:#x} sp={:#x} cause={:#x} bad={:#x}",
-                    frame.sepc, frame.gpr[2], frame.scause, frame.stval
+                    pc, sp, cause, bad
                 ),
             );
             #[cfg(not(feature = "ktest"))]
-            crate::console::fatal(frame.sepc, frame.gpr[2], frame.scause, frame.stval)
+            crate::console::fatal(pc, sp, cause, bad)
         }
     }
 }

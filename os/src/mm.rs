@@ -9,6 +9,8 @@ pub(crate) mod ktest;
 mod page;
 mod pcp;
 mod slub;
+pub(crate) mod space;
+pub(crate) mod user_table;
 
 pub(crate) use bootmem::PAGE_SIZE;
 pub use folio::{FolioRead, FolioRef};

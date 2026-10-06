@@ -4,6 +4,12 @@
 .balign 4
 .global rv_trap_entry
 rv_trap_entry:
+    // sscratch 为零时保留原内核栈；用户执行时只接受内核预置的私有现场指针。
+    csrrw sp, sscratch, sp
+    beqz sp, .Lrv_kernel_trap
+    j rv_user_trap_entry
+.Lrv_kernel_trap:
+    csrrw sp, sscratch, sp
     addi sp, sp, -{frame_size}
     sd x1, ({gpr} + 1 * {word})(sp)
     sd x3, ({gpr} + 3 * {word})(sp)

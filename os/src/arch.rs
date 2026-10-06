@@ -15,6 +15,23 @@ use loongarch64 as dma_backend;
 #[cfg(target_arch = "riscv64")]
 use riscv64 as dma_backend;
 
+/// 用户缺页所请求的硬件访问方向，各后端独立解释自己的异常编号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserAccess {
+    Read,
+    Write,
+    Execute,
+}
+
+/// 用户现场已完整保存并返回原 Task 栈后的事件快照。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserTrap {
+    Syscall,
+    Interrupt,
+    PageFault { address: usize, access: UserAccess },
+    Exception { code: usize, address: usize },
+}
+
 /// 在 coherent DMA 索引发表前排序描述符和 payload 写入，保留编译器内存副作用。
 pub fn dma_write_barrier() {
     dma_backend::dma_write_barrier();

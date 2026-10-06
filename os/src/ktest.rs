@@ -13,6 +13,7 @@ mod registry;
 pub(crate) mod report;
 mod runner;
 pub(crate) mod selftest;
+mod user_execution;
 
 pub(crate) use crate::console::{
     early_write as control_write, emergency_write, ktest_read_byte as control_read_byte,

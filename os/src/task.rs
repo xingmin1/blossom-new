@@ -1,5 +1,8 @@
 //! 普通内核任务拥有执行栈与入口；完成观察者只拥有独立结果。
 
+mod user;
+pub(crate) use user::UserThread;
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::alloc::AllocError;
@@ -10,9 +13,11 @@ use core::ptr;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::arch::UserContext;
+use crate::mm::space::Mm;
 use crate::mm::{alloc_pages, OwnedPages};
 use crate::sched::context::TaskContext;
-use crate::sync::IrqSaveGuard;
+use crate::sync::{IrqSaveGuard, SpinLock};
 use crate::time::Duration;
 use crate::wait::{WaitId, WaitNode, WaitQueue, Waiter};
 
@@ -137,6 +142,7 @@ pub struct Task {
     pub(crate) resources: UnsafeCell<Resources>,
     pub(crate) join: Arc<JoinState>,
     pub(crate) worker: Option<Arc<crate::workqueue::Worker>>,
+    pub(crate) user: SpinLock<Option<Arc<UserThread>>>,
     #[cfg(feature = "ktest")]
     pub(crate) ktest_boundary: AtomicPtr<()>,
     #[cfg(feature = "ktest")]
@@ -145,11 +151,17 @@ pub struct Task {
 
 // SAFETY: scheduling 仅在调度锁内访问；ctx 仅由 Running 的唯一 CPU 与其离栈交接访问。
 // resources 仅由该执行者及 ctx 保存后的调度栈访问；入口是 Send，页拥有权只移动一次。
+// user 的绑定只在准备期安装、离栈后摘离，短锁保护远端取得拥有的读者。
 unsafe impl Send for Task {}
 // SAFETY: 对外只共享不可变身份与原子结果；独立 UnsafeCell 的写者遵守上述执行权和锁协议。
 unsafe impl Sync for Task {}
 
 impl Task {
+    /// 取得单一用户绑定的拥有快照，内核任务和已退出任务没有运行绑定。
+    pub(crate) fn user_thread(&self) -> Option<Arc<UserThread>> {
+        self.user.lock().clone()
+    }
+
     /// 返回与调度位置、迁核和完成状态无关的唯一身份。
     pub fn id(&self) -> TaskId {
         self.id
@@ -245,6 +257,14 @@ pub(crate) struct PreparedTask {
 }
 
 impl PreparedTask {
+    /// 在尚未发表时安装唯一用户绑定，弱反向关联不保留 Task 栈。
+    pub(crate) fn bind_user(&self, user: Arc<UserThread>) {
+        user.bind_executor(Arc::downgrade(&self.task));
+        let mut slot = self.task.user.lock();
+        assert!(slot.is_none(), "prepared task already has a user binding");
+        *slot = Some(user);
+    }
+
     /// 发表前即可将稳定身份登记到服务元数据，不保留 Task 强引用。
     pub(crate) fn task_id(&self) -> TaskId {
         self.task.id()
@@ -339,6 +359,7 @@ fn prepare(
         }),
         join: Arc::clone(&join),
         worker,
+        user: SpinLock::new(None),
         #[cfg(feature = "ktest")]
         ktest_boundary: AtomicPtr::new(ptr::null_mut()),
         #[cfg(feature = "ktest")]
@@ -352,6 +373,19 @@ fn prepare(
         task,
         handle: JoinHandle { id, join },
     })
+}
+
+/// 先准备私有用户绑定和普通 Task，再由调用者统一发表；失败正常归还全部未发表拥有。
+pub(crate) fn prepare_user(
+    mm: Arc<Mm>,
+    context: UserContext,
+    entry: impl FnOnce(Arc<UserThread>) -> i32 + Send + 'static,
+) -> Result<PreparedTask, AllocError> {
+    let user = UserThread::try_new(mm, context)?;
+    let binding = Arc::clone(&user);
+    let prepared = prepare(Placement::Any, None, move || entry(user))?;
+    prepared.bind_user(binding);
+    Ok(prepared)
 }
 
 /// 借用普通任务的强引用；调度栈或硬 IRQ/BH 调用直接报告上下文错误。

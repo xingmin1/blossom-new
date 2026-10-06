@@ -8,6 +8,20 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 pub const NAME: &str = "loongarch64";
 
+mod mmu;
+mod user;
+
+pub use mmu::{
+    activate_kernel_root, activate_user_root, flush_user_translations, initialize_user_root,
+    sync_user_icache, user_empty_entry, user_entry_is_table, user_entry_physical, user_leaf_entry,
+    user_leaf_permissions, user_table_entry, SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS,
+    USER_STACK_TOP,
+};
+pub use user::{run_user, UserContext};
+
+#[cfg(feature = "ktest")]
+pub(crate) use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
+
 #[repr(C, align(16))]
 struct KernelTrapFrame {
     gpr: [usize; 32],
@@ -199,7 +213,7 @@ pub fn mmio_address(pa: usize) -> usize {
     }
     pa | base
 }
-/// 确认入口已安装最终 DMW；普通内核不再使用 DA 低地址别名。
+/// 确认最终 PLV0 DMW 并建立永久 invalid 页表链；普通内核不再使用 DA 低地址别名。
 ///
 /// # Safety
 /// 必须由 BSP 在 IRQ 关闭、辅核尚未释放时调用一次；入口已建立 PG、缓存与强序 DMW。
@@ -208,6 +222,8 @@ pub unsafe fn finish_boot_mappings(_: &BootInfo) {
     assert_eq!(csr_read::<0>() & 0x18, 0x10);
     assert_eq!(csr_read::<0x181>(), phys_to_virt(0) | 0x11);
     assert_eq!(csr_read::<0x180>(), mmio_address(0) | 1);
+    // SAFETY: 本函数的 BSP 独占启动契约保证 AP 尚未发布，静态 DMW 映射已通过上面的断言。
+    unsafe { mmu::initialize_invalid_tables() };
 }
 /// 将稳定的内核 per-CPU 指针放入 KS0；用户 TLS 寄存器不参与此约定。
 ///
@@ -237,7 +253,7 @@ pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     // 汇编仅按 Rust 提供的布局访问整数字段，不恢复 CPU 基址或扩展单元现场。
     unsafe { la_switch_context(prev, next) };
 }
-/// 安装本核异常入口、关闭普通内核扩展单元，并初始化本核 timer/IPI 状态。
+/// 安装本核异常与三级用户 walker、关闭内核扩展单元，并初始化 timer/IPI。
 pub fn init_current_cpu() {
     irq_save();
     // SAFETY: 入口已建立本核 PLV0/DMW 和有效栈；IRQ 已关闭，异常代码在永久内核映射内。
@@ -247,6 +263,7 @@ pub fn init_current_cpu() {
         csr_write::<4>((1 << 11) | (1 << 12) | (1 << 3));
         csr_write::<2>(0);
     }
+    mmu::initialize_current_cpu();
     disable_timer();
     iocsr_write32(0x100c, u32::MAX);
     iocsr_write32(0x1004, u32::MAX);
@@ -598,7 +615,6 @@ extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
         #[cfg(not(feature = "ktest"))]
         crate::console::fatal(frame.era, frame.gpr[3], frame.estat, frame.badv);
     }
-    let _hardirq = crate::cpu::HardIrqGuard::enter();
     // 仅显式等待窗口允许回滚。重启包含 mask 初始化，不能复用 csrxchg 已改写的 t0。
     let (idle_start, idle_end) = (
         core::ptr::addr_of!(la_idle_window_start) as usize,
@@ -607,7 +623,13 @@ extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
     if idle_start <= frame.era && frame.era < idle_end {
         frame.era = la_idle_once_asm as usize;
     }
-    let pending = frame.estat & csr_read::<4>() & 0x1fff;
+    handle_hardware_interrupt(frame.estat);
+}
+
+/// 在当前 IRQ-off 核完成真实硬中断；返回前 guard 已退出，调用者才能请求普通调度。
+fn handle_hardware_interrupt(estat: usize) {
+    let _hardirq = crate::cpu::HardIrqGuard::enter();
+    let pending = estat & csr_read::<4>() & 0x1fff;
     if pending & (1 << 11) != 0 {
         disable_timer();
         crate::cpu::handle_timer();

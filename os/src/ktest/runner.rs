@@ -32,6 +32,7 @@ pub(crate) fn early() -> RunCommand {
     core::hint::black_box(super::boot_cases::anchors());
     core::hint::black_box(super::execution_core::anchors());
     core::hint::black_box(super::execution_services::anchors());
+    core::hint::black_box(super::user_execution::anchors());
     core::hint::black_box(crate::drivers::virtio::ktest_prepare::anchors());
     core::hint::black_box(crate::block::ktest_irq::anchors());
     core::hint::black_box(crate::cache::ktest::anchors());

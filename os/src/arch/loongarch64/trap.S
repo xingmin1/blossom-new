@@ -203,6 +203,53 @@ la_kernel_trap:
 .balign 64
 .global la_kernel_refill
 la_kernel_refill:
+    # 用户 refill 把 t0 存入 TLBRSAVE、t1 存入临时 KS2，不触碰用户 SP 或 KS0。
+    csrwr $t0, 139
+    csrrd $t0, 143
+    andi $t0, $t0, 3
+    xori $t0, $t0, 3
+    beqz $t0, .Luser_refill
+    # PLV0 的用户入口窗口仍可能持有 context/用户 SP；只在该窗口借 KS3 续接栈。
+    # KS2 是非返回的内核 refill 临时槽，原 GPR 在压致命 frame 前恢复。
+    csrwr $t1, 50
+    csrrd $t0, 12
+    la.abs $t1, la_user_trap
+    bne $t0, $t1, .Lordinary_kernel_refill
+    b la_user_kernel_refill_fault
+.Lordinary_kernel_refill:
+    csrrd $t1, 50
+    csrrd $t0, 139
+    b .Lkernel_refill_fatal
+.Luser_refill:
+    # 三层只索引低 39 位；超出政策范围的地址只能走永久 invalid 链。
+    csrrd $t0, 137
+    srli.d $t0, $t0, 39
+    bnez $t0, .Linvalid_user_root
+    csrrd $t0, 25
+    b .Luser_refill_walk
+.Linvalid_user_root:
+    la.abs $t0, LA_INVALID_ROOT
+    bstrpick.d $t0, $t0, 47, 0
+.Luser_refill_walk:
+    # PWCH DIR2 / PWCL DIR0 / PT 构成固定三级；空目录总指向永久 invalid 页。
+    lddir $t0, $t0, 3
+    lddir $t0, $t0, 1
+    # QEMU 9.2.1 的 LDPTE 会截断高权限位；固定 4KiB 叶以完整 64 位装入偶奇 CSR。
+    # KS2 只暂存 t1，真正用户 trap 会重新保存 t0；TLBREHI 保留本次 VPPN 和既有 PS12。
+    csrwr $t1, 50
+    csrrd $t1, 137
+    bstrpick.d $t1, $t1, 20, 13
+    slli.d $t1, $t1, 4
+    add.d $t0, $t0, $t1
+    ld.d $t1, $t0, 8
+    csrwr $t1, 141
+    ld.d $t0, $t0, 0
+    csrwr $t0, 140
+    csrrd $t1, 50
+    tlbfill
+    csrrd $t0, 139
+    ertn
+.Lkernel_refill_fatal:
     # refill 自动处于 DA；高地址栈仍以物理掩码可访问。
     addi.d $sp, $sp, -{refill_size}
     st.d $r0, $sp, {refill_gpr}+0*8
