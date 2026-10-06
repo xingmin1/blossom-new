@@ -19,7 +19,7 @@ pub use mmu::{
     USER_STACK_TOP,
 };
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
-pub use user::{run_user, UserContext};
+pub use user::{run_user, signal_return_code, UserContext};
 
 #[cfg(feature = "ktest")]
 pub(crate) use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};

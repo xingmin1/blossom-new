@@ -202,7 +202,7 @@ impl Mm {
         })
     }
 
-    /// 在尚未共享的地址空间安装完整初始化单页，并转交匿名页的真实共享归还责任。
+    /// 在尚未共享的地址空间安装完整初始化单页，保留当前与最大权限并转交匿名页归还责任。
     ///
     /// # Safety
     /// 调用者必须完整初始化 pages 的全部字节，结束全部排他 Rust 引用及未受控原始访问；
@@ -212,12 +212,13 @@ impl Mm {
         address: usize,
         pages: OwnedPages,
         permissions: PagePermissions,
+        maximum: PagePermissions,
     ) -> Result<(), PageTableError> {
         if pages.order() != 0 {
             return Err(PageTableError::InvalidRange);
         }
         let range = vma::checked_range(address, PAGE_SIZE).map_err(table_error)?;
-        let vma = Vma::try_new(range, permissions, permissions, VmaBacking::Anonymous)
+        let vma = Vma::try_new(range, permissions, maximum, VmaBacking::Anonymous)
             .map_err(table_error)?;
         // SAFETY: 调用者保证完整初始化的独占 order0 页，无其他映射、设备或内容借用；
         // 此处消费原归还权，后续访问仅沿本 Mm 的原始访问和硬件权限协议。

@@ -23,7 +23,7 @@ pub use mmu::{
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 #[cfg(feature = "ktest")]
 pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
-pub use user::{run_user, UserContext};
+pub use user::{run_user, signal_return_code, UserContext};
 
 /// 当前唯一编译目标的架构名称。
 pub const NAME: &str = "riscv64";

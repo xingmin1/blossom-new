@@ -289,7 +289,7 @@ fn page(
     unsafe { core::ptr::copy_nonoverlapping(contents.as_ptr(), direct, contents.len()) };
     // SAFETY: 全页已清零并完成内容复制，无排他引用或并发访问；只作为用户代码或数据，
     // 原页唯一归还权移入尚未共享的 Mm，旧裸地址从不用于恢复或释放拥有。
-    unsafe { mm.map_owned(address, pages, permissions) }
+    unsafe { mm.map_owned(address, pages, permissions, permissions) }
         .map_err(|_| TestError("user probe mapping failed"))?;
     Ok(direct as usize)
 }

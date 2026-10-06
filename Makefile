@@ -19,13 +19,22 @@ EXTRA_IMAGE ?=
 SCRATCH_IMAGE ?=
 WORK_DIR ?= build/run-$(ARCH)
 RESUME ?= 0
+LLVM_MC ?= llvm-mc
+USER_LD ?= rust-lld
+USER_OUTPUT := build/user-$(ARCH)/user-smoke
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
 QEMU := qemu-system-riscv64
+USER_TRIPLE := riscv64-unknown-linux-gnu
+USER_MATTR := +m,+a,+f,+d,-c,-v
+USER_EMULATION := elf64lriscv
 else ifeq ($(ARCH),loongarch64)
 TARGET := loongarch64-unknown-none
 QEMU := qemu-system-loongarch64
+USER_TRIPLE := loongarch64-unknown-linux-gnu
+USER_MATTR := +f,+d,-lsx,-lasx
+USER_EMULATION := elf64loongarch
 else
 $(error ARCH 只支持 riscv64 或 loongarch64)
 endif
@@ -87,6 +96,14 @@ ktest-list:
 
 ktest:
 	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+
+.PHONY: user-tests
+user-tests: $(USER_OUTPUT)
+
+$(USER_OUTPUT): tests/user/smoke-$(ARCH).S tests/user/smoke.ld
+	mkdir -p "$(dir $@)"
+	$(LLVM_MC) --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
+	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
 clean:
 	cd os && cargo clean

@@ -27,6 +27,7 @@ mod platform;
 mod sched;
 mod storage;
 mod sync;
+mod syscall;
 mod task;
 mod time;
 mod timer;
@@ -241,9 +242,9 @@ fn init() -> i32 {
     0
 }
 
-/// 普通 init 用真实磁盘槽读取固定系统文件，结束后释放临时路径、打开文件和缓存。
+/// 普通 init 保留真实根与存储拥有直到磁盘程序退出和离栈回收，不建立用户 PID1 服务。
 #[cfg(not(feature = "ktest"))]
-fn init_filesystems(storage: &storage::Storage) -> Result<(), fs::FsError> {
+fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError> {
     use alloc::sync::Arc;
 
     let selected = fs::system::boot_devices(boot::info().bootargs())?;
@@ -256,7 +257,8 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), fs::FsError> {
         .transpose()?;
     let inodes =
         Arc::try_new(fs::InodeCache::try_new(64, 16)?).map_err(|_| fs::FsError::NoMemory)?;
-    let vfs = fs::system::mount_disks(root, extra, inodes)?;
+    let vfs = Arc::try_new(fs::system::mount_disks(root, extra, inodes)?)
+        .map_err(|_| fs::FsError::NoMemory)?;
     let context = fs::FsContext::new(vfs.root(), vfs.root())?;
     let files = fs::FileTable::try_new(4)?;
     crate::klog!(
@@ -291,7 +293,35 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), fs::FsError> {
         );
     }
     drop(files);
-    drop(context);
+    let graph = task::process::TaskGraph::try_new(128)?;
+    const PROGRAM: &[u8] = b"/test/bin/user-smoke";
+    let path = vfs.resolve(&context, PROGRAM, fs::ResolveMode::Follow)?;
+    let file = fs::open_path(path)?;
+    let arguments =
+        task::exec::Arguments::from_kernel(PROGRAM, &[PROGRAM, b"raw"], &[b"USER_SMOKE=1"])?;
+    let runtime = task::UserRuntime::try_new(Arc::clone(&vfs), context, task::Credentials::ROOT)?;
+    let image = task::exec::load(file, &arguments, 0, 0)?;
+    let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
+    let pid = prepared.pid();
+    let child = prepared.publish()?;
+    let event = graph.wait(None, pid)?;
+    assert_eq!(
+        child.join(),
+        event.status,
+        "user exit and off-stack result differ"
+    );
+    crate::klog!(
+        klog::Level::Info,
+        "USER exited pid={} task={} status={} interrupts={} timers={} cpu={}",
+        event.pid,
+        event.task_id.as_usize(),
+        event.status,
+        event.user_interrupts,
+        event.user_timer_interrupts,
+        event.cpu
+    );
+    drop(arguments);
+    drop(graph);
     vfs.prune_unused();
     drop(vfs);
     crate::klog!(klog::Level::Info, "ROOTFS completed");

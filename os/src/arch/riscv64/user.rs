@@ -35,6 +35,22 @@ impl UserContext {
     }
 }
 
+global_asm!(include_str!("sigreturn.S"));
+
+extern "C" {
+    static rv_user_signal_return_start: u8;
+    static rv_user_signal_return_end: u8;
+}
+
+/// 借用内核持有的固定 rt_sigreturn 指令字节，供独立 Mm 安装用户 RX 返回页。
+pub fn signal_return_code() -> &'static [u8] {
+    let start = core::ptr::addr_of!(rv_user_signal_return_start);
+    let end = core::ptr::addr_of!(rv_user_signal_return_end) as usize;
+    // SAFETY: 两个链接符号界定同一永久只读片段，end 位于 start 之后，字节内容全部已初始化；
+    // 返回切片只借内核静态字节，不借用户映射或建立可并发写的用户内容引用。
+    unsafe { core::slice::from_raw_parts(start, end - start as usize) }
+}
+
 global_asm!(include_str!("user.S"),
     gpr = const offset_of!(UserContext, gpr),
     pc = const offset_of!(UserContext, pc),

@@ -1,7 +1,11 @@
 //! 普通内核任务拥有执行栈与入口；完成观察者只拥有独立结果。
 
+pub(crate) mod exec;
+pub(crate) mod process;
 mod user;
-pub(crate) use user::UserThread;
+pub(crate) use user::{
+    prepare_program, Credentials, PreparedProgram, ProgramError, UserFs, UserRuntime, UserThread,
+};
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -13,8 +17,6 @@ use core::ptr;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::UserContext;
-use crate::mm::space::Mm;
 use crate::mm::{alloc_pages, OwnedPages};
 use crate::sched::context::TaskContext;
 use crate::sync::{IrqSaveGuard, SpinLock};
@@ -375,15 +377,14 @@ fn prepare(
     })
 }
 
-/// 先准备私有用户绑定和普通 Task，再由调用者统一发表；失败正常归还全部未发表拥有。
+/// 将已准备完整资源的用户对象绑定到普通 Task，身份发表完成后才允许调用者发布 Ready。
 pub(crate) fn prepare_user(
-    mm: Arc<Mm>,
-    context: UserContext,
+    user: Arc<UserThread>,
+    placement: Placement,
     entry: impl FnOnce(Arc<UserThread>) -> i32 + Send + 'static,
 ) -> Result<PreparedTask, AllocError> {
-    let user = UserThread::try_new(mm, context)?;
     let binding = Arc::clone(&user);
-    let prepared = prepare(Placement::Any, None, move || entry(user))?;
+    let prepared = prepare(placement, None, move || entry(user))?;
     prepared.bind_user(binding);
     Ok(prepared)
 }

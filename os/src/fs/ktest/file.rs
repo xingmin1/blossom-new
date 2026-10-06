@@ -891,7 +891,7 @@ fn vm_image() -> Result<Mm, TestError> {
         };
         // SAFETY: 全页已初始化，仅包含受控用户代码或零栈；排他引用与原始初始化已结束，
         // 唯一拥有转交尚未共享的 Mm，旧裸地址不再被使用或恢复为拥有者。
-        unsafe { mm.map_owned(address, pages, permissions) }
+        unsafe { mm.map_owned(address, pages, permissions, permissions) }
             .map_err(|_| TestError("file-mapping instruction or stack mapping failed"))?;
     }
     Ok(mm)

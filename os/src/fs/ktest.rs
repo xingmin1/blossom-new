@@ -25,6 +25,7 @@ mod file;
 mod format;
 mod path;
 mod system;
+mod user;
 
 const PATTERN_SIZE: u64 = 65573;
 const DIRECTORY_ENTRIES: usize = 12000;
@@ -32,7 +33,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 保留格式、inode、路径、文件与系统盘模块的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 20],
+    [&'static ::ktest::SuiteSlot; 21],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -59,6 +60,7 @@ pub(crate) fn anchors() -> (
             concurrency::inode_loading::__ktest_anchor(),
             concurrency::file_loading::__ktest_anchor(),
             concurrency::failed_loading::__ktest_anchor(),
+            user::anchor(),
         ],
         path::anchors(),
         file::anchors(),
