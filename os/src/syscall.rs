@@ -3,7 +3,9 @@
 mod error;
 mod file;
 mod memory;
+pub(crate) mod signal;
 mod task;
+pub(crate) mod time;
 
 use crate::arch::UserContext;
 use crate::sched;
@@ -41,17 +43,92 @@ impl Request {
         context.gpr[ARGUMENT_REGISTER] = result as usize;
         context.pc = self.pc.checked_add(4).expect("syscall PC overflow");
     }
+
+    /// 重放仅由内部restart结果授权的原始调用，恢复参数与原PC而不推断用户指令。
+    pub(crate) fn restart_to(self, context: &mut UserContext, restart_block: bool) {
+        context.gpr[ARGUMENT_REGISTER..ARGUMENT_REGISTER + 6].copy_from_slice(&self.arguments);
+        context.gpr[NUMBER_REGISTER] = if restart_block { 128 } else { self.number };
+        context.pc = self.pc;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Restart {
+    Syscall {
+        request: Request,
+    },
+    NoHandler {
+        request: Request,
+    },
+    Sleep {
+        request: Request,
+        deadline: crate::time::MonotonicInstant,
+        remaining: Option<usize>,
+    },
 }
 
 pub(crate) enum Outcome {
     Return(isize),
     Exit(i32),
     GroupExit(i32),
+    Restart(Restart),
+    Restored,
+}
+
+/// 信号选择后依据已选handler策略决定EINTR或重启，剩余时间交付先于现场借用。
+pub(crate) fn resolve_restart(user: &UserThread, state: Restart, handler_flags: Option<usize>) {
+    let (request, restart) = match state {
+        Restart::Syscall { request } => (
+            request,
+            handler_flags.is_none_or(|flags| flags & crate::task::signal::SA_RESTART != 0),
+        ),
+        Restart::NoHandler { request } | Restart::Sleep { request, .. } => {
+            (request, handler_flags.is_none())
+        }
+    };
+    if restart {
+        if matches!(state, Restart::NoHandler { .. }) {
+            user.restore_saved_mask();
+        }
+        let block = matches!(state, Restart::Sleep { .. });
+        if block {
+            user.save_restart(state);
+        }
+        request.restart_to(&mut user.context(), block);
+    } else {
+        let result = match state {
+            Restart::Sleep {
+                deadline,
+                remaining,
+                ..
+            } => time::interrupt_sleep(user, deadline, remaining).unwrap_or_else(Errno::result),
+            _ => Errno::Interrupted.result(),
+        };
+        request.return_to(&mut user.context(), result);
+    }
 }
 
 /// 分派已支持的真实调用，未知编号保持ENOSYS；控制结果不落入普通写寄存器尾部。
 pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let raw = request.arguments;
+    if matches!(request.number, 101..=103 | 113..=115 | 153 | 165 | 169) {
+        return time::dispatch(user, request);
+    }
+    if request.number == 128 {
+        return match user.take_restart() {
+            Some(Restart::Sleep {
+                request,
+                deadline,
+                remaining,
+            }) => time::resume_sleep(user, request, deadline, remaining),
+            Some(Restart::Syscall { .. } | Restart::NoHandler { .. }) | None => {
+                Outcome::Return(Errno::Interrupted.result())
+            }
+        };
+    }
+    if matches!(request.number, 129..=139 | 240) {
+        return signal::dispatch(user, request);
+    }
     let result: SysResult = match request.number {
         93 => return Outcome::Exit(((raw[0] & 255) << 8) as i32),
         94 => return Outcome::GroupExit(((raw[0] & 255) << 8) as i32),
@@ -69,11 +146,11 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         78 => file::readlink(user, raw),
         79 => file::statat(user, raw),
         80 => file::fstat(user, raw),
+        95 => return task::waitid(user, request),
         124 => {
             sched::yield_now();
             Ok(0)
         }
-        134 => task::sigaction(user, raw),
         172 | 178 => {
             let identity = user.identity().expect("syscall has no user identity");
             Ok(if request.number == 172 {

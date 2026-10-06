@@ -47,6 +47,7 @@ pub(crate) struct CloneArguments {
     share_fs: bool,
     share_sighand: bool,
     thread: bool,
+    exit_signal: u8,
     stack: usize,
     tls: Option<usize>,
     parent_tid: Option<usize>,
@@ -79,6 +80,7 @@ impl CloneArguments {
             share_fs: flags & FS != 0,
             share_sighand,
             thread,
+            exit_signal: (flags & 0xff) as u8,
             stack: raw[1],
             tls: (flags & SETTLS != 0).then_some(tls),
             parent_tid: (flags & PARENT_SETTID != 0).then_some(raw[2]),
@@ -106,6 +108,7 @@ pub(crate) fn create(
             arguments.share_sighand,
         )
         .map_err(CloneError::File)?;
+    let inherited = identity.signals().inherit(arguments.share_vm);
     let mut context = user.context().fork();
     request.return_to(&mut context, 0);
     if arguments.stack != 0 {
@@ -120,9 +123,15 @@ pub(crate) fn create(
         Arc::try_new(parent_mm.fork().map_err(CloneError::Vm)?).map_err(|_| CloneError::NoMemory)?
     };
     let identity = if arguments.thread {
-        graph.prepare_thread(&group)
+        graph.prepare_thread(&group, runtime.sighand.clone(), inherited)
     } else {
-        graph.prepare_process(Some(&group))
+        graph.prepare_process(
+            Some(&group),
+            runtime.sighand.clone(),
+            runtime.credentials.uid,
+            inherited,
+            arguments.exit_signal,
+        )
     }
     .map_err(CloneError::Identity)?;
     let program = prepare_bound_user(

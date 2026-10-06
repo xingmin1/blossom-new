@@ -12,6 +12,7 @@ pub(super) enum Errno {
     NotPermitted = 1,
     NotFound = 2,
     NoProcess = 3,
+    Interrupted = 4,
     Io = 5,
     BadFd = 9,
     NoChild = 10,

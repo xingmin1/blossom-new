@@ -83,6 +83,33 @@ fn sleep_inner(deadline: MonotonicInstant, after_arm: Option<fn(Waker)>) {
     }
 }
 
+/// 用户睡眠始终等待同一绝对期限；信号中断先撤唯一活等待，再确认回调真实尾部。
+pub(crate) fn sleep_until_interruptible(deadline: MonotonicInstant) -> crate::wait::WaitResult {
+    while time::now() < deadline {
+        let waiter = Waiter::new_interruptible();
+        let waker = core::pin::pin!(waiter.waker());
+        let timer = core::pin::pin!(Timer::new(
+            crate::cpu::current().id,
+            TimerKind::Precise,
+            notify,
+            waker.as_ref().get_ref() as *const Waker as usize,
+        ));
+        // SAFETY: timer 与 Waker 在本栈固定，退出该轮前同步停止确认回调尾部，
+        // 存储不移动、不提前释放，且回调只读取 Waker 并通知。
+        unsafe { timer.as_ref().arm_borrowed(deadline) }.expect("fresh user sleep timer rejected");
+        let result = waiter.park_signal();
+        drop(waiter);
+        timer.as_ref().cancel_sync();
+        if deadline <= time::now() {
+            return crate::wait::WaitResult::Woken;
+        }
+        if matches!(result, crate::wait::WaitResult::Interrupted) {
+            return crate::wait::WaitResult::Interrupted;
+        }
+    }
+    crate::wait::WaitResult::Woken
+}
+
 /// 提前通知验收走生产睡眠路径，每一轮仍登记原绝对截止，不提供另一套等待后端。
 #[cfg(feature = "ktest")]
 pub(crate) fn test_sleep_until(deadline: MonotonicInstant, after_arm: fn(Waker)) {

@@ -1,15 +1,27 @@
-//! 动作表独立于线程组身份；共享处理处置不合并不同进程的待递送信号。
+//! 动作锁串行保护处置与组、线程信号状态；共享处置不合并不同进程的pending。
 
 use alloc::alloc::AllocError;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use spin::Once;
 
+use crate::arch::UserContext;
 use crate::sync::SpinLock;
+use crate::task::process::TaskGraph;
+use crate::wait::{WaitId, WaitMode, Waker};
 
 pub(crate) const SIGNAL_COUNT: usize = 64;
-pub(crate) const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
-const ACTION_FLAGS: usize = 1 | 2 | 4 | 0x0800_0000 | 0x1000_0000 | 0x4000_0000 | 0x8000_0000;
+pub(crate) const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
+pub(crate) const SA_ONSTACK: usize = 0x0800_0000;
+pub(crate) const SA_RESTART: usize = 0x1000_0000;
+pub(crate) const SA_NODEFER: usize = 0x4000_0000;
+pub(crate) const SA_RESETHAND: usize = 0x8000_0000;
+pub(crate) const SS_ONSTACK: u32 = 1;
+pub(crate) const SS_DISABLE: u32 = 2;
+const ACTION_FLAGS: usize = 1 | 2 | 4 | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
+const STOP_MASK: u64 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21);
+const RT_CAPACITY: usize = 64;
 
-/// 两目标的动作对象都没有restorer字段；内核只保存值，不解引用handler地址。
+/// 两目标的动作对象没有restorer字段；内核保存用户handler地址但不解引用它。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SignalAction {
     pub(crate) handler: usize,
@@ -28,46 +40,883 @@ impl SignalAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignalError {
     InvalidSignal,
+    InvalidStack,
+    OnStack,
+    StackTooSmall,
+    QueueFull,
+    NoProcess,
+    Permission,
 }
 
-/// 同一动作锁串行取旧值和替换；用户对象复制与clone分配在短锁外。
+/// 现场事实仅随同步fault保存；siginfo只编码目标UAPI实际存在的字段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignalPayload {
+    Sender {
+        pid: usize,
+        uid: u32,
+        value: usize,
+    },
+    Fault {
+        address: usize,
+        pc: usize,
+        trap: usize,
+    },
+    Child {
+        pid: usize,
+        uid: u32,
+        status: i32,
+        user_ticks: u64,
+        kernel_ticks: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SignalInfo {
+    pub(crate) signum: u8,
+    pub(crate) errno: i32,
+    pub(crate) code: i32,
+    pub(crate) payload: SignalPayload,
+}
+
+impl SignalInfo {
+    /// 内核生成的普通信号携带SI_KERNEL，不借用用户发送者身份。
+    pub(crate) fn kernel(signum: u8) -> Self {
+        Self {
+            signum,
+            errno: 0,
+            code: 128,
+            payload: SignalPayload::Sender {
+                pid: 0,
+                uid: 0,
+                value: 0,
+            },
+        }
+    }
+
+    /// 编码64位两目标共同的128字节siginfo，所有padding与未使用union字节清零。
+    pub(crate) fn encode(&self, bytes: &mut [u8]) {
+        assert_eq!(bytes.len(), 128);
+        bytes.fill(0);
+        bytes[0..4].copy_from_slice(&(self.signum as i32).to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.errno.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.code.to_le_bytes());
+        match self.payload {
+            SignalPayload::Sender { pid, uid, value } => {
+                bytes[16..20].copy_from_slice(&(pid as i32).to_le_bytes());
+                bytes[20..24].copy_from_slice(&uid.to_le_bytes());
+                bytes[24..32].copy_from_slice(&value.to_le_bytes());
+            }
+            SignalPayload::Fault { address, .. } => {
+                bytes[16..24].copy_from_slice(&address.to_le_bytes())
+            }
+            SignalPayload::Child {
+                pid,
+                uid,
+                status,
+                user_ticks,
+                kernel_ticks,
+            } => {
+                bytes[16..20].copy_from_slice(&(pid as i32).to_le_bytes());
+                bytes[20..24].copy_from_slice(&uid.to_le_bytes());
+                bytes[24..28].copy_from_slice(&status.to_le_bytes());
+                bytes[32..40].copy_from_slice(&user_ticks.to_le_bytes());
+                bytes[40..48].copy_from_slice(&kernel_ticks.to_le_bytes());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AltStack {
+    pub(crate) base: usize,
+    pub(crate) size: usize,
+    pub(crate) flags: u32,
+}
+
+impl AltStack {
+    pub(crate) const DISABLED: Self = Self {
+        base: 0,
+        size: 0,
+        flags: SS_DISABLE,
+    };
+
+    /// 禁用位决定是否提供备用栈，不用地址为零推测启用状态。
+    pub(crate) fn enabled(&self) -> bool {
+        self.flags & SS_DISABLE == 0
+    }
+
+    /// 向下生长的栈包含初始top，排除已经耗尽的base。
+    pub(crate) fn on_stack(&self, sp: usize) -> bool {
+        self.enabled()
+            && self.base < sp
+            && self
+                .base
+                .checked_add(self.size)
+                .is_some_and(|end| sp <= end)
+    }
+
+    /// 查询结果的ONSTACK取当前SP，内核保存值不固化动态栈状态。
+    pub(crate) fn reported(&self, sp: usize) -> Self {
+        Self {
+            flags: if !self.enabled() {
+                SS_DISABLE
+            } else if self.on_stack(sp) {
+                SS_ONSTACK
+            } else {
+                0
+            },
+            ..*self
+        }
+    }
+
+    /// 验证实际支持的stack_t设置与地址范围；目标最小容量由调用者另行判断。
+    pub(crate) fn validate(&self) -> Result<(), SignalError> {
+        if !matches!(self.flags, 0 | SS_ONSTACK | SS_DISABLE)
+            || (self.enabled() && self.base.checked_add(self.size).is_none())
+        {
+            return Err(SignalError::InvalidStack);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct SignalFrameArgs {
+    pub(crate) info: SignalInfo,
+    pub(crate) action: SignalAction,
+    pub(crate) restore_mask: u64,
+    pub(crate) altstack: AltStack,
+    pub(crate) trampoline: usize,
+}
+
+pub(crate) struct SignalFrameRestore {
+    pub(crate) context: UserContext,
+    pub(crate) mask: u64,
+    pub(crate) altstack: AltStack,
+    pub(crate) pending_signal: Option<SignalInfo>,
+}
+
+/// clone只复制阻塞集与备用栈，pending与等待登记始终从空状态开始。
+#[derive(Clone, Copy)]
+pub(crate) struct SignalInheritance {
+    pub(crate) mask: u64,
+    pub(crate) altstack: AltStack,
+}
+
+impl SignalInheritance {
+    pub(crate) const EMPTY: Self = Self {
+        mask: 0,
+        altstack: AltStack::DISABLED,
+    };
+}
+
+/// 动作siglock先于组和private短锁；选择、RESETHAND和消费在同一siglock事务中。
 pub(crate) struct Sighand {
     actions: SpinLock<[SignalAction; SIGNAL_COUNT]>,
 }
 
 impl Sighand {
-    /// 锁外构造完整默认表，尚未绑定到任何可运行用户线程。
+    /// 锁外构造完整默认处置，尚未发表到可运行执行者。
     pub(crate) fn try_new() -> Result<Arc<Self>, AllocError> {
         Arc::try_new(Self {
             actions: SpinLock::new([SignalAction::DEFAULT; SIGNAL_COUNT]),
         })
     }
 
-    /// fork复制本次处置快照；新表分配不占原siglock，不复制任何pending实例。
+    /// fork复制处置快照，新表分配不占原siglock。
     pub(crate) fn try_copy(&self) -> Result<Arc<Self>, AllocError> {
         let actions = *self.actions.lock();
         Arc::try_new(Self {
             actions: SpinLock::new(actions),
         })
     }
+}
 
-    /// 取得并按需替换同一动作；KILL/STOP只允许查询，未知标志清除以保能力探测语义。
-    pub(crate) fn update(
+struct Pending {
+    ordinary: [Option<SignalInfo>; 31],
+    // ponytail: 每个pending源64个RT排队额度；kill额外保每号一个实例，不扩动态分配。
+    realtime: [Option<SignalInfo>; RT_CAPACITY],
+    kill_reserve: [Option<SignalInfo>; 33],
+    rt_len: usize,
+    bits: u64,
+}
+
+impl Pending {
+    /// 固定容量随拥有者一次准备，IRQ普通发送与领取不分配。
+    fn new() -> Self {
+        Self {
+            ordinary: [None; 31],
+            realtime: [None; RT_CAPACITY],
+            kill_reserve: [None; 33],
+            rt_len: 0,
+            bits: 0,
+        }
+    }
+
+    /// 普通保首次实例；RT用户排队满报错，kill满时保每号一个真实实例并允许合并。
+    fn push(&mut self, info: SignalInfo, queued: bool) -> Result<(), SignalError> {
+        let bit = signal_bit(info.signum)?;
+        if info.signum < 32 {
+            self.ordinary[info.signum as usize - 1].get_or_insert(info);
+        } else {
+            if self.rt_len == RT_CAPACITY {
+                if queued {
+                    return Err(SignalError::QueueFull);
+                }
+                if self.bits & bit == 0 {
+                    self.kill_reserve[info.signum as usize - 32] = Some(info);
+                }
+            } else {
+                self.realtime[self.rt_len] = Some(info);
+                self.rt_len += 1;
+            }
+        }
+        self.bits |= bit;
+        Ok(())
+    }
+
+    /// 从允许集中选最低号码，RT同号按原到达顺序移出一次。
+    fn take(&mut self, allowed: u64) -> Option<SignalInfo> {
+        let bits = self.bits & allowed;
+        if bits == 0 {
+            return None;
+        }
+        let signum = bits.trailing_zeros() as u8 + 1;
+        if signum < 32 {
+            self.bits &= !(1 << (signum - 1));
+            return self.ordinary[signum as usize - 1].take();
+        }
+        // 保底实例只会在该号码原无实例时产生，因此先于随后获得额度的新实例。
+        let info = if let Some(info) = self.kill_reserve[signum as usize - 32].take() {
+            Some(info)
+        } else {
+            let index = self.realtime[..self.rt_len]
+                .iter()
+                .position(|entry| entry.is_some_and(|info| info.signum == signum))
+                .expect("RT bit has no queued instance");
+            let info = self.realtime[index].take();
+            self.realtime.copy_within(index + 1..self.rt_len, index);
+            self.rt_len -= 1;
+            self.realtime[self.rt_len] = None;
+            info
+        };
+        if !self.realtime[..self.rt_len]
+            .iter()
+            .any(|entry| entry.is_some_and(|info| info.signum == signum))
+        {
+            self.bits &= !(1 << (signum - 1));
+        }
+        info
+    }
+
+    /// 丢弃明确取消的号码集合，不触碰其他FIFO实例顺序。
+    fn discard(&mut self, mask: u64) {
+        while self.take(mask).is_some() {}
+    }
+}
+
+struct GroupState {
+    pending: Pending,
+    members: usize,
+    stopped: usize,
+    stop_signal: Option<u8>,
+    stop_reported: bool,
+    exit: Option<i32>,
+}
+
+/// 每个真实线程组独有pending与组控制，动作表引用仅绑定一次且不拥有执行者。
+pub(crate) struct SignalGroup {
+    graph: Weak<TaskGraph>,
+    tgid: usize,
+    sighand: Once<Arc<Sighand>>,
+    state: SpinLock<GroupState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignalControl {
+    Run,
+    Stop,
+    Exit(i32),
+}
+
+pub(crate) enum SignalSelection {
+    Handler {
+        info: SignalInfo,
+        action: SignalAction,
+        restore_mask: u64,
+        altstack: AltStack,
+    },
+    Stop,
+    Exit(i32),
+}
+
+impl SignalGroup {
+    /// 在身份发表前分配组信号拥有，弱图关联供锁外通知使用。
+    pub(crate) fn try_new(graph: Weak<TaskGraph>, tgid: usize) -> Result<Arc<Self>, AllocError> {
+        Arc::try_new(Self {
+            graph,
+            tgid,
+            sighand: Once::new(),
+            state: SpinLock::new(GroupState {
+                pending: Pending::new(),
+                members: 0,
+                stopped: 0,
+                stop_signal: None,
+                stop_reported: false,
+                exit: None,
+            }),
+        })
+    }
+
+    /// 所有组成员必须使用同一处置表，非THREAD的共享处置组仍保各自组状态。
+    fn bind_sighand(&self, sighand: Arc<Sighand>) {
+        let bound = self.sighand.call_once(|| sighand.clone());
+        assert!(
+            Arc::ptr_eq(bound, &sighand),
+            "thread group uses different sighands"
+        );
+    }
+
+    /// 返回已在身份准备阶段绑定的siglock，发送者不需要访问UserThread运行资源。
+    fn sighand(&self) -> &Sighand {
+        self.sighand.get().expect("signal group has no sighand")
+    }
+
+    /// IRQ普通定时信号无分配，发送与通知在siglock两侧，调用者不得已持siglock。
+    pub(crate) fn send_timer(&self, signum: u8) {
+        assert!(matches!(signum, 14 | 26 | 27));
+        self.send(SignalInfo::kernel(signum))
+            .expect("ordinary timer signal failed");
+    }
+
+    /// 同一真实图发送事务保护处置、pending和跨成员控制，通知仍由锁外边界完成。
+    pub(crate) fn send(&self, info: SignalInfo) -> Result<(), SignalError> {
+        signal_bit(info.signum)?;
+        let graph = self.graph.upgrade().ok_or(SignalError::NoProcess)?;
+        graph.send_group_info(self.tgid, self, info)
+    }
+
+    /// 稳定组拥有在图锁外发出调度提醒和等待通知，不在siglock中反查图。
+    pub(crate) fn notify(&self) {
+        if let Some(graph) = self.graph.upgrade() {
+            graph.notify_group(self.tgid, self);
+        }
+    }
+
+    /// 图发表事务登记真实成员，早到的pending保留到其首次用户返回点。
+    pub(super) fn add_member(&self) {
+        let _siglock = self.sighand().actions.lock();
+        let mut group = self.state.lock();
+        group.members = group
+            .members
+            .checked_add(1)
+            .expect("signal member overflow");
+        group.stop_reported = false;
+    }
+
+    /// 图退出事务移出真实成员，已确认停止计数跟随成员责任减少。
+    pub(super) fn remove_member(&self, thread: &ThreadSignals) -> Option<u8> {
+        let _siglock = self.sighand().actions.lock();
+        let mut group = self.state.lock();
+        let mut private = thread.state.lock();
+        group.members = group
+            .members
+            .checked_sub(1)
+            .expect("signal member underflow");
+        if private.stopped {
+            private.stopped = false;
+            group.stopped = group.stopped.checked_sub(1).expect("stop count underflow");
+        }
+        stopped_event(&mut group)
+    }
+
+    /// 图→siglock的一次递送事务处理控制取消、忽略、默认致命与真实FIFO，不进行通知。
+    pub(super) fn deliver<'a>(
+        &self,
+        info: SignalInfo,
+        target: Option<&ThreadSignals>,
+        queued: bool,
+        threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
+    ) -> Result<bool, SignalError> {
+        let bit = signal_bit(info.signum)?;
+        let actions = self.sighand().actions.lock();
+        let action = actions[info.signum as usize - 1];
+        let mut group = self.state.lock();
+        if group.members == 0 || group.exit.is_some() {
+            return Ok(false);
+        }
+        let continued = info.signum == 18 && group.stop_reported;
+        let discard = match info.signum {
+            18 => STOP_MASK,
+            19..=22 => 1 << 17,
+            _ => 0,
+        };
+        group.pending.discard(discard);
+        if info.signum == 18 {
+            group.stop_signal = None;
+            group.stop_reported = false;
+            group.stopped = 0;
+        }
+        let mut blocked = false;
+        let mut eligible = false;
+        for thread in threads {
+            let mut private = thread.state.lock();
+            private.pending.discard(discard);
+            if info.signum == 18 {
+                private.stopped = false;
+            }
+            if target.is_none()
+                || target.is_some_and(|target| core::ptr::eq(target, thread.as_ref()))
+            {
+                blocked |= (private.mask | private.real_blocked.unwrap_or(0)) & bit != 0;
+                eligible |= (private.mask | private.real_blocked.unwrap_or(0)) & bit == 0;
+            }
+        }
+        if info.signum == 9 {
+            group.exit.get_or_insert(9);
+            group.stop_signal = None;
+        } else if blocked || !ignored(action, info.signum) {
+            match target {
+                Some(thread) => thread.state.lock().pending.push(info, queued)?,
+                None => group.pending.push(info, queued)?,
+            }
+            if eligible
+                && action.handler == 0
+                && !ignored(action, info.signum)
+                && !matches!(info.signum, 19..=22)
+            {
+                group.exit.get_or_insert(info.signum as i32);
+                group.stop_signal = None;
+            }
+        }
+        Ok(continued)
+    }
+
+    /// 动作替换与当前组pending丢弃同锁执行，共享处置的其他组仍保各自pending拥有。
+    pub(super) fn update_action<'a>(
         &self,
         signal: usize,
         action: Option<SignalAction>,
+        threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<SignalAction, SignalError> {
         if signal == 0 || SIGNAL_COUNT < signal || (action.is_some() && matches!(signal, 9 | 19)) {
             return Err(SignalError::InvalidSignal);
         }
-        let mut actions = self.actions.lock();
-        let current = &mut actions[signal - 1];
-        let previous = *current;
+        let mut actions = self.sighand().actions.lock();
+        let previous = actions[signal - 1];
         if let Some(mut action) = action {
             action.flags &= ACTION_FLAGS;
             action.mask &= !UNBLOCKABLE;
-            *current = action;
+            actions[signal - 1] = action;
+            if ignored(action, signal as u8) {
+                let discard = 1 << (signal - 1);
+                self.state.lock().pending.discard(discard);
+                for thread in threads {
+                    thread.state.lock().pending.discard(discard);
+                }
+            }
         }
         Ok(previous)
     }
+
+    /// 首次退出原因保留，全组停止取消，通知在锁外触达真实成员。
+    pub(crate) fn request_exit(&self, status: i32) {
+        self.mark_exit(status);
+        self.notify();
+    }
+
+    /// 图根回收事务只写合法点退出请求，不在持关系锁时通知或反查成员。
+    pub(super) fn mark_exit(&self, status: i32) {
+        let _siglock = self.sighand().actions.lock();
+        let mut group = self.state.lock();
+        group.exit.get_or_insert(status);
+        group.stop_signal = None;
+    }
+
+    /// 图或用户安全点读取组退出请求，不改变任何调度器状态。
+    pub(crate) fn exit_request(&self) -> Option<i32> {
+        let _siglock = self.sighand().actions.lock();
+        let exit = self.state.lock().exit;
+        exit
+    }
+
+    /// 父SIGCHLD的停止/继续通知遵守SA_NOCLDSTOP，退出仍正常发送。
+    pub(crate) fn send_child(&self, info: SignalInfo) {
+        let suppress = {
+            let actions = self.sighand().actions.lock();
+            matches!(info.code, 5 | 6) && actions[16].flags & 1 != 0
+        };
+        if !suppress {
+            match self.send(info) {
+                Ok(()) | Err(SignalError::NoProcess) => {}
+                Err(error) => panic!("ordinary child signal failed: {:?}", error),
+            }
+        }
+    }
+}
+
+struct ThreadState {
+    pending: Pending,
+    fault: Option<SignalInfo>,
+    mask: u64,
+    real_blocked: Option<u64>,
+    waited_set: u64,
+    altstack: AltStack,
+    stopped: bool,
+    wait: Option<(WaitId, Waker, WaitMode)>,
+}
+
+/// 每个身份拥有自己的private pending、mask、altstack和唯一可中断WaitId。
+pub(crate) struct ThreadSignals {
+    group: Arc<SignalGroup>,
+    state: SpinLock<ThreadState>,
+}
+
+impl ThreadSignals {
+    /// 锁外准备完整private状态，绑定组siglock，所有fallible准备早于身份与Ready发表。
+    pub(crate) fn try_new(
+        group: Arc<SignalGroup>,
+        sighand: Arc<Sighand>,
+        inherited: SignalInheritance,
+    ) -> Result<Arc<Self>, AllocError> {
+        group.bind_sighand(sighand);
+        Arc::try_new(Self {
+            group,
+            state: SpinLock::new(ThreadState {
+                pending: Pending::new(),
+                fault: None,
+                mask: inherited.mask & !UNBLOCKABLE,
+                real_blocked: None,
+                waited_set: 0,
+                altstack: inherited.altstack,
+                stopped: false,
+                wait: None,
+            }),
+        })
+    }
+
+    /// clone继承阻塞集；CLONE_VM且无VFORK时禁用child备用栈，不复制pending。
+    pub(crate) fn inherit(&self, share_vm: bool) -> SignalInheritance {
+        let _siglock = self.group.sighand().actions.lock();
+        let private = self.state.lock();
+        SignalInheritance {
+            mask: private.mask,
+            altstack: if share_vm {
+                AltStack::DISABLED
+            } else {
+                private.altstack
+            },
+        }
+    }
+
+    /// 同步用户fault保存地址与原trap事实，内核强制信号走同一优先领取责任。
+    pub(crate) fn force_fault(&self, info: SignalInfo) {
+        assert!(matches!(info.signum, 4 | 5 | 7 | 8 | 11 | 31));
+        assert!(matches!(info.payload, SignalPayload::Fault { .. }));
+        self.force(info);
+    }
+
+    /// 强制同步信号优先于异步队列；阻断或忽略时恢复默认处置，不重新执行硬件异常。
+    pub(crate) fn force(&self, info: SignalInfo) {
+        signal_bit(info.signum).expect("invalid forced signal");
+        {
+            let mut actions = self.group.sighand().actions.lock();
+            let mut private = self.state.lock();
+            let bit = 1 << (info.signum - 1);
+            let action = &mut actions[info.signum as usize - 1];
+            if private.mask & bit != 0 || action.handler == 1 {
+                *action = SignalAction::DEFAULT;
+            }
+            private.mask &= !bit;
+            private.fault.get_or_insert(info);
+        }
+        self.notify_wait();
+    }
+
+    /// pending查询只报告阻塞的实例，私有与组pending按同一siglock快照合并号码。
+    pub(crate) fn pending(&self) -> u64 {
+        let _siglock = self.group.sighand().actions.lock();
+        let group = self.group.state.lock();
+        let private = self.state.lock();
+        (private.pending.bits | group.pending.bits) & private.mask
+    }
+
+    /// 替换阻塞集时始终去除KILL/STOP，解除阻断后锁外提醒其他可处理组成员。
+    pub(crate) fn replace_mask(&self, mask: u64) -> u64 {
+        let old = {
+            let _siglock = self.group.sighand().actions.lock();
+            let mut private = self.state.lock();
+            let old = private.mask;
+            private.mask = mask & !UNBLOCKABLE;
+            old
+        };
+        self.group.notify();
+        old
+    }
+
+    /// 在siglock中读取实际线程阻塞集，供sigsuspend与原现场恢复。
+    pub(crate) fn mask(&self) -> u64 {
+        let _siglock = self.group.sighand().actions.lock();
+        let mask = self.state.lock().mask;
+        mask
+    }
+
+    /// sigtimedwait暂时解除请求集阻断，保存真实旧mask以免忽略或默认致命丢失等待实例。
+    pub(crate) fn begin_waited(&self, set: u64) -> u64 {
+        let _siglock = self.group.sighand().actions.lock();
+        let mut private = self.state.lock();
+        assert!(private.real_blocked.is_none(), "nested timed signal wait");
+        let old = private.mask;
+        private.real_blocked = Some(old);
+        private.waited_set = set & !UNBLOCKABLE;
+        private.mask = old & !private.waited_set;
+        old
+    }
+
+    /// 原等待结束后恢复真实阻塞集，清请求集责任再锁外重新提醒组pending消费者。
+    pub(crate) fn end_waited(&self, old: u64) {
+        {
+            let _siglock = self.group.sighand().actions.lock();
+            let mut private = self.state.lock();
+            assert_eq!(private.real_blocked.take(), Some(old));
+            private.mask = old & !UNBLOCKABLE;
+            private.waited_set = 0;
+        }
+        self.group.notify();
+    }
+
+    /// sigaltstack查询返回动态ONSTACK，设置只能在当前备用栈之外进行。
+    pub(crate) fn altstack(
+        &self,
+        sp: usize,
+        replacement: Option<AltStack>,
+    ) -> Result<AltStack, SignalError> {
+        let _siglock = self.group.sighand().actions.lock();
+        let mut private = self.state.lock();
+        let previous = private.altstack.reported(sp);
+        if let Some(stack) = replacement {
+            set_altstack(&mut private, stack, sp)?;
+        }
+        Ok(previous)
+    }
+
+    /// 完整帧解码之后提交mask；无效备用栈恢复保留旧值，遵守rt_sigreturn的忽略设置错误语义。
+    pub(crate) fn restore(&self, mask: u64, altstack: AltStack, restored_sp: usize) {
+        {
+            let _siglock = self.group.sighand().actions.lock();
+            let mut private = self.state.lock();
+            private.mask = mask & !UNBLOCKABLE;
+            let _ = set_altstack(&mut private, altstack, restored_sp);
+        }
+        self.group.notify();
+    }
+
+    /// sigtimedwait只领取请求集合中的真实实例；领取后copyout失败不得重新排队。
+    pub(crate) fn take_waited(&self, set: u64) -> Option<SignalInfo> {
+        let _siglock = self.group.sighand().actions.lock();
+        let mut group = self.group.state.lock();
+        let mut private = self.state.lock();
+        let allowed = set & !UNBLOCKABLE;
+        private
+            .pending
+            .take(allowed)
+            .or_else(|| group.pending.take(allowed))
+    }
+
+    /// 一次选择、消费与处置快照同时完成，帧copyout只能在返回且解锁之后执行。
+    pub(crate) fn select(&self) -> Option<SignalSelection> {
+        let mut actions = self.group.sighand().actions.lock();
+        let mut group = self.group.state.lock();
+        let mut private = self.state.lock();
+        if let Some(status) = group.exit {
+            return Some(SignalSelection::Exit(status));
+        }
+        if group.stop_signal.is_some() {
+            return Some(SignalSelection::Stop);
+        }
+        loop {
+            let allowed = !private.mask;
+            let info = private
+                .fault
+                .take()
+                .or_else(|| private.pending.take(allowed))
+                .or_else(|| group.pending.take(allowed))?;
+            let action = actions[info.signum as usize - 1];
+            if ignored(action, info.signum) {
+                continue;
+            }
+            if action.handler == 0 {
+                if matches!(info.signum, 19..=22) {
+                    group.stop_signal = Some(info.signum);
+                    return Some(SignalSelection::Stop);
+                }
+                let status = info.signum as i32;
+                group.exit.get_or_insert(status);
+                return Some(SignalSelection::Exit(status));
+            }
+            if action.flags & SA_RESETHAND != 0 {
+                actions[info.signum as usize - 1].handler = 0;
+            }
+            let restore_mask = private.mask;
+            private.mask |= action.mask;
+            if action.flags & SA_NODEFER == 0 {
+                private.mask |= 1 << (info.signum - 1);
+            }
+            private.mask &= !UNBLOCKABLE;
+            return Some(SignalSelection::Handler {
+                info,
+                action,
+                restore_mask,
+                altstack: private.altstack,
+            });
+        }
+    }
+
+    /// 仅真实成员到合法安全点才确认停止，末个确认产生一次父stopped事件。
+    pub(super) fn acknowledge_control(&self) -> (SignalControl, Option<u8>) {
+        let _siglock = self.group.sighand().actions.lock();
+        let mut group = self.group.state.lock();
+        let mut private = self.state.lock();
+        if let Some(status) = group.exit {
+            return (SignalControl::Exit(status), None);
+        }
+        if group.stop_signal.is_none() {
+            return (SignalControl::Run, None);
+        }
+        if !private.stopped {
+            private.stopped = true;
+            group.stopped = group.stopped.checked_add(1).expect("stop count overflow");
+        }
+        (SignalControl::Stop, stopped_event(&mut group))
+    }
+
+    /// 原Waiter登记唯一WaitId；先保存登记再锁外重查pending，关闭早发送窗口。
+    pub(crate) fn register_wait(&self, id: WaitId, waker: Waker, mode: WaitMode) {
+        {
+            let _siglock = self.group.sighand().actions.lock();
+            let mut private = self.state.lock();
+            assert!(private.wait.is_none(), "nested signal wait");
+            private.wait = Some((id, waker, mode));
+        }
+        self.notify_wait();
+    }
+
+    /// 只撤销本轮登记，最后Weak引用析构在siglock外。
+    pub(crate) fn unregister_wait(&self, id: WaitId) {
+        let removed = {
+            let _siglock = self.group.sighand().actions.lock();
+            let mut private = self.state.lock();
+            if private
+                .wait
+                .as_ref()
+                .is_some_and(|(current, _, _)| *current == id)
+            {
+                private.wait.take()
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+
+    /// Killable只接受致命KILL/exit，Interruptible接受实际非忽略可处理pending与组控制。
+    pub(crate) fn interruption_pending(&self, mode: WaitMode) -> bool {
+        let actions = self.group.sighand().actions.lock();
+        let group = self.group.state.lock();
+        let private = self.state.lock();
+        interruption(&actions, &group, &private, mode)
+    }
+
+    /// 在短锁中取得原Waker快照，升级任务和真正notify都在锁外。
+    pub(crate) fn notify_wait(&self) {
+        let waker = {
+            let actions = self.group.sighand().actions.lock();
+            let group = self.group.state.lock();
+            let private = self.state.lock();
+            private.wait.as_ref().and_then(|(_, waker, mode)| {
+                interruption(&actions, &group, &private, *mode).then(|| waker.clone())
+            })
+        };
+        if let Some(waker) = waker {
+            waker.notify();
+        }
+    }
+}
+
+/// 验证用户信号范围并生成号码位，不允许零信号进入真实pending。
+fn signal_bit(signum: u8) -> Result<u64, SignalError> {
+    if signum == 0 || SIGNAL_COUNT < signum as usize {
+        return Err(SignalError::InvalidSignal);
+    }
+    Ok(1 << (signum - 1))
+}
+
+/// 默认忽略集合包含CONT的递送动作，CONT的恢复副作用在图发送事务中独立执行。
+fn ignored(action: SignalAction, signum: u8) -> bool {
+    action.handler == 1 || (action.handler == 0 && matches!(signum, 17 | 18 | 23 | 28))
+}
+
+/// 实际活成员全部确认时记录停止完成，成员退出不能制造空组停止事件。
+fn stopped_event(group: &mut GroupState) -> Option<u8> {
+    if 0 < group.members
+        && group.stopped == group.members
+        && !group.stop_reported
+        && group.exit.is_none()
+    {
+        if let Some(signum) = group.stop_signal {
+            group.stop_reported = true;
+            return Some(signum);
+        }
+    }
+    None
+}
+
+/// 短锁中的中断判定不分配、通知或反查身份图。
+fn interruption(
+    actions: &[SignalAction; SIGNAL_COUNT],
+    group: &GroupState,
+    private: &ThreadState,
+    mode: WaitMode,
+) -> bool {
+    if group.exit.is_some() {
+        return true;
+    }
+    let pending = private.pending.bits | group.pending.bits;
+    if pending & (1 << 8) != 0 {
+        return true;
+    }
+    if mode == WaitMode::Killable {
+        return false;
+    }
+    if pending & private.waited_set != 0 {
+        return true;
+    }
+    if group.stop_signal.is_some() || private.fault.is_some() {
+        return true;
+    }
+    let mut allowed = pending & !private.mask;
+    while allowed != 0 {
+        let index = allowed.trailing_zeros() as usize;
+        if !ignored(actions[index], index as u8 + 1) {
+            return true;
+        }
+        allowed &= allowed - 1;
+    }
+    false
+}
+
+/// 备用栈设置共享sigaltstack和sigreturn约束，禁用时规范化全部保存字段。
+fn set_altstack(private: &mut ThreadState, stack: AltStack, sp: usize) -> Result<(), SignalError> {
+    if private.altstack.on_stack(sp) {
+        return Err(SignalError::OnStack);
+    }
+    stack.validate()?;
+    if stack.enabled() && stack.size < crate::arch::SIGNAL_MIN_STACK {
+        return Err(SignalError::StackTooSmall);
+    }
+    private.altstack = if stack.enabled() {
+        stack
+    } else {
+        AltStack::DISABLED
+    };
+    Ok(())
 }

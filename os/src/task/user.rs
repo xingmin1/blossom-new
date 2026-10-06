@@ -11,12 +11,18 @@ use crate::arch::{self, UserContext, UserTrap};
 use crate::fs::{FileTable, FsContext, FsError, Vfs};
 use crate::mm::space::{self, Mm, VmError};
 use crate::sync::{IrqSaveGuard, SleepMutex, SpinLock};
+use crate::syscall::Restart;
 use crate::task::exec::{ExecError, LoadedImage};
 use crate::task::process::{
     PreparedExecution, PreparedIdentity, ProcessError, TaskGraph, ThreadGroup, UserIdentity,
 };
-use crate::task::signal::Sighand;
+use crate::task::signal::{
+    Sighand, SignalControl, SignalFrameArgs, SignalInfo, SignalInheritance, SignalPayload,
+    SignalSelection, ThreadSignals,
+};
+use crate::task::time::UserTime;
 use crate::task::{self, JoinHandle, Placement, PreparedTask, Task};
+use crate::wait::{WaitMode, Waiter};
 
 const USER_DESCRIPTOR_CAPACITY: usize = 128;
 
@@ -122,11 +128,14 @@ pub struct UserThread {
     context: RefCell<UserContext>,
     process: SpinLock<Option<UserProcess>>,
     user_timer_interrupts: Cell<usize>,
+    user_time: Once<UserTime>,
+    restart: Cell<Option<Restart>>,
+    saved_mask: Cell<Option<u64>>,
 }
 
-// SAFETY: context 与 user_timer_interrupts 只由弱关联指定的唯一 Running 普通 Task 访问；
-// 其他 CPU 和中断域在访问前被身份与执行上下文检查拒绝，RefCell 排除重叠现场借用。
-// 任务迁核由原调度交接串行化，mm 的远端拥有快照另由短锁保护。
+// SAFETY: context、user_timer_interrupts、restart与saved_mask仅由弱关联指定的唯一Running Task访问；
+// 现场/重启访问核对当前身份，RefCell排除现场重叠借用，任务迁核由原调度交接串行化。
+// mm/process远端拥有快照由短锁保护；Ready前初始化的UserTime仅通过同步原子记账接口共享。
 unsafe impl Sync for UserThread {}
 
 impl UserThread {
@@ -138,6 +147,9 @@ impl UserThread {
             context: RefCell::new(context),
             process: SpinLock::new(None),
             user_timer_interrupts: Cell::new(0),
+            user_time: Once::new(),
+            restart: Cell::new(None),
+            saved_mask: Cell::new(None),
         })
     }
 
@@ -162,6 +174,9 @@ impl UserThread {
         runtime: UserRuntime,
         child_set_tid: Option<usize>,
     ) {
+        assert!(self.user_time.get().is_none(), "user time is already bound");
+        self.user_time
+            .call_once(|| UserTime::new(identity.group().time().clone()));
         let mut process = self.process.lock();
         assert!(process.is_none(), "user process is already bound");
         *process = Some(UserProcess {
@@ -198,9 +213,74 @@ impl UserThread {
             .map(|process| process.runtime.clone())
     }
 
+    /// 身份拥有private信号状态；裸内核probe没有Linux信号绑定。
+    pub(crate) fn signals(&self) -> Option<Arc<ThreadSignals>> {
+        self.identity().map(|identity| identity.signals())
+    }
+
+    /// 升级原弱执行关联以观察稳定Task，不建立另一个线程表或改变调度状态。
+    pub(crate) fn executor(&self) -> Option<Arc<Task>> {
+        self.executor.get().and_then(Weak::upgrade)
+    }
+
+    /// 通知稳定执行者在自己的安全返回点处理工作，不远端改现场或调度状态。
+    pub(crate) fn kick(&self) {
+        if let Some(executor) = self.executor() {
+            crate::sched::request_user_work(&executor);
+        }
+    }
+
+    /// 借用Ready前绑定的线程账；accounting短段不克隆拥有或取得业务锁。
+    pub(crate) fn user_time(&self) -> Option<&UserTime> {
+        self.user_time.get()
+    }
+
+    /// 累计已结束的真实执行片段；无进程身份的内核probe不产生LinuxCPU账。
+    pub(crate) fn account_execution(&self, user: bool, ns: u64) {
+        if let Some(time) = self.user_time.get() {
+            time.account_execution(user, ns);
+        }
+    }
+
+    /// 当前执行者保存sleep的唯一原始deadline，供restart_syscall领取。
+    pub(crate) fn save_restart(&self, state: Restart) {
+        self.assert_current();
+        self.restart.set(Some(state));
+    }
+
+    /// restart_syscall和sigreturn各自一次取走旧restart block。
+    pub(crate) fn take_restart(&self) -> Option<Restart> {
+        self.assert_current();
+        self.restart.take()
+    }
+
+    /// sigsuspend保存进入前mask，下一实际handler帧消费一次。
+    pub(crate) fn save_mask(&self, mask: u64) {
+        self.assert_current();
+        if self.saved_mask.get().is_none() {
+            self.saved_mask.set(Some(mask));
+        }
+    }
+
+    /// 无handler重放sigsuspend前结束临时mask责任，参数重读失败也不遗留旧保存值。
+    pub(crate) fn restore_saved_mask(&self) {
+        self.assert_current();
+        if let Some(mask) = self.saved_mask.take() {
+            self.signals()
+                .expect("saved signal mask has no signal binding")
+                .replace_mask(mask);
+        }
+    }
+
+    /// 实际handler保存sigsuspend的旧mask，否则保留选择时的mask快照。
+    fn mask_to_restore(&self, selected: u64) -> u64 {
+        self.saved_mask.take().unwrap_or(selected)
+    }
+
     /// 当前用户循环先解除运行拥有，再用返回的身份发表退出；CPU仍独立保活活动根。
     pub(crate) fn release_process(&self) -> Arc<UserIdentity> {
         self.assert_current();
+        crate::accounting::detach_user();
         let mm = self.mm.lock().take();
         let process = self
             .process
@@ -233,11 +313,13 @@ impl UserThread {
             "running user thread has another active MM"
         );
         let local = crate::cpu::current();
+        crate::accounting::user_enter(self);
         let timer_before = local.timer_interrupts.load(Ordering::Relaxed);
         // SAFETY: 弱关联已核对当前唯一 Running Task，RefCell 的独占借用排除现场别名；
         // IRQ guard 关闭本地中断，MM 与 CPU 活动拥有保证全部根、用户页及内核映射存活。
         // 架构在同一调用栈返回，IRQ 关闭且硬中断 guard 已结束，期间不切换 Task。
         let trap = unsafe { arch::run_user(&mut context) };
+        crate::accounting::user_leave();
         if local.timer_interrupts.load(Ordering::Relaxed) != timer_before {
             self.user_timer_interrupts.set(
                 self.user_timer_interrupts
@@ -366,7 +448,13 @@ pub(crate) fn prepare_program(
     runtime: UserRuntime,
     placement: Placement,
 ) -> Result<PreparedProgram, ProgramError> {
-    let identity = graph.prepare_process(parent)?;
+    let identity = graph.prepare_process(
+        parent,
+        runtime.sighand.clone(),
+        runtime.credentials.uid,
+        SignalInheritance::EMPTY,
+        17,
+    )?;
     prepare_bound_user(identity, image, runtime, placement, None)
 }
 
@@ -403,12 +491,66 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             .copyout(address, &bytes);
     }
     let mut interrupts = 0usize;
+    let signals = identity.signals();
+    let mut restart = None;
     let status = loop {
-        crate::sched::cond_resched();
-        if let Some(status) = identity.graph().exit_request(&identity) {
+        if let Some(status) = wait_control(&identity) {
             break status;
         }
-        match user.run_user() {
+        crate::sched::cond_resched();
+        crate::accounting::settle_current();
+        user.user_time()
+            .expect("user loop has no CPU time")
+            .flush_cpu_timers();
+        match signals.select() {
+            Some(SignalSelection::Exit(status)) => {
+                identity.group().signals().notify();
+                break status;
+            }
+            Some(SignalSelection::Stop) => {
+                identity.group().signals().notify();
+                continue;
+            }
+            Some(SignalSelection::Handler {
+                info,
+                action,
+                restore_mask,
+                altstack,
+            }) => {
+                if let Some(state) = restart.take() {
+                    crate::syscall::resolve_restart(&user, state, Some(action.flags));
+                }
+                let args = SignalFrameArgs {
+                    info,
+                    action,
+                    restore_mask: user.mask_to_restore(restore_mask),
+                    altstack,
+                    trampoline: arch::SIGNAL_RETURN_PAGE,
+                };
+                let mm = user.mm().expect("signal delivery has no MM");
+                let mut candidate = user.context().fork();
+                if candidate.setup_signal(&mm, &args).is_err() {
+                    identity.graph().request_exit(&identity, 11);
+                    break 11;
+                }
+                *user.context() = candidate;
+            }
+            None => {
+                if let Some(state) = restart.take() {
+                    crate::syscall::resolve_restart(&user, state, None);
+                }
+            }
+        }
+        let trap = {
+            let _irq = IrqSaveGuard::new();
+            if signals.interruption_pending(WaitMode::Interruptible)
+                || crate::cpu::current().need_resched.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            user.run_user()
+        };
+        match trap {
             UserTrap::Interrupt => {
                 interrupts = interrupts
                     .checked_add(1)
@@ -418,8 +560,10 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 let request = crate::syscall::Request::snapshot(&user.context());
                 match crate::syscall::dispatch(&user, request) {
                     crate::syscall::Outcome::Return(result) => {
-                        request.return_to(&mut user.context(), result);
+                        request.return_to(&mut user.context(), result)
                     }
+                    crate::syscall::Outcome::Restored => {}
+                    crate::syscall::Outcome::Restart(state) => restart = Some(state),
                     crate::syscall::Outcome::Exit(status) => break status,
                     crate::syscall::Outcome::GroupExit(status) => {
                         identity.graph().request_exit(&identity, status);
@@ -428,35 +572,54 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 }
             }
             UserTrap::PageFault { address, access } => {
-                let result = user
+                let pc = user.context().pc;
+                if let Err(error) = user
                     .mm()
                     .expect("user fault has no MM")
-                    .fault(address, access);
-                if let Err(error) = result {
-                    let signal = fault_signal(error);
-                    crate::klog!(
-                        crate::klog::Level::Warn,
-                        "USER fault address={:#x} access={:?} cause={:?} signal={}",
-                        address,
-                        access,
-                        error,
-                        signal
-                    );
-                    identity.graph().request_exit(&identity, signal);
-                    break signal;
+                    .fault(address, access)
+                {
+                    let (signum, code) = fault_signal(error);
+                    if signum == 9 {
+                        identity.graph().request_exit(&identity, 9);
+                        break 9;
+                    }
+                    signals.force_fault(SignalInfo {
+                        signum,
+                        errno: 0,
+                        code,
+                        payload: SignalPayload::Fault {
+                            address,
+                            pc,
+                            trap: access as usize,
+                        },
+                    });
                 }
             }
             UserTrap::Exception { code, address } => {
-                let signal = exception_signal(code);
-                crate::klog!(
-                    crate::klog::Level::Warn,
-                    "USER exception code={} address={:#x} signal={}",
-                    code,
-                    address,
-                    signal
-                );
-                identity.graph().request_exit(&identity, signal);
-                break signal;
+                let mut context = user.context();
+                let pc = context.pc;
+                let fcsr = context.fcsr;
+                let (signum, si_code) = exception_signal(code, fcsr);
+                #[cfg(target_arch = "loongarch64")]
+                if code == 18 {
+                    context.fcsr = fcsr & !((fcsr & 0x1f) << 24);
+                }
+                drop(context);
+                let address = if matches!(signum, 4 | 5 | 8) {
+                    pc
+                } else {
+                    address
+                };
+                signals.force_fault(SignalInfo {
+                    signum,
+                    errno: 0,
+                    code: si_code,
+                    payload: SignalPayload::Fault {
+                        address,
+                        pc,
+                        trap: code,
+                    },
+                });
             }
         }
     };
@@ -471,33 +634,76 @@ fn run_program(user: Arc<UserThread>) -> i32 {
     status
 }
 
-/// 尚无捕获处置时按真实用户 fault 原因终止；文件 EOF/I/O 与地址/权限错误分开。
-fn fault_signal(error: VmError) -> i32 {
+/// 真实成员确认停止后在原控制源登记，登记后重查关闭CONT/KILL早通知窗口。
+fn wait_control(identity: &UserIdentity) -> Option<i32> {
+    loop {
+        match identity.graph().acknowledge_control(identity) {
+            SignalControl::Run => return None,
+            SignalControl::Exit(status) => return Some(status),
+            SignalControl::Stop => {}
+        }
+        let waiter = Waiter::new();
+        let mut node = core::pin::pin!(crate::wait::WaitNode::new(waiter.waker()));
+        // SAFETY: identity保活原图和控制源；node固定本Task栈，登记先于node和Waiter撤除，
+        // 所有控制检查和通知不持登记源锁，返回和重试都先撤链再退栈。
+        let _registration = unsafe { identity.graph().control_waiters().register(node.as_mut()) };
+        match identity.graph().acknowledge_control(identity) {
+            SignalControl::Run => return None,
+            SignalControl::Exit(status) => return Some(status),
+            SignalControl::Stop => waiter.park(),
+        }
+    }
+}
+
+/// 将发生时VM原因保存为siginfo，EOF与IO保持SIGBUS，内存耗尽请求合法点退出。
+fn fault_signal(error: VmError) -> (u8, i32) {
     match error {
         VmError::NoMemory
-        | VmError::File(FsError::NoMemory | FsError::Io(crate::block::BlockError::NoMemory)) => 9,
-        VmError::BeyondEof | VmError::File(_) => 7,
-        VmError::InvalidRange | VmError::Occupied | VmError::Unmapped | VmError::Permission => 11,
+        | VmError::File(FsError::NoMemory | FsError::Io(crate::block::BlockError::NoMemory)) => {
+            (9, 0)
+        }
+        VmError::BeyondEof => (7, 2),
+        VmError::File(_) => (7, 3),
+        VmError::Permission => (11, 2),
+        VmError::InvalidRange | VmError::Occupied | VmError::Unmapped => (11, 1),
     }
 }
 
-/// 将本目标的实际同步用户异常映为默认终止信号，不影响内核异常的 fatal 路径。
+/// 将实际同步异常保存为目标信号与si_code，不改变内核fatal路径。
 #[cfg(target_arch = "riscv64")]
-fn exception_signal(code: usize) -> i32 {
+fn exception_signal(code: usize, _fcsr: usize) -> (u8, i32) {
     match code {
-        0 | 4 | 6 => 7,
-        1 | 5 | 7 => 11,
-        3 => 5,
-        _ => 4,
+        0 | 4 | 6 => (7, 1),
+        1 | 5 | 7 => (11, 2),
+        3 => (5, 1),
+        _ => (4, 1),
     }
 }
 
-/// 对齐未启用扩展、地址对齐及断点的实际异常；内核异常仍由架构独立处理。
+/// 对齐异常、断点和非法指令保持目标同步事实，内核异常仍由架构独立处理。
 #[cfg(target_arch = "loongarch64")]
-fn exception_signal(code: usize) -> i32 {
+fn exception_signal(code: usize, fcsr: usize) -> (u8, i32) {
     match code {
-        9 => 7,
-        12 => 5,
-        _ => 4,
+        7 => (11, 2),
+        8 | 10 => (7, 2),
+        9 => (7, 1),
+        12 => (5, 1),
+        18 => (
+            8,
+            if fcsr & (1 << 28) != 0 {
+                7
+            } else if fcsr & (1 << 27) != 0 {
+                3
+            } else if fcsr & (1 << 26) != 0 {
+                4
+            } else if fcsr & (1 << 25) != 0 {
+                5
+            } else if fcsr & (1 << 24) != 0 {
+                6
+            } else {
+                14
+            },
+        ),
+        _ => (4, 1),
     }
 }

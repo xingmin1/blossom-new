@@ -8,6 +8,11 @@ use core::ptr;
 
 use crate::sched;
 use crate::sync::SpinLock;
+use crate::task::signal::{
+    Sighand, SignalAction, SignalControl, SignalError, SignalGroup, SignalInfo, SignalInheritance,
+    SignalPayload, ThreadSignals,
+};
+use crate::task::time::{GroupTime, USER_HZ};
 use crate::task::{JoinObserver, TaskId, UserThread};
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
@@ -43,6 +48,10 @@ pub(crate) struct ThreadGroup {
     pid: Arc<Pid>,
     pgid: Arc<Pid>,
     sid: Arc<Pid>,
+    uid: u32,
+    exit_signal: u8,
+    signals: Arc<SignalGroup>,
+    time: Arc<GroupTime>,
 }
 
 impl ThreadGroup {
@@ -60,6 +69,16 @@ impl ThreadGroup {
     pub(crate) fn sid(&self) -> usize {
         self.sid.number
     }
+
+    /// 借用组独有pending与控制拥有，不把共享动作轴等同于线程组。
+    pub(crate) fn signals(&self) -> &Arc<SignalGroup> {
+        &self.signals
+    }
+
+    /// 借用真实组CPU时间和itimer拥有，线程私有时间由执行者另持。
+    pub(crate) fn time(&self) -> &Arc<GroupTime> {
+        &self.time
+    }
 }
 
 /// 执行者拥有自己的图与组；图反向只持 Weak<UserThread>，没有强引用环。
@@ -67,6 +86,7 @@ pub(crate) struct UserIdentity {
     graph: Arc<TaskGraph>,
     group: Arc<ThreadGroup>,
     tid: Arc<Pid>,
+    signals: Arc<ThreadSignals>,
 }
 
 impl UserIdentity {
@@ -94,6 +114,11 @@ impl UserIdentity {
     pub(crate) fn tid_object(&self) -> Arc<Pid> {
         self.tid.clone()
     }
+
+    /// 身份准备时已构造private信号状态，退出解绑运行资源不会丢失早到信号。
+    pub(crate) fn signals(&self) -> Arc<ThreadSignals> {
+        self.signals.clone()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +129,15 @@ pub(crate) struct WaitEvent {
     pub user_timer_interrupts: usize,
     pub task_id: TaskId,
     pub cpu: usize,
+}
+
+/// 有限waitid消费的真实子组状态，停止事件只在全部实际成员到安全点后产生。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildEvent {
+    pub(crate) pid: usize,
+    pub(crate) uid: u32,
+    pub(crate) code: i32,
+    pub(crate) status: i32,
 }
 
 /// 每个真实执行者的离栈观察；节点锁外准备，退出后只保小完成对象。
@@ -123,6 +157,7 @@ struct ThreadEntry {
     user: Weak<UserThread>,
     group: Arc<ThreadGroup>,
     execution: Box<PreparedExecution>,
+    signals: Arc<ThreadSignals>,
 }
 
 struct ProcessEntry {
@@ -132,11 +167,11 @@ struct ProcessEntry {
     members: usize,
     leader_task_id: TaskId,
     leader_status: Option<i32>,
-    exit_requested: Option<i32>,
     user_interrupts: usize,
     user_timer_interrupts: usize,
     completed: Option<Box<PreparedExecution>>,
     exit: Option<WaitEvent>,
+    control_event: Option<ChildEvent>,
 }
 
 impl ProcessEntry {
@@ -190,6 +225,7 @@ pub(crate) struct TaskGraph {
     // ponytail: 有限号码域使用线性预留与转亲扫描；大号码域再换独立空闲索引。
     slots: SpinLock<Vec<Slot>>,
     waiters: WaitQueue,
+    control_waiters: WaitQueue,
 }
 
 /// 未发表号码的唯一归还责任，任何锁外准备失败都正常清除预留。
@@ -220,14 +256,19 @@ impl TaskGraph {
         Arc::try_new(Self {
             slots: SpinLock::new(slots),
             waiters: WaitQueue::new(),
+            control_waiters: WaitQueue::new(),
         })
         .map_err(|_| ProcessError::NoMemory)
     }
 
-    /// 新进程私有预留号码，锁外完成身份分配；None指定内核根回收者。
+    /// 新进程私有预留号码与已解码的退出信号，锁外完成分配；None指定内核根回收者。
     pub(crate) fn prepare_process(
         self: &Arc<Self>,
         parent: Option<&Arc<ThreadGroup>>,
+        sighand: Arc<Sighand>,
+        uid: u32,
+        inherited: SignalInheritance,
+        exit_signal: u8,
     ) -> Result<PreparedIdentity, ProcessError> {
         let reservation = self.reserve_number(parent)?;
         let pid = Arc::try_new(Pid {
@@ -238,17 +279,27 @@ impl TaskGraph {
             Some(parent) => (parent.pgid.clone(), parent.sid.clone()),
             None => (pid.clone(), pid.clone()),
         };
+        let signals = SignalGroup::try_new(Arc::downgrade(self), pid.number)
+            .map_err(|_| ProcessError::NoMemory)?;
+        let private = ThreadSignals::try_new(signals.clone(), sighand, inherited)
+            .map_err(|_| ProcessError::NoMemory)?;
+        let time = GroupTime::try_new(signals.clone()).map_err(|_| ProcessError::NoMemory)?;
         let group = Arc::try_new(ThreadGroup {
             graph: Arc::downgrade(self),
             pid: pid.clone(),
             pgid,
             sid,
+            uid,
+            exit_signal,
+            signals,
+            time,
         })
         .map_err(|_| ProcessError::NoMemory)?;
         let identity = Arc::try_new(UserIdentity {
             graph: self.clone(),
             group,
             tid: pid,
+            signals: private,
         })
         .map_err(|_| ProcessError::NoMemory)?;
         Ok(PreparedIdentity {
@@ -262,16 +313,21 @@ impl TaskGraph {
     pub(crate) fn prepare_thread(
         self: &Arc<Self>,
         group: &Arc<ThreadGroup>,
+        sighand: Arc<Sighand>,
+        inherited: SignalInheritance,
     ) -> Result<PreparedIdentity, ProcessError> {
         let reservation = self.reserve_number(Some(group))?;
         let tid = Arc::try_new(Pid {
             number: reservation.index + 1,
         })
         .map_err(|_| ProcessError::NoMemory)?;
+        let signals = ThreadSignals::try_new(group.signals.clone(), sighand, inherited)
+            .map_err(|_| ProcessError::NoMemory)?;
         let identity = Arc::try_new(UserIdentity {
             graph: self.clone(),
             group: group.clone(),
             tid,
+            signals,
         })
         .map_err(|_| ProcessError::NoMemory)?;
         Ok(PreparedIdentity {
@@ -361,30 +417,14 @@ impl TaskGraph {
         user.upgrade()
     }
 
-    /// 仅请求成员在自己的合法用户返回点退出，首个组退出原因保留到最后成员结束。
+    /// 首个组退出原因保留，锁外通知所有真实成员在自己的合法用户返回点退出。
     pub(crate) fn request_exit(&self, identity: &UserIdentity, status: i32) {
-        let mut slots = self.slots.lock();
-        let process = slots[identity.tgid() - 1]
-            .process
-            .as_mut()
-            .expect("group exit requested for an unpublished process");
-        assert!(Arc::ptr_eq(&process.group, &identity.group));
-        assert!(
-            0 < process.members,
-            "group exit requested after last member"
-        );
-        process.exit_requested.get_or_insert(status);
+        identity.group.signals.request_exit(status);
     }
 
-    /// 当前执行者在IRQ/业务短锁外检查本组控制，不让远核修改用户现场或释放栈。
+    /// 当前执行者在IRQ和业务短锁外读取本组控制，不允许远核改用户现场或释放栈。
     pub(crate) fn exit_request(&self, identity: &UserIdentity) -> Option<i32> {
-        let slots = self.slots.lock();
-        let process = slots[identity.tgid() - 1]
-            .process
-            .as_ref()
-            .expect("running user has no process");
-        assert!(Arc::ptr_eq(&process.group, &identity.group));
-        process.exit_requested
+        identity.group.signals.exit_request()
     }
 
     /// 解绑本成员运行资源后移出弱关联；最后成员才发表组事件并转亲，小完成观察保至回收。
@@ -405,12 +445,13 @@ impl TaskGraph {
                 && (status & 0xff == 0 || (status & 0xff00 == 0 && (1..=64).contains(&signal))),
             "invalid Linux exit status"
         );
-        let (user, group, released, last) = {
+        let (user, group, released, exit, event, parent) = {
             let mut slots = self.slots.lock();
             let ThreadEntry {
                 user,
                 group,
                 mut execution,
+                signals,
             } = slots[identity.tid() - 1]
                 .thread
                 .take()
@@ -445,20 +486,38 @@ impl TaskGraph {
                 .expect("group user timer count overflow");
             execution.next = process.completed.take();
             process.completed = Some(execution);
-            let last = process.members == 0;
-            if last {
-                process.exit = Some(WaitEvent {
-                    pid: identity.tgid(),
-                    status: process
-                        .exit_requested
-                        .or(process.leader_status)
-                        .unwrap_or(status),
-                    user_interrupts: process.user_interrupts,
-                    user_timer_interrupts: process.user_timer_interrupts,
-                    task_id: process.leader_task_id,
-                    cpu: crate::cpu::current().id,
+            let stopped = group
+                .signals
+                .remove_member(&signals)
+                .map(|signum| ChildEvent {
+                    pid: group.tgid(),
+                    uid: group.uid,
+                    code: 5,
+                    status: signum as i32,
                 });
+            if let Some(event) = stopped {
+                process.control_event = Some(event);
             }
+            let last = process.members == 0;
+            let exit = last.then(|| WaitEvent {
+                pid: identity.tgid(),
+                status: group
+                    .signals
+                    .exit_request()
+                    .or(process.leader_status)
+                    .unwrap_or(status),
+                user_interrupts: process.user_interrupts,
+                user_timer_interrupts: process.user_timer_interrupts,
+                task_id: process.leader_task_id,
+                cpu: crate::cpu::current().id,
+            });
+            let event = exit
+                .map(|exit| exit_child_event_number(exit.pid, exit.status, group.uid))
+                .or(stopped);
+            let parent_number = process.parent;
+            let parent = parent_number
+                .and_then(|pid| slots[pid - 1].process.as_ref())
+                .map(|parent| parent.group.clone());
             let released = detach_role(&mut slots, &identity.tid, TID);
             if last {
                 for slot in slots.iter_mut() {
@@ -469,14 +528,27 @@ impl TaskGraph {
                     }
                 }
             }
-            (user, group, released, last)
+            (user, group, released, exit, event, parent)
         };
         drop(user);
-        drop(group);
         drop(released);
-        if last {
+        if let Some(exit) = exit {
+            // 先在锁外确认定时回调尾部，随后才允许用户wait回收组身份与时间拥有。
+            group.time.stop();
+            let mut slots = self.slots.lock();
+            let process = slots[identity.tgid() - 1]
+                .process
+                .as_mut()
+                .expect("last exiting group disappeared before timer stop");
+            assert!(Arc::ptr_eq(&process.group, &group));
+            assert_eq!(process.members, 0);
+            process.exit = Some(exit);
+        }
+        if let Some(event) = event {
+            send_parent_event(parent.as_deref(), &group, event);
             self.waiters.wake_all();
         }
+        drop(group);
     }
 
     /// 用户等待只消费退出信息，不等待成员离栈；nowait保留事件，具体子PID只允许一次消费。
@@ -486,7 +558,7 @@ impl TaskGraph {
         pid: usize,
         nowait: bool,
     ) -> Result<Option<WaitEvent>, ProcessError> {
-        self.collect_child(parent, pid, nowait)
+        self.collect_child(parent, pid, nowait, None)
             .map(|child| child.map(|child| child.event))
     }
 
@@ -496,6 +568,7 @@ impl TaskGraph {
         parent: Option<&ThreadGroup>,
         pid: usize,
         nowait: bool,
+        expected: Option<&ThreadGroup>,
     ) -> Result<Option<CollectedChild>, ProcessError> {
         let collected = {
             let mut slots = self.slots.lock();
@@ -510,6 +583,9 @@ impl TaskGraph {
             let slot = slots.get(index).ok_or(ProcessError::NoChild)?;
             let process = slot.process.as_ref().ok_or(ProcessError::NoChild)?;
             if process.parent != parent_number {
+                return Err(ProcessError::NoChild);
+            }
+            if expected.is_some_and(|expected| !ptr::eq(process.group.as_ref(), expected)) {
                 return Err(ProcessError::NoChild);
             }
             let Some(event) = process.exit else {
@@ -540,6 +616,9 @@ impl TaskGraph {
             }
         };
         self.waiters.wake_all();
+        if let (Some(parent), Some(process)) = (parent, collected.process.as_ref()) {
+            parent.time.add_reaped_child(&process.group.time);
+        }
         Ok(Some(collected))
     }
 
@@ -566,7 +645,7 @@ impl TaskGraph {
     ) -> Result<CollectedChild, ProcessError> {
         sched::assert_switchable();
         loop {
-            if let Some(collected) = self.collect_child(parent, pid, false)? {
+            if let Some(collected) = self.collect_child(parent, pid, false, None)? {
                 return Ok(collected);
             }
             let waiter = Waiter::new();
@@ -574,7 +653,7 @@ impl TaskGraph {
             // SAFETY: self借用保活固定源；node固定当前Task栈，registration先于
             // node/waiter析构，复查关闭早通知窗口，返回前撤链后才可等待成员join。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
-            if let Some(collected) = self.collect_child(parent, pid, false)? {
+            if let Some(collected) = self.collect_child(parent, pid, false, None)? {
                 return Ok(collected);
             }
             waiter.park();
@@ -595,6 +674,467 @@ impl TaskGraph {
         self.wait(None, pid)
     }
 
+    /// 用户waitid登记沿用原退出通知源，业务事件在登记后仍须复查。
+    pub(crate) fn waiters(&self) -> &WaitQueue {
+        &self.waiters
+    }
+
+    /// 内核根回收者关闭现存组的合法点执行，统一标记后锁外提醒，派生发表重新核对退出请求。
+    pub(crate) fn request_root_exit(&self, status: i32) {
+        let capacity = {
+            let slots = self.slots.lock();
+            for process in slots.iter().filter_map(|slot| slot.process.as_ref()) {
+                if 0 < process.members {
+                    process.group.signals.mark_exit(status);
+                }
+            }
+            slots.len()
+        };
+        for index in 0..capacity {
+            let group = {
+                let slots = self.slots.lock();
+                slots[index]
+                    .process
+                    .as_ref()
+                    .filter(|process| 0 < process.members)
+                    .map(|process| process.group.clone())
+            };
+            if let Some(group) = group {
+                group.signals.notify();
+            }
+        }
+    }
+
+    /// 已确认停止的成员在独立控制源停驻，完成计数不由普通Blocked推导。
+    pub(crate) fn control_waiters(&self) -> &WaitQueue {
+        &self.control_waiters
+    }
+
+    /// 真实成员在合法安全点确认组控制，末个停止确认才发表父事件。
+    pub(crate) fn acknowledge_control(&self, identity: &UserIdentity) -> SignalControl {
+        let (control, event) = {
+            let mut slots = self.slots.lock();
+            let thread = slots[identity.tid() - 1]
+                .thread
+                .as_ref()
+                .expect("unpublished member acknowledged signal control");
+            assert!(Arc::ptr_eq(&thread.group, &identity.group));
+            let (control, stopped) = thread.signals.acknowledge_control();
+            let event = stopped.map(|signum| ChildEvent {
+                pid: identity.tgid(),
+                uid: identity.group.uid,
+                code: 5,
+                status: signum as i32,
+            });
+            if let Some(event) = event {
+                slots[identity.tgid() - 1]
+                    .process
+                    .as_mut()
+                    .expect("stopping member has no process")
+                    .control_event = Some(event);
+            }
+            (control, event)
+        };
+        if let Some(event) = event {
+            self.notify_parent(&identity.group, event);
+            self.waiters.wake_all();
+        }
+        control
+    }
+
+    /// 具体子PID的有限waitid只消费请求类型，WNOWAIT保留事件，不收取尚未停止完成的成员。
+    pub(crate) fn try_wait_event(
+        &self,
+        parent: &ThreadGroup,
+        pid: usize,
+        options: u32,
+    ) -> Result<Option<ChildEvent>, ProcessError> {
+        const NOWAIT: u32 = 0x0100_0000;
+        let group = {
+            let mut slots = self.slots.lock();
+            let parent_number = self
+                .live_parent(&slots, parent)
+                .map_err(|_| ProcessError::NoChild)?;
+            let process = slots
+                .get_mut(pid.checked_sub(1).ok_or(ProcessError::NoChild)?)
+                .and_then(|slot| slot.process.as_mut())
+                .ok_or(ProcessError::NoChild)?;
+            if process.parent != Some(parent_number) {
+                return Err(ProcessError::NoChild);
+            }
+            if options & 4 != 0 && process.exit.is_some() {
+                process.group.clone()
+            } else {
+                let event = process.control_event.filter(|event| {
+                    (event.code == 5 && options & 2 != 0) || (event.code == 6 && options & 8 != 0)
+                });
+                if event.is_some() && options & NOWAIT == 0 {
+                    process.control_event = None;
+                }
+                return Ok(event);
+            }
+        };
+        self.collect_child(Some(parent), pid, options & NOWAIT != 0, Some(&group))
+            .map(|child| {
+                child.map(|child| {
+                    exit_child_event_number(child.event.pid, child.event.status, group.uid)
+                })
+            })
+    }
+
+    /// kill按真实进程、进程组或全域选目标，零信号只执行存在性与权限检查。
+    pub(crate) fn send_signal(
+        &self,
+        sender: &UserIdentity,
+        pid: i32,
+        signum: u8,
+    ) -> Result<(), SignalError> {
+        if 64 < signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        let info = SignalInfo {
+            signum,
+            errno: 0,
+            code: 0,
+            payload: SignalPayload::Sender {
+                pid: sender.tgid(),
+                uid: sender.group.uid,
+                value: 0,
+            },
+        };
+        let capacity = self.slots.lock().len();
+        let mut found = false;
+        let mut delivered = false;
+        let mut error = SignalError::NoProcess;
+        for index in 0..capacity {
+            let group = {
+                let slots = self.slots.lock();
+                slots[index]
+                    .process
+                    .as_ref()
+                    .filter(|process| {
+                        let target = &process.group;
+                        match pid {
+                            1.. => target.tgid() == pid as usize,
+                            0 => target.pgid() == sender.group.pgid(),
+                            -1 => target.tgid() != 1 && target.tgid() != sender.tgid(),
+                            _ => target.pgid() == pid.unsigned_abs() as usize,
+                        }
+                    })
+                    .map(|process| process.group.clone())
+            };
+            let Some(group) = group else {
+                continue;
+            };
+            found = true;
+            if !signal_permission(sender, &group, signum) {
+                error = SignalError::Permission;
+                continue;
+            }
+            if signum == 0 {
+                delivered = true;
+                continue;
+            }
+            match self.deliver_group(&group, info, false) {
+                Ok(()) => delivered = true,
+                Err(failure) => error = failure,
+            }
+        }
+        if delivered {
+            Ok(())
+        } else if found {
+            Err(error)
+        } else {
+            Err(SignalError::NoProcess)
+        }
+    }
+
+    /// tkill与tgkill共用真实TID查找，tgid条件在同一关系快照中核对，零信号不递送。
+    pub(crate) fn send_thread_signal(
+        &self,
+        sender: &UserIdentity,
+        tid: usize,
+        tgid: Option<usize>,
+        signum: u8,
+    ) -> Result<(), SignalError> {
+        if tid == 0 || tgid == Some(0) || 64 < signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        let info = SignalInfo {
+            signum,
+            errno: 0,
+            code: -6,
+            payload: SignalPayload::Sender {
+                pid: sender.tgid(),
+                uid: sender.group.uid,
+                value: 0,
+            },
+        };
+        self.deliver_thread(sender, tid, tgid, info, false)
+    }
+
+    /// queueinfo只寻具体进程，外部发送者不得伪造非负kernel code或SI_TKILL。
+    pub(crate) fn send_queue(
+        &self,
+        sender: &UserIdentity,
+        pid: usize,
+        info: SignalInfo,
+    ) -> Result<(), SignalError> {
+        if pid == 0 || 64 < info.signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        if (0 <= info.code || info.code == -6) && sender.tid() != pid {
+            return Err(SignalError::Permission);
+        }
+        let group = self.group_target(pid)?;
+        if !signal_permission(sender, &group, info.signum) {
+            return Err(SignalError::Permission);
+        }
+        if info.signum == 0 {
+            return Ok(());
+        }
+        self.deliver_group(&group, info, true)
+    }
+
+    /// tgsigqueueinfo核对真实组与成员后送private FIFO，队列满保留旧实例并返回QueueFull。
+    pub(crate) fn send_thread_queue(
+        &self,
+        sender: &UserIdentity,
+        tid: usize,
+        tgid: usize,
+        info: SignalInfo,
+    ) -> Result<(), SignalError> {
+        if tid == 0 || tgid == 0 || 64 < info.signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        if (0 <= info.code || info.code == -6) && sender.tid() != tid {
+            return Err(SignalError::Permission);
+        }
+        self.deliver_thread(sender, tid, Some(tgid), info, true)
+    }
+
+    /// 内核控制者通过真实组身份发送普通信号，所有kick与uaccess仍在图和siglock之外。
+    pub(crate) fn send_kernel(&self, pid: usize, signum: u8) -> Result<(), SignalError> {
+        if signum == 0 || 64 < signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        let group = self.group_target(pid)?;
+        self.deliver_group(&group, SignalInfo::kernel(signum), false)
+    }
+
+    /// 在关系锁中取得稳定组拥有，退出组仍可被kill0探测但发送不会重新建立成员。
+    fn group_target(&self, pid: usize) -> Result<Arc<ThreadGroup>, SignalError> {
+        let slots = self.slots.lock();
+        slots
+            .get(pid.checked_sub(1).ok_or(SignalError::NoProcess)?)
+            .and_then(|slot| slot.process.as_ref())
+            .map(|process| process.group.clone())
+            .ok_or(SignalError::NoProcess)
+    }
+
+    /// 同一关系事务保护目标、控制与动作，锁序固定Graph→siglock；最后拥有和通知在锁外。
+    fn deliver_group(
+        &self,
+        group: &Arc<ThreadGroup>,
+        info: SignalInfo,
+        queued: bool,
+    ) -> Result<(), SignalError> {
+        let event = {
+            let mut slots = self.slots.lock();
+            let actual = slots[group.tgid() - 1]
+                .process
+                .as_ref()
+                .ok_or(SignalError::NoProcess)?;
+            if !Arc::ptr_eq(&actual.group, group) {
+                return Err(SignalError::NoProcess);
+            }
+            let continued = group.signals.deliver(
+                info,
+                None,
+                queued,
+                slots
+                    .iter()
+                    .filter_map(|slot| slot.thread.as_ref())
+                    .filter(|thread| Arc::ptr_eq(&thread.group, group))
+                    .map(|thread| &thread.signals),
+            )?;
+            if continued {
+                let event = ChildEvent {
+                    pid: group.tgid(),
+                    uid: group.uid,
+                    code: 6,
+                    status: 18,
+                };
+                slots[group.tgid() - 1]
+                    .process
+                    .as_mut()
+                    .expect("continuing group disappeared")
+                    .control_event = Some(event);
+                Some(event)
+            } else {
+                None
+            }
+        };
+        group.signals.notify();
+        if let Some(event) = event {
+            self.notify_parent(group, event);
+            self.waiters.wake_all();
+        }
+        Ok(())
+    }
+
+    /// 定时IRQ与父事件由原SignalGroup弱图发送，同号重用必须核对原信号拥有。
+    pub(super) fn send_group_info(
+        &self,
+        pid: usize,
+        source: &SignalGroup,
+        info: SignalInfo,
+    ) -> Result<(), SignalError> {
+        let group = self.group_target(pid)?;
+        if !ptr::eq(group.signals.as_ref(), source) {
+            return Err(SignalError::NoProcess);
+        }
+        self.deliver_group(&group, info, false)
+    }
+
+    /// private递送在Graph→siglock事务中完成，通知与弱Task升级不占任一短锁。
+    fn deliver_thread(
+        &self,
+        sender: &UserIdentity,
+        tid: usize,
+        tgid: Option<usize>,
+        info: SignalInfo,
+        queued: bool,
+    ) -> Result<(), SignalError> {
+        let (group, signals, user, event) = {
+            let mut slots = self.slots.lock();
+            let thread = slots
+                .get(tid.checked_sub(1).ok_or(SignalError::NoProcess)?)
+                .and_then(|slot| slot.thread.as_ref())
+                .ok_or(SignalError::NoProcess)?;
+            if tgid.is_some_and(|tgid| thread.group.tgid() != tgid) {
+                return Err(SignalError::NoProcess);
+            }
+            if !signal_permission(sender, &thread.group, info.signum) {
+                return Err(SignalError::Permission);
+            }
+            if info.signum == 0 {
+                return Ok(());
+            }
+            let group = thread.group.clone();
+            let signals = thread.signals.clone();
+            let user = thread.user.clone();
+            let continued = group.signals.deliver(
+                info,
+                Some(&signals),
+                queued,
+                slots
+                    .iter()
+                    .filter_map(|slot| slot.thread.as_ref())
+                    .filter(|thread| Arc::ptr_eq(&thread.group, &group))
+                    .map(|thread| &thread.signals),
+            )?;
+            let event = if continued {
+                let event = ChildEvent {
+                    pid: group.tgid(),
+                    uid: group.uid,
+                    code: 6,
+                    status: 18,
+                };
+                slots[group.tgid() - 1]
+                    .process
+                    .as_mut()
+                    .expect("continuing group disappeared")
+                    .control_event = Some(event);
+                Some(event)
+            } else {
+                None
+            };
+            (group, signals, user, event)
+        };
+        signals.notify_wait();
+        if let Some(user) = user.upgrade() {
+            user.kick();
+        }
+        if info.signum == 18 || group.signals.exit_request().is_some() {
+            group.signals.notify();
+        }
+        if let Some(event) = event {
+            self.notify_parent(&group, event);
+            self.waiters.wake_all();
+        }
+        Ok(())
+    }
+
+    /// rt_sigaction替换和当前真实组全部pending清理同事务完成，避免裸动作更新绕开组责任。
+    pub(crate) fn update_action(
+        &self,
+        identity: &UserIdentity,
+        signal: usize,
+        action: Option<SignalAction>,
+    ) -> Result<SignalAction, SignalError> {
+        let previous = {
+            let slots = self.slots.lock();
+            let process = slots[identity.tgid() - 1]
+                .process
+                .as_ref()
+                .ok_or(SignalError::NoProcess)?;
+            if !Arc::ptr_eq(&process.group, &identity.group) {
+                return Err(SignalError::NoProcess);
+            }
+            identity.group.signals.update_action(
+                signal,
+                action,
+                slots
+                    .iter()
+                    .filter_map(|slot| slot.thread.as_ref())
+                    .filter(|thread| Arc::ptr_eq(&thread.group, &identity.group))
+                    .map(|thread| &thread.signals),
+            )?
+        };
+        identity.group.signals.notify();
+        Ok(previous)
+    }
+
+    /// 逐个快照真实成员后放锁通知，无临时Vec分配；原组对象阻止同号新组接受旧提醒。
+    pub(super) fn notify_group(&self, tgid: usize, source: &SignalGroup) {
+        let capacity = self.slots.lock().len();
+        for index in 0..capacity {
+            let member = {
+                let slots = self.slots.lock();
+                slots[index]
+                    .thread
+                    .as_ref()
+                    .filter(|thread| {
+                        thread.group.tgid() == tgid
+                            && ptr::eq(thread.group.signals.as_ref(), source)
+                    })
+                    .map(|thread| (thread.signals.clone(), thread.user.clone()))
+            };
+            if let Some((signals, user)) = member {
+                signals.notify_wait();
+                if let Some(user) = user.upgrade() {
+                    user.kick();
+                }
+            }
+        }
+        self.control_waiters.wake_all();
+    }
+
+    /// 父关系快照只在图锁中取得，SIGCHLD编码、发送、等待通知全部在锁外。
+    fn notify_parent(&self, group: &ThreadGroup, event: ChildEvent) {
+        let parent = {
+            let slots = self.slots.lock();
+            let process = slots[group.tgid() - 1].process.as_ref();
+            process
+                .filter(|process| ptr::eq(process.group.as_ref(), group))
+                .and_then(|process| process.parent)
+                .and_then(|pid| slots[pid - 1].process.as_ref())
+                .map(|process| process.group.clone())
+        };
+        send_parent_event(parent.as_deref(), group, event);
+    }
+
     /// 同关系锁核对原组身份和实际活成员；旧组对象与同号新组不能互为父子。
     fn live_parent(&self, slots: &[Slot], parent: &ThreadGroup) -> Result<usize, ProcessError> {
         if !ptr::eq(self, parent.graph.as_ptr()) {
@@ -607,7 +1147,7 @@ impl TaskGraph {
         if !ptr::eq(process.group.as_ref(), parent)
             || process.exit.is_some()
             || process.members == 0
-            || process.exit_requested.is_some()
+            || process.group.signals.exit_request().is_some()
         {
             return Err(ProcessError::InvalidParent);
         }
@@ -655,7 +1195,9 @@ impl PreparedIdentity {
                 user,
                 group: self.identity.group.clone(),
                 execution,
+                signals: self.identity.signals.clone(),
             });
+            self.identity.group.signals.add_member();
             if leader {
                 attach_role(&mut slots, &self.identity.group.pid, TGID);
                 attach_role(&mut slots, &self.identity.group.pgid, PGID);
@@ -666,11 +1208,11 @@ impl PreparedIdentity {
                     members: 1,
                     leader_task_id: task_id,
                     leader_status: None,
-                    exit_requested: None,
                     user_interrupts: 0,
                     user_timer_interrupts: 0,
                     completed: None,
                     exit: None,
+                    control_event: None,
                 });
             } else {
                 let process = slots[self.identity.tgid() - 1]
@@ -737,5 +1279,60 @@ fn detach_role(slots: &mut [Slot], pid: &Arc<Pid>, role: usize) -> Option<Arc<Pi
         slot.pid.take()
     } else {
         None
+    }
+}
+
+/// 单一不可变uid凭据满足同uid或root权限，CONT另允许同会话的真实组成员。
+fn signal_permission(sender: &UserIdentity, target: &ThreadGroup, signum: u8) -> bool {
+    sender.group.uid == 0
+        || sender.group.uid == target.uid
+        || (signum == 18 && sender.group.sid() == target.sid())
+}
+
+/// 把普通Linux退出状态转成waitid字段，不把编码后的status误作si_status。
+fn exit_child_event_number(pid: usize, status: i32, uid: u32) -> ChildEvent {
+    let signal = status & 0x7f;
+    ChildEvent {
+        pid,
+        uid,
+        code: if signal == 0 {
+            1
+        } else if status & 0x80 != 0 {
+            3
+        } else {
+            2
+        },
+        status: if signal == 0 {
+            (status >> 8) & 0xff
+        } else {
+            signal
+        },
+    }
+}
+
+/// 父拥有已在图锁中稳定取得，退出信号与停止/继续通知各按事件语义锁外发送。
+fn send_parent_event(parent: Option<&ThreadGroup>, group: &ThreadGroup, event: ChildEvent) {
+    if let Some(parent) = parent {
+        let signum = if matches!(event.code, 1..=3) {
+            group.exit_signal
+        } else {
+            17
+        };
+        if signum == 0 {
+            return;
+        }
+        let time = group.time.snapshot();
+        parent.signals.send_child(SignalInfo {
+            signum,
+            errno: 0,
+            code: event.code,
+            payload: SignalPayload::Child {
+                pid: event.pid,
+                uid: event.uid,
+                status: event.status,
+                user_ticks: time.user_ns / (1_000_000_000 / USER_HZ),
+                kernel_ticks: time.kernel_ns / (1_000_000_000 / USER_HZ),
+            },
+        });
     }
 }

@@ -1,11 +1,12 @@
 //! 每 CPU 的执行片段只由所属 CPU 在 IRQ 关闭时结算，跨核观察只读原子总账。
 
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cpu;
 use crate::sync::IrqSaveGuard;
-use crate::task::Task;
+use crate::task::{Task, UserThread};
 use crate::time::{self, Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,8 @@ struct Segment {
     mode: Mode,
     interrupted: Option<Mode>,
     baseline_ns: u64,
+    user: *const UserThread,
+    in_user: bool,
 }
 
 pub(crate) struct CpuAccount {
@@ -56,6 +59,8 @@ impl CpuAccount {
                 mode: Mode::Dormant,
                 interrupted: None,
                 baseline_ns: 0,
+                user: core::ptr::null(),
+                in_user: false,
             }),
             task_ns: AtomicU64::new(0),
             irq_ns: AtomicU64::new(0),
@@ -80,6 +85,11 @@ impl CpuAccount {
                 // SAFETY: Task 模式只在本核取得执行权后建立；切出先结算再发表 Ready，
                 // IRQ 保存模式期间不能调度，活登记始终保持指针与独占执行权。
                 unsafe { (*task).account_execution(delta) };
+                if !segment.user.is_null() {
+                    // SAFETY: Task 的用户绑定只在离栈后解除；片段结算在唯一执行者
+                    // 切出以前完成，IRQ 保存期间不调度，用户对象地址保持有效。
+                    unsafe { (*segment.user).account_execution(segment.in_user, delta) };
+                }
                 &self.task_ns
             }
             Mode::Idle => &self.idle_ns,
@@ -143,6 +153,14 @@ pub(crate) fn task_enter() {
     // SAFETY: 调度器已发表本核 current，IRQ 关闭，活登记保护唯一执行者。
     let task = unsafe { *cpu::current().current_task.get() };
     assert!(!task.is_null(), "task accounting entry has no task");
+    // SAFETY: current 活登记保活 Task；绑定只在离栈后解除，快照退还后仍由 Task 保活。
+    let user = unsafe { (*task).user_thread() };
+    let user = user.filter(|user| user.user_time().is_none_or(|time| time.is_active()));
+    with_current(|_, segment| {
+        assert!(segment.user.is_null());
+        assert!(!segment.in_user);
+        segment.user = user.as_ref().map_or(core::ptr::null(), Arc::as_ptr);
+    });
     transition(Mode::Scheduler, Mode::Task(task));
 }
 
@@ -156,8 +174,64 @@ pub(crate) fn task_leave() {
     let task = unsafe { *cpu::current().current_task.get() };
     assert!(!task.is_null(), "task accounting exit has no task");
     transition(Mode::Task(task), Mode::Scheduler);
+    with_current(|_, segment| {
+        assert!(!segment.in_user, "task switched out in user accounting");
+        segment.user = core::ptr::null();
+    });
 }
 
+/// 在真实用户指令入口前结算内核片段；当前绑定和 IRQ-off 执行权必须保持不变。
+pub(crate) fn user_enter(user: &UserThread) {
+    with_current(|account, segment| {
+        assert!(matches!(segment.mode, Mode::Task(_)));
+        assert!(core::ptr::eq(segment.user, user));
+        assert!(!segment.in_user);
+        assert!(segment.interrupted.is_none());
+        account.settle(segment, time::now().as_nanos());
+        segment.in_user = true;
+    });
+}
+
+/// 用户 trap 返回原内核栈后结算用户片段，硬 IRQ 已由独立片段剔除。
+pub(crate) fn user_leave() {
+    with_current(|account, segment| {
+        assert!(matches!(segment.mode, Mode::Task(_)));
+        assert!(segment.in_user);
+        assert!(segment.interrupted.is_none());
+        account.settle(segment, time::now().as_nanos());
+        segment.in_user = false;
+    });
+}
+
+/// 在普通用户任务的合法锁外观察点补结算正在运行的内核片段。
+pub(crate) fn settle_current() {
+    let _irq = IrqSaveGuard::new();
+    with_current(|account, segment| {
+        assert!(matches!(segment.mode, Mode::Task(_)));
+        assert!(!segment.in_user);
+        assert!(segment.interrupted.is_none());
+        account.settle(segment, time::now().as_nanos());
+    });
+}
+
+/// 用户最后退出在释放进程资源以前结清并撤掉片段关联，后续内核离栈工作不进 Linux 账。
+pub(crate) fn detach_user() {
+    let _irq = IrqSaveGuard::new();
+    with_current(|account, segment| {
+        assert!(matches!(segment.mode, Mode::Task(_)));
+        assert!(!segment.in_user);
+        assert!(segment.interrupted.is_none());
+        account.settle(segment, time::now().as_nanos());
+        if !segment.user.is_null() {
+            // SAFETY: 当前片段仍由 Task 活绑定保活，刚结算完成且 IRQ-off；
+            // 只访问固定的私有时间对象，不取进程或信号锁，随后立即撤掉裸关联。
+            if let Some(time) = unsafe { (*segment.user).user_time() } {
+                time.retire();
+            }
+        }
+        segment.user = core::ptr::null();
+    });
+}
 /// 最终无工作检查通过以后开始 idle 片段；次数表示协议入口，架构仍会检查新提示。
 pub(crate) fn idle_enter() {
     transition(Mode::Scheduler, Mode::Idle);

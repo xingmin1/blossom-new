@@ -4,6 +4,7 @@ pub(crate) mod clone;
 pub(crate) mod exec;
 pub(crate) mod process;
 pub(crate) mod signal;
+pub(crate) mod time;
 mod user;
 pub(crate) use user::{
     prepare_program, Credentials, PreparedProgram, ProgramError, UserFs, UserRuntime, UserThread,

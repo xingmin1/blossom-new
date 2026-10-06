@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 pub const NAME: &str = "loongarch64";
 
 mod mmu;
+mod signal;
 mod uaccess;
 mod user;
 
@@ -18,6 +19,7 @@ pub use mmu::{
     user_leaf_permissions, user_table_entry, SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS,
     USER_STACK_TOP,
 };
+pub(crate) use signal::SIGNAL_MIN_STACK;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 pub use user::{run_user, signal_return_code, UserContext};
 

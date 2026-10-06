@@ -21,7 +21,7 @@ WORK_DIR ?= build/run-$(ARCH)
 RESUME ?= 0
 LLVM_MC ?= llvm-mc
 USER_LD ?= rust-lld
-USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone)
+USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal)
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf

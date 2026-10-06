@@ -17,6 +17,7 @@ use crate::task::exec::{
     self, Arguments, ExecError, LoadedImage, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT,
 };
 use crate::task::process::{ProcessError, UserIdentity};
+use crate::task::signal::SignalInheritance;
 use crate::task::{prepare_program, Credentials, Placement, ProgramError, UserRuntime};
 
 const WORD: usize = size_of::<usize>();
@@ -268,13 +269,23 @@ fn abandon_program(
     fixture: &UserOwner,
 ) -> Result<Arc<UserIdentity>, TestError> {
     let graph = fixture.graph();
-    let reserved = graph.prepare_process(None).map_err(|error| {
-        context.diagnostic(format_args!(
-            "user preparation reservation error={:?}",
-            error
-        ));
-        TestError("user preparation reservation failed")
-    })?;
+    let runtime = runtime(context, fixture)?;
+    let sighand = Arc::clone(&runtime.sighand);
+    let reserved = graph
+        .prepare_process(
+            None,
+            Arc::clone(&sighand),
+            Credentials::ROOT.uid,
+            SignalInheritance::EMPTY,
+            17,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!(
+                "user preparation reservation error={:?}",
+                error
+            ));
+            TestError("user preparation reservation failed")
+        })?;
     let old_identity = reserved.identity();
     let number = old_identity.tid();
     let old_pid = old_identity.tid_object();
@@ -286,7 +297,6 @@ fn abandon_program(
     );
     drop(reserved);
     let image = fixture.load(context)?;
-    let runtime = runtime(context, fixture)?;
     let program = prepare_program(
         graph,
         None,
@@ -310,13 +320,21 @@ fn abandon_program(
     );
     // PreparedProgram 已持有完整用户现场、运行资源和真实执行栈，但未移交 Ready 队列。
     drop(program);
-    let reused = graph.prepare_process(None).map_err(|error| {
-        context.diagnostic(format_args!(
-            "user preparation cancellation reuse error={:?}",
-            error
-        ));
-        TestError("user preparation cancellation did not return number")
-    })?;
+    let reused = graph
+        .prepare_process(
+            None,
+            sighand,
+            Credentials::ROOT.uid,
+            SignalInheritance::EMPTY,
+            17,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!(
+                "user preparation cancellation reuse error={:?}",
+                error
+            ));
+            TestError("user preparation cancellation did not return number")
+        })?;
     context.expect_eq(reused.identity().tid(), number);
     context.expect_eq(graph.lookup_thread(number).is_none(), true);
     context.expect_eq(graph.lookup_pid(&old_pid).is_none(), true);
@@ -338,6 +356,7 @@ fn allocation_failure(
     let graph = Arc::clone(fixture.graph());
     let image = fixture.load(context)?;
     let runtime = runtime(context, fixture)?;
+    let sighand = Arc::clone(&runtime.sighand);
     let placement = Placement::Cpu(crate::cpu::current().id);
     let old_pid = old_identity.tid_object();
     let number = old_identity.tid();
@@ -369,13 +388,21 @@ fn allocation_failure(
         graph.try_wait(None, number, true),
         Err(ProcessError::NoChild),
     );
-    let reused = graph.prepare_process(None).map_err(|error| {
-        context.diagnostic(format_args!(
-            "user preparation allocation failure reuse error={:?}",
-            error
-        ));
-        TestError("user preparation allocation failure did not return number")
-    })?;
+    let reused = graph
+        .prepare_process(
+            None,
+            sighand,
+            Credentials::ROOT.uid,
+            SignalInheritance::EMPTY,
+            17,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!(
+                "user preparation allocation failure reuse error={:?}",
+                error
+            ));
+            TestError("user preparation allocation failure did not return number")
+        })?;
     context.expect_eq(reused.identity().tid(), number);
     drop(reused);
     Ok(())

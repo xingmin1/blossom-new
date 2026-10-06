@@ -18,10 +18,12 @@ SECTIONS
 
     /* 页内起点与文件偏移同余；首尾文件页不能按整页字节直接复制。 */
     . = ALIGN(4096) + 0x123;
-    .data :
+    .data . : SUBALIGN(1)
     {
         __data_start = .;
         BYTE(0x3c)
+        /* 段首保留页内边缘，实际输入载荷另行对齐，不能让输入对齐抬高段首。 */
+        . = ALIGN(16);
         *(.data .data.*)
         BYTE(0xc3)
         __data_end = .;

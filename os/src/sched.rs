@@ -57,7 +57,7 @@ impl Scheduler {
         self.push_ready(task);
     }
 
-    /// 锁内发表独立 ready 节点，随后向所有合法目标发不等待的调度提示。
+    /// 锁内发表独立 ready 节点；本核忙于调度时不自发提示，idle及其余合法目标保持原通知。
     fn push_ready(&mut self, task: *const Task) {
         // SAFETY: 私有调用点保证 task 活着且为 Ready、不在 ready；锁独占独立 ready 链接。
         unsafe {
@@ -71,8 +71,16 @@ impl Scheduler {
                 (*(*self.ready_tail).scheduling.get()).ready_next = task;
             }
             self.ready_tail = task;
+            // 本核离栈后会直接 pick；自发 IPI 反而在下一 Task 开 IRQ 时重建已消费提示，
+            // 令用户安全点反复让出而到不了真实用户入口；idle窗口仍保留原IPI唤醒。
+            let local = cpu::current();
             for owner in 0..cpu::count() {
-                if allowed_on(data, owner) && cpu::get(owner).online.load(Ordering::Acquire) {
+                if allowed_on(data, owner)
+                    && cpu::get(owner).online.load(Ordering::Acquire)
+                    && (owner != local.id
+                        || local.current_task_id.load(Ordering::Relaxed) != 0
+                        || local.idle.load(Ordering::Acquire))
+                {
                     cpu::kick(owner, cpu::KICK_RESCHEDULE);
                 }
             }
@@ -265,6 +273,28 @@ pub fn cond_resched() -> bool {
         yield_now();
     }
     requested
+}
+
+/// 请求用户执行者在所属 CPU 的合法点检查工作，不改现场或唤醒不可中断等待。
+pub(crate) fn request_user_work(task: &Task) {
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY: 调度锁保护状态与归属；调用者借用保持 Task 有效，只读数据，不访问 ctx 或运行资源。
+    let data = unsafe { &*task.scheduling.get() };
+    match data.state {
+        State::Running(owner) | State::SwitchingOut(owner, _) => {
+            // 在归属锁内发表提示，迁核前的旧 owner 与后续 ready 发表不会留下无人接收的窗口。
+            cpu::kick(owner, cpu::KICK_RESCHEDULE);
+        }
+        State::Ready => {
+            for owner in 0..cpu::count() {
+                if allowed_on(data, owner) && cpu::get(owner).online.load(Ordering::Acquire) {
+                    cpu::kick(owner, cpu::KICK_RESCHEDULE);
+                }
+            }
+        }
+        // Blocked 的可中断轮次只由其精确 WaitId 通知；内核 DMA 等待保留原资源责任。
+        State::Blocked | State::Exited => {}
+    }
 }
 
 /// 在专用 IRQ-off 段提交意图，通知已到达的 Park 不交出执行权。
