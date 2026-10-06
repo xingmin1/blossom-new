@@ -3,8 +3,9 @@
 use alloc::vec::Vec;
 use core::mem;
 
+use crate::fs::file::{O_DIRECTORY, O_NOFOLLOW};
 use crate::fs::{
-    open_path, DirectoryEntry, FileRef, FileStat, FsContext, FsError, InodeKind, ResolveMode,
+    open_path_with_flags, DirectoryEntry, FileRef, FileStat, FsContext, FsError, ResolveMode,
     SeekFrom, Vfs,
 };
 use crate::sync::SpinLock;
@@ -64,6 +65,24 @@ impl FileTable {
         })
     }
 
+    /// 锁外准备完整空表，父锁内仅复制 Open 引用与属性，Reserved 不转移。
+    pub fn try_clone(&self) -> Result<Self, FsError> {
+        let child = Self::try_new(self.capacity)?;
+        {
+            let mut target = child.slots.lock();
+            let source = self.slots.lock();
+            for (source, target) in source.iter().zip(target.iter_mut()) {
+                if let Slot::Open { file, flags } = source {
+                    *target = Slot::Open {
+                        file: file.clone(),
+                        flags: *flags,
+                    };
+                }
+            }
+        }
+        Ok(child)
+    }
+
     /// 返回构造时固定的槽数，预留和复制描述符都不能扩大它。
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -102,6 +121,18 @@ impl FileTable {
         }
     }
 
+    /// 同一次槽锁中替换 descriptor 属性，不改变其共享 OFD。
+    pub fn set_flags(&self, fd: usize, replacement: DescriptorFlags) -> Result<(), FsError> {
+        let mut slots = self.slots.lock();
+        match slots.get_mut(fd) {
+            Some(Slot::Open { flags, .. }) => {
+                *flags = replacement;
+                Ok(())
+            }
+            _ => Err(FsError::BadFd),
+        }
+    }
+
     /// 普通可睡眠 Task 先预留，再解析真实路径并构造完整文件；任何失败由预留析构取消。
     pub fn open(
         &self,
@@ -117,10 +148,9 @@ impl FileTable {
             ResolveMode::Follow
         };
         let path = vfs.resolve(context, pathname, mode)?;
-        if options.directory && path.inode()?.metadata()?.kind != InodeKind::Directory {
-            return Err(FsError::NotDirectory);
-        }
-        let file = open_path(path)?;
+        let flags = if options.directory { O_DIRECTORY } else { 0 }
+            | if options.no_follow { O_NOFOLLOW } else { 0 };
+        let file = open_path_with_flags(path, flags)?;
         Ok(reservation.publish(
             file,
             DescriptorFlags {
@@ -179,27 +209,58 @@ impl FileTable {
         Ok(())
     }
 
-    /// 同一短锁内验证源并复制到最小空槽，共享同一文件但清除新描述符的 CLOEXEC。
+    /// 内核最小空号复制清除新描述符 CLOEXEC，仍共享原 OFD。
     pub fn dup(&self, fd: usize) -> Result<usize, FsError> {
+        self.dup_min(fd, 0, DescriptorFlags::default())
+    }
+
+    /// 验证源后选择不小于 min 的最小空槽，固定表不隐式扩容。
+    pub fn dup_min(&self, fd: usize, min: usize, flags: DescriptorFlags) -> Result<usize, FsError> {
         let mut slots = self.slots.lock();
         let Some(Slot::Open { file, .. }) = slots.get(fd) else {
             return Err(FsError::BadFd);
         };
+        if self.capacity <= min {
+            return Err(FsError::InvalidOperation);
+        }
         let target = slots
             .iter()
-            .position(|slot| matches!(slot, Slot::Vacant))
+            .enumerate()
+            .skip(min)
+            .find(|(_, slot)| matches!(slot, Slot::Vacant))
+            .map(|(fd, _)| fd)
             .ok_or(FsError::TooManyFiles)?;
         let file = file.clone();
-        slots[target] = Slot::Open {
-            file,
-            flags: DescriptorFlags::default(),
-        };
+        slots[target] = Slot::Open { file, flags };
         Ok(target)
     }
 
-    /// 同一短锁内验证并原子替换目标；自己的编号保持属性，其他目标的新属性清空。
-    /// Reserved 只属于其预留对象，替换返回 Busy；旧目标文件在解锁后释放。
+    /// 内核精确复制允许同号保留原属性，其余复制清除 CLOEXEC。
     pub fn dup_exact(&self, source: usize, target: usize) -> Result<usize, FsError> {
+        self.replace_duplicate(source, target, DescriptorFlags::default(), true)
+    }
+
+    /// 用户 dup3 原子替换指定槽，同号无效，Reserved 不可由其他责任替换。
+    pub fn dup_exact_flags(
+        &self,
+        source: usize,
+        target: usize,
+        flags: DescriptorFlags,
+    ) -> Result<usize, FsError> {
+        self.replace_duplicate(source, target, flags, false)
+    }
+
+    /// 同锁验证并移动完整目标拥有值，最后 put 在表锁之外执行。
+    fn replace_duplicate(
+        &self,
+        source: usize,
+        target: usize,
+        flags: DescriptorFlags,
+        allow_same: bool,
+    ) -> Result<usize, FsError> {
+        if !allow_same && source == target {
+            return Err(FsError::InvalidOperation);
+        }
         let old = {
             let mut slots = self.slots.lock();
             let Some(Slot::Open { file, .. }) = slots.get(source) else {
@@ -214,7 +275,7 @@ impl FileTable {
             }
             let replacement = Slot::Open {
                 file: file.clone(),
-                flags: DescriptorFlags::default(),
+                flags,
             };
             mem::replace(&mut slots[target], replacement)
         };

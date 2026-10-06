@@ -66,6 +66,35 @@ impl Path {
         &self.mount.volume
     }
 
+    /// 按真实 owner/group/other mode 检查最终访问，写操作始终受只读卷约束。
+    pub fn check_access(&self, uid: u32, gid: u32, mask: u16) -> Result<(), FsError> {
+        if mask & !7 != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        if mask & 2 != 0 {
+            return Err(FsError::ReadOnly);
+        }
+        let data = self.inode()?.metadata()?;
+        if uid == 0 {
+            if mask & 1 != 0 && data.kind != InodeKind::Directory && data.mode & 0o111 == 0 {
+                return Err(FsError::Permission);
+            }
+            return Ok(());
+        }
+        let shift = if uid == data.uid {
+            6
+        } else if gid == data.gid {
+            3
+        } else {
+            0
+        };
+        if (data.mode >> shift) & mask == mask {
+            Ok(())
+        } else {
+            Err(FsError::Permission)
+        }
+    }
+
     /// 返回一个真实祖先边；挂载根的上一个位置是父视图覆盖点。
     fn topology_parent(&self) -> Option<Self> {
         if self.dentry.ptr_eq(&self.mount.root) {
@@ -175,12 +204,24 @@ impl Vfs {
         &self.inodes
     }
 
-    /// 借用原路径逐组件行走，只在跟随符号链接时拥有目标与尚未消费的后缀。
+    /// 内核从 cwd 无凭据行走，与显式 dirfd 查找共用同一逐组件算法。
     pub fn resolve(
         &self,
         context: &FsContext,
         pathname: &[u8],
         mode: ResolveMode,
+    ) -> Result<Path, FsError> {
+        self.resolve_from(context, context.cwd(), pathname, mode, None)
+    }
+
+    /// 绝对路径从 root、相对路径从显式起点行走，每个组件都重新检查目录搜索权限。
+    pub fn resolve_from(
+        &self,
+        context: &FsContext,
+        start: &Path,
+        pathname: &[u8],
+        mode: ResolveMode,
+        credentials: Option<(u32, u32)>,
     ) -> Result<Path, FsError> {
         if pathname.is_empty() {
             return Err(FsError::NotFound);
@@ -191,7 +232,7 @@ impl Vfs {
         {
             let mounts = self.mounts.lock();
             if !contains_mount(&mounts, &context.root.mount)
-                || !contains_mount(&mounts, &context.cwd.mount)
+                || (pathname[0] != b'/' && !contains_mount(&mounts, &start.mount))
             {
                 return Err(FsError::InvalidOperation);
             }
@@ -199,7 +240,7 @@ impl Vfs {
         let mut current = if pathname[0] == b'/' {
             context.root.clone()
         } else {
-            context.cwd.clone()
+            start.clone()
         };
         let mut pending = Cow::Borrowed(pathname);
         let mut offset = 0;
@@ -207,6 +248,9 @@ impl Vfs {
         while offset < pending.len() {
             // 先验证当前目录，再处理点组件；file/.. 和 missing/.. 不做词法折叠。
             require_directory(&current)?;
+            if let Some((uid, gid)) = credentials {
+                current.check_access(uid, gid, 1)?;
+            }
             while offset < pending.len() && pending[offset] == b'/' {
                 offset += 1;
             }

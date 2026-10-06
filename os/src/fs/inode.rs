@@ -11,7 +11,7 @@ use spin::Once;
 
 use crate::cache::FileMapping;
 use crate::fs::ext4::{DirectoryEntry, Ext4Volume, InodeData, InodeKind};
-use crate::fs::FsError;
+use crate::fs::{FsError, ReadBuffer};
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::sched;
 use crate::sync::SpinLock;
@@ -316,37 +316,50 @@ impl Inode {
         &self.mapping
     }
 
-    /// 读取普通文件的有效字节，后页失败时返回已交付前缀，零长和 EOF 不建立页。
+    /// 内核按位置读取与用户接收端使用同一页交付循环。
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
-        if dst.is_empty() {
+        self.read_into(offset, &mut ReadBuffer::kernel(dst))
+    }
+
+    /// 读取普通文件有效字节，页或接收端失败均优先返回本次已交付前缀。
+    pub(crate) fn read_into(
+        &self,
+        offset: u64,
+        target: &mut ReadBuffer<'_>,
+    ) -> Result<usize, FsError> {
+        let initial = target.copied();
+        let remaining = target.len() - initial;
+        if remaining == 0 {
             return Ok(0);
         }
         let data = self.metadata()?;
+        if data.kind == InodeKind::Directory {
+            return Err(FsError::IsDirectory);
+        }
         if data.kind != InodeKind::Regular {
             return Err(FsError::InvalidOperation);
         }
         if data.size <= offset {
             return Ok(0);
         }
-        let len = (data.size - offset).min(dst.len() as u64) as usize;
+        let len = (data.size - offset).min(remaining as u64) as usize;
         let mut copied = 0;
         while copied < len {
-            // copied 不超过 size-offset，因此本次位置及页内有效范围不会溢出。
+            // 已交付量不超过 size-offset，位置和页内有效范围不会溢出。
             let position = offset + copied as u64;
             let index = position / PAGE_SIZE as u64;
             let in_page = (position % PAGE_SIZE as u64) as usize;
             let count = (len - copied).min(PAGE_SIZE - in_page);
             let result = self.read_page(data, index).and_then(|folio| {
+                // 成功 folio 已只读；with_bytes 在回调前释放用途短锁，用户 fault 可睡眠。
                 folio
-                    .with_bytes(in_page, count, |bytes| {
-                        dst[copied..copied + count].copy_from_slice(bytes);
-                    })
-                    .map_err(FsError::from)
+                    .with_bytes(in_page, count, |bytes| target.push(bytes))
+                    .map_err(FsError::from)?
             });
+            copied = target.copied() - initial;
             if let Err(error) = result {
                 return if copied == 0 { Err(error) } else { Ok(copied) };
             }
-            copied += count;
         }
         Ok(copied)
     }

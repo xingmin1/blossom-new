@@ -1,7 +1,13 @@
 //! 每次调用只读取一次用户寄存器；返回值与退出是互斥控制结果，阻塞时不借用户现场。
 
+mod error;
+mod file;
+mod memory;
+mod task;
+
 use crate::arch::UserContext;
 use crate::sched;
+use crate::syscall::error::{Errno, SysResult};
 use crate::task::UserThread;
 
 #[cfg(target_arch = "riscv64")]
@@ -40,25 +46,48 @@ impl Request {
 pub(crate) enum Outcome {
     Return(isize),
     Exit(i32),
+    GroupExit(i32),
 }
 
-/// 分派真实 Linux 编号；让出后仍回到原 Task，未知请求返回 ENOSYS。
+/// 分派已支持的真实调用，未知编号保持ENOSYS；控制结果不落入普通写寄存器尾部。
 pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
-    let result = match request.number {
-        93 => return Outcome::Exit(((request.arguments[0] & 255) << 8) as i32),
+    let raw = request.arguments;
+    let result: SysResult = match request.number {
+        93 => return Outcome::Exit(((raw[0] & 255) << 8) as i32),
+        94 => return Outcome::GroupExit(((raw[0] & 255) << 8) as i32),
+        23 => file::dup(user, raw[0]),
+        24 => file::dup3(user, raw),
+        25 => file::fcntl(user, raw),
+        49 => file::chdir(user, raw[0]),
+        56 => file::openat(user, raw),
+        57 => file::close(user, raw[0]),
+        61 => file::getdents(user, raw),
+        62 => file::seek(user, raw),
+        63 => file::read(user, raw),
+        64 | 68 => file::write(user, raw),
+        67 => file::pread(user, raw),
+        78 => file::readlink(user, raw),
+        79 => file::statat(user, raw),
+        80 => file::fstat(user, raw),
         124 => {
             sched::yield_now();
-            0
+            Ok(0)
         }
+        134 => task::sigaction(user, raw),
         172 | 178 => {
             let identity = user.identity().expect("syscall has no user identity");
-            if request.number == 172 {
-                identity.tgid() as isize
+            Ok(if request.number == 172 {
+                identity.tgid()
             } else {
-                identity.tid() as isize
-            }
+                identity.tid()
+            } as isize)
         }
-        _ => -38,
+        214 => Ok(memory::brk(user, raw[0])),
+        215 => memory::munmap(user, raw),
+        220 => task::clone(user, request),
+        222 => memory::mmap(user, raw),
+        226 => memory::mprotect(user, raw),
+        _ => Err(Errno::NoSyscall),
     };
-    Outcome::Return(result)
+    Outcome::Return(result.unwrap_or_else(Errno::result))
 }

@@ -35,6 +35,20 @@ impl UserContext {
         context.gpr[3] = sp;
         context
     }
+
+    /// 派生私有整数与浮点现场，FCC按用户ABI复制，不继承内核续接或异常CSR。
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            gpr: self.gpr,
+            pc: self.pc,
+            fpr: self.fpr,
+            fcsr: self.fcsr,
+            fcc: self.fcc,
+            estat: 0,
+            badv: 0,
+            kernel_sp: 0,
+        }
+    }
 }
 
 global_asm!(include_str!("sigreturn.S"));

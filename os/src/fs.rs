@@ -11,8 +11,14 @@ mod path;
 pub(crate) mod system;
 
 pub use dentry::{DentryCache, DentryRef};
-pub use ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind};
-pub use file::{open_path, DirectoryFile, FileLike, FileRef, FileStat, InodeFile, SeekFrom};
+pub use ext4::{
+    BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind, InodeTime,
+};
+pub use file::ReadBuffer;
+pub use file::{
+    open_path, open_path_with_flags, stat_path, DirectoryFile, FileLike, FileRef, FileStat,
+    InodeFile, SeekFrom,
+};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
 pub use inode::{InodeCache, InodeRef};
 pub use path::{FsContext, Path, ResolveMode, Vfs};
@@ -37,6 +43,8 @@ pub enum FsError {
     TooManyFiles,
     ReadOnly,
     IsDirectory,
+    BadAddress,
+    Permission,
     LoadAborted,
     Io(BlockError),
 }
@@ -55,6 +63,8 @@ impl FsError {
             | Self::TooManyFiles
             | Self::ReadOnly
             | Self::IsDirectory
+            | Self::BadAddress
+            | Self::Permission
             | Self::NotFound
             | Self::MissingRoot
             | Self::NotDirectory

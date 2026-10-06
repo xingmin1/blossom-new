@@ -1,0 +1,125 @@
+//! 用户ABI错误在分派边界编码，文件和VM内部仍保留各自具体错误。
+
+use crate::block::BlockError;
+use crate::fs::FsError;
+use crate::mm::space::{Mm, VmError};
+use crate::mm::uaccess::CStringError;
+use crate::task::process::ProcessError;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(isize)]
+pub(super) enum Errno {
+    NotPermitted = 1,
+    NotFound = 2,
+    NoProcess = 3,
+    Io = 5,
+    BadFd = 9,
+    NoChild = 10,
+    Again = 11,
+    NoMemory = 12,
+    Permission = 13,
+    BadAddress = 14,
+    Busy = 16,
+    Exists = 17,
+    NotDirectory = 20,
+    IsDirectory = 21,
+    InvalidArgument = 22,
+    TooManyFiles = 24,
+    ReadOnly = 30,
+    NameTooLong = 36,
+    NoSyscall = 38,
+    TooManySymlinks = 40,
+    Overflow = 75,
+    Unsupported = 95,
+}
+
+pub(super) type SysResult = Result<isize, Errno>;
+
+impl Errno {
+    /// 只在普通syscall返回边界转换为目标Linux负errno。
+    pub(super) fn result(self) -> isize {
+        -(self as isize)
+    }
+}
+
+impl From<FsError> for Errno {
+    /// 保留文件类型、权限、号码和实际内存错误，盘格式错误不伪装EOF。
+    fn from(error: FsError) -> Self {
+        match error {
+            FsError::NoMemory | FsError::Io(BlockError::NoMemory) => Self::NoMemory,
+            FsError::BadAddress => Self::BadAddress,
+            FsError::Permission => Self::Permission,
+            FsError::Unsupported => Self::Unsupported,
+            FsError::NotFound | FsError::MissingRoot => Self::NotFound,
+            FsError::NotDirectory => Self::NotDirectory,
+            FsError::InvalidName | FsError::InvalidOperation => Self::InvalidArgument,
+            FsError::Busy => Self::Busy,
+            FsError::TooManySymlinks => Self::TooManySymlinks,
+            FsError::BadFd => Self::BadFd,
+            FsError::TooManyFiles => Self::TooManyFiles,
+            FsError::ReadOnly => Self::ReadOnly,
+            FsError::IsDirectory => Self::IsDirectory,
+            FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => {
+                Self::Io
+            }
+        }
+    }
+}
+
+impl From<VmError> for Errno {
+    /// 映射操作区分不合法范围、实际空洞和最大权限，uaccess另按BadAddress交付。
+    fn from(error: VmError) -> Self {
+        match error {
+            VmError::NoMemory | VmError::Unmapped => Self::NoMemory,
+            VmError::InvalidRange => Self::InvalidArgument,
+            VmError::Occupied => Self::Exists,
+            VmError::Permission => Self::Permission,
+            VmError::BeyondEof => Self::BadAddress,
+            VmError::File(error) => error.into(),
+        }
+    }
+}
+
+impl From<CStringError> for Errno {
+    /// 路径保原始字节；无NUL、分配失败和不可访问页各有明确返回。
+    fn from(error: CStringError) -> Self {
+        match error {
+            CStringError::Vm(_) => Self::BadAddress,
+            CStringError::NoMemory => Self::NoMemory,
+            CStringError::Unterminated => Self::NameTooLong,
+        }
+    }
+}
+
+impl From<ProcessError> for Errno {
+    /// 身份准备失败不发表半个child，号码耗尽与对象分配失败分开返回。
+    fn from(error: ProcessError) -> Self {
+        match error {
+            ProcessError::InvalidCapacity => Self::InvalidArgument,
+            ProcessError::NoMemory => Self::NoMemory,
+            ProcessError::NoPid => Self::Again,
+            ProcessError::InvalidParent => Self::NoProcess,
+            ProcessError::NoChild => Self::NoChild,
+        }
+    }
+}
+
+/// 完整交付已初始化ABI字节后才算成功，故障不撤回实际写入前缀。
+pub(super) fn copyout(mm: &Mm, address: usize, bytes: &[u8]) -> Result<(), Errno> {
+    let progress = mm.copyout(address, bytes);
+    if progress.copied == bytes.len() && progress.error.is_none() {
+        Ok(())
+    } else {
+        Err(Errno::BadAddress)
+    }
+}
+
+/// 完整取得本次ABI字节，不以部分初始化内核值解释用户对象。
+pub(super) fn copyin(mm: &Mm, bytes: &mut [u8], address: usize) -> Result<(), Errno> {
+    let progress = mm.copyin(bytes, address);
+    if progress.copied == bytes.len() && progress.error.is_none() {
+        Ok(())
+    } else {
+        Err(Errno::BadAddress)
+    }
+}

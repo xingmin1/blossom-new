@@ -2,7 +2,7 @@
 
 pub(crate) use crate::fs::ext4::crc::{crc16, crc32c};
 pub(crate) use crate::fs::ext4::directory::{verify_directory, DirectoryLayout};
-use crate::fs::ext4::{Geometry, InodeData, InodeKind};
+use crate::fs::ext4::{Geometry, InodeData, InodeKind, InodeTime};
 use crate::fs::FsError;
 
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
@@ -349,6 +349,9 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         gid: u32::from(le16(data, 24)?) | u32::from(le16(data, 122)?) << 16,
         links: u32::from(le16(data, 26)?),
         blocks,
+        atime: decode_time(data, 8, 140, extra_isize)?,
+        mtime: decode_time(data, 16, 136, extra_isize)?,
+        ctime: decode_time(data, 12, 132, extra_isize)?,
         generation,
         flags,
         block,
@@ -356,6 +359,25 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         fast_symlink,
         file_acl,
         extra_isize,
+    })
+}
+
+/// 基础秒有符号扩展；只有 extra_isize 覆盖该字段时才消费 epoch 和纳秒。
+fn decode_time(
+    data: &[u8],
+    base: usize,
+    extra: usize,
+    extra_isize: usize,
+) -> Result<InodeTime, FsError> {
+    let seconds = i64::from(le32(data, base)? as i32);
+    let extension = if extra + 4 <= 128 + extra_isize {
+        le32(data, extra)?
+    } else {
+        0
+    };
+    Ok(InodeTime {
+        seconds: seconds + (i64::from(extension & 3) << 32),
+        nanoseconds: extension >> 2,
     })
 }
 

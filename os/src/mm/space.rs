@@ -8,8 +8,9 @@ use core::ops::Range;
 use crate::arch::{self, UserAccess};
 use crate::cpu;
 use crate::fs::{FileRef, FsError, InodeKind};
+use crate::mm::anon::SharedAnon;
 use crate::mm::user_table::{
-    Mapping, PagePermissions, PageTableError, PreparedTables, UserPageTable,
+    Mapping, PagePermissions, PageTableError, PreparedTables, RetiredTables, UserPageTable,
 };
 use crate::mm::vma::{self, MmapState, Vma, VmaBacking};
 use crate::mm::{AnonPageRef, FolioRef, OwnedPages, PAGE_SIZE};
@@ -39,6 +40,33 @@ impl From<PageTableError> for VmError {
             }
         }
     }
+}
+
+/// 用户选址将可移动 hint、固定覆盖和固定不覆盖明确区分。
+pub(crate) enum MmapAddress {
+    Hint(usize),
+    Fixed(usize),
+    FixedNoReplace(usize),
+}
+
+/// 映射源持真实打开实例；共享匿名对象在每次独立 mmap 时创建。
+pub(crate) enum MmapSource {
+    PrivateAnonymous,
+    SharedAnonymous,
+    File {
+        file: FileRef,
+        offset: u64,
+        private: bool,
+    },
+}
+
+/// 当前与最大权限由 ABI/OFD 边界决定，Mm 再守页范围和只读后备约束。
+pub(crate) struct MmapRequest {
+    pub(crate) address: MmapAddress,
+    pub(crate) length: usize,
+    pub(crate) permissions: PagePermissions,
+    pub(crate) maximum: PagePermissions,
+    pub(crate) source: MmapSource,
 }
 
 /// 所有内容已初始化的驻留原页；文件页只允许硬件只读或执行，私有写先复制匿名页。
@@ -272,15 +300,7 @@ impl Mm {
         private: bool,
     ) -> Result<(), VmError> {
         let range = vma::checked_range(address, length)?;
-        if offset & (PAGE_SIZE as u64 - 1) != 0 || offset.checked_add(length as u64).is_none() {
-            return Err(VmError::InvalidRange);
-        }
-        if !private && (permissions.write || maximum.write) {
-            return Err(VmError::File(FsError::ReadOnly));
-        }
-        if file.stat().map_err(VmError::File)?.kind != InodeKind::Regular {
-            return Err(VmError::File(FsError::IsDirectory));
-        }
+        check_file(&file, offset, length, private, permissions, maximum)?;
         let vma = Vma::try_new(
             range,
             permissions,
@@ -292,6 +312,109 @@ impl Mm {
             },
         )?;
         self.mmap.write().insert(vma)
+    }
+
+    /// 页上取整用户长度并在同一写侧选址与发表；固定覆盖先备齐候选再解除旧叶。
+    pub(crate) fn mmap(&self, request: MmapRequest) -> Result<usize, VmError> {
+        if request.length == 0 {
+            return Err(VmError::InvalidRange);
+        }
+        let length = page_end(request.length)?;
+        if let MmapSource::File {
+            file,
+            offset,
+            private,
+        } = &request.source
+        {
+            check_file(
+                file,
+                *offset,
+                length,
+                *private,
+                request.permissions,
+                request.maximum,
+            )?;
+        }
+        let mut mmap = self.mmap.write();
+        let (address, replace) = match request.address {
+            MmapAddress::Hint(hint) => (mmap.choose_address(hint, length)?, false),
+            MmapAddress::Fixed(address) => (address, true),
+            MmapAddress::FixedNoReplace(address) => (address, false),
+        };
+        let range = vma::checked_range(address, length)?;
+        if !replace && !mmap.vacant(&range) {
+            return Err(VmError::Occupied);
+        }
+        let backing = match request.source {
+            MmapSource::PrivateAnonymous => VmaBacking::Anonymous,
+            MmapSource::SharedAnonymous => VmaBacking::SharedAnonymous {
+                owner: SharedAnon::try_new()?,
+                offset: 0,
+            },
+            MmapSource::File {
+                file,
+                offset,
+                private,
+            } => VmaBacking::File {
+                file,
+                offset,
+                private,
+            },
+        };
+        let vma = Vma::try_new(range.clone(), request.permissions, request.maximum, backing)?;
+        if replace {
+            let retired = self.replace_range(&mut mmap, &range, Some(vma))?;
+            drop(mmap);
+            drop(retired);
+        } else {
+            mmap.insert(vma)?;
+        }
+        Ok(address)
+    }
+
+    /// byte break 与页增删在单次 mmap 写侧完成；零请求及任何失败均返回原 break。
+    pub(crate) fn brk(&self, request: usize) -> usize {
+        let mut mmap = self.mmap.write();
+        let old = mmap.heap_end;
+        if request == 0 || request < mmap.heap_start || arch::USER_ADDRESS_END < request {
+            return old;
+        }
+        let Ok(end) = page_end(request) else {
+            return old;
+        };
+        let Ok(previous) = page_end(old) else {
+            return old;
+        };
+        let mut retired = None;
+        if previous < end {
+            let range = previous..end;
+            if !mmap.vacant(&range) {
+                return old;
+            }
+            let permissions = PagePermissions {
+                read: true,
+                write: true,
+                execute: false,
+            };
+            let maximum = PagePermissions {
+                read: true,
+                write: true,
+                execute: true,
+            };
+            let candidate = Vma::try_new(range, permissions, maximum, VmaBacking::Anonymous);
+            if candidate.and_then(|vma| mmap.insert(vma)).is_err() {
+                return old;
+            }
+        } else if end < previous {
+            match self.replace_range(&mut mmap, &(end..previous), None) {
+                Ok(discarded) => retired = Some(discarded),
+                Err(_) => return old,
+            }
+        }
+        mmap.heap_end = request;
+        drop(mmap);
+        drop(retired);
+        request
     }
 
     /// 按当前实际 VMA 与方向解决缺页或 COW；分配、读盘及原始复制均在映射锁外。
@@ -566,8 +689,21 @@ impl Mm {
     pub fn unmap(&self, address: usize, length: usize) -> Result<(), VmError> {
         let range = vma::checked_range(address, length)?;
         let mut mmap = self.mmap.write();
-        let vmas = mmap.rewrite(&range, None)?;
-        let addresses = self.resident_addresses(&range)?;
+        let retired = self.replace_range(&mut mmap, &range, None)?;
+        drop(mmap);
+        drop(retired);
+        Ok(())
+    }
+
+    /// 写侧先备齐候选索引及退休容器，再撤叶并同步所有 CPU；旧拥有交回调用者锁外释放。
+    fn replace_range(
+        &self,
+        mmap: &mut MmapState,
+        range: &Range<usize>,
+        replacement: Option<Arc<Vma>>,
+    ) -> Result<(Vec<Arc<Vma>>, ResidentPages, Vec<RetiredTables>), VmError> {
+        let vmas = mmap.replacement(range, replacement)?;
+        let addresses = self.resident_addresses(range)?;
         let mut tables = Vec::new();
         tables
             .try_reserve_exact(addresses.len())
@@ -581,8 +717,8 @@ impl Mm {
                     .pages
                     .remove(address)
                     .expect("unmap resident disappeared");
-                // SAFETY: 写侧阻止新的叶或目录提交，page 移入本次具体退休链保活；
-                // 返回表页只在全部 CPU 失效后短锁外析构。
+                // SAFETY: 写侧阻止叶与目录提交，具体退休链保活全部旧页；
+                // 摘取表页仅移入已足额预留的容器，归还晚于全部 CPU 翻译与取指失效。
                 let (old, retired) = unsafe { state.table.unmap(address) };
                 assert_eq!(old.unwrap().physical, page.backing.physical());
                 discarded.push(page);
@@ -593,11 +729,7 @@ impl Mm {
         if !addresses.is_empty() {
             sync_all();
         }
-        drop(mmap);
-        drop(discarded);
-        drop(tables);
-        drop(old_vmas);
-        Ok(())
+        Ok((old_vmas, discarded, tables))
     }
 
     /// 写侧保证驻留数量稳定，在 PTE 锁外预留容器，短锁只复制实际 VA 标识。
@@ -676,6 +808,15 @@ fn prepare_backing(
             ResidentBacking::Anonymous(AnonPageRef::try_new().ok_or(VmError::NoMemory)?),
             false,
         )),
+        VmaBacking::SharedAnonymous { owner, offset } => {
+            let offset = offset
+                .checked_add((base - source.vma.range.start) as u64)
+                .ok_or(VmError::InvalidRange)?;
+            Ok((
+                ResidentBacking::Anonymous(owner.page(offset / PAGE_SIZE as u64)?),
+                false,
+            ))
+        }
         VmaBacking::File {
             file,
             offset,
@@ -715,6 +856,35 @@ fn prepare_backing(
             Ok((ResidentBacking::Anonymous(page), false))
         }
     }
+}
+
+/// 统一内核及用户映射的只读文件边界，属性 I/O 始终在 mmap/PTE 锁外完成。
+fn check_file(
+    file: &FileRef,
+    offset: u64,
+    length: usize,
+    private: bool,
+    permissions: PagePermissions,
+    maximum: PagePermissions,
+) -> Result<(), VmError> {
+    if offset & (PAGE_SIZE as u64 - 1) != 0 || offset.checked_add(length as u64).is_none() {
+        return Err(VmError::InvalidRange);
+    }
+    if !private && (permissions.write || maximum.write) {
+        return Err(VmError::File(FsError::ReadOnly));
+    }
+    if file.stat().map_err(VmError::File)?.kind != InodeKind::Regular {
+        return Err(VmError::File(FsError::IsDirectory));
+    }
+    Ok(())
+}
+
+/// 将字节边界 checked 上取整到基本页，用户长度和 raw break 共用此纯计算。
+fn page_end(address: usize) -> Result<usize, VmError> {
+    address
+        .checked_add(PAGE_SIZE - 1)
+        .map(|end| end & !(PAGE_SIZE - 1))
+        .ok_or(VmError::InvalidRange)
 }
 
 /// 尚未共享的旧单页入口保留原页表错误类别，不吞掉已经发表范围的错误。

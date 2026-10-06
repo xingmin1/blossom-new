@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::convert::TryFrom;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::block::{Disk, DiskRef, IoResult, ReadOnlyClaim, SECTOR_BYTES};
 use crate::cache::{BufferRef, MetadataCache};
@@ -100,6 +101,13 @@ pub enum InodeKind {
     Other,
 }
 
+/// inode 时间按盘面有符号秒与扩展纳秒保存，不在只读读取时修改时钟。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeTime {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
 #[derive(Debug)]
 pub struct InodeData {
     pub number: u64,
@@ -111,6 +119,9 @@ pub struct InodeData {
     pub links: u32,
     /// 已分配空间按 512 字节计数，包括独立 EA 块。
     pub blocks: u64,
+    pub atime: InodeTime,
+    pub mtime: InodeTime,
+    pub ctime: InodeTime,
     pub generation: u32,
     pub flags: u32,
     pub block: [u8; 60],
@@ -137,6 +148,7 @@ pub struct DirectoryEntry {
 }
 
 pub struct Ext4Volume {
+    device: u32,
     disk: DiskRef,
     metadata: MetadataCache,
     geometry: Geometry,
@@ -144,6 +156,9 @@ pub struct Ext4Volume {
     #[cfg(feature = "ktest")]
     segment_hook: SpinLock<Option<SegmentHook>>,
 }
+
+/// 虚拟卷编号只表示本内核的独立卷实例，耗尽后拒绝构造而不回绕复用。
+static NEXT_DEVICE: AtomicU32 = AtomicU32::new(1);
 
 impl Ext4Volume {
     /// 普通任务取得只读声明后读取主超级块；不执行 journal replay 或写盘。
@@ -165,6 +180,11 @@ impl Ext4Volume {
             return Err(FsError::Unsupported);
         }
         let volume = Self {
+            device: NEXT_DEVICE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(1)
+                })
+                .map_err(|_| FsError::NoMemory)?,
             disk,
             metadata,
             geometry,
@@ -182,6 +202,11 @@ impl Ext4Volume {
     /// 借用一次解码并验证的有效几何。
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
+    }
+
+    /// 同一卷的所有 Arc 引用共享稳定非零编号，不泄漏地址或宿主设备号。
+    pub fn device(&self) -> u64 {
+        u64::from(self.device)
     }
 
     /// 借用保活且被只读声明保护的实际磁盘。

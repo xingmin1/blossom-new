@@ -6,6 +6,7 @@ use core::ops::Range;
 
 use crate::arch::{self, UserAccess};
 use crate::fs::FileRef;
+use crate::mm::anon::SharedAnon;
 use crate::mm::space::VmError;
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
@@ -14,6 +15,10 @@ use crate::mm::PAGE_SIZE;
 #[derive(Clone)]
 pub(crate) enum VmaBacking {
     Anonymous,
+    SharedAnonymous {
+        owner: Arc<SharedAnon>,
+        offset: u64,
+    },
     File {
         file: FileRef,
         offset: u64,
@@ -60,11 +65,12 @@ impl Vma {
     pub(crate) fn is_private(&self) -> bool {
         match &self.backing {
             VmaBacking::Anonymous => true,
+            VmaBacking::SharedAnonymous { .. } => false,
             VmaBacking::File { private, .. } => *private,
         }
     }
 
-    /// 从原范围拆出新身份，文件偏移随左边界移动，backing 与最大权限保持原义。
+    /// 从原范围拆出新身份，文件及共享匿名偏移随左边界移动，最大权限保持原义。
     fn slice(
         &self,
         range: Range<usize>,
@@ -72,6 +78,12 @@ impl Vma {
     ) -> Result<Arc<Self>, VmError> {
         let backing = match &self.backing {
             VmaBacking::Anonymous => VmaBacking::Anonymous,
+            VmaBacking::SharedAnonymous { owner, offset } => VmaBacking::SharedAnonymous {
+                owner: Arc::clone(owner),
+                offset: offset
+                    .checked_add((range.start - self.range.start) as u64)
+                    .ok_or(VmError::InvalidRange)?,
+            },
             VmaBacking::File {
                 file,
                 offset,
@@ -85,6 +97,45 @@ impl Vma {
             },
         };
         Self::try_new(range, permissions, self.maximum, backing)
+    }
+
+    /// 只合并权限及真实后备连续的相邻范围，保留无访问范围的独立边界。
+    fn mergeable(&self, next: &Self) -> bool {
+        if self.range.end != next.range.start
+            || self.permissions != next.permissions
+            || self.maximum != next.maximum
+            || !(self.permissions.read || self.permissions.write || self.permissions.execute)
+        {
+            return false;
+        }
+        let length = (self.range.end - self.range.start) as u64;
+        match (&self.backing, &next.backing) {
+            (VmaBacking::Anonymous, VmaBacking::Anonymous) => true,
+            (
+                VmaBacking::SharedAnonymous { owner, offset },
+                VmaBacking::SharedAnonymous {
+                    owner: next_owner,
+                    offset: next_offset,
+                },
+            ) => Arc::ptr_eq(owner, next_owner) && offset.checked_add(length) == Some(*next_offset),
+            (
+                VmaBacking::File {
+                    file,
+                    offset,
+                    private,
+                },
+                VmaBacking::File {
+                    file: next_file,
+                    offset: next_offset,
+                    private: next_private,
+                },
+            ) => {
+                private == next_private
+                    && Arc::ptr_eq(file, next_file)
+                    && offset.checked_add(length) == Some(*next_offset)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -116,16 +167,14 @@ impl MmapState {
             .is_none_or(|vma| range.end <= vma.range.start)
     }
 
-    /// 在 mmap 写侧且 PTE 短锁外准备索引容量，然后发布已准备的身份。
+    /// 在 mmap 写侧准备完整新索引及合并身份，成功后一次发表，失败保留原索引。
     pub(crate) fn insert(&mut self, vma: Arc<Vma>) -> Result<(), VmError> {
         if !self.vacant(&vma.range) {
             return Err(VmError::Occupied);
         }
-        self.vmas.try_reserve(1).map_err(|_| VmError::NoMemory)?;
-        let index = self
-            .vmas
-            .partition_point(|current| current.range.start < vma.range.start);
-        self.vmas.insert(index, vma);
+        let range = vma.range.clone();
+        let vmas = self.replacement(&range, Some(vma))?;
+        self.vmas = vmas;
         Ok(())
     }
 
@@ -199,8 +248,75 @@ impl MmapState {
                 vmas.push(vma.slice(range.end..vma.range.end, vma.permissions)?);
             }
         }
+        coalesce(&mut vmas)?;
         Ok(vmas)
     }
+
+    /// 准备删除或覆盖后的全部身份；所有分配与偏移检查发生在解除旧叶之前。
+    pub(crate) fn replacement(
+        &self,
+        range: &Range<usize>,
+        replacement: Option<Arc<Vma>>,
+    ) -> Result<Vec<Arc<Vma>>, VmError> {
+        let mut vmas = self.rewrite(range, None)?;
+        if let Some(replacement) = replacement {
+            vmas.try_reserve(1).map_err(|_| VmError::NoMemory)?;
+            let index = vmas.partition_point(|vma| vma.range.start < range.start);
+            vmas.insert(index, replacement);
+            coalesce(&mut vmas)?;
+        }
+        Ok(vmas)
+    }
+
+    /// 先尝试已页下取整的合法 hint，冲突或越界时从普通 64KiB 起找首个完整空隙。
+    pub(crate) fn choose_address(&self, hint: usize, length: usize) -> Result<usize, VmError> {
+        const MINIMUM: usize = 64 * 1024;
+        let hint = hint & !(PAGE_SIZE - 1);
+        if MINIMUM <= hint {
+            if let Ok(range) = checked_range(hint, length) {
+                if self.vacant(&range) {
+                    return Ok(hint);
+                }
+            }
+        }
+        let mut cursor = MINIMUM;
+        for vma in &self.vmas {
+            if vma.range.end <= cursor {
+                continue;
+            }
+            let range = checked_range(cursor, length).map_err(|_| VmError::NoMemory)?;
+            if range.end <= vma.range.start {
+                return Ok(cursor);
+            }
+            cursor = vma.range.end;
+        }
+        checked_range(cursor, length).map_err(|_| VmError::NoMemory)?;
+        Ok(cursor)
+    }
+}
+
+/// 在未发表候选索引中原地合并相邻身份，任何分配失败均不改当前 Mm。
+fn coalesce(vmas: &mut Vec<Arc<Vma>>) -> Result<(), VmError> {
+    let mut kept = 0;
+    for index in 0..vmas.len() {
+        if 0 < kept && vmas[kept - 1].mergeable(&vmas[index]) {
+            let previous = &vmas[kept - 1];
+            let merged = Vma::try_new(
+                previous.range.start..vmas[index].range.end,
+                previous.permissions,
+                previous.maximum,
+                previous.backing.clone(),
+            )?;
+            vmas[kept - 1] = merged;
+        } else {
+            if kept != index {
+                vmas[kept] = Arc::clone(&vmas[index]);
+            }
+            kept += 1;
+        }
+    }
+    vmas.truncate(kept);
+    Ok(())
 }
 
 /// 一次 checked 解析用户页范围，不接受空长度、未对齐或越出架构用户区域。

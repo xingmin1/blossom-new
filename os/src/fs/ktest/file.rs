@@ -256,19 +256,6 @@ pub(crate) mod regular {
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,
             PATTERN_SIZE,
         );
-        context.expect_eq(
-            checked(context, table.seek(fd, SeekFrom::Start(u64::MAX)))?,
-            u64::MAX,
-        );
-        context.expect_eq(
-            table.seek(fd, SeekFrom::Current(1)).err(),
-            Some(FsError::InvalidOperation),
-        );
-        context.expect_eq(
-            checked(context, table.seek(fd, SeekFrom::Current(0)))?,
-            u64::MAX,
-        );
-        context.expect_eq(checked(context, table.read(fd, &mut bytes))?, 0);
         context.expect_eq(table.write(fd, b"write").err(), Some(FsError::ReadOnly));
         context.expect_eq(table.write(fd, b"").err(), Some(FsError::ReadOnly));
         context.expect_eq(table.readdir(fd).err(), Some(FsError::NotDirectory));

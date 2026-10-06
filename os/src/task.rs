@@ -1,7 +1,9 @@
 //! 普通内核任务拥有执行栈与入口；完成观察者只拥有独立结果。
 
+pub(crate) mod clone;
 pub(crate) mod exec;
 pub(crate) mod process;
+pub(crate) mod signal;
 mod user;
 pub(crate) use user::{
     prepare_program, Credentials, PreparedProgram, ProgramError, UserFs, UserRuntime, UserThread,
@@ -221,7 +223,6 @@ impl JoinHandle {
         self.id
     }
     /// 创建仅保留原完成状态的观察者，不延长 Task 或执行栈寿命。
-    #[cfg(feature = "ktest")]
     pub(crate) fn observer(&self) -> JoinObserver {
         JoinObserver {
             id: self.id,
@@ -230,13 +231,11 @@ impl JoinHandle {
     }
 }
 
-/// 测试观察者保留原结果与身份；唯一原 JoinHandle 仍由作用域消费。
-#[cfg(feature = "ktest")]
+/// 完成观察者只保留原结果与身份，不延长 Task、运行资源或执行栈寿命。
 pub(crate) struct JoinObserver {
     id: TaskId,
     join: Arc<JoinState>,
 }
-#[cfg(feature = "ktest")]
 impl JoinObserver {
     /// Some 只来自原粘性完成事实，已确认执行栈归还。
     pub(crate) fn try_join(&self) -> Option<i32> {
@@ -270,6 +269,11 @@ impl PreparedTask {
     /// 发表前即可将稳定身份登记到服务元数据，不保留 Task 强引用。
     pub(crate) fn task_id(&self) -> TaskId {
         self.task.id()
+    }
+
+    /// 在身份发表前取得仅持小完成对象的观察者，供协调者确认用户成员真正离栈。
+    pub(crate) fn observer(&self) -> JoinObserver {
+        self.handle.observer()
     }
 
     /// 将预备的唯一任务拥有移交调度器，不再执行任何可失败的分配。

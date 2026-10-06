@@ -27,7 +27,7 @@ SECTIONS
         __data_end = .;
     } :data
 
-    /* BSS 紧随文件尾，从未页齐位置跨过多个整页，末端也不页齐。 */
+    /* BSS 紧随文件尾；具体程序决定零区长度，不给没有大BSS的程序补占位内存。 */
     .bss (NOLOAD) :
     {
         __bss_start = .;
@@ -40,5 +40,4 @@ SECTIONS
 
 ASSERT((__data_start & 4095) == 0x123, "data boundary changed")
 ASSERT((__bss_start & 4095) != 0, "bss start must remain unaligned")
-ASSERT(__bss_end - __bss_start > 8192, "bss must cross page boundaries")
 ASSERT((__bss_end & 4095) != 0, "bss end must remain unaligned")

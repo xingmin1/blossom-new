@@ -21,7 +21,7 @@ WORK_DIR ?= build/run-$(ARCH)
 RESUME ?= 0
 LLVM_MC ?= llvm-mc
 USER_LD ?= rust-lld
-USER_OUTPUT := build/user-$(ARCH)/user-smoke
+USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone)
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -98,9 +98,9 @@ ktest:
 	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 .PHONY: user-tests
-user-tests: $(USER_OUTPUT)
+user-tests: $(USER_OUTPUTS)
 
-$(USER_OUTPUT): tests/user/smoke-$(ARCH).S tests/user/smoke.ld
+build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	mkdir -p "$(dir $@)"
 	$(LLVM_MC) --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
 	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"

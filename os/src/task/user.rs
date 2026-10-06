@@ -1,5 +1,6 @@
 //! 私有用户现场与独立 MM 引用；反向执行关联不保活 Task 或内核栈。
 
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::alloc::AllocError;
 use core::cell::{Cell, RefCell, RefMut};
@@ -11,7 +12,10 @@ use crate::fs::{FileTable, FsContext, FsError, Vfs};
 use crate::mm::space::{self, Mm, VmError};
 use crate::sync::{IrqSaveGuard, SleepMutex, SpinLock};
 use crate::task::exec::{ExecError, LoadedImage};
-use crate::task::process::{PreparedIdentity, ProcessError, TaskGraph, ThreadGroup, UserIdentity};
+use crate::task::process::{
+    PreparedExecution, PreparedIdentity, ProcessError, TaskGraph, ThreadGroup, UserIdentity,
+};
+use crate::task::signal::Sighand;
 use crate::task::{self, JoinHandle, Placement, PreparedTask, Task};
 
 const USER_DESCRIPTOR_CAPACITY: usize = 128;
@@ -39,6 +43,7 @@ pub(crate) struct UserRuntime {
     pub(crate) files: Arc<FileTable>,
     pub(crate) fs: Arc<SleepMutex<UserFs>>,
     pub(crate) credentials: Credentials,
+    pub(crate) sighand: Arc<Sighand>,
 }
 
 impl UserRuntime {
@@ -52,10 +57,55 @@ impl UserRuntime {
         let files = Arc::try_new(files).map_err(|_| crate::fs::FsError::NoMemory)?;
         let fs = Arc::try_new(SleepMutex::new(UserFs { vfs, context }))
             .map_err(|_| crate::fs::FsError::NoMemory)?;
+        let sighand = Sighand::try_new().map_err(|_| FsError::NoMemory)?;
         Ok(Self {
             files,
             fs,
             credentials,
+            sighand,
+        })
+    }
+
+    /// 消费运行快照，按三个独立共享轴取得文件表、FS和动作表，所有分配在短锁外。
+    pub(crate) fn try_fork(
+        self,
+        share_files: bool,
+        share_fs: bool,
+        share_sighand: bool,
+    ) -> Result<Self, FsError> {
+        let Self {
+            files,
+            fs,
+            credentials,
+            sighand,
+        } = self;
+        let files = if share_files {
+            files
+        } else {
+            Arc::try_new(files.try_clone()?).map_err(|_| FsError::NoMemory)?
+        };
+        let fs = if share_fs {
+            fs
+        } else {
+            let snapshot = {
+                let current = fs.lock();
+                UserFs {
+                    vfs: current.vfs.clone(),
+                    context: current.context.clone(),
+                }
+            };
+            Arc::try_new(SleepMutex::new(snapshot)).map_err(|_| FsError::NoMemory)?
+        };
+        let sighand = if share_sighand {
+            sighand
+        } else {
+            sighand.try_copy().map_err(|_| FsError::NoMemory)?
+        };
+        Ok(Self {
+            files,
+            fs,
+            credentials,
+            sighand,
         })
     }
 }
@@ -63,6 +113,7 @@ impl UserRuntime {
 struct UserProcess {
     identity: Arc<UserIdentity>,
     runtime: UserRuntime,
+    child_set_tid: Option<usize>,
 }
 
 pub struct UserThread {
@@ -104,11 +155,31 @@ impl UserThread {
         self.mm.lock().clone()
     }
 
-    /// 完整进程资源在原 PreparedTask 发布之前绑定，受控架构入口不需要 Linux 身份。
-    pub(crate) fn bind_process(&self, identity: Arc<UserIdentity>, runtime: UserRuntime) {
+    /// 完整运行资源及一次child入口写入在原PreparedTask发表之前绑定。
+    pub(crate) fn bind_process(
+        &self,
+        identity: Arc<UserIdentity>,
+        runtime: UserRuntime,
+        child_set_tid: Option<usize>,
+    ) {
         let mut process = self.process.lock();
         assert!(process.is_none(), "user process is already bound");
-        *process = Some(UserProcess { identity, runtime });
+        *process = Some(UserProcess {
+            identity,
+            runtime,
+            child_set_tid,
+        });
+    }
+
+    /// 只有绑定的当前Task消费一次child_tid地址，用户访问必须在此短锁外执行。
+    fn take_child_tid(&self) -> Option<usize> {
+        self.assert_current();
+        self.process
+            .lock()
+            .as_mut()
+            .expect("user entry has no process")
+            .child_set_tid
+            .take()
     }
 
     /// 在关系和信号操作前取得身份快照，不跨图锁保存用户资源锁。
@@ -136,7 +207,9 @@ impl UserThread {
             .lock()
             .take()
             .expect("exiting user thread has no process resources");
-        let UserProcess { identity, runtime } = process;
+        let UserProcess {
+            identity, runtime, ..
+        } = process;
         drop(runtime);
         drop(mm);
         identity
@@ -203,6 +276,7 @@ pub(crate) struct PreparedProgram {
     identity: PreparedIdentity,
     user: Arc<UserThread>,
     task: PreparedTask,
+    execution: Box<PreparedExecution>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,15 +319,42 @@ impl PreparedProgram {
         self.identity.identity().tid()
     }
 
-    /// 身份短锁发表成功后才移交 Ready；失败时没有可运行的半创建 Task。
+    /// 身份发表成功后才移交Ready；没有parent_tid交付的普通启动走同一提交。
     pub(crate) fn publish(self) -> Result<JoinHandle, ProcessError> {
+        self.publish_to(None)
+    }
+
+    /// 创建已成功时parent_tid写失败不撤child，尝试写入完成后才允许child运行。
+    pub(crate) fn publish_child(
+        self,
+        parent_mm: &Mm,
+        parent_tid: Option<usize>,
+    ) -> Result<JoinHandle, ProcessError> {
+        self.publish_to(parent_tid.map(|address| (parent_mm, address)))
+    }
+
+    /// 在合法关系发表和Ready之间向父Mm复制小端TID；部分写入或错误不撤销创建。
+    /// 用户访问可处理COW并睡眠，期间不持图锁或用户现场借用。
+    fn publish_to(self, parent_tid: Option<(&Mm, usize)>) -> Result<JoinHandle, ProcessError> {
+        let pid = self.pid();
         let Self {
             identity,
             user,
             task,
+            execution,
         } = self;
-        identity.publish(Arc::downgrade(&user), task.task_id())?;
+        identity.publish(Arc::downgrade(&user), execution)?;
+        if let Some((mm, address)) = parent_tid {
+            // child已经建立，父地址错误不改变创建结果；写入仍走父自己的COW/uaccess。
+            let bytes = (pid as u32).to_le_bytes();
+            let _ = mm.copyout(address, &bytes);
+        }
         Ok(task.publish())
+    }
+
+    /// 内核协调者在Ready前取得拥有快照，可为真实并发测试保留原文件表预留责任。
+    pub(crate) fn user(&self) -> Arc<UserThread> {
+        self.user.clone()
     }
 }
 
@@ -266,21 +367,47 @@ pub(crate) fn prepare_program(
     placement: Placement,
 ) -> Result<PreparedProgram, ProgramError> {
     let identity = graph.prepare_process(parent)?;
+    prepare_bound_user(identity, image, runtime, placement, None)
+}
+
+/// 将进程或线程身份与完整私有现场绑定，成员离栈观察同样在发表前fallible准备。
+pub(crate) fn prepare_bound_user(
+    identity: PreparedIdentity,
+    image: LoadedImage,
+    runtime: UserRuntime,
+    placement: Placement,
+    child_set_tid: Option<usize>,
+) -> Result<PreparedProgram, ProgramError> {
     let user = UserThread::try_new(image.mm, image.context)?;
-    user.bind_process(identity.identity(), runtime);
+    user.bind_process(identity.identity(), runtime, child_set_tid);
     let task = task::prepare_user(Arc::clone(&user), placement, run_program)?;
+    let execution = PreparedExecution::try_new(task.observer())?;
     Ok(PreparedProgram {
         identity,
         user,
         task,
+        execution,
     })
 }
 
-/// 同一真实 Task 循环执行用户现场；只有返回 Rust 并结束 IRQ/现场借用后才允许等待或调度。
+/// 同一真实Task先向自身Mm尝试复制小端child_tid，部分写入或错误不取消创建。
+/// 随后循环执行用户现场，只有返回Rust并结束IRQ/现场借用后才允许等待或调度。
 fn run_program(user: Arc<UserThread>) -> i32 {
+    let identity = user.identity().expect("user entry has no identity");
+    if let Some(address) = user.take_child_tid() {
+        // child在自己的Mm首次入口尝试写入；地址错误不取消已经成功的创建。
+        let bytes = (identity.tid() as u32).to_le_bytes();
+        let _ = user
+            .mm()
+            .expect("child entry has no MM")
+            .copyout(address, &bytes);
+    }
     let mut interrupts = 0usize;
     let status = loop {
         crate::sched::cond_resched();
+        if let Some(status) = identity.graph().exit_request(&identity) {
+            break status;
+        }
         match user.run_user() {
             UserTrap::Interrupt => {
                 interrupts = interrupts
@@ -294,6 +421,10 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                         request.return_to(&mut user.context(), result);
                     }
                     crate::syscall::Outcome::Exit(status) => break status,
+                    crate::syscall::Outcome::GroupExit(status) => {
+                        identity.graph().request_exit(&identity, status);
+                        break status;
+                    }
                 }
             }
             UserTrap::PageFault { address, access } => {
@@ -311,6 +442,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                         error,
                         signal
                     );
+                    identity.graph().request_exit(&identity, signal);
                     break signal;
                 }
             }
@@ -323,10 +455,12 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                     address,
                     signal
                 );
+                identity.graph().request_exit(&identity, signal);
                 break signal;
             }
         }
     };
+    drop(identity);
     let identity = user.release_process();
     identity.graph().exit(
         &identity,

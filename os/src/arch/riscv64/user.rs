@@ -33,6 +33,19 @@ impl UserContext {
         context.gpr[2] = sp;
         context
     }
+
+    /// 派生独立用户现场，只复制用户寄存器，受信续接和上次异常记录保持清零。
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            gpr: self.gpr,
+            pc: self.pc,
+            fpr: self.fpr,
+            fcsr: self.fcsr,
+            kernel_sp: 0,
+            scause: 0,
+            stval: 0,
+        }
+    }
 }
 
 global_asm!(include_str!("sigreturn.S"));

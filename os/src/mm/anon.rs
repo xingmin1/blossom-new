@@ -1,10 +1,15 @@
 //! 匿名基本页的共享归还权；用户字节只经原始访问，不建立 Rust 内容引用。
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+
 use core::pin::Pin;
 
 use crate::arch;
 use crate::mm::page::PageDesc;
+use crate::mm::space::VmError;
 use crate::mm::{alloc_pages, pages, OwnedPages, PAGE_SIZE};
+use crate::sync::SpinLock;
 
 /// 用途锁下保存原 order0 拥有者和真实引用数，不含用户内容视图。
 pub(crate) struct AnonState {
@@ -100,5 +105,91 @@ impl Drop for AnonPageRef {
             }
         };
         drop(discarded);
+    }
+}
+
+/// 一份共享匿名对象拥有按页索引保存的原页；各 Mm 另持自己的驻留与页表责任。
+pub(crate) struct SharedAnon {
+    pages: SpinLock<SharedPages>,
+}
+
+struct SharedPage {
+    index: u64,
+    page: AnonPageRef,
+    next: Option<Box<SharedPage>>,
+}
+
+#[derive(Default)]
+struct SharedPages {
+    head: Option<Box<SharedPage>>,
+}
+
+impl SharedPages {
+    /// 在对象短锁内按稳定页索引查找，不以当前 VA 或 PFN 作为对象身份。
+    fn find(&self, index: u64) -> Option<&AnonPageRef> {
+        // ponytail: 有限共享匿名页使用具体线性链；页数成为热点时再替换索引。
+        let mut cursor = self.head.as_deref();
+        while let Some(entry) = cursor {
+            if entry.index == index {
+                return Some(&entry.page);
+            }
+            cursor = entry.next.as_deref();
+        }
+        None
+    }
+}
+
+impl Drop for SharedPages {
+    /// 对象最后引用已消失，逐节点释放原页引用，避免共享页数变成析构栈深度。
+    fn drop(&mut self) {
+        while let Some(mut entry) = self.head.take() {
+            self.head = entry.next.take();
+            drop(entry);
+        }
+    }
+}
+
+impl SharedAnon {
+    /// 在映射发表前准备独立共享对象，不提前申请尚未访问的用户页。
+    pub(crate) fn try_new() -> Result<Arc<Self>, VmError> {
+        Arc::try_new(Self {
+            pages: SpinLock::new(SharedPages::default()),
+        })
+        .map_err(|_| VmError::NoMemory)
+    }
+
+    /// 锁外准备零页和节点，锁内重查并仅移入拥有；失败候选和竞争输家均锁外释放。
+    pub(crate) fn page(&self, index: u64) -> Result<AnonPageRef, VmError> {
+        if let Some(page) = self.pages.lock().find(index).cloned() {
+            return Ok(page);
+        }
+        let candidate = AnonPageRef::try_new()
+            .ok_or(VmError::NoMemory)
+            .and_then(|page| {
+                Box::try_new(SharedPage {
+                    index,
+                    page,
+                    next: None,
+                })
+                .map_err(|_| VmError::NoMemory)
+            });
+        let mut pages = self.pages.lock();
+        if let Some(page) = pages.find(index).cloned() {
+            drop(pages);
+            drop(candidate);
+            return Ok(page);
+        }
+        let mut candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                drop(pages);
+                return Err(error);
+            }
+        };
+        let page = candidate.page.clone();
+        candidate.next = pages.head.take();
+        pages.head = Some(candidate);
+        drop(pages);
+        Ok(page)
     }
 }

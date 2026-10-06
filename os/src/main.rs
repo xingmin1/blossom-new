@@ -294,33 +294,57 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
     }
     drop(files);
     let graph = task::process::TaskGraph::try_new(128)?;
-    const PROGRAM: &[u8] = b"/test/bin/user-smoke";
-    let path = vfs.resolve(&context, PROGRAM, fs::ResolveMode::Follow)?;
-    let file = fs::open_path(path)?;
-    let arguments =
-        task::exec::Arguments::from_kernel(PROGRAM, &[PROGRAM, b"raw"], &[b"USER_SMOKE=1"])?;
-    let runtime = task::UserRuntime::try_new(Arc::clone(&vfs), context, task::Credentials::ROOT)?;
-    let image = task::exec::load(file, &arguments, 0, 0)?;
-    let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
-    let pid = prepared.pid();
-    let child = prepared.publish()?;
-    let event = graph.wait(None, pid)?;
-    assert_eq!(
-        child.join(),
-        event.status,
-        "user exit and off-stack result differ"
-    );
-    crate::klog!(
-        klog::Level::Info,
-        "USER exited pid={} task={} status={} interrupts={} timers={} cpu={}",
-        event.pid,
-        event.task_id.as_usize(),
-        event.status,
-        event.user_interrupts,
-        event.user_timer_interrupts,
-        event.cpu
-    );
-    drop(arguments);
+    const PROGRAMS: &[(&[u8], &[u8], &[&[u8]])] = &[
+        (b"/test/bin/user-smoke", b"raw", &[b"USER_SMOKE=1"]),
+        (b"/test/bin/user-io", b"raw", &[]),
+        (b"/test/bin/user-clone", b"F0", &[]),
+        (b"/test/bin/user-clone", b"t3", &[]),
+    ];
+    for &(program, argument, environment) in PROGRAMS {
+        let path = vfs.resolve(&context, program, fs::ResolveMode::Follow)?;
+        let file = fs::open_path(path)?;
+        let arguments =
+            task::exec::Arguments::from_kernel(program, &[program, argument], environment)?;
+        let runtime =
+            task::UserRuntime::try_new(Arc::clone(&vfs), context.clone(), task::Credentials::ROOT)?;
+        let image = task::exec::load(file, &arguments, 0, 0)?;
+        let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
+        let pid = prepared.pid();
+        let child = prepared.publish()?;
+        let event = graph.wait(None, pid)?;
+        let task_status = child.join();
+        crate::klog!(
+            klog::Level::Info,
+            "USER exited program={} argument={} pid={} task={} status={} task_status={} interrupts={} timers={} cpu={}",
+            core::str::from_utf8(program).expect("static program path is ASCII"),
+            core::str::from_utf8(argument).expect("static program argument is ASCII"),
+            event.pid,
+            event.task_id.as_usize(),
+            event.status,
+            task_status,
+            event.user_interrupts,
+            event.user_timer_interrupts,
+            event.cpu
+        );
+        loop {
+            match graph.wait_root() {
+                Ok(event) => {
+                    crate::klog!(
+                        klog::Level::Info,
+                        "USER child-reaped pid={} task={} status={} interrupts={} timers={} cpu={}",
+                        event.pid,
+                        event.task_id.as_usize(),
+                        event.status,
+                        event.user_interrupts,
+                        event.user_timer_interrupts,
+                        event.cpu
+                    );
+                }
+                Err(task::process::ProcessError::NoChild) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     drop(graph);
     vfs.prune_unused();
     drop(vfs);

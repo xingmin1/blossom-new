@@ -1,15 +1,104 @@
 //! 每次打开拥有独立位置，描述符复制只共享同一个具体文件对象。
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::fs::{DirectoryEntry, FsError, InodeKind, Path};
-use crate::mm::FolioRef;
+use crate::arch;
+use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeTime, Path};
+use crate::mm::{space::Mm, FolioRef};
 use crate::sync::SleepMutex;
 
 /// 共享一个打开实例及其位置；最后引用释放该实例持有的路径。
 pub type FileRef = Arc<dyn FileLike>;
 
-/// 文件中的非负字节位置；相对位移计算失败时保留原位置。
+const O_ACCMODE: u32 = 0o3;
+const O_APPEND: u32 = 0o2000;
+const O_NONBLOCK: u32 = 0o4000;
+pub(crate) const O_DIRECTORY: u32 = 0o200000;
+pub(crate) const O_NOFOLLOW: u32 = 0o400000;
+const O_CLOEXEC: u32 = 0o2000000;
+const MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
+const OPEN_FLAGS: u32 = MUTABLE_FLAGS | 0o100000 | O_DIRECTORY | O_NOFOLLOW | 0o400;
+
+/// 同一文件页循环的两个接收端，实际交付量独立于请求长度。
+pub struct ReadBuffer<'a> {
+    target: ReadTarget<'a>,
+    written: usize,
+}
+
+/// 内核切片遵守独占借用；用户地址只由绑定的 Mm 执行逐页原始复制。
+enum ReadTarget<'a> {
+    Kernel(&'a mut [u8]),
+    User {
+        mm: &'a Mm,
+        address: usize,
+        length: usize,
+    },
+}
+
+impl<'a> ReadBuffer<'a> {
+    /// 将内核消费者绑定到同一文件页交付循环。
+    pub fn kernel(bytes: &'a mut [u8]) -> Self {
+        Self {
+            target: ReadTarget::Kernel(bytes),
+            written: 0,
+        }
+    }
+
+    /// 一次验证非零用户范围；零长请求不要求地址可访问。
+    pub fn user(mm: &'a Mm, address: usize, length: usize) -> Result<Self, FsError> {
+        if length != 0 {
+            let end = address.checked_add(length).ok_or(FsError::BadAddress)?;
+            if arch::USER_ADDRESS_END < end {
+                return Err(FsError::BadAddress);
+            }
+        }
+        Ok(Self {
+            target: ReadTarget::User {
+                mm,
+                address,
+                length,
+            },
+            written: 0,
+        })
+    }
+
+    /// 返回本次接收端的完整容量，不包含已交付进度。
+    pub fn len(&self) -> usize {
+        match &self.target {
+            ReadTarget::Kernel(bytes) => bytes.len(),
+            ReadTarget::User { length, .. } => *length,
+        }
+    }
+
+    /// 观察已经真正写入接收端的前缀，故障不会撤回这段进度。
+    pub fn copied(&self) -> usize {
+        self.written
+    }
+
+    /// 从成功只读 folio 交付字节；可能处理用户 fault，但不持文件页用途短锁。
+    pub fn push(&mut self, bytes: &[u8]) -> Result<usize, FsError> {
+        let count = bytes.len().min(self.len() - self.written);
+        let bytes = &bytes[..count];
+        match &mut self.target {
+            ReadTarget::Kernel(dst) => {
+                dst[self.written..self.written + count].copy_from_slice(bytes);
+                self.written += count;
+                Ok(count)
+            }
+            ReadTarget::User { mm, address, .. } => {
+                let progress = mm.copyout(*address + self.written, bytes);
+                self.written += progress.copied;
+                match progress.error {
+                    None => Ok(progress.copied),
+                    Some(_) => Err(FsError::BadAddress),
+                }
+            }
+        }
+    }
+}
+
+/// 可表示为有符号64位的非负文件位置；相对位移失败时保留原位置。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeekFrom {
     Start(u64),
@@ -17,7 +106,7 @@ pub enum SeekFrom {
     End(i64),
 }
 
-/// 已加载 inode 的真实属性，不包含文件页或尚未实现的属性。
+/// 真实 inode 与卷属性的小快照，时间来自只读盘面。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileStat {
     pub inode: u64,
@@ -29,15 +118,39 @@ pub struct FileStat {
     pub links: u32,
     /// 已分配空间按 512 字节计数。
     pub blocks: u64,
+    pub device: u64,
+    pub block_size: u32,
+    pub atime: InodeTime,
+    pub mtime: InodeTime,
+    pub ctime: InodeTime,
 }
 
 /// 普通可睡眠任务使用的文件操作；调用者须在描述符表锁外持有实例引用。
 pub trait FileLike: Send + Sync {
-    /// 从共享位置读取，只有实际交付的字节推进位置。
-    fn read(&self, dst: &mut [u8]) -> Result<usize, FsError>;
+    /// 内核顺序读取使用与用户读取相同的页交付和位置提交协议。
+    fn read(&self, dst: &mut [u8]) -> Result<usize, FsError> {
+        self.read_into(&mut ReadBuffer::kernel(dst))
+    }
 
-    /// 按指定位置读取，不获取或修改共享位置。
-    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError>;
+    /// 内核按位置读取使用同一页循环，不取得共享位置锁。
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
+        self.read_at_into(offset, &mut ReadBuffer::kernel(dst))
+    }
+
+    /// 从共享位置向具体接收端交付，只提交已交付的正前缀。
+    fn read_into(&self, target: &mut ReadBuffer<'_>) -> Result<usize, FsError>;
+
+    /// 按指定位置向接收端交付，不获取或修改共享位置。
+    fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError>;
+
+    /// 借用保活挂载与 inode 的完整路径，dirfd 不暴露裸身份。
+    fn path(&self) -> &Path;
+
+    /// 读取此 OFD 的访问模式和状态，CLOEXEC 只在描述符槽保存。
+    fn flags(&self) -> u32;
+
+    /// 只改变支持的可变状态位，不修改访问模式与打开时路径约束。
+    fn set_status_flags(&self, raw: u32) -> Result<(), FsError>;
 
     /// 在普通任务中等待唯一 inode 的缓存页，不获取位置锁；EOF 与私有尾页由映射调用者处理。
     fn file_page(&self, index: u64) -> Result<FolioRef, FsError>;
@@ -51,6 +164,12 @@ pub trait FileLike: Send + Sync {
     /// 返回下一项及其原始名字，成功取得项后才推进目录位置。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError>;
 
+    /// 回调完整交付一项并返回 true 后提交其 cookie；false 或错误保留该项位置。
+    fn for_each_dirent(
+        &self,
+        emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
+    ) -> Result<(), FsError>;
+
     /// 当前只读文件拒绝写入，包括空输入。
     fn write(&self, src: &[u8]) -> Result<usize, FsError>;
 }
@@ -59,26 +178,48 @@ pub trait FileLike: Send + Sync {
 pub struct InodeFile {
     path: Path,
     cursor: SleepMutex<u64>,
+    flags: AtomicU32,
 }
 
 /// 目录的打开实例，枚举位置使用后端已有的字节记录边界。
 pub struct DirectoryFile {
     path: Path,
     cursor: SleepMutex<u64>,
+    flags: AtomicU32,
 }
 
-/// 按真实 inode 类型创建位置为零的新实例，元数据错误原样返回，分配失败返回 NoMemory。
-/// 最终未跟随的符号链接不能成为可读实例，路径的挂载拥有权随新实例保存。
+/// 内核默认只读打开与用户带标志打开共用唯一构造。
 pub fn open_path(path: Path) -> Result<FileRef, FsError> {
-    match path.inode()?.metadata()?.kind {
+    open_path_with_flags(path, 0)
+}
+
+/// 创建真实只读 OFD，访问模式和写意图不能越过只读卷边界。
+pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
+    if flags & O_ACCMODE == O_ACCMODE {
+        return Err(FsError::InvalidOperation);
+    }
+    if flags & (O_ACCMODE | 0o100 | 0o1000) != 0 {
+        return Err(FsError::ReadOnly);
+    }
+    let flags = flags & !O_CLOEXEC;
+    if flags & !OPEN_FLAGS != 0 {
+        return Err(FsError::Unsupported);
+    }
+    let kind = path.inode()?.metadata()?.kind;
+    if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
+        return Err(FsError::NotDirectory);
+    }
+    match kind {
         InodeKind::Regular => Ok(Arc::try_new(InodeFile {
             path,
             cursor: SleepMutex::new(0),
+            flags: AtomicU32::new(flags),
         })
         .map_err(|_| FsError::NoMemory)?),
         InodeKind::Directory => Ok(Arc::try_new(DirectoryFile {
             path,
             cursor: SleepMutex::new(0),
+            flags: AtomicU32::new(flags),
         })
         .map_err(|_| FsError::NoMemory)?),
         InodeKind::Symlink => Err(FsError::TooManySymlinks),
@@ -87,18 +228,33 @@ pub fn open_path(path: Path) -> Result<FileRef, FsError> {
 }
 
 impl FileLike for InodeFile {
-    /// 位置锁跨真实读取保持独占，后页错误产生的正前缀仍按实际长度推进。
-    fn read(&self, dst: &mut [u8]) -> Result<usize, FsError> {
+    /// 位置锁跨实际交付保持独占，用户故障的正前缀仍按真实长度推进。
+    fn read_into(&self, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
         let mut cursor = self.cursor.lock();
-        let bytes = self.path.inode()?.read_at(*cursor, dst)?;
-        // 原读取限制 bytes 不超过 size-cursor；EOF 或零长返回零，因此位置相加不会溢出。
+        let bytes = self.path.inode()?.read_into(*cursor, target)?;
+        // inode 限制交付不超过 size-cursor，EOF 与零长返回零。
         *cursor += bytes as u64;
         Ok(bytes)
     }
 
-    /// 直接读取唯一 inode 的文件页，不参与共享位置的串行化。
-    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
-        self.path.inode()?.read_at(offset, dst)
+    /// 按位置读取唯一 inode 的文件页，不参与共享位置的串行化。
+    fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+        self.path.inode()?.read_into(offset, target)
+    }
+
+    /// 由完整路径保活挂载，调用者可克隆此路径作为 dirfd 起点。
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// OFD 状态由原子快照读取，不获取位置锁。
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// 更新同一 OFD 的可变状态，dup 的所有引用观察相同状态。
+    fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
+        set_status_flags(&self.flags, raw)
     }
 
     /// 从完整路径保活的 inode 取得同源缓存页，不读取或修改打开实例的位置。
@@ -111,13 +267,21 @@ impl FileLike for InodeFile {
         seek_path(&self.path, &self.cursor, from)
     }
 
-    /// 只复制属性字段，文件页与 inode 的内部块数据保持原有拥有权。
+    /// 只复制属性字段，不复制完整元数据或文件内容。
     fn stat(&self) -> Result<FileStat, FsError> {
         stat_path(&self.path)
     }
 
     /// 普通文件不能作为目录枚举。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 普通文件不提供目录流，不调用消费者。
+    fn for_each_dirent(
+        &self,
+        _emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
+    ) -> Result<(), FsError> {
         Err(FsError::NotDirectory)
     }
 
@@ -129,13 +293,28 @@ impl FileLike for InodeFile {
 
 impl FileLike for DirectoryFile {
     /// 目录字节由目录项操作消费，不能按普通文件读取。
-    fn read(&self, _dst: &mut [u8]) -> Result<usize, FsError> {
+    fn read_into(&self, _target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
         Err(FsError::IsDirectory)
     }
 
     /// 指定位置的普通字节读取同样拒绝目录。
-    fn read_at(&self, _offset: u64, _dst: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at_into(&self, _offset: u64, _target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
         Err(FsError::IsDirectory)
+    }
+
+    /// 目录实例保活完整路径，可作为相对路径起点。
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 读取此目录 OFD 状态，不获取枚举位置锁。
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// 目录状态与描述符属性分离，不改变枚举位置。
+    fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
+        set_status_flags(&self.flags, raw)
     }
 
     /// 目录不能提供普通文件映射页，不建立缓存页或改变枚举位置。
@@ -153,14 +332,30 @@ impl FileLike for DirectoryFile {
         stat_path(&self.path)
     }
 
-    /// 每次只取得下一项；分配、格式或 I/O 错误均保留原枚举位置。
+    /// 内核单项枚举保留原拥有语义，与流式枚举共用完整项提交。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
         let mut cursor = self.cursor.lock();
         let entry = self.path.inode()?.dir_next(*cursor)?;
         if let Some(entry) = &entry {
-            *cursor = entry.next_offset;
+            commit_dirent(&mut cursor, entry);
         }
         Ok(entry)
+    }
+
+    /// 锁内串行真实目录流，消费者在完整记录交付后才授权推进 cookie。
+    fn for_each_dirent(
+        &self,
+        emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
+    ) -> Result<(), FsError> {
+        let mut cursor = self.cursor.lock();
+        let inode = self.path.inode()?;
+        while let Some(entry) = inode.dir_next(*cursor)? {
+            if !emit(&entry)? {
+                break;
+            }
+            commit_dirent(&mut cursor, &entry);
+        }
+        Ok(())
     }
 
     /// 只读目录拒绝写入，空输入也不能伪报成功。
@@ -169,7 +364,23 @@ impl FileLike for DirectoryFile {
     }
 }
 
-/// 在同一次位置锁占有中计算并提交位置，只有 End 借用真实文件大小。
+/// 同一原子更新保留全部不可变打开位，只提交支持的可变状态位。
+fn set_status_flags(flags: &AtomicU32, raw: u32) -> Result<(), FsError> {
+    if raw & !(OPEN_FLAGS | O_ACCMODE | O_CLOEXEC) != 0 {
+        return Err(FsError::Unsupported);
+    }
+    let _ = flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some((old & !MUTABLE_FLAGS) | (raw & MUTABLE_FLAGS))
+    });
+    Ok(())
+}
+
+/// 已完整交付目录项的拥有值或字节后，提交后端提供的下一记录边界。
+fn commit_dirent(cursor: &mut u64, entry: &DirectoryEntry) {
+    *cursor = entry.next_offset;
+}
+
+/// 同一位置锁内计算并校验非负loff_t，再提交共享位置，失败不改变游标。
 fn seek_path(path: &Path, cursor: &SleepMutex<u64>, from: SeekFrom) -> Result<u64, FsError> {
     let mut cursor = cursor.lock();
     let position = match from {
@@ -178,14 +389,21 @@ fn seek_path(path: &Path, cursor: &SleepMutex<u64>, from: SeekFrom) -> Result<u6
         SeekFrom::End(delta) => path.inode()?.metadata()?.size.checked_add_signed(delta),
     }
     .ok_or(FsError::InvalidOperation)?;
+    if (i64::MAX as u64) < position {
+        return Err(FsError::InvalidOperation);
+    }
     *cursor = position;
     Ok(position)
 }
 
-/// 从共享 inode 借用字段形成小快照，不复制完整元数据或文件内容。
-fn stat_path(path: &Path) -> Result<FileStat, FsError> {
+/// 从真实路径借用字段形成小快照，未打开的符号链接同样能取得属性。
+pub fn stat_path(path: &Path) -> Result<FileStat, FsError> {
     let inode = path.inode()?;
     let data = inode.metadata()?;
+    if data.kind == InodeKind::Other {
+        return Err(FsError::Unsupported);
+    }
+    let volume = inode.filesystem();
     Ok(FileStat {
         inode: inode.number(),
         kind: data.kind,
@@ -195,5 +413,10 @@ fn stat_path(path: &Path) -> Result<FileStat, FsError> {
         gid: data.gid,
         links: data.links,
         blocks: data.blocks,
+        device: volume.device(),
+        block_size: volume.geometry().block_size as u32,
+        atime: data.atime,
+        mtime: data.mtime,
+        ctime: data.ctime,
     })
 }
