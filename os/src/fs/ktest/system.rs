@@ -320,7 +320,7 @@ fn raw_bio(disk: &Disk, operation: BlkOperation) -> Result<Bio, BlockError> {
 
 /// 真实提交并等待 DMA 收权后领回原 memory，错误前缀不被当作完整读写。
 fn raw_io(
-    disk: &Disk,
+    disk: &DiskRef,
     operation: BlkOperation,
 ) -> Result<(IoResult, Vec<MappedPages>), BlockError> {
     let bio = raw_bio(disk, operation)?;

@@ -1409,7 +1409,8 @@ class HostFatalReplayTests(unittest.TestCase):
         rows = [case_record(expected_fatal="panic", fatal_message="wanted")]
         for tail, process_tail, status in (
                 (["  # KTEST armed 0 panic", "business wanted",
-                  "  # KTEST fatal 0 panic", "actual panic: wanted"], "", "Pass"),
+                  "  # KTEST fatal 0 panic", "actual panic: wanted"],
+                 "uart.close()\nlistener.close()\nimport os\nos._exit(0)", "Pass"),
                 (["  # KTEST armed 0 panic", "  # KTEST fatal 0 panic",
                   "actual panic: wanted"], "uart.close()\nraise SystemExit(9)", "Crash"),
                 (["  # KTEST armed 0 panic", "  # KTEST fatal 0 panic",

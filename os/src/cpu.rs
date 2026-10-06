@@ -218,7 +218,8 @@ impl CpuLocal {
     }
 }
 
-static CPU_LOCALS: Once<[CpuLocal; MAX_CPUS]> = Once::new();
+// 按槽构造，避免整个 CPU 表的按值临时副本叠加到启动栈。
+static CPU_LOCALS: [Once<CpuLocal>; MAX_CPUS] = [const { Once::new() }; MAX_CPUS];
 static mut BOOT_RECORDS: [CpuBoot; MAX_CPUS] = [CpuBoot {
     stack_top: 0,
     local: 0,
@@ -231,20 +232,18 @@ static mut BOOT_RECORDS: [CpuBoot; MAX_CPUS] = [CpuBoot {
 /// cpu_count 和 hardware_ids 已验证。启动栈映射有效，且不存在 AP 对记录的访问。
 pub unsafe fn initialize(info: &BootInfo) {
     assert!(
-        CPU_LOCALS.get().is_none(),
+        CPU_LOCALS.iter().all(|local| local.get().is_none()),
         "CPU table is already initialized"
     );
     let stack_base = ptr::addr_of!(BOOT_STACKS) as usize;
-    let locals = CPU_LOCALS.call_once(|| {
-        core::array::from_fn(|id| {
+    for (id, slot) in CPU_LOCALS[..info.cpu_count].iter().enumerate() {
+        let local = slot.call_once(|| {
             CpuLocal::new(
                 id,
                 info.hardware_ids[id],
                 stack_base + (id + 1) * STACK_SIZE,
             )
-        })
-    });
-    for (id, local) in locals[..info.cpu_count].iter().enumerate() {
+        });
         // SAFETY: id 来自已验证的有效 CPU 范围；BSP 独占静态记录，AP 尚未读取。
         unsafe {
             ptr::addr_of_mut!(BOOT_RECORDS)
@@ -257,7 +256,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         }
     }
     // SAFETY: 逻辑 0 是 BSP；Once 中的对象已完成构造且永久存在，IRQ 尚未开启。
-    unsafe { crate::arch::install_cpu_local(&locals[0]) };
+    unsafe { crate::arch::install_cpu_local(get(0)) };
 }
 
 /// 借用当前核的稳定 CPU 对象；未安装基址时直接报告初始化错误。
@@ -275,10 +274,9 @@ pub fn count() -> usize {
 
 /// 借用有效逻辑编号的 CPU；构造时序和编号错误只在此对象边界报告。
 pub fn get(id: usize) -> &'static CpuLocal {
-    let locals = CPU_LOCALS
+    CPU_LOCALS[..count()][id]
         .get()
-        .expect("CPU table has not been initialized");
-    &locals[..count()][id]
+        .expect("CPU local has not been initialized")
 }
 
 /// 在本核已能服务中断后发布上线，使等待者的 acquire 观察对应真实可用状态。

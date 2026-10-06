@@ -416,17 +416,6 @@ impl Disk {
             .map_err(|_| BlockError::NoMemory)
     }
 
-    /// 私有构造保证 self 来自未移动的原 Arc；仅无 child 的完成移交临时保活。
-    pub(super) fn clone_ref(&self) -> DiskRef {
-        let raw = self as *const Self;
-        // SAFETY: Disk 只能由 prepare 的 pinned Arc 构造，当前借用保原分配存活；
-        // 增加真实现存控制块强引用，立刻原样恢复并固定，未从 Arc 移出对象。
-        unsafe {
-            Arc::increment_strong_count(raw);
-            Pin::new_unchecked(Arc::from_raw(raw))
-        }
-    }
-
     /// 普通生成者或其独立完成 Work 在真实回调尾部归还同一 accepted 责任。
     pub(super) fn finish_generation_tail(&self, operation: BlkOperation) {
         {
@@ -441,7 +430,11 @@ impl Disk {
     }
 
     /// 只在 Live 接受一个 root，挂载 claim 与写生成者检查属于同一临界区。
-    pub(super) fn admit(&self, bio: Bio) -> Result<ActiveBio<'_>, (Bio, BlockError)> {
+    /// 生成期借用实际设备拥有者，只有最后生成义务移交完成 Work 时才克隆保活引用。
+    pub(super) fn admit<'a>(
+        self: &'a DiskRef,
+        bio: Bio,
+    ) -> Result<ActiveBio<'a>, (Bio, BlockError)> {
         {
             let mut q = self.queue.lock();
             let error = if !matches!(q.phase, QueuePhase::Live) {
@@ -933,7 +926,7 @@ impl Drop for Disk {
 pub(super) struct ActiveBio<'a> {
     pub(super) bio: Arc<BioInner>,
     pub(super) offset: usize,
-    disk: &'a Disk,
+    disk: &'a DiskRef,
     finished: bool,
 }
 

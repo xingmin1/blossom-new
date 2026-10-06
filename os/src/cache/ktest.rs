@@ -325,7 +325,7 @@ impl Drop for HeapPressure {
 }
 
 /// 预建固定 CPU0 Task 独占压力与唯一 read，正式准备返回后才放压；不制造完成结果。
-fn prepare_oom_read(observation: &Observation, disk: &Disk) -> Result<(), BlockError> {
+fn prepare_oom_read(observation: &Observation, disk: &DiskRef) -> Result<(), BlockError> {
     let mut pressure = observation
         .pressure
         .lock()

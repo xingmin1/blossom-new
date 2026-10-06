@@ -379,10 +379,11 @@ impl BioInner {
     }
 
     /// 结束生成者账本；true 表示可睡完成及 accepted 尾部已移交构造期同域预留 Work。
+    /// accepted 生成者借用实际 DiskRef；只有独立完成 Work 接责时才取得强拥有。
     pub(super) fn finish_generation(
         self: &Arc<Self>,
         error: Option<(usize, BlockError)>,
-        owner: Option<&Disk>,
+        owner: Option<&DiskRef>,
     ) -> bool {
         sched::assert_switchable();
         let completion = {
@@ -435,7 +436,7 @@ impl BioInner {
         mut memory: Vec<MappedPages>,
         result: IoResult,
         device_owned: bool,
-        owner: Option<&Disk>,
+        owner: Option<&DiskRef>,
         queue_task: bool,
     ) -> bool {
         if device_owned {
@@ -457,7 +458,7 @@ impl BioInner {
                 state.memory = Some(memory);
                 state.result = Some(result);
                 // 所有 child 已结束并从槽移出，临时 owner 没有 Disk→本 Bio 的返回边。
-                state.completion_owner = owner.map(Disk::clone_ref);
+                state.completion_owner = owner.cloned();
             }
             let owned = Arc::into_raw(Arc::clone(self));
             let work = self

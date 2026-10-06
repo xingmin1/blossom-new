@@ -1,6 +1,6 @@
 //! 只验证父完成账本的受控顺序，不冒充硬件反序 used 或磁盘 I/O。
 
-use super::{Bio, Disk};
+use super::{Bio, Disk, DiskRef};
 
 /// 只读真实设备 used.idx，固定布局与同一控制区 owner 保活，不消费或合成元素。
 pub(crate) fn used_index(disk: &Disk, legacy: bool) -> u16 {
@@ -23,7 +23,7 @@ pub(crate) fn used_index(disk: &Disk, legacy: bool) -> u16 {
 }
 
 /// 准入与生成尾部使用生产 API；原零页不发表给设备，只控制两个 child 的完成顺序。
-pub(crate) fn generation_pair(disk: &Disk, first: Bio, second: Bio) {
+pub(crate) fn generation_pair(disk: &DiskRef, first: Bio, second: Bio) {
     let first = disk
         .admit(first)
         .unwrap_or_else(|(_, error)| panic!("controlled first admission: {:?}", error));
@@ -40,7 +40,7 @@ pub(crate) fn generation_pair(disk: &Disk, first: Bio, second: Bio) {
 }
 
 /// 仅控制无设备引用的 child 先结束；生产准入与生成者最后完成仍使用真实实现。
-pub(crate) fn generation_last(disk: &Disk, bio: Bio) {
+pub(crate) fn generation_last(disk: &DiskRef, bio: Bio) {
     let active = disk
         .admit(bio)
         .unwrap_or_else(|(_, error)| panic!("controlled generation admission: {:?}", error));

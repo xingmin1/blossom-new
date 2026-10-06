@@ -9,7 +9,7 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 use crate::block::bio::BioInner;
 use crate::block::disk::{ActiveBio, PreparingSlot};
 use crate::block::{
-    Bio, BioCompletion, BlkOperation, BlockError, Disk, IoResult, QueueLimits, MAX_BATCH,
+    Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, IoResult, QueueLimits, MAX_BATCH,
     SECTOR_BYTES,
 };
 use crate::mm::dma::{DmaError, MappedPages};
@@ -58,7 +58,7 @@ struct GenerationPlan {
 
 impl Disk {
     /// 普通 Task 同步生成全部 child；返回后仍须由 BioCompletion 等待真实完成。
-    pub(crate) fn submit_bio(&self, bio: Bio) {
+    pub(crate) fn submit_bio(self: &DiskRef, bio: Bio) {
         drop(task::current_task());
         let mut active: [Option<ActiveBio<'_>>; MAX_BATCH] = [const { None }; MAX_BATCH];
         match self.admit(bio) {
@@ -73,7 +73,7 @@ impl Disk {
     }
 
     /// 消耗显式批次，每组最多八个生成者，组内相邻普通范围才允许合并。
-    pub(crate) fn submit_batch(&self, bios: Vec<Bio>) {
+    pub(crate) fn submit_batch(self: &DiskRef, bios: Vec<Bio>) {
         drop(task::current_task());
         let mut pending = bios.into_iter();
         loop {
@@ -228,7 +228,7 @@ impl Disk {
     }
 
     /// 将原 folio 的完整读入范围交给 Bio，等待真实 DMA 全尾及内容结果发布。
-    pub fn load_folio(&self, byte_offset: u64, read: FolioRead) -> Result<(), BlockError> {
+    pub fn load_folio(self: &DiskRef, byte_offset: u64, read: FolioRead) -> Result<(), BlockError> {
         let len = read.len();
         let (_, result) = self.read_folio_bio(byte_offset, read, None)?;
         if let Some(error) = result.error {
@@ -243,7 +243,7 @@ impl Disk {
     /// 普通 Task 将一个页内子范围直接读到原页，全尾收权后返回仍锁定的整份读入者。
     /// 磁盘位置与页内偏移独立；失败发布原错误，成功不提前授予整页读取权。
     pub fn fill_folio_range(
-        &self,
+        self: &DiskRef,
         byte_offset: u64,
         read: FolioRead,
         offset: usize,
@@ -275,7 +275,7 @@ impl Disk {
 
     /// 锁外准备原页 Bio 并同步等待；None 结束完整读，子范围成功后由来源继续填页。
     fn read_folio_bio(
-        &self,
+        self: &DiskRef,
         byte_offset: u64,
         mut read: FolioRead,
         range: Option<(usize, usize)>,
@@ -340,7 +340,7 @@ impl Disk {
 
     /// 普通 Task 用请求自有零页完成字节范围读取，只有全长成功才修改调用者缓冲区。
     /// 非空范围必须符合设备逻辑块对齐；文件页填充直接使用自己的页提交 Bio。
-    pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+    pub fn read_exact_at(self: &DiskRef, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         drop(task::current_task());
         let result = self.read_with_pages(offset, dst);
         self.unplug();
@@ -348,7 +348,7 @@ impl Disk {
     }
 
     /// 所有 fallible 页与 Vec 准备都在队列锁外，错误完成仍通过原拥有者归还原阶。
-    fn read_with_pages(&self, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+    fn read_with_pages(self: &DiskRef, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         let limits = self.limits();
         let logical = u64::from(limits.logical_block_size);
         let capacity = limits
