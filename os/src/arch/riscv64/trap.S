@@ -7,7 +7,10 @@ rv_trap_entry:
     // sscratch 为零时保留原内核栈；用户执行时只接受内核预置的私有现场指针。
     csrrw sp, sscratch, sp
     beqz sp, .Lrv_kernel_trap
-    j rv_user_trap_entry
+    // 不依赖外部入口位于 JAL 的 ±1MiB 内；先保存用户 t0，再用 PC 相对长跳转。
+    sd t0, ({user_gpr} + 5 * {word})(sp)
+    lla t0, rv_user_trap_entry
+    jr t0
 .Lrv_kernel_trap:
     csrrw sp, sscratch, sp
     addi sp, sp, -{frame_size}

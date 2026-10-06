@@ -7,6 +7,7 @@ use core::slice;
 use core::sync::atomic::AtomicUsize;
 
 use crate::boot::MAX_MEMORY_REGIONS;
+use crate::mm::anon::AnonState;
 use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
 use crate::mm::folio::FolioState;
 use crate::mm::OwnedPages;
@@ -32,7 +33,7 @@ pub(crate) struct PageDesc {
     pub(crate) slab_head: AtomicUsize,
     /// 只锁定用途访问令牌，取锁不会借用槽内的 folio 或等待源。
     usage_lock: SpinLock<()>,
-    /// Empty 只表示没有 SLUB 或 folio 用途，不表示属于自由链。
+    /// Empty 只表示没有 slab、folio 或匿名页用途，不表示属于自由链。
     usage: UnsafeCell<PageUse>,
     _pinned: PhantomPinned,
 }
@@ -42,6 +43,7 @@ enum PageUse {
     Empty,
     Slab(SlabState),
     Folio(FolioState),
+    Anon(AnonState),
 }
 
 /// 页用途的短锁令牌；只授予已确认用途的视图，不暴露整个槽的可变借用。
@@ -62,7 +64,7 @@ impl PageUseGuard<'_> {
     pub(crate) fn slab(&self) -> Option<&SlabState> {
         match self.value() {
             PageUse::Slab(state) => Some(state),
-            PageUse::Empty | PageUse::Folio(_) => None,
+            PageUse::Empty | PageUse::Folio(_) | PageUse::Anon(_) => None,
         }
     }
 
@@ -73,7 +75,7 @@ impl PageUseGuard<'_> {
         // 可变 guard 借用结束全部先前视图，返回借用不能超出当前 guard。
         match unsafe { &mut *self.descriptor.usage.get() } {
             PageUse::Slab(state) => Some(state),
-            PageUse::Empty | PageUse::Folio(_) => unreachable!(),
+            PageUse::Empty | PageUse::Folio(_) | PageUse::Anon(_) => unreachable!(),
         }
     }
 
@@ -81,7 +83,30 @@ impl PageUseGuard<'_> {
     pub(crate) fn folio(&self) -> &FolioState {
         match self.value() {
             PageUse::Folio(state) => state,
-            PageUse::Empty | PageUse::Slab(_) => panic!("live folio lost its page use"),
+            PageUse::Empty | PageUse::Slab(_) | PageUse::Anon(_) => {
+                panic!("live folio lost its page use")
+            }
+        }
+    }
+
+    /// 借用用途锁下匿名页状态，返回视图不能超过当前 guard。
+    pub(crate) fn anon(&self) -> &AnonState {
+        match self.value() {
+            PageUse::Anon(state) => state,
+            PageUse::Empty | PageUse::Slab(_) | PageUse::Folio(_) => {
+                panic!("live anonymous page lost its page use")
+            }
+        }
+    }
+
+    /// 确认匿名用途后修改真实引用头，不借用任何活 folio 或固定等待源。
+    pub(crate) fn anon_mut(&mut self) -> &mut AnonState {
+        self.anon();
+        // SAFETY: 用途锁排除安装和移出，标签已确认为 Anon，槽中无活 folio；
+        // 匿名状态不向锁外投影，可变 guard 借用结束全部短视图，返回借用绑定 guard。
+        match unsafe { &mut *self.descriptor.usage.get() } {
+            PageUse::Anon(state) => state,
+            PageUse::Empty | PageUse::Slab(_) | PageUse::Folio(_) => unreachable!(),
         }
     }
 
@@ -106,6 +131,11 @@ impl PageUseGuard<'_> {
         self.install(PageUse::Folio(state));
     }
 
+    /// 在首引用发布前将匿名基本页的原归还权安装到空槽。
+    pub(crate) fn install_anon(&mut self, state: AnonState) {
+        self.install(PageUse::Anon(state));
+    }
+
     /// 移出已摘离且没有活对象的 slab，原页须在全部 MM 锁外归还。
     pub(crate) fn take_slab(&mut self) -> Option<SlabState> {
         let state = self.slab()?;
@@ -119,7 +149,22 @@ impl PageUseGuard<'_> {
         // 可变 guard 借用结束全部短视图，锁排除其他 slab 访问和用途变化。
         match unsafe { self.descriptor.usage.get().replace(PageUse::Empty) } {
             PageUse::Slab(state) => Some(state),
-            PageUse::Empty | PageUse::Folio(_) => unreachable!(),
+            PageUse::Empty | PageUse::Folio(_) | PageUse::Anon(_) => unreachable!(),
+        }
+    }
+
+    /// 引用数归零后移出匿名页的原拥有者，调用方须在全部 MM 锁外归还。
+    pub(crate) fn take_anon(&mut self) -> OwnedPages {
+        assert_eq!(
+            self.anon().references,
+            0,
+            "removed anonymous page retains references"
+        );
+        // SAFETY: 标签已确认为 Anon 且真实引用归零，没有锁外状态投影；
+        // 可变 guard 借用结束短视图，用途锁排除竞争访问，不移动任何固定 folio。
+        match unsafe { self.descriptor.usage.get().replace(PageUse::Empty) } {
+            PageUse::Anon(state) => state.backing,
+            PageUse::Empty | PageUse::Slab(_) | PageUse::Folio(_) => unreachable!(),
         }
     }
 
@@ -132,7 +177,9 @@ impl PageUseGuard<'_> {
         // 可变 guard 借用结束锁内视图，只取走未被固定的 backing，不移动等待源。
         let backing = match unsafe { &mut *self.descriptor.usage.get() } {
             PageUse::Folio(state) => state.take_backing(),
-            PageUse::Empty | PageUse::Slab(_) => panic!("live folio lost its page use"),
+            PageUse::Empty | PageUse::Slab(_) | PageUse::Anon(_) => {
+                panic!("live folio lost its page use")
+            }
         };
         // SAFETY: backing 已移交返回值，所有其他责任已结束；原地析构满足
         // 等待源的 Pin 承诺，随后在已析构槽写入 Empty，不析构或移动原页。
@@ -179,9 +226,9 @@ pub(crate) struct SlabState {
 }
 
 // SAFETY: kind 发布后不可变，buddy 的全部读写由唯一所属 zone 锁互斥；
-// slab_head 仅原子访问，SLUB 状态由独立 usage_lock 互斥；folio 固定用途仅修改
-// 同锁保护的内部共享头，取锁只借用独立令牌，内容锁与等待源维持固定地址。
-// 生产描述符永久发布后不移动；最后引用才原地析构 folio，原页归还在用途锁外。
+// slab_head 仅原子访问，SLUB 与匿名页状态由独立 usage_lock 互斥；folio 固定
+// 用途仅修改同锁保护的内部共享头，取锁只借用独立令牌，内容锁与等待源维持固定地址。
+// 生产描述符永久发布后不移动；最后引用才结束用途，原页归还在用途锁外。
 unsafe impl Sync for PageDesc {}
 
 impl PageDesc {

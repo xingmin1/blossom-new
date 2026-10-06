@@ -34,7 +34,7 @@ const DEEP_EXTENTS: u64 = 1500;
 pub(crate) fn anchors() -> (
     [&'static ::ktest::SuiteSlot; 20],
     [&'static ::ktest::SuiteSlot; 7],
-    [&'static ::ktest::SuiteSlot; 7],
+    [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
 ) {
     (
@@ -98,18 +98,15 @@ fn recovered(
     label: &'static str,
     before: mm::MemoryStats,
 ) -> TestResult {
-    let mut after = settled()?;
-    until(label, || {
-        mm::shrink_all();
-        mm::drain_all_pages();
-        after = mm::stats();
-        after == before
-    })?;
-    context.expect_eq(after, before);
+    let after = settled()?;
     context.diagnostic(format_args!(
         "fs-resources boundary={} six-domains-before={:?} six-domains-after={:?}",
         label, before, after
     ));
+    if after != before {
+        return Err(TestError(label));
+    }
+    context.expect_eq(after, before);
     Ok(())
 }
 
@@ -247,6 +244,10 @@ enum Job {
         pathname: &'static [u8],
         pressure: crate::cache::ktest::HeapPressure,
     },
+    User {
+        thread: Arc<crate::task::UserThread>,
+        access: crate::arch::UserAccess,
+    },
 }
 
 enum Returned {
@@ -298,6 +299,7 @@ enum Returned {
         submitted_before: usize,
         submitted_after: usize,
     },
+    User(Result<file::VmAccessResult, TestError>),
 }
 
 struct Observation {
@@ -338,8 +340,11 @@ impl Observation {
 }
 
 /// 普通原生任务消费真实 API；结果只观察已初始化内容或实际原错误。
-fn perform(job: Job) -> Result<Returned, FsError> {
+fn perform(job: Job, cancelled: &AtomicBool) -> Result<Returned, FsError> {
     match job {
+        Job::User { thread, access } => Ok(Returned::User(file::run_vm_access(
+            thread, access, cancelled,
+        ))),
         Job::FileRead {
             table,
             fd,
@@ -529,7 +534,7 @@ struct Owner {
     cache: Option<Arc<InodeCache>>,
     observation: Option<Arc<Observation>>,
     pressure: Option<crate::cache::ktest::HeapPressure>,
-    prepared: Vec<PreparedTask>,
+    prepared: [Option<PreparedTask>; 3],
     joins: Vec<JoinHandle>,
     activation_error: Option<BlockError>,
 }
@@ -614,17 +619,14 @@ impl Owner {
             })
             .map_err(|_| TestError("inode load observer OOM"))?;
             cache.ktest_set_load_hook(Some(hook));
-            let mut prepared = Vec::new();
+            let mut prepared = [const { None }; 3];
             let mut joins = Vec::new();
-            prepared
-                .try_reserve_exact(3)
-                .map_err(|_| TestError("filesystem native task slots OOM"))?;
             joins
                 .try_reserve_exact(3)
                 .map_err(|_| TestError("filesystem native join slots OOM"))?;
             for index in 0..3 {
                 let observer = observation.clone();
-                prepared.push(
+                prepared[index] = Some(
                     task::prepare_kernel_on(index % cpu::count(), move || {
                         observer.tasks.lock()[index] = Some(task::current_task());
                         if index == 0 && observer.hold_loader.load(Ordering::Acquire) {
@@ -643,7 +645,7 @@ impl Owner {
                         let Some(job) = job else {
                             return 1;
                         };
-                        let result = perform(job);
+                        let result = perform(job, &observer.cancelled);
                         observer.results.lock()[index] = Some(result);
                         0
                     })
@@ -728,7 +730,12 @@ impl Owner {
     /// 给尚未发表的原 Task 转交拥有型工作，push 仅消费预留槽。
     fn publish(&mut self, index: usize, job: Job) {
         self.observer().jobs.lock()[index] = Some(job);
-        self.joins.push(self.prepared.remove(0).publish());
+        self.joins.push(
+            self.prepared[index]
+                .take()
+                .expect("filesystem native task already published")
+                .publish(),
+        );
     }
 
     /// 全部原生 Task 真正离栈，才能消费 JoinHandle 和释放它们的观察存储。

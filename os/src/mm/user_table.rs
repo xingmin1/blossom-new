@@ -182,6 +182,29 @@ impl UserPageTable {
         mapping(unsafe { read_slot(table, slot_index(va, 0)) })
     }
 
+    /// 只解除一个叶而保留中间表，用于同步失效前的 break-before-make 交接。
+    ///
+    /// # Safety
+    /// 调用者必须串行化软件修改，保活旧数据页到全活动 CPU 同步失效完成；
+    /// 中间表仍由本对象拥有，失效前不得把新物理页或新权限发表到此叶。
+    pub unsafe fn clear_leaf(&mut self, va: usize) -> Option<Mapping> {
+        if !valid_page(va) {
+            return None;
+        }
+        let mut table = self.root_phys();
+        for level in (1..arch::USER_LEVELS).rev() {
+            // SAFETY: 根和逐级非空目录均由本表保活；短锁串行软件修改，索引在页内。
+            let entry = unsafe { read_slot(table, slot_index(va, level)) };
+            if !arch::user_entry_is_table(entry, level) {
+                return None;
+            }
+            table = arch::user_entry_physical(entry, level);
+        }
+        // SAFETY: 叶表仍归本对象所有，调用者保活旧数据页到后续同步失效完成；
+        // 本次只原子清空叶，不摘取或归还任何中间表。
+        mapping(unsafe { replace_slot(table, slot_index(va, 0), arch::user_empty_entry(0)) })
+    }
+
     /// 查询映射该页还需多少中间页，非法页基址或被大页占用的路径返回零。
     /// 调用者须在取得 PTE 锁后重新检查，不能把锁外计数视为发表许可。
     pub fn needed_tables(&self, va: usize) -> usize {

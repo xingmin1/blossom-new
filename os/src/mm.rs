@@ -1,3 +1,4 @@
+mod anon;
 mod bootmem;
 mod buddy;
 pub mod dma;
@@ -10,8 +11,11 @@ mod page;
 mod pcp;
 mod slub;
 pub(crate) mod space;
+pub(crate) mod uaccess;
 pub(crate) mod user_table;
+pub(crate) mod vma;
 
+pub use anon::AnonPageRef;
 pub(crate) use bootmem::PAGE_SIZE;
 pub use folio::{FolioRead, FolioRef};
 pub use frame_allocator::{alloc_pages, OwnedPages};

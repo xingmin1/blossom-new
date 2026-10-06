@@ -3,6 +3,7 @@
 use alloc::sync::Arc;
 
 use crate::fs::{DirectoryEntry, FsError, InodeKind, Path};
+use crate::mm::FolioRef;
 use crate::sync::SleepMutex;
 
 /// 共享一个打开实例及其位置；最后引用释放该实例持有的路径。
@@ -37,6 +38,9 @@ pub trait FileLike: Send + Sync {
 
     /// 按指定位置读取，不获取或修改共享位置。
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError>;
+
+    /// 在普通任务中等待唯一 inode 的缓存页，不获取位置锁；EOF 与私有尾页由映射调用者处理。
+    fn file_page(&self, index: u64) -> Result<FolioRef, FsError>;
 
     /// 更新共享字节位置，负值或溢出不修改原位置。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError>;
@@ -97,6 +101,11 @@ impl FileLike for InodeFile {
         self.path.inode()?.read_at(offset, dst)
     }
 
+    /// 从完整路径保活的 inode 取得同源缓存页，不读取或修改打开实例的位置。
+    fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
+        self.path.inode()?.file_page(index)
+    }
+
     /// 与顺序读取共用位置锁，允许定位到文件末尾之后。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError> {
         seek_path(&self.path, &self.cursor, from)
@@ -126,6 +135,11 @@ impl FileLike for DirectoryFile {
 
     /// 指定位置的普通字节读取同样拒绝目录。
     fn read_at(&self, _offset: u64, _dst: &mut [u8]) -> Result<usize, FsError> {
+        Err(FsError::IsDirectory)
+    }
+
+    /// 目录不能提供普通文件映射页，不建立缓存页或改变枚举位置。
+    fn file_page(&self, _index: u64) -> Result<FolioRef, FsError> {
         Err(FsError::IsDirectory)
     }
 

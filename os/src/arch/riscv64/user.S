@@ -105,8 +105,7 @@ rv_run_user:
 .balign 4
 .global rv_user_trap_entry
 rv_user_trap_entry:
-    // 通用 trap 入口已把受信 context 换入 SP，sscratch 暂存被中断的原 SP。
-    sd x5, ({gpr} + 5 * 8)(sp)
+    // 通用入口已保存用户 t0 并换入受信 context；sscratch 暂存被中断的原 SP。
     csrr t0, sscratch
     csrw sscratch, sp
     sd t0, ({gpr} + 2 * 8)(sp)

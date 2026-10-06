@@ -1,13 +1,18 @@
 //! 具体打开文件、固定描述符表和真实异步拥有的消费回归。
 
+use crate::arch::{self, UserAccess, UserContext, UserTrap};
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::*;
 use crate::fs::{DescriptorFlags, FileTable, OpenOptions, SeekFrom};
+use crate::mm::space::{Mm, VmError};
+use crate::mm::user_table::PagePermissions;
+use crate::task::UserThread;
 
 struct FileOwner {
     path: PathOwner,
     table: Option<Arc<FileTable>>,
     hook_volume: Option<Arc<Ext4Volume>>,
+    user: Option<usize>,
 }
 
 impl FileOwner {
@@ -81,10 +86,11 @@ impl Fixture<DeviceInventory> for FileOwner {
             path: <PathOwner as Fixture<DeviceInventory>>::set_up(context, inventory)?,
             table: None,
             hook_volume: None,
+            user: None,
         })
     }
 
-    /// 先撤自己的页观察并放行，再释放表；旧路径夹具唯一负责真实 join 和设备停止。
+    /// 先撤自己的页观察并放行，再释放表；旧路径夹具唯一负责用户和文件任务的取消、join 与设备停止。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         if let Some(volume) = &self.hook_volume {
             volume.ktest_set_segment_hook(None);
@@ -95,6 +101,7 @@ impl Fixture<DeviceInventory> for FileOwner {
             .hold_loader
             .store(false, Ordering::Release);
         self.path.owner.observer().gate.complete();
+        self.user = None;
         drop(self.table.take());
         drop(self.hook_volume.take());
         <PathOwner as Fixture<DeviceInventory>>::quiesce(&mut self.path, context)
@@ -106,6 +113,7 @@ impl Fixture<DeviceInventory> for FileOwner {
             path,
             table,
             hook_volume,
+            user: _,
         } = self;
         drop(table);
         drop(hook_volume);
@@ -128,7 +136,7 @@ fn read_pattern(
 }
 
 /// 静态宏锚点交给既有父入口，不维护第二份用例列表。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 7] {
+pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 9] {
     [
         regular::__ktest_anchor(),
         directories::__ktest_anchor(),
@@ -137,6 +145,8 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 7] {
         prefix::__ktest_anchor(),
         mounts::__ktest_anchor(),
         oom::__ktest_anchor(),
+        vm_lifetime::__ktest_anchor(),
+        vm_racing::__ktest_anchor(),
     ]
 }
 
@@ -836,6 +846,399 @@ pub(crate) mod oom {
             ),
             false,
         );
+        Ok(())
+    }
+}
+
+const VM_CODE: usize = 0x10000;
+const VM_STACK: usize = 0x30000;
+const VM_TARGET: usize = 0x50000;
+const VM_RO: PagePermissions = PagePermissions {
+    read: true,
+    write: false,
+    execute: false,
+};
+const VM_RW: PagePermissions = PagePermissions {
+    read: true,
+    write: true,
+    execute: false,
+};
+const VM_RX: PagePermissions = PagePermissions {
+    read: true,
+    write: false,
+    execute: true,
+};
+
+/// 文件用户场景也使用原受控指令和真实拥有根，不复制模拟页表或设置测试 syscall。
+fn vm_image() -> Result<Mm, TestError> {
+    let mut mm = Mm::try_new().map_err(|_| TestError("NoMemory: file-mapping root"))?;
+    for (address, permissions, contents) in [
+        (VM_CODE, VM_RX, arch::user_code()),
+        (VM_STACK, VM_RW, &[][..]),
+    ] {
+        let mut pages = mm::alloc_pages(0, true).ok_or(TestError(
+            "NoMemory: file-mapping instruction or stack page",
+        ))?;
+        assert!(contents.len() <= mm::PAGE_SIZE);
+        // SAFETY: 原页独占且完整清零，稳定代码字节在已检查页内；两块内核 RAM 不重叠，
+        // 本次初始化结束前没有页表发表或用户访问。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                contents.as_ptr(),
+                pages.as_mut_ptr().cast::<u8>(),
+                contents.len(),
+            )
+        };
+        // SAFETY: 全页已初始化，仅包含受控用户代码或零栈；排他引用与原始初始化已结束，
+        // 唯一拥有转交尚未共享的 Mm，旧裸地址不再被使用或恢复为拥有者。
+        unsafe { mm.map_owned(address, pages, permissions) }
+            .map_err(|_| TestError("file-mapping instruction or stack mapping failed"))?;
+    }
+    Ok(mm)
+}
+
+/// 原生用户 Task 的真实访问结果；只保存已发生的缺页数和实际指令观察值。
+pub(super) struct VmAccessResult {
+    faults: usize,
+    value: usize,
+}
+
+/// 在原文件 fixture 预备的 Task 中执行真实用户访问；错误交回父正文，不跨原生栈展开断言。
+pub(super) fn run_vm_access(
+    user: Arc<UserThread>,
+    direction: UserAccess,
+    cancelled: &AtomicBool,
+) -> Result<VmAccessResult, TestError> {
+    #[cfg(target_arch = "riscv64")]
+    let result_register = 5;
+    #[cfg(target_arch = "loongarch64")]
+    let result_register = 12;
+    let mut faults = 0;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(TestError("file-mapping user stopped"));
+        }
+        match user.run_user() {
+            UserTrap::Interrupt => {
+                sched::cond_resched();
+            }
+            UserTrap::PageFault { address, access } => {
+                if address != VM_TARGET || access != direction {
+                    return Err(TestError(
+                        "unexpected file-mapping fault address or direction",
+                    ));
+                }
+                let pc = user.context().pc;
+                if let Err(error) = user.mm().unwrap().fault(address, access) {
+                    crate::ktest::report::diagnostic(format_args!(
+                        "file-mapping fault: {:?}",
+                        error
+                    ));
+                    return Err(TestError("file-mapping fault resolution failed"));
+                }
+                if user.context().pc != pc {
+                    return Err(TestError("file-mapping fault advanced user PC"));
+                }
+                faults += 1;
+                if faults != 1 {
+                    return Err(TestError("resolved file fault repeated"));
+                }
+            }
+            UserTrap::Syscall => {
+                let value = if direction == UserAccess::Read {
+                    user.context().gpr[result_register]
+                } else {
+                    user.mm()
+                        .unwrap()
+                        .read_u64(VM_TARGET)
+                        .map_err(|_| TestError("file-mapping user store observation failed"))?
+                        as usize
+                };
+                return Ok(VmAccessResult { faults, value });
+            }
+            trap => {
+                crate::ktest::report::diagnostic(format_args!("file-mapping trap: {:?}", trap));
+                return Err(TestError("unexpected file-mapping user trap"));
+            }
+        }
+    }
+}
+
+impl FileOwner {
+    /// 绑定原固定槽的尚未发表 Task，正常返回和 MM 离栈继续由原文件 fixture 的 JoinHandle 拥有。
+    fn start_vm_access(&mut self, index: usize, mm: Arc<Mm>, direction: UserAccess) -> TestResult {
+        let mut context = UserContext::new(
+            VM_CODE + arch::fault_offset(direction),
+            VM_STACK + mm::PAGE_SIZE,
+        );
+        #[cfg(target_arch = "riscv64")]
+        let address_register = 15;
+        #[cfg(target_arch = "loongarch64")]
+        let address_register = 9;
+        context.gpr[address_register] = VM_TARGET;
+        let user = UserThread::try_new(mm, context)
+            .map_err(|_| TestError("NoMemory: file-mapping user context"))?;
+        self.path.owner.prepared[index]
+            .as_ref()
+            .ok_or(TestError("file-mapping native task already published"))?
+            .bind_user(Arc::clone(&user));
+        self.path.owner.publish(
+            index,
+            Job::User {
+                thread: user,
+                access: direction,
+            },
+        );
+        self.user = Some(index);
+        Ok(())
+    }
+
+    /// 原 JoinState 完成后消费真实访问结果，用户栈、活动根与 MM 运行引用均已离开。
+    fn join_vm_user(&self, expected: usize) -> TestResult {
+        let index = self.user.expect("file-mapping user was not published");
+        let join = self
+            .path
+            .owner
+            .joins
+            .last()
+            .expect("file-mapping native join absent");
+        until("file-mapping user did not finish", || {
+            join.try_join().is_some()
+        })?;
+        let returned = self.path.owner.observer().results.lock()[index]
+            .take()
+            .ok_or(TestError("file-mapping native result absent"))?;
+        let Returned::User(result) =
+            returned.map_err(|_| TestError("file-mapping native job failed"))?
+        else {
+            return Err(TestError("file-mapping native result kind differs"));
+        };
+        let result = result?;
+        assert_eq!(result.faults, 1);
+        assert_eq!(result.value, expected);
+        Ok(())
+    }
+}
+
+#[ktest::suite(fixture = FileOwner, suite_resources = DeviceInventory, context = "Thread", tags("user-vm-file"), resources("root"), timeout_ms = 90000)]
+pub(crate) mod vm_lifetime {
+    use super::*;
+
+    /// 用户读写沿同一缓存页与私有 COW，尾页零填、整页 EOF 和关闭 fd 各保真实语义。
+    #[test]
+    fn file_page_identity_eof_and_private_write(
+        context: &mut TestContext<'_>,
+        fixture: &mut FileOwner,
+    ) -> TestResult {
+        fixture.prepare(context, 4)?;
+        let fd = fixture.open(context, b"/pattern", OpenOptions::default())?;
+        let file = checked(context, fixture.table().lookup(fd))?;
+        checked(context, file.seek(SeekFrom::Start(19)))?;
+        let mut expected = [0; 8];
+        assert_eq!(
+            checked(context, file.read_at(0, &mut expected))?,
+            expected.len()
+        );
+        assert!(patterned(&expected, 0));
+        let folio = checked(context, file.file_page(0))?;
+        let original = folio.phys_addr();
+        let mm = vm_image()?;
+        mm.map_file(
+            VM_TARGET,
+            mm::PAGE_SIZE,
+            VM_RO,
+            VM_RW,
+            Arc::clone(&file),
+            0,
+            true,
+        )
+        .unwrap();
+        let mm = Arc::try_new(mm).map_err(|_| TestError("NoMemory: file-mapping MM owner"))?;
+        fixture.start_vm_access(0, Arc::clone(&mm), UserAccess::Read)?;
+        fixture.join_vm_user(u64::from_le_bytes(expected) as usize)?;
+        assert_eq!(mm.mapping(VM_TARGET).unwrap().physical, original);
+        assert_eq!(checked(context, file.seek(SeekFrom::Current(0)))?, 19);
+        mm.protect(VM_TARGET, mm::PAGE_SIZE, VM_RW).unwrap();
+        fixture.start_vm_access(2, Arc::clone(&mm), UserAccess::Write)?;
+        fixture.join_vm_user(0)?;
+        assert_ne!(mm.mapping(VM_TARGET).unwrap().physical, original);
+        assert_eq!(
+            folio.with_bytes(0, 8, |bytes| patterned(bytes, 0)),
+            Ok(true)
+        );
+        let private = b"private-COW";
+        assert_eq!(mm.copyout(VM_TARGET + 13, private).error, None);
+        let mut cached = [0; 11];
+        assert_eq!(
+            checked(context, file.read_at(13, &mut cached))?,
+            cached.len()
+        );
+        assert!(patterned(&cached, 13));
+        assert_ne!(&cached, private);
+        assert_eq!(
+            mm.map_file(
+                VM_TARGET + mm::PAGE_SIZE,
+                mm::PAGE_SIZE,
+                VM_RW,
+                VM_RW,
+                Arc::clone(&file),
+                0,
+                false
+            ),
+            Err(VmError::File(FsError::ReadOnly)),
+        );
+        let tail = VM_TARGET + 2 * mm::PAGE_SIZE;
+        let offset = PATTERN_SIZE & !(mm::PAGE_SIZE as u64 - 1);
+        mm.map_file(
+            tail,
+            2 * mm::PAGE_SIZE,
+            VM_RW,
+            VM_RW,
+            Arc::clone(&file),
+            offset,
+            true,
+        )
+        .unwrap();
+        checked(context, fixture.table().close(fd))?;
+        drop(file);
+        let mut bytes = [0xa7; mm::PAGE_SIZE];
+        let progress = mm.copyin(&mut bytes, tail);
+        assert_eq!((progress.copied, progress.error), (mm::PAGE_SIZE, None));
+        let valid = (PATTERN_SIZE - offset) as usize;
+        assert!(patterned(&bytes[..valid], offset));
+        assert!(bytes[valid..].iter().all(|byte| *byte == 0));
+        assert_eq!(mm.copyout(tail + valid + 3, b"tail").error, None);
+        let mut suffix = [0; 4];
+        assert_eq!(mm.copyin(&mut suffix, tail + valid + 3).error, None);
+        assert_eq!(&suffix, b"tail");
+        assert_eq!(
+            mm.fault(tail + mm::PAGE_SIZE, UserAccess::Read),
+            Err(VmError::BeyondEof)
+        );
+        assert_eq!(
+            mm.fault(tail + mm::PAGE_SIZE, UserAccess::Write),
+            Err(VmError::BeyondEof)
+        );
+        let empty = fixture.open(context, b"/empty", OpenOptions::default())?;
+        let empty_file = checked(context, fixture.table().lookup(empty))?;
+        let empty_address = tail + 3 * mm::PAGE_SIZE;
+        mm.map_file(
+            empty_address,
+            mm::PAGE_SIZE,
+            VM_RO,
+            VM_RW,
+            empty_file,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            mm.fault(empty_address, UserAccess::Read),
+            Err(VmError::BeyondEof)
+        );
+        let sparse = fixture.open(context, b"/sparse", OpenOptions::default())?;
+        let sparse_file = checked(context, fixture.table().lookup(sparse))?;
+        let sparse_address = empty_address + mm::PAGE_SIZE;
+        mm.map_file(
+            sparse_address,
+            mm::PAGE_SIZE,
+            VM_RO,
+            VM_RW,
+            sparse_file,
+            4096,
+            true,
+        )
+        .unwrap();
+        bytes.fill(0xa7);
+        assert_eq!(mm.copyin(&mut bytes, sparse_address).error, None);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let directory = fixture.open(context, b"/", OpenOptions::default())?;
+        let directory_file = checked(context, fixture.table().lookup(directory))?;
+        assert_eq!(
+            directory_file.file_page(0).err(),
+            Some(FsError::IsDirectory)
+        );
+        assert_eq!(
+            mm.map_file(
+                sparse_address + mm::PAGE_SIZE,
+                mm::PAGE_SIZE,
+                VM_RO,
+                VM_RO,
+                directory_file,
+                0,
+                false
+            ),
+            Err(VmError::File(FsError::IsDirectory)),
+        );
+        drop(mm);
+        drop(folio);
+        Ok(())
+    }
+}
+
+#[ktest::suite(fixture = FileOwner, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("user-vm-file"), resources("root"), timeout_ms = 90000)]
+pub(crate) mod vm_racing {
+    use super::*;
+
+    /// 真实用户文件 fault 在读盘时放锁；同址重新映射后不安装先前文件的准备页。
+    #[test]
+    fn file_fault_unmap_and_remap(
+        context: &mut TestContext<'_>,
+        fixture: &mut FileOwner,
+    ) -> TestResult {
+        sched::test_migrate_to(0);
+        fixture.prepare(context, 2)?;
+        let fd = fixture.open(context, b"/pattern", OpenOptions::default())?;
+        let file = checked(context, fixture.table().lookup(fd))?;
+        let mm = vm_image()?;
+        mm.map_file(
+            VM_TARGET,
+            mm::PAGE_SIZE,
+            VM_RO,
+            VM_RW,
+            Arc::clone(&file),
+            mm::PAGE_SIZE as u64,
+            true,
+        )
+        .unwrap();
+        let mm = Arc::try_new(mm).map_err(|_| TestError("NoMemory: remapped file MM owner"))?;
+        fixture.hold_first_page(context)?;
+        fixture.start_vm_access(1, Arc::clone(&mm), UserAccess::Read)?;
+        until("file fault did not reach its actual segment gate", || {
+            fixture
+                .path
+                .owner
+                .observer()
+                .loader_entered
+                .load(Ordering::Acquire)
+                == 1
+                && fixture.path.owner.observer().gate.test_waiting() == 1
+        })?;
+        assert!(mm.mapping(VM_TARGET).is_none());
+        mm.unmap(VM_TARGET, mm::PAGE_SIZE).unwrap();
+        mm.map_anonymous(VM_TARGET, mm::PAGE_SIZE, VM_RO, VM_RW)
+            .unwrap();
+        fixture
+            .path
+            .owner
+            .observer()
+            .hold_loader
+            .store(false, Ordering::Release);
+        fixture.path.owner.observer().gate.complete();
+        fixture.join_vm_user(0)?;
+        assert_eq!(mm.read_u64(VM_TARGET), Ok(0));
+        let old = checked(context, file.file_page(1))?;
+        assert_ne!(mm.mapping(VM_TARGET).unwrap().physical, old.phys_addr());
+        assert_eq!(
+            old.with_bytes(0, mm::PAGE_SIZE, |bytes| patterned(
+                bytes,
+                mm::PAGE_SIZE as u64
+            )),
+            Ok(true),
+        );
+        assert_eq!(checked(context, file.seek(SeekFrom::Current(0)))?, 0);
+        drop(old);
+        drop(mm);
         Ok(())
     }
 }

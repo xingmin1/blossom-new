@@ -2,9 +2,11 @@
 
 pub mod completion;
 pub mod mutex;
+pub mod rwlock;
 
 pub use completion::Completion;
 pub use mutex::{SleepMutex, SleepMutexGuard};
+pub use rwlock::{ReadGuard, SleepRwLock, WriteGuard};
 
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;

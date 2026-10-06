@@ -351,6 +351,15 @@ impl Inode {
         Ok(copied)
     }
 
+    /// 普通任务取得正式元数据后等待同一 mapping 的页；映射调用者另行检查 EOF 和私有尾页。
+    pub(crate) fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
+        let data = self.metadata()?;
+        if data.kind != InodeKind::Regular {
+            return Err(FsError::InvalidOperation);
+        }
+        self.read_page(data, index)
+    }
+
     /// 通过共同 mapping 协调同页唯一填充；不同页没有 inode 级读入锁。
     fn read_page(&self, data: &InodeData, index: u64) -> Result<FolioRef, FsError> {
         let (folio, read) = self.mapping.get_or_prepare(index)?;

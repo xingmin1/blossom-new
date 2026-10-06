@@ -12,6 +12,7 @@ use core::{
 };
 
 mod mmu;
+mod uaccess;
 mod user;
 pub use mmu::{
     activate_kernel_root, activate_user_root, flush_user_translations, initialize_user_root,
@@ -19,6 +20,7 @@ pub use mmu::{
     user_leaf_permissions, user_table_entry, SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS,
     USER_STACK_TOP,
 };
+pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 #[cfg(feature = "ktest")]
 pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
 pub use user::{run_user, UserContext};
@@ -80,6 +82,7 @@ global_asm!(include_str!("riscv64/entry.S"),
 global_asm!(include_str!("riscv64/trap.S"),
     frame_size = const size_of::<KernelTrapFrame>(),
     gpr = const offset_of!(KernelTrapFrame, gpr),
+    user_gpr = const offset_of!(UserContext, gpr),
     word = const size_of::<usize>(),
     sepc = const offset_of!(KernelTrapFrame, sepc),
     sstatus = const offset_of!(KernelTrapFrame, sstatus),
