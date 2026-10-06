@@ -2,6 +2,7 @@
 
 pub(crate) mod clone;
 pub(crate) mod exec;
+pub(crate) mod futex;
 pub(crate) mod process;
 pub(crate) mod signal;
 pub(crate) mod time;

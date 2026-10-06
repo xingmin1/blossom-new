@@ -9,7 +9,7 @@ use spin::Once;
 
 use crate::arch::{self, UserContext, UserTrap};
 use crate::fs::{FileTable, FsContext, FsError, Vfs};
-use crate::mm::space::{self, Mm, VmError};
+use crate::mm::space::{self, Mm, MmUser, VmError};
 use crate::sync::{IrqSaveGuard, SleepMutex, SpinLock};
 use crate::syscall::Restart;
 use crate::task::exec::{ExecError, LoadedImage};
@@ -120,11 +120,12 @@ struct UserProcess {
     identity: Arc<UserIdentity>,
     runtime: UserRuntime,
     child_set_tid: Option<usize>,
+    clear_child_tid: usize,
 }
 
 pub struct UserThread {
     executor: Once<Weak<Task>>,
-    mm: SpinLock<Option<Arc<Mm>>>,
+    mm: SpinLock<Option<MmUser>>,
     context: RefCell<UserContext>,
     process: SpinLock<Option<UserProcess>>,
     user_timer_interrupts: Cell<usize>,
@@ -143,7 +144,7 @@ impl UserThread {
     pub(crate) fn try_new(mm: Arc<Mm>, context: UserContext) -> Result<Arc<Self>, AllocError> {
         Arc::try_new(Self {
             executor: Once::new(),
-            mm: SpinLock::new(Some(mm)),
+            mm: SpinLock::new(Some(MmUser::new(mm))),
             context: RefCell::new(context),
             process: SpinLock::new(None),
             user_timer_interrupts: Cell::new(0),
@@ -164,15 +165,19 @@ impl UserThread {
 
     /// 取得当前实际资源快照，退出解绑后的诊断引用不再保有 MM。
     pub(crate) fn mm(&self) -> Option<Arc<Mm>> {
-        self.mm.lock().clone()
+        self.mm
+            .lock()
+            .as_ref()
+            .map(|binding| Arc::clone(binding.mm()))
     }
 
-    /// 完整运行资源及一次child入口写入在原PreparedTask发表之前绑定。
+    /// 完整运行资源与child入口/退出TID地址在原PreparedTask发表之前绑定。
     pub(crate) fn bind_process(
         &self,
         identity: Arc<UserIdentity>,
         runtime: UserRuntime,
         child_set_tid: Option<usize>,
+        clear_child_tid: usize,
     ) {
         assert!(self.user_time.get().is_none(), "user time is already bound");
         self.user_time
@@ -183,6 +188,7 @@ impl UserThread {
             identity,
             runtime,
             child_set_tid,
+            clear_child_tid,
         });
     }
 
@@ -195,6 +201,17 @@ impl UserThread {
             .expect("user entry has no process")
             .child_set_tid
             .take()
+    }
+
+    /// 只记录本线程退出时的用户清零地址；是否可写在实际旧Mm清理处决定。
+    pub(crate) fn set_tid_address(&self, address: usize) -> usize {
+        self.assert_current();
+        let mut process = self.process.lock();
+        let process = process
+            .as_mut()
+            .expect("set_tid_address has no user process");
+        process.clear_child_tid = address;
+        process.identity.tid()
     }
 
     /// 在关系和信号操作前取得身份快照，不跨图锁保存用户资源锁。
@@ -242,7 +259,7 @@ impl UserThread {
         }
     }
 
-    /// 当前执行者保存sleep的唯一原始deadline，供restart_syscall领取。
+    /// 当前执行者保存原请求及首次deadline，供restart_syscall领取。
     pub(crate) fn save_restart(&self, state: Restart) {
         self.assert_current();
         self.restart.set(Some(state));
@@ -288,8 +305,18 @@ impl UserThread {
             .take()
             .expect("exiting user thread has no process resources");
         let UserProcess {
-            identity, runtime, ..
+            identity,
+            runtime,
+            clear_child_tid,
+            ..
         } = process;
+        if let Some(binding) = &mm {
+            let mm = binding.mm();
+            if clear_child_tid != 0 && mm.user_count() > 1 {
+                let _ = mm.store_user_u32(clear_child_tid, 0);
+                let _ = crate::task::futex::wake(mm, clear_child_tid, false, 1, u32::MAX);
+            }
+        }
         drop(runtime);
         drop(mm);
         identity
@@ -455,7 +482,7 @@ pub(crate) fn prepare_program(
         SignalInheritance::EMPTY,
         17,
     )?;
-    prepare_bound_user(identity, image, runtime, placement, None)
+    prepare_bound_user(identity, image, runtime, placement, None, 0)
 }
 
 /// 将进程或线程身份与完整私有现场绑定，成员离栈观察同样在发表前fallible准备。
@@ -465,9 +492,10 @@ pub(crate) fn prepare_bound_user(
     runtime: UserRuntime,
     placement: Placement,
     child_set_tid: Option<usize>,
+    clear_child_tid: usize,
 ) -> Result<PreparedProgram, ProgramError> {
     let user = UserThread::try_new(image.mm, image.context)?;
-    user.bind_process(identity.identity(), runtime, child_set_tid);
+    user.bind_process(identity.identity(), runtime, child_set_tid, clear_child_tid);
     let task = task::prepare_user(Arc::clone(&user), placement, run_program)?;
     let execution = PreparedExecution::try_new(task.observer())?;
     Ok(PreparedProgram {

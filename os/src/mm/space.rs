@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::{self, UserAccess};
 use crate::cpu;
@@ -14,7 +15,7 @@ use crate::mm::user_table::{
 };
 use crate::mm::vma::{self, MmapState, Vma, VmaBacking};
 use crate::mm::{AnonPageRef, FolioRef, OwnedPages, PAGE_SIZE};
-use crate::sync::{IrqSaveGuard, SleepRwLock, SpinLock};
+use crate::sync::{IrqSaveGuard, ReadGuard, SleepRwLock, SpinLock};
 
 /// 用户映射失败保留范围、权限、实际文件和内存不足各自的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +217,175 @@ struct FaultSource {
 pub struct Mm {
     table: SpinLock<PteState>,
     mmap: SleepRwLock<MmapState>,
+    users: AtomicUsize,
+}
+
+/// 一份真实用户线程地址空间绑定；页表、CPU 和 futex key 的 Arc 不参与计数。
+pub struct MmUser {
+    mm: Arc<Mm>,
+}
+
+impl MmUser {
+    /// 发表前取得一份绑定责任；失败路径和正常退出均由同一 Drop 归还。
+    pub fn new(mm: Arc<Mm>) -> Self {
+        mm.users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .expect("MM user count overflow");
+        Self { mm }
+    }
+
+    /// 借用本绑定保活的真实地址空间，不额外增加用户绑定计数。
+    pub fn mm(&self) -> &Arc<Mm> {
+        &self.mm
+    }
+}
+
+impl Drop for MmUser {
+    /// 先归还真实绑定；Arc 的最后析构发生在原调用者持有的锁之外。
+    fn drop(&mut self) {
+        let previous = self.mm.users.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "MM user count underflow");
+    }
+}
+
+/// futex 只拥有地址空间或共享匿名对象的真实身份，不把页帧当作长期同步身份。
+#[derive(Clone)]
+pub(crate) enum FutexKey {
+    Mm {
+        mm: Arc<Mm>,
+        address: usize,
+        private: bool,
+    },
+    Shared {
+        owner: Arc<SharedAnon>,
+        offset: u64,
+    },
+}
+
+impl FutexKey {
+    /// 按真实对象及字节位置比较，包括共享对象页内偏移。
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Mm {
+                    mm,
+                    address,
+                    private,
+                },
+                Self::Mm {
+                    mm: other_mm,
+                    address: other_address,
+                    private: other_private,
+                },
+            ) => Arc::ptr_eq(mm, other_mm) && address == other_address && private == other_private,
+            (
+                Self::Shared { owner, offset },
+                Self::Shared {
+                    owner: other_owner,
+                    offset: other_offset,
+                },
+            ) => Arc::ptr_eq(owner, other_owner) && offset == other_offset,
+            _ => false,
+        }
+    }
+
+    /// 哈希只选择固定桶；相等性仍由完整的实际对象身份决定。
+    pub(crate) fn hash(&self) -> usize {
+        let (owner, position, kind) = match self {
+            Self::Mm {
+                mm,
+                address,
+                private,
+            } => (Arc::as_ptr(mm) as usize, *address, usize::from(!*private)),
+            Self::Shared { owner, offset } => {
+                (Arc::as_ptr(owner) as usize, *offset as usize, 2usize)
+            }
+        };
+        (owner >> 4).wrapping_mul(0x9e37_79b9) ^ (position >> 2) ^ kind
+    }
+}
+
+/// 共享文件同步尚无实际可写映射；此具体错误不扩散到一般 VM 错误分类。
+pub(crate) enum FutexAccessError {
+    Vm(VmError),
+    Unsupported,
+}
+
+impl From<VmError> for FutexAccessError {
+    /// 保留实际范围、权限或缺页准备失败的 VM 原因。
+    fn from(error: VmError) -> Self {
+        Self::Vm(error)
+    }
+}
+
+/// 先取得可睡眠 mmap 读侧，再建立唯一 Waiter；之后的字访问只取得 PTE 短锁。
+pub(crate) struct FutexRead<'a> {
+    mm: &'a Arc<Mm>,
+    mmap: ReadGuard<'a, MmapState>,
+}
+
+impl FutexRead<'_> {
+    /// 从同一稳定读侧解析当前 VMA 的具体 futex 身份。
+    pub(crate) fn key(&self, address: usize, private: bool) -> Result<FutexKey, FutexAccessError> {
+        if address & 3 != 0
+            || address
+                .checked_add(4)
+                .is_none_or(|end| arch::USER_ADDRESS_END < end)
+        {
+            return Err(VmError::InvalidRange.into());
+        }
+        if private {
+            return Ok(FutexKey::Mm {
+                mm: Arc::clone(self.mm),
+                address,
+                private: true,
+            });
+        }
+        let vma = self.mmap.find(address).ok_or(VmError::Unmapped)?;
+        if !vma.allows(UserAccess::Read) {
+            return Err(VmError::Permission.into());
+        }
+        match &vma.backing {
+            VmaBacking::SharedAnonymous { owner, offset } => {
+                return Ok(FutexKey::Shared {
+                    owner: Arc::clone(owner),
+                    offset: offset
+                        .checked_add((address - vma.range.start) as u64)
+                        .ok_or(VmError::InvalidRange)?,
+                });
+            }
+            VmaBacking::File { .. } => return Err(FutexAccessError::Unsupported),
+            _ => {}
+        }
+        if !vma.allows(UserAccess::Write) {
+            return Err(VmError::Permission.into());
+        }
+        Ok(FutexKey::Mm {
+            mm: Arc::clone(self.mm),
+            address,
+            private: false,
+        })
+    }
+
+    /// 在 mmap→PTE 保护下使用原始地址；缺页返回 None，准备必须放开此读侧后进行。
+    /// visit 只允许原始字访问及固定桶操作，不得分配、睡眠或保留可访问地址。
+    pub(crate) fn with_word<R>(&self, address: usize, visit: impl FnOnce(usize) -> R) -> Option<R> {
+        if !self.mmap.find(address)?.allows(UserAccess::Read) {
+            return None;
+        }
+        let base = address & !(PAGE_SIZE - 1);
+        let state = self.mm.table.lock();
+        let page = state.pages.find(base)?;
+        let mapping = state
+            .table
+            .lookup(base)
+            .expect("resident futex page has no leaf");
+        assert_eq!(mapping.physical, page.backing.physical());
+        assert!(vma::allows(mapping.permissions, UserAccess::Read));
+        Some(visit(arch::phys_to_virt(mapping.physical) + address - base))
+    }
 }
 
 impl Mm {
@@ -227,7 +397,53 @@ impl Mm {
                 pages: ResidentPages::default(),
             }),
             mmap: SleepRwLock::new(MmapState::default()),
+            users: AtomicUsize::new(0),
         })
+    }
+
+    /// 返回真实用户线程绑定数，不包含 CPU、诊断或同步 key 的拥有引用。
+    pub fn user_count(&self) -> usize {
+        self.users.load(Ordering::Acquire)
+    }
+
+    /// 在唯一 futex Waiter 建立前取得可睡眠范围读侧，排除后续比较登记期间的重映射。
+    pub(crate) fn futex_read(self: &Arc<Self>) -> FutexRead<'_> {
+        FutexRead {
+            mm: self,
+            mmap: self.mmap.read(),
+        }
+    }
+
+    /// 在当前共享匿名对象上安装真实额外别名，保留源 VMA；不接受文件或私有匿名。
+    #[cfg(feature = "ktest")]
+    pub fn test_shared_alias(
+        &self,
+        source: usize,
+        destination: usize,
+        length: usize,
+    ) -> Result<(), VmError> {
+        let source_range = vma::checked_range(source, length)?;
+        let destination_range = vma::checked_range(destination, length)?;
+        let mut mmap = self.mmap.write();
+        let source_vma = mmap.find(source).ok_or(VmError::Unmapped)?;
+        if source_vma.range.end < source_range.end {
+            return Err(VmError::InvalidRange);
+        }
+        let VmaBacking::SharedAnonymous { owner, offset } = &source_vma.backing else {
+            return Err(VmError::Permission);
+        };
+        let alias = Vma::try_new(
+            destination_range,
+            source_vma.permissions,
+            source_vma.maximum,
+            VmaBacking::SharedAnonymous {
+                owner: Arc::clone(owner),
+                offset: offset
+                    .checked_add((source - source_vma.range.start) as u64)
+                    .ok_or(VmError::InvalidRange)?,
+            },
+        )?;
+        mmap.insert(alias)
     }
 
     /// 在尚未共享的地址空间安装完整初始化单页，保留当前与最大权限并转交匿名页归还责任。

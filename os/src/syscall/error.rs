@@ -4,6 +4,7 @@ use crate::block::BlockError;
 use crate::fs::FsError;
 use crate::mm::space::{Mm, VmError};
 use crate::mm::uaccess::CStringError;
+use crate::task::futex::FutexError;
 use crate::task::process::ProcessError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub(super) enum Errno {
     TooManySymlinks = 40,
     Overflow = 75,
     Unsupported = 95,
+    TimedOut = 110,
 }
 
 pub(super) type SysResult = Result<isize, Errno>;
@@ -77,6 +79,20 @@ impl From<VmError> for Errno {
             VmError::Permission => Self::Permission,
             VmError::BeyondEof => Self::BadAddress,
             VmError::File(error) => error.into(),
+        }
+    }
+}
+
+impl From<FutexError> for Errno {
+    /// futex参数错误与真实用户访问错误分开，空洞/权限不按一般mmap错误编码。
+    fn from(error: FutexError) -> Self {
+        match error {
+            FutexError::Mismatch => Self::Again,
+            FutexError::InvalidArgument => Self::InvalidArgument,
+            FutexError::Unsupported => Self::Unsupported,
+            FutexError::Vm(VmError::NoMemory) => Self::NoMemory,
+            FutexError::Vm(VmError::File(error)) => error.into(),
+            FutexError::Vm(_) => Self::BadAddress,
         }
     }
 }

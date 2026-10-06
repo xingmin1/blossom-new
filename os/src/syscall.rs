@@ -2,6 +2,7 @@
 
 mod error;
 mod file;
+mod futex;
 mod memory;
 pub(crate) mod signal;
 mod task;
@@ -65,6 +66,10 @@ pub(crate) enum Restart {
         deadline: crate::time::MonotonicInstant,
         remaining: Option<usize>,
     },
+    Futex {
+        request: Request,
+        deadline: crate::time::MonotonicInstant,
+    },
 }
 
 pub(crate) enum Outcome {
@@ -82,15 +87,15 @@ pub(crate) fn resolve_restart(user: &UserThread, state: Restart, handler_flags: 
             request,
             handler_flags.is_none_or(|flags| flags & crate::task::signal::SA_RESTART != 0),
         ),
-        Restart::NoHandler { request } | Restart::Sleep { request, .. } => {
-            (request, handler_flags.is_none())
-        }
+        Restart::NoHandler { request }
+        | Restart::Sleep { request, .. }
+        | Restart::Futex { request, .. } => (request, handler_flags.is_none()),
     };
     if restart {
         if matches!(state, Restart::NoHandler { .. }) {
             user.restore_saved_mask();
         }
-        let block = matches!(state, Restart::Sleep { .. });
+        let block = matches!(state, Restart::Sleep { .. } | Restart::Futex { .. });
         if block {
             user.save_restart(state);
         }
@@ -111,6 +116,9 @@ pub(crate) fn resolve_restart(user: &UserThread, state: Restart, handler_flags: 
 /// 分派已支持的真实调用，未知编号保持ENOSYS；控制结果不落入普通写寄存器尾部。
 pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let raw = request.arguments;
+    if request.number == 98 {
+        return futex::dispatch(user, request);
+    }
     if matches!(request.number, 101..=103 | 113..=115 | 153 | 165 | 169) {
         return time::dispatch(user, request);
     }
@@ -121,6 +129,9 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
                 deadline,
                 remaining,
             }) => time::resume_sleep(user, request, deadline, remaining),
+            Some(Restart::Futex { request, deadline }) => {
+                futex::resume_wait(user, request, deadline)
+            }
             Some(Restart::Syscall { .. } | Restart::NoHandler { .. }) | None => {
                 Outcome::Return(Errno::Interrupted.result())
             }
@@ -147,6 +158,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         79 => file::statat(user, raw),
         80 => file::fstat(user, raw),
         95 => return task::waitid(user, request),
+        96 => Ok(user.set_tid_address(raw[0]) as isize),
         124 => {
             sched::yield_now();
             Ok(0)

@@ -17,9 +17,18 @@ const SIGHAND: usize = 0x800;
 const THREAD: usize = 0x1_0000;
 const SETTLS: usize = 0x8_0000;
 const PARENT_SETTID: usize = 0x10_0000;
+const CHILD_CLEARTID: usize = 0x20_0000;
 const CHILD_SETTID: usize = 0x100_0000;
-const SUPPORTED: usize =
-    0xff | VM | FS | FILES | SIGHAND | THREAD | SETTLS | PARENT_SETTID | CHILD_SETTID;
+const SUPPORTED: usize = 0xff
+    | VM
+    | FS
+    | FILES
+    | SIGHAND
+    | THREAD
+    | SETTLS
+    | PARENT_SETTID
+    | CHILD_SETTID
+    | CHILD_CLEARTID;
 
 #[cfg(target_arch = "riscv64")]
 const STACK_REGISTER: usize = 2;
@@ -52,6 +61,7 @@ pub(crate) struct CloneArguments {
     tls: Option<usize>,
     parent_tid: Option<usize>,
     child_tid: Option<usize>,
+    clear_child_tid: usize,
 }
 
 impl CloneArguments {
@@ -85,6 +95,11 @@ impl CloneArguments {
             tls: (flags & SETTLS != 0).then_some(tls),
             parent_tid: (flags & PARENT_SETTID != 0).then_some(raw[2]),
             child_tid: (flags & CHILD_SETTID != 0).then_some(child_tid),
+            clear_child_tid: if flags & CHILD_CLEARTID != 0 {
+                child_tid
+            } else {
+                0
+            },
         })
     }
 }
@@ -140,6 +155,7 @@ pub(crate) fn create(
         runtime,
         Placement::Any,
         arguments.child_tid,
+        arguments.clear_child_tid,
     )
     .map_err(program_error)?;
     let pid = program.pid();

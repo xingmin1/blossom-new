@@ -270,7 +270,11 @@ fn getrusage(user: &UserThread, raw: [usize; 6]) -> SysResult {
 }
 
 /// ABI 的有符号秒和亚秒在相乘前验证，内部有限纳秒范围不接受溢出。
-fn decode_time(bytes: &[u8], units_per_sec: u64, ns_per_unit: u64) -> Result<u64, Errno> {
+pub(super) fn decode_time(
+    bytes: &[u8],
+    units_per_sec: u64,
+    ns_per_unit: u64,
+) -> Result<u64, Errno> {
     let seconds = i64::from_le_bytes(bytes[..8].try_into().expect("time seconds width"));
     let fraction = i64::from_le_bytes(bytes[8..16].try_into().expect("time fraction width"));
     if seconds < 0 || fraction < 0 || units_per_sec <= fraction as u64 {
