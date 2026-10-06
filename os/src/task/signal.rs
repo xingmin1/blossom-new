@@ -1,8 +1,9 @@
-//! 动作锁串行保护处置与组、线程信号状态；共享处置不合并不同进程的pending。
+//! 绑定锁串行动作表切换，动作锁保护处置与组、线程状态；共享处置不合并不同组pending。
 
 use alloc::alloc::AllocError;
 use alloc::sync::{Arc, Weak};
-use spin::Once;
+use core::mem;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::UserContext;
 use crate::sync::SpinLock;
@@ -209,9 +210,10 @@ impl SignalInheritance {
     };
 }
 
-/// 动作siglock先于组和private短锁；选择、RESETHAND和消费在同一siglock事务中。
+/// 绑定锁先于动作siglock、组和private短锁，选择与消费在同一事务中。
 pub(crate) struct Sighand {
     actions: SpinLock<[SignalAction; SIGNAL_COUNT]>,
+    users: AtomicUsize,
 }
 
 impl Sighand {
@@ -219,6 +221,7 @@ impl Sighand {
     pub(crate) fn try_new() -> Result<Arc<Self>, AllocError> {
         Arc::try_new(Self {
             actions: SpinLock::new([SignalAction::DEFAULT; SIGNAL_COUNT]),
+            users: AtomicUsize::new(0),
         })
     }
 
@@ -227,7 +230,28 @@ impl Sighand {
         let actions = *self.actions.lock();
         Arc::try_new(Self {
             actions: SpinLock::new(actions),
+            users: AtomicUsize::new(0),
         })
+    }
+
+    /// 增加真实运行绑定责任，诊断引用与组的动作表拥有不参与计数。
+    pub(crate) fn add_user(&self) {
+        self.users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .expect("sighand user count overflow");
+    }
+
+    /// 归还真实运行绑定，动作表最后引用仍由调用者在短锁外释放。
+    pub(crate) fn remove_user(&self) {
+        let previous = self.users.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "sighand user count underflow");
+    }
+
+    /// 返回真实运行绑定数，不把普通拥有快照误判为外部共享者。
+    pub(crate) fn user_count(&self) -> usize {
+        self.users.load(Ordering::Acquire)
     }
 }
 
@@ -323,11 +347,11 @@ struct GroupState {
     exit: Option<i32>,
 }
 
-/// 每个真实线程组独有pending与组控制，动作表引用仅绑定一次且不拥有执行者。
+/// 每个真实线程组独有pending与组控制，绑定锁保护当前动作表的完整事务。
 pub(crate) struct SignalGroup {
     graph: Weak<TaskGraph>,
     tgid: usize,
-    sighand: Once<Arc<Sighand>>,
+    sighand: SpinLock<Arc<Sighand>>,
     state: SpinLock<GroupState>,
 }
 
@@ -350,12 +374,16 @@ pub(crate) enum SignalSelection {
 }
 
 impl SignalGroup {
-    /// 在身份发表前分配组信号拥有，弱图关联供锁外通知使用。
-    pub(crate) fn try_new(graph: Weak<TaskGraph>, tgid: usize) -> Result<Arc<Self>, AllocError> {
+    /// 在身份发表前绑定完整动作表并分配组信号拥有，弱图关联仅供锁外通知。
+    pub(crate) fn try_new(
+        graph: Weak<TaskGraph>,
+        tgid: usize,
+        sighand: Arc<Sighand>,
+    ) -> Result<Arc<Self>, AllocError> {
         Arc::try_new(Self {
             graph,
             tgid,
-            sighand: Once::new(),
+            sighand: SpinLock::new(sighand),
             state: SpinLock::new(GroupState {
                 pending: Pending::new(),
                 members: 0,
@@ -365,20 +393,6 @@ impl SignalGroup {
                 exit: None,
             }),
         })
-    }
-
-    /// 所有组成员必须使用同一处置表，非THREAD的共享处置组仍保各自组状态。
-    fn bind_sighand(&self, sighand: Arc<Sighand>) {
-        let bound = self.sighand.call_once(|| sighand.clone());
-        assert!(
-            Arc::ptr_eq(bound, &sighand),
-            "thread group uses different sighands"
-        );
-    }
-
-    /// 返回已在身份准备阶段绑定的siglock，发送者不需要访问UserThread运行资源。
-    fn sighand(&self) -> &Sighand {
-        self.sighand.get().expect("signal group has no sighand")
     }
 
     /// IRQ普通定时信号无分配，发送与通知在siglock两侧，调用者不得已持siglock。
@@ -404,7 +418,8 @@ impl SignalGroup {
 
     /// 图发表事务登记真实成员，早到的pending保留到其首次用户返回点。
     pub(super) fn add_member(&self) {
-        let _siglock = self.sighand().actions.lock();
+        let binding = self.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut group = self.state.lock();
         group.members = group
             .members
@@ -415,7 +430,8 @@ impl SignalGroup {
 
     /// 图退出事务移出真实成员，已确认停止计数跟随成员责任减少。
     pub(super) fn remove_member(&self, thread: &ThreadSignals) -> Option<u8> {
-        let _siglock = self.sighand().actions.lock();
+        let binding = self.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut group = self.state.lock();
         let mut private = thread.state.lock();
         group.members = group
@@ -438,7 +454,8 @@ impl SignalGroup {
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<bool, SignalError> {
         let bit = signal_bit(info.signum)?;
-        let actions = self.sighand().actions.lock();
+        let binding = self.sighand.lock();
+        let actions = binding.actions.lock();
         let action = actions[info.signum as usize - 1];
         let mut group = self.state.lock();
         if group.members == 0 || group.exit.is_some() {
@@ -501,7 +518,8 @@ impl SignalGroup {
         if signal == 0 || SIGNAL_COUNT < signal || (action.is_some() && matches!(signal, 9 | 19)) {
             return Err(SignalError::InvalidSignal);
         }
-        let mut actions = self.sighand().actions.lock();
+        let binding = self.sighand.lock();
+        let mut actions = binding.actions.lock();
         let previous = actions[signal - 1];
         if let Some(mut action) = action {
             action.flags &= ACTION_FLAGS;
@@ -526,7 +544,8 @@ impl SignalGroup {
 
     /// 图根回收事务只写合法点退出请求，不在持关系锁时通知或反查成员。
     pub(super) fn mark_exit(&self, status: i32) {
-        let _siglock = self.sighand().actions.lock();
+        let binding = self.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut group = self.state.lock();
         group.exit.get_or_insert(status);
         group.stop_signal = None;
@@ -534,7 +553,8 @@ impl SignalGroup {
 
     /// 图或用户安全点读取组退出请求，不改变任何调度器状态。
     pub(crate) fn exit_request(&self) -> Option<i32> {
-        let _siglock = self.sighand().actions.lock();
+        let binding = self.sighand.lock();
+        let _siglock = binding.actions.lock();
         let exit = self.state.lock().exit;
         exit
     }
@@ -542,7 +562,8 @@ impl SignalGroup {
     /// 父SIGCHLD的停止/继续通知遵守SA_NOCLDSTOP，退出仍正常发送。
     pub(crate) fn send_child(&self, info: SignalInfo) {
         let suppress = {
-            let actions = self.sighand().actions.lock();
+            let binding = self.sighand.lock();
+            let actions = binding.actions.lock();
             matches!(info.code, 5 | 6) && actions[16].flags & 1 != 0
         };
         if !suppress {
@@ -562,6 +583,7 @@ struct ThreadState {
     waited_set: u64,
     altstack: AltStack,
     stopped: bool,
+    exec_exit: bool,
     wait: Option<(WaitId, Waker, WaitMode)>,
 }
 
@@ -572,13 +594,11 @@ pub(crate) struct ThreadSignals {
 }
 
 impl ThreadSignals {
-    /// 锁外准备完整private状态，绑定组siglock，所有fallible准备早于身份与Ready发表。
+    /// 锁外准备完整private状态，所有fallible准备早于身份与Ready发表。
     pub(crate) fn try_new(
         group: Arc<SignalGroup>,
-        sighand: Arc<Sighand>,
         inherited: SignalInheritance,
     ) -> Result<Arc<Self>, AllocError> {
-        group.bind_sighand(sighand);
         Arc::try_new(Self {
             group,
             state: SpinLock::new(ThreadState {
@@ -589,6 +609,7 @@ impl ThreadSignals {
                 waited_set: 0,
                 altstack: inherited.altstack,
                 stopped: false,
+                exec_exit: false,
                 wait: None,
             }),
         })
@@ -596,7 +617,8 @@ impl ThreadSignals {
 
     /// clone继承阻塞集；CLONE_VM且无VFORK时禁用child备用栈，不复制pending。
     pub(crate) fn inherit(&self, share_vm: bool) -> SignalInheritance {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let private = self.state.lock();
         SignalInheritance {
             mask: private.mask,
@@ -619,7 +641,8 @@ impl ThreadSignals {
     pub(crate) fn force(&self, info: SignalInfo) {
         signal_bit(info.signum).expect("invalid forced signal");
         {
-            let mut actions = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let mut actions = binding.actions.lock();
             let mut private = self.state.lock();
             let bit = 1 << (info.signum - 1);
             let action = &mut actions[info.signum as usize - 1];
@@ -634,7 +657,8 @@ impl ThreadSignals {
 
     /// pending查询只报告阻塞的实例，私有与组pending按同一siglock快照合并号码。
     pub(crate) fn pending(&self) -> u64 {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let group = self.group.state.lock();
         let private = self.state.lock();
         (private.pending.bits | group.pending.bits) & private.mask
@@ -643,7 +667,8 @@ impl ThreadSignals {
     /// 替换阻塞集时始终去除KILL/STOP，解除阻断后锁外提醒其他可处理组成员。
     pub(crate) fn replace_mask(&self, mask: u64) -> u64 {
         let old = {
-            let _siglock = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let _siglock = binding.actions.lock();
             let mut private = self.state.lock();
             let old = private.mask;
             private.mask = mask & !UNBLOCKABLE;
@@ -655,14 +680,16 @@ impl ThreadSignals {
 
     /// 在siglock中读取实际线程阻塞集，供sigsuspend与原现场恢复。
     pub(crate) fn mask(&self) -> u64 {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mask = self.state.lock().mask;
         mask
     }
 
     /// sigtimedwait暂时解除请求集阻断，保存真实旧mask以免忽略或默认致命丢失等待实例。
     pub(crate) fn begin_waited(&self, set: u64) -> u64 {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut private = self.state.lock();
         assert!(private.real_blocked.is_none(), "nested timed signal wait");
         let old = private.mask;
@@ -675,7 +702,8 @@ impl ThreadSignals {
     /// 原等待结束后恢复真实阻塞集，清请求集责任再锁外重新提醒组pending消费者。
     pub(crate) fn end_waited(&self, old: u64) {
         {
-            let _siglock = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let _siglock = binding.actions.lock();
             let mut private = self.state.lock();
             assert_eq!(private.real_blocked.take(), Some(old));
             private.mask = old & !UNBLOCKABLE;
@@ -690,7 +718,8 @@ impl ThreadSignals {
         sp: usize,
         replacement: Option<AltStack>,
     ) -> Result<AltStack, SignalError> {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut private = self.state.lock();
         let previous = private.altstack.reported(sp);
         if let Some(stack) = replacement {
@@ -702,7 +731,8 @@ impl ThreadSignals {
     /// 完整帧解码之后提交mask；无效备用栈恢复保留旧值，遵守rt_sigreturn的忽略设置错误语义。
     pub(crate) fn restore(&self, mask: u64, altstack: AltStack, restored_sp: usize) {
         {
-            let _siglock = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let _siglock = binding.actions.lock();
             let mut private = self.state.lock();
             private.mask = mask & !UNBLOCKABLE;
             let _ = set_altstack(&mut private, altstack, restored_sp);
@@ -712,7 +742,8 @@ impl ThreadSignals {
 
     /// sigtimedwait只领取请求集合中的真实实例；领取后copyout失败不得重新排队。
     pub(crate) fn take_waited(&self, set: u64) -> Option<SignalInfo> {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut group = self.group.state.lock();
         let mut private = self.state.lock();
         let allowed = set & !UNBLOCKABLE;
@@ -724,11 +755,15 @@ impl ThreadSignals {
 
     /// 一次选择、消费与处置快照同时完成，帧copyout只能在返回且解锁之后执行。
     pub(crate) fn select(&self) -> Option<SignalSelection> {
-        let mut actions = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let mut actions = binding.actions.lock();
         let mut group = self.group.state.lock();
         let mut private = self.state.lock();
         if let Some(status) = group.exit {
             return Some(SignalSelection::Exit(status));
+        }
+        if private.exec_exit {
+            return Some(SignalSelection::Exit(0));
         }
         if group.stop_signal.is_some() {
             return Some(SignalSelection::Stop);
@@ -773,11 +808,15 @@ impl ThreadSignals {
 
     /// 仅真实成员到合法安全点才确认停止，末个确认产生一次父stopped事件。
     pub(super) fn acknowledge_control(&self) -> (SignalControl, Option<u8>) {
-        let _siglock = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
         let mut group = self.group.state.lock();
         let mut private = self.state.lock();
         if let Some(status) = group.exit {
             return (SignalControl::Exit(status), None);
+        }
+        if private.exec_exit {
+            return (SignalControl::Exit(0), None);
         }
         if group.stop_signal.is_none() {
             return (SignalControl::Run, None);
@@ -792,7 +831,8 @@ impl ThreadSignals {
     /// 原Waiter登记唯一WaitId；先保存登记再锁外重查pending，关闭早发送窗口。
     pub(crate) fn register_wait(&self, id: WaitId, waker: Waker, mode: WaitMode) {
         {
-            let _siglock = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let _siglock = binding.actions.lock();
             let mut private = self.state.lock();
             assert!(private.wait.is_none(), "nested signal wait");
             private.wait = Some((id, waker, mode));
@@ -803,7 +843,8 @@ impl ThreadSignals {
     /// 只撤销本轮登记，最后Weak引用析构在siglock外。
     pub(crate) fn unregister_wait(&self, id: WaitId) {
         let removed = {
-            let _siglock = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let _siglock = binding.actions.lock();
             let mut private = self.state.lock();
             if private
                 .wait
@@ -818,9 +859,10 @@ impl ThreadSignals {
         drop(removed);
     }
 
-    /// Killable只接受致命KILL/exit，Interruptible接受实际非忽略可处理pending与组控制。
+    /// Killable接受KILL、组退出和私有exec退出，Interruptible还接受可处理pending与组控制。
     pub(crate) fn interruption_pending(&self, mode: WaitMode) -> bool {
-        let actions = self.group.sighand().actions.lock();
+        let binding = self.group.sighand.lock();
+        let actions = binding.actions.lock();
         let group = self.group.state.lock();
         let private = self.state.lock();
         interruption(&actions, &group, &private, mode)
@@ -829,7 +871,8 @@ impl ThreadSignals {
     /// 在短锁中取得原Waker快照，升级任务和真正notify都在锁外。
     pub(crate) fn notify_wait(&self) {
         let waker = {
-            let actions = self.group.sighand().actions.lock();
+            let binding = self.group.sighand.lock();
+            let actions = binding.actions.lock();
             let group = self.group.state.lock();
             let private = self.state.lock();
             private.wait.as_ref().and_then(|(_, waker, mode)| {
@@ -839,6 +882,51 @@ impl ThreadSignals {
         if let Some(waker) = waker {
             waker.notify();
         }
+    }
+
+    /// 请求本线程在合法点退出并打断等待，不改变组退出原因或其他成员控制。
+    pub(crate) fn request_exec_exit(&self) {
+        {
+            let binding = self.group.sighand.lock();
+            let _siglock = binding.actions.lock();
+            self.state.lock().exec_exit = true;
+        }
+        self.notify_wait();
+    }
+
+    /// 查询本线程的私有exec退出请求，不把组退出原因当作本请求。
+    pub(crate) fn exec_exit_requested(&self) -> bool {
+        let binding = self.group.sighand.lock();
+        let _siglock = binding.actions.lock();
+        let requested = self.state.lock().exec_exit;
+        requested
+    }
+
+    /// 唯一成员且无活等待登记时切换动作表，只保IGNORE的handler；阻塞集、pending与组计时拥有不变。
+    pub(crate) fn reset_for_exec(&self, sighand: Arc<Sighand>) {
+        let old = {
+            let mut binding = self.group.sighand.lock();
+            {
+                let mut actions = sighand.actions.lock();
+                let group = self.group.state.lock();
+                let mut private = self.state.lock();
+                assert_eq!(group.members, 1, "exec has live signal peers");
+                assert!(private.wait.is_none(), "exec has an active signal waiter");
+                for action in actions.iter_mut() {
+                    *action = SignalAction {
+                        handler: usize::from(action.handler == 1),
+                        ..SignalAction::DEFAULT
+                    };
+                }
+                if let Some(mask) = private.real_blocked.take() {
+                    private.mask = mask;
+                }
+                private.waited_set = 0;
+                private.altstack = AltStack::DISABLED;
+            }
+            mem::replace(&mut *binding, sighand)
+        };
+        drop(old);
     }
 }
 
@@ -877,7 +965,7 @@ fn interruption(
     private: &ThreadState,
     mode: WaitMode,
 ) -> bool {
-    if group.exit.is_some() {
+    if group.exit.is_some() || private.exec_exit {
         return true;
     }
     let pending = private.pending.bits | group.pending.bits;

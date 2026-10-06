@@ -5,10 +5,11 @@ use crate::fs::ktest::*;
 use crate::mm::space::{Mm, VmError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
-use crate::task::process::{TaskGraph, WaitEvent};
-use crate::task::{Credentials, Placement, UserRuntime};
+use crate::task::process::{TaskGraph, WaitEvent, WaitSelector};
+use crate::task::{Credentials, Placement, TaskId, UserRuntime};
 
 mod layout;
+mod lifecycle;
 mod preparation;
 
 const PROGRAM: &[u8] = b"/test/bin/user-smoke";
@@ -18,6 +19,7 @@ struct RunningProgram {
     pid: usize,
     target: Option<usize>,
     coordinator: usize,
+    expected_task: Option<TaskId>,
     join: JoinHandle,
 }
 
@@ -155,6 +157,7 @@ impl UserOwner {
             pid,
             target: affine_group.then_some(target),
             coordinator,
+            expected_task: Some(join.task_id()),
             join,
         });
         Ok(())
@@ -261,10 +264,13 @@ impl UserOwner {
             pid,
             target,
             coordinator,
+            expected_task,
             join,
         } = self.running.take().unwrap();
         context.expect_eq(event.pid, pid);
-        context.expect_eq(event.task_id, join.task_id());
+        if let Some(expected_task) = expected_task {
+            context.expect_eq(event.task_id, expected_task);
+        }
         let task_status = join.join();
         if let Some(target) = target {
             context.expect_eq(event.cpu, target);
@@ -426,6 +432,7 @@ impl UserOwner {
             pid,
             target: Some(target),
             coordinator,
+            expected_task: Some(join.task_id()),
             join,
         });
         ready.wait();
@@ -576,11 +583,16 @@ impl UserOwner {
         self.graph()
             .send_kernel(pid, 19)
             .map_err(|_| TestError("suspend child stop request failed"))?;
+        let selector = WaitSelector::Pid(
+            self.graph()
+                .pid_object(pid)
+                .ok_or(TestError("suspend child identity disappeared"))?,
+        );
         let mut stopped = None;
         let mut wait_error = None;
         until(
             "suspend child did not acknowledge the group stop",
-            || match self.graph().try_wait_event(&parent, pid, 0x0100_0003) {
+            || match self.graph().try_wait_event(&parent, &selector, 0x0100_0003) {
                 Ok(Some(event)) => {
                     stopped = Some(event);
                     true
@@ -779,11 +791,16 @@ impl UserOwner {
                     .identity()
                     .expect("deadline parent has no identity")
                     .group();
+                let selector = WaitSelector::Pid(
+                    self.graph()
+                        .pid_object(child_pid)
+                        .ok_or(TestError("futex child identity disappeared"))?,
+                );
                 let mut stopped = None;
                 let mut wait_error = None;
                 until("futex child did not acknowledge group stop", || match self
                     .graph()
-                    .try_wait_event(&parent, child_pid, 0x0100_0003)
+                    .try_wait_event(&parent, &selector, 0x0100_0003)
                 {
                     Ok(Some(event)) => {
                         stopped = Some(event);
@@ -1300,5 +1317,60 @@ pub(crate) mod programs {
             fixture.futex_program(context, mode)?;
         }
         Ok(())
+    }
+
+    /// 非leader沿原Task转移Linux身份；两个实际exec只允许唯一新映像或真实组fatal。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn exec_nonleader_and_concurrent_control(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.lifecycle_exec(context)
+    }
+
+    /// 外部共享files/sighand不被exec修改，旧根保活，新映像与CLOEXEC由普通程序验证。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn exec_shared_resources_and_mm_handoff(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.lifecycle_resources(context)
+    }
+
+    /// vfork按旧Mm使用结束恢复父；父被取消后子仍独立退出并完成转亲回收。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn vfork_exec_exit_and_parent_cancellation(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.lifecycle_vfork(context)
+    }
+
+    /// leader先退出保同组父资格；组退出、转亲和角色释放后才复用号码。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn exit_group_parentage_and_pid_role_reuse(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.lifecycle_roles(context)
+    }
+
+    /// 两个真实阻塞wait者可重复观察，但只能消费一次；坏copyout不恢复僵尸。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn wait_observation_consumption_and_copyout(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.lifecycle_wait(context)
     }
 }

@@ -312,7 +312,7 @@ fn resolve(
 }
 
 /// 绝对路径忽略dirfd，相对路径使用已取得的真实目录Path，每次search权限由VFS执行。
-fn resolve_bytes(
+pub(super) fn resolve_bytes(
     runtime: &UserRuntime,
     dirfd: usize,
     pathname: &[u8],

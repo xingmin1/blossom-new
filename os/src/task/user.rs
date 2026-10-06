@@ -4,13 +4,14 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::alloc::AllocError;
 use core::cell::{Cell, RefCell, RefMut};
+use core::mem;
 use core::sync::atomic::Ordering;
 use spin::Once;
 
 use crate::arch::{self, UserContext, UserTrap};
 use crate::fs::{FileTable, FsContext, FsError, Vfs};
 use crate::mm::space::{self, Mm, MmUser, VmError};
-use crate::sync::{IrqSaveGuard, SleepMutex, SpinLock};
+use crate::sync::{Completion, IrqSaveGuard, SleepMutex, SpinLock};
 use crate::syscall::Restart;
 use crate::task::exec::{ExecError, LoadedImage};
 use crate::task::process::{
@@ -114,13 +115,60 @@ impl UserRuntime {
             sighand,
         })
     }
+
+    /// 其他实际执行者仍共享时才私有化；普通资源快照不触发复制。
+    pub(crate) fn try_exec(self) -> Result<Self, FsError> {
+        let Self {
+            files,
+            fs,
+            credentials,
+            sighand,
+        } = self;
+        let files = if files.user_count() > 1 {
+            Arc::try_new(files.try_clone()?).map_err(|_| FsError::NoMemory)?
+        } else {
+            files
+        };
+        let sighand = if sighand.user_count() > 1 {
+            sighand.try_copy().map_err(|_| FsError::NoMemory)?
+        } else {
+            sighand
+        };
+        Ok(Self {
+            files,
+            fs,
+            credentials,
+            sighand,
+        })
+    }
+}
+
+/// 只计真实用户运行绑定，未发表失败与正常退出共用同一归还责任。
+struct RuntimeBinding(UserRuntime);
+
+impl RuntimeBinding {
+    /// 在发表前移动完整资源，并取得两项独立运行责任。
+    fn new(runtime: UserRuntime) -> Self {
+        runtime.files.add_user();
+        runtime.sighand.add_user();
+        Self(runtime)
+    }
+}
+
+impl Drop for RuntimeBinding {
+    /// 先解除运行责任，字段最后拥有由原锁外调用者释放。
+    fn drop(&mut self) {
+        self.0.files.remove_user();
+        self.0.sighand.remove_user();
+    }
 }
 
 struct UserProcess {
     identity: Arc<UserIdentity>,
-    runtime: UserRuntime,
+    runtime: RuntimeBinding,
     child_set_tid: Option<usize>,
     clear_child_tid: usize,
+    vfork: Option<Arc<Completion>>,
 }
 
 pub struct UserThread {
@@ -186,9 +234,10 @@ impl UserThread {
         assert!(process.is_none(), "user process is already bound");
         *process = Some(UserProcess {
             identity,
-            runtime,
+            runtime: RuntimeBinding::new(runtime),
             child_set_tid,
             clear_child_tid,
+            vfork: None,
         });
     }
 
@@ -227,7 +276,79 @@ impl UserThread {
         self.process
             .lock()
             .as_ref()
-            .map(|process| process.runtime.clone())
+            .map(|process| process.runtime.0.clone())
+    }
+
+    /// child尚未Ready时绑定双方拥有的完成对象，不借父Task栈。
+    pub(crate) fn bind_vfork(&self, completion: Arc<Completion>) {
+        let mut process = self.process.lock();
+        let process = process.as_mut().expect("vfork child has no process");
+        assert!(process.vfork.is_none(), "vfork completion is already bound");
+        process.vfork = Some(completion);
+    }
+
+    /// 父致命取消只解绑本次关系，child资源与执行仍走自己的正常清理。
+    pub(crate) fn cancel_vfork(&self, completion: &Arc<Completion>) {
+        let removed = {
+            let mut process = self.process.lock();
+            process.as_mut().and_then(|process| {
+                if process
+                    .vfork
+                    .as_ref()
+                    .is_some_and(|bound| Arc::ptr_eq(bound, completion))
+                {
+                    process.vfork.take()
+                } else {
+                    None
+                }
+            })
+        };
+        drop(removed);
+    }
+
+    /// 在同一执行者提交新现场与活动根，旧MM实际使用结束后才恢复vfork父。
+    pub(crate) fn install_image(&self, image: LoadedImage, runtime: UserRuntime) {
+        self.assert_current();
+        let runtime = RuntimeBinding::new(runtime);
+        runtime.0.files.close_on_exec();
+        self.signals()
+            .expect("exec has no signals")
+            .reset_for_exec(runtime.0.sighand.clone());
+        let old_mm = self.mm().expect("exec has no old MM");
+        let clear_child_tid = {
+            let mut process = self.process.lock();
+            let process = process.as_mut().expect("exec has no process");
+            mem::take(&mut process.clear_child_tid)
+        };
+        clear_tid(&old_mm, clear_child_tid);
+        let binding = MmUser::new(image.mm);
+        let active = binding.mm().clone();
+        self.restart.set(None);
+        self.saved_mask.set(None);
+        let (old_runtime, old_binding, old_active, completion) = {
+            let _irq = IrqSaveGuard::new();
+            let (old_runtime, completion) = {
+                let mut process = self.process.lock();
+                let process = process.as_mut().expect("exec has no process");
+                process.child_set_tid = None;
+                (
+                    mem::replace(&mut process.runtime, runtime),
+                    process.vfork.take(),
+                )
+            };
+            let old_active = space::leave_current();
+            let old_binding = self.mm.lock().replace(binding);
+            *self.context.borrow_mut() = image.context;
+            space::enter_current(Some(active));
+            (old_runtime, old_binding, old_active, completion)
+        };
+        drop(old_runtime);
+        drop(old_binding);
+        drop(old_active);
+        drop(old_mm);
+        if let Some(completion) = completion {
+            completion.complete();
+        }
     }
 
     /// 身份拥有private信号状态；裸内核probe没有Linux信号绑定。
@@ -308,17 +429,17 @@ impl UserThread {
             identity,
             runtime,
             clear_child_tid,
+            vfork,
             ..
         } = process;
         if let Some(binding) = &mm {
-            let mm = binding.mm();
-            if clear_child_tid != 0 && mm.user_count() > 1 {
-                let _ = mm.store_user_u32(clear_child_tid, 0);
-                let _ = crate::task::futex::wake(mm, clear_child_tid, false, 1, u32::MAX);
-            }
+            clear_tid(binding.mm(), clear_child_tid);
         }
         drop(runtime);
         drop(mm);
+        if let Some(completion) = vfork {
+            completion.complete();
+        }
         identity
     }
 
@@ -591,6 +712,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                         request.return_to(&mut user.context(), result)
                     }
                     crate::syscall::Outcome::Restored => {}
+                    crate::syscall::Outcome::NewImage => restart = None,
                     crate::syscall::Outcome::Restart(state) => restart = Some(state),
                     crate::syscall::Outcome::Exit(status) => break status,
                     crate::syscall::Outcome::GroupExit(status) => {
@@ -660,6 +782,14 @@ fn run_program(user: Arc<UserThread>) -> i32 {
         user.user_timer_interrupts.get(),
     );
     status
+}
+
+/// 地址失效仍完成退出或exec；CPU独立拥有旧根，真实用户数不包含诊断引用。
+fn clear_tid(mm: &Arc<Mm>, address: usize) {
+    if address != 0 && mm.user_count() > 1 {
+        let _ = mm.store_user_u32(address, 0);
+        let _ = crate::task::futex::wake(mm, address, false, 1, u32::MAX);
+    }
 }
 
 /// 真实成员确认停止后在原控制源登记，登记后重查关闭CONT/KILL早通知窗口。

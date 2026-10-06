@@ -91,7 +91,8 @@ impl Arguments {
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<Self, ExecError> {
-        let mut args = Self::new(filename)?;
+        validate_filename(filename)?;
+        let mut args = Self::new(copy_bytes(filename)?);
         for string in argv {
             args.push_kernel(string, true)?;
         }
@@ -106,33 +107,27 @@ impl Arguments {
     /// 并发用户写入不保证多字符串的原子快照，访问错误按原 VM 原因返回。
     pub(crate) fn from_user(
         mm: &Mm,
-        filename: &[u8],
+        filename: Vec<u8>,
         argv: usize,
         envp: usize,
     ) -> Result<Self, ExecError> {
-        let mut args = Self::new(filename)?;
+        validate_filename(&filename)?;
+        let mut args = Self::new(filename);
         args.read_vector(mm, argv, true)?;
         args.ensure_argv0()?;
         args.read_vector(mm, envp, false)?;
         Ok(args)
     }
 
-    /// 先验证 pathname 并预留 argc、argv/envp 的两个 NULL 指针所需空间。
-    fn new(filename: &[u8]) -> Result<Self, ExecError> {
-        if MAX_PATH_BYTES <= filename.len() {
-            return Err(ExecError::ArgumentsTooBig);
-        }
-        if filename.is_empty() || filename.contains(&0) {
-            return Err(ExecError::Format);
-        }
-        let filename = copy_bytes(filename)?;
+    /// 输入已验证有界；移动路径并预留argc与两个终止指针的预算。
+    fn new(filename: Vec<u8>) -> Self {
         let bytes = filename.len() + 1 + 3 * core::mem::size_of::<usize>();
-        Ok(Self {
+        Self {
             filename,
             argv: Vec::new(),
             envp: Vec::new(),
             bytes,
-        })
+        }
     }
 
     /// 参数与环境合计使用有限个指针，每项在分配或读取前取得剩余字节预算。
@@ -216,8 +211,19 @@ impl Arguments {
     }
 }
 
+/// 路径在分配或移动之前验证，不把格式错误变成用户可写内核字符串。
+fn validate_filename(filename: &[u8]) -> Result<(), ExecError> {
+    if MAX_PATH_BYTES <= filename.len() {
+        return Err(ExecError::ArgumentsTooBig);
+    }
+    if filename.is_empty() || filename.contains(&0) {
+        return Err(ExecError::Format);
+    }
+    Ok(())
+}
+
 /// 只复制已经验证有界的字节，分配失败不触发内核不可恢复的 OOM 路径。
-fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, ExecError> {
+pub(crate) fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, ExecError> {
     let mut owned = Vec::new();
     owned
         .try_reserve_exact(bytes.len())

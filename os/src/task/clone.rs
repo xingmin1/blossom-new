@@ -4,16 +4,19 @@ use alloc::sync::Arc;
 
 use crate::fs::FsError;
 use crate::mm::space::VmError;
+use crate::sync::Completion;
 use crate::syscall::Request;
 use crate::task::exec::LoadedImage;
 use crate::task::process::ProcessError;
 use crate::task::user::{prepare_bound_user, ProgramError};
 use crate::task::{Placement, UserThread};
+use crate::wait::WaitResult;
 
 const VM: usize = 0x100;
 const FS: usize = 0x200;
 const FILES: usize = 0x400;
 const SIGHAND: usize = 0x800;
+const VFORK: usize = 0x4000;
 const THREAD: usize = 0x1_0000;
 const SETTLS: usize = 0x8_0000;
 const PARENT_SETTID: usize = 0x10_0000;
@@ -24,6 +27,7 @@ const SUPPORTED: usize = 0xff
     | FS
     | FILES
     | SIGHAND
+    | VFORK
     | THREAD
     | SETTLS
     | PARENT_SETTID
@@ -56,6 +60,7 @@ pub(crate) struct CloneArguments {
     share_fs: bool,
     share_sighand: bool,
     thread: bool,
+    vfork: bool,
     exit_signal: u8,
     stack: usize,
     tls: Option<usize>,
@@ -90,6 +95,7 @@ impl CloneArguments {
             share_fs: flags & FS != 0,
             share_sighand,
             thread,
+            vfork: flags & VFORK != 0,
             exit_signal: (flags & 0xff) as u8,
             stack: raw[1],
             tls: (flags & SETTLS != 0).then_some(tls),
@@ -123,7 +129,9 @@ pub(crate) fn create(
             arguments.share_sighand,
         )
         .map_err(CloneError::File)?;
-    let inherited = identity.signals().inherit(arguments.share_vm);
+    let inherited = identity
+        .signals()
+        .inherit(arguments.share_vm && !arguments.vfork);
     let mut context = user.context().fork();
     request.return_to(&mut context, 0);
     if arguments.stack != 0 {
@@ -138,7 +146,7 @@ pub(crate) fn create(
         Arc::try_new(parent_mm.fork().map_err(CloneError::Vm)?).map_err(|_| CloneError::NoMemory)?
     };
     let identity = if arguments.thread {
-        graph.prepare_thread(&group, runtime.sighand.clone(), inherited)
+        graph.prepare_thread(&group, inherited)
     } else {
         graph.prepare_process(
             Some(&group),
@@ -159,11 +167,26 @@ pub(crate) fn create(
     )
     .map_err(program_error)?;
     let pid = program.pid();
+    let vfork = if arguments.vfork {
+        let completion = Arc::try_new(Completion::new()).map_err(|_| CloneError::NoMemory)?;
+        let child = program.user();
+        child.bind_vfork(completion.clone());
+        Some((Arc::downgrade(&child), completion))
+    } else {
+        None
+    };
     let handle = program
         .publish_child(&parent_mm, arguments.parent_tid)
         .map_err(CloneError::Identity)?;
-    // 图只保小离栈观察；调度器拥有child，父syscall不持其运行资源或等待它结束。
+    // 图只保离栈观察；vfork只等child结束旧Mm使用，不持child Task或运行资源。
     drop(handle);
+    if let Some((child, completion)) = vfork {
+        if completion.wait_killable() == WaitResult::Interrupted {
+            if let Some(child) = child.upgrade() {
+                child.cancel_vfork(&completion);
+            }
+        }
+    }
     Ok(pid)
 }
 

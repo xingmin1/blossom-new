@@ -15,6 +15,8 @@ pub(super) enum Errno {
     NoProcess = 3,
     Interrupted = 4,
     Io = 5,
+    ArgumentsTooBig = 7,
+    ExecFormat = 8,
     BadFd = 9,
     NoChild = 10,
     Again = 11,
@@ -117,6 +119,11 @@ impl From<ProcessError> for Errno {
             ProcessError::NoPid => Self::Again,
             ProcessError::InvalidParent => Self::NoProcess,
             ProcessError::NoChild => Self::NoChild,
+            ProcessError::Busy => Self::Again,
+            ProcessError::NoProcess => Self::NoProcess,
+            ProcessError::Permission => Self::NotPermitted,
+            ProcessError::Access => Self::Permission,
+            ProcessError::InvalidArgument => Self::InvalidArgument,
         }
     }
 }

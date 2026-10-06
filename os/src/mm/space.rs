@@ -1130,7 +1130,7 @@ fn sync_all() {
     }
 }
 
-/// 在所属 CPU 的 IRQ-off 调度交接中安装根，硬件使用期间由 CPU 保留一份拥有。
+/// 在所属CPU的IRQ-off调度交接或exec提交中安装根，硬件使用期间保留CPU拥有。
 pub(crate) fn enter_current(mm: Option<Arc<Mm>>) {
     assert!(!arch::irq_enabled(), "MM switch requires disabled IRQ");
     let local = cpu::current();
@@ -1150,7 +1150,7 @@ pub(crate) fn enter_current(mm: Option<Arc<Mm>>) {
 pub(crate) fn leave_current() -> Option<Arc<Mm>> {
     assert!(!arch::irq_enabled(), "MM detach requires disabled IRQ");
     let local = cpu::current();
-    // SAFETY: 只有所属 CPU 的 IRQ-off 调度交接访问活动槽，旧 Task 已保存并离栈。
+    // SAFETY: 只有所属CPU在IRQ-off交接或exec中访问槽，原用户现场已完整保存。
     let active = unsafe { &mut *local.active_mm.get() };
     if active.is_some() {
         arch::activate_kernel_root();

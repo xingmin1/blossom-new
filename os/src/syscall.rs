@@ -78,6 +78,7 @@ pub(crate) enum Outcome {
     GroupExit(i32),
     Restart(Restart),
     Restored,
+    NewImage,
 }
 
 /// 信号选择后依据已选handler策略决定EINTR或重启，剩余时间交付先于现场借用。
@@ -159,6 +160,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         80 => file::fstat(user, raw),
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
+        154..=157 | 173 => task::identity(user, request.number, raw),
         124 => {
             sched::yield_now();
             Ok(0)
@@ -174,8 +176,10 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         214 => Ok(memory::brk(user, raw[0])),
         215 => memory::munmap(user, raw),
         220 => task::clone(user, request),
+        221 => return task::execve(user, request),
         222 => memory::mmap(user, raw),
         226 => memory::mprotect(user, raw),
+        260 => return task::wait4(user, request),
         _ => Err(Errno::NoSyscall),
     };
     Outcome::Return(result.unwrap_or_else(Errno::result))

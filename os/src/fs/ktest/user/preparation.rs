@@ -128,7 +128,15 @@ fn snapshot_arguments(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) ->
     write_bytes(context, mm, ENVIRONMENT, b"USER_SMOKE=1\0")?;
     write_vector(context, mm, ARGV, &[STRING, RAW])?;
     write_vector(context, mm, ENVP, &[ENVIRONMENT])?;
-    let arguments = checked_exec(context, Arguments::from_user(mm, PROGRAM, ARGV, ENVP))?;
+    let arguments = checked_exec(
+        context,
+        Arguments::from_user(
+            mm,
+            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            ARGV,
+            ENVP,
+        ),
+    )?;
     write_vector(context, mm, ARGV, &[])?;
     write_vector(context, mm, ENVP, &[])?;
     write_bytes(context, mm, STRING, b"changed\0")?;
@@ -146,7 +154,13 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
         (arch::USER_ADDRESS_END - WORD + 1, VmError::InvalidRange),
         (usize::MAX - WORD + 1, VmError::InvalidRange),
     ] {
-        let error = Arguments::from_user(mm, PROGRAM, table, 0).err();
+        let error = Arguments::from_user(
+            mm,
+            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            table,
+            0,
+        )
+        .err();
         context.diagnostic(format_args!(
             "user preparation bad vector address={:#x} error={:?}",
             table, error
@@ -159,7 +173,13 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
         (usize::MAX - WORD, VmError::InvalidRange),
     ] {
         write_vector(context, mm, ARGV, &[pointer])?;
-        let error = Arguments::from_user(mm, PROGRAM, ARGV, 0).err();
+        let error = Arguments::from_user(
+            mm,
+            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            ARGV,
+            0,
+        )
+        .err();
         context.diagnostic(format_args!(
             "user preparation bad string address={:#x} error={:?}",
             pointer, error
@@ -170,12 +190,24 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
     write_bytes(context, mm, unmapped - 3, b"abc")?;
     write_vector(context, mm, ARGV, &[unmapped - 3])?;
     context.expect_eq(
-        Arguments::from_user(mm, PROGRAM, ARGV, 0).err(),
+        Arguments::from_user(
+            mm,
+            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            ARGV,
+            0,
+        )
+        .err(),
         Some(ExecError::Vm(VmError::Unmapped)),
     );
     write_bytes(context, mm, STRING, source)?;
     write_vector(context, mm, ARGV, &[STRING])?;
-    let error = Arguments::from_user(mm, PROGRAM, ARGV, 0).err();
+    let error = Arguments::from_user(
+        mm,
+        checked_exec(context, exec::copy_bytes(PROGRAM))?,
+        ARGV,
+        0,
+    )
+    .err();
     context.diagnostic(format_args!(
         "user preparation unterminated string error={:?}",
         error
@@ -188,7 +220,15 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
 fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> TestResult {
     write_vector(context, mm, ARGV, &[])?;
     for table in [0, ARGV] {
-        let arguments = checked_exec(context, Arguments::from_user(mm, PROGRAM, table, 0))?;
+        let arguments = checked_exec(
+            context,
+            Arguments::from_user(
+                mm,
+                checked_exec(context, exec::copy_bytes(PROGRAM))?,
+                table,
+                0,
+            ),
+        )?;
         let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
         check_stack(context, &image, &[b""], &[])?;
     }
@@ -197,7 +237,15 @@ fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> Tes
     let pointers = [STRING; MAX_ARGUMENT_COUNT + 1];
     write_vector(context, mm, ARGV, &pointers[..count])?;
     write_vector(context, mm, ENVP, &pointers[..MAX_ARGUMENT_COUNT - count])?;
-    let arguments = checked_exec(context, Arguments::from_user(mm, PROGRAM, ARGV, ENVP))?;
+    let arguments = checked_exec(
+        context,
+        Arguments::from_user(
+            mm,
+            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            ARGV,
+            ENVP,
+        ),
+    )?;
     let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
     let empty: [&[u8]; MAX_ARGUMENT_COUNT] = [b""; MAX_ARGUMENT_COUNT];
     check_stack(
@@ -214,7 +262,13 @@ fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> Tes
         ENVP,
         &pointers[..MAX_ARGUMENT_COUNT - count + 1],
     )?;
-    let error = Arguments::from_user(mm, PROGRAM, ARGV, ENVP).err();
+    let error = Arguments::from_user(
+        mm,
+        checked_exec(context, exec::copy_bytes(PROGRAM))?,
+        ARGV,
+        ENVP,
+    )
+    .err();
     context.diagnostic(format_args!(
         "user preparation argument count overflow error={:?}",
         error
@@ -234,14 +288,28 @@ fn argument_bytes(
     write_bytes(context, mm, STRING, source)?;
     write_bytes(context, mm, STRING + length, &[0])?;
     write_vector(context, mm, ARGV, &[STRING])?;
-    let arguments = checked_exec(context, Arguments::from_user(mm, PROGRAM, ARGV, 0))?;
+    let arguments = checked_exec(
+        context,
+        Arguments::from_user(
+            mm,
+            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            ARGV,
+            0,
+        ),
+    )?;
     let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
     check_stack(context, &image, &[&source[..length]], &[])?;
     drop(image);
     drop(arguments);
     write_bytes(context, mm, SCRATCH, b"x\0")?;
     write_vector(context, mm, ENVP, &[SCRATCH])?;
-    let error = Arguments::from_user(mm, PROGRAM, ARGV, ENVP).err();
+    let error = Arguments::from_user(
+        mm,
+        checked_exec(context, exec::copy_bytes(PROGRAM))?,
+        ARGV,
+        ENVP,
+    )
+    .err();
     context.diagnostic(format_args!(
         "user preparation total argument bytes overflow error={:?}",
         error

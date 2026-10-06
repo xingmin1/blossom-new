@@ -4,7 +4,7 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sched;
-use crate::wait::{WaitNode, WaitQueue, Waiter};
+use crate::wait::{WaitNode, WaitQueue, WaitResult, Waiter};
 
 /// 每次 complete 增加一个完成 token，每次成功等待只消费一个。
 pub struct Completion {
@@ -66,6 +66,38 @@ impl Completion {
                     self.waiters.wake_one();
                 }
                 return;
+            }
+        }
+    }
+
+    /// 用户父只响应致命取消，真实完成token优先，撤除登记后才返回。
+    pub fn wait_killable(&self) -> WaitResult {
+        sched::assert_switchable();
+        loop {
+            if self.try_wait() {
+                return WaitResult::Woken;
+            }
+            let result = {
+                let waiter = Waiter::new_killable();
+                let mut node = pin!(WaitNode::new(waiter.waker()));
+                // SAFETY: self保活完成存储；node固定当前栈，registration先于node/waiter撤除。
+                let _registration = unsafe { self.waiters.register(node.as_mut()) };
+                if self.try_wait() {
+                    Some(WaitResult::Woken)
+                } else {
+                    let result = waiter.park_signal();
+                    if self.try_wait() {
+                        Some(WaitResult::Woken)
+                    } else {
+                        (result == WaitResult::Interrupted).then_some(result)
+                    }
+                }
+            };
+            if let Some(result) = result {
+                if self.is_ready() {
+                    self.waiters.wake_one();
+                }
+                return result;
             }
         }
     }

@@ -28,6 +28,11 @@ pub(crate) enum ProcessError {
     NoPid,
     InvalidParent,
     NoChild,
+    Busy,
+    NoProcess,
+    Permission,
+    Access,
+    InvalidArgument,
 }
 
 /// 数字不可变的身份对象；诊断引用不参与号码占用判定。
@@ -42,16 +47,20 @@ impl Pid {
     }
 }
 
-/// 组的不可变身份；成员、亲缘和退出状态由所属图的同一关系锁保护。
+/// 组身份对象保持不变；可变角色和退出信号由关系锁事务更新。
 pub(crate) struct ThreadGroup {
     graph: Weak<TaskGraph>,
     pid: Arc<Pid>,
-    pgid: Arc<Pid>,
-    sid: Arc<Pid>,
+    relations: SpinLock<GroupRelations>,
     uid: u32,
-    exit_signal: u8,
     signals: Arc<SignalGroup>,
     time: Arc<GroupTime>,
+}
+
+struct GroupRelations {
+    pgid: Arc<Pid>,
+    sid: Arc<Pid>,
+    exit_signal: u8,
 }
 
 impl ThreadGroup {
@@ -62,12 +71,17 @@ impl ThreadGroup {
 
     /// 返回根组自身建立或从父组继承的进程组身份。
     pub(crate) fn pgid(&self) -> usize {
-        self.pgid.number
+        self.relations.lock().pgid.number
+    }
+
+    /// 在关系锁内取得当前PGID原对象，等待不得先取数字再回图查同号身份。
+    pub(crate) fn pgid_object(&self) -> Arc<Pid> {
+        Arc::clone(&self.relations.lock().pgid)
     }
 
     /// 返回根组自身建立或从父组继承的会话身份。
     pub(crate) fn sid(&self) -> usize {
-        self.sid.number
+        self.relations.lock().sid.number
     }
 
     /// 借用组独有pending与控制拥有，不把共享动作轴等同于线程组。
@@ -85,14 +99,14 @@ impl ThreadGroup {
 pub(crate) struct UserIdentity {
     graph: Arc<TaskGraph>,
     group: Arc<ThreadGroup>,
-    tid: Arc<Pid>,
+    tid: SpinLock<Arc<Pid>>,
     signals: Arc<ThreadSignals>,
 }
 
 impl UserIdentity {
-    /// 每个成员保留自己的不可变TID，组首线程与TGID共享同一Pid对象。
+    /// 返回当前TID；exec可在保留本身份对象时接管原组首的Pid。
     pub(crate) fn tid(&self) -> usize {
-        self.tid.number
+        self.tid.lock().number
     }
 
     /// 返回用户线程所属线程组的 Linux 数字身份。
@@ -112,7 +126,7 @@ impl UserIdentity {
 
     /// 保存稳定身份对象供诊断；数值复用后此对象不会命中新执行者。
     pub(crate) fn tid_object(&self) -> Arc<Pid> {
-        self.tid.clone()
+        self.tid.lock().clone()
     }
 
     /// 身份准备时已构造private信号状态，退出解绑运行资源不会丢失早到信号。
@@ -138,6 +152,15 @@ pub(crate) struct ChildEvent {
     pub(crate) uid: u32,
     pub(crate) code: i32,
     pub(crate) status: i32,
+    pub(crate) user_ns: u64,
+    pub(crate) kernel_ns: u64,
+}
+
+/// 已由ABI解码的子进程选择条件，扫描和消费共用同一关系锁。
+pub(crate) enum WaitSelector {
+    Pid(Arc<Pid>),
+    Group(Arc<Pid>),
+    Any,
 }
 
 /// 每个真实执行者的离栈观察；节点锁外准备，退出后只保小完成对象。
@@ -167,6 +190,8 @@ struct ProcessEntry {
     members: usize,
     leader_task_id: TaskId,
     leader_status: Option<i32>,
+    exec_owner: Option<TaskId>,
+    did_exec: bool,
     user_interrupts: usize,
     user_timer_interrupts: usize,
     completed: Option<Box<PreparedExecution>>,
@@ -270,27 +295,32 @@ impl TaskGraph {
         inherited: SignalInheritance,
         exit_signal: u8,
     ) -> Result<PreparedIdentity, ProcessError> {
-        let reservation = self.reserve_number(parent)?;
+        let reservation = self.reserve_number(parent, false)?;
         let pid = Arc::try_new(Pid {
             number: reservation.index + 1,
         })
         .map_err(|_| ProcessError::NoMemory)?;
         let (pgid, sid) = match parent {
-            Some(parent) => (parent.pgid.clone(), parent.sid.clone()),
+            Some(parent) => {
+                let relations = parent.relations.lock();
+                (relations.pgid.clone(), relations.sid.clone())
+            }
             None => (pid.clone(), pid.clone()),
         };
-        let signals = SignalGroup::try_new(Arc::downgrade(self), pid.number)
+        let signals = SignalGroup::try_new(Arc::downgrade(self), pid.number, sighand)
             .map_err(|_| ProcessError::NoMemory)?;
-        let private = ThreadSignals::try_new(signals.clone(), sighand, inherited)
+        let private = ThreadSignals::try_new(signals.clone(), inherited)
             .map_err(|_| ProcessError::NoMemory)?;
         let time = GroupTime::try_new(signals.clone()).map_err(|_| ProcessError::NoMemory)?;
         let group = Arc::try_new(ThreadGroup {
             graph: Arc::downgrade(self),
             pid: pid.clone(),
-            pgid,
-            sid,
+            relations: SpinLock::new(GroupRelations {
+                pgid,
+                sid,
+                exit_signal,
+            }),
             uid,
-            exit_signal,
             signals,
             time,
         })
@@ -298,7 +328,7 @@ impl TaskGraph {
         let identity = Arc::try_new(UserIdentity {
             graph: self.clone(),
             group,
-            tid: pid,
+            tid: SpinLock::new(pid),
             signals: private,
         })
         .map_err(|_| ProcessError::NoMemory)?;
@@ -313,20 +343,19 @@ impl TaskGraph {
     pub(crate) fn prepare_thread(
         self: &Arc<Self>,
         group: &Arc<ThreadGroup>,
-        sighand: Arc<Sighand>,
         inherited: SignalInheritance,
     ) -> Result<PreparedIdentity, ProcessError> {
-        let reservation = self.reserve_number(Some(group))?;
+        let reservation = self.reserve_number(Some(group), true)?;
         let tid = Arc::try_new(Pid {
             number: reservation.index + 1,
         })
         .map_err(|_| ProcessError::NoMemory)?;
-        let signals = ThreadSignals::try_new(group.signals.clone(), sighand, inherited)
+        let signals = ThreadSignals::try_new(group.signals.clone(), inherited)
             .map_err(|_| ProcessError::NoMemory)?;
         let identity = Arc::try_new(UserIdentity {
             graph: self.clone(),
             group: group.clone(),
-            tid,
+            tid: SpinLock::new(tid),
             signals,
         })
         .map_err(|_| ProcessError::NoMemory)?;
@@ -341,12 +370,23 @@ impl TaskGraph {
     fn reserve_number(
         self: &Arc<Self>,
         parent: Option<&Arc<ThreadGroup>>,
+        thread: bool,
     ) -> Result<NumberReservation, ProcessError> {
         self.prune_completed();
         let index = {
             let mut slots = self.slots.lock();
             if let Some(parent) = parent {
                 self.live_parent(&slots, parent)?;
+                if thread
+                    && slots[parent.tgid() - 1]
+                        .process
+                        .as_ref()
+                        .expect("live group disappeared")
+                        .exec_owner
+                        .is_some()
+                {
+                    return Err(ProcessError::Busy);
+                }
             }
             let index = slots
                 .iter()
@@ -417,6 +457,11 @@ impl TaskGraph {
         user.upgrade()
     }
 
+    /// 保存此刻已发表的原身份，阻塞等待不能因数值复用改选另一个对象。
+    pub(crate) fn pid_object(&self, pid: usize) -> Option<Arc<Pid>> {
+        self.slots.lock().get(pid.checked_sub(1)?)?.pid.clone()
+    }
+
     /// 首个组退出原因保留，锁外通知所有真实成员在自己的合法用户返回点退出。
     pub(crate) fn request_exit(&self, identity: &UserIdentity, status: i32) {
         identity.group.signals.request_exit(status);
@@ -425,6 +470,162 @@ impl TaskGraph {
     /// 当前执行者在IRQ和业务短锁外读取本组控制，不允许远核改用户现场或释放栈。
     pub(crate) fn exit_request(&self, identity: &UserIdentity) -> Option<i32> {
         identity.group.signals.exit_request()
+    }
+
+    /// 当前实际Task独占exec，其他成员在自己的合法点退出并真正离栈后才交接TID。
+    pub(crate) fn de_thread(&self, identity: &UserIdentity) -> Result<(), ProcessError> {
+        sched::assert_switchable();
+        let owner = crate::task::current_task_id().ok_or(ProcessError::NoProcess)?;
+        let capacity = {
+            let mut slots = self.slots.lock();
+            let process = self.exec_process(&mut slots, identity, owner)?;
+            if process.exec_owner.is_some() {
+                return Err(ProcessError::Busy);
+            }
+            process.exec_owner = Some(owner);
+            slots.len()
+        };
+        for index in 0..capacity {
+            let member = {
+                let slots = self.slots.lock();
+                slots[index]
+                    .thread
+                    .as_ref()
+                    .filter(|thread| {
+                        Arc::ptr_eq(&thread.group, &identity.group)
+                            && thread.execution.join.task_id() != owner
+                    })
+                    .map(|thread| (thread.signals.clone(), thread.user.clone()))
+            };
+            if let Some((signals, user)) = member {
+                signals.request_exec_exit();
+                if let Some(user) = user.upgrade() {
+                    user.kick();
+                }
+            }
+        }
+        // 已停止成员使用图的控制等待源，private通知之外还须唤醒其原停驻登记。
+        self.control_waiters.wake_all();
+        loop {
+            let completed = {
+                let mut slots = self.slots.lock();
+                let process = self.exec_process(&mut slots, identity, owner)?;
+                if process.exec_owner != Some(owner) {
+                    return Err(ProcessError::Busy);
+                }
+                (process.members == 1).then(|| process.completed.take())
+            };
+            if let Some(mut completed) = completed {
+                // 成员已解绑资源；此处没有本栈Waiter，逐个确认真正归还执行栈。
+                while let Some(mut execution) = completed.take() {
+                    completed = execution.next.take();
+                    execution.join.join();
+                }
+                break;
+            }
+            let waiter = Waiter::new();
+            let mut node = pin!(WaitNode::new(waiter.waker()));
+            // SAFETY: 图和栈节点保活，登记先于node/waiter析构；登记后重查防止早通知。
+            let _registration = unsafe { self.control_waiters.register(node.as_mut()) };
+            {
+                let mut slots = self.slots.lock();
+                let process = self.exec_process(&mut slots, identity, owner)?;
+                if process.exec_owner != Some(owner) {
+                    return Err(ProcessError::Busy);
+                }
+                if process.members == 1 {
+                    continue;
+                }
+            }
+            waiter.park();
+        }
+        let released = {
+            let mut slots = self.slots.lock();
+            let process = self.exec_process(&mut slots, identity, owner)?;
+            if process.exec_owner != Some(owner) || process.members != 1 {
+                return Err(ProcessError::Busy);
+            }
+            process.leader_task_id = owner;
+            process.leader_status = None;
+            process.control_event = None;
+            identity.group.relations.lock().exit_signal = 17;
+            let mut tid = identity.tid.lock();
+            if Arc::ptr_eq(&tid, &identity.group.pid) {
+                (None, None)
+            } else {
+                let old_index = tid.number - 1;
+                let new_index = identity.tgid() - 1;
+                if slots[new_index].thread.is_some() {
+                    return Err(ProcessError::Busy);
+                }
+                slots[new_index].thread = slots[old_index].thread.take();
+                attach_role(&mut slots, &identity.group.pid, TID);
+                let old = core::mem::replace(&mut *tid, identity.group.pid.clone());
+                let released = detach_role(&mut slots, &old, TID);
+                (Some(old), released)
+            }
+        };
+        drop(released);
+        Ok(())
+    }
+
+    /// 新映像已在同一Task发表后释放exec控制，并记录父setpgid不可越过的exec边界。
+    pub(crate) fn complete_exec(&self, identity: &UserIdentity) -> Result<(), ProcessError> {
+        let owner = crate::task::current_task_id().ok_or(ProcessError::NoProcess)?;
+        {
+            let mut slots = self.slots.lock();
+            let process = self.exec_process(&mut slots, identity, owner)?;
+            if process.exec_owner != Some(owner)
+                || process.members != 1
+                || identity.tid() != identity.tgid()
+            {
+                return Err(ProcessError::Busy);
+            }
+            process.did_exec = true;
+            process.exec_owner = None;
+        }
+        self.control_waiters.wake_all();
+        Ok(())
+    }
+
+    /// 关系锁内核对原组、私有身份和当前实际Task，不把同号复用或组退出视为成功。
+    fn exec_process<'a>(
+        &self,
+        slots: &'a mut [Slot],
+        identity: &UserIdentity,
+        owner: TaskId,
+    ) -> Result<&'a mut ProcessEntry, ProcessError> {
+        if !ptr::eq(self, identity.graph.as_ref()) {
+            return Err(ProcessError::NoProcess);
+        }
+        let thread = slots
+            .get(
+                identity
+                    .tid()
+                    .checked_sub(1)
+                    .ok_or(ProcessError::NoProcess)?,
+            )
+            .and_then(|slot| slot.thread.as_ref())
+            .ok_or(ProcessError::NoProcess)?;
+        if !Arc::ptr_eq(&thread.group, &identity.group)
+            || !Arc::ptr_eq(&thread.signals, &identity.signals)
+            || thread.execution.join.task_id() != owner
+        {
+            return Err(ProcessError::NoProcess);
+        }
+        let process = slots
+            .get_mut(identity.tgid() - 1)
+            .and_then(|slot| slot.process.as_mut())
+            .filter(|process| Arc::ptr_eq(&process.group, &identity.group))
+            .ok_or(ProcessError::NoProcess)?;
+        if process.members == 0
+            || process.exit.is_some()
+            || identity.group.signals.exit_request().is_some()
+            || identity.signals.exec_exit_requested()
+        {
+            return Err(ProcessError::Busy);
+        }
+        Ok(process)
     }
 
     /// 解绑本成员运行资源后移出弱关联；最后成员才发表组事件并转亲，小完成观察保至回收。
@@ -469,8 +670,15 @@ impl TaskGraph {
                 "exiting stale group"
             );
             assert!(process.exit.is_none(), "exiting a reaped process");
-            if identity.tid() == identity.tgid() {
+            let task_id = execution.join.task_id();
+            if identity.tid() == identity.tgid()
+                && !signals.exec_exit_requested()
+                && !process.exec_owner.is_some_and(|owner| owner != task_id)
+            {
                 process.leader_status = Some(status);
+            }
+            if process.exec_owner == Some(task_id) {
+                process.exec_owner = None;
             }
             process.members = process
                 .members
@@ -489,12 +697,7 @@ impl TaskGraph {
             let stopped = group
                 .signals
                 .remove_member(&signals)
-                .map(|signum| ChildEvent {
-                    pid: group.tgid(),
-                    uid: group.uid,
-                    code: 5,
-                    status: signum as i32,
-                });
+                .map(|signum| child_event(&group, 5, signum as i32));
             if let Some(event) = stopped {
                 process.control_event = Some(event);
             }
@@ -512,13 +715,13 @@ impl TaskGraph {
                 cpu: crate::cpu::current().id,
             });
             let event = exit
-                .map(|exit| exit_child_event_number(exit.pid, exit.status, group.uid))
+                .map(|exit| exit_child_event(&group, exit.status))
                 .or(stopped);
             let parent_number = process.parent;
             let parent = parent_number
                 .and_then(|pid| slots[pid - 1].process.as_ref())
                 .map(|parent| parent.group.clone());
-            let released = detach_role(&mut slots, &identity.tid, TID);
+            let released = detach_role(&mut slots, &identity.tid_object(), TID);
             if last {
                 for slot in slots.iter_mut() {
                     if let Some(child) = slot.process.as_mut() {
@@ -548,6 +751,7 @@ impl TaskGraph {
             send_parent_event(parent.as_deref(), &group, event);
             self.waiters.wake_all();
         }
+        self.control_waiters.wake_all();
         drop(group);
     }
 
@@ -558,7 +762,7 @@ impl TaskGraph {
         pid: usize,
         nowait: bool,
     ) -> Result<Option<WaitEvent>, ProcessError> {
-        self.collect_child(parent, pid, nowait, None)
+        self.collect_child(parent, pid, nowait)
             .map(|child| child.map(|child| child.event))
     }
 
@@ -568,7 +772,6 @@ impl TaskGraph {
         parent: Option<&ThreadGroup>,
         pid: usize,
         nowait: bool,
-        expected: Option<&ThreadGroup>,
     ) -> Result<Option<CollectedChild>, ProcessError> {
         let collected = {
             let mut slots = self.slots.lock();
@@ -585,9 +788,6 @@ impl TaskGraph {
             if process.parent != parent_number {
                 return Err(ProcessError::NoChild);
             }
-            if expected.is_some_and(|expected| !ptr::eq(process.group.as_ref(), expected)) {
-                return Err(ProcessError::NoChild);
-            }
             let Some(event) = process.exit else {
                 return Ok(None);
             };
@@ -598,27 +798,12 @@ impl TaskGraph {
                     _released: [None, None, None],
                 }));
             }
-            assert_eq!(process.members, 0, "reaping a live group");
-            assert!(slot.thread.is_none(), "reaping a live leader");
-            let retired = slots[index]
-                .process
-                .take()
-                .expect("wait process disappeared");
-            let released = [
-                detach_role(&mut slots, &retired.group.pid, TGID),
-                detach_role(&mut slots, &retired.group.pgid, PGID),
-                detach_role(&mut slots, &retired.group.sid, SID),
-            ];
-            CollectedChild {
-                event,
-                process: Some(retired),
-                _released: released,
+            if let Some(parent) = parent {
+                parent.time.add_reaped_child(&process.group.time);
             }
+            reap_child(&mut slots, index)
         };
         self.waiters.wake_all();
-        if let (Some(parent), Some(process)) = (parent, collected.process.as_ref()) {
-            parent.time.add_reaped_child(&process.group.time);
-        }
         Ok(Some(collected))
     }
 
@@ -645,7 +830,7 @@ impl TaskGraph {
     ) -> Result<CollectedChild, ProcessError> {
         sched::assert_switchable();
         loop {
-            if let Some(collected) = self.collect_child(parent, pid, false, None)? {
+            if let Some(collected) = self.collect_child(parent, pid, false)? {
                 return Ok(collected);
             }
             let waiter = Waiter::new();
@@ -653,7 +838,7 @@ impl TaskGraph {
             // SAFETY: self借用保活固定源；node固定当前Task栈，registration先于
             // node/waiter析构，复查关闭早通知窗口，返回前撤链后才可等待成员join。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
-            if let Some(collected) = self.collect_child(parent, pid, false, None)? {
+            if let Some(collected) = self.collect_child(parent, pid, false)? {
                 return Ok(collected);
             }
             waiter.park();
@@ -720,12 +905,7 @@ impl TaskGraph {
                 .expect("unpublished member acknowledged signal control");
             assert!(Arc::ptr_eq(&thread.group, &identity.group));
             let (control, stopped) = thread.signals.acknowledge_control();
-            let event = stopped.map(|signum| ChildEvent {
-                pid: identity.tgid(),
-                uid: identity.group.uid,
-                code: 5,
-                status: signum as i32,
-            });
+            let event = stopped.map(|signum| child_event(&identity.group, 5, signum as i32));
             if let Some(event) = event {
                 slots[identity.tgid() - 1]
                     .process
@@ -742,44 +922,233 @@ impl TaskGraph {
         control
     }
 
-    /// 具体子PID的有限waitid只消费请求类型，WNOWAIT保留事件，不收取尚未停止完成的成员。
+    /// 同锁筛选全部亲缘、观察及唯一消费；WNOWAIT保留事件且不计入父的子CPU账。
     pub(crate) fn try_wait_event(
         &self,
         parent: &ThreadGroup,
-        pid: usize,
+        selector: &WaitSelector,
         options: u32,
     ) -> Result<Option<ChildEvent>, ProcessError> {
         const NOWAIT: u32 = 0x0100_0000;
-        let group = {
+        const WALL: u32 = 0x4000_0000;
+        const WCLONE: u32 = 0x8000_0000;
+        let mut retired = None;
+        let event = {
             let mut slots = self.slots.lock();
             let parent_number = self
                 .live_parent(&slots, parent)
                 .map_err(|_| ProcessError::NoChild)?;
-            let process = slots
-                .get_mut(pid.checked_sub(1).ok_or(ProcessError::NoChild)?)
-                .and_then(|slot| slot.process.as_mut())
-                .ok_or(ProcessError::NoChild)?;
-            if process.parent != Some(parent_number) {
-                return Err(ProcessError::NoChild);
-            }
-            if options & 4 != 0 && process.exit.is_some() {
-                process.group.clone()
-            } else {
-                let event = process.control_event.filter(|event| {
+            let mut eligible = false;
+            let mut selected = None;
+            for index in 0..slots.len() {
+                let Some(process) = slots[index].process.as_ref() else {
+                    continue;
+                };
+                if process.parent != Some(parent_number) {
+                    continue;
+                }
+                let matches = match selector {
+                    WaitSelector::Pid(pid) => Arc::ptr_eq(&process.group.pid, pid),
+                    WaitSelector::Group(pgid) => {
+                        Arc::ptr_eq(&process.group.relations.lock().pgid, pgid)
+                    }
+                    WaitSelector::Any => true,
+                };
+                let clone = process.group.relations.lock().exit_signal != 17;
+                if !matches || (options & WALL == 0 && clone != (options & WCLONE != 0)) {
+                    continue;
+                }
+                eligible = true;
+                if options & 4 != 0 {
+                    if let Some(exit) = process.exit {
+                        selected = Some(exit_child_event(&process.group, exit.status));
+                        if options & NOWAIT == 0 {
+                            parent.time.add_reaped_child(&process.group.time);
+                            retired = Some(reap_child(&mut slots, index));
+                        }
+                        break;
+                    }
+                }
+                let control = process.control_event.filter(|event| {
                     (event.code == 5 && options & 2 != 0) || (event.code == 6 && options & 8 != 0)
                 });
-                if event.is_some() && options & NOWAIT == 0 {
-                    process.control_event = None;
+                if let Some(event) = control {
+                    selected = Some(event);
+                    if options & NOWAIT == 0 {
+                        slots[index]
+                            .process
+                            .as_mut()
+                            .expect("selected process disappeared")
+                            .control_event = None;
+                    }
+                    break;
                 }
-                return Ok(event);
             }
+            if !eligible {
+                return Err(ProcessError::NoChild);
+            }
+            selected
         };
-        self.collect_child(Some(parent), pid, options & NOWAIT != 0, Some(&group))
-            .map(|child| {
-                child.map(|child| {
-                    exit_child_event_number(child.event.pid, child.event.status, group.uid)
-                })
-            })
+        if retired.is_some() {
+            self.waiters.wake_all();
+        }
+        drop(retired);
+        Ok(event)
+    }
+
+    /// 活父仍属于原亲缘组时返回其TGID；内核根回收者没有用户PID。
+    pub(crate) fn parent_pid(&self, identity: &UserIdentity) -> usize {
+        let slots = self.slots.lock();
+        if !ptr::eq(self, identity.graph.as_ref()) {
+            return 0;
+        }
+        slots
+            .get(identity.tgid() - 1)
+            .and_then(|slot| slot.process.as_ref())
+            .filter(|process| Arc::ptr_eq(&process.group, &identity.group))
+            .and_then(|process| process.parent)
+            .and_then(|pid| slots[pid - 1].process.as_ref())
+            .filter(|parent| parent.members != 0)
+            .map_or(0, |parent| parent.group.tgid())
+    }
+
+    /// pid为零查询本组，否则允许查询仍发表的TID或僵尸组首。
+    pub(crate) fn get_pgid(
+        &self,
+        caller: &UserIdentity,
+        pid: usize,
+    ) -> Result<usize, ProcessError> {
+        let slots = self.slots.lock();
+        let group = self.identity_target(&slots, caller, pid)?;
+        Ok(group.pgid())
+    }
+
+    /// 查询有限身份域的会话角色，零选择调用者原组。
+    pub(crate) fn get_sid(&self, caller: &UserIdentity, pid: usize) -> Result<usize, ProcessError> {
+        let slots = self.slots.lock();
+        let group = self.identity_target(&slots, caller, pid)?;
+        Ok(group.sid())
+    }
+
+    /// 关系锁内验证调用者原组，数字查询只命中当前实际发表的身份。
+    fn identity_target<'a>(
+        &self,
+        slots: &'a [Slot],
+        caller: &UserIdentity,
+        pid: usize,
+    ) -> Result<&'a ThreadGroup, ProcessError> {
+        self.live_parent(slots, &caller.group)
+            .map_err(|_| ProcessError::NoProcess)?;
+        let pid = if pid == 0 { caller.tgid() } else { pid };
+        let slot = slots.get(pid - 1).ok_or(ProcessError::NoProcess)?;
+        slot.process
+            .as_ref()
+            .map(|process| process.group.as_ref())
+            .or_else(|| slot.thread.as_ref().map(|thread| thread.group.as_ref()))
+            .ok_or(ProcessError::NoProcess)
+    }
+
+    /// 只允许本组或同会话的直接子改变PGID；已exec子、会话首和跨会话加入被拒绝。
+    pub(crate) fn set_pgid(
+        &self,
+        caller: &UserIdentity,
+        pid: usize,
+        pgid: usize,
+    ) -> Result<(), ProcessError> {
+        if pid > i32::MAX as usize || pgid > i32::MAX as usize {
+            return Err(ProcessError::InvalidArgument);
+        }
+        let released = {
+            let mut slots = self.slots.lock();
+            self.live_parent(&slots, &caller.group)
+                .map_err(|_| ProcessError::NoProcess)?;
+            let pid = if pid == 0 { caller.tgid() } else { pid };
+            let pgid = if pgid == 0 { pid } else { pgid };
+            let index = pid - 1;
+            let slot = slots.get(index).ok_or(ProcessError::NoProcess)?;
+            let process = match slot.process.as_ref() {
+                Some(process) => process,
+                None if slot.thread.is_some() => return Err(ProcessError::InvalidArgument),
+                None => return Err(ProcessError::NoProcess),
+            };
+            if process.members == 0 {
+                return Err(ProcessError::NoProcess);
+            }
+            let child = process.parent == Some(caller.tgid());
+            if pid != caller.tgid() && !child {
+                return Err(ProcessError::NoProcess);
+            }
+            let group = process.group.clone();
+            let caller_sid = caller.group.relations.lock().sid.clone();
+            if child {
+                if !Arc::ptr_eq(&group.relations.lock().sid, &caller_sid) {
+                    return Err(ProcessError::Permission);
+                }
+                if process.did_exec || process.exec_owner.is_some() {
+                    return Err(ProcessError::Access);
+                }
+            }
+            if Arc::ptr_eq(&group.relations.lock().sid, &group.pid) {
+                return Err(ProcessError::Permission);
+            }
+            let new_pgid = if pgid == pid {
+                group.pid.clone()
+            } else {
+                let slot = slots.get(pgid - 1).ok_or(ProcessError::Permission)?;
+                let target = slot
+                    .pid
+                    .as_ref()
+                    .filter(|_| slot.roles[PGID] != 0)
+                    .ok_or(ProcessError::Permission)?;
+                let same_session =
+                    slots
+                        .iter()
+                        .filter_map(|slot| slot.process.as_ref())
+                        .any(|process| {
+                            let relations = process.group.relations.lock();
+                            Arc::ptr_eq(&relations.pgid, target)
+                                && Arc::ptr_eq(&relations.sid, &caller_sid)
+                        });
+                if !same_session {
+                    return Err(ProcessError::Permission);
+                }
+                target.clone()
+            };
+            let mut relations = group.relations.lock();
+            if Arc::ptr_eq(&relations.pgid, &new_pgid) {
+                return Ok(());
+            }
+            attach_role(&mut slots, &new_pgid, PGID);
+            let old = core::mem::replace(&mut relations.pgid, new_pgid);
+            let released = detach_role(&mut slots, &old, PGID);
+            (old, released)
+        };
+        drop(released);
+        Ok(())
+    }
+
+    /// 当前组不是会话首且本TGID无外部PGID角色时建立新会话，不实现TTY扩展。
+    pub(crate) fn create_session(&self, caller: &UserIdentity) -> Result<usize, ProcessError> {
+        let released = {
+            let mut slots = self.slots.lock();
+            self.live_parent(&slots, &caller.group)
+                .map_err(|_| ProcessError::NoProcess)?;
+            let group = &caller.group;
+            let mut relations = group.relations.lock();
+            if Arc::ptr_eq(&relations.sid, &group.pid) || slots[caller.tgid() - 1].roles[PGID] != 0
+            {
+                return Err(ProcessError::Permission);
+            }
+            attach_role(&mut slots, &group.pid, PGID);
+            attach_role(&mut slots, &group.pid, SID);
+            let old_pgid = core::mem::replace(&mut relations.pgid, group.pid.clone());
+            let old_sid = core::mem::replace(&mut relations.sid, group.pid.clone());
+            let pgid = detach_role(&mut slots, &old_pgid, PGID);
+            let sid = detach_role(&mut slots, &old_sid, SID);
+            (old_pgid, old_sid, pgid, sid)
+        };
+        drop(released);
+        Ok(caller.tgid())
     }
 
     /// kill按真实进程、进程组或全域选目标，零信号只执行存在性与权限检查。
@@ -959,12 +1328,7 @@ impl TaskGraph {
                     .map(|thread| &thread.signals),
             )?;
             if continued {
-                let event = ChildEvent {
-                    pid: group.tgid(),
-                    uid: group.uid,
-                    code: 6,
-                    status: 18,
-                };
+                let event = child_event(group, 6, 18);
                 slots[group.tgid() - 1]
                     .process
                     .as_mut()
@@ -1035,12 +1399,7 @@ impl TaskGraph {
                     .map(|thread| &thread.signals),
             )?;
             let event = if continued {
-                let event = ChildEvent {
-                    pid: group.tgid(),
-                    uid: group.uid,
-                    code: 6,
-                    status: 18,
-                };
+                let event = child_event(&group, 6, 18);
                 slots[group.tgid() - 1]
                     .process
                     .as_mut()
@@ -1168,16 +1527,35 @@ impl PreparedIdentity {
         execution: Box<PreparedExecution>,
     ) -> Result<(), ProcessError> {
         let graph = self.reservation.graph.clone();
+        let mut old_relations = None;
         {
             let mut slots = graph.slots.lock();
             let leader = self.identity.tid() == self.identity.tgid();
             let parent = if leader {
                 match self.parent.as_ref() {
-                    Some(parent) => Some(graph.live_parent(&slots, parent)?),
+                    Some(parent) => {
+                        let number = graph.live_parent(&slots, parent)?;
+                        let inherited = parent.relations.lock();
+                        let mut relations = self.identity.group.relations.lock();
+                        old_relations = Some((
+                            core::mem::replace(&mut relations.pgid, inherited.pgid.clone()),
+                            core::mem::replace(&mut relations.sid, inherited.sid.clone()),
+                        ));
+                        Some(number)
+                    }
                     None => None,
                 }
             } else {
                 graph.live_parent(&slots, &self.identity.group)?;
+                if slots[self.identity.tgid() - 1]
+                    .process
+                    .as_ref()
+                    .expect("live group disappeared")
+                    .exec_owner
+                    .is_some()
+                {
+                    return Err(ProcessError::Busy);
+                }
                 None
             };
             let index = self.reservation.index;
@@ -1189,8 +1567,9 @@ impl PreparedIdentity {
             );
             let task_id = execution.join.task_id();
             slots[index].reserved = false;
-            slots[index].pid = Some(self.identity.tid.clone());
-            attach_role(&mut slots, &self.identity.tid, TID);
+            let tid = self.identity.tid_object();
+            slots[index].pid = Some(tid.clone());
+            attach_role(&mut slots, &tid, TID);
             slots[index].thread = Some(ThreadEntry {
                 user,
                 group: self.identity.group.clone(),
@@ -1200,14 +1579,17 @@ impl PreparedIdentity {
             self.identity.group.signals.add_member();
             if leader {
                 attach_role(&mut slots, &self.identity.group.pid, TGID);
-                attach_role(&mut slots, &self.identity.group.pgid, PGID);
-                attach_role(&mut slots, &self.identity.group.sid, SID);
+                let relations = self.identity.group.relations.lock();
+                attach_role(&mut slots, &relations.pgid, PGID);
+                attach_role(&mut slots, &relations.sid, SID);
                 slots[index].process = Some(ProcessEntry {
                     group: self.identity.group.clone(),
                     parent,
                     members: 1,
                     leader_task_id: task_id,
                     leader_status: None,
+                    exec_owner: None,
+                    did_exec: false,
                     user_interrupts: 0,
                     user_timer_interrupts: 0,
                     completed: None,
@@ -1226,6 +1608,7 @@ impl PreparedIdentity {
             }
             self.reservation.active = false;
         }
+        drop(old_relations);
         Ok(())
     }
 }
@@ -1290,23 +1673,66 @@ fn signal_permission(sender: &UserIdentity, target: &ThreadGroup, signum: u8) ->
 }
 
 /// 把普通Linux退出状态转成waitid字段，不把编码后的status误作si_status。
-fn exit_child_event_number(pid: usize, status: i32, uid: u32) -> ChildEvent {
+fn exit_child_event(group: &ThreadGroup, status: i32) -> ChildEvent {
     let signal = status & 0x7f;
-    ChildEvent {
-        pid,
-        uid,
-        code: if signal == 0 {
+    child_event(
+        group,
+        if signal == 0 {
             1
         } else if status & 0x80 != 0 {
             3
         } else {
             2
         },
-        status: if signal == 0 {
+        if signal == 0 {
             (status >> 8) & 0xff
         } else {
             signal
         },
+    )
+}
+
+/// 事件产生时快照真实组账与已消费后代账，不依赖诊断引用或线程数估算。
+fn child_event(group: &ThreadGroup, code: i32, status: i32) -> ChildEvent {
+    let own = group.time.snapshot();
+    let descendants = group.time.children();
+    ChildEvent {
+        pid: group.tgid(),
+        uid: group.uid,
+        code,
+        status,
+        user_ns: own
+            .user_ns
+            .checked_add(descendants.user_ns)
+            .expect("child user time overflow"),
+        kernel_ns: own
+            .kernel_ns
+            .checked_add(descendants.kernel_ns)
+            .expect("child kernel time overflow"),
+    }
+}
+
+/// 图锁内唯一移走退出进程并解绑全部角色，移出的小拥有在锁外释放或join。
+fn reap_child(slots: &mut [Slot], index: usize) -> CollectedChild {
+    let retired = slots[index]
+        .process
+        .take()
+        .expect("wait process disappeared");
+    assert_eq!(retired.members, 0, "reaping a live group");
+    assert!(slots[index].thread.is_none(), "reaping a live leader");
+    let event = retired.exit.expect("reaping without exit event");
+    let released = {
+        let relations = retired.group.relations.lock();
+        [
+            detach_role(slots, &retired.group.pid, TGID),
+            detach_role(slots, &relations.pgid, PGID),
+            detach_role(slots, &relations.sid, SID),
+        ]
+    };
+    CollectedChild {
+        event,
+        process: Some(retired),
+        _released: released,
     }
 }
 
@@ -1314,14 +1740,13 @@ fn exit_child_event_number(pid: usize, status: i32, uid: u32) -> ChildEvent {
 fn send_parent_event(parent: Option<&ThreadGroup>, group: &ThreadGroup, event: ChildEvent) {
     if let Some(parent) = parent {
         let signum = if matches!(event.code, 1..=3) {
-            group.exit_signal
+            group.relations.lock().exit_signal
         } else {
             17
         };
         if signum == 0 {
             return;
         }
-        let time = group.time.snapshot();
         parent.signals.send_child(SignalInfo {
             signum,
             errno: 0,
@@ -1330,8 +1755,8 @@ fn send_parent_event(parent: Option<&ThreadGroup>, group: &ThreadGroup, event: C
                 pid: event.pid,
                 uid: event.uid,
                 status: event.status,
-                user_ticks: time.user_ns / (1_000_000_000 / USER_HZ),
-                kernel_ticks: time.kernel_ns / (1_000_000_000 / USER_HZ),
+                user_ticks: event.user_ns / (1_000_000_000 / USER_HZ),
+                kernel_ticks: event.kernel_ns / (1_000_000_000 / USER_HZ),
             },
         });
     }

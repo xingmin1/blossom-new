@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use core::mem;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::fs::file::{O_DIRECTORY, O_NOFOLLOW};
 use crate::fs::{
@@ -39,6 +40,7 @@ enum Slot {
 pub struct FileTable {
     slots: SpinLock<Vec<Slot>>,
     capacity: usize,
+    users: AtomicUsize,
 }
 
 /// 借用原表的单次预留责任；移动后只能发表一次，未发表的析构释放原槽。
@@ -62,6 +64,7 @@ impl FileTable {
         Ok(Self {
             slots: SpinLock::new(slots),
             capacity,
+            users: AtomicUsize::new(0),
         })
     }
 
@@ -81,6 +84,26 @@ impl FileTable {
             }
         }
         Ok(child)
+    }
+
+    /// 增加真实运行绑定责任，普通表引用与诊断拥有不参与计数。
+    pub(crate) fn add_user(&self) {
+        self.users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .expect("file table user count overflow");
+    }
+
+    /// 归还真实运行绑定，表与文件的最后引用由调用者在短锁外释放。
+    pub(crate) fn remove_user(&self) {
+        let previous = self.users.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "file table user count underflow");
+    }
+
+    /// 返回真实运行绑定数，不将诊断引用误判为共享描述符表的执行者。
+    pub(crate) fn user_count(&self) -> usize {
+        self.users.load(Ordering::Acquire)
     }
 
     /// 返回构造时固定的槽数，预留和复制描述符都不能扩大它。
@@ -207,6 +230,22 @@ impl FileTable {
         };
         drop(old);
         Ok(())
+    }
+
+    /// 逐槽移出带CLOEXEC的打开文件，锁外最后释放，不分配或改变固定容量。
+    pub fn close_on_exec(&self) {
+        for fd in 0..self.capacity {
+            let old = {
+                let mut slots = self.slots.lock();
+                let slot = &mut slots[fd];
+                if matches!(slot, Slot::Open { flags, .. } if flags.close_on_exec) {
+                    Some(mem::replace(slot, Slot::Vacant))
+                } else {
+                    None
+                }
+            };
+            drop(old);
+        }
     }
 
     /// 内核最小空号复制清除新描述符 CLOEXEC，仍共享原 OFD。
