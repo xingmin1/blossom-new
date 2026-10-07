@@ -181,6 +181,9 @@ _start:
     MODE 103, .Lgroup
     MODE 112, .Lparent
     MODE 119, .Lwait
+    MODE 100, .Lautoreap
+    MODE 101, .Lautoreap
+    MODE 97, .Lautoreap
     MODE 117, .Lproduction
     li.d $s8, 9
     b .Lexit
@@ -664,6 +667,120 @@ _start:
     WAIT 12, 5
     b .Lpass
 
+# /// SIGCHLD处置由普通syscall设置；存活WNOHANG与离栈后的wait结果分阶段判定。
+# 控制页0=child PID、8=phase、12=go、24=存活wait、28=退出wait、32=status、40=sigtimedwait。
+.Lautoreap:
+    Z
+    la.local $a1, .Lchld_mask
+    li.d $a3, 8
+    SC 135
+    CHECK $a0, 0, 210
+    la.local $t1, .Lchld_action
+    MODE 101, .Lautoreap_ignore
+    MODE 97, .Lautoreap_nocldwait
+    b .Lautoreap_action
+.Lautoreap_ignore:
+    li.d $t0, 1
+    st.d $t0, $t1, 0
+    b .Lautoreap_action
+.Lautoreap_nocldwait:
+    la.local $t0, .Lhandler
+    st.d $t0, $t1, 0
+    li.d $t0, 2
+    st.d $t0, $t1, 8
+.Lautoreap_action:
+    Z
+    li.d $a0, 17
+    move $a1, $t1
+    li.d $a3, 8
+    SC 134
+    CHECK $a0, 0, 211
+    CLONE 0x100011, .Lstack0_top, 0, -1, .Lautoreap_child, 212
+    la.local $t1, .Lstatus
+    li.d $t0, 0x5a5a
+    st.w $t0, $t1, 0
+    Z
+    move $a0, $s3
+    la.local $a1, .Lstatus
+    li.d $a2, 1
+    SC 260
+    dbar 0
+    st.w $a0, $s0, 24
+    CHECK $a0, 0, 213
+    la.local $t1, .Lstatus
+    ld.w $t2, $t1, 0
+    CHECK $t2, 0x5a5a, 214
+    STORE 8, 1
+    # go=2只在夹具确认原Task已释放执行栈后发布，不拿child_tid清零猜退出。
+    WAIT 12, 2
+    Z
+    move $a0, $s3
+    la.local $a1, .Lstatus
+    li.d $a2, 1
+    SC 260
+    move $s4, $a0
+    la.local $t1, .Lstatus
+    ld.w $s5, $t1, 0
+    Z
+    la.local $a0, .Lchld_mask
+    la.local $a1, .Linfo
+    la.local $a2, .Lzero_time
+    li.d $a3, 8
+    SC 137
+    move $s6, $a0
+    dbar 0
+    st.w $s4, $s0, 28
+    st.w $s5, $s0, 32
+    st.w $s6, $s0, 40
+    STORE 8, 3
+    WAIT 12, 3
+    # 错误结果仍走原退出/wait/join，phase=3不表示测试通过。
+    MODE 100, .Lautoreap_default_result
+    CHECK $s4, -10, 220
+    MODE 101, .Lautoreap_ignore_result
+    CHECK $s6, 17, 221
+    la.local $t1, .Linfo
+    ld.w $t2, $t1, 0
+    CHECK $t2, 17, 222
+    ld.w $t2, $t1, 8
+    CHECK $t2, 1, 223
+    ld.w $t2, $t1, 16
+    EQ $t2, $s3, 224
+    ld.w $t2, $t1, 24
+    CHECK $t2, 23, 225
+    Z
+    la.local $a0, .Lchld_mask
+    la.local $a2, .Lzero_time
+    li.d $a3, 8
+    SC 137
+    CHECK $a0, -11, 227
+    b .Lpass
+.Lautoreap_ignore_result:
+    CHECK $s6, -11, 226
+    b .Lpass
+.Lautoreap_default_result:
+    EQ $s4, $s3, 217
+    CHECK $s5, 0x1700, 218
+    Z
+    move $a0, $s3
+    li.d $a2, 1
+    SC 260
+    CHECK $a0, -10, 219
+    b .Lpass
+
+# /// 子只等待原共享匿名futex再正常exit(23)，父处置不改变实际执行者的离栈责任。
+.Lautoreap_child:
+    Z
+    addi.d $a0, $s0, 12
+    SC 98
+    CHECK $a0, 0, 215
+    WAIT 12, 1
+    Z
+    li.d $a0, 23
+    SC 93
+    li.d $s8, 216
+    b .Lexit
+
 # /// WNOHANG不制造事件或改写wait4输出；两个WNOWAIT观察相同最终快照。
 .Lwait:
     CLONE 0x100011, .Lstack0_top, 0, -1, .Lwait_cpu, 140
@@ -959,6 +1076,8 @@ _start:
 .Largv_U: .quad .Lself, .Lmode_U, 0
 .Lenv: .quad .Lexec_env, 0
 .Lusr1_mask: .quad 0x200
+.Lchld_mask: .quad 0x10000
+.Lchld_action: .quad 0, 0, 0
 .Lcatch_action: .quad .Lhandler, 4, 0x800
 .Lignore_action: .quad 1, 0x10000000, 0x800
 .Ltimer_on: .quad 0, 0, 3, 0

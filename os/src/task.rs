@@ -173,6 +173,15 @@ impl Task {
         self.id
     }
 
+    /// 保存同一离栈完成事实，不延长执行者或运行栈的寿命。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn join_observer(&self) -> JoinObserver {
+        JoinObserver {
+            id: self.id,
+            join: Arc::clone(&self.join),
+        }
+    }
+
     /// 读取各次真实在 CPU 执行并已结算的总时长，不包含离 CPU 的等待。
     pub fn execution_time(&self) -> Duration {
         Duration::from_nanos(self.execution_ns.load(Ordering::Relaxed))

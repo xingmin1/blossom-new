@@ -372,4 +372,60 @@ impl UserOwner {
         ));
         Ok(())
     }
+
+    /// 独立Join观察保留本例离栈清理责任，自动回收不依赖图中的退出对象。
+    pub(super) fn lifecycle_child_left_stack(&mut self) -> Result<Option<i32>, TestError> {
+        if let Some(observer) = &self.lifecycle_child {
+            until("自动回收子尚未离栈", || {
+                observer.try_join().is_some()
+            })?;
+        }
+        Ok(self.lifecycle_child.take().map(|observer| observer.join()))
+    }
+
+    /// 子在原futex阻塞时核WNOHANG，真实离栈后才允许用户区分退出状态与ECHILD。
+    pub(super) fn lifecycle_sigchld(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        for mode in [b"d" as &[u8], b"e", b"a"] {
+            let (mm, root) = self.start_lifecycle(context, mode)?;
+            Self::lifecycle_checkpoint(&mm, &root, 8, 1)?;
+            let child = self.futex_child(&mm, 0)?;
+            let child_mm = child.mm().ok_or(TestError("自动回收子Mm提前解除"))?;
+            let executor = child
+                .executor()
+                .ok_or(TestError("自动回收子执行者提前解除"))?;
+            let task_id = executor.id();
+            self.lifecycle_child = Some(executor.join_observer());
+            drop(executor);
+            Self::futex_waiting(&child_mm, &child, FUTEX_CONTROL + 12, false, u32::MAX)?;
+            context.expect_eq(mm.load_user_u32(FUTEX_CONTROL + 24), Ok(0));
+            Self::lifecycle_go(&mm, 1)?;
+            let count = futex::wake(&mm, FUTEX_CONTROL + 12, false, 1, u32::MAX)
+                .map_err(|_| TestError("自动回收子真实futex唤醒失败"))?;
+            context.expect_eq(count, 1);
+            context.expect_eq(self.lifecycle_child_left_stack()?, Some(23 << 8));
+            context.expect_eq(child.mm().is_none(), true);
+            context.expect_eq(child.runtime().is_none(), true);
+            context.expect_eq(child_mm.user_count(), 0);
+            Self::lifecycle_go(&mm, 2)?;
+            Self::lifecycle_checkpoint(&mm, &root, 8, 3)?;
+            let wait_result =
+                mm.load_user_u32(FUTEX_CONTROL + 28)
+                    .map_err(|_| TestError("自动回收用户wait结果不可读"))? as i32;
+            let wait_status = mm
+                .load_user_u32(FUTEX_CONTROL + 32)
+                .map_err(|_| TestError("自动回收用户wait状态不可读"))?;
+            let signal_result =
+                mm.load_user_u32(FUTEX_CONTROL + 40)
+                    .map_err(|_| TestError("自动回收用户信号结果不可读"))? as i32;
+            context.diagnostic(format_args!(
+                "user-sigchld mode={:?} child-task={} alive-wnohang=0 child-left-stack=1 wait-result={} wait-status={} signal-result={}",
+                mode, task_id.as_usize(), wait_result, wait_status, signal_result
+            ));
+            Self::lifecycle_go(&mm, 3)?;
+            let event = self.finish_lifecycle(context, mode)?;
+            context.expect_eq(event.status, 0);
+            context.expect_eq(mm.user_count(), 0);
+        }
+        Ok(())
+    }
 }

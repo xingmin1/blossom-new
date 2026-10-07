@@ -628,7 +628,7 @@ impl TaskGraph {
         Ok(process)
     }
 
-    /// 解绑本成员运行资源后移出弱关联；最后成员才发表组事件并转亲，小完成观察保至回收。
+    /// 最后成员在锁外停稳定时器后重查父关系，按父当前处置发表退出或移出回收拥有。
     pub(crate) fn exit(
         &self,
         identity: &UserIdentity,
@@ -646,7 +646,7 @@ impl TaskGraph {
                 && (status & 0xff == 0 || (status & 0xff00 == 0 && (1..=64).contains(&signal))),
             "invalid Linux exit status"
         );
-        let (user, group, released, exit, event, parent) = {
+        let (user, group, released, exit, stopped, parent) = {
             let mut slots = self.slots.lock();
             let ThreadEntry {
                 user,
@@ -714,10 +714,7 @@ impl TaskGraph {
                 task_id: process.leader_task_id,
                 cpu: crate::cpu::current().id,
             });
-            let event = exit
-                .map(|exit| exit_child_event(&group, exit.status))
-                .or(stopped);
-            let parent_number = process.parent;
+            let parent_number = if last { None } else { process.parent };
             let parent = parent_number
                 .and_then(|pid| slots[pid - 1].process.as_ref())
                 .map(|parent| parent.group.clone());
@@ -731,24 +728,51 @@ impl TaskGraph {
                     }
                 }
             }
-            (user, group, released, exit, event, parent)
+            (user, group, released, exit, stopped, parent)
         };
         drop(user);
         drop(released);
         if let Some(exit) = exit {
             // 先在锁外确认定时回调尾部，随后才允许用户wait回收组身份与时间拥有。
             group.time.stop();
-            let mut slots = self.slots.lock();
-            let process = slots[identity.tgid() - 1]
-                .process
-                .as_mut()
-                .expect("last exiting group disappeared before timer stop");
-            assert!(Arc::ptr_eq(&process.group, &group));
-            assert_eq!(process.members, 0);
-            process.exit = Some(exit);
-        }
-        if let Some(event) = event {
-            send_parent_event(parent.as_deref(), &group, event);
+            let (parent, retired) = {
+                let mut slots = self.slots.lock();
+                let process = slots[identity.tgid() - 1]
+                    .process
+                    .as_mut()
+                    .expect("last exiting group disappeared before timer stop");
+                assert!(Arc::ptr_eq(&process.group, &group));
+                assert_eq!(process.members, 0);
+                let parent_number = process.parent;
+                process.exit = Some(exit);
+                // 父可能在timer.stop期间最后退出并转亲；最终发布只使用此刻的关系与动作表。
+                let signum = group.relations.lock().exit_signal;
+                let parent = parent_number
+                    .filter(|_| signum == 17)
+                    .and_then(|pid| slots[pid - 1].process.as_ref())
+                    .map(|parent| parent.group.clone());
+                let autoreap = parent.as_ref().is_some_and(|parent| {
+                    parent.signals.deliver_child_exit(
+                        child_signal_info(17, exit_child_event(&group, exit.status)),
+                        slots
+                            .iter()
+                            .filter_map(|slot| slot.thread.as_ref())
+                            .filter(|thread| Arc::ptr_eq(&thread.group, parent))
+                            .map(|thread| &thread.signals),
+                    )
+                });
+                let retired = autoreap.then(|| reap_child(&mut slots, identity.tgid() - 1));
+                (parent, retired)
+            };
+            if let Some(parent) = parent {
+                parent.signals.notify();
+            }
+            // 无退出信号或已自动回收仍须唤醒原wait，让其重查事件或返回ECHILD。
+            self.waiters.wake_all();
+            // 小完成观察只释放不join；scheduler继续持有本Task与栈至真实离栈。
+            drop(retired);
+        } else if let Some(event) = stopped {
+            send_parent_event(parent.as_deref(), event);
             self.waiters.wake_all();
         }
         self.control_waiters.wake_all();
@@ -1480,7 +1504,7 @@ impl TaskGraph {
         self.control_waiters.wake_all();
     }
 
-    /// 父关系快照只在图锁中取得，SIGCHLD编码、发送、等待通知全部在锁外。
+    /// 控制事件的父关系快照在图锁中取得，SIGCHLD发送与等待通知仍在锁外。
     fn notify_parent(&self, group: &ThreadGroup, event: ChildEvent) {
         let parent = {
             let slots = self.slots.lock();
@@ -1491,7 +1515,7 @@ impl TaskGraph {
                 .and_then(|pid| slots[pid - 1].process.as_ref())
                 .map(|process| process.group.clone())
         };
-        send_parent_event(parent.as_deref(), group, event);
+        send_parent_event(parent.as_deref(), event);
     }
 
     /// 同关系锁核对原组身份和实际活成员；旧组对象与同号新组不能互为父子。
@@ -1736,28 +1760,25 @@ fn reap_child(slots: &mut [Slot], index: usize) -> CollectedChild {
     }
 }
 
-/// 父拥有已在图锁中稳定取得，退出信号与停止/继续通知各按事件语义锁外发送。
-fn send_parent_event(parent: Option<&ThreadGroup>, group: &ThreadGroup, event: ChildEvent) {
+/// 控制事件保留原SA_NOCLDSTOP发送路径，不参与退出处置和自动回收事务。
+fn send_parent_event(parent: Option<&ThreadGroup>, event: ChildEvent) {
     if let Some(parent) = parent {
-        let signum = if matches!(event.code, 1..=3) {
-            group.relations.lock().exit_signal
-        } else {
-            17
-        };
-        if signum == 0 {
-            return;
-        }
-        parent.signals.send_child(SignalInfo {
-            signum,
-            errno: 0,
-            code: event.code,
-            payload: SignalPayload::Child {
-                pid: event.pid,
-                uid: event.uid,
-                status: event.status,
-                user_ticks: event.user_ns / (1_000_000_000 / USER_HZ),
-                kernel_ticks: event.kernel_ns / (1_000_000_000 / USER_HZ),
-            },
-        });
+        parent.signals.send_child(child_signal_info(17, event));
+    }
+}
+
+/// 由同一子事件编码退出与控制通知的siginfo，CPU账按公开USER_HZ换算。
+fn child_signal_info(signum: u8, event: ChildEvent) -> SignalInfo {
+    SignalInfo {
+        signum,
+        errno: 0,
+        code: event.code,
+        payload: SignalPayload::Child {
+            pid: event.pid,
+            uid: event.uid,
+            status: event.status,
+            user_ticks: event.user_ns / (1_000_000_000 / USER_HZ),
+            kernel_ticks: event.kernel_ns / (1_000_000_000 / USER_HZ),
+        },
     }
 }

@@ -18,7 +18,9 @@ pub(crate) const SA_NODEFER: usize = 0x4000_0000;
 pub(crate) const SA_RESETHAND: usize = 0x8000_0000;
 pub(crate) const SS_ONSTACK: u32 = 1;
 pub(crate) const SS_DISABLE: u32 = 2;
-const ACTION_FLAGS: usize = 1 | 2 | 4 | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
+const SA_NOCLDWAIT: usize = 2;
+const ACTION_FLAGS: usize =
+    1 | SA_NOCLDWAIT | 4 | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
 const STOP_MASK: u64 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21);
 const RT_CAPACITY: usize = 64;
 
@@ -456,7 +458,26 @@ impl SignalGroup {
         let bit = signal_bit(info.signum)?;
         let binding = self.sighand.lock();
         let actions = binding.actions.lock();
-        let action = actions[info.signum as usize - 1];
+        self.deliver_locked(
+            info,
+            bit,
+            actions[info.signum as usize - 1],
+            target,
+            queued,
+            threads,
+        )
+    }
+
+    /// 调用者持续持有canonical绑定锁与动作锁，普通发送和子退出共用同一pending及控制事务。
+    fn deliver_locked<'a>(
+        &self,
+        info: SignalInfo,
+        bit: u64,
+        action: SignalAction,
+        target: Option<&ThreadSignals>,
+        queued: bool,
+        threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
+    ) -> Result<bool, SignalError> {
         let mut group = self.state.lock();
         if group.members == 0 || group.exit.is_some() {
             return Ok(false);
@@ -506,6 +527,26 @@ impl SignalGroup {
             }
         }
         Ok(continued)
+    }
+
+    /// 图锁内以父当前处置决定本次SIGCHLD自动回收，同锁发布pending，显式忽略即使blocked也不发送。
+    pub(super) fn deliver_child_exit<'a>(
+        &self,
+        info: SignalInfo,
+        threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
+    ) -> bool {
+        assert!(info.signum == 17 && matches!(info.code, 1..=3));
+        let binding = self.sighand.lock();
+        let actions = binding.actions.lock();
+        let action = actions[16];
+        let autoreap = action.handler == 1 || action.flags & SA_NOCLDWAIT != 0;
+        if action.handler != 1 {
+            match self.deliver_locked(info, 1 << 16, action, None, false, threads) {
+                Ok(_) => {}
+                Err(error) => panic!("ordinary child signal failed: {:?}", error),
+            }
+        }
+        autoreap
     }
 
     /// 动作替换与当前组pending丢弃同锁执行，共享处置的其他组仍保各自pending拥有。
@@ -559,7 +600,7 @@ impl SignalGroup {
         exit
     }
 
-    /// 父SIGCHLD的停止/继续通知遵守SA_NOCLDSTOP，退出仍正常发送。
+    /// 父停止/继续通知遵守SA_NOCLDSTOP，沿原锁外发送路径处理SIGCHLD。
     pub(crate) fn send_child(&self, info: SignalInfo) {
         let suppress = {
             let binding = self.sighand.lock();

@@ -199,6 +199,9 @@ _start:
     SELECT 112, .Lparent
     SELECT 103, .Lgroup
     SELECT 119, .Lwait
+    SELECT 100, .Lautoreap
+    SELECT 101, .Lautoreap
+    SELECT 97, .Lautoreap
     SELECT 117, .Lproduction
     li s8, 8
     j .Lexit
@@ -789,6 +792,117 @@ _start:
     lw t2, \info+24(s0)
     CHECK t2, 0, \statuscode
 .endm
+# /// SIGCHLD处置由普通syscall设置；存活WNOHANG与离栈后的wait结果分阶段判定。
+# 控制页0=child PID、8=phase、12=go、24=存活wait、28=退出wait、32=status、40=sigtimedwait。
+.Lautoreap:
+    MASK 0, 0x10000, 210
+    lla t1, .Lchld_action
+    SELECT 101, .Lautoreap_ignore
+    SELECT 97, .Lautoreap_nocldwait
+    j .Lautoreap_action
+.Lautoreap_ignore:
+    li t0, 1
+    sd t0, 0(t1)
+    j .Lautoreap_action
+.Lautoreap_nocldwait:
+    lla t0, .Lhandler
+    sd t0, 0(t1)
+    li t0, 2
+    sd t0, 8(t1)
+.Lautoreap_action:
+    ARGS
+    li a0, 17
+    mv a1, t1
+    li a3, 8
+    SC 134
+    CHECK a0, 0, 211
+    FORK .Lautoreap_child, 0, 212
+    mv s2, a0
+    lla t1, .Lstatus
+    li t0, 0x5a5a
+    sw t0, 0(t1)
+    ARGS
+    mv a0, s2
+    lla a1, .Lstatus
+    li a2, 1
+    SC 260
+    fence rw, w
+    sw a0, 24(s0)
+    CHECK a0, 0, 213
+    lla t1, .Lstatus
+    lw t2, 0(t1)
+    CHECK t2, 0x5a5a, 214
+    PHASE 1
+    # go=2只在夹具确认原Task已释放执行栈后发布，不拿child_tid清零猜退出。
+    GO 2
+    ARGS
+    mv a0, s2
+    lla a1, .Lstatus
+    li a2, 1
+    SC 260
+    mv s4, a0
+    lla t1, .Lstatus
+    lw s5, 0(t1)
+    ARGS
+    lla a0, .Lchld_mask
+    lla a1, .Linfo
+    lla a2, .Lzero_time
+    li a3, 8
+    SC 137
+    mv s6, a0
+    fence rw, w
+    sw s4, 28(s0)
+    sw s5, 32(s0)
+    sw s6, 40(s0)
+    PHASE 3
+    GO 3
+    # 错误结果仍走原退出/wait/join，phase=3不表示测试通过。
+    SELECT 100, .Lautoreap_default_result
+    CHECK s4, -10, 220
+    SELECT 101, .Lautoreap_ignore_result
+    CHECK s6, 17, 221
+    lla t1, .Linfo
+    lw t2, 0(t1)
+    CHECK t2, 17, 222
+    lw t2, 8(t1)
+    CHECK t2, 1, 223
+    lw t2, 16(t1)
+    EQ t2, s2, 224
+    lw t2, 24(t1)
+    CHECK t2, 23, 225
+    ARGS
+    lla a0, .Lchld_mask
+    lla a2, .Lzero_time
+    li a3, 8
+    SC 137
+    CHECK a0, -11, 227
+    j .Lsuccess
+.Lautoreap_ignore_result:
+    CHECK s6, -11, 226
+    j .Lsuccess
+.Lautoreap_default_result:
+    EQ s4, s2, 217
+    CHECK s5, 0x1700, 218
+    ARGS
+    mv a0, s2
+    li a2, 1
+    SC 260
+    CHECK a0, -10, 219
+    j .Lsuccess
+
+# /// 子只等待原共享匿名futex再正常exit(23)，父处置不改变实际执行者的离栈责任。
+.Lautoreap_child:
+    ARGS
+    addi a0, s0, 12
+    SC 98
+    CHECK a0, 0, 215
+    GO 1
+    ARGS
+    li a0, 23
+    SC 93
+    li s8, 216
+    j .Lexit
+
 # /// 两个真实阻塞等待者都观察同一快照，随后竞争唯一消费。
 .Lwait:
     PUT 24, -4096
@@ -982,6 +1096,8 @@ _start:
 .Lcapture: .quad .Lhandler, 4, 0x800
 .Lignore: .quad 1, 0x10000000, 0x800
 .Lmask: .quad 0
+.Lchld_mask: .quad 0x10000
+.Lchld_action: .quad 0, 0, 0
 .Lzero_time: .quad 0, 0
 .Ltimer: .quad 0, 0, 3, 0
 .Ltimer_off: .quad 0, 0, 0, 0

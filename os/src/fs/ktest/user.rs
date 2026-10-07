@@ -6,7 +6,7 @@ use crate::mm::space::{Mm, VmError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
 use crate::task::process::{TaskGraph, WaitEvent, WaitSelector};
-use crate::task::{Credentials, Placement, TaskId, UserRuntime};
+use crate::task::{Credentials, JoinObserver, Placement, TaskId, UserRuntime};
 use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
 mod layout;
@@ -36,6 +36,7 @@ struct UserOwner {
     running: Option<RunningProgram>,
     reserved: Option<ReservedDescriptor>,
     observer: Option<JoinHandle>,
+    lifecycle_child: Option<JoinObserver>,
 }
 
 impl UserOwner {
@@ -1006,6 +1007,7 @@ impl Fixture<DeviceInventory> for UserOwner {
             running: None,
             reserved: None,
             observer: None,
+            lifecycle_child: None,
         })
     }
 
@@ -1027,6 +1029,7 @@ impl Fixture<DeviceInventory> for UserOwner {
         }
         if self.graph.is_some() {
             self.reap_children(context, true)?;
+            self.lifecycle_child_left_stack()?;
         }
         drop(self.graph.take());
         self.release_pressure();
@@ -1039,7 +1042,8 @@ impl Fixture<DeviceInventory> for UserOwner {
             self.running.is_none()
                 && self.graph.is_none()
                 && self.reserved.is_none()
-                && self.observer.is_none(),
+                && self.observer.is_none()
+                && self.lifecycle_child.is_none(),
             "user fixture is not quiesced"
         );
         let before = self.metadata_before;
@@ -1448,6 +1452,17 @@ pub(crate) mod programs {
     ) -> TestResult {
         fixture.prepare(context)?;
         fixture.lifecycle_wait(context)
+    }
+
+    /// 默认忽略仍保wait状态；显式忽略和NOCLDWAIT自动回收由普通用户syscall判定。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn sigchld_autoreap_and_wait_semantics(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.lifecycle_sigchld(context)
     }
 
     /// 普通用户错误按真实wait状态和离栈join验证，内核或夹具错误仍归原框架。

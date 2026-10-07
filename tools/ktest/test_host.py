@@ -1149,7 +1149,7 @@ class LifecycleAndReportTests(unittest.TestCase):
                      ([*ending, abort], "", "Error"),
                      ([*ending, "  # KTEST suite-error cleanup late"], "", "Error"),
                      ([*ending, "  # KTEST status 1 Error"], "", "Error"),
-                     (ending, "raise SystemExit(7)", "Error"),
+                     (ending, "import os; os._exit(7)", "Error"),
                      (ending, "time.sleep(1)", "Timeout"),
                      ([], "time.sleep(1)", "Crash"))
         for suffix, tail, status in scenarios:
