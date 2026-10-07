@@ -166,6 +166,9 @@ _start:
     MODE 88, .Lnew
     MODE 86, .Lnew
     MODE 85, .Lnew
+    MODE 115, .Lsegv
+    MODE 98, .Lbus
+    MODE 105, .Lill
     MAP 0x31, 8
     STORE 24, -4096
     STORE 28, -4096
@@ -883,6 +886,38 @@ _start:
     CHECK $t2, 0, 168
     jr $ra
 
+# /// 真正用户异常只能由信号终止并正常wait，不把kernelpanic当成功。
+.Lsegv:
+    li.d $t0, 0x70000000
+    ld.d $t1, $t0, 0
+    li.d $s8, 203
+    b .Lexit
+.Lbus:
+    Z
+    li.d $a0, -100
+    la.local $a1, .Lempty
+    SC 56
+    li.d $s8, 204
+    bge $a0, $zero, 1f
+    b .Lexit
+1:
+    move $s3, $a0
+    Z
+    li.d $a0, 0x47000000
+    li.d $a1, 4096
+    li.d $a2, 1
+    li.d $a3, 0x12
+    move $a4, $s3
+    SC 222
+    CHECK $a0, 0x47000000, 205
+    ld.d $t1, $a0, 0
+    li.d $s8, 206
+    b .Lexit
+.Lill:
+    .word 0
+    li.d $s8, 207
+    b .Lexit
+
 # /// 捕获USR1只发表本映像标志，由真实信号帧返回。
 .Lhandler:
     la.local $t1, .Lhandled
@@ -914,6 +949,7 @@ _start:
 .Lmode_X: .asciz "X"
 .Lmode_V: .asciz "V"
 .Lmode_U: .asciz "U"
+.Lempty: .asciz "/test/empty"
 
 .data
 .balign 16

@@ -7,6 +7,7 @@ use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
 use crate::task::process::{TaskGraph, WaitEvent, WaitSelector};
 use crate::task::{Credentials, Placement, TaskId, UserRuntime};
+use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
 mod layout;
 mod lifecycle;
@@ -30,6 +31,7 @@ struct ReservedDescriptor {
 
 struct UserOwner {
     path: PathOwner,
+    metadata_before: MetadataStats,
     graph: Option<Arc<TaskGraph>>,
     running: Option<RunningProgram>,
     reserved: Option<ReservedDescriptor>,
@@ -303,6 +305,20 @@ impl UserOwner {
         drop(self.path.owner.pressure.take());
     }
 
+    /// 暖入同一磁盘程序的全部页，避免把指令页I/O误作用户数据读等待。
+    fn warm_signal_program(&self, context: &TestContext<'_>) -> TestResult {
+        let program = self.file(context, b"/test/bin/user-signal")?;
+        let mut bytes = [0u8; 4096];
+        let mut offset = 0;
+        loop {
+            let count = checked(context, program.read_at(offset, &mut bytes))?;
+            if count == 0 {
+                return Ok(());
+            }
+            offset += count as u64;
+        }
+    }
+
     /// 保活canonical页的唯一填充责任，确认用户read实际Blocked后发信号，再从原盘完成页。
     fn signal_during_file_wait(&mut self, context: &mut TestContext<'_>) -> TestResult {
         let path = checked(
@@ -318,17 +334,7 @@ impl UserOwner {
             inode.mapping().get_or_prepare(0).map_err(FsError::Io),
         )?;
         let read = read.ok_or(TestError("fresh canonical file page already filled"))?;
-        // 先沿原文件页读取程序，排除发信号前把指令页加载误作data页等待。
-        let program = self.file(context, b"/test/bin/user-signal")?;
-        let mut bytes = [0u8; 4096];
-        let mut offset = 0;
-        loop {
-            let count = checked(context, program.read_at(offset, &mut bytes))?;
-            if count == 0 {
-                break;
-            }
-            offset += count as u64;
-        }
+        self.warm_signal_program(context)?;
         let image = self.load_named(context, b"/test/bin/user-signal", b"r")?;
         #[cfg(target_arch = "riscv64")]
         let marker = image.context.gpr[2] - 8;
@@ -374,6 +380,60 @@ impl UserOwner {
         self.reap_children(context, false)?;
         context.diagnostic(format_args!(
             "user-file-signal canonical-page-wait=1 dma-inflight-at-send=0 delivered-bytes=65536"
+        ));
+        Ok(())
+    }
+
+    /// 真实请求完成尚未消费时只请求组退出，恢复原完成后再wait和离栈join。
+    fn cancel_inflight_file_read(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        let _data = self.file(context, b"/test/data.bin")?;
+        self.warm_signal_program(context)?;
+        let image = self.load_named(context, b"/test/bin/user-signal", b"r")?;
+        #[cfg(target_arch = "riscv64")]
+        let marker = image.context.gpr[2] - 8;
+        #[cfg(target_arch = "loongarch64")]
+        let marker = image.context.gpr[3] - 8;
+        let mm = Arc::clone(&image.mm);
+        let disk = self.path.owner.disk()?.clone();
+        let legacy = matches!(disk.identity(), VirtioIdentity::Mmio { version: 1, .. });
+        let first_used = block::tests::used_index(&disk, legacy);
+        let before = disk.test_snapshot();
+        disk.test_suspend_completions();
+        self.start_program(context, image, true, false, Credentials::ROOT)?;
+        let pid = self.running.as_ref().unwrap().pid;
+        let user = self
+            .graph()
+            .lookup_thread(pid)
+            .ok_or(TestError("取消时用户读者绑定消失"))?;
+        let executor = user
+            .executor()
+            .ok_or(TestError("取消时用户读者执行者消失"))?;
+        until("用户数据读未在真实在途请求上阻塞", || {
+            let mut marker_bytes = [0u8; 8];
+            let progress = mm.copyin(&mut marker_bytes, marker);
+            progress.error.is_none()
+                && u64::from_le_bytes(marker_bytes) == 0x51a2
+                && sched::test_state(&executor) == State::Blocked
+                && disk.test_snapshot().inflight != 0
+                && block::tests::used_index(&disk, legacy) != first_used
+        })?;
+        let inflight = disk.test_snapshot().inflight;
+        context.expect_eq(disk.test_snapshot().submitted > before.submitted, true);
+        context.expect_eq(mm.user_count(), 1);
+        self.graph().request_root_exit(9);
+        context.expect_eq(sched::test_state(&executor), State::Blocked);
+        context.expect_eq(mm.user_count(), 1);
+        context.expect_eq(disk.test_snapshot().inflight, inflight);
+        disk.test_resume_completions();
+        let event = self.wait(context)?;
+        context.expect_eq(event.status, 9);
+        self.reap_children(context, true)?;
+        context.expect_eq(mm.user_count(), 0);
+        disk.test_flush_completions();
+        context.expect_eq(disk.test_snapshot().inflight, 0);
+        context.diagnostic(format_args!(
+            "user-cancel inflight-at-request={} real-used=1 blocked-mm-users=1 status={} joined=1 final-mm-users=0 final-inflight=0",
+            inflight, event.status
         ));
         Ok(())
     }
@@ -938,8 +998,10 @@ impl Fixture<DeviceInventory> for UserOwner {
         context: &mut TestContext<'_>,
         inventory: &DeviceInventory,
     ) -> Result<Self, TestError> {
+        let metadata_before = metadata_stats();
         Ok(Self {
             path: <PathOwner as Fixture<DeviceInventory>>::set_up(context, inventory)?,
+            metadata_before,
             graph: None,
             running: None,
             reserved: None,
@@ -952,6 +1014,10 @@ impl Fixture<DeviceInventory> for UserOwner {
         self.release_reserved(context);
         if let Some(graph) = &self.graph {
             graph.request_root_exit(9);
+        }
+        // 用户wait仍可能等原盘完成；只恢复消费，不提前释放DMA拥有。
+        for disk in &self.path.owner.disks {
+            disk.test_resume_completions();
         }
         if self.running.is_some() {
             self.wait(context)?;
@@ -967,7 +1033,7 @@ impl Fixture<DeviceInventory> for UserOwner {
         <PathOwner as Fixture<DeviceInventory>>::quiesce(&mut self.path, context)
     }
 
-    /// 用户与设备都完成真实清理后沿原夹具比较本例完整六域。
+    /// 原设备夹具完成离栈和六域停稳后，只读取一次本例Task/worker/domain归还计数。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         assert!(
             self.running.is_none()
@@ -976,7 +1042,17 @@ impl Fixture<DeviceInventory> for UserOwner {
                 && self.observer.is_none(),
             "user fixture is not quiesced"
         );
-        <PathOwner as Fixture<DeviceInventory>>::tear_down(self.path, context)
+        let before = self.metadata_before;
+        <PathOwner as Fixture<DeviceInventory>>::tear_down(self.path, context)?;
+        let after = metadata_stats();
+        context.diagnostic(format_args!(
+            "user-resources metadata-before={:?} metadata-after={:?}",
+            before, after
+        ));
+        if after != before {
+            return Err(TestError("用户Task/worker/domain资源未归还"));
+        }
+        Ok(())
     }
 }
 
@@ -1372,5 +1448,30 @@ pub(crate) mod programs {
     ) -> TestResult {
         fixture.prepare(context)?;
         fixture.lifecycle_wait(context)
+    }
+
+    /// 普通用户错误按真实wait状态和离栈join验证，内核或夹具错误仍归原框架。
+    #[test]
+    fn user_faults_are_wait_status(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        for (mode, signal) in [(b"s" as &[u8], 11), (b"b", 7), (b"i", 4)] {
+            let event = fixture.run_named(context, b"/test/bin/user-lifecycle", mode, false)?;
+            context.expect_eq(event.status, signal);
+        }
+        Ok(())
+    }
+
+    /// 远核read仍保有Mm和真实DMA请求时取消，完成、退出和离栈各自结束后才回收。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn user_cancel_keeps_inflight_io_and_mm(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.cancel_inflight_file_read(context)
     }
 }

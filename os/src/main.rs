@@ -300,6 +300,7 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         (b"/test/bin/user-clone", b"F0", &[]),
         (b"/test/bin/user-clone", b"t3", &[]),
         (b"/test/bin/user-signal", b"f", &[]),
+        (b"/test/bin/user-lifecycle", b"u", &[]),
     ];
     for &(program, argument, environment) in PROGRAMS {
         let path = vfs.resolve(&context, program, fs::ResolveMode::Follow)?;

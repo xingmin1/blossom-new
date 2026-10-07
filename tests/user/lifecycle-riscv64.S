@@ -180,6 +180,9 @@ _start:
     SELECT 88, .Lnew
     SELECT 86, .Lnew
     SELECT 85, .Lnew
+    SELECT 115, .Lsegv
+    SELECT 98, .Lbus
+    SELECT 105, .Lill
     MAP 0x31, 6
     ARGS
     SC 172
@@ -910,6 +913,35 @@ _start:
     sd t1, 864(s0)
     j .Lsuccess
 
+# /// 用户硬件错误由正常信号退出和wait判定，不借内核panic或控制syscall。
+.Lsegv:
+    li t0, 0x70000000
+    ld t1, 0(t0)
+    li s8, 203
+    j .Lexit
+.Lbus:
+    ARGS
+    li a0, -100
+    lla a1, .Lempty
+    SC 56
+    NONNEG a0, 204
+    mv s2, a0
+    ARGS
+    li a0, 0x47000000
+    li a1, 4096
+    li a2, 1
+    li a3, 0x12
+    mv a4, s2
+    SC 222
+    CHECK a0, 0x47000000, 205
+    ld t1, 0(a0)
+    li s8, 206
+    j .Lexit
+.Lill:
+    .word 0
+    li s8, 207
+    j .Lexit
+
 # /// 捕获处理器只发表本映像标志，返回内核提供的 rt_sigreturn trampoline。
 .Lhandler:
     lla t1, .Lhandled
@@ -939,6 +971,7 @@ _start:
 .Lmissing: .asciz "/test/no-lifecycle-image"
 .Lunsupported: .asciz "/test/bin/user-interp"
 .Lexec_env: .asciz "EXEC=1"
+.Lempty: .asciz "/test/empty"
 
 .data
 .balign 16
