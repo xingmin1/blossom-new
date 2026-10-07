@@ -76,7 +76,7 @@ impl<'a> ReadBuffer<'a> {
         self.written
     }
 
-    /// 从成功只读 folio 交付字节；可能处理用户 fault，但不持文件页用途短锁。
+    /// 从独占内核片段交付字节；可能处理用户 fault，调用时不得持源文件页内容锁。
     pub fn push(&mut self, bytes: &[u8]) -> Result<usize, FsError> {
         let count = bytes.len().min(self.len() - self.written);
         let bytes = &bytes[..count];
@@ -106,7 +106,7 @@ pub enum SeekFrom {
     End(i64),
 }
 
-/// 真实 inode 与卷属性的小快照，时间来自只读盘面。
+/// 真实 inode 当前属性与卷几何的小快照，不包含块映射根。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileStat {
     pub inode: u64,
@@ -158,7 +158,7 @@ pub trait FileLike: Send + Sync {
     /// 更新共享字节位置，负值或溢出不修改原位置。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError>;
 
-    /// 借用真实 inode 元数据生成属性快照，不获取位置锁。
+    /// 读取 canonical inode 的属性快照，不获取位置锁。
     fn stat(&self) -> Result<FileStat, FsError>;
 
     /// 返回下一项及其原始名字，成功取得项后才推进目录位置。
@@ -170,7 +170,7 @@ pub trait FileLike: Send + Sync {
         emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
     ) -> Result<(), FsError>;
 
-    /// 当前只读文件拒绝写入，包括空输入。
+    /// 写能力与具体操作支持分别检查，空输入也不能伪报成功。
     fn write(&self, src: &[u8]) -> Result<usize, FsError>;
 }
 
@@ -193,19 +193,20 @@ pub fn open_path(path: Path) -> Result<FileRef, FsError> {
     open_path_with_flags(path, 0)
 }
 
-/// 创建真实只读 OFD，访问模式和写意图不能越过只读卷边界。
+/// 创建真实 OFD；写意图先检查当前挂载能力，尚未实现的文件修改返回 Unsupported。
 pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
     if flags & O_ACCMODE == O_ACCMODE {
         return Err(FsError::InvalidOperation);
     }
     if flags & (O_ACCMODE | 0o100 | 0o1000) != 0 {
-        return Err(FsError::ReadOnly);
+        path.check_writable()?;
+        return Err(FsError::Unsupported);
     }
     let flags = flags & !O_CLOEXEC;
     if flags & !OPEN_FLAGS != 0 {
         return Err(FsError::Unsupported);
     }
-    let kind = path.inode()?.metadata()?.kind;
+    let kind = path.inode()?.metadata_snapshot()?.kind;
     if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
@@ -285,9 +286,10 @@ impl FileLike for InodeFile {
         Err(FsError::NotDirectory)
     }
 
-    /// 只读实例不接受写入，也不推进位置。
+    /// 检查保活路径的写能力后拒绝尚未实现的 buffered write，不推进位置。
     fn write(&self, _src: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::ReadOnly)
+        self.path.check_writable()?;
+        Err(FsError::Unsupported)
     }
 }
 
@@ -358,9 +360,10 @@ impl FileLike for DirectoryFile {
         Ok(())
     }
 
-    /// 只读目录拒绝写入，空输入也不能伪报成功。
+    /// 先检查当前挂载能力，再拒绝目录字节写入，空输入也不伪报成功。
     fn write(&self, _src: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::ReadOnly)
+        self.path.check_writable()?;
+        Err(FsError::IsDirectory)
     }
 }
 
@@ -386,7 +389,11 @@ fn seek_path(path: &Path, cursor: &SleepMutex<u64>, from: SeekFrom) -> Result<u6
     let position = match from {
         SeekFrom::Start(position) => Some(position),
         SeekFrom::Current(delta) => cursor.checked_add_signed(delta),
-        SeekFrom::End(delta) => path.inode()?.metadata()?.size.checked_add_signed(delta),
+        SeekFrom::End(delta) => path
+            .inode()?
+            .metadata_snapshot()?
+            .size
+            .checked_add_signed(delta),
     }
     .ok_or(FsError::InvalidOperation)?;
     if (i64::MAX as u64) < position {
@@ -396,10 +403,10 @@ fn seek_path(path: &Path, cursor: &SleepMutex<u64>, from: SeekFrom) -> Result<u6
     Ok(position)
 }
 
-/// 从真实路径借用字段形成小快照，未打开的符号链接同样能取得属性。
+/// 从 canonical inode 一次读取当前属性快照，未打开的符号链接同样能取得属性。
 pub fn stat_path(path: &Path) -> Result<FileStat, FsError> {
     let inode = path.inode()?;
-    let data = inode.metadata()?;
+    let data = inode.metadata_snapshot()?;
     if data.kind == InodeKind::Other {
         return Err(FsError::Unsupported);
     }

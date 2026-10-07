@@ -1,4 +1,4 @@
-//! 原 folio、真实块设备读入与有界只读缓存的具名消费回归。
+//! 原 folio、真实块设备读入与共同元数据内容的具名消费回归。
 
 use ::ktest::{self, Fixture, TestContext, TestError, TestResult};
 use alloc::alloc::{alloc, dealloc};
@@ -8,10 +8,12 @@ use core::alloc::Layout;
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::block::{self, BlockError, Disk, DiskRef};
+use crate::block::{self, AccessMode, BlockError, Disk, DiskRef, IoResult};
 use crate::cache::{BufferRef, FileMapping, MetadataCache};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
+use crate::fs::ext4::{codec, Ext4Volume};
+use crate::fs::{FsError, InodeMetadata};
 use crate::mm::folio::{FolioRead, FolioRef};
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
@@ -22,7 +24,7 @@ const OFFSET: u64 = 64 * mm::PAGE_SIZE as u64;
 const PRESSURE_CAPACITY: usize = 65536;
 
 /// 父入口只显式引用宏产生的实际注册槽，不维护第二份用例表。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 10] {
+pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 12] {
     [
         folio::__ktest_anchor(),
         metadata_views::__ktest_anchor(),
@@ -34,6 +36,8 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 10] {
         bounded::__ktest_anchor(),
         oom::__ktest_anchor(),
         prepare_oom::__ktest_anchor(),
+        mutable_metadata::__ktest_anchor(),
+        metadata_records::__ktest_anchor(),
     ]
 }
 
@@ -65,13 +69,7 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
 
 /// 完整消费拥有者后核六域，不重置计数或回滚物理内存状态。
 fn recovered(context: &mut TestContext<'_>, baseline: mm::MemoryStats) -> TestResult {
-    let mut after = settled()?;
-    until("cache six-domain resources did not return", || {
-        mm::shrink_all();
-        mm::drain_all_pages();
-        after = mm::stats();
-        after == baseline
-    })?;
+    let after = settled()?;
     context.expect_eq(after, baseline);
     context.diagnostic(format_args!(
         "cache-resources six-domains-before={:?} six-domains-after={:?} real-stop-join-cleanup=1",
@@ -212,6 +210,8 @@ enum Scenario {
     Bounded,
     PrepareOom,
     Oom,
+    MutableMetadata,
+    MetadataRecords,
 }
 
 enum Returned {
@@ -232,11 +232,13 @@ impl Returned {
     fn valid(&self, offset: u64) -> Result<bool, BlockError> {
         match self {
             Self::Buffer(buffer) => {
-                buffer.with_bytes(|bytes| patterned(bytes, 1, offset, mm::PAGE_SIZE))
+                buffer.with_read(|bytes| patterned(bytes, 1, offset, mm::PAGE_SIZE))
             }
-            Self::Folio(folio) => folio.with_bytes(0, mm::PAGE_SIZE, |bytes| {
-                patterned(bytes, 1, offset, mm::PAGE_SIZE)
-            }),
+            Self::Folio(folio) => {
+                let mut bytes = [0_u8; mm::PAGE_SIZE];
+                folio.copy_to(0, &mut bytes)?;
+                Ok(patterned(&bytes, 1, offset, mm::PAGE_SIZE))
+            }
         }
     }
 }
@@ -394,8 +396,8 @@ struct Owner {
     disk: DiskRef,
     extra: Option<DiskRef>,
     queue: WorkQueue,
-    metadata: Arc<MetadataCache>,
-    extra_metadata: Option<MetadataCache>,
+    metadata: Option<Arc<MetadataCache>>,
+    extra_metadata: Option<Arc<MetadataCache>>,
     mapping: Arc<FileMapping>,
     observation: Arc<Observation>,
     held: [Option<Returned>; 3],
@@ -405,13 +407,21 @@ struct Owner {
     legacy: bool,
     activation_error: Option<BlockError>,
     avail_address: usize,
+    private_metadata: bool,
 }
 
 impl Owner {
-    /// 借本组真实库存，完整 fallible 控制存储与原生 Task 先于 start。
+    /// 借本组库存启动真实设备，再建立显式 FS 占用与本例控制拥有。
     fn prepare(scenario: Scenario, resources: &DeviceInventory) -> Result<Self, TestError> {
         let baseline = settled()?;
-        let mut inventory = devices(resources, if scenario == Scenario::Views { 2 } else { 1 })?;
+        let mut inventory = devices(
+            resources,
+            if matches!(scenario, Scenario::Views | Scenario::MetadataRecords) {
+                2
+            } else {
+                1
+            },
+        )?;
         let device = inventory.remove(0);
         let info = device.info();
         let unit = info.logical_block_size as usize;
@@ -444,7 +454,14 @@ impl Owner {
                 return Err(TestError("cache Disk preparation failed"));
             }
         };
-        let mut owner = Self::prepare_resources(
+        if disk.start().is_err() {
+            disk.stop()
+                .map_err(|_| TestError("cache failed activation stop failed"))?;
+            drop(disk);
+            queue.close_sync();
+            return Err(TestError("cache Disk activation failed"));
+        }
+        let owner = Self::prepare_resources(
             scenario,
             baseline,
             disk.clone(),
@@ -453,26 +470,20 @@ impl Owner {
             inventory,
             avail_address,
         )?;
-        owner.activation_error = disk.start().err();
-        if let Some(extra) = &owner.extra {
-            if let Err(error) = extra.start() {
-                owner.activation_error.get_or_insert(error);
-            }
-        }
         Ok(owner)
     }
 
-    /// 构造缓存、观察者与任务；尚未 start 的设备不具有已发表 DMA 请求。
+    /// 已启动设备先取得 RO 占用，缓存及任务准备失败按原拥有顺序释放。
     fn prepare_resources(
         scenario: Scenario,
         baseline: mm::MemoryStats,
-        disk: DiskRef,
+        mut disk: DiskRef,
         queue: WorkQueue,
         legacy: bool,
         mut inventory: Vec<VirtioDevice>,
         avail_address: usize,
     ) -> Result<Self, TestError> {
-        let extra = match inventory
+        let mut extra = match inventory
             .pop()
             .map(|device| Disk::prepare(device, &queue))
             .transpose()
@@ -487,20 +498,61 @@ impl Owner {
             }
         };
         let resources = (|| {
+            if let Some(extra) = &extra {
+                extra
+                    .start()
+                    .map_err(|_| TestError("extra cache activation failed"))?;
+            }
+            if scenario == Scenario::MetadataRecords {
+                let first_root = Ext4Volume::open(disk.clone(), AccessMode::ReadOnly, 8).is_ok();
+                let second_root =
+                    Ext4Volume::open(extra.as_ref().unwrap().clone(), AccessMode::ReadOnly, 8)
+                        .is_ok();
+                if first_root == second_root {
+                    return Err(TestError(
+                        "record case requires exactly one real ext4 root and one scratch",
+                    ));
+                }
+                if first_root {
+                    core::mem::swap(&mut disk, extra.as_mut().unwrap());
+                }
+            }
             let capacity = if scenario == Scenario::Bounded { 2 } else { 8 };
-            let metadata = Arc::try_new(
-                MetadataCache::try_new(disk.clone(), capacity)
-                    .map_err(|_| TestError("metadata preparation failed"))?,
-            )
-            .map_err(|_| TestError("metadata owner preparation OOM"))?;
-            let mapping = Arc::try_new(
-                FileMapping::try_new(capacity)
-                    .map_err(|_| TestError("mapping preparation failed"))?,
-            )
-            .map_err(|_| TestError("mapping owner preparation OOM"))?;
+            let metadata = if matches!(
+                scenario,
+                Scenario::Views
+                    | Scenario::MetadataFlight
+                    | Scenario::MetadataIndependent
+                    | Scenario::Bounded
+                    | Scenario::Oom
+                    | Scenario::MutableMetadata
+                    | Scenario::MetadataRecords
+            ) {
+                let mode = if matches!(
+                    scenario,
+                    Scenario::MutableMetadata | Scenario::MetadataRecords
+                ) {
+                    AccessMode::ReadWrite
+                } else {
+                    AccessMode::ReadOnly
+                };
+                let claim = Disk::claim_fs(&disk, mode)
+                    .map_err(|_| TestError("metadata FS claim failed"))?;
+                Some(
+                    MetadataCache::shared(&claim, capacity)
+                        .map_err(|_| TestError("metadata preparation failed"))?,
+                )
+            } else {
+                None
+            };
+            let mapping = Arc::try_new(FileMapping::new())
+                .map_err(|_| TestError("mapping owner preparation OOM"))?;
             let extra_metadata = extra
                 .as_ref()
-                .map(|disk| MetadataCache::try_new(disk.clone(), 8))
+                .map(|disk| {
+                    let claim = Disk::claim_fs(disk, AccessMode::ReadOnly)?;
+                    MetadataCache::shared(&claim, 8)
+                })
                 .transpose()
                 .map_err(|_| TestError("extra metadata preparation failed"))?;
             let (failure_folio, read) =
@@ -529,10 +581,28 @@ impl Owner {
             let mut prepared = Vec::new();
             let mut joins = Vec::new();
             prepared
-                .try_reserve_exact(count)
+                .try_reserve_exact(
+                    if matches!(
+                        scenario,
+                        Scenario::MutableMetadata | Scenario::MetadataRecords
+                    ) {
+                        2
+                    } else {
+                        count
+                    },
+                )
                 .map_err(|_| TestError("cache prepared Task slots OOM"))?;
             joins
-                .try_reserve_exact(count)
+                .try_reserve_exact(
+                    if matches!(
+                        scenario,
+                        Scenario::MutableMetadata | Scenario::MetadataRecords
+                    ) {
+                        2
+                    } else {
+                        count
+                    },
+                )
                 .map_err(|_| TestError("cache join slots OOM"))?;
             let mut pressure = Vec::new();
             if scenario == Scenario::Oom {
@@ -543,7 +613,14 @@ impl Owner {
             for index in 0..count {
                 let observer = observation.clone();
                 let task_disk = disk.clone();
-                let cache = metadata.clone();
+                let cache = if matches!(
+                    scenario,
+                    Scenario::MetadataFlight | Scenario::MetadataIndependent
+                ) {
+                    metadata.clone()
+                } else {
+                    None
+                };
                 let file = mapping.clone();
                 let failure_folio = failure_folio.clone();
                 prepared.push(
@@ -570,7 +647,11 @@ impl Owner {
                             scenario,
                             Scenario::MetadataFlight | Scenario::MetadataIndependent
                         ) {
-                            cache.get(key, mm::PAGE_SIZE).map(Returned::Buffer)
+                            cache
+                                .as_ref()
+                                .unwrap()
+                                .get(key, mm::PAGE_SIZE)
+                                .map(Returned::Buffer)
                         } else if scenario == Scenario::PrepareOom && index == 0 {
                             prepare_oom_read(&observer, &task_disk)
                                 .map(|()| Returned::Folio(failure_folio.unwrap()))
@@ -639,6 +720,10 @@ impl Owner {
                 legacy,
                 activation_error: None,
                 avail_address,
+                private_metadata: matches!(
+                    scenario,
+                    Scenario::MutableMetadata | Scenario::MetadataRecords
+                ),
             }),
             Err(error) => {
                 if let Some(extra) = &extra {
@@ -796,7 +881,7 @@ impl Owner {
         context.expect_eq(folio.is_ready(), true);
         context.expect_eq(folio.wait_ready(), Err(BlockError::QueueStopped));
         context.expect_eq(
-            folio.with_bytes(0, mm::PAGE_SIZE, |_| ()),
+            folio.copy_to(0, &mut [0_u8; mm::PAGE_SIZE]),
             Err(BlockError::QueueStopped),
         );
         let (hit, owner) = self
@@ -823,6 +908,8 @@ impl Owner {
             let offset = 33 * size as u64;
             let root = self
                 .metadata
+                .as_ref()
+                .unwrap()
                 .get(33, size)
                 .map_err(|_| TestError("root metadata view read failed"))?;
             let second = extra
@@ -831,20 +918,14 @@ impl Owner {
             context.expect_eq(root.len(), size);
             context.expect_eq(root.offset(), offset as usize % mm::PAGE_SIZE);
             context.expect_eq(
-                root.with_bytes(|bytes| patterned(bytes, 1, offset, size)),
+                root.with_read(|bytes| patterned(bytes, 1, offset, size)),
                 Ok(true),
             );
             context.expect_eq(
-                second.with_bytes(|bytes| patterned(bytes, 2, offset, size)),
+                second.with_read(|bytes| patterned(bytes, 2, offset, size)),
                 Ok(true),
             );
             context.expect_eq(root.folio().phys_addr() != second.folio().phys_addr(), true);
-            context.expect_eq(
-                root.folio()
-                    .with_bytes(root.offset(), size + 1, |_| ())
-                    .is_err(),
-                true,
-            );
         }
         Ok(())
     }
@@ -859,37 +940,41 @@ impl Owner {
         Ok(folio)
     }
 
-    /// 两种有界索引全活时拒 miss，clean victim 自动回收与显式 prune 均保活引用。
+    /// 元数据预算满时拒绝活页 miss；文件稀疏索引保留任意已持页并正常增长。
     fn bounded(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.ready()?;
-        context.expect_eq(self.metadata.capacity(), 2);
-        context.expect_eq(self.mapping.capacity(), 2);
         self.held[0] = Some(Returned::Buffer(
             self.metadata
+                .as_ref()
+                .unwrap()
                 .get(64, mm::PAGE_SIZE)
                 .map_err(|_| TestError("bounded first metadata read failed"))?,
         ));
         self.held[1] = Some(Returned::Buffer(
             self.metadata
+                .as_ref()
+                .unwrap()
                 .get(65, mm::PAGE_SIZE)
                 .map_err(|_| TestError("bounded second metadata read failed"))?,
         ));
         self.disk.test_flush_completions();
         context.expect_eq(
             matches!(
-                self.metadata.get(66, mm::PAGE_SIZE),
+                self.metadata.as_ref().unwrap().get(66, mm::PAGE_SIZE),
                 Err(BlockError::NoMemory)
             ),
             true,
         );
-        context.expect_eq(self.metadata.prune_unused(), 0);
+        context.expect_eq(self.metadata.as_ref().unwrap().prune_unused(), 0);
         drop(self.held[0].take());
         self.held[0] = Some(Returned::Buffer(
             self.metadata
+                .as_ref()
+                .unwrap()
                 .get(66, mm::PAGE_SIZE)
                 .map_err(|_| TestError("bounded clean metadata victim did not retire"))?,
         ));
-        context.expect_eq(self.metadata.len(), 2);
+        context.expect_eq(self.metadata.as_ref().unwrap().len(), 2);
         context.expect_eq(
             self.held[0]
                 .as_ref()
@@ -900,8 +985,8 @@ impl Owner {
         drop(self.held[0].take());
         drop(self.held[1].take());
         self.disk.test_flush_completions();
-        context.expect_eq(self.metadata.prune_unused(), 2);
-        context.expect_eq(self.metadata.len(), 0);
+        context.expect_eq(self.metadata.as_ref().unwrap().prune_unused(), 2);
+        context.expect_eq(self.metadata.as_ref().unwrap().len(), 0);
 
         self.held[0] = Some(Returned::Folio(
             self.file_page(64)
@@ -912,28 +997,22 @@ impl Owner {
                 .map_err(|_| TestError("bounded second file read failed"))?,
         ));
         self.disk.test_flush_completions();
-        context.expect_eq(
-            matches!(self.mapping.get_or_prepare(66), Err(BlockError::NoMemory)),
-            true,
-        );
-        context.expect_eq(self.mapping.prune_unused(), 0);
-        drop(self.held[0].take());
-        self.held[0] =
+        self.held[2] =
             Some(Returned::Folio(self.file_page(66).map_err(|_| {
-                TestError("bounded clean file victim did not retire")
+                TestError("sparse third live file page failed")
             })?));
-        context.expect_eq(self.mapping.len(), 2);
-        context.expect_eq(
-            self.held[0]
-                .as_ref()
-                .unwrap()
-                .valid(66 * mm::PAGE_SIZE as u64),
-            Ok(true),
-        );
+        context.expect_eq(self.mapping.prune_unused(), 0);
+        for (index, held) in self.held.iter().flatten().enumerate() {
+            context.expect_eq(
+                held.valid((64 + index as u64) * mm::PAGE_SIZE as u64),
+                Ok(true),
+            );
+        }
         drop(self.held[0].take());
         drop(self.held[1].take());
+        drop(self.held[2].take());
         self.disk.test_flush_completions();
-        context.expect_eq(self.mapping.prune_unused(), 2);
+        context.expect_eq(self.mapping.prune_unused(), 3);
         context.expect_eq(self.mapping.len(), 0);
         Ok(())
     }
@@ -958,40 +1037,36 @@ impl Owner {
         Ok(())
     }
 
-    /// 满缓存先锁外归还 clean 页，真实零空闲页时仍能发表新占位；放压后实际读盘验证。
+    /// 稀疏索引真实页 OOM 时 miss 保原错误；放压后只建立一个原页填充拥有者。
     fn reclaim_under_oom(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.ready()?;
-        for index in 64..64 + self.mapping.capacity() as u64 {
-            drop(
-                self.file_page(index)
-                    .map_err(|_| TestError("OOM reclaim warm read failed"))?,
-            );
-        }
-        self.disk.test_flush_completions();
-        context.expect_eq(self.mapping.len(), self.mapping.capacity());
-        self.exhaust_pages(context)?;
         let index = 80;
-        let (folio, read) = self.mapping.get_or_prepare(index).map_err(|_| {
-            TestError("full clean cache did not reclaim before candidate allocation")
-        })?;
-        let read = read.ok_or(TestError("OOM replacement did not own the new fill"))?;
+        self.exhaust_pages(context)?;
+        context.expect_eq(
+            matches!(
+                self.mapping.get_or_prepare(index),
+                Err(BlockError::NoMemory)
+            ),
+            true,
+        );
+        self.pressure.clear();
+        let (folio, read) = self
+            .mapping
+            .get_or_prepare(index)
+            .map_err(|_| TestError("sparse miss did not recover after releasing pressure"))?;
+        let read = read.ok_or(TestError("recovered miss did not own its fill"))?;
         let (hit, duplicate) = self
             .mapping
             .get_or_prepare(index)
-            .map_err(|_| TestError("OOM replacement placeholder disappeared"))?;
+            .map_err(|_| TestError("recovered placeholder disappeared"))?;
         context.expect_eq(hit.phys_addr(), folio.phys_addr());
         context.expect_eq(duplicate.is_none(), true);
         context.expect_eq(folio.is_ready(), false);
-        context.expect_eq(self.mapping.len(), self.mapping.capacity());
-        self.pressure.clear();
         self.disk
             .load_folio(index * mm::PAGE_SIZE as u64, read)
-            .map_err(|_| TestError("reclaimed folio real read failed"))?;
-        context.expect_eq(folio.wait_ready(), Ok(()));
+            .map_err(|_| TestError("recovered original folio real read failed"))?;
         context.expect_eq(
-            folio.with_bytes(0, mm::PAGE_SIZE, |bytes| {
-                patterned(bytes, 1, index * mm::PAGE_SIZE as u64, mm::PAGE_SIZE)
-            }),
+            Returned::Folio(folio).valid(index * mm::PAGE_SIZE as u64),
             Ok(true),
         );
         Ok(())
@@ -1002,6 +1077,8 @@ impl Owner {
         self.ready()?;
         self.held[0] = Some(Returned::Buffer(
             self.metadata
+                .as_ref()
+                .unwrap()
                 .get(64, mm::PAGE_SIZE)
                 .map_err(|_| TestError("OOM warm metadata read failed"))?,
         ));
@@ -1013,6 +1090,8 @@ impl Owner {
         self.exhaust_pages(context)?;
         let buffer = self
             .metadata
+            .as_ref()
+            .unwrap()
             .get(64, mm::PAGE_SIZE)
             .map_err(|_| TestError("metadata hit allocated under OOM"))?;
         context.expect_eq(
@@ -1020,7 +1099,7 @@ impl Owner {
             self.held[0].as_ref().unwrap().folio().phys_addr(),
         );
         context.expect_eq(
-            buffer.with_bytes(|bytes| patterned(bytes, 1, OFFSET, mm::PAGE_SIZE)),
+            buffer.with_read(|bytes| patterned(bytes, 1, OFFSET, mm::PAGE_SIZE)),
             Ok(true),
         );
         let (folio, read) = self
@@ -1032,15 +1111,10 @@ impl Owner {
             folio.phys_addr(),
             self.held[1].as_ref().unwrap().folio().phys_addr(),
         );
-        context.expect_eq(
-            folio.with_bytes(0, mm::PAGE_SIZE, |bytes| {
-                patterned(bytes, 1, OFFSET, mm::PAGE_SIZE)
-            }),
-            Ok(true),
-        );
+        context.expect_eq(Returned::Folio(folio).valid(OFFSET), Ok(true));
         context.expect_eq(
             matches!(
-                self.metadata.get(65, mm::PAGE_SIZE),
+                self.metadata.as_ref().unwrap().get(65, mm::PAGE_SIZE),
                 Err(BlockError::NoMemory)
             ),
             true,
@@ -1088,7 +1162,7 @@ impl Owner {
         context.expect_eq(folio.is_ready(), true);
         context.expect_eq(folio.wait_ready(), Err(BlockError::NoMemory));
         context.expect_eq(
-            folio.with_bytes(0, mm::PAGE_SIZE, |_| ()),
+            folio.copy_to(0, &mut [0_u8; mm::PAGE_SIZE]),
             Err(BlockError::NoMemory),
         );
         let (hit, read) = self
@@ -1110,6 +1184,245 @@ impl Owner {
         Ok(())
     }
 
+    /// 私有 scratch 的 super 和 tiny 视图读取缺失范围，共页更新不能被后续 Read 覆盖。
+    fn overlapping_updates(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.ready()?;
+        if 1024 < self.disk.limits().logical_block_size {
+            return Err(TestError("overlap case requires logical block <= 1KiB"));
+        }
+        let cache = self.metadata.as_ref().unwrap();
+        let claim = Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
+            .map_err(|_| TestError("private metadata RW claim failed"))?;
+        let same = MetadataCache::shared(&claim, 8)
+            .map_err(|_| TestError("shared same-Disk metadata cache disappeared"))?;
+        context.expect_eq(Arc::ptr_eq(cache, &same), true);
+        context.expect_eq(MetadataCache::shared(&claim, 7).is_err(), true);
+        let tiny = cache
+            .get(1, 1024)
+            .map_err(|_| TestError("private 1KiB metadata read failed"))?;
+        let pfn = tiny.folio().phys_addr();
+        context.expect_eq(tiny.folio().range_ready(1024, 1024), Ok(()));
+        context.expect_eq(tiny.folio().range_ready(0, 1024), Err(BlockError::NotReady));
+        context.expect_eq(
+            tiny.folio().range_ready(2048, 2048),
+            Err(BlockError::NotReady),
+        );
+        context.expect_eq(tiny.folio().is_ready(), false);
+        tiny.update(&claim, |bytes| bytes.fill(0xa5))
+            .map_err(|_| TestError("private tiny update failed"))?;
+        context.expect_eq(tiny.folio().dirty_sectors(), 0b0000_1100);
+        let ro = Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
+            .map_err(|_| TestError("private metadata RO claim failed"))?;
+        context.expect_eq(
+            tiny.update(&ro, |bytes| bytes.fill(0xee)),
+            Err(BlockError::ReadOnly),
+        );
+        let two = same
+            .get(0, 2048)
+            .map_err(|_| TestError("private 2KiB metadata read failed"))?;
+        context.expect_eq(two.folio().phys_addr(), pfn);
+        context.expect_eq(
+            two.with_read(|bytes| {
+                bytes[..1024].iter().all(|b| *b == 0) && bytes[1024..].iter().all(|b| *b == 0xa5)
+            }),
+            Ok(true),
+        );
+        two.update(&claim, |bytes| bytes[..512].fill(0x19))
+            .map_err(|_| TestError("private 2KiB metadata update failed"))?;
+        let super_view = cache
+            .get(0, mm::PAGE_SIZE)
+            .map_err(|_| TestError("private super metadata read failed"))?;
+        context.expect_eq(super_view.folio().phys_addr(), pfn);
+        context.expect_eq(
+            super_view.with_read(|bytes| {
+                bytes[..512].iter().all(|b| *b == 0x19)
+                    && bytes[512..1024].iter().all(|b| *b == 0)
+                    && bytes[1024..2048].iter().all(|b| *b == 0xa5)
+                    && bytes[2048..].iter().all(|b| *b == 0)
+            }),
+            Ok(true),
+        );
+        context.expect_eq(
+            tiny.with_read(|bytes| bytes.iter().all(|b| *b == 0xa5)),
+            Ok(true),
+        );
+        context.expect_eq(super_view.folio().dirty_sectors(), 0b0000_1111);
+        context.expect_eq(super_view.folio().writeback_sectors(), 0);
+        drop(super_view);
+        drop(two);
+        drop(tiny);
+        drop(same);
+        context.expect_eq(cache.prune_unused(), 0);
+        context.expect_eq(cache.len(), 1);
+        context.diagnostic(format_args!(
+            "metadata-overlap private-scratch=1 physical-page=0 PFN={} windows=1/2/4KiB partial-not-ready=1 dirty-retained-after-read=1 dirty-prune-refused=1 CPU-content-only=1 file-write-fsync-covered=0",
+            pfn,
+        ));
+        Ok(())
+    }
+
+    /// 从只读真实卷取两有效记录，在私有 scratch 同页用生产 codec 更新并复核完整 CRC。
+    fn concurrent_records(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.ready()?;
+        let volume = Ext4Volume::open(
+            self.extra.as_ref().unwrap().clone(),
+            AccessMode::ReadOnly,
+            8,
+        )
+        .map_err(|_| TestError("record case real root open failed"))?;
+        let g = volume.geometry();
+        if g.inode_size != 256 || g.features_ro_compat & codec::METADATA_CSUM == 0 {
+            return Err(TestError(
+                "record case requires real 256-byte checksummed inode records",
+            ));
+        }
+        let root = volume
+            .load_inode(2)
+            .map_err(|_| TestError("record root inode failed"))?;
+        let pattern = volume
+            .lookup(&InodeMetadata::from_data(&root), &root.block, b"pattern")
+            .map_err(|_| TestError("record pattern lookup failed"))?
+            .ok_or(TestError(
+                "record case requires existing root pattern fixture",
+            ))?;
+        let source_cache = MetadataCache::shared(volume.claim(), 8)
+            .map_err(|_| TestError("record source metadata cache unavailable"))?;
+        let numbers = [root.number, pattern];
+        let mut original = [[0u8; 256]; 2];
+        let mut before = [InodeMetadata::from_data(&root); 2];
+        for index in 0..2 {
+            let number = numbers[index];
+            let group = (number - 1) / g.inodes_per_group;
+            let descriptor = group * g.descriptor_size as u64;
+            let block = g.first_data_block + 1 + descriptor / g.block_size as u64;
+            let offset = (descriptor % g.block_size as u64) as usize;
+            // 主描述符属于保留元数据范围，按卷的原缓存读取，不能当作普通数据块校验。
+            let table = source_cache
+                .get(block, g.block_size)
+                .map_err(|_| TestError("record group descriptor read failed"))?
+                .with_read(|bytes| {
+                    codec::decode_group(g, group, codec::bytes(bytes, offset, g.descriptor_size)?)
+                })
+                .map_err(|_| TestError("record descriptor view failed"))?
+                .map_err(|_| TestError("record descriptor decode failed"))?;
+            let byte = ((number - 1) % g.inodes_per_group) * g.inode_size as u64;
+            let buffer = volume
+                .metadata_block(table + byte / g.block_size as u64)
+                .map_err(|_| TestError("record inode table read failed"))?;
+            buffer
+                .with_read(|bytes| {
+                    original[index].copy_from_slice(
+                        &bytes[(byte % g.block_size as u64) as usize
+                            ..(byte % g.block_size as u64) as usize + 256],
+                    );
+                })
+                .map_err(|_| TestError("record source copy failed"))?;
+            let decoded = codec::decode_inode(g, number, &original[index])
+                .map_err(|_| TestError("record source checksum failed"))?;
+            before[index] = InodeMetadata::from_data(&decoded);
+        }
+        let mut after = before;
+        for index in 0..2 {
+            after[index].mode ^= 0o020;
+            after[index].uid = 0x1234_abcd + index as u32;
+            after[index].gid = 0xabcd_1234 + index as u32;
+            after[index].atime.seconds += 7 + index as i64;
+            codec::validate_inode_metadata_update(&before[index], &after[index])
+                .map_err(|_| TestError("record expected metadata not representable"))?;
+        }
+        let claim = Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
+            .map_err(|_| TestError("private record RW claim failed"))?;
+        let cache = self.metadata.as_ref().unwrap().clone();
+        let buffer = cache
+            .get(0, mm::PAGE_SIZE)
+            .map_err(|_| TestError("private record scratch read failed"))?;
+        buffer
+            .update(&claim, |bytes| {
+                bytes[..256].copy_from_slice(&original[0]);
+                bytes[256..512].copy_from_slice(&original[1]);
+            })
+            .map_err(|_| TestError("private record initialization failed"))?;
+        for index in 0..2 {
+            let target = buffer.clone();
+            let task_claim = claim.clone();
+            let task_volume = volume.clone();
+            let observer = self.observation.clone();
+            let old = before[index];
+            let next = after[index];
+            self.prepared.push(
+                task::prepare_kernel_on(index % cpu::count(), move || {
+                    observer.tasks.lock()[index] = Some(task::current_task());
+                    observer.entered[index].store(true, Ordering::Release);
+                    match target.update(&task_claim, |bytes| {
+                        codec::patch_inode_metadata(
+                            task_volume.geometry(),
+                            &mut bytes[index * 256..(index + 1) * 256],
+                            &old,
+                            &next,
+                        )
+                    }) {
+                        Ok(Ok(())) => 0,
+                        _ => 1,
+                    }
+                })
+                .map_err(|_| TestError("record update Task preparation failed"))?,
+            );
+        }
+        let content = buffer.folio().lock_content();
+        self.publish_one();
+        self.publish_one();
+        let blocked = until(
+            "record update tasks did not block on common content",
+            || {
+                self.observation.entered[0].load(Ordering::Acquire)
+                    && self.observation.entered[1].load(Ordering::Acquire)
+                    && self.observation.blocked(0)
+                    && self.observation.blocked(1)
+            },
+        );
+        drop(content);
+        blocked?;
+        self.join_tasks()?;
+        let (decoded, roots_preserved, corrupt_rejected) = buffer
+            .with_read(|bytes| {
+                let mut decoded = [Err(FsError::Corrupt); 2];
+                let mut roots_preserved = [false; 2];
+                let mut corrupt_rejected = [false; 2];
+                for index in 0..2 {
+                    let record = &bytes[index * 256..(index + 1) * 256];
+                    decoded[index] = codec::decode_inode(g, numbers[index], record)
+                        .map(|inode| InodeMetadata::from_data(&inode));
+                    roots_preserved[index] = record[40..100] == original[index][40..100];
+                    let mut corrupt = [0u8; 256];
+                    corrupt.copy_from_slice(record);
+                    corrupt[255] ^= 1;
+                    corrupt_rejected[index] =
+                        codec::decode_inode(g, numbers[index], &corrupt).is_err();
+                }
+                (decoded, roots_preserved, corrupt_rejected)
+            })
+            .map_err(|_| TestError("record final common view failed"))?;
+        for index in 0..2 {
+            context.expect_eq(decoded[index], Ok(after[index]));
+            context.expect_eq(roots_preserved[index], true);
+            context.expect_eq(corrupt_rejected[index], true);
+        }
+        for index in 0..2 {
+            let unchanged = volume
+                .load_inode(numbers[index])
+                .map_err(|_| TestError("record original root reread failed"))?;
+            context.expect_eq(InodeMetadata::from_data(&unchanged), before[index]);
+        }
+        let pfn = buffer.folio().phys_addr();
+        drop(buffer);
+        context.expect_eq(cache.prune_unused(), 0);
+        context.diagnostic(format_args!(
+            "metadata-records private-scratch=1 PFN={} native-blocked=2 shared-page-records=2 production-codec=1 full-CRC=1 root-unchanged=1 file-write-fsync-covered=0",
+            pfn,
+        ));
+        Ok(())
+    }
+
     /// 正常和主体失败共用真实静止化：停未发表 producer、放 gate/read、恢复 used、stop/join/Work 尾。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.observation.cancelled.store(true, Ordering::Release);
@@ -1122,14 +1435,6 @@ impl Owner {
         if let Some(extra) = &self.extra {
             extra.test_resume_completions();
         }
-        self.disk
-            .stop()
-            .map_err(|_| TestError("cache stop cannot converge; retaining original DMA owner"))?;
-        if let Some(extra) = &self.extra {
-            extra.stop().map_err(|_| {
-                TestError("extra cache stop cannot converge; retaining original owner")
-            })?;
-        }
         if let Some(join) = self.joins.first() {
             until("cache read owner did not leave stack", || {
                 join.try_join().is_some()
@@ -1138,6 +1443,31 @@ impl Owner {
         let read = self.observation.read.lock().take();
         drop(read);
         self.join_tasks()?;
+        self.disk.test_flush_completions();
+        if let Some(extra) = &self.extra {
+            extra.test_flush_completions();
+        }
+        self.held.fill_with(|| None);
+        let results =
+            core::mem::replace(&mut *self.observation.results.lock(), [const { None }; 3]);
+        drop(results);
+        if self.private_metadata {
+            // SAFETY: 本例只有私有 scratch metadata，未构造 FS/inode 或发表任何写；
+            // 已取消并 join 全部参与者、结束真实 Read/Work，外部 Buffer/Folio 均已释放。
+            // discard_private 先关闭新取得并真实 detach；没有用户映射或 WB，CPU 修改无需落盘。
+            unsafe { self.metadata.as_ref().unwrap().discard_private() }
+                .map_err(|_| TestError("private metadata detach retained a live owner"))?;
+        }
+        drop(self.metadata.take());
+        drop(self.extra_metadata.take());
+        self.disk
+            .stop()
+            .map_err(|_| TestError("cache stop cannot converge; retaining original DMA owner"))?;
+        if let Some(extra) = &self.extra {
+            extra
+                .stop()
+                .map_err(|_| TestError("extra cache stop cannot converge"))?;
+        }
         self.queue.close_sync();
         context.expect_eq(self.disk.test_snapshot().inflight, 0);
         if let Some(extra) = &self.extra {
@@ -1185,6 +1515,8 @@ fixture!(Failure, Failure);
 fixture!(Bounded, Bounded);
 fixture!(Oom, Oom);
 fixture!(PrepareOom, PrepareOom);
+fixture!(MutableMetadata, MutableMetadata);
+fixture!(MetadataRecords, MetadataRecords);
 
 #[ktest::suite(fixture = Pages, context = "Thread", tags("cache", "folio"), timeout_ms = 15000)]
 mod folio {
@@ -1193,6 +1525,91 @@ mod folio {
     #[test]
     fn original_page_lifetime(context: &mut TestContext<'_>, fixture: &mut Pages) -> TestResult {
         fixture.identity(context)
+    }
+
+    /// 有序、逆序和大跨度键超过旧固定槽；真实 OOM 下命中原页且 AVL 删除保持平衡。
+    #[test]
+    fn sparse_index_insert_hit_and_prune(
+        context: &mut TestContext<'_>,
+        _: &mut Pages,
+    ) -> TestResult {
+        for pass in 0..3 {
+            let mapping = FileMapping::new();
+            context.expect_eq(mapping.ktest_validate(), (0, 0));
+            let key = |index: usize| match pass {
+                0 => index as u64,
+                1 => (95 - index) as u64,
+                _ if index == 95 => u64::MAX,
+                _ => (1u64 << 40) + index as u64 * 8191,
+            };
+            let mut addresses = [0usize; 96];
+            for (index, address) in addresses.iter_mut().enumerate() {
+                let (folio, read) = mapping
+                    .get_or_prepare(key(index))
+                    .map_err(|_| TestError("sparse AVL insertion failed"))?;
+                let mut read = read.ok_or(TestError("sparse miss did not own initialization"))?;
+                for byte in read.bytes_mut() {
+                    byte.write(index as u8);
+                }
+                // SAFETY: 本 owner 从未交给设备；其整个页范围已由上面循环初始化，
+                // 没有任何 DMA/CPU 初始化别名，complete 后不再使用原可写范围。
+                unsafe {
+                    read.complete(IoResult {
+                        completed: mm::PAGE_SIZE,
+                        error: None,
+                    });
+                }
+                *address = folio.phys_addr();
+                context.expect_eq(mapping.ktest_validate().0, index + 1);
+            }
+            let (count, height) = mapping.ktest_validate();
+            context.expect_eq(count, 96);
+            context.expect_eq(height <= 8, true);
+            if pass == 0 {
+                let mut pressure = HeapPressure::prepare()?;
+                let evidence = pressure.exhaust();
+                let result = mapping.get_or_prepare(key(48));
+                drop(pressure);
+                context.expect_eq(evidence, (true, true));
+                let (hit, read) =
+                    result.map_err(|_| TestError("sparse hit allocated under real OOM"))?;
+                context.expect_eq(hit.phys_addr(), addresses[48]);
+                context.expect_eq(read.is_none(), true);
+            }
+            for (index, address) in addresses.iter().enumerate() {
+                let (hit, read) = mapping
+                    .get_or_prepare(key(index))
+                    .map_err(|_| TestError("sparse AVL hit lost original page"))?;
+                context.expect_eq(hit.phys_addr(), *address);
+                context.expect_eq(read.is_none(), true);
+                let mut byte = [0u8; 1];
+                context.expect_eq(hit.copy_to(0, &mut byte), Ok(()));
+                context.expect_eq(byte[0], index as u8);
+            }
+            let first = mapping
+                .get_or_prepare(key(0))
+                .map_err(|_| TestError("sparse first pin failed"))?
+                .0;
+            let middle = mapping
+                .get_or_prepare(key(48))
+                .map_err(|_| TestError("sparse middle pin failed"))?
+                .0;
+            let last = mapping
+                .get_or_prepare(key(95))
+                .map_err(|_| TestError("sparse last pin failed"))?
+                .0;
+            context.expect_eq(mapping.prune_unused(), 93);
+            context.expect_eq(mapping.ktest_validate(), (3, 2));
+            drop(first);
+            drop(middle);
+            drop(last);
+            context.expect_eq(mapping.prune_unused(), 3);
+            context.expect_eq(mapping.ktest_validate(), (0, 0));
+        }
+        context.diagnostic(format_args!(
+            "sparse-index orders=ascending/descending/sparse pages-per-order=96 old-fixed-slot-limit=none real-OOM-hit=1 same-PFN=1 AVL-checked=1 prune-live=93 prune-final=3"
+        ));
+        Ok(())
     }
 }
 
@@ -1271,7 +1688,7 @@ mod stopped_failure {
 #[ktest::suite(fixture = Bounded, suite_resources = DeviceInventory, context = "Thread", tags("cache", "prune", "B23"), resources("root"), timeout_ms = 15000)]
 mod bounded {
     use super::*;
-    /// 两种缓存预算内 clean 回收，全活 miss 明确 NoMemory。
+    /// 元数据活页拒预算外 miss，文件稀疏索引保留三个活页及完整内容。
     #[test]
     fn clean_prune_and_live_no_memory(
         context: &mut TestContext<'_>,
@@ -1292,9 +1709,9 @@ mod oom {
     ) -> TestResult {
         fixture.0.oom(context)
     }
-    /// 满预算但存在 clean 页时，先回收原页再准备新 key，不产生可避免的 NoMemory。
+    /// 真实 OOM 保 miss 错误，放压后只建立一个原页填充拥有者。
     #[test]
-    fn clean_replacement_under_real_oom(
+    fn sparse_miss_recovers_after_real_oom(
         context: &mut TestContext<'_>,
         fixture: &mut Oom,
     ) -> TestResult {
@@ -1313,5 +1730,33 @@ mod prepare_oom {
         fixture: &mut PrepareOom,
     ) -> TestResult {
         fixture.0.prepare_oom(context)
+    }
+}
+
+#[ktest::suite(fixture = MutableMetadata, suite_resources = DeviceInventory, context = "Thread",
+    tags("cache", "metadata"), resources("scratch"), timeout_ms = 15000)]
+mod mutable_metadata {
+    use super::*;
+    /// 实际 scratch Read 补缺失 sector，1/2/4KiB 视图共 PFN 且保既有 CPU 修改。
+    #[test]
+    fn overlapping_partial_views_preserve_updates(
+        context: &mut TestContext<'_>,
+        fixture: &mut MutableMetadata,
+    ) -> TestResult {
+        fixture.0.overlapping_updates(context)
+    }
+}
+
+#[ktest::suite(fixture = MetadataRecords, suite_resources = DeviceInventory, context = "Thread",
+    tags("cache", "metadata"), resources("root", "scratch"), timeout_ms = 15000)]
+mod metadata_records {
+    use super::*;
+    /// 两实际生产 inode 记录复制到私有页，由原生任务互斥更新并以生产解码器核完整 CRC。
+    #[test]
+    fn common_page_record_updates_keep_both_checksums(
+        context: &mut TestContext<'_>,
+        fixture: &mut MetadataRecords,
+    ) -> TestResult {
+        fixture.0.concurrent_records(context)
     }
 }

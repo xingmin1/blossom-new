@@ -1,16 +1,36 @@
 //! 设备停机先终止 DMA，再等待本设备的中断与工作执行尾部。
 
+use alloc::sync::Arc;
 use core::time::Duration;
 
 use crate::arch;
 use crate::block::disk::{Disk, DiskRef, QueuePhase, QueueState};
-use crate::block::BlockError;
+use crate::block::{AccessMode, BlockError};
 use crate::wait::{WaitNode, Waiter};
 use crate::{sched, time, timer};
 
-/// 挂载持有实际磁盘引用，并在同一队列准入锁下排斥原始写入。
-pub struct ReadOnlyClaim {
+/// 文件系统占用共享同一个真实磁盘及模式，克隆不增加队列占用数。
+#[derive(Clone)]
+pub struct FsClaim {
+    inner: Arc<FsClaimInner>,
+}
+
+struct FsClaimInner {
     disk: DiskRef,
+    mode: AccessMode,
+    claimed: bool,
+}
+
+impl FsClaim {
+    /// 借用本次占用的访问模式，不从设备可写能力推导视图权限。
+    pub fn mode(&self) -> AccessMode {
+        self.inner.mode
+    }
+
+    /// 借用实际磁盘拥有者，调用方不得以设备身份值伪造该占用。
+    pub fn disk(&self) -> &DiskRef {
+        &self.inner.disk
+    }
 }
 
 impl Disk {
@@ -212,26 +232,39 @@ impl Disk {
         }
     }
 
-    /// 原始写生成者和写 slot 都结束后取得只读挂载声明；读请求仍可并发。
-    pub fn claim_readonly(disk: &DiskRef) -> Result<ReadOnlyClaim, BlockError> {
-        let owner = disk.clone();
+    /// 首次占用在原队列锁下排斥既有 raw 写者；已有占用可与合法 FS 写并存。
+    /// 共享 inner 在锁外 fallible 准备，未发表失败不改变队列计数。
+    pub fn claim_fs(disk: &DiskRef, mode: AccessMode) -> Result<FsClaim, BlockError> {
+        if mode == AccessMode::ReadWrite && disk.limits.readonly {
+            return Err(BlockError::ReadOnly);
+        }
+        let mut owner = Arc::try_new(FsClaimInner {
+            disk: disk.clone(),
+            mode,
+            claimed: false,
+        })
+        .map_err(|_| BlockError::NoMemory)?;
         {
+            let inner = Arc::get_mut(&mut owner).expect("unpublished FS claim is shared");
             let mut queue = disk.queue.lock();
             if queue.phase != QueuePhase::Live
-                || queue.writer_generators != 0
-                || queue.writing_slots != 0
+                || (queue.mounts == 0 && (queue.writer_generators != 0 || queue.writing_slots != 0))
             {
                 return Err(BlockError::Busy);
             }
             queue.mounts = queue.mounts.checked_add(1).ok_or(BlockError::Busy)?;
+            inner.claimed = true;
         }
-        Ok(ReadOnlyClaim { disk: owner })
+        Ok(FsClaim { inner: owner })
     }
 }
 
-impl Drop for ReadOnlyClaim {
-    /// 最后一个挂载拥有者锁下撤销写保护计数，锁外通知并释放固定磁盘引用。
+impl Drop for FsClaimInner {
+    /// 最后一个真实占用在队列锁下撤销计数，通知及磁盘最后 put 均在锁外。
     fn drop(&mut self) {
+        if !self.claimed {
+            return;
+        }
         {
             let mut queue = self.disk.queue.lock();
             assert!(0 < queue.mounts, "block mount claim underflow");

@@ -1,6 +1,6 @@
 //! 固定请求槽与真实 ring head 共同维持块 I/O 的唯一拥有关系。
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::marker::PhantomPinned;
@@ -12,7 +12,8 @@ use virtio_drivers::transport::{DeviceStatus, InterruptStatus};
 use virtio_drivers::{DmaRegion, Error, Hal, MappedSegment};
 
 use crate::block::bio::BioInner;
-use crate::block::{Bio, BlkOperation, BlockError, QueueLimits, MAX_BATCH};
+use crate::block::{AccessMode, Bio, BlkOperation, BlockError, FsClaim, QueueLimits, MAX_BATCH};
+use crate::cache::MetadataCache;
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity, VirtioInitError};
 use crate::irq::{self, IrqRegistration};
 use crate::mm::dma::KernelHal;
@@ -83,6 +84,8 @@ pub(super) struct RequestPart {
     pub(super) bio: Arc<BioInner>,
     pub(super) offset: usize,
     pub(super) length: usize,
+    // 独立保占用到 slot 资源和队列计数归还；父 ready 不终止此责任。
+    _fs_claim: Option<FsClaim>,
 }
 
 struct SlotResources {
@@ -122,6 +125,7 @@ pub struct Disk {
     pub(super) quiescent: WaitQueue,
     pub(super) limits: QueueLimits,
     pub(super) identity: VirtioIdentity,
+    metadata_cache: SpinLock<Weak<MetadataCache>>,
     pub(super) _pinned: PhantomPinned,
 }
 
@@ -316,6 +320,7 @@ impl Disk {
             quiescent: WaitQueue::new(),
             limits,
             identity,
+            metadata_cache: SpinLock::new(Weak::new()),
             _pinned: PhantomPinned,
         })
         .map_err(|_| BlockError::NoMemory)?;
@@ -403,6 +408,28 @@ impl Disk {
         self.limits
     }
 
+    /// 取得本磁盘尚存活的共同元数据缓存；不在块层构造或解析文件系统。
+    pub(crate) fn metadata_cache(&self) -> Option<Arc<MetadataCache>> {
+        self.metadata_cache.lock().upgrade()
+    }
+
+    /// 候选由缓存层锁外构造，调用方须保证属于本磁盘并检查预算相容；短锁双查只发布弱引用。
+    /// 未采用的候选仍归调用方，旧弱引用在锁外释放。
+    pub(crate) fn intern_metadata_cache(
+        &self,
+        candidate: &Arc<MetadataCache>,
+    ) -> Arc<MetadataCache> {
+        let retired = {
+            let mut slot = self.metadata_cache.lock();
+            if let Some(existing) = slot.upgrade() {
+                return existing;
+            }
+            core::mem::replace(&mut *slot, Arc::downgrade(candidate))
+        };
+        drop(retired);
+        Arc::clone(candidate)
+    }
+
     /// 非 slot 的 Task 最后义务复用原域，并在 Bio 构造期预留独占执行栈及一次性尾部。
     pub(super) fn prepare_finalizer(
         &self,
@@ -429,20 +456,35 @@ impl Disk {
         self.quiescent.wake_all();
     }
 
-    /// 只在 Live 接受一个 root，挂载 claim 与写生成者检查属于同一临界区。
-    /// 生成期借用实际设备拥有者，只有最后生成义务移交完成 Work 时才克隆保活引用。
+    /// raw 准入没有文件系统授权，与 FS 提交共用原生成者和 slot 核心。
     pub(super) fn admit<'a>(
         self: &'a DiskRef,
         bio: Bio,
+    ) -> Result<ActiveBio<'a>, (Bio, BlockError)> {
+        self.admit_from(bio, None)
+    }
+
+    /// Live 下核对实际磁盘和写来源，再在同一队列短锁中接受 root。
+    /// claim 由借用来源保活到锁外移交，复杂最后 put 不发生在准入锁中。
+    pub(super) fn admit_from<'a>(
+        self: &'a DiskRef,
+        bio: Bio,
+        claim: Option<&FsClaim>,
     ) -> Result<ActiveBio<'a>, (Bio, BlockError)> {
         {
             let mut q = self.queue.lock();
             let error = if !matches!(q.phase, QueuePhase::Live) {
                 Some(q.stopped_error())
-            } else if bio.inner.target() != self.identity {
+            } else if bio.inner.target() != self.identity
+                || claim.is_some_and(|claim| !ptr::eq(&**claim.disk(), &**self))
+            {
                 Some(BlockError::InvalidRange)
             } else if bio.inner.operation() == BlkOperation::Write
-                && (self.limits.readonly || 0 < q.mounts)
+                && (self.limits.readonly
+                    || match claim {
+                        Some(claim) => claim.mode() != AccessMode::ReadWrite,
+                        None => 0 < q.mounts,
+                    })
             {
                 Some(BlockError::ReadOnly)
             } else {
@@ -456,11 +498,15 @@ impl Disk {
                 q.writer_generators += 1;
             }
         }
+        if let Some(claim) = claim {
+            bio.inner.retain_fs_claim(claim);
+        }
         bio.inner.begin();
         Ok(ActiveBio {
             bio: bio.inner,
             offset: 0,
             disk: self,
+            fs_claim: claim.cloned(),
             finished: false,
         })
     }
@@ -736,8 +782,8 @@ impl Disk {
         }
         let writing = resources.operation == BlkOperation::Write;
         let mut remaining = completed;
-        for index in 0..resources.part_count {
-            let part = resources.parts[index].take().expect("slot part is missing");
+        let parts = core::mem::replace(&mut resources.parts, [const { None }; MAX_BATCH]);
+        for part in parts.iter().flatten() {
             let progress = remaining.min(part.length);
             remaining -= progress;
             let part_error = if progress < part.length || part.length == 0 {
@@ -747,7 +793,6 @@ impl Disk {
             };
             part.bio
                 .finish_child(part.offset, part.length, progress, part_error);
-            drop(part);
         }
         resources.sg.clear();
         resources.part_count = 0;
@@ -774,6 +819,8 @@ impl Disk {
         }
         self.available.wake_all();
         self.quiescent.wake_all();
+        // 完成观察者可早于 slot 尾被唤醒，所有 part 的占用仍保留到计数归还后。
+        drop(parts);
     }
 
     /// 只有真实 reset 已确认才能撤 Submitted 的设备拥有期；已认领完成槽不会重复完成。
@@ -928,6 +975,7 @@ pub(super) struct ActiveBio<'a> {
     pub(super) offset: usize,
     disk: &'a DiskRef,
     finished: bool,
+    fs_claim: Option<FsClaim>,
 }
 
 impl ActiveBio<'_> {
@@ -946,6 +994,8 @@ impl ActiveBio<'_> {
         if !deferred {
             self.disk.finish_generation_tail(self.bio.operation());
         }
+        // 延后完成由 BioState 继续保活；同步完成在 accepted 队列尾后才解除本引用。
+        drop(self.fs_claim.take());
     }
 }
 
@@ -1006,10 +1056,12 @@ impl PreparingSlot<'_> {
         {
             return Err(BlockError::InvalidRange);
         }
+        let fs_claim = bio.fs_claim();
         resources.parts[resources.part_count] = Some(RequestPart {
             bio,
             offset,
             length,
+            _fs_claim: fs_claim,
         });
         resources.part_count += 1;
         Ok(())
@@ -1194,9 +1246,7 @@ impl Drop for PreparingSlot<'_> {
         let disk = self.disk;
         let tag = self.tag;
         let resources = self.resources_mut();
-        for part in &mut resources.parts {
-            drop(part.take());
-        }
+        let parts = core::mem::replace(&mut resources.parts, [const { None }; MAX_BATCH]);
         resources.sg.clear();
         resources.part_count = 0;
         resources.configured = false;
@@ -1208,6 +1258,7 @@ impl Drop for PreparingSlot<'_> {
         }
         disk.available.wake_all();
         disk.quiescent.wake_all();
+        drop(parts);
     }
 }
 

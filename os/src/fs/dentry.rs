@@ -80,7 +80,7 @@ impl DentryCache {
         name: &[u8],
     ) -> Result<DentryRef, FsError> {
         sched::assert_switchable();
-        if parent.inode()?.metadata()?.kind != InodeKind::Directory {
+        if parent.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
         validate_name(name)?;
@@ -238,7 +238,7 @@ impl DentryCache {
 impl DentryRef {
     /// 以真实正目录建立无父、空名字且已完成的挂载根，不参与名字索引。
     pub fn try_root(inode: InodeRef) -> Result<Self, FsError> {
-        if inode.metadata()?.kind != InodeKind::Directory {
+        if inode.metadata_snapshot()?.kind != InodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
         let dentry = Arc::try_new(Dentry {

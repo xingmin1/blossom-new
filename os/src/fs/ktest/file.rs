@@ -188,7 +188,7 @@ pub(crate) mod regular {
                 .resolve(fixture.path.context(), b"/pattern", ResolveMode::Follow),
         )?;
         let inode = checked(context, path.inode())?;
-        let data = checked(context, inode.metadata())?;
+        let data = checked(context, inode.metadata_snapshot())?;
         context.expect_eq(
             (
                 stat.inode,
@@ -727,8 +727,14 @@ pub(crate) mod mounts {
             .disks
             .get(1)
             .ok_or(TestError("file extra Disk absent"))?;
-        let volume = checked(context, Ext4Volume::open(disk.clone(), 64))?;
-        checked(context, vfs.mount(&covered, volume.clone()))?;
+        let volume = checked(
+            context,
+            Ext4Volume::open(disk.clone(), AccessMode::ReadOnly, 64),
+        )?;
+        checked(
+            context,
+            vfs.mount(&covered, volume.clone(), AccessMode::ReadOnly),
+        )?;
         let fd = fixture.open(context, b"/mnt/extra/pattern", OpenOptions::default())?;
         let table = fixture.table();
         read_pattern(context, table, fd, 0, 31)?;
@@ -1049,10 +1055,11 @@ pub(crate) mod vm_lifetime {
         fixture.start_vm_access(2, Arc::clone(&mm), UserAccess::Write)?;
         fixture.join_vm_user(0)?;
         assert_ne!(mm.mapping(VM_TARGET).unwrap().physical, original);
-        assert_eq!(
-            folio.with_bytes(0, 8, |bytes| patterned(bytes, 0)),
-            Ok(true)
-        );
+        checked(
+            context,
+            folio.copy_to(0, &mut expected).map_err(FsError::from),
+        )?;
+        assert!(patterned(&expected, 0));
         let private = b"private-COW";
         assert_eq!(mm.copyout(VM_TARGET + 13, private).error, None);
         let mut cached = [0; 11];
@@ -1216,13 +1223,9 @@ pub(crate) mod vm_racing {
         assert_eq!(mm.read_u64(VM_TARGET), Ok(0));
         let old = checked(context, file.file_page(1))?;
         assert_ne!(mm.mapping(VM_TARGET).unwrap().physical, old.phys_addr());
-        assert_eq!(
-            old.with_bytes(0, mm::PAGE_SIZE, |bytes| patterned(
-                bytes,
-                mm::PAGE_SIZE as u64
-            )),
-            Ok(true),
-        );
+        let mut bytes = [0xa7; mm::PAGE_SIZE];
+        checked(context, old.copy_to(0, &mut bytes).map_err(FsError::from))?;
+        assert!(patterned(&bytes, mm::PAGE_SIZE as u64));
         assert_eq!(checked(context, file.seek(SeekFrom::Current(0)))?, 0);
         drop(old);
         drop(mm);

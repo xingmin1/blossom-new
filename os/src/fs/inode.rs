@@ -1,4 +1,4 @@
-//! 缓存域保存唯一 inode，元数据只发布一次，文件页由该 inode 的 mapping 拥有。
+//! canonical inode 的加载结果、运行属性和块映射分别受实际拥有与同步协议保护。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -9,12 +9,13 @@ use core::pin::{pin, Pin};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Once;
 
+use crate::block::{AccessMode, FsClaim};
 use crate::cache::FileMapping;
-use crate::fs::ext4::{DirectoryEntry, Ext4Volume, InodeData, InodeKind};
+use crate::fs::ext4::{BlockMapping, DirectoryEntry, Ext4Volume, InodeData, InodeKind, InodeTime};
 use crate::fs::{FsError, ReadBuffer};
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::sched;
-use crate::sync::SpinLock;
+use crate::sync::{SleepMutex, SleepRwLock, SpinLock};
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
 #[cfg(feature = "ktest")]
@@ -25,7 +26,7 @@ type LoadHook = Arc<dyn Fn(&InodeRef) + Send + Sync>;
 pub struct InodeCache {
     entries: SpinLock<Vec<InodeRef>>,
     capacity: usize,
-    file_page_capacity: usize,
+    domain: Arc<()>,
     #[cfg(feature = "ktest")]
     load_hook: SpinLock<Option<LoadHook>>,
     #[cfg(feature = "ktest")]
@@ -37,14 +38,103 @@ pub struct InodeCache {
 #[derive(Clone)]
 pub struct InodeRef(Arc<Inode>);
 
-/// 同一卷实例与 inode 号的只读对象，尚未发布 once 结果时处于 Loading。
+/// 同一 FS 实例中的唯一运行对象，未发表加载结果时处于 Loading。
 pub struct Inode {
     filesystem: Arc<Ext4Volume>,
+    _domain: Arc<()>,
     number: u64,
-    data: Once<Result<InodeData, FsError>>,
+    data: Once<Result<InodeState, FsError>>,
     mapping: FileMapping,
     waiters: WaitQueue,
     _pinned: PhantomPinned,
+}
+
+/// 有界属性快照不含块根；size 只在 canonical 属性锁内保存一份运行值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeMetadata {
+    pub number: u64,
+    pub kind: InodeKind,
+    pub mode: u16,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub links: u32,
+    pub blocks: u64,
+    pub atime: InodeTime,
+    pub mtime: InodeTime,
+    pub ctime: InodeTime,
+    pub generation: u32,
+    pub flags: u32,
+    pub checksum_seed: u32,
+    pub fast_symlink: bool,
+    pub file_acl: u64,
+    pub extra_isize: usize,
+}
+
+struct InodeState {
+    write: SleepMutex<()>,
+    metadata: SpinLock<InodeMetadata>,
+    root: SleepRwLock<[u8; 60]>,
+}
+
+impl InodeMetadata {
+    /// 将盘面加载值拆为运行属性，块根单独进入睡眠读写保护。
+    pub(crate) fn from_data(data: &InodeData) -> Self {
+        Self {
+            number: data.number,
+            kind: data.kind,
+            mode: data.mode,
+            size: data.size,
+            uid: data.uid,
+            gid: data.gid,
+            links: data.links,
+            blocks: data.blocks,
+            atime: data.atime,
+            mtime: data.mtime,
+            ctime: data.ctime,
+            generation: data.generation,
+            flags: data.flags,
+            checksum_seed: data.checksum_seed,
+            fast_symlink: data.fast_symlink,
+            file_acl: data.file_acl,
+            extra_isize: data.extra_isize,
+        }
+    }
+
+    /// 仅为当次真实块映射查询组装 codec 输入，不保存第二份可变状态。
+    pub(crate) fn with_block(&self, block: &[u8; 60]) -> InodeData {
+        InodeData {
+            number: self.number,
+            kind: self.kind,
+            mode: self.mode,
+            size: self.size,
+            uid: self.uid,
+            gid: self.gid,
+            links: self.links,
+            blocks: self.blocks,
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+            generation: self.generation,
+            flags: self.flags,
+            checksum_seed: self.checksum_seed,
+            fast_symlink: self.fast_symlink,
+            file_acl: self.file_acl,
+            extra_isize: self.extra_isize,
+            block: *block,
+        }
+    }
+}
+
+impl InodeState {
+    /// 完成真实加载后一次安装同步容器，初始化不执行额外 IO。
+    fn new(data: InodeData) -> Self {
+        Self {
+            write: SleepMutex::new(()),
+            metadata: SpinLock::new(InodeMetadata::from_data(&data)),
+            root: SleepRwLock::new(data.block),
+        }
+    }
 }
 
 /// 只有胜出的候选取得此责任；提前退出发布取消结果并解除自己的占位。
@@ -55,9 +145,9 @@ struct LoadGuard<'a> {
 }
 
 impl InodeCache {
-    /// 锁外一次预留有限索引；每个 inode 的页预算在候选构造时预留。
-    pub fn try_new(inode_capacity: usize, file_page_capacity: usize) -> Result<Self, FsError> {
-        if inode_capacity == 0 || file_page_capacity == 0 {
+    /// 锁外预留有限 inode 槽；文件页索引不预留每文件固定页槽。
+    pub fn try_new(inode_capacity: usize) -> Result<Self, FsError> {
+        if inode_capacity == 0 {
             return Err(FsError::InvalidOperation);
         }
         let mut entries = Vec::new();
@@ -67,7 +157,7 @@ impl InodeCache {
         Ok(Self {
             entries: SpinLock::new(entries),
             capacity: inode_capacity,
-            file_page_capacity,
+            domain: Arc::try_new(()).map_err(|_| FsError::NoMemory)?,
             #[cfg(feature = "ktest")]
             load_hook: SpinLock::new(None),
             #[cfg(feature = "ktest")]
@@ -78,6 +168,7 @@ impl InodeCache {
     /// 普通可切换 Task 获取同身份对象；加载与等待均在索引锁和 once 初始化之外。
     pub fn iget(&self, filesystem: &Arc<Ext4Volume>, number: u64) -> Result<InodeRef, FsError> {
         sched::assert_switchable();
+        filesystem.bind_inode_domain(&self.domain)?;
         let (existing, full) = {
             let entries = self.entries.lock();
             (
@@ -86,7 +177,7 @@ impl InodeCache {
             )
         };
         if let Some(inode) = existing {
-            inode.metadata()?;
+            inode.wait_loaded()?;
             return Ok(inode);
         }
         if full {
@@ -97,14 +188,14 @@ impl InodeCache {
             let full = self.capacity <= entries.len();
             drop(entries);
             if let Some(inode) = existing {
-                inode.metadata()?;
+                inode.wait_loaded()?;
                 return Ok(inode);
             }
             if full {
                 return Err(FsError::NoMemory);
             }
         }
-        let candidate = InodeRef::try_new(filesystem, number, self.file_page_capacity)?;
+        let candidate = InodeRef::try_new(filesystem, number, &self.domain)?;
         let mut loader = LoadGuard {
             cache: self,
             inode: &candidate,
@@ -122,7 +213,7 @@ impl InodeCache {
             // 竞争失败者没有加载责任，不改变赢家的 once 或等待队列。
             drop(loader);
             drop(candidate);
-            inode.metadata()?;
+            inode.wait_loaded()?;
             return Ok(inode);
         }
         #[cfg(feature = "ktest")]
@@ -136,7 +227,7 @@ impl InodeCache {
         let result = filesystem.load_inode(number);
         loader.complete(result);
         drop(loader);
-        candidate.metadata()?;
+        candidate.wait_loaded()?;
         Ok(candidate)
     }
 
@@ -250,11 +341,12 @@ impl InodeRef {
     fn try_new(
         filesystem: &Arc<Ext4Volume>,
         number: u64,
-        file_page_capacity: usize,
+        domain: &Arc<()>,
     ) -> Result<Self, FsError> {
-        let mapping = FileMapping::try_new(file_page_capacity)?;
+        let mapping = FileMapping::new();
         let inode = Arc::try_new(Inode {
             filesystem: Arc::clone(filesystem),
+            _domain: domain.clone(),
             number,
             data: Once::new(),
             mapping,
@@ -268,6 +360,80 @@ impl InodeRef {
     /// 比较原对象身份，不以相同卷号、元数据内容或盘上 inode 号代替实例身份。
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+    /// 内核按位置读取与用户接收端使用同一页交付循环。
+    pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
+        self.read_into(offset, &mut ReadBuffer::kernel(dst))
+    }
+
+    /// 读取普通文件有效字节，页或接收端失败均优先返回本次已交付前缀。
+    pub(crate) fn read_into(
+        &self,
+        offset: u64,
+        target: &mut ReadBuffer<'_>,
+    ) -> Result<usize, FsError> {
+        let initial = target.copied();
+        let remaining = target.len() - initial;
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let data = self.metadata_snapshot()?;
+        if data.kind == InodeKind::Directory {
+            return Err(FsError::IsDirectory);
+        }
+        if data.kind != InodeKind::Regular {
+            return Err(FsError::InvalidOperation);
+        }
+        if data.size <= offset {
+            return Ok(0);
+        }
+        let len = (data.size - offset).min(remaining as u64) as usize;
+        let mut copied = 0;
+        let mut staging = [0u8; 512];
+        while copied < len {
+            // 已交付量不超过 size-offset，位置和页内有效范围不会溢出。
+            let position = offset + copied as u64;
+            let index = position / PAGE_SIZE as u64;
+            let in_page = (position % PAGE_SIZE as u64) as usize;
+            let page_end = copied + (len - copied).min(PAGE_SIZE - in_page);
+            let result = self.read_page(index).and_then(|folio| {
+                while copied < page_end {
+                    let count = (page_end - copied).min(staging.len());
+                    let source = ((offset + copied as u64) % PAGE_SIZE as u64) as usize;
+                    folio.copy_to(source, &mut staging[..count])?;
+                    // 原页内容访问已经结束，目标 fault 可再次取得同一 inode/page。
+                    target.push(&staging[..count])?;
+                    copied = target.copied() - initial;
+                }
+                Ok::<_, FsError>(())
+            });
+            copied = target.copied() - initial;
+            if let Err(error) = result {
+                return if copied == 0 { Err(error) } else { Ok(copied) };
+            }
+        }
+        Ok(copied)
+    }
+
+    /// 普通任务取得正式元数据后等待同一 mapping 的页；映射调用者另行检查 EOF 和私有尾页。
+    pub(crate) fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
+        let data = self.metadata_snapshot()?;
+        if data.kind != InodeKind::Regular {
+            return Err(FsError::InvalidOperation);
+        }
+        self.read_page(index)
+    }
+
+    /// 通过共同 mapping 协调同页唯一填充；不同页没有 inode 级读入锁。
+    fn read_page(&self, index: u64) -> Result<FolioRef, FsError> {
+        let (folio, read) = self.mapping.get_or_prepare(index)?;
+        if let Some(read) = read {
+            self.with_map_read(|metadata, root| {
+                self.filesystem.fill_page(metadata, root, index, read)
+            })?;
+        }
+        folio.wait_ready()?;
+        Ok(folio.with_file_owner(self.clone()))
     }
 }
 
@@ -291,8 +457,8 @@ impl Inode {
         &self.filesystem
     }
 
-    /// 等待一次加载结果并借用已解码元数据；命中不重新解析或复制 inode。
-    pub fn metadata(&self) -> Result<&InodeData, FsError> {
+    /// 等待唯一加载结果；属性与块根的访问必须继续取得各自规定的锁。
+    fn wait_loaded(&self) -> Result<&InodeState, FsError> {
         sched::assert_switchable();
         let inode = self.pinned().get_ref();
         loop {
@@ -311,95 +477,77 @@ impl Inode {
         }
     }
 
-    /// 借用 inode 自己唯一的文件页索引，页填充仍须遵守后端与 FolioRead 协议。
-    pub fn mapping(&self) -> &FileMapping {
-        &self.mapping
+    /// 短属性锁内复制当前运行值，不将 Spin guard 带入 IO、等待或用户复制。
+    pub fn metadata_snapshot(&self) -> Result<InodeMetadata, FsError> {
+        Ok(*self.wait_loaded()?.metadata.lock())
     }
 
-    /// 内核按位置读取与用户接收端使用同一页交付循环。
-    pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
-        self.read_into(offset, &mut ReadBuffer::kernel(dst))
-    }
-
-    /// 读取普通文件有效字节，页或接收端失败均优先返回本次已交付前缀。
-    pub(crate) fn read_into(
+    /// 睡眠 data-sem 读侧保持块映射有效；属性快照的短锁在调用闭包前已经释放。
+    pub fn with_map_read<T>(
         &self,
-        offset: u64,
-        target: &mut ReadBuffer<'_>,
-    ) -> Result<usize, FsError> {
-        let initial = target.copied();
-        let remaining = target.len() - initial;
-        if remaining == 0 {
-            return Ok(0);
-        }
-        let data = self.metadata()?;
-        if data.kind == InodeKind::Directory {
-            return Err(FsError::IsDirectory);
-        }
-        if data.kind != InodeKind::Regular {
-            return Err(FsError::InvalidOperation);
-        }
-        if data.size <= offset {
-            return Ok(0);
-        }
-        let len = (data.size - offset).min(remaining as u64) as usize;
-        let mut copied = 0;
-        while copied < len {
-            // 已交付量不超过 size-offset，位置和页内有效范围不会溢出。
-            let position = offset + copied as u64;
-            let index = position / PAGE_SIZE as u64;
-            let in_page = (position % PAGE_SIZE as u64) as usize;
-            let count = (len - copied).min(PAGE_SIZE - in_page);
-            let result = self.read_page(data, index).and_then(|folio| {
-                // 成功 folio 已只读；with_bytes 在回调前释放用途短锁，用户 fault 可睡眠。
-                folio
-                    .with_bytes(in_page, count, |bytes| target.push(bytes))
-                    .map_err(FsError::from)?
-            });
-            copied = target.copied() - initial;
-            if let Err(error) = result {
-                return if copied == 0 { Err(error) } else { Ok(copied) };
-            }
-        }
-        Ok(copied)
+        consume: impl FnOnce(&InodeMetadata, &[u8; 60]) -> Result<T, FsError>,
+    ) -> Result<T, FsError> {
+        let state = self.wait_loaded()?;
+        let root = state.root.read();
+        let metadata = *state.metadata.lock();
+        consume(&metadata, &root)
     }
 
-    /// 普通任务取得正式元数据后等待同一 mapping 的页；映射调用者另行检查 EOF 和私有尾页。
-    pub(crate) fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
-        let data = self.metadata()?;
-        if data.kind != InodeKind::Regular {
-            return Err(FsError::InvalidOperation);
-        }
-        self.read_page(data, index)
+    /// 在块映射读保护下执行真实后端查询，不导出永久块根借用。
+    pub fn map_block(&self, logical: u64) -> Result<BlockMapping, FsError> {
+        self.with_map_read(|metadata, root| self.filesystem.map_block(metadata, root, logical))
     }
 
-    /// 通过共同 mapping 协调同页唯一填充；不同页没有 inode 级读入锁。
-    fn read_page(&self, data: &InodeData, index: u64) -> Result<FolioRef, FsError> {
-        let (folio, read) = self.mapping.get_or_prepare(index)?;
-        if let Some(read) = read {
-            self.filesystem.fill_page(data, index, read)?;
+    /// inode 写序列化与 data-sem 写侧保护受控属性修改，并字段级更新共同盘面记录。
+    /// 此入口不分配块、不截断文件；大小和块布局变更须由对应内容协议实现。
+    pub fn update_metadata<T>(
+        &self,
+        claim: &FsClaim,
+        update: impl FnOnce(&mut InodeMetadata) -> T,
+    ) -> Result<T, FsError> {
+        if claim.mode() != AccessMode::ReadWrite || self.filesystem.mode() != AccessMode::ReadWrite
+        {
+            return Err(FsError::ReadOnly);
         }
-        folio.wait_ready()?;
-        Ok(folio)
+        if !core::ptr::eq(
+            claim.disk().as_ref().get_ref(),
+            self.filesystem.disk().as_ref().get_ref(),
+        ) {
+            return Err(FsError::InvalidOperation);
+        }
+        let state = self.wait_loaded()?;
+        let _write = state.write.lock();
+        let _root = state.root.write();
+        let old = *state.metadata.lock();
+        let mut next = old;
+        let result = update(&mut next);
+        self.filesystem.update_inode_metadata(claim, &old, &next)?;
+        *state.metadata.lock() = next;
+        Ok(result)
+    }
+
+    /// 内核加载或范围扫描借用唯一页索引，须保对应 InodeRef 到裸页使用与 IO 全尾结束。
+    /// 普通文件页消费使用 InodeRef 的出口，交给外部的页引用不能缺少原 inode anchor。
+    pub(crate) fn mapping(&self) -> &FileMapping {
+        &self.mapping
     }
 
     /// 原始单组件名字经真实目录后端查找，再在同缓存域获取硬链接的唯一对象。
     pub fn lookup(&self, cache: &InodeCache, name: &[u8]) -> Result<InodeRef, FsError> {
         let number = self
-            .filesystem
-            .lookup(self.metadata()?, name)?
+            .with_map_read(|metadata, root| self.filesystem.lookup(metadata, root, name))?
             .ok_or(FsError::NotFound)?;
         cache.iget(&self.filesystem, number)
     }
 
     /// 沿盘上字节位置枚举下一个有效目录项，不构造整目录副本。
     pub fn dir_next(&self, offset: u64) -> Result<Option<DirectoryEntry>, FsError> {
-        self.filesystem.dir_next(self.metadata()?, offset)
+        self.with_map_read(|metadata, root| self.filesystem.dir_next(metadata, root, offset))
     }
 
     /// 由后端按真实 inode 存储规则返回符号链接的原始字节。
     pub fn read_link(&self) -> Result<Vec<u8>, FsError> {
-        self.filesystem.read_link(self.metadata()?)
+        self.with_map_read(|metadata, root| self.filesystem.read_link(metadata, root))
     }
 
     /// 私有拥有类型禁止移动内嵌等待源，借用期间最后一个 Arc 不能析构。
@@ -419,7 +567,7 @@ impl LoadGuard<'_> {
 
     /// 复用首次结果，展开清理不能覆盖已经发布的真实加载原因。
     fn publish(&self, result: Result<InodeData, FsError>) {
-        let result = self.inode.data.call_once(|| result);
+        let result = self.inode.data.call_once(|| result.map(InodeState::new));
         if result.is_err() {
             self.cache.remove_failed(self.inode);
         }

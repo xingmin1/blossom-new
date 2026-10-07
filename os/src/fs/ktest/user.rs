@@ -329,7 +329,6 @@ impl UserOwner {
                 .resolve(self.path.context(), b"/test/data.bin", ResolveMode::Follow),
         )?;
         let inode = checked(context, path.inode())?.clone();
-        let data = checked(context, inode.metadata())?;
         let (folio, read) = checked(
             context,
             inode.mapping().get_or_prepare(0).map_err(FsError::Io),
@@ -374,7 +373,12 @@ impl UserOwner {
             signals.interruption_pending(crate::wait::WaitMode::Interruptible),
             true,
         );
-        checked(context, inode.filesystem().fill_page(data, 0, read))?;
+        checked(
+            context,
+            inode.with_map_read(|metadata, root| {
+                inode.filesystem().fill_page(metadata, root, 0, read)
+            }),
+        )?;
         checked(context, folio.wait_ready().map_err(FsError::Io))?;
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);

@@ -17,7 +17,7 @@ pub(crate) mod tests;
 
 pub use bio::{Bio, BioCompletion};
 pub use disk::{Disk, DiskRef};
-pub use stop::ReadOnlyClaim;
+pub use stop::FsClaim;
 pub use virtio_drivers::device::blk::BlkOperation;
 
 use core::convert::TryFrom;
@@ -29,6 +29,13 @@ use crate::mm::dma::MappedPages;
 /// 协议 sector 与设备 logical block、文件系统块大小彼此独立。
 pub const SECTOR_BYTES: u64 = 512;
 pub(super) const MAX_BATCH: usize = 8;
+
+/// 卷能力与挂载视图各自保存访问模式，设备只读能力仍由 QueueLimits 表达。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
+}
 
 /// 普通消费者的错误；额度暂满由核心等待，不暴露成忙重试协议。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

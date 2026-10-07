@@ -3,6 +3,7 @@
 pub(crate) use crate::fs::ext4::crc::{crc16, crc32c};
 pub(crate) use crate::fs::ext4::directory::{verify_directory, DirectoryLayout};
 use crate::fs::ext4::{Geometry, InodeData, InodeKind, InodeTime};
+use crate::fs::inode::InodeMetadata;
 use crate::fs::FsError;
 
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
@@ -379,6 +380,108 @@ fn decode_time(
         seconds: seconds + (i64::from(extension & 3) << 32),
         nanoseconds: extension >> 2,
     })
+}
+
+/// 受控属性更新不改变文件内容、块布局或 inode 身份；格式有限位宽在改字节前检查。
+pub(crate) fn validate_inode_metadata_update(
+    old: &InodeMetadata,
+    next: &InodeMetadata,
+) -> Result<(), FsError> {
+    let mut fixed = *next;
+    fixed.mode = old.mode;
+    fixed.uid = old.uid;
+    fixed.gid = old.gid;
+    fixed.links = old.links;
+    fixed.atime = old.atime;
+    fixed.mtime = old.mtime;
+    fixed.ctime = old.ctime;
+    if fixed != *old || old.mode & 0xf000 != next.mode & 0xf000 || (u16::MAX as u32) < next.links {
+        return Err(FsError::InvalidOperation);
+    }
+    time_encoding(next.atime, 140, next.extra_isize)?;
+    time_encoding(next.mtime, 136, next.extra_isize)?;
+    time_encoding(next.ctime, 132, next.extra_isize)?;
+    Ok(())
+}
+
+/// 根据本 inode 的真实 extra_isize 编码秒扩展与纳秒，不静默截断不可表示时间。
+fn time_encoding(
+    time: InodeTime,
+    extra: usize,
+    extra_isize: usize,
+) -> Result<(u32, Option<u32>), FsError> {
+    if 1_000_000_000 <= time.nanoseconds {
+        return Err(FsError::InvalidOperation);
+    }
+    let base = time.seconds as i32;
+    let epoch = time
+        .seconds
+        .checked_sub(i64::from(base))
+        .ok_or(FsError::InvalidOperation)?
+        >> 32;
+    if extra + 4 <= 128 + extra_isize {
+        if !(0..=3).contains(&epoch) {
+            return Err(FsError::InvalidOperation);
+        }
+        Ok((base as u32, Some((time.nanoseconds << 2) | epoch as u32)))
+    } else {
+        if epoch != 0 || time.nanoseconds != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        Ok((base as u32, None))
+    }
+}
+
+/// 同一元数据 guard 内只改当前记录的属性和 CRC，保留块根、未知字段及邻记录。
+pub(crate) fn patch_inode_metadata(
+    g: &Geometry,
+    record: &mut [u8],
+    old: &InodeMetadata,
+    next: &InodeMetadata,
+) -> Result<(), FsError> {
+    validate_inode_metadata_update(old, next)?;
+    let current = decode_inode(g, old.number, record)?;
+    if InodeMetadata::from_data(&current) != *old {
+        return Err(FsError::Corrupt);
+    }
+    let record = record.get_mut(..g.inode_size).ok_or(FsError::Corrupt)?;
+    let atime = time_encoding(next.atime, 140, next.extra_isize)?;
+    let mtime = time_encoding(next.mtime, 136, next.extra_isize)?;
+    let ctime = time_encoding(next.ctime, 132, next.extra_isize)?;
+    put16(record, 0, next.mode);
+    put16(record, 2, next.uid as u16);
+    put16(record, 120, (next.uid >> 16) as u16);
+    put16(record, 24, next.gid as u16);
+    put16(record, 122, (next.gid >> 16) as u16);
+    put16(record, 26, next.links as u16);
+    put_time(record, 8, 140, atime);
+    put_time(record, 16, 136, mtime);
+    put_time(record, 12, 132, ctime);
+    if g.features_ro_compat & METADATA_CSUM != 0 {
+        put16(record, 124, 0);
+        if 4 <= next.extra_isize {
+            put16(record, 130, 0);
+        }
+        let crc = crc32c(next.checksum_seed, record);
+        put16(record, 124, crc as u16);
+        if 4 <= next.extra_isize {
+            put16(record, 130, (crc >> 16) as u16);
+        }
+    }
+    Ok(())
+}
+
+/// 写入已由固定 inode 几何验证的字段，修改不跨出本记录。
+fn put16(record: &mut [u8], offset: usize, value: u16) {
+    record[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+/// 使用预先检查的时间编码，不在修改了部分记录后再引入可失败步骤。
+fn put_time(record: &mut [u8], base: usize, extra: usize, encoding: (u32, Option<u32>)) {
+    record[base..base + 4].copy_from_slice(&encoding.0.to_le_bytes());
+    if let Some(extension) = encoding.1 {
+        record[extra..extra + 4].copy_from_slice(&extension.to_le_bytes());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

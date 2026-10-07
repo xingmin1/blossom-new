@@ -255,8 +255,7 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         .extra
         .map(|index| storage.disk(index).ok_or(fs::FsError::MissingRoot))
         .transpose()?;
-    let inodes =
-        Arc::try_new(fs::InodeCache::try_new(64, 16)?).map_err(|_| fs::FsError::NoMemory)?;
+    let inodes = Arc::try_new(fs::InodeCache::try_new(64)?).map_err(|_| fs::FsError::NoMemory)?;
     let vfs = Arc::try_new(fs::system::mount_disks(root, extra, inodes)?)
         .map_err(|_| fs::FsError::NoMemory)?;
     let context = fs::FsContext::new(vfs.root(), vfs.root())?;

@@ -212,7 +212,7 @@ impl FileTable {
         file.readdir()
     }
 
-    /// 在表锁外调用真实文件的写接口，由只读文件返回 ReadOnly。
+    /// 在表锁外调用真实文件写接口，由具体 OFD 判断挂载能力、类型与操作支持。
     pub fn write(&self, fd: usize, buffer: &[u8]) -> Result<usize, FsError> {
         let file = self.lookup(fd)?;
         file.write(buffer)

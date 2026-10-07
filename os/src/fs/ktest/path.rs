@@ -19,7 +19,13 @@ impl PathOwner {
         let volume = self.owner.open(context)?;
         let vfs = Arc::try_new(checked(
             context,
-            Vfs::try_new(volume.clone(), self.owner.cache().clone(), 128, 4),
+            Vfs::try_new(
+                volume.clone(),
+                self.owner.cache().clone(),
+                128,
+                4,
+                AccessMode::ReadOnly,
+            ),
         )?)
         .map_err(|_| TestError("path view owner OOM"))?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
@@ -115,7 +121,10 @@ impl Fixture<DeviceInventory> for PathOwner {
 /// 读取消费者可见的完整首段图样，不以 inode 编号或名字缓存命中替代数据。
 fn read_pattern(context: &mut TestContext<'_>, path: &Path) -> TestResult {
     let inode = checked(context, path.inode())?;
-    context.expect_eq(checked(context, inode.metadata())?.size, PATTERN_SIZE);
+    context.expect_eq(
+        checked(context, inode.metadata_snapshot())?.size,
+        PATTERN_SIZE,
+    );
     let mut bytes = [0xa7; 4096];
     context.expect_eq(checked(context, inode.read_at(0, &mut bytes))?, bytes.len());
     context.expect_eq(patterned(&bytes, 0), true);
@@ -161,7 +170,7 @@ pub(crate) mod walk {
         let walk = fixture.resolve(context, b"/walk")?;
         let sub = fixture.resolve(context, b"//walk///sub/./")?;
         context.expect_eq(
-            checked(context, checked(context, sub.inode())?.metadata())?.kind,
+            checked(context, checked(context, sub.inode())?.metadata_snapshot())?.kind,
             InodeKind::Directory,
         );
         context.expect_eq(
@@ -237,6 +246,74 @@ pub(crate) mod walk {
         Ok(())
     }
 
+    /// 同一可写卷的独立挂载视图共用 inode，RO 视图拒绝写意图但读取原文件内容。
+    #[test]
+    #[ktest(tags("W01"))]
+    fn rw_volume_keeps_readonly_mount_view(
+        context: &mut TestContext<'_>,
+        fixture: &mut PathOwner,
+    ) -> TestResult {
+        let volume = checked(
+            context,
+            Ext4Volume::open(fixture.owner.disk()?.clone(), AccessMode::ReadWrite, 64),
+        )?;
+        let reopened = checked(
+            context,
+            Ext4Volume::open(fixture.owner.disk()?.clone(), AccessMode::ReadWrite, 64),
+        )?;
+        context.expect_eq(Arc::ptr_eq(&volume, &reopened), true);
+        context.expect_eq(
+            Ext4Volume::open(fixture.owner.disk()?.clone(), AccessMode::ReadOnly, 64).err(),
+            Some(FsError::Busy),
+        );
+        let ro = checked(
+            context,
+            Vfs::try_new(
+                volume.clone(),
+                fixture.owner.cache().clone(),
+                16,
+                1,
+                AccessMode::ReadOnly,
+            ),
+        )?;
+        let rw = checked(
+            context,
+            Vfs::try_new(
+                reopened,
+                fixture.owner.cache().clone(),
+                16,
+                1,
+                AccessMode::ReadWrite,
+            ),
+        )?;
+        let ro_context = checked(context, FsContext::new(ro.root(), ro.root()))?;
+        let rw_context = checked(context, FsContext::new(rw.root(), rw.root()))?;
+        let ro_file = checked(
+            context,
+            ro.resolve(&ro_context, b"/pattern", ResolveMode::Follow),
+        )?;
+        let rw_file = checked(
+            context,
+            rw.resolve(&rw_context, b"/pattern", ResolveMode::Follow),
+        )?;
+        context.expect_eq(
+            checked(context, ro_file.inode())?.ptr_eq(checked(context, rw_file.inode())?),
+            true,
+        );
+        context.expect_eq(ro_file.check_access(0, 0, 2), Err(FsError::ReadOnly));
+        context.expect_eq(rw_file.check_access(0, 0, 2), Ok(()));
+        context.expect_eq(
+            crate::fs::file::open_path_with_flags(ro_file.clone(), 1).err(),
+            Some(FsError::ReadOnly),
+        );
+        read_pattern(context, &ro_file)?;
+        read_pattern(context, &rw_file)?;
+        context.diagnostic(format_args!(
+            "mount-mode volume-RW=1 same-volume=1 canonical-inode=1 RO-write-intent-rejected=1 RW-access-granted=1 full-read-pattern=1 file-write-fsync-covered=0"
+        ));
+        Ok(())
+    }
+
     /// 链接消费父目录、当前根和末尾目录语义，缓存命中也服从 NoFollow 与四十次上限。
     #[test]
     #[ktest(tags("B18"))]
@@ -273,7 +350,7 @@ pub(crate) mod walk {
                 InodeKind::Regular
             };
             context.expect_eq(
-                checked(context, checked(context, path.inode())?.metadata())?.kind,
+                checked(context, checked(context, path.inode())?.metadata_snapshot())?.kind,
                 expected,
             );
         }
@@ -381,8 +458,14 @@ pub(crate) mod mounts {
             .disks
             .get(1)
             .ok_or(TestError("path extra Disk absent"))?;
-        let volume = checked(context, Ext4Volume::open(disk.clone(), 64))?;
-        checked(context, vfs.mount(&covered, volume.clone()))?;
+        let volume = checked(
+            context,
+            Ext4Volume::open(disk.clone(), AccessMode::ReadOnly, 64),
+        )?;
+        checked(
+            context,
+            vfs.mount(&covered, volume.clone(), AccessMode::ReadOnly),
+        )?;
         let mounted = fixture.resolve(context, b"/mnt/extra")?;
         context.expect_eq(mounted.ptr_eq(&covered), false);
         context.expect_eq(Arc::ptr_eq(mounted.filesystem(), &volume), true);
@@ -412,11 +495,16 @@ pub(crate) mod mounts {
             false,
         );
         read_pattern(context, &file)?;
-        context.expect_eq(vfs.mount(&other, volume.clone()).err(), Some(FsError::Busy));
+        context.expect_eq(
+            vfs.mount(&other, volume.clone(), AccessMode::ReadOnly)
+                .err(),
+            Some(FsError::Busy),
+        );
         context.expect_eq(
             vfs.mount(
                 &other,
                 fixture.volume.as_ref().expect("root volume alive").clone(),
+                AccessMode::ReadOnly,
             )
             .err(),
             Some(FsError::Busy),
@@ -442,7 +530,10 @@ pub(crate) mod mounts {
             Some(FsError::NotFound),
         );
         vfs.prune_unused();
-        checked(context, vfs.mount(&covered, volume.clone()))?;
+        checked(
+            context,
+            vfs.mount(&covered, volume.clone(), AccessMode::ReadOnly),
+        )?;
         let reread = fixture.resolve(context, b"/mnt/extra/pattern")?;
         read_pattern(context, &reread)?;
         drop(reread);
@@ -527,7 +618,7 @@ pub(crate) mod pruning {
 
         let empty = fixture.resolve(context, b"/empty")?;
         let inode = checked(context, empty.inode())?;
-        context.expect_eq(checked(context, inode.metadata())?.size, 0);
+        context.expect_eq(checked(context, inode.metadata_snapshot())?.size, 0);
         let mut bytes = [0xa7; 1];
         context.expect_eq(checked(context, inode.read_at(0, &mut bytes))?, 0);
         context.expect_eq(fixture.vfs().inodes().len(), 2);
@@ -612,7 +703,11 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
                 return Err(TestError("path lookup returned wrong kind"));
             };
             context.expect_eq(
-                checked(context, checked(context, dentry.inode())?.metadata())?.size,
+                checked(
+                    context,
+                    checked(context, dentry.inode())?.metadata_snapshot(),
+                )?
+                .size,
                 PATTERN_SIZE,
             );
             if let Some(first) = &first {
@@ -706,7 +801,7 @@ pub(crate) mod loading {
             0,
         );
         context.expect_eq(
-            checked(context, checked(context, path.inode())?.metadata())?.kind,
+            checked(context, checked(context, path.inode())?.metadata_snapshot())?.kind,
             InodeKind::Regular,
         );
         fixture
@@ -723,7 +818,11 @@ pub(crate) mod loading {
             return Err(TestError("held lookup returned wrong kind"));
         };
         context.expect_eq(
-            checked(context, checked(context, dentry.inode())?.metadata())?.size,
+            checked(
+                context,
+                checked(context, dentry.inode())?.metadata_snapshot(),
+            )?
+            .size,
             PATTERN_SIZE,
         );
         let path = fixture.resolve(context, b"/pattern")?;
@@ -813,7 +912,11 @@ pub(crate) mod oom {
             0,
         );
         context.expect_eq(
-            checked(context, checked(context, empty.inode())?.metadata())?.kind,
+            checked(
+                context,
+                checked(context, empty.inode())?.metadata_snapshot(),
+            )?
+            .kind,
             InodeKind::Regular,
         );
         context.expect_eq(fixture.resolve(context, b"/pattern")?.ptr_eq(&cached), true);

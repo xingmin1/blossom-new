@@ -38,7 +38,7 @@ fn indexed_name(index: usize) -> [u8; 191] {
 
 /// 被拒挂载仍由 typed fixture 保持原 Disk，原错误不落入假零或 NotFound。
 fn open_error(context: &mut TestContext<'_>, fixture: &Owner, expected: FsError) -> TestResult {
-    let result = Ext4Volume::open(fixture.disk()?.clone(), 64);
+    let result = Ext4Volume::open(fixture.disk()?.clone(), AccessMode::ReadOnly, 64);
     context.expect_eq(result.err(), Some(expected));
     context.diagnostic(format_args!(
         "ext4-reject error={:?} hardware-EIO-covered=0",
@@ -183,7 +183,7 @@ pub(crate) mod volume {
             context.expect_eq(g.features_incompat & 0x2000 != 0, g.block_size == 4096);
         }
         let file = fixture.file(context, &volume, b"pattern")?;
-        let metadata = checked(context, file.metadata())?;
+        let metadata = checked(context, file.metadata_snapshot())?;
         context.expect_eq(metadata.kind, InodeKind::Regular);
         context.expect_eq(metadata.size, PATTERN_SIZE);
         context.expect_eq(metadata.links, 2);
@@ -202,11 +202,15 @@ pub(crate) mod volume {
             .get_or_prepare(last)
             .map_err(|_| TestError("EOF folio missing"))?;
         context.expect_eq(read.is_none(), true);
+        checked(
+            context,
+            folio
+                .copy_to(37, &mut bytes[..mm::PAGE_SIZE - 37])
+                .map_err(FsError::from),
+        )?;
         context.expect_eq(
-            folio.with_bytes(37, mm::PAGE_SIZE - 37, |tail| {
-                tail.iter().all(|byte| *byte == 0)
-            }),
-            Ok(true),
+            bytes[..mm::PAGE_SIZE - 37].iter().all(|byte| *byte == 0),
+            true,
         );
         let before = file.mapping().len();
         context.expect_eq(checked(context, file.read_at(PATTERN_SIZE, &mut bytes))?, 0);
@@ -239,12 +243,9 @@ pub(crate) mod volume {
         }
         context.expect_eq(checked(context, sparse.read_at(12288, &mut bytes))?, 37);
         context.expect_eq(patterned(&bytes[..37], 12288), true);
-        context.expect_eq(matches!(checked(context, volume.map_block(checked(context, sparse.metadata())?, 4096 / bs))?, BlockMapping::Hole { len } if 0 < len), true);
+        context.expect_eq(matches!(checked(context, sparse.map_block(4096 / bs))?, BlockMapping::Hole { len } if 0 < len), true);
         let unwritten = fixture.file(context, &volume, b"unwritten")?;
-        let mapped = checked(
-            context,
-            volume.map_block(checked(context, unwritten.metadata())?, 0),
-        )?;
+        let mapped = checked(context, unwritten.map_block(0))?;
         context.expect_eq(
             if volume.geometry().features_incompat & 0x40 != 0 {
                 matches!(mapped, BlockMapping::Unwritten { len, .. } if 0 < len)
@@ -260,8 +261,10 @@ pub(crate) mod volume {
         context.expect_eq(bytes.iter().all(|byte| *byte == 0), true);
         let deep = fixture.file(context, &volume, b"deep")?;
         if volume.geometry().features_incompat & 0x40 != 0 {
-            let header = ext4_codec::extent_header(&checked(context, deep.metadata())?.block, None)
-                .map_err(|_| TestError("deep extent header invalid"))?;
+            let header = checked(
+                context,
+                deep.with_map_read(|_, block| ext4_codec::extent_header(block, None)),
+            )?;
             context.expect_eq(2 <= header.depth, true);
         }
         for logical in [0, 2, 998, (DEEP_EXTENTS - 1) * 2] {
@@ -271,7 +274,7 @@ pub(crate) mod volume {
                 bs as usize,
             );
             context.expect_eq(patterned(&bytes[..bs as usize], offset), true);
-            context.expect_eq(matches!(checked(context, volume.map_block(checked(context, deep.metadata())?, logical))?, BlockMapping::Mapped { len, .. } if 0 < len), true);
+            context.expect_eq(matches!(checked(context, deep.map_block(logical))?, BlockMapping::Mapped { len, .. } if 0 < len), true);
             if logical < (DEEP_EXTENTS - 1) * 2 {
                 context.expect_eq(
                     checked(
@@ -294,14 +297,11 @@ pub(crate) mod volume {
                     1024,
                 );
                 context.expect_eq(patterned(&bytes[..1024], logical * bs), true);
-                context.expect_eq(matches!(checked(context, volume.map_block(checked(context, traditional.metadata())?, logical))?, BlockMapping::Mapped { len, .. } if 0 < len), true);
+                context.expect_eq(matches!(checked(context, traditional.map_block(logical))?, BlockMapping::Mapped { len, .. } if 0 < len), true);
             }
         }
         context.expect_eq(
-            checked(
-                context,
-                volume.map_block(checked(context, deep.metadata())?, DEEP_EXTENTS * 2),
-            )?,
+            checked(context, deep.map_block(DEEP_EXTENTS * 2))?,
             BlockMapping::Eof,
         );
         Ok(())
@@ -320,10 +320,16 @@ pub(crate) mod volume {
         context.expect_eq(first.ptr_eq(&hard), true);
         context.expect_eq(core::ptr::eq(first.mapping(), hard.mapping()), true);
         let fast = fixture.file(context, &volume, b"fastlink")?;
-        context.expect_eq(checked(context, fast.metadata())?.fast_symlink, true);
+        context.expect_eq(
+            checked(context, fast.metadata_snapshot())?.fast_symlink,
+            true,
+        );
         context.expect_eq(checked(context, fast.read_link())?.as_slice(), b"pattern");
         let long = fixture.file(context, &volume, b"blocklink")?;
-        context.expect_eq(checked(context, long.metadata())?.fast_symlink, false);
+        context.expect_eq(
+            checked(context, long.metadata_snapshot())?.fast_symlink,
+            false,
+        );
         context.expect_eq(checked(context, long.read_link())?.as_slice(), &[b't'; 180]);
         let raw = fixture.file(context, &volume, b"name-\xff\xfe")?;
         let mut bytes = [0xa7; 9];
@@ -377,7 +383,7 @@ pub(crate) mod volume {
         let volume = fixture.open(context)?;
         let directory = fixture.file(context, &volume, b"indexed")?;
         context.expect_eq(
-            checked(context, directory.metadata())?.flags & 0x1000,
+            checked(context, directory.metadata_snapshot())?.flags & 0x1000,
             0x1000,
         );
         let mut seen = [false; DIRECTORY_ENTRIES];
@@ -420,7 +426,10 @@ pub(crate) mod volume {
                 context,
                 directory.lookup(fixture.cache(), &indexed_name(index)),
             )?;
-            context.expect_eq(checked(context, item.metadata())?.kind, InodeKind::Regular);
+            context.expect_eq(
+                checked(context, item.metadata_snapshot())?.kind,
+                InodeKind::Regular,
+            );
         }
         context.expect_eq(
             directory.lookup(fixture.cache(), b"absent").err(),
@@ -452,7 +461,10 @@ pub(crate) mod identity {
         fixture: &mut Owner,
     ) -> TestResult {
         let first_volume = fixture.open(context)?;
-        let second_volume = checked(context, Ext4Volume::open(fixture.disks[1].clone(), 64))?;
+        let second_volume = checked(
+            context,
+            Ext4Volume::open(fixture.disks[1].clone(), AccessMode::ReadOnly, 64),
+        )?;
         let first = fixture.file(context, &first_volume, b"pattern")?;
         let hard = fixture.file(context, &first_volume, b"hardlink")?;
         let second = checked(
@@ -472,7 +484,7 @@ pub(crate) mod identity {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bounded"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bounded {
     use super::*;
-    /// 全活预算明确 NoMemory，clean 释放仅移缓存引用，不改变活 canonical 身份。
+    /// inode 全活预算明确 NoMemory；稀疏文件页可增长，clean 回收保留外部拥有与 canonical 身份。
     #[test]
     #[ktest(tags("B23"))]
     fn inode_and_file_budget_clean_prune(
@@ -480,8 +492,7 @@ pub(crate) mod bounded {
         fixture: &mut Owner,
     ) -> TestResult {
         let volume = fixture.open(context)?;
-        let cache =
-            InodeCache::try_new(2, 2).map_err(|_| TestError("bounded inode cache failed"))?;
+        let cache = InodeCache::try_new(2).map_err(|_| TestError("bounded inode cache failed"))?;
         let root = checked(context, cache.iget(&volume, 2))?;
         let file = checked(context, root.lookup(&cache, b"pattern"))?;
         let number = file.number();
@@ -505,15 +516,13 @@ pub(crate) mod bounded {
             context.expect_eq(read.is_none(), true);
             held[page] = Some(folio);
         }
-        context.expect_eq(
-            file.read_at(8192, &mut bytes).err(),
-            Some(FsError::NoMemory),
-        );
-        context.expect_eq(file.mapping().prune_unused(), 0);
-        drop(held[0].take());
-        context.expect_eq(file.mapping().prune_unused(), 1);
         context.expect_eq(checked(context, file.read_at(8192, &mut bytes))?, 4096);
         context.expect_eq(patterned(&bytes, 8192), true);
+        context.expect_eq(file.mapping().prune_unused(), 1);
+        drop(held[0].take());
+        context.expect_eq(file.mapping().prune_unused(), 1);
+        context.expect_eq(checked(context, file.read_at(0, &mut bytes))?, 4096);
+        context.expect_eq(patterned(&bytes, 0), true);
         drop(held);
         context.expect_eq(file.mapping().prune_unused(), 2);
         drop(root);
@@ -528,7 +537,7 @@ pub(crate) mod bounded {
         context.expect_eq(cache.len(), 0);
         let root = checked(context, cache.iget(&volume, 2))?;
         let empty = checked(context, root.lookup(&cache, b"empty"))?;
-        context.expect_eq(checked(context, empty.metadata())?.size, 0);
+        context.expect_eq(checked(context, empty.metadata_snapshot())?.size, 0);
         drop(empty);
         drop(root);
         cache.prune_unused();
@@ -556,10 +565,11 @@ pub(crate) mod bounded {
             .map_err(|_| TestError("detached mapping identity lost"))?;
         context.expect_eq(read.is_none(), true);
         context.expect_eq(same_page.phys_addr(), page_address);
-        context.expect_eq(
-            detached.with_bytes(0, 4096, |data| patterned(data, 0)),
-            Ok(true),
-        );
+        checked(
+            context,
+            detached.copy_to(0, &mut bytes).map_err(FsError::from),
+        )?;
+        context.expect_eq(patterned(&bytes, 0), true);
         drop(same_page);
         drop(again);
         context.expect_eq(cache.prune_unused(), 0);
@@ -588,7 +598,7 @@ pub(crate) mod oom {
         let inode = fixture.file(context, &volume, b"pattern")?;
         let empty_number = checked(
             context,
-            volume.lookup(checked(context, root.metadata())?, b"empty"),
+            root.with_map_read(|metadata, block| volume.lookup(metadata, block, b"empty")),
         )?
         .ok_or(TestError("OOM empty directory entry missing"))?;
         let mut bytes = [0xa7; 4096];
@@ -643,12 +653,10 @@ pub(crate) mod oom {
         context.expect_eq(page_error, Some(FsError::NoMemory));
         context.expect_eq(submitted_after, submitted_before);
         context.expect_eq(address, folio.phys_addr());
-        context.expect_eq(
-            folio.with_bytes(0, 4096, |data| patterned(data, 0)),
-            Ok(true),
-        );
+        checked(context, folio.copy_to(0, &mut bytes).map_err(FsError::from))?;
+        context.expect_eq(patterned(&bytes, 0), true);
         let empty = checked(context, fixture.cache().iget(&volume, empty_number))?;
-        context.expect_eq(checked(context, empty.metadata())?.size, 0);
+        context.expect_eq(checked(context, empty.metadata_snapshot())?.size, 0);
         context.expect_eq(checked(context, inode.read_at(4096, &mut bytes))?, 4096);
         context.expect_eq(patterned(&bytes, 4096), true);
         let (original, read) = inode
@@ -687,7 +695,7 @@ pub(crate) mod bad_group {
     #[test]
     #[ktest(tags("B12"))]
     fn group_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
-        match Ext4Volume::open(fixture.disk()?.clone(), 64) {
+        match Ext4Volume::open(fixture.disk()?.clone(), AccessMode::ReadOnly, 64) {
             Err(error) => {
                 context.expect_eq(error, FsError::Checksum);
                 context.diagnostic(format_args!("ext4-group-checksum rejected-at=open"));
@@ -712,7 +720,7 @@ pub(crate) mod bad_inode {
         let root = checked(context, fixture.cache().iget(&volume, 2))?;
         let number = checked(
             context,
-            volume.lookup(checked(context, root.metadata())?, b"pattern"),
+            root.with_map_read(|metadata, block| volume.lookup(metadata, block, b"pattern")),
         )?
         .ok_or(TestError("bad inode name missing"))?;
         let before = fixture.cache().len();
@@ -741,12 +749,7 @@ pub(crate) mod bad_extent {
     fn external_extent_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         let volume = fixture.open(context)?;
         let inode = fixture.file(context, &volume, b"deep")?;
-        context.expect_eq(
-            volume
-                .map_block(checked(context, inode.metadata())?, 0)
-                .err(),
-            Some(FsError::Checksum),
-        );
+        context.expect_eq(inode.map_block(0).err(), Some(FsError::Checksum));
         let mut bytes = [0xa7; 4096];
         context.expect_eq(inode.read_at(0, &mut bytes).err(), Some(FsError::Checksum));
         let (folio, read) = inode
@@ -755,7 +758,7 @@ pub(crate) mod bad_extent {
             .map_err(|_| TestError("failed extent folio missing"))?;
         context.expect_eq(read.is_none(), true);
         context.expect_eq(folio.wait_ready(), Err(BlockError::Checksum));
-        context.expect_eq(folio.with_bytes(0, 4096, |_| ()), Err(BlockError::Checksum));
+        context.expect_eq(folio.range_ready(0, 4096), Err(BlockError::Checksum));
         Ok(())
     }
 }
@@ -846,7 +849,7 @@ pub(crate) mod bad_mapping {
         let root = checked(context, fixture.cache().iget(&volume, 2))?;
         let number = checked(
             context,
-            volume.lookup(checked(context, root.metadata())?, b"pattern"),
+            root.with_map_read(|metadata, block| volume.lookup(metadata, block, b"pattern")),
         )?
         .ok_or(TestError("bad mapping pattern directory entry missing"))?;
         match fixture.cache().iget(&volume, number) {
@@ -864,12 +867,7 @@ pub(crate) mod bad_mapping {
                     0
                 };
                 let mut bytes = [0xa7; 4096];
-                context.expect_eq(
-                    volume
-                        .map_block(checked(context, inode.metadata())?, logical)
-                        .err(),
-                    Some(FsError::Corrupt),
-                );
+                context.expect_eq(inode.map_block(logical).err(), Some(FsError::Corrupt));
                 context.expect_eq(
                     inode
                         .read_at(logical * volume.geometry().block_size as u64, &mut bytes)

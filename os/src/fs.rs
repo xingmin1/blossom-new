@@ -20,7 +20,7 @@ pub use file::{
     InodeFile, SeekFrom,
 };
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
-pub use inode::{InodeCache, InodeRef};
+pub use inode::{InodeCache, InodeMetadata, InodeRef};
 pub use path::{FsContext, Path, ResolveMode, Vfs};
 
 use crate::block::BlockError;

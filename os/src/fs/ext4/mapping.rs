@@ -81,7 +81,7 @@ fn extent_map(
                 visited[count] = physical;
                 count += 1;
                 let buffer = volume.metadata_block(physical)?;
-                step = buffer.with_bytes(|data| {
+                step = buffer.with_read(|data| {
                     extent_step(g, inode, data, logical, Some(depth), Some(low), high)
                 })??;
             }
@@ -226,7 +226,7 @@ fn indirect_map(
         span /= pointers;
         let index = remaining / span;
         remaining %= span;
-        physical = buffer.with_bytes(|data| {
+        physical = buffer.with_read(|data| {
             validate_pointers(g, data)?;
             codec::le32(data, index as usize * 4).map(u64::from)
         })??;

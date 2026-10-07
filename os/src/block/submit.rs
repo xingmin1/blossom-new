@@ -9,8 +9,8 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 use crate::block::bio::BioInner;
 use crate::block::disk::{ActiveBio, PreparingSlot};
 use crate::block::{
-    Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, IoResult, QueueLimits, MAX_BATCH,
-    SECTOR_BYTES,
+    Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, FsClaim, IoResult, QueueLimits,
+    MAX_BATCH, SECTOR_BYTES,
 };
 use crate::mm::dma::{DmaError, MappedPages};
 use crate::mm::{alloc_pages, FolioRead, PAGE_SIZE};
@@ -56,12 +56,30 @@ struct GenerationPlan {
     splits: usize,
 }
 
+impl FsClaim {
+    /// 以本占用提交 FS 请求，Write 仅允许 RW；Read 与设备支持的 Flush 可由 RO 使用。
+    /// 接受的请求独立保占用至生成、设备收权、回调及原队列资源的全部尾部结束。
+    pub fn submit_bio(&self, bio: Bio) {
+        self.disk().submit_bio_from(bio, Some(self));
+    }
+
+    /// 显式 FS 批次沿同一原 Bio 准入、有限合并及 split 路径，不另建提交引擎。
+    pub fn submit_batch(&self, bios: Vec<Bio>) {
+        self.disk().submit_batch_from(bios, Some(self));
+    }
+}
+
 impl Disk {
-    /// 普通 Task 同步生成全部 child；返回后仍须由 BioCompletion 等待真实完成。
+    /// raw 提交不携 FS 授权，任何活占用期间拒绝 Write；父完成仍由观察者等待。
     pub(crate) fn submit_bio(self: &DiskRef, bio: Bio) {
+        self.submit_bio_from(bio, None);
+    }
+
+    /// 唯一单父提交先验证来源，再同步生成原 child；失败仍 kick 已发表前缀。
+    fn submit_bio_from(self: &DiskRef, bio: Bio, claim: Option<&FsClaim>) {
         drop(task::current_task());
         let mut active: [Option<ActiveBio<'_>>; MAX_BATCH] = [const { None }; MAX_BATCH];
-        match self.admit(bio) {
+        match self.admit_from(bio, claim) {
             Ok(accepted) => active[0] = Some(accepted),
             Err((bio, error)) => {
                 self.unplug();
@@ -72,8 +90,13 @@ impl Disk {
         self.submit_accepted(&mut active);
     }
 
-    /// 消耗显式批次，每组最多八个生成者，组内相邻普通范围才允许合并。
+    /// raw 批次没有 FS 授权，每组最多八个生成者，组内相邻普通范围才允许合并。
     pub(crate) fn submit_batch(self: &DiskRef, bios: Vec<Bio>) {
+        self.submit_batch_from(bios, None);
+    }
+
+    /// 两种来源共用批次准入及 child 生成，拒绝的父只清自身准备资源。
+    fn submit_batch_from(self: &DiskRef, bios: Vec<Bio>, claim: Option<&FsClaim>) {
         drop(task::current_task());
         let mut pending = bios.into_iter();
         loop {
@@ -82,7 +105,7 @@ impl Disk {
                 let Some(bio) = pending.next() else {
                     break;
                 };
-                match self.admit(bio) {
+                match self.admit_from(bio, claim) {
                     Ok(accepted) => *entry = Some(accepted),
                     Err((bio, error)) => {
                         self.unplug();

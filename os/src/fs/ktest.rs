@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::block::{self, BlockError, Disk, DiskRef};
+use crate::block::{self, AccessMode, BlockError, Disk, DiskRef};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{Ext4Volume, InodeKind};
@@ -476,13 +476,13 @@ fn perform(job: Job, cancelled: &AtomicBool) -> Result<Returned, FsError> {
             read,
             folio,
         } => {
-            inode
-                .filesystem()
-                .fill_page(inode.metadata()?, page, read)?;
-            folio.wait_ready()?;
-            let valid = folio.with_bytes(0, mm::PAGE_SIZE, |bytes| {
-                patterned(bytes, page * mm::PAGE_SIZE as u64)
+            inode.with_map_read(|metadata, root| {
+                inode.filesystem().fill_page(metadata, root, page, read)
             })?;
+            folio.wait_ready()?;
+            let mut bytes = [0xa7; mm::PAGE_SIZE];
+            folio.copy_to(0, &mut bytes)?;
+            let valid = patterned(&bytes, page * mm::PAGE_SIZE as u64);
             Ok(Returned::Page {
                 folio,
                 bytes: mm::PAGE_SIZE,
@@ -607,7 +607,7 @@ impl Owner {
                 8
             };
             let cache = Arc::try_new(
-                InodeCache::try_new(inode_capacity, 8)
+                InodeCache::try_new(inode_capacity)
                     .map_err(|_| TestError("inode cache preparation failed"))?,
             )
             .map_err(|_| TestError("inode cache owner OOM"))?;
@@ -715,7 +715,10 @@ impl Owner {
 
     /// 打开真实只读卷；所有格式检查使用生产 codec 与共享 metadata cache。
     fn open(&self, context: &TestContext<'_>) -> Result<Arc<Ext4Volume>, TestError> {
-        checked(context, Ext4Volume::open(self.disk()?.clone(), 64))
+        checked(
+            context,
+            Ext4Volume::open(self.disk()?.clone(), AccessMode::ReadOnly, 64),
+        )
     }
 
     /// 只用正式 root inode 按原字节组件查找，不维护宿主 inode 编号表。

@@ -55,7 +55,7 @@ fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, User
     let pathname = mm.read_c_string(raw[0], 4096)?;
     let path = file::resolve_bytes(&runtime, (-100i32) as usize, &pathname, ResolveMode::Follow)?;
     let credentials = runtime.credentials;
-    if path.inode()?.metadata()?.kind != InodeKind::Regular {
+    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Regular {
         return Err(Errno::Permission);
     }
     path.check_access(credentials.uid, credentials.gid, 1)?;

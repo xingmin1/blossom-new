@@ -27,7 +27,7 @@ fn file_number(
     let root = checked(context, fixture.cache().iget(volume, 2))?;
     checked(
         context,
-        volume.lookup(checked(context, root.metadata())?, b"pattern"),
+        root.with_map_read(|metadata, block| volume.lookup(metadata, block, b"pattern")),
     )?
     .ok_or(TestError("concurrency pattern directory entry missing"))
 }
@@ -91,7 +91,10 @@ fn inode_flight(context: &mut TestContext<'_>, fixture: &mut Owner, failure: boo
                 return Err(TestError("inode producer returned wrong kind"));
             };
             context.expect_eq(inode.number(), number);
-            context.expect_eq(checked(context, inode.metadata())?.size, PATTERN_SIZE);
+            context.expect_eq(
+                checked(context, inode.metadata_snapshot())?.size,
+                PATTERN_SIZE,
+            );
             if let Some(original) = &original {
                 context.expect_eq(original.ptr_eq(&inode), true);
                 context.expect_eq(core::ptr::eq(original.mapping(), inode.mapping()), true);
@@ -136,10 +139,9 @@ fn pages(context: &mut TestContext<'_>, fixture: &Owner, count: usize, same: boo
         } else {
             index as u64 * mm::PAGE_SIZE as u64
         };
-        context.expect_eq(
-            folio.with_bytes(0, mm::PAGE_SIZE, |data| patterned(data, offset)),
-            Ok(true),
-        );
+        let mut data = [0xa7; mm::PAGE_SIZE];
+        checked(context, folio.copy_to(0, &mut data).map_err(FsError::from))?;
+        context.expect_eq(patterned(&data, offset), true);
     }
     Ok(())
 }
@@ -192,10 +194,7 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
         .map_err(|_| TestError("inflight mapping disappeared"))?;
     context.expect_eq(first_read.is_none(), true);
     context.expect_eq(first_folio.is_ready(), false);
-    context.expect_eq(
-        first_folio.with_bytes(0, 4096, |_| ()),
-        Err(BlockError::NotReady),
-    );
+    context.expect_eq(first_folio.range_ready(0, 4096), Err(BlockError::NotReady));
     let address = first_folio.phys_addr();
     fixture.disk()?.test_resume_completions();
     fixture.join_tasks()?;
@@ -212,10 +211,9 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
         .map_err(|_| TestError("completed mapping disappeared"))?;
     context.expect_eq(read.is_none(), true);
     context.expect_eq(ready.phys_addr(), address);
-    context.expect_eq(
-        ready.with_bytes(0, 4096, |data| patterned(data, 0)),
-        Ok(true),
-    );
+    let mut data = [0xa7; mm::PAGE_SIZE];
+    checked(context, ready.copy_to(0, &mut data).map_err(FsError::from))?;
+    context.expect_eq(patterned(&data, 0), true);
     context.diagnostic(format_args!("file-singleflight same-page={} Blocked-consumers={} simultaneous-inflight={} original-PFN={} real-used-resumed=1 hardware-EIO-covered=0", same, count, if same { 1 } else { 2 }, address));
     Ok(())
 }
@@ -276,10 +274,7 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
         context.expect_eq(result.and_then(Result::err), Some(expected));
     }
     context.expect_eq(folio.wait_ready(), Err(expected.folio_error()));
-    context.expect_eq(
-        folio.with_bytes(0, 4096, |_| ()),
-        Err(expected.folio_error()),
-    );
+    context.expect_eq(folio.range_ready(0, 4096), Err(expected.folio_error()));
     drop(folio);
     context.expect_eq(inode.mapping().prune_unused(), 1);
     context.expect_eq(inode.mapping().len(), 0);
@@ -368,7 +363,7 @@ pub(crate) mod file_loading {
         context.expect_eq(read.is_none(), true);
         context.expect_eq(same.phys_addr(), address);
         context.expect_eq(folio.is_ready(), false);
-        context.expect_eq(folio.with_bytes(0, 4096, |_| ()), Err(BlockError::NotReady));
+        context.expect_eq(folio.range_ready(0, 4096), Err(BlockError::NotReady));
         context.expect_eq(fixture.disk()?.test_snapshot().inflight, 0);
         let first_dma = fixture
             .disk()?
@@ -389,17 +384,17 @@ pub(crate) mod file_loading {
             last_dma,
             (address, (address + last_offset) as u64, last_offset, bs),
         );
+        let mut bytes = [0xa7; mm::PAGE_SIZE];
+        checked(context, folio.copy_to(0, &mut bytes).map_err(FsError::from))?;
         context.expect_eq(
-            folio.with_bytes(0, 4096, |bytes| {
-                bytes.chunks(bs).enumerate().all(|(logical, block)| {
-                    if logical % 2 == 0 {
-                        patterned(block, (logical * bs) as u64)
-                    } else {
-                        block.iter().all(|byte| *byte == 0)
-                    }
-                })
+            bytes.chunks(bs).enumerate().all(|(logical, block)| {
+                if logical % 2 == 0 {
+                    patterned(block, (logical * bs) as u64)
+                } else {
+                    block.iter().all(|byte| *byte == 0)
+                }
             }),
-            Ok(true),
+            true,
         );
         context.diagnostic(format_args!("ext4-segment original-PFN={} block-size={} first-real-segment-complete-NotReady=1 actual-first-SG={:?} actual-last-SG={:?} mapped-hole-mapped={} Uptodate-published-after-all-blocks=1", address, bs, first_dma, last_dma, bs < 4096));
         Ok(())

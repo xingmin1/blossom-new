@@ -12,14 +12,16 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 
 use super::disk::QueuePhase;
 use super::{
-    Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, IoResult, ReadOnlyClaim,
+    AccessMode, Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim,
+    IoResult,
 };
 use crate::drivers::virtio::VirtioDevice;
+use crate::drivers::DeviceInventory;
 use crate::mm::dma::MappedPages;
 use crate::sync::SpinLock;
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
-use crate::{cpu, drivers, mm, sched, time, timer};
+use crate::{cpu, mm, sched, time, timer};
 
 // EndIo 的函数指针只经此单槽定位当前 fixture；所有 Task/页/gate 均由该例拥有。
 static ACTIVE: SpinLock<Option<Arc<Observation>>> = SpinLock::new(None);
@@ -182,9 +184,11 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
     Ok(mm::stats())
 }
 
-/// 每例独占声明数量的真实 raw 设备；没有挂载、VFS 或源盘写入路径。
-fn devices(count: usize) -> Result<Vec<(VirtioDevice, bool)>, TestError> {
-    let inventory = drivers::discover().map_err(|_| TestError("quota discovery failed"))?;
+/// 每例借 suite 的一次发现库存准备独占工作设备，不重复扫描 PCI。
+fn devices(
+    inventory: &DeviceInventory,
+    count: usize,
+) -> Result<Vec<(VirtioDevice, bool)>, TestError> {
     let pci =
         inventory.pci.devices().iter().filter(|device| {
             device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
@@ -353,7 +357,7 @@ struct Owner {
     submitter: Option<JoinHandle>,
     prepared_stops: Vec<Option<PreparedTask>>,
     stops: Vec<Option<JoinHandle>>,
-    claim: Option<ReadOnlyClaim>,
+    claim: Option<FsClaim>,
     pressure: Pressure,
     activation_error: bool,
     before_a: (usize, usize),
@@ -363,8 +367,12 @@ struct Owner {
 }
 
 impl Owner {
-    /// 一例重新建立真实库存、原共享 quota、全部 Bio/观察/producer/stop/native 栈。
-    fn prepare(count: usize, context: &mut TestContext<'_>) -> Result<Self, TestError> {
+    /// 借一次库存建立原共享 quota、Bio、观察者及本例 producer/stop 栈。
+    fn prepare(
+        count: usize,
+        context: &mut TestContext<'_>,
+        inventory: &DeviceInventory,
+    ) -> Result<Self, TestError> {
         let baseline = settled()?;
         let origin = if context.case.name.contains("reject") {
             Origin::Reject
@@ -375,7 +383,7 @@ impl Owner {
             .case
             .parameter
             .is_some_and(|name| name.starts_with("oom"));
-        let devices = devices(count)?;
+        let devices = devices(inventory, count)?;
         let max_active = devices
             .iter()
             .map(|(device, _)| usize::from(device.info().tag_count) + 1)
@@ -661,8 +669,8 @@ impl Owner {
         self.identities(context)?;
         if self.origin == Origin::Reject {
             self.claim = Some(
-                Disk::claim_readonly(&self.disks[0])
-                    .map_err(|_| TestError("quota readonly claim failed"))?,
+                Disk::claim_fs(&self.disks[0], AccessMode::ReadOnly)
+                    .map_err(|_| TestError("quota RO FS claim failed"))?,
             );
         }
         self.before_a = self.counts(0);
@@ -842,7 +850,7 @@ impl Owner {
         context.diagnostic(format_args!("quota origin={:?} disks={} normal-max-active={} A={} raw-Read-used={} Task-Blocked={} mode={} A-scope={} B-scope=real-hardware-read-full-pattern",
             self.origin, self.disks.len(), self.max_active, count, self.used_target, count,
             if self.oom { "page-and-heap-OOM-after-real-used" } else { "normal" },
-            if self.origin == Origin::Reject { "real-ReadOnlyClaim-admission-no-write" } else { "controlled-ledger-no-descriptors-not-hardware-used" }));
+            if self.origin == Origin::Reject { "real-FsClaim-RO-admission-no-write" } else { "controlled-ledger-no-descriptors-not-hardware-used" }));
         Ok(())
     }
 
@@ -968,13 +976,7 @@ impl Owner {
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let baseline = self.baseline;
         drop(self);
-        let mut after = settled()?;
-        until("quota six-domain resources did not return", || {
-            mm::shrink_all();
-            mm::drain_all_pages();
-            after = mm::stats();
-            after == baseline
-        })?;
+        let after = settled()?;
         context.expect_eq(after, baseline);
         context.diagnostic(format_args!(
             "quota resources-before={:?} resources-after={:?} stopped-IRQ-Work-native-join=1",
@@ -1018,10 +1020,13 @@ struct Double(Owner);
 
 macro_rules! fixture {
     ($name:ident, $count:expr) => {
-        impl Fixture<()> for $name {
-            /// 具名 case 每次获得全新真实设备/域/页/观察/控制责任，无过滤或 shuffle 依赖。
-            fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
-                Owner::prepare($count, context).map(Self)
+        impl Fixture<DeviceInventory> for $name {
+            /// 每例只借一次发现的库存，独立取得真实设备、域、原页与控制责任。
+            fn set_up(
+                context: &mut TestContext<'_>,
+                inventory: &DeviceInventory,
+            ) -> Result<Self, TestError> {
+                Owner::prepare($count, context, inventory).map(Self)
             }
             /// 不能安全收敛时 Err 交原 typed case-abort 保活终结 VM，不 Drop 活设备。
             fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
@@ -1037,7 +1042,7 @@ macro_rules! fixture {
 fixture!(Single, 1);
 fixture!(Double, 2);
 
-#[ktest::suite(fixture = Single, context = "Thread", isolation = "Case", min_cpus = 2,
+#[ktest::suite(fixture = Single, suite_resources = DeviceInventory, context = "Thread", isolation = "Case", min_cpus = 2,
     tags("block", "quota", "B11", "T5"), resources("root"), timeout_ms = 60000)]
 mod single {
     use super::*;
@@ -1062,7 +1067,7 @@ mod single {
     }
 }
 
-#[ktest::suite(fixture = Double, context = "Thread", isolation = "Case", min_cpus = 2,
+#[ktest::suite(fixture = Double, suite_resources = DeviceInventory, context = "Thread", isolation = "Case", min_cpus = 2,
     tags("block", "quota", "cross-disk", "B11", "T5"), resources("root", "extra"), timeout_ms = 60000)]
 mod double {
     use super::*;
@@ -1147,13 +1152,7 @@ impl Fixture<()> for Unsubmitted {
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let baseline = self.baseline;
         drop(self);
-        let mut after = settled()?;
-        until("unsubmitted reserved six domains leaked", || {
-            mm::shrink_all();
-            mm::drain_all_pages();
-            after = mm::stats();
-            after == baseline
-        })?;
+        let after = settled()?;
         context.expect_eq(after, baseline);
         Ok(())
     }

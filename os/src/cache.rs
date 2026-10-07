@@ -1,180 +1,238 @@
-//! 元数据块与文件页分别索引原 Folio，读入责任在发表前建立。
+//! 元数据视图共用 Disk 的物理页；文件页使用同一稀疏索引和原页状态。
 
-use alloc::vec::Vec;
+mod index;
+
+use alloc::sync::{Arc, Weak};
 use core::convert::TryFrom;
 
-use crate::block::{BlockError, DiskRef, SECTOR_BYTES};
+use crate::block::{AccessMode, BlockError, FsClaim, SECTOR_BYTES};
+use crate::fs::ext4::Ext4Volume;
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
-use crate::sync::SpinLock;
+use crate::sync::{SleepMutex, SpinLock};
+use index::{Node, Tree};
 
-struct Entry<K> {
-    key: K,
-    folio: FolioRef,
+/// 内容状态从节点自己的 folio 读取；ToWrite 只标记本轮选中的原节点。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FolioMark {
+    Dirty,
+    Writeback,
+    ToWrite,
 }
 
-/// 固定预算的页索引只保护身份发表，不跨读入、等待或原页归还。
-struct FolioIndex<K> {
-    entries: SpinLock<Vec<Entry<K>>>,
-    capacity: usize,
+struct FolioIndex {
+    entries: SpinLock<Tree>,
+    capacity: Option<usize>,
+    metadata: bool,
 }
 
-impl<K: Copy + Eq> FolioIndex<K> {
-    /// 在锁外一次预留全部索引槽；零预算无法保存任何页，直接拒绝。
-    fn try_new(capacity: usize) -> Result<Self, BlockError> {
-        if capacity == 0 {
-            return Err(BlockError::InvalidRange);
-        }
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(capacity)
-            .map_err(|_| BlockError::NoMemory)?;
-        Ok(Self {
-            entries: SpinLock::new(entries),
+impl FolioIndex {
+    /// 文件索引不预留固定槽；元数据预算限制的是实际物理页数量。
+    const fn new(capacity: Option<usize>, metadata: bool) -> Self {
+        Self {
+            entries: SpinLock::new(Tree::new()),
             capacity,
-        })
+            metadata,
+        }
     }
 
-    /// 预算已满时先移出仅索引持有的静止页，避免无用候选分配或占满页后的假 OOM。
-    fn evict_if_full(&self, entries: &mut Vec<Entry<K>>) -> Result<Option<Entry<K>>, BlockError> {
-        if entries.len() < self.capacity {
+    /// 在索引锁内仅移出可回收的静止页；全活、Dirty 或 WB 都不能腾空预算。
+    fn evict_if_full(
+        &self,
+        entries: &mut Tree,
+    ) -> Result<Option<alloc::boxed::Box<Node>>, BlockError> {
+        if self.capacity.is_none_or(|capacity| entries.len < capacity) {
             return Ok(None);
         }
-        let position = entries
-            .iter()
-            .position(|entry| entry.folio.can_prune())
-            .ok_or(BlockError::NoMemory)?;
-        Ok(Some(entries.swap_remove(position)))
-    }
-
-    /// 先查命中与真实预算；移出的静止页交调用者在候选分配前锁外归还。
-    fn prepare_slot(&self, key: K) -> Result<(Option<FolioRef>, Option<Entry<K>>), BlockError> {
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
-            return Ok((Some(entry.folio.clone()), None));
+        let mut cursor = 0;
+        while let Some(node) = entries.lower_bound(cursor) {
+            let key = node.key;
+            if node.folio.can_prune() {
+                return Ok(entries.remove(key));
+            }
+            let Some(next) = key.checked_add(1) else {
+                break;
+            };
+            cursor = next;
         }
-        Ok((None, self.evict_if_full(&mut entries)?))
+        Err(BlockError::NoMemory)
     }
 
-    /// 双查后发表已 Locked 的候选；被替换的独占静止页交调用者锁外释放。
-    fn publish(
-        &self,
-        key: K,
-        candidate: &FolioRef,
-    ) -> Result<(Option<FolioRef>, Option<Entry<K>>), BlockError> {
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
-            return Ok((Some(entry.folio.clone()), None));
-        }
-        // 锁顺序为索引锁到 PageUse 锁；这里只检查静止状态或增加引用。
-        let victim = self.evict_if_full(&mut entries)?;
-        // 构造时已经预留全部预算，移出 victim 后必有空位，push 不分配。
-        entries.push(Entry {
-            key,
-            folio: candidate.clone(),
-        });
-        Ok((None, victim))
-    }
-
-    /// 锁外准备候选与唯一读入责任；竞争失败者不提交候选的 I/O。
-    fn get_or_prepare(
-        &self,
-        key: K,
-        offset: usize,
-        len: usize,
-    ) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
-        let (existing, victim) = self.prepare_slot(key)?;
+    /// 命中不分配；候选页和 AVL 节点锁外准备，双查后只转移拥有。
+    fn get_or_prepare(&self, key: u64) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
+        let victim = {
+            let mut entries = self.entries.lock();
+            if entries.closed {
+                return Err(BlockError::QueueStopped);
+            }
+            if let Some(node) = entries.get(key) {
+                return Ok((node.folio.clone(), None));
+            }
+            self.evict_if_full(&mut entries)?
+        };
         drop(victim);
+        let candidate = if self.metadata {
+            FolioRef::allocate_metadata()
+        } else {
+            FolioRef::allocate()
+        }
+        .ok_or(BlockError::NoMemory)?;
+        let read = if self.metadata {
+            None
+        } else {
+            Some(candidate.begin_read(0, PAGE_SIZE)?)
+        };
+        let mut prepared = Some(Node::prepare(key, candidate.clone())?);
+        let (existing, victim) = {
+            let mut entries = self.entries.lock();
+            if entries.closed {
+                return Err(BlockError::QueueStopped);
+            }
+            if let Some(node) = entries.get(key) {
+                (Some(node.folio.clone()), None)
+            } else {
+                let victim = self.evict_if_full(&mut entries)?;
+                entries.insert(prepared.take().unwrap());
+                (None, victim)
+            }
+        };
+        drop(victim);
+        drop(prepared);
         if let Some(folio) = existing {
+            drop(read);
             return Ok((folio, None));
         }
-        let candidate = FolioRef::allocate().ok_or(BlockError::NoMemory)?;
-        let read = candidate.begin_read(offset, len)?;
-        let (existing, victim) = self.publish(key, &candidate)?;
-        drop(victim);
-        match existing {
-            Some(folio) => {
-                // 读入尚未交设备；取消 loser 只结束其私有候选，索引中的页不受影响。
-                drop(read);
-                drop(candidate);
-                Ok((folio, None))
-            }
-            None => Ok((candidate, Some(read))),
-        }
+        Ok((candidate, read))
     }
 
-    /// 移出仅索引持有的静止页，逐页解锁后归还；并发新发表的页可留待下次回收。
+    /// 每次只摘一个静止节点，原页和 Box 析构均在短锁外；只扫描当时的有界键前缀。
     fn prune_unused(&self) -> usize {
+        let budget = self.len();
+        let mut cursor = 0;
         let mut removed = 0;
-        // 反向检查初始槽数，swap_remove 不使尚未检查的低位发生移动。
-        for position in (0..self.len()).rev() {
-            let victim = {
+        for _ in 0..budget {
+            let (victim, next) = {
                 let mut entries = self.entries.lock();
-                if entries
-                    .get(position)
-                    .is_some_and(|entry| entry.folio.can_prune())
-                {
-                    Some(entries.swap_remove(position))
+                let Some(node) = entries.lower_bound(cursor) else {
+                    break;
+                };
+                let key = node.key;
+                let victim = if node.folio.can_prune() {
+                    entries.remove(key)
                 } else {
                     None
-                }
+                };
+                (victim, key.checked_add(1))
             };
-            if victim.is_some() {
-                removed += 1;
-            }
+            removed += usize::from(victim.is_some());
             drop(victim);
+            let Some(next) = next else {
+                break;
+            };
+            cursor = next;
         }
         removed
     }
 
-    /// 观察当前占用的页索引槽数，不把在途页排除在预算之外。
+    /// 读取当前真实节点数，读入中与失败节点仍占元数据预算。
     fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.lock().len
+    }
+
+    /// 有界选择半开页范围，扫描与输出均受调用者片段限制；返回后续扫描起点。
+    fn select_range(
+        &self,
+        start: u64,
+        end: u64,
+        mark: FolioMark,
+        output: &mut [Option<(u64, FolioRef)>],
+    ) -> Option<u64> {
+        let entries = self.entries.lock();
+        let mut cursor = start;
+        let mut selected = 0;
+        for _ in 0..output.len() {
+            let node = entries.lower_bound(cursor)?;
+            if end <= node.key {
+                return None;
+            }
+            let matches = match mark {
+                FolioMark::Dirty => node.folio.dirty_sectors() != 0,
+                FolioMark::Writeback => node.folio.writeback_sectors() != 0,
+                FolioMark::ToWrite => node.to_write,
+            };
+            if matches {
+                assert!(
+                    output[selected].is_none(),
+                    "folio scan output retains an owner"
+                );
+                output[selected] = Some((node.key, node.folio.clone()));
+                selected += 1;
+            }
+            cursor = node.key.checked_add(1)?;
+        }
+        (cursor < end).then_some(cursor)
     }
 }
 
-/// 一个真实设备的元数据块缓存，块大小属于键的一部分。
+/// Disk 弱反向槽取得同一物理元数据域；外部视图保留本缓存和真实 FS 占用。
 pub struct MetadataCache {
-    disk: DiskRef,
-    index: FolioIndex<(u64, usize)>,
+    index: FolioIndex,
+    // 卷弱关联只协调同一 FS 实例的取得；卷持缓存，不形成强环。
+    pub(crate) filesystem: SleepMutex<Weak<Ext4Volume>>,
+    // 静止索引与弱关联先析构，最后一份 FS 占用才允许 raw writer 进入。
+    claim: FsClaim,
 }
 
 impl MetadataCache {
-    /// 绑定实际设备，并在锁外一次预留固定的元数据页预算。
-    pub fn try_new(disk: DiskRef, capacity: usize) -> Result<Self, BlockError> {
-        Ok(Self {
-            disk,
-            index: FolioIndex::try_new(capacity)?,
+    /// 相同 Disk 复用唯一缓存；活域请求不同页预算明确拒绝，不默默采用首个预算。
+    pub fn shared(claim: &FsClaim, capacity: usize) -> Result<Arc<Self>, BlockError> {
+        if capacity == 0 {
+            return Err(BlockError::InvalidRange);
+        }
+        if let Some(cache) = claim.disk().metadata_cache() {
+            if cache.capacity() != capacity {
+                return Err(BlockError::Busy);
+            }
+            return Ok(cache);
+        }
+        let candidate = Arc::try_new(Self {
+            claim: claim.clone(),
+            index: FolioIndex::new(Some(capacity), true),
+            filesystem: SleepMutex::new(Weak::new()),
         })
+        .map_err(|_| BlockError::NoMemory)?;
+        let cache = claim.disk().intern_metadata_cache(&candidate);
+        if cache.capacity() != capacity {
+            return Err(BlockError::Busy);
+        }
+        Ok(cache)
     }
 
-    /// 读取一个 1/2/4KiB 元数据块；只有新页拥有者提交真实 I/O，其余 Task 等同页结果。
-    pub fn get(&self, block: u64, block_size: usize) -> Result<BufferRef, BlockError> {
-        let (byte_offset, offset) = self.block_range(block, block_size)?;
-        let (folio, read) =
-            self.index
-                .get_or_prepare((byte_offset, block_size), offset, block_size)?;
-        if let Some(read) = read {
-            self.disk.load_folio(byte_offset, read)?;
+    /// 取得准确 1/2/4KiB 窗口；缺失段逐次认领，已有有效或脏字节不会被重新读盘覆盖。
+    pub fn get(self: &Arc<Self>, block: u64, block_size: usize) -> Result<BufferRef, BlockError> {
+        let (byte, offset) = self.block_range(block, block_size)?;
+        let page = byte - offset as u64;
+        let (folio, _) = self.index.get_or_prepare(page)?;
+        while let Some(read) = folio.begin_metadata_read(offset, block_size)? {
+            self.claim
+                .disk()
+                .load_folio(page + read.offset() as u64, read)?;
         }
-        folio.wait_ready()?;
         Ok(BufferRef {
-            folio,
+            folio: folio.with_metadata_owner(self.clone()),
             offset,
             len: block_size,
         })
     }
 
-    /// 检查块到字节的转换、设备边界和页内范围，在发表候选前拒绝错误几何。
+    /// 在发表候选前解释块几何、设备容量和准确页内范围。
     fn block_range(&self, block: u64, block_size: usize) -> Result<(u64, usize), BlockError> {
         if !matches!(block_size, 1024 | 2048 | 4096) {
             return Err(BlockError::InvalidRange);
         }
         let size = u64::try_from(block_size).map_err(|_| BlockError::InvalidRange)?;
-        let byte_offset = block.checked_mul(size).ok_or(BlockError::InvalidRange)?;
-        let end = byte_offset
-            .checked_add(size)
-            .ok_or(BlockError::InvalidRange)?;
-        let limits = self.disk.limits();
+        let byte = block.checked_mul(size).ok_or(BlockError::InvalidRange)?;
+        let end = byte.checked_add(size).ok_or(BlockError::InvalidRange)?;
+        let limits = self.claim.disk().limits();
         let capacity = limits
             .capacity_sectors
             .checked_mul(SECTOR_BYTES)
@@ -183,43 +241,75 @@ impl MetadataCache {
             return Err(BlockError::InvalidRange);
         }
         let logical = u64::from(limits.logical_block_size);
-        if byte_offset % logical != 0 || size % logical != 0 {
+        if byte % logical != 0 || size % logical != 0 {
             return Err(BlockError::Misaligned);
         }
-        let offset = usize::try_from(byte_offset % PAGE_SIZE as u64)
-            .map_err(|_| BlockError::InvalidRange)?;
-        if PAGE_SIZE
-            < offset
-                .checked_add(block_size)
-                .ok_or(BlockError::InvalidRange)?
-        {
+        let offset = (byte % PAGE_SIZE as u64) as usize;
+        if PAGE_SIZE < offset + block_size {
             return Err(BlockError::InvalidRange);
         }
-        Ok((byte_offset, offset))
+        Ok((byte, offset))
     }
 
-    /// 显式归还仅缓存持有的静止元数据页，失败页同样可以回收。
+    /// 回收仅索引持有且无 Dirty、WB 或内容锁的页。
     pub fn prune_unused(&self) -> usize {
         self.index.prune_unused()
     }
 
-    /// 返回当前元数据索引占用，包括仍在真实读入的页。
+    /// 返回在途、错误及有效范围共同占用的真实物理页数。
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    /// 观察缓存是否尚未持有任何元数据页。
+    /// 检查物理页索引是否为空。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// 返回构造时固定的页预算，不随底层 Vec 的实际保留空间增大。
+    /// 返回此 Disk 活元数据域的明确页预算。
     pub fn capacity(&self) -> usize {
-        self.index.capacity
+        self.index.capacity.unwrap()
+    }
+
+    /// 关闭私有域的新取得，摘离全部页后丢弃明确无需落盘的测试或未发表内容。
+    ///
+    /// # Safety
+    /// 调用者必须已停止全部 get/update 生产者并结束全部 IO、WB 和外部视图使用。
+    /// 这些字节只能属于未发表或私有 CPU 协议页，不得包含任何已接受的真实 FS 修改。
+    pub unsafe fn discard_private(self: &Arc<Self>) -> Result<usize, BlockError> {
+        let mut detached = {
+            let mut entries = self.index.entries.lock();
+            let mut cursor = 0;
+            while let Some(node) = entries.lower_bound(cursor) {
+                if node.folio.ref_count() != 1 || node.folio.writeback_sectors() != 0 {
+                    return Err(BlockError::Busy);
+                }
+                let Some(next) = node.key.checked_add(1) else {
+                    break;
+                };
+                cursor = next;
+            }
+            entries.closed = true;
+            entries.take_all()
+        };
+        let count = detached.len;
+        while let Some(node) = detached.lower_bound(0) {
+            let key = node.key;
+            let node = detached.remove(key).unwrap();
+            let mut content = node.folio.lock_content();
+            // SAFETY: 调用者已停止全部生产者和在途访问；索引已关闭并摘离全部节点，
+            // 上面的唯一引用检查拒绝外部视图。内容明确私有且无需落盘，guard 排斥 CPU 访问。
+            unsafe {
+                content.discard();
+            }
+            drop(content);
+            drop(node);
+        }
+        Ok(count)
     }
 }
 
-/// 原 Folio 内已初始化的元数据块视图，不复制内容。
+/// 同一元数据页中的准确范围，保活缓存及其 Disk 占用，不复制字节。
 #[derive(Clone)]
 pub struct BufferRef {
     folio: FolioRef,
@@ -228,70 +318,123 @@ pub struct BufferRef {
 }
 
 impl BufferRef {
-    /// 短暂访问本块内容，借用不能跨消费者返回或脱离 Folio 内容保护。
-    pub fn with_bytes<T>(&self, consume: impl FnOnce(&[u8]) -> T) -> Result<T, BlockError> {
-        self.folio.with_bytes(self.offset, self.len, consume)
+    /// 内容锁内短借用本视图；闭包不得分配、等待 IO 或进行可能 fault 的用户复制。
+    pub fn with_read<T>(&self, consume: impl FnOnce(&[u8]) -> T) -> Result<T, BlockError> {
+        let content = self.folio.lock_content();
+        Ok(consume(content.metadata_bytes(self.offset, self.len)?))
     }
 
-    /// 返回本块的字节数，独立于 Folio 的物理页大小。
+    /// 同 Disk 的 RW 授权只修改准确视图，Dirty 在字节修改之前记录，已有 WB 不被清除。
+    /// 闭包不得等待或用户复制；相邻 inode 记录与校验和在同一真实内容锁内保持一致。
+    pub fn update<T>(
+        &self,
+        claim: &FsClaim,
+        update: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<T, BlockError> {
+        if claim.mode() != AccessMode::ReadWrite {
+            return Err(BlockError::ReadOnly);
+        }
+        let cache = self
+            .folio
+            .metadata_owner()
+            .expect("metadata buffer lost its cache owner");
+        if !core::ptr::eq(
+            claim.disk().as_ref().get_ref(),
+            cache.claim.disk().as_ref().get_ref(),
+        ) {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut content = self.folio.lock_content();
+        Ok(update(content.metadata_bytes_mut(self.offset, self.len)?))
+    }
+
+    /// 返回视图自己的字节长度。
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 元数据块视图总是非空，零长度范围不会进入缓存。
+    /// 元数据块视图不接受零长度请求。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// 返回本块在原物理页中的字节偏移。
+    /// 返回视图在真实 4KiB 页中的起点。
     pub fn offset(&self) -> usize {
         self.offset
     }
 
-    /// 借用实际原页身份，观察或持有该页不会建立第二份内容。
+    /// 借用同一原页身份；内容仍只能按本视图或原页角色访问。
     pub fn folio(&self) -> &FolioRef {
         &self.folio
     }
 }
 
-/// 活文件对象自己的页索引；实际文件来源消费唯一读入 owner。
+/// canonical inode 自己的空稀疏页索引，不将文件工作集封死在预留槽数。
 pub struct FileMapping {
-    index: FolioIndex<u64>,
+    index: FolioIndex,
 }
 
 impl FileMapping {
-    /// 在锁外一次预留固定的文件页预算，不建立格式或设备加载器。
-    pub fn try_new(capacity: usize) -> Result<Self, BlockError> {
-        Ok(Self {
-            index: FolioIndex::try_new(capacity)?,
-        })
+    /// 建立无预留节点的唯一文件页索引，miss 的真实内存不足由节点和页申请返回。
+    pub const fn new() -> Self {
+        Self {
+            index: FolioIndex::new(None, false),
+        }
     }
 
-    /// 按文件页号返回同页；Some 是唯一填充责任，None 的消费者必须等待原页结果。
-    ///
-    /// 新页的 owner 覆盖整页，来源必须完整填充后完成；错误完成保留原原因并唤醒等待者。
-    pub fn get_or_prepare(&self, index: u64) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
-        self.index.get_or_prepare(index, 0, PAGE_SIZE)
+    /// 内核加载者在锁外候选上取得同页唯一填充责任，命中只增加原页引用。
+    /// 文件来源须持有对应 InodeRef 到低层填充和使用全部结束；裸页交给外部
+    /// 拥有者前必须附同一 InodeRef anchor，普通文件消费者使用 InodeRef 的页出口。
+    pub(crate) fn get_or_prepare(
+        &self,
+        index: u64,
+    ) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
+        self.index.get_or_prepare(index)
     }
 
-    /// 显式归还仅 mapping 持有的静止页，不替换仍被消费者持有的身份。
+    /// 仅摘除无内容锁、Dirty、WB 和外部使用者的静止页。
     pub fn prune_unused(&self) -> usize {
         self.index.prune_unused()
     }
 
-    /// 返回已发表的文件页数，在途与失败页仍计入预算。
+    /// 返回已发表的稀疏节点数。
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    /// 观察此 mapping 是否尚未持有文件页。
+    /// 检查是否仍保有任何页身份。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// 返回构造时固定的文件页预算。
-    pub fn capacity(&self) -> usize {
-        self.index.capacity
+    /// 在同一原节点标记或取消本轮待写选择，不创建第二份页拥有。
+    pub fn set_to_write(&self, index: u64, selected: bool) {
+        self.index.entries.lock().set_to_write(index, selected);
+    }
+
+    /// 锁内只选有界范围和增加原引用；返回值是下一次有界扫描起点。
+    /// 文件扫描者保原 InodeRef 到所有选中页和 IO 使用结束，跨拥有交付须附原 anchor。
+    pub(crate) fn select_range(
+        &self,
+        start: u64,
+        end: u64,
+        mark: FolioMark,
+        output: &mut [Option<(u64, FolioRef)>],
+    ) -> Option<u64> {
+        self.index.select_range(start, end, mark, output)
+    }
+
+    /// 验收原索引的排序和平衡，不以预期页数替代树中真实结构。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_validate(&self) -> (usize, u16) {
+        self.index.entries.lock().validate()
+    }
+}
+
+impl Default for FileMapping {
+    /// 默认文件映射同样没有预先申请或固定页预算。
+    fn default() -> Self {
+        Self::new()
     }
 }
 

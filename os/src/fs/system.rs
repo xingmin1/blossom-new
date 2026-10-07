@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 
-use crate::block::DiskRef;
+use crate::block::{AccessMode, DiskRef};
 use crate::fs::ext4::crc::crc32c;
 use crate::fs::{
     Ext4Volume, FileLike, FileTable, FsContext, FsError, InodeCache, OpenOptions, ResolveMode, Vfs,
@@ -42,21 +42,21 @@ fn device_index(name: &[u8]) -> Result<usize, FsError> {
     }
 }
 
-/// 普通可睡眠 Task 用已准备的真实磁盘构造根视图，仅显式附盘才挂到 /mnt/extra。
+/// 普通可睡眠 Task 明确以 RO 卷和 RO 挂载构造根视图，仅显式附盘才挂到 /mnt/extra。
 /// 卷与路径只保活原设备及缓存，不停止设备，也不建立全局文件系统拥有者。
 pub(crate) fn mount_disks(
     root: DiskRef,
     extra: Option<DiskRef>,
     inodes: Arc<InodeCache>,
 ) -> Result<Vfs, FsError> {
-    let volume = Ext4Volume::open(root, 64)?;
-    let vfs = Vfs::try_new(volume, inodes, 128, 4)?;
+    let volume = Ext4Volume::open(root, AccessMode::ReadOnly, 64)?;
+    let vfs = Vfs::try_new(volume, inodes, 128, 4, AccessMode::ReadOnly)?;
     if let Some(extra) = extra {
         let root = vfs.root();
         let context = FsContext::new(root.clone(), root)?;
         let covered = vfs.resolve(&context, b"/mnt/extra", ResolveMode::Follow)?;
-        let volume = Ext4Volume::open(extra, 64)?;
-        vfs.mount(&covered, volume)?;
+        let volume = Ext4Volume::open(extra, AccessMode::ReadOnly, 64)?;
+        vfs.mount(&covered, volume, AccessMode::ReadOnly)?;
     }
     Ok(vfs)
 }

@@ -32,7 +32,7 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
         ResolveMode::Follow
     };
     let path = resolve(&runtime, &mm, raw[0], raw[1], mode)?;
-    if flags & DIRECTORY != 0 && path.inode()?.metadata()?.kind != InodeKind::Directory {
+    if flags & DIRECTORY != 0 && path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
         return Err(Errno::NotDirectory);
     }
     if flags & 3 != 0 || flags & (0x40 | 0x200) != 0 {
@@ -250,7 +250,7 @@ pub(super) fn readlink(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("readlink has no runtime");
     let mm = user.mm().expect("readlink has no MM");
     let path = resolve(&runtime, &mm, raw[0], raw[1], ResolveMode::NoFollow)?;
-    if path.inode()?.metadata()?.kind != InodeKind::Symlink {
+    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Symlink {
         return Err(Errno::InvalidArgument);
     }
     let target = path.inode()?.read_link()?;

@@ -168,13 +168,15 @@ impl PageUseGuard<'_> {
         }
     }
 
-    /// 最后引用结束后取走原页归还权并原地析构固定 folio，原页须在用途锁外归还。
+    /// 静止末引用取走原页并原地析构固定 folio；原页须在用途锁外归还。
     ///
     /// # Safety
-    /// 引用数必须为零，读入、等待登记、内容借用与所有固定共享投影必须已经结束。
+    /// 引用数必须为零，内容锁、初始化/DMA、Dirty、WB、等待登记、内容借用和固定投影
+    /// 必须已经结束。不得用析构丢弃尚有写入或持久化责任的原页。
     pub(crate) unsafe fn take_folio(&mut self) -> OwnedPages {
-        // SAFETY: caller 已结束全部 folio 访问责任，当前锁排除用途变化；
-        // 可变 guard 借用结束锁内视图，只取走未被固定的 backing，不移动等待源。
+        // SAFETY: caller 已结束全部 folio 访问和写入责任，用途锁排除用途变化；
+        // 可变 guard 借用结束锁内视图，take_backing 再核无锁、无 Dirty/WB，
+        // 只取走未固定的 backing，不移动等待源。
         let backing = match unsafe { &mut *self.descriptor.usage.get() } {
             PageUse::Folio(state) => state.take_backing(),
             PageUse::Empty | PageUse::Slab(_) | PageUse::Anon(_) => {

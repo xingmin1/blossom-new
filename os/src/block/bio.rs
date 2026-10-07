@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use virtio_drivers::MappedSegment;
 
-use crate::block::{BlkOperation, BlockError, Disk, DiskRef, EndIo, IoResult};
+use crate::block::{BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim, IoResult};
 use crate::drivers::virtio::VirtioIdentity;
 use crate::mm::dma::MappedPages;
 use crate::sched;
@@ -45,6 +45,7 @@ struct BioState {
     first_error: Option<(usize, BlockError)>,
     result: Option<IoResult>,
     completion_owner: Option<DiskRef>,
+    fs_claim: Option<FsClaim>,
 }
 
 /// 不可变范围与常数完成账本分开；队列 part 只强拥有此对象。
@@ -120,6 +121,7 @@ impl Bio {
                     first_error: None,
                     result: None,
                     completion_owner: None,
+                    fs_claim: None,
                 }),
                 ready: AtomicBool::new(false),
                 waiters: WaitQueue::new(),
@@ -291,6 +293,19 @@ impl BioInner {
     /// slot 在 IRQ 分派前检查是否必须使用预建完成 Work。
     pub(super) fn needs_task(&self) -> bool {
         matches!(self.end_io, Some(EndIo::Task(_)))
+    }
+
+    /// 已接受 FS 来源在交权前保存共享占用，拒绝的 Bio 从不取得该责任。
+    pub(super) fn retain_fs_claim(&self, claim: &FsClaim) {
+        let mut state = self.state.lock();
+        assert_eq!(state.phase, Phase::New);
+        assert!(state.fs_claim.is_none());
+        state.fs_claim = Some(claim.clone());
+    }
+
+    /// 为准备中的 part 克隆同一占用，延续至 slot 资源与队列尾部结束。
+    pub(super) fn fs_claim(&self) -> Option<FsClaim> {
+        self.state.lock().fs_claim.clone()
     }
 
     /// 唯一 admission 在普通 Task 中建立生成者义务，再锁外交整个原 memory 给设备。
@@ -474,12 +489,13 @@ impl BioInner {
             );
             return true;
         }
-        self.finalize(memory, result);
+        drop(self.finalize(memory, result));
         false
     }
 
-    /// 唯一完成者在锁外执行回调，随后发布 folio 终态，最后 Release 发布父完成。
-    fn finalize(&self, mut memory: Vec<MappedPages>, result: IoResult) {
+    /// 唯一完成者锁外执行回调及 folio 收权，Release 发布父完成后移出 FS 占用。
+    /// 返回的占用由 accepted 生成者或 part 保活至各自队列尾，最后 put 不在状态锁内。
+    fn finalize(&self, mut memory: Vec<MappedPages>, result: IoResult) -> Option<FsClaim> {
         match self.end_io {
             Some(EndIo::Inline(callback)) => callback(&result, &memory),
             Some(EndIo::Task(callback)) => {
@@ -502,16 +518,18 @@ impl BioInner {
                 })
             };
         }
-        {
+        let claim = {
             let mut state = self.state.lock();
             assert_eq!(state.phase, Phase::Finishing);
             assert!(state.memory.is_none() && state.result.is_none());
             state.memory = Some(memory);
             state.result = Some(result);
             state.phase = Phase::Complete;
-        }
+            state.fs_claim.take()
+        };
         self.ready.store(true, Ordering::Release);
         self.waiters.wake_all();
+        claim
     }
 }
 
@@ -529,10 +547,11 @@ fn finalizer_callback(work: Pin<&Work>) {
             state.completion_owner.take(),
         )
     };
-    bio.finalize(memory, result);
+    let claim = bio.finalize(memory, result);
     if let Some(owner) = owner {
         owner.finish_generation_tail(bio.operation());
     }
+    drop(claim);
 }
 
 impl BioState {

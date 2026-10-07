@@ -7,13 +7,17 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use virtio_drivers::{BufferDirection, MappedSegment};
 
 use super::disk::{QueuePhase, SlotState};
-use super::{Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, IoResult};
+use super::{
+    AccessMode, Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim,
+    IoResult,
+};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::DeviceInventory;
 use crate::mm::dma::MappedPages;
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
-use crate::{cpu, drivers, mm, sched, time, timer};
+use crate::{cpu, mm, sched, time, timer};
 
 // EndIo 只有函数指针；唯一有界定位槽强拥有当前 fixture 的观察者，不保存跨例 gate。
 static CALLBACK_OWNER: SpinLock<Option<Arc<Observation>>> = SpinLock::new(None);
@@ -30,6 +34,8 @@ enum Scenario {
     Tail,
     Callback,
     Scratch,
+    FsScratch,
+    ReadonlyDevice,
     Entry,
     Identity,
     Exact,
@@ -139,9 +145,8 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
     Ok(mm::stats())
 }
 
-/// 从本例声明的独占真实库存准备全部设备，不借上一例的 registry 或根文件系统。
-fn devices(count: usize) -> Result<Vec<VirtioDevice>, TestError> {
-    let inventory = drivers::discover().map_err(|_| TestError("queue discovery failed"))?;
+/// 每例借 suite 一次发现库存取得独占设备，上一例已真实 stop/join。
+fn devices(inventory: &DeviceInventory, count: usize) -> Result<Vec<VirtioDevice>, TestError> {
     let pci =
         inventory.pci.devices().iter().filter(|device| {
             device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
@@ -311,15 +316,23 @@ struct Owner {
     observation: Arc<Observation>,
     activation_error: Option<BlockError>,
     legacy: bool,
+    claim: Option<FsClaim>,
     fill: usize,
     model_live: Option<usize>,
 }
 
 impl Owner {
-    /// 每 fixture 固定一次真实 limits；全部页、gate、观察者和 producer 栈在 start 前 fallible 准备。
-    fn prepare(scenario: Scenario, context: &mut TestContext<'_>) -> Result<Self, TestError> {
+    /// 借 suite 库存固定真实 limits；原页、gate 和 producer 栈在 start 前 fallible 准备。
+    fn prepare(
+        scenario: Scenario,
+        context: &mut TestContext<'_>,
+        resources: &DeviceInventory,
+    ) -> Result<Self, TestError> {
         let baseline = settled()?;
-        let mut inventory = devices(if scenario == Scenario::Identity { 2 } else { 1 })?;
+        let mut inventory = devices(
+            resources,
+            if scenario == Scenario::Identity { 2 } else { 1 },
+        )?;
         let device = inventory.remove(0);
         let info = device.info();
         let unit = info.logical_block_size as usize;
@@ -331,6 +344,16 @@ impl Owner {
         if scenario == Scenario::Scratch && (info.readonly || !info.flush) {
             return Err(TestError(
                 "scratch case requires writable device with negotiated FLUSH",
+            ));
+        }
+        if scenario == Scenario::FsScratch && info.readonly {
+            return Err(TestError(
+                "FS write case requires a writable scratch device",
+            ));
+        }
+        if scenario == Scenario::ReadonlyDevice && !info.readonly {
+            return Err(TestError(
+                "readonly device case requires --read-only scratch",
             ));
         }
         let legacy = matches!(device.identity(), VirtioIdentity::Mmio { version: 1, .. });
@@ -424,6 +447,13 @@ impl Owner {
                     | Scenario::ProgressBatch
                     | Scenario::Generation => 2,
                     Scenario::Scratch => 4,
+                    Scenario::FsScratch => {
+                        if info.flush {
+                            6
+                        } else {
+                            5
+                        }
+                    }
                     Scenario::Exact => 0,
                     _ => 1,
                 };
@@ -494,6 +524,18 @@ impl Owner {
                             if ordinal == 3 { 0 } else { unit },
                             0,
                         ),
+                        Scenario::FsScratch => (
+                            if ordinal < 4 {
+                                BlkOperation::Write
+                            } else if ordinal == 4 {
+                                BlkOperation::Read
+                            } else {
+                                BlkOperation::Flush
+                            },
+                            if ordinal == 5 { 0 } else { 2048 },
+                            if ordinal == 5 { 0 } else { unit },
+                            0,
+                        ),
                         Scenario::Model => (
                             BlkOperation::Read,
                             32,
@@ -519,14 +561,16 @@ impl Owner {
                         ),
                         _ => (BlkOperation::Read, 384, unit, 0),
                     };
-                    let end_io = if ordinal == 0
+                    let end_io = if (ordinal == 0
                         && matches!(
                             scenario,
                             Scenario::Callback
                                 | Scenario::Progress
                                 | Scenario::ProgressBatch
                                 | Scenario::Generation
-                        ) {
+                        ))
+                        || (scenario == Scenario::FsScratch && ordinal == 3)
+                    {
                         Some(EndIo::Task(callback))
                     } else {
                         None
@@ -622,6 +666,7 @@ impl Owner {
                 | Scenario::Progress
                 | Scenario::ProgressBatch
                 | Scenario::Generation
+                | Scenario::FsScratch
         ) {
             let mut slot = CALLBACK_OWNER.lock();
             assert!(slot.is_none(), "previous queue callback owner remains");
@@ -653,6 +698,7 @@ impl Owner {
             activation_error,
             legacy,
             fill,
+            claim: None,
             model_live: None,
         })
     }
@@ -1051,8 +1097,8 @@ impl Owner {
     /// 独占 scratch 上 claim 拒写和 Busy stop，释放后实际 Write/Read-back/FLUSH，不写挂载盘。
     fn scratch(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.ready()?;
-        let claim = Disk::claim_readonly(&self.disk)
-            .map_err(|_| TestError("scratch readonly claim failed"))?;
+        let claim = Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
+            .map_err(|_| TestError("scratch RO FS claim failed"))?;
         let before = self.disk.test_snapshot();
         context.expect_eq(self.disk.stop(), Err(BlockError::Busy));
         self.submit(0);
@@ -1069,7 +1115,15 @@ impl Owner {
         self.submit(1);
         self.requests[1].success(context, None)?;
         self.submit(2);
-        let request = &self.requests[2];
+        self.readback(2, context)?;
+        self.submit(3);
+        self.requests[3].success(context, None)?;
+        self.drained()
+    }
+
+    /// 已提交 Read 的全长字节及原页身份逐一验证，拒绝只检查首字节的假读回。
+    fn readback(&self, index: usize, context: &mut TestContext<'_>) -> TestResult {
+        let request = &self.requests[index];
         until("scratch read-back did not complete", || {
             request.completion.is_complete()
         })?;
@@ -1106,9 +1160,128 @@ impl Owner {
             Some(BlockError::Busy),
         );
         drop(memory);
-        self.submit(3);
+        Ok(())
+    }
+
+    /// 合法 FS 写和 raw/RO 拒绝同用生产队列，克隆占用与真实回调尾部分开核验。
+    fn fs_scratch(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.ready()?;
+        let before = self.disk.test_snapshot();
+        let ro = Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
+            .map_err(|_| TestError("scratch RO FS claim failed"))?;
+        self.submit(0);
+        ro.submit_bio(self.requests[1].pending.take().unwrap());
+        for request in &self.requests[..2] {
+            request.reclaim(
+                context,
+                IoResult {
+                    completed: 0,
+                    error: Some(BlockError::ReadOnly),
+                },
+                None,
+            )?;
+        }
+        context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
+        drop(ro);
+        self.claim = Some(
+            Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
+                .map_err(|_| TestError("scratch RW FS claim failed"))?,
+        );
+        let clone = self.claim.as_ref().unwrap().clone();
+        context.expect_eq(self.disk.queue.lock().mounts, 1);
+        drop(clone);
+        context.expect_eq(self.disk.queue.lock().mounts, 1);
+        self.submit(2);
+        self.requests[2].reclaim(
+            context,
+            IoResult {
+                completed: 0,
+                error: Some(BlockError::ReadOnly),
+            },
+            None,
+        )?;
+        context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
+        self.disk.test_suspend_completions();
+        let used = super::tests::used_index(&self.disk, self.legacy);
+        self.claim
+            .as_ref()
+            .unwrap()
+            .submit_bio(self.requests[3].pending.take().unwrap());
+        drop(self.claim.take());
+        self.used(usize::from(used.wrapping_add(1)))?;
+        context.expect_eq(self.disk.queue.lock().mounts, 1);
+        context.expect_eq(self.disk.stop(), Err(BlockError::Busy));
+        self.disk.test_resume_completions();
+        until("FS write callback did not block on the real gate", || {
+            self.observation.callback_blocked()
+        })?;
+        context.expect_eq(self.disk.queue.lock().mounts, 1);
+        context.expect_eq(self.disk.test_snapshot().inflight, 1);
+        context.expect_eq(self.requests[3].completion.is_complete(), false);
+        context.expect_eq(
+            self.requests[3].completion.take_memory().err(),
+            Some(BlockError::Busy),
+        );
+        context.expect_eq(self.disk.stop(), Err(BlockError::Busy));
+        self.observation.gate.complete();
         self.requests[3].success(context, None)?;
-        self.drained()
+        self.drained()?;
+        context.expect_eq(self.disk.queue.lock().mounts, 0);
+        context.expect_eq(self.observation.callback_calls.load(Ordering::Acquire), 1);
+        context.expect_eq(
+            self.observation.callback_valid.load(Ordering::Acquire),
+            true,
+        );
+        context.expect_eq(self.observation.callback_tail.load(Ordering::Acquire), true);
+        self.claim = Some(
+            Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
+                .map_err(|_| TestError("scratch RW FS readback claim failed"))?,
+        );
+        self.claim
+            .as_ref()
+            .unwrap()
+            .submit_bio(self.requests[4].pending.take().unwrap());
+        self.readback(4, context)?;
+        if self.disk.limits().flush {
+            self.claim
+                .as_ref()
+                .unwrap()
+                .submit_bio(self.requests[5].pending.take().unwrap());
+            self.requests[5].success(context, None)?;
+        }
+        self.drained()?;
+        context.diagnostic(format_args!(
+            "FS-claim scratch-sector=2048 bytes={} authorized-write-readback=1 negotiated-FLUSH={} clone-occupancy=1 used-and-callback-tail-retained=1 mount-view-covered=0 file-write-fsync-covered=0",
+            self.requests[4].bytes, self.disk.limits().flush,
+        ));
+        drop(self.claim.take());
+        Ok(())
+    }
+
+    /// 真实协商只读设备拒绝 RW 占用，RO 占用仍可完成实际 Read。
+    fn readonly_device(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.ready()?;
+        context.expect_eq(self.disk.limits().readonly, true);
+        context.expect_eq(
+            Disk::claim_fs(&self.disk, AccessMode::ReadWrite).err(),
+            Some(BlockError::ReadOnly),
+        );
+        context.expect_eq(self.disk.queue.lock().mounts, 0);
+        self.claim = Some(
+            Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
+                .map_err(|_| TestError("readonly device RO FS claim failed"))?,
+        );
+        self.claim
+            .as_ref()
+            .unwrap()
+            .submit_bio(self.requests[0].pending.take().unwrap());
+        self.requests[0].success(context, None)?;
+        self.drained()?;
+        drop(self.claim.take());
+        context.diagnostic(format_args!(
+            "FS-claim negotiated-device-readonly=1 RW-rejected=1 RO-real-read=1"
+        ));
+        Ok(())
     }
 
     /// 原入参所有范围、方向、映射长度、logical、属性和 FLUSH 反例不得发表且不改 dst。
@@ -1397,6 +1570,8 @@ impl Owner {
                 bio.inner.reject(BlockError::QueueStopped);
             }
         }
+        self.drained()?;
+        drop(self.claim.take());
         self.disk
             .stop()
             .map_err(|_| TestError("queue stop cannot safely converge; retaining DMA fixture"))?;
@@ -1413,6 +1588,7 @@ impl Owner {
                 | Scenario::Progress
                 | Scenario::ProgressBatch
                 | Scenario::Generation
+                | Scenario::FsScratch
         ) {
             // 设备 stop 和同域 close 已确认全部 slot/finalizer 原 Work 真尾部，不再查询此槽。
             let locator = CALLBACK_OWNER.lock().take();
@@ -1438,13 +1614,7 @@ impl Owner {
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let baseline = self.baseline;
         drop(self);
-        let mut after = settled()?;
-        until("queue six-domain resources did not return", || {
-            mm::shrink_all();
-            mm::drain_all_pages();
-            after = mm::stats();
-            after == baseline
-        })?;
+        let after = settled()?;
         context.expect_eq(after, baseline);
         context.diagnostic(format_args!("queue-resources six-domains-before={:?} six-domains-after={:?} real-stop-join-cleanup=1", baseline, after));
         Ok(())
@@ -1462,10 +1632,13 @@ enum Ledger {
 macro_rules! fixture {
     ($name:ident, $scenario:ident) => {
         struct $name(Owner);
-        impl Fixture<()> for $name {
-            /// 本实例新建独占真实库存、域、原页和固定限额，不依赖 case 顺序。
-            fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
-                Owner::prepare(Scenario::$scenario, context).map(Self)
+        impl Fixture<DeviceInventory> for $name {
+            /// 每例借一次库存独立准备真实域、原页与限额，不重复扫描设备。
+            fn set_up(
+                context: &mut TestContext<'_>,
+                resources: &DeviceInventory,
+            ) -> Result<Self, TestError> {
+                Owner::prepare(Scenario::$scenario, context, resources).map(Self)
             }
             /// 具体 fixture 真实停源并 join，失败由现成 typed case-abort 保住原 owner。
             fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
@@ -1496,8 +1669,10 @@ fixture!(Progress, Progress);
 fixture!(ProgressBatch, ProgressBatch);
 fixture!(Generation, Generation);
 fixture!(Stopped, Stopped);
+fixture!(FsScratch, FsScratch);
+fixture!(ReadonlyDevice, ReadonlyDevice);
 
-#[ktest::suite(fixture = Multi, context = "Thread", min_cpus = 2, tags("block", "B04", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Multi, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "B04", "T5"), resources("root"), timeout_ms = 15000)]
 mod multi {
     use super::*;
     /// 八个真实不同 Task 各读两页不同 sector，保原页并证明实际 peak 多在途。
@@ -1509,7 +1684,7 @@ mod multi {
         fixture.0.multi(context)
     }
 }
-#[ktest::suite(fixture = Tag, context = "Thread", min_cpus = 2, tags("block", "B07", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Tag, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "B07", "T5"), resources("root"), timeout_ms = 15000)]
 mod tags {
     use super::*;
     /// 真 tag 耗尽、kick、生产 Blocked 与 used 唤醒。
@@ -1521,7 +1696,7 @@ mod tags {
         fixture.0.pressure(context)
     }
 }
-#[ktest::suite(fixture = Descriptor, context = "Thread", min_cpus = 2, tags("block", "B07", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Descriptor, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "B07", "T5"), resources("root"), timeout_ms = 15000)]
 mod descriptors {
     use super::*;
     /// 固定四 SG 请求在 tag 未满时耗尽真实 descriptor。
@@ -1533,7 +1708,7 @@ mod descriptors {
         fixture.0.pressure(context)
     }
 }
-#[ktest::suite(fixture = Rearm, context = "Thread", tags("block", "B08", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Rearm, suite_resources = DeviceInventory, context = "Thread", tags("block", "B08", "T5"), resources("root"), timeout_ms = 15000)]
 mod interrupts {
     use super::*;
     /// flags 禁中断、重装复查和实际超过生产预算的真实 used 续行。
@@ -1545,7 +1720,7 @@ mod interrupts {
         fixture.0.rearm(context)
     }
 }
-#[ktest::suite(fixture = Split, context = "Thread", tags("block", "B05", "B06", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Split, suite_resources = DeviceInventory, context = "Thread", tags("block", "B05", "B06", "T5"), resources("root"), timeout_ms = 15000)]
 mod scatter {
     use super::*;
     /// 三独立原页沿真实限额 split，所有 child 后统一父 ready。
@@ -1557,7 +1732,7 @@ mod scatter {
         fixture.0.split(context)
     }
 }
-#[ktest::suite(fixture = Merge, context = "Thread", tags("block", "B09", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Merge, suite_resources = DeviceInventory, context = "Thread", tags("block", "B09", "T5"), resources("root"), timeout_ms = 15000)]
 mod merge {
     use super::*;
     /// 同 batch 三父只发一个真实 request，每父原页独立归还。
@@ -1566,7 +1741,7 @@ mod merge {
         fixture.0.batch(context)
     }
 }
-#[ktest::suite(fixture = Notify, context = "Thread", tags("block", "B09", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Notify, suite_resources = DeviceInventory, context = "Thread", tags("block", "B09", "T5"), resources("root"), timeout_ms = 15000)]
 mod notify {
     use super::*;
     /// 非相邻三个 request 的显式 batch 只 unplug 一次。
@@ -1578,7 +1753,7 @@ mod notify {
         fixture.0.batch(context)
     }
 }
-#[ktest::suite(fixture = Tail, context = "Thread", tags("block", "B09", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Tail, suite_resources = DeviceInventory, context = "Thread", tags("block", "B09", "T5"), resources("root"), timeout_ms = 15000)]
 mod tail {
     use super::*;
     /// DMA boundary 无合法尾 logical block 时首父仍真实 unplug 完成。
@@ -1590,7 +1765,7 @@ mod tail {
         fixture.0.batch(context)
     }
 }
-#[ktest::suite(fixture = Callback, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Callback, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]
 mod callbacks {
     use super::*;
     /// Task 回调真 Blocked 保槽与父，放 gate 后原尾部归权。
@@ -1602,19 +1777,19 @@ mod callbacks {
         fixture.0.callback_tail(context)
     }
 }
-#[ktest::suite(fixture = Scratch, context = "Thread", tags("block", "B10", "T5"), resources("scratch"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Scratch, suite_resources = DeviceInventory, context = "Thread", tags("block", "B10", "T5"), resources("scratch"), timeout_ms = 15000)]
 mod scratch {
     use super::*;
     /// 不借根盘写入：独占 scratch 的 claim 拒写、Busy stop、释放后真写读与 FLUSH。
     #[test]
-    fn readonly_claim_write_readback_flush(
+    fn ro_fs_claim_then_unclaimed_raw_write_readback_flush(
         context: &mut TestContext<'_>,
         fixture: &mut Scratch,
     ) -> TestResult {
         fixture.0.scratch(context)
     }
 }
-#[ktest::suite(fixture = Entry, context = "Thread", tags("block", "entry", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Entry, suite_resources = DeviceInventory, context = "Thread", tags("block", "entry", "T5"), resources("root"), timeout_ms = 15000)]
 mod entry {
     use super::*;
     /// 非法范围/映射方向/长度/logical/属性/FLUSH 不发表且 dst 保持原值。
@@ -1626,7 +1801,7 @@ mod entry {
         fixture.0.entry(context)
     }
 }
-#[ktest::suite(fixture = Identity, context = "Thread", tags("block", "entry", "T5"), resources("root", "extra"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Identity, suite_resources = DeviceInventory, context = "Thread", tags("block", "entry", "T5"), resources("root", "extra"), timeout_ms = 15000)]
 mod identity {
     use super::*;
     /// 真双设备的错 identity Bio 拒绝且原页只归还一次。
@@ -1638,7 +1813,7 @@ mod identity {
         fixture.0.identity(context)
     }
 }
-#[ktest::suite(fixture = Exact, context = "Thread", tags("block", "read-exact", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Exact, suite_resources = DeviceInventory, context = "Thread", tags("block", "read-exact", "T5"), resources("root"), timeout_ms = 15000)]
 mod exact {
     use super::*;
     /// 普通逻辑块含 4K 的不同 sector 必须实际读取非零不同完整图样。
@@ -1650,7 +1825,7 @@ mod exact {
         fixture.0.exact(context)
     }
 }
-#[ktest::suite(fixture = Model, context = "Thread", isolation = "Case", tags("block", "controlled-ledger", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Model, suite_resources = DeviceInventory, context = "Thread", isolation = "Case", tags("block", "controlled-ledger", "T5"), resources("root"), timeout_ms = 15000)]
 mod ledger {
     use super::*;
     /// 受控 child 顺序与生成尾部仅证明账本，不宣称硬件反序成功。
@@ -1667,7 +1842,7 @@ mod ledger {
         fixture.0.model(context, mode)
     }
 }
-#[ktest::suite(fixture = Progress, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Progress, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]
 mod progress {
     use super::*;
     /// 非 batch 两个真实 used 的 progress Work 必须让 peer 完成而不被 A 回调阻断。
@@ -1679,7 +1854,7 @@ mod progress {
         fixture.0.peer(context)
     }
 }
-#[ktest::suite(fixture = ProgressBatch, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = ProgressBatch, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]
 mod progress_batch {
     use super::*;
     /// 同 batch 的 Task peer 父不能错误 merge 导致槽完成依赖死锁。
@@ -1691,7 +1866,7 @@ mod progress_batch {
         fixture.0.peer(context)
     }
 }
-#[ktest::suite(fixture = Generation, context = "Thread", min_cpus = 2, tags("block", "controlled-ledger", "callback", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Generation, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "controlled-ledger", "callback", "T5"), resources("root"), timeout_ms = 15000)]
 mod generation {
     use super::*;
     /// child 先结束的 generation-peer 只控制未发表账本，真实 reserved finalizer 不阻断 B。
@@ -1703,7 +1878,7 @@ mod generation {
         fixture.0.peer(context)
     }
 }
-#[ktest::suite(fixture = Stopped, context = "Thread", tags("block", "stop", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Stopped, suite_resources = DeviceInventory, context = "Thread", tags("block", "stop", "T5"), resources("root"), timeout_ms = 15000)]
 mod stopped {
     use super::*;
     /// 实际停止后拒新 admission 且 repeat stop 不重放。
@@ -1713,5 +1888,33 @@ mod stopped {
         fixture: &mut Stopped,
     ) -> TestResult {
         fixture.0.stopped(context)
+    }
+}
+
+#[ktest::suite(fixture = FsScratch, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2,
+    tags("block", "FS-claim"), resources("scratch"), timeout_ms = 15000)]
+mod fs_claim {
+    use super::*;
+    /// scratch 的真实 FS 授权写、完整读回与协商 FLUSH；活回调持占用至真实尾部。
+    #[test]
+    fn authorized_write_readback_and_callback_tail(
+        context: &mut TestContext<'_>,
+        fixture: &mut FsScratch,
+    ) -> TestResult {
+        fixture.0.fs_scratch(context)
+    }
+}
+
+#[ktest::suite(fixture = ReadonlyDevice, suite_resources = DeviceInventory, context = "Thread",
+    tags("block", "FS-claim"), resources("scratch"), timeout_ms = 15000)]
+mod readonly_device {
+    use super::*;
+    /// 参数必须使设备真实协商 RO，不替换生产 capability 或伪造 limits。
+    #[test]
+    fn negotiated_ro_rejects_rw_claim(
+        context: &mut TestContext<'_>,
+        fixture: &mut ReadonlyDevice,
+    ) -> TestResult {
+        fixture.0.readonly_device(context)
     }
 }

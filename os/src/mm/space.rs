@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
+use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::{self, UserAccess};
@@ -1008,15 +1009,31 @@ fn prepare_backing(
     if let Some(backing) = &source.backing {
         // ponytail: 私有 COW 总复制一页；有实际映射独占证明后才考虑原页复用。
         let page = AnonPageRef::try_new().ok_or(VmError::NoMemory)?;
-        // SAFETY: source 克隆保活完整初始化原页，旧 COW 叶无硬件写权限；原始汇编允许
-        // 用户并发原始访问，不建立引用。新页尚未映射，独占初始化，两页物理范围不重叠。
-        unsafe {
-            arch::copy_user_bytes(
-                page.direct_address() as *mut u8,
-                arch::phys_to_virt(backing.physical()) as *const u8,
-                PAGE_SIZE,
-            )
-        };
+        match backing {
+            ResidentBacking::Anonymous(source) => {
+                // SAFETY: source 克隆保活完整初始化原页，旧 COW 叶无硬件写权限；
+                // 原始汇编不建立源引用。新匿名页尚未映射或共享，独占接收复制，
+                // 原页仍被 source 持有，分配器返回的新页与其物理范围不重叠。
+                unsafe {
+                    arch::copy_user_bytes(
+                        page.direct_address() as *mut u8,
+                        source.direct_address() as *const u8,
+                        PAGE_SIZE,
+                    )
+                };
+            }
+            ResidentBacking::File(folio) => {
+                // SAFETY: 新匿名页已完整清零，只有本地 page 引用且尚未映射或交给设备；
+                // folio 保活另一张真实原页，分配器不能返回仍被持有的源页。
+                // 短切片只独占匿名目标，copy_to 从已初始化源原始读取，不形成源切片。
+                let dst = unsafe {
+                    slice::from_raw_parts_mut(page.direct_address() as *mut u8, PAGE_SIZE)
+                };
+                folio
+                    .copy_to(0, dst)
+                    .map_err(|error| VmError::File(error.into()))?;
+            }
+        }
         return Ok((ResidentBacking::Anonymous(page), false));
     }
     match &source.vma.backing {
@@ -1051,23 +1068,18 @@ fn prepare_backing(
                 .map_err(VmError::File)?;
             if valid == PAGE_SIZE && access != UserAccess::Write {
                 folio
-                    .with_bytes(0, PAGE_SIZE, |_| ())
+                    .lock_content()
+                    .range_ready(0, PAGE_SIZE)
                     .map_err(|error| VmError::File(error.into()))?;
                 return Ok((ResidentBacking::File(folio), *private));
             }
             let page = AnonPageRef::try_new().ok_or(VmError::NoMemory)?;
+            // SAFETY: 新匿名页已完整清零，只有本地 page 引用，尚无映射、设备或其他访问；
+            // valid 不超过 PAGE_SIZE，folio 保活源原页，分配器返回的目标与其不重叠。
+            // 仅匿名目标形成短独占切片，copy_to 原始读取有效前缀，目标尾部保留零初始化。
+            let dst = unsafe { slice::from_raw_parts_mut(page.direct_address() as *mut u8, valid) };
             folio
-                .with_bytes(0, valid, |bytes| {
-                    // SAFETY: folio 完成后只读且本引用保活，bytes 已检查完整成功初始化范围；
-                    // 新匿名页清零且尚未映射，独占初始化，两个真实原页不重叠。
-                    unsafe {
-                        arch::copy_user_bytes(
-                            page.direct_address() as *mut u8,
-                            bytes.as_ptr(),
-                            bytes.len(),
-                        )
-                    };
-                })
+                .copy_to(0, dst)
                 .map_err(|error| VmError::File(error.into()))?;
             Ok((ResidentBacking::Anonymous(page), false))
         }

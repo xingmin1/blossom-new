@@ -4,7 +4,8 @@ use alloc::vec::Vec;
 
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, INDEX, METADATA_CSUM};
-use crate::fs::ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind};
+use crate::fs::ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeKind};
+use crate::fs::inode::InodeMetadata;
 use crate::fs::FsError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,7 +25,7 @@ struct Record {
 }
 
 /// 检查目录类型及完整块大小，避免将不完整尾块解释成目录项。
-fn check_directory(volume: &Ext4Volume, inode: &InodeData) -> Result<(), FsError> {
+fn check_directory(volume: &Ext4Volume, inode: &InodeMetadata) -> Result<(), FsError> {
     if inode.kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
@@ -40,10 +41,11 @@ fn check_directory(volume: &Ext4Volume, inode: &InodeData) -> Result<(), FsError
 /// 读取一个真实目录块，空洞或未写入块不能充当空目录。
 fn directory_block(
     volume: &Ext4Volume,
-    inode: &InodeData,
+    inode: &InodeMetadata,
+    map_root: &[u8; 60],
     logical: u64,
 ) -> Result<BufferRef, FsError> {
-    let physical = match volume.map_block(inode, logical)? {
+    let physical = match volume.map_block(inode, map_root, logical)? {
         BlockMapping::Mapped { physical, .. } => physical,
         _ => return Err(FsError::Corrupt),
     };
@@ -52,13 +54,18 @@ fn directory_block(
 
 /// 从根的真实索引引用判定节点角色，空叶块不能靠记录长度被误判成 dx 节点。
 // ponytail: 极深目录每块重扫有限索引节点；实际吞吐受限时由目录游标保存遍历位置。
-fn index_block(volume: &Ext4Volume, inode: &InodeData, target: u64) -> Result<bool, FsError> {
+fn index_block(
+    volume: &Ext4Volume,
+    inode: &InodeMetadata,
+    map_root: &[u8; 60],
+    target: u64,
+) -> Result<bool, FsError> {
     if inode.flags & INDEX == 0 || target == 0 {
         return Ok(false);
     }
     let g = volume.geometry();
-    let root = directory_block(volume, inode, 0)?;
-    let (levels, count) = root.with_bytes(|data| {
+    let root = directory_block(volume, inode, map_root, 0)?;
+    let (levels, count) = root.with_read(|data| {
         codec::verify_directory(g, inode, 0, data, false)?;
         Ok::<_, FsError>((data[30], usize::from(codec::le16(data, 34)?)))
     })??;
@@ -66,15 +73,15 @@ fn index_block(volume: &Ext4Volume, inode: &InodeData, target: u64) -> Result<bo
         return Ok(false);
     }
     for index in 0..count {
-        let child = root.with_bytes(|data| {
+        let child = root.with_read(|data| {
             codec::le32(data, 36 + index * 8).map(|value| u64::from(value & 0x0fff_ffff))
         })??;
         if child == target {
             return Ok(true);
         }
         if levels == 2 {
-            let node = directory_block(volume, inode, child)?;
-            let found = node.with_bytes(|data| {
+            let node = directory_block(volume, inode, map_root, child)?;
+            let found = node.with_read(|data| {
                 codec::verify_directory(g, inode, child, data, true)?;
                 let count = usize::from(codec::le16(data, 10)?);
                 for index in 0..count {
@@ -96,7 +103,7 @@ fn index_block(volume: &Ext4Volume, inode: &InodeData, target: u64) -> Result<bo
 /// 验证普通目录尾或 dx 根/节点及其正式校验范围，返回可枚举区域。
 pub(crate) fn verify_directory(
     g: &Geometry,
-    inode: &InodeData,
+    inode: &InodeMetadata,
     logical: u64,
     data: &[u8],
     index: bool,
@@ -154,7 +161,7 @@ pub(crate) fn verify_directory(
 /// 验证 dx 布局、条目排序与逻辑块地址，CRC 不包含未使用索引槽。
 fn verify_dx(
     g: &Geometry,
-    inode: &InodeData,
+    inode: &InodeMetadata,
     logical: u64,
     data: &[u8],
     root: bool,
@@ -311,7 +318,8 @@ fn scan_next(
 /// 在每个块的校验完成之后比较借用的名称，查找不创建目录项 Vec。
 pub(crate) fn lookup(
     volume: &Ext4Volume,
-    inode: &InodeData,
+    inode: &InodeMetadata,
+    map_root: &[u8; 60],
     name: &[u8],
 ) -> Result<Option<u64>, FsError> {
     check_directory(volume, inode)?;
@@ -320,9 +328,9 @@ pub(crate) fn lookup(
     }
     let g = volume.geometry();
     for logical in 0..inode.size / g.block_size as u64 {
-        let buffer = directory_block(volume, inode, logical)?;
-        let index = index_block(volume, inode, logical)?;
-        let found = buffer.with_bytes(|data| {
+        let buffer = directory_block(volume, inode, map_root, logical)?;
+        let index = index_block(volume, inode, map_root, logical)?;
+        let found = buffer.with_read(|data| {
             let layout = codec::verify_directory(g, inode, logical, data, index)?;
             if layout == DirectoryLayout::Index {
                 return Ok(None);
@@ -353,7 +361,8 @@ pub(crate) fn lookup(
 /// 枚举可拥有的下一记录，名称只进行一次 fallible 预留和一次复制。
 pub(crate) fn next(
     volume: &Ext4Volume,
-    inode: &InodeData,
+    inode: &InodeMetadata,
+    map_root: &[u8; 60],
     mut offset: u64,
 ) -> Result<Option<DirectoryEntry>, FsError> {
     check_directory(volume, inode)?;
@@ -361,9 +370,9 @@ pub(crate) fn next(
     while offset < inode.size {
         let logical = offset / g.block_size as u64;
         let base = logical * g.block_size as u64;
-        let buffer = directory_block(volume, inode, logical)?;
-        let index = index_block(volume, inode, logical)?;
-        let entry = buffer.with_bytes(|data| {
+        let buffer = directory_block(volume, inode, map_root, logical)?;
+        let index = index_block(volume, inode, map_root, logical)?;
+        let entry = buffer.with_read(|data| {
             let layout = codec::verify_directory(g, inode, logical, data, index)?;
             scan_next(g, data, layout, (offset - base) as usize)
         })??;
@@ -371,7 +380,7 @@ pub(crate) fn next(
             let mut name = Vec::new();
             name.try_reserve_exact(entry.name_len)
                 .map_err(|_| FsError::NoMemory)?;
-            buffer.with_bytes(|data| {
+            buffer.with_read(|data| {
                 name.extend_from_slice(&data[entry.name_offset..entry.name_offset + entry.name_len])
             })?;
             return Ok(Some(DirectoryEntry {

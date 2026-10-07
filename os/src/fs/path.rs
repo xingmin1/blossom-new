@@ -4,6 +4,7 @@ use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::block::AccessMode;
 use crate::fs::{DentryCache, DentryRef, Ext4Volume, FsError, InodeCache, InodeKind, InodeRef};
 use crate::sync::SpinLock;
 
@@ -24,6 +25,7 @@ pub struct Path {
 /// 子挂载只保活父视图，父挂载不反持子挂载；登记表负责向下取得引用。
 struct Mount {
     volume: Arc<Ext4Volume>,
+    mode: AccessMode,
     root: DentryRef,
     covered: Option<Path>,
 }
@@ -66,15 +68,15 @@ impl Path {
         &self.mount.volume
     }
 
-    /// 按真实 owner/group/other mode 检查最终访问，写操作始终受只读卷约束。
+    /// 先检查挂载、卷与设备写能力，再按当前 canonical owner/group/other mode 检查访问。
     pub fn check_access(&self, uid: u32, gid: u32, mask: u16) -> Result<(), FsError> {
         if mask & !7 != 0 {
             return Err(FsError::InvalidOperation);
         }
         if mask & 2 != 0 {
-            return Err(FsError::ReadOnly);
+            self.check_writable()?;
         }
-        let data = self.inode()?.metadata()?;
+        let data = self.inode()?.metadata_snapshot()?;
         if uid == 0 {
             if mask & 1 != 0 && data.kind != InodeKind::Directory && data.mode & 0o111 == 0 {
                 return Err(FsError::Permission);
@@ -93,6 +95,18 @@ impl Path {
         } else {
             Err(FsError::Permission)
         }
+    }
+
+    /// 检查此路径的独立挂载写能力；不读取 inode 属性，也不授予尚未实现的文件操作。
+    pub(crate) fn check_writable(&self) -> Result<(), FsError> {
+        let volume = &self.mount.volume;
+        if self.mount.mode != AccessMode::ReadWrite
+            || volume.mode() != AccessMode::ReadWrite
+            || volume.disk().limits().readonly
+        {
+            return Err(FsError::ReadOnly);
+        }
+        Ok(())
     }
 
     /// 返回一个真实祖先边；挂载根的上一个位置是父视图覆盖点。
@@ -153,15 +167,19 @@ impl FsContext {
 }
 
 impl Vfs {
-    /// 锁外取得 inode 2 和根名字，预留包含根挂载在内的全部有限登记槽。
+    /// 按明确挂载模式锁外取得 inode 2 和根名字，预留包含根挂载的全部有限登记槽。
     pub fn try_new(
         volume: Arc<Ext4Volume>,
         inodes: Arc<InodeCache>,
         dentry_capacity: usize,
         mount_capacity: usize,
+        root_mode: AccessMode,
     ) -> Result<Self, FsError> {
         if mount_capacity == 0 {
             return Err(FsError::InvalidOperation);
+        }
+        if root_mode == AccessMode::ReadWrite && volume.mode() != AccessMode::ReadWrite {
+            return Err(FsError::ReadOnly);
         }
         let dcache = DentryCache::try_new(dentry_capacity)?;
         let mut mounts = Vec::new();
@@ -171,6 +189,7 @@ impl Vfs {
         let root = DentryRef::try_root(inodes.iget(&volume, 2)?)?;
         let mount = Arc::try_new(Mount {
             volume,
+            mode: root_mode,
             root,
             covered: None,
         })
@@ -277,7 +296,7 @@ impl Vfs {
                 dentry,
             });
             let inode = next.inode()?;
-            let follow = inode.metadata()?.kind == InodeKind::Symlink
+            let follow = inode.metadata_snapshot()?.kind == InodeKind::Symlink
                 && (mode == ResolveMode::Follow || end < pending.len());
             if follow {
                 if links == 40 {
@@ -304,9 +323,17 @@ impl Vfs {
         Ok(current)
     }
 
-    /// 在父视图真实目录下挂入只读卷，准备与 inode I/O 在表锁外，发表时双查。
-    pub fn mount(&self, covered: &Path, volume: Arc<Ext4Volume>) -> Result<(), FsError> {
+    /// 按独立模式在父视图目录下挂入卷，准备与 inode I/O 在表锁外，发表时双查。
+    pub fn mount(
+        &self,
+        covered: &Path,
+        volume: Arc<Ext4Volume>,
+        mode: AccessMode,
+    ) -> Result<(), FsError> {
         require_directory(covered)?;
+        if mode == AccessMode::ReadWrite && volume.mode() != AccessMode::ReadWrite {
+            return Err(FsError::ReadOnly);
+        }
         {
             let mounts = self.mounts.lock();
             self.check_mount(&mounts, covered, &volume)?;
@@ -314,6 +341,7 @@ impl Vfs {
         let root = DentryRef::try_root(self.inodes.iget(&volume, 2)?)?;
         let candidate = Arc::try_new(Mount {
             volume,
+            mode,
             root,
             covered: Some(covered.clone()),
         })
@@ -363,7 +391,7 @@ impl Vfs {
         Ok(())
     }
 
-    /// 只回收无人使用的静止缓存；页与 I/O 自己的拥有者仍保活卷和只读声明。
+    /// 只回收无人使用的静止缓存；页与 I/O 自己的拥有者仍保活卷和文件系统占用。
     pub fn prune_unused(&self) -> usize {
         let mut removed = self.dcache.prune_unused() + self.inodes.prune_unused();
         let count = self.mounts.lock().len();
@@ -430,7 +458,7 @@ impl Vfs {
 
 /// 只接受实际正目录，缓存命中和点组件都不能绕过类型检查。
 fn require_directory(path: &Path) -> Result<(), FsError> {
-    if path.inode()?.metadata()?.kind == InodeKind::Directory {
+    if path.inode()?.metadata_snapshot()?.kind == InodeKind::Directory {
         Ok(())
     } else {
         Err(FsError::NotDirectory)
