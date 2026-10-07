@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::{self, UserAccess};
 use crate::cpu;
-use crate::fs::{FileRef, FsError, InodeKind};
+use crate::fs::{ExecAccess, FileRef, FsError, InodeKind};
 use crate::mm::anon::SharedAnon;
 use crate::mm::user_table::{
     Mapping, PagePermissions, PageTableError, PreparedTables, RetiredTables, UserPageTable,
@@ -219,6 +219,8 @@ pub struct Mm {
     table: SpinLock<PteState>,
     mmap: SleepRwLock<MmapState>,
     users: AtomicUsize,
+    /// 原执行文件与写排斥保留到此 Mm 最后实际拥有结束，普通私有映射不取得责任。
+    executable: Option<(FileRef, ExecAccess)>,
 }
 
 /// 一份真实用户线程地址空间绑定；页表、CPU 和 futex key 的 Arc 不参与计数。
@@ -399,7 +401,14 @@ impl Mm {
             }),
             mmap: SleepRwLock::new(MmapState::default()),
             users: AtomicUsize::new(0),
+            executable: None,
         })
+    }
+
+    /// 未发表 Mm 接受原执行文件及其写排斥，后续错误由 Mm 正常析构归还。
+    pub(crate) fn bind_executable(&mut self, file: FileRef, access: ExecAccess) {
+        assert!(self.executable.is_none(), "MM executable already bound");
+        self.executable = Some((file, access));
     }
 
     /// 返回真实用户线程绑定数，不包含 CPU、诊断或同步 key 的拥有引用。
@@ -775,9 +784,10 @@ impl Mm {
         Ok(Some(result))
     }
 
-    /// 新 Mm 未发表前完成全部 fallible 准备，父私有写保护与全在线失效结束后才返回。
+    /// 子 Mm 继承原执行文件排斥，全部 fallible 准备和父 COW/TLB 结束后才返回。
     pub fn fork(&self) -> Result<Self, VmError> {
-        let child = Self::try_new()?;
+        let mut child = Self::try_new()?;
+        child.executable = self.executable.clone();
         let mmap = self.mmap.write();
         let snapshot = mmap.snapshot()?;
         let addresses = self.resident_addresses(&(0..arch::USER_ADDRESS_END))?;
@@ -1000,7 +1010,7 @@ fn prepare_fault(
     Ok((page, tables))
 }
 
-/// 锁外按具体源准备新页；COW 总复制，不用真实引用数快照推断映射独占性。
+/// 锁外准备具体驻留拥有；共享文件尾页保 canonical folio，私有 COW 不按引用数猜独占性。
 fn prepare_backing(
     source: &FaultSource,
     base: usize,
@@ -1066,7 +1076,7 @@ fn prepare_backing(
             let folio = file
                 .file_page(offset / PAGE_SIZE as u64)
                 .map_err(VmError::File)?;
-            if valid == PAGE_SIZE && access != UserAccess::Write {
+            if (!*private || valid == PAGE_SIZE) && access != UserAccess::Write {
                 folio
                     .lock_content()
                     .range_ready(0, PAGE_SIZE)
@@ -1086,7 +1096,7 @@ fn prepare_backing(
     }
 }
 
-/// 统一内核及用户映射的只读文件边界，属性 I/O 始终在 mmap/PTE 锁外完成。
+/// 文件映射先核 OFD 读取能力；属性 I/O 在 mmap/PTE 锁外，共享写仍明确拒绝。
 fn check_file(
     file: &FileRef,
     offset: u64,
@@ -1095,6 +1105,9 @@ fn check_file(
     permissions: PagePermissions,
     maximum: PagePermissions,
 ) -> Result<(), VmError> {
+    if file.flags() & 3 == 1 {
+        return Err(VmError::File(FsError::BadFd));
+    }
     if offset & (PAGE_SIZE as u64 - 1) != 0 || offset.checked_add(length as u64).is_none() {
         return Err(VmError::InvalidRange);
     }

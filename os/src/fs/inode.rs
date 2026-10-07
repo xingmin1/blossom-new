@@ -11,11 +11,14 @@ use spin::Once;
 
 use crate::block::{AccessMode, FsClaim};
 use crate::cache::FileMapping;
-use crate::fs::ext4::{BlockMapping, DirectoryEntry, Ext4Volume, InodeData, InodeKind, InodeTime};
-use crate::fs::{FsError, ReadBuffer};
+use crate::fs::ext4::{
+    codec, BlockMapping, DirectoryEntry, Ext4Volume, InodeData, InodeKind, InodeTime,
+};
+use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::sched;
 use crate::sync::{SleepMutex, SleepRwLock, SpinLock};
+use crate::time;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
 #[cfg(feature = "ktest")]
@@ -75,6 +78,7 @@ struct InodeState {
     write: SleepMutex<()>,
     metadata: SpinLock<InodeMetadata>,
     root: SleepRwLock<[u8; 60]>,
+    writecount: SpinLock<isize>,
 }
 
 impl InodeMetadata {
@@ -133,7 +137,61 @@ impl InodeState {
             write: SleepMutex::new(()),
             metadata: SpinLock::new(InodeMetadata::from_data(&data)),
             root: SleepRwLock::new(data.block),
+            writecount: SpinLock::new(0),
         }
+    }
+}
+
+/// 真正写打开持有的 inode 责任；dup 共享 OFD 不复制本 token。
+pub struct WriteAccess {
+    inode: InodeRef,
+}
+
+/// 每个活执行地址空间保有独立 deny 责任，最后实际映像使用结束才释放。
+pub struct ExecAccess {
+    inode: InodeRef,
+}
+
+impl WriteAccess {
+    /// 写能力始终绑定取得时的 canonical inode，不能借给其他文件。
+    pub fn write_from(
+        &self,
+        claim: &FsClaim,
+        offset: u64,
+        append: bool,
+        source: &mut WriteBuffer<'_>,
+    ) -> Result<(u64, usize), FsError> {
+        self.inode.write_from(claim, offset, append, source)
+    }
+}
+
+impl Drop for WriteAccess {
+    /// 只归还原 inode 的一次写拥有，计数短锁内不分配或等待。
+    fn drop(&mut self) {
+        let mut count = self.inode.loaded_state().writecount.lock();
+        assert!(0 < *count, "write access count lost");
+        *count -= 1;
+    }
+}
+
+impl Clone for ExecAccess {
+    /// fork 增加同 inode 的独立映像拥有，活 deny 期间不可能出现正写计数。
+    fn clone(&self) -> Self {
+        let mut count = self.inode.loaded_state().writecount.lock();
+        assert!(*count < 0, "exec access count lost");
+        *count = count.checked_sub(1).expect("exec access count overflow");
+        Self {
+            inode: self.inode.clone(),
+        }
+    }
+}
+
+impl Drop for ExecAccess {
+    /// 地址空间最后退出时归还本次 deny，不能替其他映像释放。
+    fn drop(&mut self) {
+        let mut count = self.inode.loaded_state().writecount.lock();
+        assert!(*count < 0, "exec access count lost");
+        *count += 1;
     }
 }
 
@@ -361,6 +419,180 @@ impl InodeRef {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// 同一短计数锁线性化写打开与 exec deny；失败不改变原拥有。
+    pub fn acquire_write(&self) -> Result<WriteAccess, FsError> {
+        let state = self.wait_loaded()?;
+        let mut count = state.writecount.lock();
+        if *count < 0 {
+            return Err(FsError::TextBusy);
+        }
+        *count = count.checked_add(1).expect("write access count overflow");
+        Ok(WriteAccess {
+            inode: self.clone(),
+        })
+    }
+
+    /// 第一次映像读取前取得 deny，任何真正写 owner 活时明确 TextBusy。
+    pub fn deny_writes(&self) -> Result<ExecAccess, FsError> {
+        let state = self.wait_loaded()?;
+        let mut count = state.writecount.lock();
+        if 0 < *count {
+            return Err(FsError::TextBusy);
+        }
+        *count = count.checked_sub(1).expect("exec access count overflow");
+        Ok(ExecAccess {
+            inode: self.clone(),
+        })
+    }
+
+    /// 唯一普通写循环只由绑定本 inode 的 WriteAccess 调用；输入 fault 不持块根或内容锁。
+    fn write_from(
+        &self,
+        claim: &FsClaim,
+        offset: u64,
+        append: bool,
+        source: &mut WriteBuffer<'_>,
+    ) -> Result<(u64, usize), FsError> {
+        self.filesystem.require_write(claim)?;
+        let state = self.wait_loaded()?;
+        let _write = state.write.lock();
+        let initial = *state.metadata.lock();
+        if initial.kind == InodeKind::Directory {
+            return Err(FsError::IsDirectory);
+        }
+        if initial.kind != InodeKind::Regular {
+            return Err(FsError::InvalidOperation);
+        }
+        let start = if append { initial.size } else { offset };
+        let limit = write_limit(self.filesystem.geometry(), initial.flags);
+        let remaining = source.len() - source.copied();
+        let mut accepted = 0usize;
+        let mut input = [0u8; 512];
+        while accepted < remaining {
+            let position = match start.checked_add(accepted as u64) {
+                Some(position) if position < limit => position,
+                _ => return write_result(start, accepted, FsError::FileTooLarge),
+            };
+            let size = self.filesystem.geometry().block_size;
+            let count = (remaining - accepted)
+                .min(input.len())
+                .min(size - (position % size as u64) as usize)
+                .min((limit - position) as usize);
+            let pulled = match source.pull(&mut input[..count]) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) => return write_result(start, accepted, error),
+            };
+            let old = *state.metadata.lock();
+            if old.size < position {
+                if let Err(error) = self.zero_eof_tail(&old, position) {
+                    return write_result(start, accepted, error);
+                }
+            }
+            let (record, record_offset) = match self.filesystem.inode_record(old.number) {
+                Ok(record) => record,
+                Err(error) => return write_result(start, accepted, error),
+            };
+            let prepared = {
+                let root = state.root.write();
+                let current = record.with_read(|bytes| {
+                    crate::fs::ext4::codec::decode_inode(
+                        self.filesystem.geometry(),
+                        old.number,
+                        &bytes
+                            [record_offset..record_offset + self.filesystem.geometry().inode_size],
+                    )
+                });
+                let valid = match current {
+                    Ok(Ok(current))
+                        if InodeMetadata::from_data(&current) == old && current.block == *root =>
+                    {
+                        Ok(())
+                    }
+                    Ok(Ok(_)) => Err(FsError::Corrupt),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(error.into()),
+                };
+                if let Err(error) = valid {
+                    return write_result(start, accepted, error);
+                }
+                self.filesystem
+                    .prepare_write(&old, &root, position / size as u64)
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return write_result(start, accepted, error),
+            };
+            let next = match write_metadata(
+                self.filesystem.geometry(),
+                &old,
+                position,
+                pulled,
+                prepared.added_blocks,
+                prepared.removed_blocks,
+                time::now().as_nanos(),
+            ) {
+                Ok(next) => next,
+                Err(error) => {
+                    prepared.cancel(&self.filesystem);
+                    return write_result(start, accepted, error);
+                }
+            };
+            // 尚未发表的映射保持旧根；filefault 可取得读侧完成目的页初始化。
+            let folio = match self.read_page(position / PAGE_SIZE as u64) {
+                Ok(folio) => folio,
+                Err(error) => {
+                    prepared.cancel(&self.filesystem);
+                    return write_result(start, accepted, error);
+                }
+            };
+            let mut root = state.root.write();
+            let mut content = folio.lock_content();
+            let block_offset = ((position / size as u64 * size as u64) % PAGE_SIZE as u64) as usize;
+            if prepared.zero {
+                let zeros = [0u8; 512];
+                for part in (block_offset..block_offset + size).step_by(zeros.len()) {
+                    content
+                        .copy_from(part, &zeros)
+                        .expect("prepared writable file block");
+                }
+            }
+            content
+                .copy_from((position % PAGE_SIZE as u64) as usize, &input[..pulled])
+                .expect("prepared writable file bytes");
+            content
+                .mark_dirty(block_offset, size)
+                .expect("prepared file block dirty range");
+            let next_root = prepared.root;
+            let retired = prepared.publish(&self.filesystem, old.checksum_seed);
+            record
+                .update(claim, |bytes| {
+                    crate::fs::ext4::codec::patch_inode_mapping(
+                        self.filesystem.geometry(),
+                        &mut bytes
+                            [record_offset..record_offset + self.filesystem.geometry().inode_size],
+                        &next,
+                        &next_root,
+                    )
+                })
+                .expect("prepared writable inode record");
+            *root = next_root;
+            *state.metadata.lock() = next;
+            drop(content);
+            for block in retired {
+                // SAFETY: root 写侧已排空旧块树读者，发表后的根和父节点均已去掉旧节点；
+                // 写侧仍阻止新读者，释放窗口保原页，forget 等真实元数据 IO/WB 收权后失效，
+                // 此后旧窗口不再被映射查询使用，位图最后才允许物理块复用。
+                unsafe {
+                    self.filesystem.release_detached_block(block);
+                }
+            }
+            drop(root);
+            accepted += pulled;
+        }
+        Ok((start, accepted))
+    }
     /// 内核按位置读取与用户接收端使用同一页交付循环。
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
         self.read_into(offset, &mut ReadBuffer::kernel(dst))
@@ -424,6 +656,32 @@ impl InodeRef {
         self.read_page(index)
     }
 
+    /// 稀疏增长先清旧 EOF 所在已映射块的尾部，避免新 size 暴露原盘尾字节。
+    /// 此时尚未持目的 folio 或块根写侧，filefault 可以沿正常读侧完成旧页。
+    fn zero_eof_tail(&self, old: &InodeMetadata, position: u64) -> Result<(), FsError> {
+        let size = self.filesystem.geometry().block_size as u64;
+        if old.size % size == 0 || old.size / size == position / size {
+            return Ok(());
+        }
+        if !matches!(
+            self.map_block(old.size / size)?,
+            BlockMapping::Mapped { .. }
+        ) {
+            return Ok(());
+        }
+        let folio = self.read_page(old.size / PAGE_SIZE as u64)?;
+        let mut content = folio.lock_content();
+        let start = (old.size % PAGE_SIZE as u64) as usize;
+        let block_start = start / size as usize * size as usize;
+        let end = block_start + size as usize;
+        let zeros = [0u8; 512];
+        for offset in (start..end).step_by(zeros.len()) {
+            content.copy_from(offset, &zeros[..(end - offset).min(zeros.len())])?;
+        }
+        content.mark_dirty(block_start, size as usize)?;
+        Ok(())
+    }
+
     /// 通过共同 mapping 协调同页唯一填充；不同页没有 inode 级读入锁。
     fn read_page(&self, index: u64) -> Result<FolioRef, FsError> {
         let (folio, read) = self.mapping.get_or_prepare(index)?;
@@ -475,6 +733,15 @@ impl Inode {
             }
             waiter.park();
         }
+    }
+
+    /// token 只能在加载成功后构造，析构路径不再等待加载或创建新的责任。
+    fn loaded_state(&self) -> &InodeState {
+        self.data
+            .get()
+            .expect("access token precedes inode load")
+            .as_ref()
+            .expect("access token retains a failed inode")
     }
 
     /// 短属性锁内复制当前运行值，不将 Spin guard 带入 IO、等待或用户复制。
@@ -590,4 +857,57 @@ fn find(entries: &[InodeRef], filesystem: &Arc<Ext4Volume>, number: u64) -> Opti
         .iter()
         .find(|inode| inode.number == number && Arc::ptr_eq(&inode.filesystem, filesystem))
         .cloned()
+}
+
+/// 正前缀已经被文件接受后保留它；零前缀保留具体的首次失败原因。
+fn write_result(start: u64, accepted: usize, error: FsError) -> Result<(u64, usize), FsError> {
+    if accepted == 0 {
+        Err(error)
+    } else {
+        Ok((start, accepted))
+    }
+}
+
+/// 有限最大文件位置由实际布局决定，传统树容量与 extent 的 32 位逻辑块号分别计算。
+fn write_limit(g: &crate::fs::ext4::Geometry, flags: u32) -> u64 {
+    let blocks = if flags & crate::fs::ext4::codec::EXTENTS != 0 {
+        1u64 << 32
+    } else {
+        let n = (g.block_size / 4) as u64;
+        12 + n + n * n + n * n * n
+    };
+    (blocks * g.block_size as u64).min(i64::MAX as u64)
+}
+
+/// 根据真实接受范围、块净增量与当前时间计算下一属性，未发表失败不修改原状态。
+fn write_metadata(
+    g: &crate::fs::ext4::Geometry,
+    old: &InodeMetadata,
+    position: u64,
+    count: usize,
+    added: u64,
+    removed: u64,
+    now: u64,
+) -> Result<InodeMetadata, FsError> {
+    let sectors = (g.block_size / 512) as u64;
+    let blocks = old
+        .blocks
+        .checked_add(added * sectors)
+        .ok_or(FsError::FileTooLarge)?;
+    let blocks = blocks
+        .checked_sub(removed * sectors)
+        .ok_or(FsError::Corrupt)?;
+    let (_, huge) = codec::blocks_encoding(g, blocks)?;
+    let (mtime, ctime) = codec::prepare_inode_write_times(now, old.extra_isize)?;
+    let mut next = *old;
+    next.size = old.size.max(
+        position
+            .checked_add(count as u64)
+            .ok_or(FsError::FileTooLarge)?,
+    );
+    next.blocks = blocks;
+    next.flags = (old.flags & !0x40000) | if huge { 0x40000 } else { 0 };
+    next.mtime = mtime;
+    next.ctime = ctime;
+    Ok(next)
 }

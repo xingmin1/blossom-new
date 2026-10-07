@@ -266,6 +266,26 @@ impl MetadataCache {
         self.len() == 0
     }
 
+    /// 标记本次元数据写回选中的原节点，身份与内容不产生第二份拥有。
+    pub(crate) fn set_to_write(&self, byte_offset: u64, selected: bool) {
+        self.index
+            .entries
+            .lock()
+            .set_to_write(byte_offset, selected);
+    }
+
+    /// 按物理 byte key 有界取得真实元数据页，调用者保持本缓存到全部消费结束。
+    /// 移交 IO 的外部页须附原缓存 anchor，索引内部的引用不反持缓存。
+    pub(crate) fn select_range(
+        &self,
+        start: u64,
+        end: u64,
+        mark: FolioMark,
+        output: &mut [Option<(u64, FolioRef)>],
+    ) -> Option<u64> {
+        self.index.select_range(start, end, mark, output)
+    }
+
     /// 返回此 Disk 活元数据域的明确页预算。
     pub fn capacity(&self) -> usize {
         self.index.capacity.unwrap()
@@ -346,6 +366,32 @@ impl BufferRef {
         }
         let mut content = self.folio.lock_content();
         Ok(update(content.metadata_bytes_mut(self.offset, self.len)?))
+    }
+
+    /// 实际块树摘离节点后失效本窗口，等待原页 WB 收权而不影响同页其他元数据块。
+    ///
+    /// # Safety
+    /// 调用者已持真实块映射写保护摘离该节点并阻止旧根新取得，旧消费与 IO 已结束；
+    /// 其他视图不得再消费本窗口旧内容，块尚未归还位图，本窗口确实无需落盘。
+    /// 同 Disk RW 占用仅证明权限，不能代替上述删除与生命周期条件。
+    pub(crate) unsafe fn forget(&self, claim: &FsClaim) -> Result<(), BlockError> {
+        if claim.mode() != AccessMode::ReadWrite {
+            return Err(BlockError::ReadOnly);
+        }
+        let cache = self
+            .folio
+            .metadata_owner()
+            .expect("metadata buffer lost its cache owner");
+        if !core::ptr::eq(
+            claim.disk().as_ref().get_ref(),
+            cache.claim.disk().as_ref().get_ref(),
+        ) {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut content = self.folio.lock_content();
+        // SAFETY: 调用者保证真实摘树与旧消费终结；此 guard 排斥新的内容准备，
+        // metadata 内容锁只在全部 WB 实际收权后取得，按本视图范围失效且尚未归块。
+        unsafe { content.forget_metadata(self.offset, self.len) }
     }
 
     /// 返回视图自己的字节长度。

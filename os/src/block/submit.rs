@@ -13,7 +13,7 @@ use crate::block::{
     MAX_BATCH, SECTOR_BYTES,
 };
 use crate::mm::dma::{DmaError, MappedPages};
-use crate::mm::{alloc_pages, FolioRead, PAGE_SIZE};
+use crate::mm::{alloc_pages, FolioRead, FolioWriteback, PAGE_SIZE};
 use crate::task;
 
 /// 当前位置只引用父 Bio 的段编号，跨 child 保留游标避免从首页反复扫描。
@@ -66,6 +66,66 @@ impl FsClaim {
     /// 显式 FS 批次沿同一原 Bio 准入、有限合并及 split 路径，不另建提交引擎。
     pub fn submit_batch(&self, bios: Vec<Bio>) {
         self.disk().submit_batch_from(bios, Some(self));
+    }
+
+    /// 普通 Task 把本轮原页 WB 交唯一 Bio 核心，等待实际设备全尾及范围责任结束。
+    /// 准备与准入失败保留 Dirty；没有 shadow 页或额外可睡眠完成 Task。
+    pub(crate) fn write_folio(
+        &self,
+        byte_offset: u64,
+        writeback: FolioWriteback,
+    ) -> Result<(), BlockError> {
+        if byte_offset % SECTOR_BYTES != 0 {
+            return Err(BlockError::Misaligned);
+        }
+        let len = writeback.len();
+        let mut memory = Vec::new();
+        memory
+            .try_reserve_exact(1)
+            .map_err(|_| BlockError::NoMemory)?;
+        let mapped =
+            MappedPages::from_writeback(writeback).map_err(|(error, _)| map_error(error))?;
+        memory.push(mapped);
+        // SAFETY: WB 凭证保实际原页、完整初始化范围及对应映射撤权责任；
+        // 不借出 CPU 切片，无完成回调。唯一 Bio 持凭证到全部 child 与生成者
+        // 结束及实际设备收权，然后才结束本轮 WB，失败保留 Dirty。
+        let bio = unsafe {
+            Bio::try_new(
+                self.disk(),
+                BlkOperation::Write,
+                byte_offset / SECTOR_BYTES,
+                memory,
+                0,
+                None,
+            )
+        }?;
+        let completion = bio.completion();
+        self.submit_bio(bio);
+        self.disk().unplug();
+        let result = completion.wait();
+        if let Some(error) = result.error {
+            return Err(error);
+        }
+        if result.completed != len {
+            return Err(BlockError::ShortIo);
+        }
+        Ok(())
+    }
+
+    /// 沿同一受限 FS 准入提交真实设备 FLUSH，失败不作重放或软件成功替身。
+    pub(crate) fn flush(&self) -> Result<(), BlockError> {
+        // SAFETY: Flush 没有数据映射或 CPU 别名，不含回调；
+        // Bio 仍承担唯一生成者、全部 child 和真实设备完成责任。
+        let bio =
+            unsafe { Bio::try_new(self.disk(), BlkOperation::Flush, 0, Vec::new(), 0, None) }?;
+        let completion = bio.completion();
+        self.submit_bio(bio);
+        self.disk().unplug();
+        let result = completion.wait();
+        match result.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 

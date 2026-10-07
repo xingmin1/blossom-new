@@ -1,5 +1,7 @@
 //! ext4 卷保存实际 FS 权限和共同元数据页，块映射由 canonical inode 的 data-sem 保护。
 
+mod allocation;
+pub use allocation::{UnpublishedBlock, UnpublishedInode};
 pub(crate) mod codec;
 pub(crate) mod crc;
 mod directory;
@@ -16,7 +18,7 @@ use crate::cache::{BufferRef, MetadataCache};
 use crate::fs::inode::InodeMetadata;
 use crate::fs::FsError;
 use crate::mm::{FolioRead, PAGE_SIZE};
-use crate::sync::SpinLock;
+use crate::sync::{SleepMutex, SpinLock};
 
 #[cfg(feature = "ktest")]
 type SegmentHook = Arc<dyn Fn(u64, usize) + Send + Sync>;
@@ -42,6 +44,7 @@ pub struct Geometry {
     pub reserved_gdt_blocks: u64,
     pub backup_groups: [u32; 2],
     pub log_groups_per_flex: u8,
+    pub first_inode: u64,
 }
 
 impl Geometry {
@@ -154,6 +157,8 @@ pub struct Ext4Volume {
     geometry: Geometry,
     claim: FsClaim,
     inode_domain: SpinLock<Weak<()>>,
+    allocation: SleepMutex<()>,
+    groups: Vec<allocation::GroupLayout>,
     #[cfg(feature = "ktest")]
     segment_hook: SpinLock<Option<SegmentHook>>,
 }
@@ -200,7 +205,7 @@ impl Ext4Volume {
         if mode == AccessMode::ReadWrite && geometry.features_ro_compat & !supported_ro != 0 {
             return Err(FsError::Unsupported);
         }
-        let volume = Self {
+        let mut volume = Self {
             device: NEXT_DEVICE
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1)
@@ -211,12 +216,25 @@ impl Ext4Volume {
             geometry,
             claim,
             inode_domain: SpinLock::new(Weak::new()),
+            allocation: SleepMutex::new(()),
+            groups: Vec::new(),
             #[cfg(feature = "ktest")]
             segment_hook: SpinLock::new(None),
         };
-        // 挂载时检查每个实际描述符，后续 inode 定位仍校验所消费的原字节。
+        volume
+            .groups
+            .try_reserve_exact(volume.geometry.groups_count as usize)
+            .map_err(|_| FsError::NoMemory)?;
         for group in 0..volume.geometry.groups_count {
-            volume.inode_table(group)?;
+            let (buffer, offset) = volume.group_buffer(group)?;
+            let layout = buffer.with_read(|data| {
+                codec::group_layout(
+                    &volume.geometry,
+                    group,
+                    codec::bytes(data, offset, volume.geometry.descriptor_size)?,
+                )
+            })??;
+            volume.groups.push(layout);
         }
         let volume = Arc::try_new(volume).map_err(|_| FsError::NoMemory)?;
         *published = Arc::downgrade(&volume);
@@ -231,6 +249,11 @@ impl Ext4Volume {
     /// 借用真实 FS 占用；授权的 Bio 仍通过唯一 Disk 请求核心提交。
     pub fn claim(&self) -> &FsClaim {
         &self.claim
+    }
+
+    /// 正式回写借用同 Disk 的唯一元数据索引，不建立第二个设备内容域。
+    pub fn metadata_cache(&self) -> &Arc<MetadataCache> {
+        &self.metadata
     }
 
     /// 同一活卷只允许一个 inode 缓存域，旧 inode/外部文件页保留域身份时拒绝冲突。
@@ -283,29 +306,26 @@ impl Ext4Volume {
         Ok(self.metadata.get(physical, self.geometry.block_size)?)
     }
 
-    /// 读取主描述符数组中的指定组，允许 flex 组跨组安置 inode 表。
-    fn inode_table(&self, group: u64) -> Result<u64, FsError> {
+    /// 定位主描述符的共同窗口，取得内容之前不持任何元数据短锁。
+    fn group_buffer(&self, group: u64) -> Result<(BufferRef, usize), FsError> {
         let g = &self.geometry;
         if g.groups_count <= group {
             return Err(FsError::Corrupt);
         }
-        let byte = group
-            .checked_mul(g.descriptor_size as u64)
-            .ok_or(FsError::Corrupt)?;
+        let byte = group * g.descriptor_size as u64;
         let block = g.first_data_block + 1 + byte / g.block_size as u64;
-        let offset = (byte % g.block_size as u64) as usize;
-        let buffer = self.metadata.get(block, g.block_size)?;
-        let table = buffer.with_read(|data| {
-            codec::decode_group(g, group, codec::bytes(data, offset, g.descriptor_size)?)
-        })??;
-        g.validate_blocks(
-            table,
-            codec::ceil_div(
-                g.inodes_per_group * g.inode_size as u64,
-                g.block_size as u64,
-            )?,
-        )?;
-        Ok(table)
+        Ok((
+            self.metadata.get(block, g.block_size)?,
+            (byte % g.block_size as u64) as usize,
+        ))
+    }
+
+    /// 布局地址在卷打开时验证一次；可变计数和位图仍消费共同 Buffer 当前字段。
+    fn inode_table(&self, group: u64) -> Result<u64, FsError> {
+        self.groups
+            .get(group as usize)
+            .map(|layout| layout.inode_table)
+            .ok_or(FsError::Corrupt)
     }
 
     /// 定位并校验一个完整 inode，外部编号不能穿过组或设备边界。
@@ -464,6 +484,44 @@ impl Ext4Volume {
             return Err(FsError::Corrupt);
         }
         Ok(result)
+    }
+
+    /// 核实当次挂载能力属于同一真实 Disk，并且卷和挂载都授予写许可。
+    pub(crate) fn require_write(&self, claim: &FsClaim) -> Result<(), FsError> {
+        if claim.mode() != AccessMode::ReadWrite || self.mode() != AccessMode::ReadWrite {
+            return Err(FsError::ReadOnly);
+        }
+        if !core::ptr::eq(
+            claim.disk().as_ref().get_ref(),
+            self.disk.as_ref().get_ref(),
+        ) {
+            return Err(FsError::InvalidOperation);
+        }
+        Ok(())
+    }
+
+    /// 在块树或目的内容发表前保留本 inode 的真实记录窗口。
+    pub(crate) fn inode_record(&self, number: u64) -> Result<(BufferRef, usize), FsError> {
+        let g = &self.geometry;
+        if number == 0 || g.inodes_count < number {
+            return Err(FsError::Corrupt);
+        }
+        let table = self.inode_table((number - 1) / g.inodes_per_group)?;
+        let byte = ((number - 1) % g.inodes_per_group) * g.inode_size as u64;
+        Ok((
+            self.metadata_block(table + byte / g.block_size as u64)?,
+            (byte % g.block_size as u64) as usize,
+        ))
+    }
+
+    /// caller 保持 inode 写序列化；准备不会连接新资源，失败有显式本次释放。
+    pub(crate) fn prepare_write(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        logical: u64,
+    ) -> Result<mapping::PreparedMapping, FsError> {
+        mapping::prepare(self, &inode.with_block(root), logical)
     }
 
     /// 先准备 inode-table 真实窗口，再在同一页锁内仅修改当前 inode 的字段和校验和。

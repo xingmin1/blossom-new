@@ -139,14 +139,35 @@ def check_system_image(image, profile):
     command(["e2fsck", "-fn", image], log)
 
 
-def system_image(source, output, profile, size_mib):
-    """新镜像完整制盘并检查后才原子替换目标，失败时保留原输入与输出。"""
+def system_image(source, output, profile, size_mib, write_fixture=False, nearly_full=False):
+    """新镜像完整制盘并检查后才原子替换目标，普通写夹具也使用同一制盘工具。"""
     if source == output.parent or source in output.parents:
         raise ValueError("output must not be inside the source tree")
     with tempfile.TemporaryDirectory(prefix="system-image-", dir=output.parent) as temporary:
         image = Path(temporary) / "system.img"
         try:
             create_image(source, image, profile, size_mib)
+            if write_fixture:
+                block_size = PROFILES[profile][0]
+                preallocated = () if profile == "legacy1k" else (
+                    ("write-unwritten", 16384 // block_size), ("write-merge", 64),
+                )
+                for name, blocks in preallocated:
+                    debug(image, f"fallocate /test/{name} 0 {blocks - 1}")
+                    for logical in range(blocks):
+                        physical = physical_block(image, f"test/{name}", logical)
+                        with image.open("r+b") as stream:
+                            stream.seek(physical * block_size)
+                            stream.write(b"\xa7" * block_size)
+                    debug(image, f"set_inode_field /test/{name} size {blocks * block_size}")
+                if nearly_full:
+                    with image.open("rb") as stream:
+                        stream.seek(1024 + 12)
+                        free = int.from_bytes(stream.read(4), "little")
+                    if free <= 256:
+                        raise ValueError("ordinary ENOSPC fixture has insufficient initial free blocks")
+                    debug(image, f"fallocate /test/write-reserve 0 {free - 129}")
+                    debug(image, f"set_inode_field /test/write-reserve size {(free - 128) * block_size}")
             check_system_image(image, profile)
         except (ValueError, OSError, subprocess.CalledProcessError):
             log = image.with_suffix(".log")
@@ -155,6 +176,25 @@ def system_image(source, output, profile, size_mib):
             raise
         os.replace(image.with_suffix(".log"), output.with_suffix(".log"))
         os.replace(image, output)
+
+
+def write_staging(directory, arch):
+    """普通可编辑 source 保留新编译目标 ELF，独立文件供每个写消费者使用。"""
+    program = ROOT / "build" / f"user-{arch}" / "user-write"
+    if not program.is_file():
+        raise ValueError(f"build the ordinary user program first: {program}")
+    test = directory / "test"
+    (test / "bin").mkdir(parents=True, exist_ok=True)
+    target = test / "bin" / "user-write"
+    if target.exists():
+        raise ValueError("write fixture requires a fresh source copy")
+    shutil.copy2(program, target)
+    shutil.copy2(program, test / "bin" / "user-write-next")
+    for name in ("write-kernel", "write-user", "write-append", "write-append-kernel",
+                 "write-oom", "write-unwritten", "write-merge", "write-tree", "write-rollback", "write-full", "write-reserve"):
+        (test / name).touch(exist_ok=False)
+    (test / "write-map").write_bytes(bytes(range(256)) * 32)
+    (test / "write-map").chmod(0o755)
 
 def staging(directory, block_size):
     """从普通文件构造链接、字节名、稀疏文件和真实多层映射的输入树。"""
@@ -285,9 +325,9 @@ def inode_offset(image, name, block_size):
 
 
 def physical_block(image, name, logical):
-    """真实映射的物理块号只从 debugfs bmap 查询，禁止启发式猜地址。"""
+    """实际物理地址只消费 bmap 的完整结果，unwritten 的合法标记不改变地址。"""
     text = debug(image, f"bmap /{name} {logical}")
-    numbers = re.findall(r"^([0-9]+)$", text, re.MULTILINE)
+    numbers = re.findall(r"^([0-9]+)(?: \(uninit\))?$", text, re.MULTILINE)
     if len(numbers) != 1 or int(numbers[0]) == 0:
         raise ValueError("debugfs bmap did not report one mapped block")
     return int(numbers[0])
@@ -377,9 +417,17 @@ def main(argv=None):
     parser.add_argument("--identity", choices=("root", "extra"), default="root")
     parser.add_argument("--size-mib", type=int, default=256)
     parser.add_argument("--fixtures", action="store_true")
+    parser.add_argument("--write-fixture", action="store_true",
+                        help="add ordinary writable files and the freshly built user-write ELF")
+    parser.add_argument("--nearly-full", action="store_true",
+                        help="reserve real ordinary data blocks, leaving at most 128 free")
     args = parser.parse_args(argv)
     if args.size_mib < 128:
         parser.error("--size-mib must be at least 128")
+    if args.write_fixture and args.fixtures:
+        parser.error("--write-fixture uses a normal single source image, not damaged fixtures")
+    if args.nearly_full and not args.write_fixture:
+        parser.error("--nearly-full requires --write-fixture")
     if args.fixtures and (args.source is not None or args.staging is not None):
         parser.error("--fixtures creates its own ordinary staging tree")
     if args.source is not None and args.staging is not None:
@@ -405,7 +453,10 @@ def main(argv=None):
                 source = system_staging(directory, args.arch, args.identity)
             if not source.is_dir():
                 raise ValueError("--source must be an existing directory")
-            system_image(source.resolve(), output, args.profile, args.size_mib)
+            if args.write_fixture:
+                write_staging(source, args.arch)
+            system_image(source.resolve(), output, args.profile, args.size_mib,
+                         args.write_fixture, args.nearly_full)
             print(f"valid root={output} profile={args.profile} source={source.resolve()}")
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"mkext4: {error}\n")

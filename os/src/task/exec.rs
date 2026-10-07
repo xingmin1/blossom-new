@@ -237,13 +237,14 @@ pub(crate) struct LoadedImage {
     pub context: UserContext,
 }
 
-/// 从同一打开实例构造完整私有映像；任何失败均在发表根之前正常释放全部拥有。
+/// 首次读取 ELF 前禁止同 inode 写入，责任随真实 Mm 保留，全部准备失败由 RAII 释放。
 pub(crate) fn load(
     file: FileRef,
     args: &Arguments,
     uid: u32,
     gid: u32,
 ) -> Result<LoadedImage, ExecError> {
+    let access = file.path().inode()?.deny_writes()?;
     let elf = Elf::read(&file)?;
     let mut mm = Mm::try_new()?;
     map_segments(&mut mm, &file, &elf.segments)?;
@@ -252,6 +253,7 @@ pub(crate) fn load(
     let heap = page_end(elf.end)?;
     mm.set_heap(heap, heap)?;
     let context = UserContext::new(elf.entry, sp);
+    mm.bind_executable(file, access);
     let mm = Arc::try_new(mm).map_err(|_| ExecError::NoMemory)?;
     Ok(LoadedImage { mm, context })
 }

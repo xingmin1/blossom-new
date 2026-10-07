@@ -1,8 +1,12 @@
 //! extent 与传统间接树只在内容借用中解码，树下降和真实 I/O 在借用之外。
 
+use crate::cache::BufferRef;
+use crate::fs::ext4::allocation::DetachedBlock;
 use crate::fs::ext4::codec::{self, EXTENTS};
-use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData};
+use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData, UnpublishedBlock};
 use crate::fs::FsError;
+use alloc::vec::Vec;
+use core::convert::TryInto;
 
 #[derive(Clone, Copy)]
 enum Step {
@@ -238,4 +242,650 @@ fn indirect_map(
     } else {
         Ok(BlockMapping::Mapped { physical, len: 1 })
     }
+}
+
+/// 一个 inode 的块树修改计划；只保存条目和字段，不保存可覆盖共同页的旧块快照。
+pub(crate) struct PreparedMapping {
+    pub root: [u8; 60],
+    pub physical: u64,
+    pub zero: bool,
+    pub added_blocks: u64,
+    pub removed_blocks: u64,
+    retired: Vec<DetachedBlock>,
+    nodes: Vec<NodeEdit>,
+    indirect: Vec<(BufferRef, usize, u32, bool)>,
+    allocated: Vec<UnpublishedBlock>,
+}
+
+struct NodeEdit {
+    buffer: Option<BufferRef>,
+    physical: u64,
+    entries: Vec<[u8; 12]>,
+    max: usize,
+    depth: u16,
+    generation: u32,
+    dirty: bool,
+    new: bool,
+}
+
+impl PreparedMapping {
+    /// 映射准备或目的页准备失败时只释放本次尚未连接的全部块。
+    pub(crate) fn cancel(mut self, volume: &Ext4Volume) {
+        while let Some(block) = self.allocated.pop() {
+            volume.release_unpublished_block(block);
+        }
+    }
+
+    /// caller 保持 root 写侧，所有窗口已有效且属于卷自身 RW claim；提交不分配或读盘。
+    pub(crate) fn publish(mut self, volume: &Ext4Volume, seed: u32) -> Vec<DetachedBlock> {
+        for node in &self.nodes {
+            if !node.dirty {
+                continue;
+            }
+            if let Some(buffer) = &node.buffer {
+                buffer
+                    .update(volume.claim(), |bytes| {
+                        patch_node(volume.geometry(), bytes, node, seed)
+                    })
+                    .expect("prepared writable extent node");
+            }
+        }
+        // 新间接链先初始化，最后才连接已有父指针；读者仍受 inode root 写侧排斥。
+        for (buffer, offset, physical, new) in &self.indirect {
+            buffer
+                .update(volume.claim(), |bytes| {
+                    if *new {
+                        bytes.fill(0);
+                    }
+                    codec::put32(bytes, *offset, *physical);
+                })
+                .expect("prepared writable indirect node");
+        }
+        while let Some(block) = self.allocated.pop() {
+            block.publish();
+        }
+        self.retired
+    }
+}
+
+/// 写映射使用与读取相同的格式分支，但不受当前 EOF 限制。
+pub(crate) fn prepare(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    logical: u64,
+) -> Result<PreparedMapping, FsError> {
+    let g = volume.geometry();
+    let limit = if inode.flags & EXTENTS != 0 {
+        1u64 << 32
+    } else {
+        let n = (g.block_size / 4) as u64;
+        12 + n + n * n + n * n * n
+    };
+    if limit <= logical {
+        return Err(FsError::FileTooLarge);
+    }
+    let existing = map(volume, inode, logical, logical + 1)?;
+    let mut prepared = PreparedMapping {
+        root: inode.block,
+        physical: 0,
+        zero: false,
+        added_blocks: 0,
+        removed_blocks: 0,
+        nodes: Vec::new(),
+        indirect: Vec::new(),
+        allocated: Vec::new(),
+        retired: Vec::new(),
+    };
+    if let BlockMapping::Mapped { physical, .. } = existing {
+        prepared.physical = physical;
+        return Ok(prepared);
+    }
+    prepared.zero = true;
+    let result = if inode.flags & EXTENTS != 0 {
+        prepare_extent(volume, inode, logical, existing, &mut prepared)
+    } else {
+        prepare_indirect(volume, inode, logical, &mut prepared)
+    };
+    if let Err(error) = result {
+        prepared.cancel(volume);
+        return Err(error);
+    }
+    prepared.added_blocks = prepared.allocated.len() as u64;
+    prepared.removed_blocks = prepared.retired.len() as u64;
+    Ok(prepared)
+}
+
+/// 准备条目容量在任何共同 Buffer 内容借用之前完成。
+fn entry_storage(max: usize) -> Result<Vec<[u8; 12]>, FsError> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(max + 2)
+        .map_err(|_| FsError::NoMemory)?;
+    Ok(entries)
+}
+
+/// 已校验的节点条目进入预备独占空间，内容借用内不分配或重复计算 CRC。
+fn read_node(bytes: &[u8], mut entries: Vec<[u8; 12]>) -> Result<NodeEdit, FsError> {
+    let header = codec::extent_header(bytes, None)?;
+    assert!(usize::from(header.max) + 2 <= entries.capacity());
+    for index in 0..usize::from(header.entries) {
+        let mut entry = [0; 12];
+        entry.copy_from_slice(codec::bytes(bytes, 12 + index * 12, 12)?);
+        entries.push(entry);
+    }
+    Ok(NodeEdit {
+        buffer: None,
+        physical: 0,
+        entries,
+        max: usize::from(header.max),
+        depth: header.depth,
+        generation: codec::le32(bytes, 8)?,
+        dirty: false,
+        new: false,
+    })
+}
+
+/// 叶条目只对单个真正初始化的 FS 块转换，前后 unwritten 继续保持零语义。
+fn prepare_extent(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    logical: u64,
+    existing: BlockMapping,
+    prepared: &mut PreparedMapping,
+) -> Result<(), FsError> {
+    let g = volume.geometry();
+    let depth = codec::extent_header(&inode.block, None)?.depth as usize;
+    if 32 < depth {
+        return Err(FsError::FileTooLarge);
+    }
+    prepared
+        .nodes
+        .try_reserve_exact((depth + 2) * 2)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .allocated
+        .try_reserve_exact(depth + 4)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .retired
+        .try_reserve_exact(depth * 2)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .nodes
+        .push(read_node(&inode.block, entry_storage(4)?)?);
+    let mut slots = [0usize; 33];
+    let mut visited = [0u64; 32];
+    let mut high = 1u64 << 32;
+    for level in 0..depth {
+        let node = &prepared.nodes[level];
+        let selected = node
+            .entries
+            .iter()
+            .rposition(|entry| entry_key(entry) <= logical)
+            .unwrap_or(0);
+        slots[level] = selected;
+        let entry = &node.entries[selected];
+        let physical = index_physical(entry);
+        let next_low = entry_key(entry);
+        let next_high = node
+            .entries
+            .get(selected + 1)
+            .map(entry_key)
+            .unwrap_or(high);
+        if visited[..level].contains(&physical) {
+            return Err(FsError::Corrupt);
+        }
+        visited[level] = physical;
+        let entries = entry_storage((g.block_size - 12) / 12)?;
+        let buffer = volume.metadata_block(physical)?;
+        // 插入最左端可早于旧首 key；节点验证仍使用原父边界。
+        let mut child = buffer.with_read(|bytes| {
+            extent_step(
+                g,
+                inode,
+                bytes,
+                logical.max(next_low),
+                Some((depth - level - 1) as u16),
+                Some(next_low),
+                next_high,
+            )?;
+            read_node(bytes, entries)
+        })??;
+        child.buffer = Some(buffer);
+        child.physical = physical;
+        prepared.nodes.push(child);
+        high = next_high;
+    }
+    prepared.physical = match existing {
+        BlockMapping::Unwritten { physical, .. } => physical,
+        BlockMapping::Hole { .. } => {
+            let block = volume.allocate_block((inode.number - 1) / g.inodes_per_group)?;
+            let physical = block.physical();
+            if (1u64 << 48) <= physical {
+                volume.release_unpublished_block(block);
+                return Err(FsError::FileTooLarge);
+            }
+            prepared.allocated.push(block);
+            physical
+        }
+        _ => return Err(FsError::Corrupt),
+    };
+    change_leaf(
+        &mut prepared.nodes[depth].entries,
+        logical,
+        prepared.physical,
+    )?;
+    prepared.nodes[depth].dirty = true;
+    let mut split_nodes = false;
+    let mut level = depth;
+    loop {
+        let count = prepared.nodes[level].entries.len();
+        if prepared.nodes[level].max < count {
+            split_nodes = true;
+            let split = count / 2;
+            let node_depth = prepared.nodes[level].depth;
+            let right = new_node(volume, inode, prepared, node_depth)?;
+            let right_index = prepared.nodes.len() - 1;
+            for index in split..count {
+                let entry = prepared.nodes[level].entries[index];
+                prepared.nodes[right_index].entries.push(entry);
+            }
+            prepared.nodes[level].entries.truncate(split);
+            prepared.nodes[level].dirty = true;
+            let right_key = entry_key(&prepared.nodes[right_index].entries[0]);
+            if level == 0 {
+                if 32 <= prepared.nodes[0].depth {
+                    return Err(FsError::FileTooLarge);
+                }
+                let node_depth = prepared.nodes[0].depth;
+                let left = new_node(volume, inode, prepared, node_depth)?;
+                let left_index = prepared.nodes.len() - 1;
+                for index in 0..prepared.nodes[0].entries.len() {
+                    let entry = prepared.nodes[0].entries[index];
+                    prepared.nodes[left_index].entries.push(entry);
+                }
+                let left_key = entry_key(&prepared.nodes[left_index].entries[0]);
+                prepared.nodes[0].entries.clear();
+                prepared.nodes[0].entries.push(index_entry(left_key, left));
+                prepared.nodes[0]
+                    .entries
+                    .push(index_entry(right_key, right));
+                prepared.nodes[0].depth += 1;
+                prepared.nodes[0].max = 4;
+                break;
+            }
+            let left_key = entry_key(&prepared.nodes[level].entries[0]);
+            let parent = &mut prepared.nodes[level - 1];
+            codec::put32(&mut parent.entries[slots[level - 1]], 0, left_key as u32);
+            parent
+                .entries
+                .insert(slots[level - 1] + 1, index_entry(right_key, right));
+            parent.dirty = true;
+        } else if level != 0 {
+            let key = entry_key(&prepared.nodes[level].entries[0]);
+            let parent = &mut prepared.nodes[level - 1];
+            codec::put32(&mut parent.entries[slots[level - 1]], 0, key as u32);
+            parent.dirty = true;
+        }
+        if level == 0 {
+            break;
+        }
+        level -= 1;
+    }
+    if !split_nodes {
+        consolidate_path(volume, inode, prepared, &mut slots, depth)?;
+    }
+    patch_node(
+        g,
+        &mut prepared.root,
+        &prepared.nodes[0],
+        inode.checksum_seed,
+    );
+    Ok(())
+}
+
+/// 分配新外部节点并保留原 token；任何后续失败由 prepare 的唯一错误出口归还。
+fn new_node(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    prepared: &mut PreparedMapping,
+    depth: u16,
+) -> Result<u64, FsError> {
+    let g = volume.geometry();
+    let max = (g.block_size - 12) / 12;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(max + 2)
+        .map_err(|_| FsError::NoMemory)?;
+    let block = volume.allocate_block((inode.number - 1) / g.inodes_per_group)?;
+    let physical = block.physical();
+    prepared.allocated.push(block);
+    if (1u64 << 48) <= physical {
+        return Err(FsError::FileTooLarge);
+    }
+    let buffer = volume.metadata_block(physical)?;
+    prepared.nodes.push(NodeEdit {
+        buffer: Some(buffer),
+        physical,
+        entries,
+        max,
+        depth,
+        generation: 0,
+        dirty: true,
+        new: true,
+    });
+    Ok(physical)
+}
+
+/// 相邻同层节点能容纳时合并条目并删父索引，再把单子根压回 inode。
+/// 所有释放窗口在发表之前取得，旧树在准备失败时仍保持原样。
+fn consolidate_path(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    prepared: &mut PreparedMapping,
+    slots: &mut [usize; 33],
+    depth: usize,
+) -> Result<(), FsError> {
+    let g = volume.geometry();
+    for level in (1..=depth).rev() {
+        let slot = slots[level - 1];
+        let parent = &prepared.nodes[level - 1];
+        let sibling_slot = if slot + 1 < parent.entries.len() {
+            slot + 1
+        } else if slot != 0 {
+            slot - 1
+        } else {
+            continue;
+        };
+        let sibling_entry = parent.entries[sibling_slot];
+        let sibling_physical = index_physical(&sibling_entry);
+        let low = entry_key(&sibling_entry);
+        let high = parent
+            .entries
+            .get(sibling_slot + 1)
+            .map(entry_key)
+            .unwrap_or(1u64 << 32);
+        let entries = entry_storage((g.block_size - 12) / 12)?;
+        let buffer = volume.metadata_block(sibling_physical)?;
+        let node_depth = prepared.nodes[level].depth;
+        let mut sibling = buffer.with_read(|bytes| {
+            extent_step(g, inode, bytes, low, Some(node_depth), Some(low), high)?;
+            read_node(bytes, entries)
+        })??;
+        sibling.buffer = Some(buffer);
+        sibling.physical = sibling_physical;
+        let current = &prepared.nodes[level];
+        let (left, right) = if slot < sibling_slot {
+            (current, &sibling)
+        } else {
+            (&sibling, current)
+        };
+        let boundary_merge = node_depth == 0
+            && leaves_merge(left.entries.last().unwrap(), right.entries.first().unwrap())?;
+        let count = left.entries.len() + right.entries.len() - usize::from(boundary_merge);
+        if left.max < count {
+            continue;
+        }
+        let detached = if slot < sibling_slot {
+            sibling_physical
+        } else {
+            current.physical
+        };
+        let release = volume.prepare_detached_block(detached)?;
+        if slot < sibling_slot {
+            for entry in sibling.entries {
+                prepared.nodes[level].entries.push(entry);
+            }
+        } else {
+            for entry in &prepared.nodes[level].entries {
+                sibling.entries.push(*entry);
+            }
+            prepared.nodes[level] = sibling;
+            slots[level - 1] -= 1;
+        }
+        if node_depth == 0 {
+            merge_leaf(&mut prepared.nodes[level].entries)?;
+        }
+        prepared.nodes[level].dirty = true;
+        prepared.nodes[level - 1]
+            .entries
+            .remove(slot.max(sibling_slot));
+        prepared.nodes[level - 1].dirty = true;
+        prepared.retired.push(release);
+    }
+    // 单子根降深不需要申请新节点，inline 容量始终是四项。
+    for level in 1..=depth {
+        if prepared.nodes[0].entries.len() != 1 || 4 < prepared.nodes[level].entries.len() {
+            break;
+        }
+        if index_physical(&prepared.nodes[0].entries[0]) != prepared.nodes[level].physical {
+            break;
+        }
+        let release = volume.prepare_detached_block(prepared.nodes[level].physical)?;
+        prepared.nodes[0].entries.clear();
+        for index in 0..prepared.nodes[level].entries.len() {
+            let entry = prepared.nodes[level].entries[index];
+            prepared.nodes[0].entries.push(entry);
+        }
+        prepared.nodes[0].depth = prepared.nodes[level].depth;
+        prepared.nodes[0].max = 4;
+        prepared.nodes[level].dirty = false;
+        prepared.retired.push(release);
+    }
+    Ok(())
+}
+
+/// 邻项只在状态、逻辑/物理连续和 ee_len 容量全部相容时合并。
+fn leaves_merge(left: &[u8; 12], right: &[u8; 12]) -> Result<bool, FsError> {
+    let (physical, len, unwritten) = leaf_fields(left)?;
+    let (next_physical, next_len, next_unwritten) = leaf_fields(right)?;
+    Ok(unwritten == next_unwritten
+        && entry_key(left) + len == entry_key(right)
+        && physical + len == next_physical
+        && len + next_len <= if unwritten { 32767 } else { 32768 })
+}
+
+/// 条目 key 是逻辑 FS 块号，与物理块地址的高低半编码无关。
+fn entry_key(entry: &[u8; 12]) -> u64 {
+    u32::from_le_bytes(entry[..4].try_into().unwrap()) as u64
+}
+
+/// 组合 extent index 的 48 位物理地址。
+fn index_physical(entry: &[u8; 12]) -> u64 {
+    u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64
+        | (u16::from_le_bytes(entry[8..10].try_into().unwrap()) as u64) << 32
+}
+
+/// 构造正式 index 条目，保留两字节 unused 为零。
+fn index_entry(logical: u64, physical: u64) -> [u8; 12] {
+    let mut entry = [0; 12];
+    codec::put32(&mut entry, 0, logical as u32);
+    codec::put32(&mut entry, 4, physical as u32);
+    codec::put16(&mut entry, 8, (physical >> 32) as u16);
+    entry
+}
+
+/// 构造容量已经检查的 initialized 或 unwritten 叶条目。
+fn leaf_entry(logical: u64, physical: u64, len: u64, unwritten: bool) -> [u8; 12] {
+    let mut entry = [0; 12];
+    codec::put32(&mut entry, 0, logical as u32);
+    codec::put16(
+        &mut entry,
+        4,
+        (len + if unwritten { 32768 } else { 0 }) as u16,
+    );
+    codec::put16(&mut entry, 6, (physical >> 32) as u16);
+    codec::put32(&mut entry, 8, physical as u32);
+    entry
+}
+
+/// 解码独占条目中的物理地址、长度和 unwritten 状态。
+fn leaf_fields(entry: &[u8; 12]) -> Result<(u64, u64, bool), FsError> {
+    let (len, unwritten) = codec::extent_length(codec::le16(entry, 4)?)?;
+    Ok((
+        u64::from(codec::le32(entry, 8)?) | u64::from(codec::le16(entry, 6)?) << 32,
+        len,
+        unwritten,
+    ))
+}
+
+/// 插入或三段切分只作用于准备空间，随后合并同状态且逻辑/物理连续的邻项。
+fn change_leaf(entries: &mut Vec<[u8; 12]>, logical: u64, physical: u64) -> Result<(), FsError> {
+    let mut index = 0;
+    while index < entries.len() && entry_key(&entries[index]) <= logical {
+        let start = entry_key(&entries[index]);
+        let (old_physical, len, unwritten) = leaf_fields(&entries[index])?;
+        if logical < start + len {
+            if !unwritten {
+                return Err(FsError::Corrupt);
+            }
+            entries.remove(index);
+            if start < logical {
+                entries.insert(
+                    index,
+                    leaf_entry(start, old_physical, logical - start, true),
+                );
+                index += 1;
+            }
+            entries.insert(index, leaf_entry(logical, physical, 1, false));
+            if logical + 1 < start + len {
+                entries.insert(
+                    index + 1,
+                    leaf_entry(logical + 1, physical + 1, start + len - logical - 1, true),
+                );
+            }
+            merge_leaf(entries)?;
+            return Ok(());
+        }
+        index += 1;
+    }
+    entries.insert(index, leaf_entry(logical, physical, 1, false));
+    merge_leaf(entries)
+}
+
+/// 每次合并减少一项；状态和最大长度限制与盘面 ee_len 编码保持一致。
+fn merge_leaf(entries: &mut Vec<[u8; 12]>) -> Result<(), FsError> {
+    let mut index = 0;
+    while index + 1 < entries.len() {
+        let left = entries[index];
+        let right = entries[index + 1];
+        let (physical, len, unwritten) = leaf_fields(&left)?;
+        let (next_physical, next_len, next_unwritten) = leaf_fields(&right)?;
+        let max = if unwritten { 32767 } else { 32768 };
+        if unwritten == next_unwritten
+            && entry_key(&left) + len == entry_key(&right)
+            && physical + len == next_physical
+            && len + next_len <= max
+        {
+            entries[index] = leaf_entry(entry_key(&left), physical, len + next_len, unwritten);
+            entries.remove(index + 1);
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+/// 字段级编码节点及有效条目；共同 Buffer 的其他区域不从旧快照恢复。
+fn patch_node(g: &Geometry, bytes: &mut [u8], node: &NodeEdit, seed: u32) {
+    if node.new {
+        bytes.fill(0);
+    }
+    codec::put16(bytes, 0, 0xf30a);
+    codec::put16(bytes, 2, node.entries.len() as u16);
+    codec::put16(bytes, 4, node.max as u16);
+    codec::put16(bytes, 6, node.depth);
+    codec::put32(bytes, 8, node.generation);
+    for (index, entry) in node.entries.iter().enumerate() {
+        bytes[12 + index * 12..24 + index * 12].copy_from_slice(entry);
+    }
+    if node.buffer.is_some() && g.features_ro_compat & codec::METADATA_CSUM != 0 {
+        let tail = 12 + node.max * 12;
+        codec::put32(bytes, tail, codec::crc32c(seed, &bytes[..tail]));
+    }
+}
+
+/// 传统块号分解为 inode 槽及至多三层指针槽，不改变已有映射格式。
+fn indirect_offsets(g: &Geometry, logical: u64) -> Result<([usize; 4], usize), FsError> {
+    let mut offsets = [0usize; 4];
+    if logical < 12 {
+        offsets[0] = logical as usize;
+        return Ok((offsets, 1));
+    }
+    let n = (g.block_size / 4) as u64;
+    let mut remaining = logical - 12;
+    let mut span = n;
+    let mut depth = 1;
+    while span <= remaining && depth < 3 {
+        remaining -= span;
+        span *= n;
+        depth += 1;
+    }
+    if span <= remaining {
+        return Err(FsError::FileTooLarge);
+    }
+    offsets[0] = 11 + depth;
+    for slot in &mut offsets[1..=depth] {
+        span /= n;
+        *slot = (remaining / span) as usize;
+        remaining %= span;
+    }
+    Ok((offsets, depth + 1))
+}
+
+/// 传统分支全部准备后才连接第一个缺失链接；已有 direct/single/double/triple 原样保留。
+fn prepare_indirect(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    logical: u64,
+    prepared: &mut PreparedMapping,
+) -> Result<(), FsError> {
+    let (offsets, length) = indirect_offsets(volume.geometry(), logical)?;
+    prepared
+        .indirect
+        .try_reserve_exact(length)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .allocated
+        .try_reserve_exact(length)
+        .map_err(|_| FsError::NoMemory)?;
+    let mut parent = None;
+    let mut missing = 0;
+    let mut physical = u64::from(codec::le32(&inode.block, offsets[0] * 4)?);
+    while physical != 0 && missing + 1 < length {
+        let buffer = volume.metadata_block(physical)?;
+        missing += 1;
+        physical = buffer.with_read(|bytes| codec::le32(bytes, offsets[missing] * 4))?? as u64;
+        parent = Some(buffer);
+    }
+    if physical != 0 {
+        return Err(FsError::Corrupt);
+    }
+    let mut next = 0u32;
+    for level in (missing..length).rev() {
+        let block =
+            volume.allocate_block((inode.number - 1) / volume.geometry().inodes_per_group)?;
+        let physical = block.physical();
+        prepared.allocated.push(block);
+        if u64::from(u32::MAX) < physical {
+            return Err(FsError::FileTooLarge);
+        }
+        if level + 1 == length {
+            prepared.physical = physical;
+        } else {
+            let buffer = volume.metadata_block(physical)?;
+            prepared
+                .indirect
+                .push((buffer, offsets[level + 1] * 4, next, true));
+        }
+        next = physical as u32;
+    }
+    if let Some(parent) = parent {
+        prepared
+            .indirect
+            .push((parent, offsets[missing] * 4, next, false));
+    } else {
+        codec::put32(&mut prepared.root, offsets[0] * 4, next);
+    }
+    Ok(())
 }

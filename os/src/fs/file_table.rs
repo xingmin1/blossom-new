@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::fs::file::{O_DIRECTORY, O_NOFOLLOW};
 use crate::fs::{
     open_path_with_flags, DirectoryEntry, FileRef, FileStat, FsContext, FsError, ResolveMode,
-    SeekFrom, Vfs,
+    SeekFrom, Vfs, WriteBuffer,
 };
 use crate::sync::SpinLock;
 
@@ -212,10 +212,29 @@ impl FileTable {
         file.readdir()
     }
 
-    /// 在表锁外调用真实文件写接口，由具体 OFD 判断挂载能力、类型与操作支持。
+    /// 内核顺序写只绑定输入，不在描述符表内复制 inode 写循环。
     pub fn write(&self, fd: usize, buffer: &[u8]) -> Result<usize, FsError> {
-        let file = self.lookup(fd)?;
-        file.write(buffer)
+        self.write_from(fd, &mut WriteBuffer::kernel(buffer))
+    }
+
+    /// 内核按位置写经过同一核心，不取得 OFD 共享位置锁。
+    pub fn write_at(&self, fd: usize, offset: u64, buffer: &[u8]) -> Result<usize, FsError> {
+        self.write_at_from(fd, offset, &mut WriteBuffer::kernel(buffer))
+    }
+
+    /// 表短锁外持原 OFD 执行顺序写，关闭复用 fd 不改变本次文件身份。
+    pub fn write_from(&self, fd: usize, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+        self.lookup(fd)?.write_from(source)
+    }
+
+    /// 表短锁外按明确位置写入，实际追加和错误均由原 OFD 提供。
+    pub fn write_at_from(
+        &self,
+        fd: usize,
+        offset: u64,
+        source: &mut WriteBuffer<'_>,
+    ) -> Result<usize, FsError> {
+        self.lookup(fd)?.write_at_from(offset, source)
     }
 
     /// 先移出打开槽并使编号立即可复用，解锁后才释放表拥有的文件引用。

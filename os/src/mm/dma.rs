@@ -4,7 +4,7 @@ use crate::arch;
 use crate::block::IoResult;
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
-use crate::mm::{alloc_pages, pages as page_map, FolioRead, OwnedPages};
+use crate::mm::{alloc_pages, pages as page_map, FolioRead, FolioWriteback, OwnedPages};
 use core::convert::TryFrom;
 use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ptr::NonNull;
@@ -97,20 +97,22 @@ enum PayloadBacking {
         read: FolioRead,
         publish_on_success: bool,
     },
+    Writeback(FolioWriteback),
 }
 
 impl PayloadBacking {
-    /// 两种来源都返回 allocator 管理的原页地址，不授予 CPU 内容访问权。
+    /// 每种来源都保留 allocator 管理的原页，不从共享页复制归还权。
     fn phys_addr(&self) -> usize {
         match self {
             Self::Pages(pages) => pages.phys_addr(),
             Self::Folio { read, .. } => read.phys_addr(),
+            Self::Writeback(writeback) => writeback.phys_addr(),
         }
     }
 }
 
 /// 在同一原页块内映射一个非空 payload 范围，不复制数据或拆散原阶。
-/// 设备拥有期间 CPU 数据入口和归还入口均拒绝访问。
+/// 设备拥有期间不提供 CPU 数据切片；文件回写可按原 folio 协议产生新的 Dirty。
 pub struct MappedPages {
     // 活动析构即使因断言进入 unwind，也不能让字段自动释放设备仍访问的页。
     backing: ManuallyDrop<PayloadBacking>,
@@ -192,6 +194,31 @@ impl MappedPages {
         })
     }
 
+    /// 消耗本轮 WB 凭证，把已初始化范围直接用于 ToDevice；失败返回原义务。
+    pub(crate) fn from_writeback(
+        writeback: FolioWriteback,
+    ) -> Result<Self, (DmaError, FolioWriteback)> {
+        if writeback.is_completed() {
+            return Err((DmaError::InvalidRange, writeback));
+        }
+        let offset = writeback.offset();
+        let len = writeback.len();
+        let address = match direct_device_address(writeback.phys_addr(), PAGE_SIZE, offset, len) {
+            Ok(address) => address,
+            Err(error) => return Err((error, writeback)),
+        };
+        Ok(Self {
+            backing: ManuallyDrop::new(PayloadBacking::Writeback(writeback)),
+            offset,
+            segment: MappedSegment {
+                address,
+                length: len as u32,
+                direction: BufferDirection::DriverToDevice,
+            },
+            device_owned: false,
+        })
+    }
+
     /// 全部设备责任结束后取回分段读入者，内容锁继续由该拥有者保存。
     pub(crate) fn into_folio(mut self) -> FolioRead {
         assert!(!self.device_owned, "taking a device-owned folio");
@@ -211,7 +238,7 @@ impl MappedPages {
         mem::forget(self);
         match backing {
             PayloadBacking::Folio { read, .. } => read,
-            PayloadBacking::Pages(_) => unreachable!(),
+            PayloadBacking::Pages(_) | PayloadBacking::Writeback(_) => unreachable!(),
         }
     }
 
@@ -241,9 +268,13 @@ impl MappedPages {
         self.device_owned
     }
 
-    /// 已发布结果的 folio 只允许读取，不能作为新 Bio 的可写 DMA 来源。
+    /// 已结束的初始化或 WB 凭证不能再次作为设备访问来源。
     pub(crate) fn is_folio_complete(&self) -> bool {
-        matches!(&*self.backing, PayloadBacking::Folio { read, .. } if read.is_completed())
+        match &*self.backing {
+            PayloadBacking::Folio { read, .. } => read.is_completed(),
+            PayloadBacking::Writeback(writeback) => writeback.is_completed(),
+            PayloadBacking::Pages(_) => false,
+        }
     }
 
     /// 只观察 folio 原页地址，不借用设备仍可写的内容。
@@ -251,11 +282,12 @@ impl MappedPages {
     pub(crate) fn ktest_folio_phys_addr(&self) -> Option<usize> {
         match &*self.backing {
             PayloadBacking::Folio { read, .. } => Some(read.phys_addr()),
+            PayloadBacking::Writeback(writeback) => Some(writeback.phys_addr()),
             PayloadBacking::Pages(_) => None,
         }
     }
 
-    /// 在 CPU 拥有期间独占 payload 字节存储；folio 完成后禁止再次可变访问。
+    /// CPU-owned 独占来源可写初始化存储；共享 WB 来源始终拒绝内容切片。
     pub fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         assert!(!self.device_owned, "CPU access during DMA device ownership");
         let len = self.len();
@@ -269,6 +301,7 @@ impl MappedPages {
                 let start = self.offset - read.offset();
                 &mut read.bytes_mut()[start..start + len]
             }
+            PayloadBacking::Writeback(_) => panic!("mutable slice of a writeback folio"),
         }
     }
 
@@ -276,9 +309,14 @@ impl MappedPages {
     ///
     /// # Safety
     /// 调用者须证明整个 payload 已初始化；短读或失败完成不能证明未写尾部有效。
-    /// 所有先前导出的裸别名必须遵守本对象的独占设备访问期，不能并发写此借用。
+    /// 所有先前导出的裸别名必须遵守独占设备访问期，不能并发写此借用。
+    /// 共享 WB 来源不得通过本入口取得切片，须沿 folio 原始字节访问。
     pub unsafe fn bytes(&self) -> &[u8] {
         assert!(!self.device_owned, "CPU access during DMA device ownership");
+        assert!(
+            !matches!(&*self.backing, PayloadBacking::Writeback(_)),
+            "slice of a writeback folio"
+        );
         let pointer = (arch::phys_to_virt(self.backing.phys_addr()) + self.offset) as *const u8;
         // SAFETY: new 已核对原块和 CPU 直映范围，本对象保活且处于 CPU 状态；
         // 调用者保证全部字节初始化及没有并发写者，借用不能超出本对象寿命。
@@ -288,9 +326,10 @@ impl MappedPages {
     /// 在 descriptor 发表前将整个 payload 交给唯一设备访问期。
     ///
     /// # Safety
-    /// 调用者必须结束所有 CPU 裸别名访问，并使本对象存活到对应全部子请求完成
-    /// 或真实 reset 已停止 DMA；DriverToDevice 的全部传输字节必须已初始化。
-    /// 子请求只可引用本映射的有界范围，不能自行收权、并发 CPU 访问或重复交权。
+    /// 独占页和读入者的全部 CPU 裸别名须先结束；ToDevice 字节必须已初始化。
+    /// WB 凭证已完成对应映射撤权，后续文件原始写按同一 folio 记录新 Dirty；
+    /// 不得借出 Rust 内容切片。子请求只引用本范围，来源保活到全部真实 used
+    /// 或确认 reset 结束，不能独立收权、归还原页或重复交权。
     pub unsafe fn begin_device_access(&mut self) {
         assert!(!self.device_owned, "DMA payload is already device owned");
         assert!(
@@ -313,22 +352,29 @@ impl MappedPages {
         self.device_owned = false;
     }
 
-    /// Bio 全尾收权后发布完整读；分段成功保留内容锁，失败立即发布原错误。
+    /// Bio 全尾收权后结束来源自己的初始化或 WB，保留新 Dirty 与原错误。
     ///
     /// # Safety
-    /// 本映射的全部设备访问和可变 CPU 别名必须已经结束；完整成功必须保证
-    /// payload 全范围已经初始化，completed 必须属于本映射的连续成功前缀。
+    /// 本映射全部设备访问已经结束；独占读入者的 CPU 可变别名也须结束。
+    /// 结果属于本映射，成功前缀不能超过其范围；WB 失败不消除脏义务。
     pub(crate) unsafe fn complete_folio(&mut self, result: IoResult) {
         assert!(!self.device_owned, "completing device-owned folio");
-        if let PayloadBacking::Folio {
-            read,
-            publish_on_success,
-        } = &mut *self.backing
-        {
-            if *publish_on_success || result.error.is_some() {
-                // SAFETY: 已真实收权；完整读覆盖 read 原范围，分段失败不授予内容访问。
-                unsafe { read.complete(result) };
+        match &mut *self.backing {
+            PayloadBacking::Folio {
+                read,
+                publish_on_success,
+            } => {
+                if *publish_on_success || result.error.is_some() {
+                    // SAFETY: 已真实收权；完整读覆盖 read 原范围，分段失败不授予内容访问。
+                    unsafe { read.complete(result) };
+                }
             }
+            PayloadBacking::Writeback(writeback) => {
+                // SAFETY: Bio 在全部 child 与生成者结束、真实收权和回调返回后调用，
+                // 本结果是该映射的实际前缀；凭证只结束自己的 WB，不清除新 Dirty。
+                unsafe { writeback.complete(result) };
+            }
+            PayloadBacking::Pages(_) => {}
         }
     }
 }
@@ -338,7 +384,7 @@ impl Drop for MappedPages {
     fn drop(&mut self) {
         assert!(!self.device_owned, "dropping device-owned DMA pages");
         // SAFETY: 原来源只由构造器移入且未取出；设备访问已停止，CPU 借用已结束。
-        // folio 的读入责任由 Bio 发布，未提交者由其原 Drop 结束；不转换原页归还权。
+        // 初始化与 WB 凭证各结束自己的责任；未提交 WB 恢复 Dirty，不转换原页归还权。
         unsafe { ManuallyDrop::drop(&mut self.backing) };
     }
 }

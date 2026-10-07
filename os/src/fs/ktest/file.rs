@@ -18,7 +18,7 @@ struct FileOwner {
 impl FileOwner {
     /// 正文构造完整路径视图与固定表，失败时保留原设备的清理责任。
     fn prepare(&mut self, context: &TestContext<'_>, capacity: usize) -> TestResult {
-        self.path.prepare_path(context)?;
+        self.path.prepare_path(context, AccessMode::ReadOnly)?;
         let table = Arc::try_new(checked(context, FileTable::try_new(capacity))?)
             .map_err(|_| TestError("file table owner OOM"))?;
         self.table = Some(table);
@@ -256,8 +256,8 @@ pub(crate) mod regular {
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,
             PATTERN_SIZE,
         );
-        context.expect_eq(table.write(fd, b"write").err(), Some(FsError::ReadOnly));
-        context.expect_eq(table.write(fd, b"").err(), Some(FsError::ReadOnly));
+        context.expect_eq(table.write(fd, b"write").err(), Some(FsError::BadFd));
+        context.expect_eq(table.write(fd, b"").err(), Some(FsError::BadFd));
         context.expect_eq(table.readdir(fd).err(), Some(FsError::NotDirectory));
         checked(context, table.seek(fd, SeekFrom::Start(0)))?;
         let mut offset = 0;
@@ -385,7 +385,7 @@ pub(crate) mod directories {
                 table.read_at(fd, 0, &mut byte).err(),
                 Some(FsError::IsDirectory),
             );
-            context.expect_eq(table.write(fd, b"x").err(), Some(FsError::ReadOnly));
+            context.expect_eq(table.write(fd, b"x").err(), Some(FsError::BadFd));
             for fd in [fd, independent, duplicate] {
                 checked(context, table.close(fd))?;
             }

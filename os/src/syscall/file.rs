@@ -5,7 +5,7 @@ use core::convert::TryFrom;
 
 use crate::fs::{
     self, DescriptorFlags, DirectoryEntry, FileStat, FsContext, InodeKind, Path, ReadBuffer,
-    ResolveMode, SeekFrom, Vfs,
+    ResolveMode, SeekFrom, Vfs, WriteBuffer,
 };
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyout, Errno, SysResult};
@@ -20,7 +20,7 @@ const AT_EMPTY_PATH: usize = 0x1000;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-/// 预留归属原文件表，锁外解析真实路径和权限后发表完整只读OFD。
+/// 预留归属原文件表，锁外按真实访问模式检查路径权限后发表完整 OFD。
 pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("openat has no runtime");
     let mm = user.mm().expect("openat has no MM");
@@ -35,10 +35,18 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & DIRECTORY != 0 && path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
         return Err(Errno::NotDirectory);
     }
-    if flags & 3 != 0 || flags & (0x40 | 0x200) != 0 {
-        return Err(Errno::ReadOnly);
-    }
-    path.check_access(runtime.credentials.uid, runtime.credentials.gid, 4)?;
+    let access = match flags & 3 {
+        0 => 4,
+        1 => 2,
+        2 => 6,
+        _ => return Err(Errno::InvalidArgument),
+    };
+    let access = if flags & 0x200 != 0 {
+        access | 2
+    } else {
+        access
+    };
+    path.check_access(runtime.credentials.uid, runtime.credentials.gid, access)?;
     let file = fs::open_path_with_flags(path, flags)?;
     Ok(reservation.publish(
         file,
@@ -75,15 +83,31 @@ pub(super) fn pread(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.read_at_into(raw[3] as u64, &mut target)? as isize)
 }
 
-/// 只读OFD先保访问模式EBADF，不能以空buffer或用户指针绕过只读边界。
+/// 用户输入绑定本次真实 Mm，文件只按已接受前缀更新共享位置。
 pub(super) fn write(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("write has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
     if file.flags() & 3 == 0 {
-        Err(Errno::BadFd)
-    } else {
-        Err(Errno::ReadOnly)
+        return Err(Errno::BadFd);
     }
+    let mm = user.mm().expect("write has no MM");
+    let mut source = WriteBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
+    Ok(file.write_from(&mut source)? as isize)
+}
+
+/// 负偏移先拒绝，按位置写不改变 OFD 游标，追加状态由同一 inode 判断。
+pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    if (raw[3] as i64) < 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("pwrite has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    if file.flags() & 3 == 0 {
+        return Err(Errno::BadFd);
+    }
+    let mm = user.mm().expect("pwrite has no MM");
+    let mut source = WriteBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
+    Ok(file.write_at_from(raw[3] as u64, &mut source)? as isize)
 }
 
 /// 共享位置的位移在原OFD锁中提交，不能把失败后的游标在表层回滚。

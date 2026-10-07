@@ -29,6 +29,9 @@ pub(super) enum Errno {
     IsDirectory = 21,
     InvalidArgument = 22,
     TooManyFiles = 24,
+    TextBusy = 26,
+    FileTooLarge = 27,
+    NoSpace = 28,
     ReadOnly = 30,
     NameTooLong = 36,
     NoSyscall = 38,
@@ -48,10 +51,13 @@ impl Errno {
 }
 
 impl From<FsError> for Errno {
-    /// 保留文件类型、权限、号码和实际内存错误，盘格式错误不伪装EOF。
+    /// 保留文件访问、写排斥、磁盘空间和真实内存错误，盘格式错误不伪装 EOF。
     fn from(error: FsError) -> Self {
         match error {
             FsError::NoMemory | FsError::Io(BlockError::NoMemory) => Self::NoMemory,
+            FsError::NoSpace => Self::NoSpace,
+            FsError::TextBusy => Self::TextBusy,
+            FsError::FileTooLarge => Self::FileTooLarge,
             FsError::BadAddress => Self::BadAddress,
             FsError::Permission => Self::Permission,
             FsError::Unsupported => Self::Unsupported,

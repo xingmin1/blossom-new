@@ -4,14 +4,18 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
-use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeTime, Path};
-use crate::mm::{space::Mm, FolioRef};
+use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess};
+use crate::mm::space::{Mm, VmError};
+use crate::mm::FolioRef;
 use crate::sync::SleepMutex;
 
 /// 共享一个打开实例及其位置；最后引用释放该实例持有的路径。
 pub type FileRef = Arc<dyn FileLike>;
 
 const O_ACCMODE: u32 = 0o3;
+const O_WRONLY: u32 = 0o1;
+const O_CREAT: u32 = 0o100;
+const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 pub(crate) const O_DIRECTORY: u32 = 0o200000;
@@ -98,6 +102,100 @@ impl<'a> ReadBuffer<'a> {
     }
 }
 
+/// 写入端只保存有限输入准备进度，文件实际接受量由 inode 单独提交。
+pub struct WriteBuffer<'a> {
+    source: WriteSource<'a>,
+    prepared: usize,
+    error: Option<FsError>,
+}
+
+/// 用户字节只能由指定 Mm 复制到独占片段，不建立用户内容的 Rust 借用。
+enum WriteSource<'a> {
+    Kernel(&'a [u8]),
+    User {
+        mm: &'a Mm,
+        address: usize,
+        length: usize,
+    },
+}
+
+impl<'a> WriteBuffer<'a> {
+    /// 将已初始化的内核字节绑定到正式 inode 写循环。
+    pub fn kernel(bytes: &'a [u8]) -> Self {
+        Self {
+            source: WriteSource::Kernel(bytes),
+            prepared: 0,
+            error: None,
+        }
+    }
+
+    /// 验证非零用户范围并绑定真实 Mm；零长请求不访问地址。
+    pub fn user(mm: &'a Mm, address: usize, length: usize) -> Result<Self, FsError> {
+        if length != 0 {
+            let end = address.checked_add(length).ok_or(FsError::BadAddress)?;
+            if arch::USER_ADDRESS_END < end {
+                return Err(FsError::BadAddress);
+            }
+        }
+        Ok(Self {
+            source: WriteSource::User {
+                mm,
+                address,
+                length,
+            },
+            prepared: 0,
+            error: None,
+        })
+    }
+
+    /// 返回输入的完整长度，不把准备片段当成已接受的文件字节。
+    pub fn len(&self) -> usize {
+        match &self.source {
+            WriteSource::Kernel(bytes) => bytes.len(),
+            WriteSource::User { length, .. } => *length,
+        }
+    }
+
+    /// 返回已取得的输入前缀，仅供剩余输入计算。
+    pub fn copied(&self) -> usize {
+        self.prepared
+    }
+
+    /// 只准备目的片段容量内的输入，调用时不能持目的 folio、块根写锁或 PTE 锁。
+    /// 部分 copyin 先交出可提交前缀，首个错误留待下一次调用，不能吞掉已有字节。
+    pub fn pull(&mut self, dst: &mut [u8]) -> Result<usize, FsError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let count = dst.len().min(self.len() - self.prepared);
+        if count == 0 {
+            return Ok(0);
+        }
+        let copied = match &self.source {
+            WriteSource::Kernel(bytes) => {
+                dst[..count].copy_from_slice(&bytes[self.prepared..self.prepared + count]);
+                count
+            }
+            WriteSource::User { mm, address, .. } => {
+                let progress = mm.copyin(&mut dst[..count], *address + self.prepared);
+                self.error = progress.error.map(|error| match error {
+                    VmError::NoMemory => FsError::NoMemory,
+                    VmError::File(error) => error,
+                    _ => FsError::BadAddress,
+                });
+                progress.copied
+            }
+        };
+        self.prepared += copied;
+        if copied == 0 {
+            if let Some(error) = self.error {
+                return Err(error);
+            }
+        }
+        Ok(copied)
+    }
+}
+
 /// 可表示为有符号64位的非负文件位置；相对位移失败时保留原位置。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeekFrom {
@@ -170,8 +268,21 @@ pub trait FileLike: Send + Sync {
         emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
     ) -> Result<(), FsError>;
 
-    /// 写能力与具体操作支持分别检查，空输入也不能伪报成功。
-    fn write(&self, src: &[u8]) -> Result<usize, FsError>;
+    /// 内核顺序写与用户写共用同一输入准备及文件提交协议。
+    fn write(&self, src: &[u8]) -> Result<usize, FsError> {
+        self.write_from(&mut WriteBuffer::kernel(src))
+    }
+
+    /// 内核按位置写不取得共享位置锁，追加状态仍由 inode 仲裁。
+    fn write_at(&self, offset: u64, src: &[u8]) -> Result<usize, FsError> {
+        self.write_at_from(offset, &mut WriteBuffer::kernel(src))
+    }
+
+    /// 持共享位置直到实际写结束，只提交 inode 返回的起点和接受前缀。
+    fn write_from(&self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError>;
+
+    /// 按明确位置写入，不取得或修改共享位置。
+    fn write_at_from(&self, offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError>;
 }
 
 /// 普通文件的打开实例，路径保活挂载和唯一 inode 的文件页索引。
@@ -179,6 +290,7 @@ pub struct InodeFile {
     path: Path,
     cursor: SleepMutex<u64>,
     flags: AtomicU32,
+    write_access: Option<WriteAccess>,
 }
 
 /// 目录的打开实例，枚举位置使用后端已有的字节记录边界。
@@ -193,36 +305,57 @@ pub fn open_path(path: Path) -> Result<FileRef, FsError> {
     open_path_with_flags(path, 0)
 }
 
-/// 创建真实 OFD；写意图先检查当前挂载能力，尚未实现的文件修改返回 Unsupported。
+/// 按真实访问模式建立 OFD；修改与同步标志未实现时保留具体拒绝错误。
 pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
-    if flags & O_ACCMODE == O_ACCMODE {
+    let access = flags & O_ACCMODE;
+    if access == O_ACCMODE {
         return Err(FsError::InvalidOperation);
     }
-    if flags & (O_ACCMODE | 0o100 | 0o1000) != 0 {
+    if access != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
         path.check_writable()?;
-        return Err(FsError::Unsupported);
     }
     let flags = flags & !O_CLOEXEC;
-    if flags & !OPEN_FLAGS != 0 {
+    if flags & !(OPEN_FLAGS | O_ACCMODE | O_CREAT | O_TRUNC) != 0 {
         return Err(FsError::Unsupported);
     }
-    let kind = path.inode()?.metadata_snapshot()?.kind;
+    let inode = path.inode()?;
+    let kind = inode.metadata_snapshot()?.kind;
     if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
     match kind {
-        InodeKind::Regular => Ok(Arc::try_new(InodeFile {
-            path,
-            cursor: SleepMutex::new(0),
-            flags: AtomicU32::new(flags),
-        })
-        .map_err(|_| FsError::NoMemory)?),
-        InodeKind::Directory => Ok(Arc::try_new(DirectoryFile {
-            path,
-            cursor: SleepMutex::new(0),
-            flags: AtomicU32::new(flags),
-        })
-        .map_err(|_| FsError::NoMemory)?),
+        InodeKind::Regular => {
+            let write_access = if access != 0 || flags & O_TRUNC != 0 {
+                Some(inode.acquire_write()?)
+            } else {
+                None
+            };
+            // 截断先经过写排斥检查，不能将活映像的 ETXTBSY 掩盖成未实现。
+            if flags & (O_CREAT | O_TRUNC) != 0 {
+                return Err(FsError::Unsupported);
+            }
+            Ok(Arc::try_new(InodeFile {
+                path,
+                cursor: SleepMutex::new(0),
+                flags: AtomicU32::new(flags),
+                write_access,
+            })
+            .map_err(|_| FsError::NoMemory)?)
+        }
+        InodeKind::Directory => {
+            if access != 0 || flags & O_TRUNC != 0 {
+                return Err(FsError::IsDirectory);
+            }
+            if flags & O_CREAT != 0 {
+                return Err(FsError::Unsupported);
+            }
+            Ok(Arc::try_new(DirectoryFile {
+                path,
+                cursor: SleepMutex::new(0),
+                flags: AtomicU32::new(flags),
+            })
+            .map_err(|_| FsError::NoMemory)?)
+        }
         InodeKind::Symlink => Err(FsError::TooManySymlinks),
         InodeKind::Other => Err(FsError::Unsupported),
     }
@@ -231,6 +364,7 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
 impl FileLike for InodeFile {
     /// 位置锁跨实际交付保持独占，用户故障的正前缀仍按真实长度推进。
     fn read_into(&self, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+        require_read(self.flags())?;
         let mut cursor = self.cursor.lock();
         let bytes = self.path.inode()?.read_into(*cursor, target)?;
         // inode 限制交付不超过 size-cursor，EOF 与零长返回零。
@@ -240,6 +374,7 @@ impl FileLike for InodeFile {
 
     /// 按位置读取唯一 inode 的文件页，不参与共享位置的串行化。
     fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+        require_read(self.flags())?;
         self.path.inode()?.read_into(offset, target)
     }
 
@@ -260,6 +395,7 @@ impl FileLike for InodeFile {
 
     /// 从完整路径保活的 inode 取得同源缓存页，不读取或修改打开实例的位置。
     fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
+        require_read(self.flags())?;
         self.path.inode()?.file_page(index)
     }
 
@@ -286,11 +422,61 @@ impl FileLike for InodeFile {
         Err(FsError::NotDirectory)
     }
 
-    /// 检查保活路径的写能力后拒绝尚未实现的 buffered write，不推进位置。
-    fn write(&self, _src: &[u8]) -> Result<usize, FsError> {
+    /// 共享位置锁跨请求保留，追加的实际起点只由 inode 写序列化决定。
+    fn write_from(&self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+        require_write(self.flags())?;
         self.path.check_writable()?;
-        Err(FsError::Unsupported)
+        let mut cursor = self.cursor.lock();
+        check_write_range(*cursor, source.len() - source.copied())?;
+        let inode = self.path.inode()?;
+        let access = self
+            .write_access
+            .as_ref()
+            .expect("writable OFD has no write access");
+        let (start, bytes) = access.write_from(
+            inode.filesystem().claim(),
+            *cursor,
+            self.flags() & O_APPEND != 0,
+            source,
+        )?;
+        if 0 < bytes {
+            *cursor = start
+                .checked_add(bytes as u64)
+                .expect("inode write position overflow");
+        }
+        Ok(bytes)
     }
+
+    /// pwrite 不参与共享位置串行化，O_APPEND 同样在 inode 锁内取得 EOF。
+    fn write_at_from(&self, offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+        require_write(self.flags())?;
+        self.path.check_writable()?;
+        check_write_range(offset, source.len() - source.copied())?;
+        let inode = self.path.inode()?;
+        let access = self
+            .write_access
+            .as_ref()
+            .expect("writable OFD has no write access");
+        access
+            .write_from(
+                inode.filesystem().claim(),
+                offset,
+                self.flags() & O_APPEND != 0,
+                source,
+            )
+            .map(|(_, bytes)| bytes)
+    }
+}
+
+/// 调用者位置和本次输入范围均须可表示为非负 loff_t，追加也不能跳过 ABI 范围检查。
+fn check_write_range(offset: u64, length: usize) -> Result<(), FsError> {
+    let end = offset
+        .checked_add(length as u64)
+        .ok_or(FsError::InvalidOperation)?;
+    if (i64::MAX as u64) < end {
+        return Err(FsError::InvalidOperation);
+    }
+    Ok(())
 }
 
 impl FileLike for DirectoryFile {
@@ -360,10 +546,34 @@ impl FileLike for DirectoryFile {
         Ok(())
     }
 
-    /// 先检查当前挂载能力，再拒绝目录字节写入，空输入也不伪报成功。
-    fn write(&self, _src: &[u8]) -> Result<usize, FsError> {
+    /// 目录不接受字节写入，访问模式检查与挂载能力检查保持各自错误。
+    fn write_from(&self, _source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+        require_write(self.flags())?;
         self.path.check_writable()?;
         Err(FsError::IsDirectory)
+    }
+
+    /// 按位置写同样拒绝目录，不获取枚举位置锁。
+    fn write_at_from(&self, _offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+        self.write_from(source)
+    }
+}
+
+/// 写模式 OFD 不授予读取或文件映射能力，空请求同样核访问模式。
+fn require_read(flags: u32) -> Result<(), FsError> {
+    if flags & O_ACCMODE == O_WRONLY {
+        Err(FsError::BadFd)
+    } else {
+        Ok(())
+    }
+}
+
+/// 只读 OFD 不授予写能力，挂载检查不能替代打开时访问模式。
+fn require_write(flags: u32) -> Result<(), FsError> {
+    if flags & O_ACCMODE == 0 {
+        Err(FsError::BadFd)
+    } else {
+        Ok(())
     }
 }
 

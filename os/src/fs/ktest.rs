@@ -33,7 +33,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 保留格式、inode、路径、文件与系统盘模块的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 21],
+    [&'static ::ktest::SuiteSlot; 22],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -61,6 +61,7 @@ pub(crate) fn anchors() -> (
             concurrency::file_loading::__ktest_anchor(),
             concurrency::failed_loading::__ktest_anchor(),
             user::anchor(),
+            user::write_anchor(),
         ],
         path::anchors(),
         file::anchors(),
@@ -246,6 +247,16 @@ enum Job {
         pathname: &'static [u8],
         pressure: crate::cache::ktest::HeapPressure,
     },
+    Append {
+        file: FileRef,
+        gate: Arc<Completion>,
+        marker: u8,
+        records: usize,
+    },
+    WriteOom {
+        file: FileRef,
+        pressure: crate::cache::ktest::HeapPressure,
+    },
     User {
         thread: Arc<crate::task::UserThread>,
         access: crate::arch::UserAccess,
@@ -253,6 +264,12 @@ enum Job {
 }
 
 enum Returned {
+    Written(usize),
+    WriteOom {
+        evidence: (bool, bool),
+        warm: Result<usize, FsError>,
+        cold: Result<usize, FsError>,
+    },
     Inode(InodeRef),
     Dentry(DentryRef),
     Path(Path),
@@ -344,6 +361,42 @@ impl Observation {
 /// 普通原生任务消费真实 API；结果只观察已初始化内容或实际原错误。
 fn perform(job: Job, cancelled: &AtomicBool) -> Result<Returned, FsError> {
     match job {
+        Job::Append {
+            file,
+            gate,
+            marker,
+            records,
+        } => {
+            gate.wait();
+            let mut bytes = [marker; 512];
+            let mut accepted = 0;
+            for index in 0..records {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(FsError::LoadAborted);
+                }
+                bytes[1] = index as u8;
+                let count = file.write(&bytes)?;
+                if count != bytes.len() {
+                    return Err(FsError::Corrupt);
+                }
+                accepted += count;
+            }
+            Ok(Returned::Written(accepted))
+        }
+        Job::WriteOom { file, mut pressure } => {
+            let evidence = {
+                let _pin = crate::sync::PreemptGuard::new();
+                pressure.exhaust()
+            };
+            let warm = file.write_at(0, &[0x6d; 17]);
+            let cold = file.write_at(4096, &[0x9b; 17]);
+            drop(pressure);
+            Ok(Returned::WriteOom {
+                evidence,
+                warm,
+                cold,
+            })
+        }
         Job::User { thread, access } => Ok(Returned::User(file::run_vm_access(
             thread, access, cancelled,
         ))),

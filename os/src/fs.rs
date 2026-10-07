@@ -1,4 +1,4 @@
-//! 只读文件后端与唯一 inode 身份共用原页缓存和块 I/O。
+//! 文件内容、唯一 inode 身份与元数据视图共用原页缓存和块 I/O。
 
 mod dentry;
 pub(crate) mod ext4;
@@ -9,18 +9,19 @@ mod inode;
 pub(crate) mod ktest;
 mod path;
 pub(crate) mod system;
+pub(crate) mod writeback;
 
 pub use dentry::{DentryCache, DentryRef};
 pub use ext4::{
     BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind, InodeTime,
 };
-pub use file::ReadBuffer;
 pub use file::{
     open_path, open_path_with_flags, stat_path, DirectoryFile, FileLike, FileRef, FileStat,
     InodeFile, SeekFrom,
 };
+pub use file::{ReadBuffer, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
-pub use inode::{InodeCache, InodeMetadata, InodeRef};
+pub use inode::{ExecAccess, InodeCache, InodeMetadata, InodeRef, WriteAccess};
 pub use path::{FsContext, Path, ResolveMode, Vfs};
 
 use crate::block::BlockError;
@@ -29,6 +30,9 @@ use crate::block::BlockError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
     NoMemory,
+    NoSpace,
+    TextBusy,
+    FileTooLarge,
     Corrupt,
     Checksum,
     Unsupported,
@@ -61,6 +65,9 @@ impl FsError {
             Self::Io(error) => error,
             Self::BadFd
             | Self::TooManyFiles
+            | Self::NoSpace
+            | Self::TextBusy
+            | Self::FileTooLarge
             | Self::ReadOnly
             | Self::IsDirectory
             | Self::BadAddress

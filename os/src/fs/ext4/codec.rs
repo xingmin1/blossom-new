@@ -88,6 +88,11 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     let inodes_count = u64::from(le32(data, 0)?);
     let blocks_per_group = u64::from(le32(data, 32)?);
     let inodes_per_group = u64::from(le32(data, 40)?);
+    let first_inode = if le32(data, 76)? == 0 {
+        11
+    } else {
+        u64::from(le32(data, 84)?)
+    };
     let inode_size = if le32(data, 76)? == 0 {
         128
     } else {
@@ -111,6 +116,10 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         || block_size as u64 * 8 < blocks_per_group
         || block_size as u64 * 8 < inodes_per_group
         || inodes_per_group % (block_size / inode_size) as u64 != 0
+        || first_inode < 11
+        || inodes_per_group < first_inode
+        || blocks_per_group % 8 != 0
+        || inodes_per_group % 8 != 0
     {
         return Err(FsError::Corrupt);
     }
@@ -166,6 +175,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         reserved_gdt_blocks: u64::from(le16(data, 206)?),
         backup_groups: [le32(data, 588)?, le32(data, 592)?],
         log_groups_per_flex,
+        first_inode,
     })
 }
 
@@ -432,6 +442,36 @@ fn time_encoding(
     }
 }
 
+/// 写提交使用已有时钟的时间值，mtime 和 ctime 各按实际扩展字段保留纳秒或整秒。
+pub(crate) fn prepare_inode_write_times(
+    nanoseconds: u64,
+    extra_isize: usize,
+) -> Result<(InodeTime, InodeTime), FsError> {
+    let modified = InodeTime {
+        seconds: (nanoseconds / 1_000_000_000) as i64,
+        nanoseconds: (nanoseconds % 1_000_000_000) as u32,
+    };
+    let mtime = if 140 <= 128 + extra_isize {
+        modified
+    } else {
+        InodeTime {
+            nanoseconds: 0,
+            ..modified
+        }
+    };
+    let ctime = if 136 <= 128 + extra_isize {
+        modified
+    } else {
+        InodeTime {
+            nanoseconds: 0,
+            ..modified
+        }
+    };
+    time_encoding(mtime, 136, extra_isize)?;
+    time_encoding(ctime, 132, extra_isize)?;
+    Ok((mtime, ctime))
+}
+
 /// 同一元数据 guard 内只改当前记录的属性和 CRC，保留块根、未知字段及邻记录。
 pub(crate) fn patch_inode_metadata(
     g: &Geometry,
@@ -457,22 +497,12 @@ pub(crate) fn patch_inode_metadata(
     put_time(record, 8, 140, atime);
     put_time(record, 16, 136, mtime);
     put_time(record, 12, 132, ctime);
-    if g.features_ro_compat & METADATA_CSUM != 0 {
-        put16(record, 124, 0);
-        if 4 <= next.extra_isize {
-            put16(record, 130, 0);
-        }
-        let crc = crc32c(next.checksum_seed, record);
-        put16(record, 124, crc as u16);
-        if 4 <= next.extra_isize {
-            put16(record, 130, (crc >> 16) as u16);
-        }
-    }
+    inode_checksum(g, record, next.checksum_seed, next.extra_isize);
     Ok(())
 }
 
 /// 写入已由固定 inode 几何验证的字段，修改不跨出本记录。
-fn put16(record: &mut [u8], offset: usize, value: u16) {
+pub(crate) fn put16(record: &mut [u8], offset: usize, value: u16) {
     record[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
@@ -542,4 +572,219 @@ pub(crate) fn verify_extent_checksum(
         }
     }
     Ok(())
+}
+
+/// 写入已经过几何检查的四字节字段，不复制共同块的其余字节。
+pub(crate) fn put32(record: &mut [u8], offset: usize, value: u32) {
+    record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// 组的物理布局固定，计数与 flags 每次从共同描述符重新解码。
+pub(crate) fn group_layout(
+    g: &Geometry,
+    group: u64,
+    record: &[u8],
+) -> Result<crate::fs::ext4::allocation::GroupLayout, FsError> {
+    let inode_table = decode_group(g, group, record)?;
+    g.validate_blocks(
+        inode_table,
+        g.inodes_per_group * g.inode_size as u64 / g.block_size as u64,
+    )?;
+    let high = |offset| -> Result<u64, FsError> {
+        Ok(if g.descriptor_size == 64 {
+            u64::from(le32(record, offset)?) << 32
+        } else {
+            0
+        })
+    };
+    Ok(crate::fs::ext4::allocation::GroupLayout {
+        block_bitmap: u64::from(le32(record, 0)?) | high(32)?,
+        inode_bitmap: u64::from(le32(record, 4)?) | high(36)?,
+        inode_table,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GroupState {
+    pub free_blocks: u32,
+    pub free_inodes: u32,
+    pub used_dirs: u32,
+    pub flags: u16,
+    pub unused_inodes: u32,
+    pub block_checksum: u32,
+    pub inode_checksum: u32,
+}
+
+/// 组合描述符的低高半字段，32 字节格式只消费实际存在的低半。
+pub(crate) fn group_state(g: &Geometry, record: &[u8]) -> Result<GroupState, FsError> {
+    let field = |low, high| -> Result<u32, FsError> {
+        Ok(u32::from(le16(record, low)?)
+            | if g.descriptor_size == 64 {
+                u32::from(le16(record, high)?) << 16
+            } else {
+                0
+            })
+    };
+    Ok(GroupState {
+        free_blocks: field(12, 44)?,
+        free_inodes: field(14, 46)?,
+        used_dirs: field(16, 48)?,
+        flags: le16(record, 18)?,
+        unused_inodes: field(28, 50)?,
+        block_checksum: field(24, 56)?,
+        inode_checksum: field(26, 58)?,
+    })
+}
+
+/// 对当前描述符作字段级提交，CRC 消费包含邻字段的当前记录。
+pub(crate) fn patch_group(g: &Geometry, group: u64, record: &mut [u8], state: GroupState) {
+    for (low, high, value) in [
+        (12, 44, state.free_blocks),
+        (14, 46, state.free_inodes),
+        (16, 48, state.used_dirs),
+        (28, 50, state.unused_inodes),
+        (24, 56, state.block_checksum),
+        (26, 58, state.inode_checksum),
+    ] {
+        put16(record, low, value as u16);
+        if g.descriptor_size == 64 {
+            put16(record, high, (value >> 16) as u16);
+        }
+    }
+    put16(record, 18, state.flags);
+    let number = (group as u32).to_le_bytes();
+    if g.features_ro_compat & METADATA_CSUM != 0 {
+        put16(record, 30, 0);
+        let sum = crc32c(crc32c(g.checksum_seed, &number), record);
+        put16(record, 30, sum as u16);
+    } else if g.features_ro_compat & 0x10 != 0 {
+        let sum = crc16(crc16(crc16(!0, &g.uuid), &number), &record[..30]);
+        let sum = if g.descriptor_size == 64 {
+            crc16(sum, &record[32..])
+        } else {
+            sum
+        };
+        put16(record, 30, sum);
+    }
+}
+
+/// 位图 CRC 只覆盖每组实际格式规定的位数，末组仍使用整组校验长度。
+pub(crate) fn bitmap_checksum(g: &Geometry, bitmap: &[u8], inode: bool) -> u32 {
+    let bits = if inode {
+        g.inodes_per_group
+    } else {
+        g.blocks_per_group
+    };
+    let sum = crc32c(g.checksum_seed, &bitmap[..(bits / 8) as usize]);
+    if g.descriptor_size == 64 {
+        sum
+    } else {
+        sum & 0xffff
+    }
+}
+
+/// 已初始化位图先校验正式 CRC，UNINIT 的构造路径由分配器单独负责。
+pub(crate) fn verify_bitmap(
+    g: &Geometry,
+    record: &[u8],
+    bitmap: &[u8],
+    inode: bool,
+) -> Result<(), FsError> {
+    if g.features_ro_compat & METADATA_CSUM != 0 {
+        let state = group_state(g, record)?;
+        let stored = if inode {
+            state.inode_checksum
+        } else {
+            state.block_checksum
+        };
+        if stored != bitmap_checksum(g, bitmap, inode) {
+            return Err(FsError::Checksum);
+        }
+    }
+    Ok(())
+}
+
+/// 在主超级块当前字段上调整空闲计数，调用者已经串行化卷的分配。
+pub(crate) fn patch_super_counts(g: &Geometry, record: &mut [u8], blocks: i64, inodes: i64) {
+    let old_blocks = u64::from(le32(record, 12).expect("prepared superblock"))
+        | if g.features_incompat & 0x80 != 0 {
+            u64::from(le32(record, 344).expect("prepared superblock")) << 32
+        } else {
+            0
+        };
+    let old_inodes = u64::from(le32(record, 16).expect("prepared superblock"));
+    let next_blocks = old_blocks
+        .checked_add_signed(blocks)
+        .expect("free block count overflow");
+    let next_inodes = old_inodes
+        .checked_add_signed(inodes)
+        .expect("free inode count overflow");
+    assert!(next_blocks <= g.blocks_count && next_inodes <= g.inodes_count);
+    put32(record, 12, next_blocks as u32);
+    if g.features_incompat & 0x80 != 0 {
+        put32(record, 344, (next_blocks >> 32) as u32);
+    }
+    put32(record, 16, next_inodes as u32);
+    if g.features_ro_compat & METADATA_CSUM != 0 {
+        put32(record, 1020, crc32c(!0, &record[..1020]));
+    }
+}
+
+/// 根据统一 sector 计数选择盘面编码；超过当前格式容量时在发表前拒绝。
+pub(crate) fn blocks_encoding(g: &Geometry, sectors: u64) -> Result<(u64, bool), FsError> {
+    if sectors <= u32::MAX as u64 {
+        return Ok((sectors, false));
+    }
+    if g.features_ro_compat & 8 == 0 {
+        return Err(FsError::FileTooLarge);
+    }
+    if sectors < (1u64 << 48) {
+        return Ok((sectors, false));
+    }
+    let blocks = sectors / (g.block_size / 512) as u64;
+    if (1u64 << 48) <= blocks {
+        return Err(FsError::FileTooLarge);
+    }
+    Ok((blocks, true))
+}
+
+/// 只更新当前 inode 的大小、sector 计数、块根、修改时间及 CRC，保留未知字段和邻记录。
+pub(crate) fn patch_inode_mapping(
+    g: &Geometry,
+    record: &mut [u8],
+    next: &InodeMetadata,
+    root: &[u8; 60],
+) {
+    let (blocks, huge) = blocks_encoding(g, next.blocks).expect("prepared inode blocks");
+    let mtime = time_encoding(next.mtime, 136, next.extra_isize).expect("prepared inode mtime");
+    let ctime = time_encoding(next.ctime, 132, next.extra_isize).expect("prepared inode ctime");
+    put32(record, 4, next.size as u32);
+    put32(record, 108, (next.size >> 32) as u32);
+    put32(record, 28, blocks as u32);
+    put16(record, 116, (blocks >> 32) as u16);
+    put32(
+        record,
+        32,
+        (next.flags & !0x40000) | if huge { 0x40000 } else { 0 },
+    );
+    record[40..100].copy_from_slice(root);
+    put_time(record, 16, 136, mtime);
+    put_time(record, 12, 132, ctime);
+    inode_checksum(g, record, next.checksum_seed, next.extra_isize);
+}
+
+/// 零化校验字段后以 inode 固定种子计算完整记录的 CRC。
+pub(crate) fn inode_checksum(g: &Geometry, record: &mut [u8], seed: u32, extra: usize) {
+    if g.features_ro_compat & METADATA_CSUM == 0 {
+        return;
+    }
+    put16(record, 124, 0);
+    if 4 <= extra {
+        put16(record, 130, 0);
+    }
+    let sum = crc32c(seed, record);
+    put16(record, 124, sum as u16);
+    if 4 <= extra {
+        put16(record, 130, (sum >> 16) as u16);
+    }
 }

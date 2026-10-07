@@ -12,6 +12,7 @@ use crate::workqueue::testing::{metadata_stats, MetadataStats};
 mod layout;
 mod lifecycle;
 mod preparation;
+mod write;
 
 const PROGRAM: &[u8] = b"/test/bin/user-smoke";
 const FUTEX_CONTROL: usize = 0x4400_0000;
@@ -42,7 +43,12 @@ struct UserOwner {
 impl UserOwner {
     /// 每例只用本例设备与根建立身份域，库存由同一 suite 保活到最后一个 case。
     fn prepare(&mut self, context: &TestContext<'_>) -> TestResult {
-        self.path.prepare_path(context)?;
+        self.prepare_mode(context, AccessMode::ReadOnly)
+    }
+
+    /// 显式卷和挂载权限决定普通用户程序的文件能力，不根据程序名字推导写权限。
+    fn prepare_mode(&mut self, context: &TestContext<'_>, mode: AccessMode) -> TestResult {
+        self.path.prepare_path(context, mode)?;
         self.graph = Some(TaskGraph::try_new(64).map_err(|error| {
             context.diagnostic(format_args!("user-graph-prepare error={:?}", error));
             TestError("user identity graph preparation failed")
@@ -1067,6 +1073,11 @@ impl Fixture<DeviceInventory> for UserOwner {
 /// 父入口只保留原生 suite 宏的真实锚点。
 pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
     programs::__ktest_anchor()
+}
+
+/// 可写消费者仍注册在原文件测试目录，不构造另一运行入口。
+pub(crate) fn write_anchor() -> &'static ::ktest::SuiteSlot {
+    write::writes::__ktest_anchor()
 }
 
 #[ktest::suite(fixture = UserOwner, suite_resources = DeviceInventory, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]

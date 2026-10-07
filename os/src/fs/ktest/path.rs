@@ -12,20 +12,21 @@ pub(super) struct PathOwner {
 }
 
 impl PathOwner {
-    /// 正文开始才打开卷并构造完整视图，失败时原设备仍交给框架正常静止化。
-    pub(super) fn prepare_path(&mut self, context: &TestContext<'_>) -> TestResult {
+    /// 显式打开卷和根挂载的同一访问模式，失败时原设备保留完整停止责任。
+    pub(super) fn prepare_path(
+        &mut self,
+        context: &TestContext<'_>,
+        mode: AccessMode,
+    ) -> TestResult {
         // 同一 gate 只观察名字加载，不能同时暂停另一个名字的 inode 后端。
         self.owner.cache().ktest_set_load_hook(None);
-        let volume = self.owner.open(context)?;
+        let volume = checked(
+            context,
+            Ext4Volume::open(self.owner.disk()?.clone(), mode, 64),
+        )?;
         let vfs = Arc::try_new(checked(
             context,
-            Vfs::try_new(
-                volume.clone(),
-                self.owner.cache().clone(),
-                128,
-                4,
-                AccessMode::ReadOnly,
-            ),
+            Vfs::try_new(volume.clone(), self.owner.cache().clone(), 128, 4, mode),
         )?)
         .map_err(|_| TestError("path view owner OOM"))?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
@@ -163,7 +164,7 @@ pub(crate) mod walk {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs();
         let root = fixture.resolve(context, b"////")?;
         context.expect_eq(root.ptr_eq(fixture.context().root()), true);
@@ -321,7 +322,7 @@ pub(crate) mod walk {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs();
         let walk = fixture.resolve(context, b"/walk")?;
         let sub = fixture.resolve(context, b"/walk/sub")?;
@@ -405,7 +406,7 @@ pub(crate) mod boundary {
     #[test]
     #[ktest(tags("B17", "B18"))]
     fn scoped_root_and_cwd(context: &mut TestContext<'_>, fixture: &mut PathOwner) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs();
         let walk = fixture.resolve(context, b"/walk")?;
         let sub = fixture.resolve(context, b"/walk/sub")?;
@@ -448,7 +449,7 @@ pub(crate) mod mounts {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs();
         let covered = fixture.resolve(context, b"/mnt/extra")?;
         let mnt = fixture.resolve(context, b"/mnt")?;
@@ -554,7 +555,7 @@ pub(crate) mod pruning {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs();
         let root = vfs.root();
         let file = fixture.resolve(context, b"/pattern")?;
@@ -610,7 +611,7 @@ pub(crate) mod pruning {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let first = fixture.resolve(context, b"/pattern")?;
         read_pattern(context, &first)?;
         context.expect_eq(fixture.vfs().inodes().len(), 2);
@@ -633,7 +634,7 @@ pub(crate) mod pruning {
 
 /// 同名加载停点只挡 pattern，真实等待者登记后才放行首次真实后端查找。
 fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bool) -> TestResult {
-    fixture.prepare_path(context)?;
+    fixture.prepare_path(context, AccessMode::ReadOnly)?;
     let vfs = fixture.vfs().clone();
     let root = vfs.root();
     let before_len = vfs.dcache().len();
@@ -748,7 +749,7 @@ pub(crate) mod loading {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs().clone();
         let root = vfs.root();
         fixture
@@ -858,7 +859,7 @@ pub(crate) mod oom {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
         let vfs = fixture.vfs().clone();
         let cached = fixture.resolve(context, b"/pattern")?;
         read_pattern(context, &cached)?;

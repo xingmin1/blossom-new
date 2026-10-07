@@ -67,11 +67,11 @@ impl Bio {
     /// 失败不发表请求，folio 以原错误结束读入责任，原页来源按原阶归还。
     ///
     /// # Safety
-    /// Write 的整个传输范围必须已初始化；所有此前导出的 CPU 裸别名必须结束访问，
-    /// 直到完成回调或完成观察者重新取得 CPU 拥有权。Read 不要求未写尾部初始化，
-    /// 每个输入映射必须当前 CPU-owned，并移交原来源完整拥有与设备交权责任；
-    /// folio 的读入责任必须尚未完成，已发布的只读内容不得再次用于设备写入。
-    /// 回调若调用 MappedPages::bytes，仍须独立证明整个映射初始化。
+    /// Write 的整个范围必须已初始化；独占来源的全部 CPU 裸别名须结束至真实收权。
+    /// 共享文件 WB 来源必须持有对应原页及映射撤权完成的凭证，之后原始写会记录新 Dirty，
+    /// 不允许导出内容切片。每个输入映射须为 CPU-owned，移交来源完整设备访问责任；
+    /// Read 的读入者尚未初始化完成，短结果不授予未写尾部的内容访问权。
+    /// 回调若调用 MappedPages::bytes，须证明独占来源整个范围初始化且无并发写。
     /// Inline 回调不得睡眠、动态准备或递归停止本 Disk；Task 回调可以睡眠，
     /// 但不得等待自身父完成、等待本 Disk 停止或复用仍由回调访问的 slot。
     /// 两种回调都不得泄露 memory 借用或在返回后继续访问其裸别名。
@@ -323,7 +323,7 @@ impl BioInner {
                 .expect("bio memory missing at admission")
         };
         for mapped in &mut memory {
-            // SAFETY: unsafe 构造保证 Write 初始化及 CPU 裸别名访问结束；唯一 admission
+            // SAFETY: 构造保证初始化及来源的 CPU/共享 WB 协议；唯一 admission
             // 尚未发表 child，原拥有者保存在此父，全部 child 和生成者结束前不能收权。
             unsafe { mapped.begin_device_access() };
         }
@@ -509,8 +509,8 @@ impl BioInner {
         for mapped in &mut memory {
             let completed = remaining.min(mapped.len());
             remaining = remaining.saturating_sub(mapped.len());
-            // SAFETY: complete 已结束全部 child 与生成者并真实收权；回调全部返回。
-            // 仅无错误的完整连续前缀证明相应范围已初始化，失败保原错误且不授予内容。
+            // SAFETY: complete 已结束全部 child 与生成者并真实收权，回调全部返回；
+            // 连续前缀属于该映射，初始化与 WB 各结束自己的责任，失败保留原原因。
             unsafe {
                 mapped.complete_folio(IoResult {
                     completed,
