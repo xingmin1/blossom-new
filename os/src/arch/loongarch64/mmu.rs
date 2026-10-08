@@ -118,6 +118,16 @@ pub fn user_leaf_permissions(entry: usize) -> Option<PagePermissions> {
     })
 }
 
+/// 原子降权须同时撤掉软件 WRITE 与硬件 DIRTY，完整保留 PFN、NR/NX 和其他位。
+pub fn user_leaf_mkclean(entry: usize) -> usize {
+    entry & !(WRITE | DIRTY)
+}
+
+/// DIRTY 在写授权时预置，表示保守脏义务而非精确 store 次数。
+pub fn user_leaf_dirty(entry: usize) -> bool {
+    entry & DIRTY != 0
+}
+
 /// 将新根全部初始化为空目录；用户表不借用任何内核 DMW 页表。
 ///
 /// # Safety

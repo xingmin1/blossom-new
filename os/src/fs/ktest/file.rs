@@ -1069,18 +1069,6 @@ pub(crate) mod vm_lifetime {
         );
         assert!(patterned(&cached, 13));
         assert_ne!(&cached, private);
-        assert_eq!(
-            mm.map_file(
-                VM_TARGET + mm::PAGE_SIZE,
-                mm::PAGE_SIZE,
-                VM_RW,
-                VM_RW,
-                Arc::clone(&file),
-                0,
-                false
-            ),
-            Err(VmError::File(FsError::ReadOnly)),
-        );
         let tail = VM_TARGET + 2 * mm::PAGE_SIZE;
         let offset = PATTERN_SIZE & !(mm::PAGE_SIZE as u64 - 1);
         mm.map_file(

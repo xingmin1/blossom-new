@@ -182,6 +182,72 @@ impl UserPageTable {
         mapping(unsafe { read_slot(table, slot_index(va, 0)) })
     }
 
+    /// 同一 PTE 锁内检查实际 PFN 并降 W/脏位，硬件访问位竞争由 CAS 保留。
+    /// 返回脏观察与实际变化；调用者保页并在锁外完成所有 CPU 的翻译失效。
+    ///
+    /// # Safety
+    /// 调用者须串行软件修改，physical 的原页须保活至全 CPU 同步失效完成。
+    pub(crate) unsafe fn mkclean(&mut self, va: usize, physical: usize) -> Option<(bool, bool)> {
+        let leaf = self.leaf_table(va)?;
+        let pointer = arch::phys_to_virt(leaf) as *mut AtomicUsize;
+        // SAFETY: leaf_table 验证真实拥有路径和页对齐，软件修改由调用者串行；
+        // 槽始终原子访问，数据页由调用者保活，CAS 不产生用户内容引用。
+        let slot = unsafe { &*pointer.add(slot_index(va, 0)) };
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            let current = mapping(old)?;
+            if current.physical != physical {
+                return None;
+            }
+            let clean = arch::user_leaf_mkclean(old);
+            match slot.compare_exchange_weak(old, clean, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some((arch::user_leaf_dirty(old), clean != old)),
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    /// 仅对同 PFN 的现有叶改变访问权限，不申请目录，也不改变驻留拥有。
+    ///
+    /// # Safety
+    /// 软件修改须受同一 PTE 锁保护，原页须保活到锁外全部 CPU 同步失效完成。
+    pub(crate) unsafe fn protect_leaf(
+        &mut self,
+        va: usize,
+        physical: usize,
+        permissions: PagePermissions,
+    ) -> Result<bool, PageTableError> {
+        let next = checked_leaf(physical, permissions)?;
+        let Some(leaf) = self.leaf_table(va) else {
+            return Ok(false);
+        };
+        // SAFETY: leaf_table 验证本表拥有的完整叶表，调用者串行软件修改并保页。
+        let old = unsafe { read_slot(leaf, slot_index(va, 0)) };
+        if mapping(old).is_none_or(|current| current.physical != physical) {
+            return Ok(false);
+        }
+        // SAFETY: 同 PFN 改权不释放原页，旧翻译由调用者在锁外同步撤销。
+        unsafe { replace_slot(leaf, slot_index(va, 0), next) };
+        Ok(true)
+    }
+
+    /// 定位本对象实际拥有的叶表，不把常驻空目录或非法页地址当作可修改槽。
+    fn leaf_table(&self, va: usize) -> Option<usize> {
+        if !valid_page(va) {
+            return None;
+        }
+        let mut table = self.root_phys();
+        for level in (1..arch::USER_LEVELS).rev() {
+            // SAFETY: 当前根和检查过的下级表由本对象保活，PTE 锁串行软件拆表。
+            let entry = unsafe { read_slot(table, slot_index(va, level)) };
+            if !arch::user_entry_is_table(entry, level) {
+                return None;
+            }
+            table = arch::user_entry_physical(entry, level);
+        }
+        Some(table)
+    }
+
     /// 只解除一个叶而保留中间表，用于同步失效前的 break-before-make 交接。
     ///
     /// # Safety

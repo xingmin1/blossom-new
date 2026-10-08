@@ -1164,7 +1164,13 @@ pub(crate) mod vm {
             resident.0.buddy_free_pages + resident.0.slab_backing_pages,
         );
         mm.unmap(address, mm::PAGE_SIZE).unwrap();
-        assert_eq!(baseline()?.0, empty.0);
+        assert!(mm.mapping(address).is_none());
+        // SLUB 的空页归还可改变临时分布，独占数据页与表页的归还总数须恢复。
+        let released = baseline()?.0;
+        assert_eq!(
+            released.buddy_free_pages + released.slab_backing_pages,
+            empty.0.buddy_free_pages + empty.0.slab_backing_pages,
+        );
         drop(mm);
         Ok(())
     }

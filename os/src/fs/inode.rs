@@ -15,9 +15,10 @@ use crate::fs::ext4::{
     codec, BlockMapping, DirectoryEntry, Ext4Volume, InodeData, InodeKind, InodeTime,
 };
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
+use crate::mm::folio::FolioContent;
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::sched;
-use crate::sync::{SleepMutex, SleepRwLock, SpinLock};
+use crate::sync::{ReadGuard, SleepMutex, SleepRwLock, SpinLock};
 use crate::time;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
@@ -76,6 +77,7 @@ pub struct InodeMetadata {
 
 struct InodeState {
     write: SleepMutex<()>,
+    invalidate: SleepRwLock<()>,
     metadata: SpinLock<InodeMetadata>,
     root: SleepRwLock<[u8; 60]>,
     writecount: SpinLock<isize>,
@@ -135,10 +137,26 @@ impl InodeState {
     fn new(data: InodeData) -> Self {
         Self {
             write: SleepMutex::new(()),
+            invalidate: SleepRwLock::new(()),
             metadata: SpinLock::new(InodeMetadata::from_data(&data)),
             root: SleepRwLock::new(data.block),
             writecount: SpinLock::new(0),
         }
+    }
+}
+
+/// 锁外准备完成的同源页及当时事实，不保留 inode、块根或内容锁的 guard。
+pub(crate) struct PreparedMkwrite {
+    folio: FolioRef,
+    index: u64,
+    size: u64,
+    prepared_sectors: u8,
+}
+
+impl PreparedMkwrite {
+    /// 借用原 canonical 页，最终授权必须重核该页仍属于当前 inode 索引。
+    pub(crate) fn folio(&self) -> &FolioRef {
+        &self.folio
     }
 }
 
@@ -446,6 +464,152 @@ impl InodeRef {
         })
     }
 
+    /// 普通 Task 在 mmap/PTE 保护之外准备当前 EOF 内全部 FS 块，不增长文件长度。
+    /// 已发表的块与时间修改在后块失败时保留；未发表资源由原 PreparedMapping 显式取消。
+    pub(crate) fn prepare_mkwrite(&self, index: u64) -> Result<PreparedMkwrite, FsError> {
+        let volume = self.filesystem();
+        volume.require_write(volume.claim())?;
+        let _access = self.acquire_write()?;
+        let state = self.wait_loaded()?;
+        let _write = state.write.lock();
+        let _invalidate = state.invalidate.read();
+        let metadata = *state.metadata.lock();
+        if metadata.kind != InodeKind::Regular {
+            return Err(FsError::InvalidOperation);
+        }
+        let start = index
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(FsError::FileTooLarge)?;
+        if metadata.size <= start {
+            return Err(FsError::InvalidOperation);
+        }
+        let folio = self.read_page(index)?;
+        let block_size = volume.geometry().block_size;
+        for offset in (0..PAGE_SIZE).step_by(block_size) {
+            let position = start
+                .checked_add(offset as u64)
+                .ok_or(FsError::FileTooLarge)?;
+            if metadata.size <= position {
+                break;
+            }
+            self.prepare_mkwrite_block(state, &folio, position)?;
+        }
+        let prepared_sectors = folio.lock_content().file_prepared_sectors();
+        Ok(PreparedMkwrite {
+            folio,
+            index,
+            size: metadata.size,
+            prepared_sectors,
+        })
+    }
+
+    /// inode.write 与 invalidate 读侧已经持有；块准备、发表和旧节点归还沿原写后端。
+    fn prepare_mkwrite_block(
+        &self,
+        state: &InodeState,
+        folio: &FolioRef,
+        position: u64,
+    ) -> Result<(), FsError> {
+        let volume = self.filesystem();
+        let block_size = volume.geometry().block_size;
+        let old = *state.metadata.lock();
+        let (record, record_offset) = volume.inode_record(old.number)?;
+        let prepared = {
+            let root = state.root.write();
+            let current = record.with_read(|bytes| {
+                codec::decode_inode(
+                    volume.geometry(),
+                    old.number,
+                    &bytes[record_offset..record_offset + volume.geometry().inode_size],
+                )
+            })??;
+            if InodeMetadata::from_data(&current) != old || current.block != *root {
+                return Err(FsError::Corrupt);
+            }
+            volume.prepare_write(&old, &root, position / block_size as u64)?
+        };
+        let next = match write_metadata(
+            volume.geometry(),
+            &old,
+            0,
+            0,
+            prepared.added_blocks,
+            prepared.removed_blocks,
+            time::now().as_nanos(),
+        ) {
+            Ok(next) => next,
+            Err(error) => {
+                prepared.cancel(volume);
+                return Err(error);
+            }
+        };
+        let mut root = state.root.write();
+        let mut content = folio.lock_content();
+        let offset = (position % PAGE_SIZE as u64) as usize;
+        if prepared.zero {
+            content
+                .zero_file_range(offset, block_size)
+                .expect("prepared mkwrite zero range");
+            content
+                .mark_dirty(offset, block_size)
+                .expect("prepared mkwrite dirty range");
+        }
+        let next_root = prepared.root;
+        let retired = prepared.publish(volume, old.checksum_seed);
+        record
+            .update(volume.claim(), |bytes| {
+                codec::patch_inode_mapping(
+                    volume.geometry(),
+                    &mut bytes[record_offset..record_offset + volume.geometry().inode_size],
+                    &next,
+                    &next_root,
+                )
+            })
+            .expect("prepared writable mkwrite inode record");
+        *root = next_root;
+        *state.metadata.lock() = next;
+        content
+            .mark_file_prepared(offset, block_size)
+            .expect("published mkwrite block");
+        drop(content);
+        for block in retired {
+            // SAFETY: root 写侧已排空旧读者，发表的新树已摘除原节点，写侧禁止新使用；
+            // release 等旧元数据真实 WB 并失效准确窗口，然后才归还物理位图。
+            unsafe { volume.release_detached_block(block) };
+        }
+        Ok(())
+    }
+
+    /// 最终授权在 mmap 之后、folio 之前取得读侧，增长与失效使用同一锁的写侧。
+    pub(crate) fn lock_invalidate(&self) -> Result<ReadGuard<'_, ()>, FsError> {
+        Ok(self.wait_loaded()?.invalidate.read())
+    }
+
+    /// 持 mmap→invalidate 读侧→本页内容锁重核准备事实，不等待 WB 或取得块根。
+    /// 真实 size、页身份或 WB 变化返回 false，由调用者放全部保护后重新准备或等待。
+    pub(crate) fn finish_mkwrite(
+        &self,
+        prepared: &PreparedMkwrite,
+        content: &mut FolioContent<'_>,
+    ) -> Result<bool, FsError> {
+        let metadata = *self.loaded_state().metadata.lock();
+        let start = prepared
+            .index
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(FsError::FileTooLarge)?;
+        if metadata.size != prepared.size
+            || metadata.size <= start
+            || content.folio().phys_addr() != prepared.folio.phys_addr()
+            || !self.mapping.is_canonical(prepared.index, &prepared.folio)
+            || content.writeback_sectors() != 0
+            || content.file_prepared_sectors() != prepared.prepared_sectors
+        {
+            return Ok(false);
+        }
+        content.mark_prepared_dirty((metadata.size - start).min(PAGE_SIZE as u64) as usize)?;
+        Ok(true)
+    }
+
     /// 唯一普通写循环只由绑定本 inode 的 WriteAccess 调用；输入 fault 不持块根或内容锁。
     fn write_from(
         &self,
@@ -485,7 +649,10 @@ impl InodeRef {
                 Err(error) => return write_result(start, accepted, error),
             };
             let old = *state.metadata.lock();
-            if old.size < position {
+            // 输入已真正取得后才进入失效域，用户源 fault 不携带目的 invalidate guard。
+            let end = position + pulled as u64;
+            let _invalidate = state.invalidate.write();
+            if old.size < end {
                 if let Err(error) = self.zero_eof_tail(&old, position) {
                     return write_result(start, accepted, error);
                 }
@@ -579,6 +746,9 @@ impl InodeRef {
                 .expect("prepared writable inode record");
             *root = next_root;
             *state.metadata.lock() = next;
+            content
+                .mark_file_prepared(block_offset, size)
+                .expect("published buffered write block");
             drop(content);
             for block in retired {
                 // SAFETY: root 写侧已排空旧块树读者，发表后的根和父节点均已去掉旧节点；
@@ -656,29 +826,47 @@ impl InodeRef {
         self.read_page(index)
     }
 
-    /// 稀疏增长先清旧 EOF 所在已映射块的尾部，避免新 size 暴露原盘尾字节。
-    /// 此时尚未持目的 folio 或块根写侧，filefault 可以沿正常读侧完成旧页。
+    /// 增长写侧先撤旧 EOF 尾页的共享 W 并完成 CSD，再清将变有效的缓存 gap。
+    /// 同块与 hole 缓存都清零，仅真实 Mapped 块产生 Dirty；调用者在 size 发表前保持 invalidate 写侧。
     fn zero_eof_tail(&self, old: &InodeMetadata, position: u64) -> Result<(), FsError> {
-        let size = self.filesystem.geometry().block_size as u64;
-        if old.size % size == 0 || old.size / size == position / size {
-            return Ok(());
-        }
-        if !matches!(
-            self.map_block(old.size / size)?,
-            BlockMapping::Mapped { .. }
-        ) {
-            return Ok(());
-        }
-        let folio = self.read_page(old.size / PAGE_SIZE as u64)?;
-        let mut content = folio.lock_content();
         let start = (old.size % PAGE_SIZE as u64) as usize;
-        let block_start = start / size as usize * size as usize;
-        let end = block_start + size as usize;
-        let zeros = [0u8; 512];
-        for offset in (start..end).step_by(zeros.len()) {
-            content.copy_from(offset, &zeros[..(end - offset).min(zeros.len())])?;
+        if start == 0 {
+            return Ok(());
         }
-        content.mark_dirty(block_start, size as usize)?;
+        let index = old.size / PAGE_SIZE as u64;
+        let folio = self.read_page(index)?;
+        let size = self.filesystem.geometry().block_size;
+        let end = position
+            .saturating_sub(index * PAGE_SIZE as u64)
+            .min(PAGE_SIZE as u64) as usize;
+        let end = end.max(start);
+        let mapped = self.with_map_read(|metadata, root| {
+            if end == start {
+                return Ok(0u8);
+            }
+            let mut mapped = 0u8;
+            for offset in (start / size * size..end).step_by(size) {
+                let logical = (index * PAGE_SIZE as u64 + offset as u64) / size as u64;
+                if matches!(
+                    self.filesystem.map_block(metadata, root, logical)?,
+                    BlockMapping::Mapped { .. }
+                ) {
+                    mapped |= 1 << (offset / size);
+                }
+            }
+            Ok(mapped)
+        })?;
+        let mut content = folio.lock_content();
+        self.mapping.mkclean(index, &folio, &mut content);
+        if end == start {
+            return Ok(());
+        }
+        content.zero_file_range(start, end - start)?;
+        for offset in (start / size * size..end).step_by(size) {
+            if mapped & (1 << (offset / size)) != 0 {
+                content.mark_dirty(offset, size)?;
+            }
+        }
         Ok(())
     }
 

@@ -65,6 +65,16 @@ pub const fn user_leaf_permissions(entry: usize) -> Option<PagePermissions> {
     })
 }
 
+/// 保留原 PFN、读执行权限及访问位，只撤销写许可和保守脏位。
+pub const fn user_leaf_mkclean(entry: usize) -> usize {
+    entry & !((1 << 2) | (1 << 7))
+}
+
+/// 当前 D 表达写授权时预置的保守脏义务，不表示精确 store 次数。
+pub const fn user_leaf_dirty(entry: usize) -> bool {
+    entry & (1 << 7) != 0
+}
+
 /// 清空用户低半，并借用已经发表且不再修改的最终内核根高半。
 ///
 /// # Safety

@@ -44,6 +44,8 @@ struct FolioShared {
     contents: FolioContents,
     dirty: u8,
     writeback: u8,
+    /// 已发表且完成初始化的文件 FS 块；只记准备事实，不保存第二份物理块根。
+    file_prepared: u8,
 }
 
 /// 页用途内保存原拥有者、独立内容锁和等待源；活引用期间禁止移动整个用途。
@@ -252,6 +254,7 @@ impl FolioRef {
                     contents,
                     dirty: 0,
                     writeback: 0,
+                    file_prepared: 0,
                 }),
                 locked: AtomicBool::new(false),
                 waiters: WaitQueue::new(),
@@ -584,6 +587,88 @@ impl Drop for FolioRef {
 }
 
 impl FolioContent<'_> {
+    /// 借用当前 guard 实际锁住的原页，用于最终授权与回写的身份核对。
+    pub(crate) fn folio(&self) -> &FolioRef {
+        self.folio
+    }
+
+    /// 在内容锁内读取真实 WB 范围；检查为零之后仍须保持授权与清脏互斥。
+    pub(crate) fn writeback_sectors(&self) -> u8 {
+        self.folio.writeback_sectors()
+    }
+
+    /// 读取本页已发表 FS 块的准备事实，最终授权核对时不取得 inode 块根。
+    pub(crate) fn file_prepared_sectors(&self) -> u8 {
+        FolioState::shared(&self.folio.descriptor.usage()).file_prepared
+    }
+
+    /// 保存已经发表并初始化的整 FS 块事实，调用者持 inode invalidate 和本内容锁。
+    /// 块根修改必须先真实提交；此位图不承担分配或块地址查询责任。
+    pub(crate) fn mark_file_prepared(
+        &mut self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), BlockError> {
+        validate_range(offset, len)?;
+        if offset % SECTOR_SIZE != 0 || len % SECTOR_SIZE != 0 {
+            return Err(BlockError::Misaligned);
+        }
+        let mut usage = self.folio.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        if !matches!(&shared.contents, FolioContents::File { .. }) {
+            return Err(BlockError::InvalidRange);
+        }
+        FolioState::range_ready(shared, offset, len)?;
+        shared.file_prepared |= sector_mask(offset, len);
+        Ok(())
+    }
+
+    /// 只重标当前 EOF 内已真实准备的整 FS 块；hole 与 EOF 外块不产生脏义务。
+    pub(crate) fn mark_prepared_dirty(&mut self, valid_bytes: usize) -> Result<(), BlockError> {
+        if PAGE_SIZE < valid_bytes {
+            return Err(BlockError::InvalidRange);
+        }
+        let Some(FolioOwner::File(inode)) = &self.folio.owner else {
+            return Err(BlockError::InvalidRange);
+        };
+        if valid_bytes == 0 {
+            return Ok(());
+        }
+        let size = inode.filesystem().geometry().block_size;
+        let end = valid_bytes.div_ceil(size) * size;
+        let mut usage = self.folio.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        FolioState::range_ready(shared, 0, end)?;
+        shared.dirty |= shared.file_prepared & sector_mask(0, end);
+        Ok(())
+    }
+
+    /// 初始化已有效的文件缓存 byte 范围，不把未映射 hole 的零内容当作盘块 Dirty。
+    /// 调用者先撤该页共享写许可并完成 TLB 同步，再按真实块映射标脏。
+    pub(crate) fn zero_file_range(&mut self, offset: usize, len: usize) -> Result<(), BlockError> {
+        validate_copy_range(offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        {
+            let usage = self.folio.descriptor.usage();
+            let shared = FolioState::shared(&usage);
+            if !matches!(&shared.contents, FolioContents::File { .. }) {
+                return Err(BlockError::InvalidRange);
+            }
+            FolioState::range_ready(shared, offset, len)?;
+        }
+        let address = arch::phys_to_virt(self.folio.phys_addr()) + offset;
+        let zeros = [0u8; SECTOR_SIZE];
+        for part in (0..len).step_by(zeros.len()) {
+            let count = (len - part).min(zeros.len());
+            // SAFETY: 内容 guard 保活并串行内核修改，完整窗口已初始化且在原页内；
+            // 独占零片段不与目标重叠，文件内容仅作原始访问，不建立共享 RAM 引用。
+            unsafe { arch::copy_user_bytes((address + part) as *mut u8, zeros.as_ptr(), count) };
+        }
+        Ok(())
+    }
+
     /// 在持内容锁期间检查真实 byte 窗口，不把同页其他 sector 的成功借给本范围。
     pub fn range_ready(&self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_range(offset, len)?;
@@ -674,6 +759,7 @@ impl FolioContent<'_> {
             }
         }
         shared.dirty = 0;
+        shared.file_prepared = 0;
     }
 
     /// 在真实元数据删除协议下失效准确窗口，保留同页其他块的内容与义务。

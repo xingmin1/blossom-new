@@ -18,7 +18,7 @@ const ALL: PagePermissions = PagePermissions {
     execute: true,
 };
 
-/// 仅支持基本页匿名与正式文件映射，私有文件写权限不授权向只读卷写回。
+/// 共享最大 W 来自真实 RW OFD 与挂载写能力；私有文件写仍只授权匿名 COW。
 pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let [address, length, prot, flags, fd, offset] = raw;
     if flags & !SUPPORTED != 0
@@ -47,8 +47,12 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
         if access == 1 || (!private && permissions.write && access == 0) {
             return Err(Errno::Permission);
         }
-        if !private && access == 0 {
-            maximum.write = false;
+        if !private {
+            let writable = file.path().check_writable();
+            maximum.write = access == 2 && writable.is_ok();
+            if permissions.write {
+                writable?;
+            }
         }
         MmapSource::File {
             file,

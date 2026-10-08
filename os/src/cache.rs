@@ -3,10 +3,15 @@
 mod index;
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::convert::TryFrom;
+use core::ops::Range;
 
 use crate::block::{AccessMode, BlockError, FsClaim, SECTOR_BYTES};
 use crate::fs::ext4::Ext4Volume;
+use crate::fs::InodeRef;
+use crate::mm::folio::FolioContent;
+use crate::mm::space::{sync_all, PteDomain};
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
 use crate::sync::{SleepMutex, SpinLock};
 use index::{Node, Tree};
@@ -415,9 +420,73 @@ impl BufferRef {
     }
 }
 
-/// canonical inode 自己的空稀疏页索引，不将文件工作集封死在预留槽数。
+/// 每份文件 VMA 的固定来源；驻留页仅弱持来源，私有 COW 后仍保文件范围事实。
+pub(crate) struct FileRangeData {
+    pub(crate) inode: InodeRef,
+    pub(crate) domain: Arc<PteDomain>,
+    pub(crate) range: Range<usize>,
+    pub(crate) offset: u64,
+    pub(crate) private: bool,
+}
+
+impl FileRangeData {
+    /// 有序键的分配地址由遍历 cursor 的 Arc 保活，防止迭代期间地址复用。
+    fn key(this: &Arc<Self>) -> (u64, usize) {
+        (this.offset, Arc::as_ptr(this) as usize)
+    }
+}
+
+/// VMA 独占登记责任；先从 inode 的弱索引摘离，再释放固定来源及 PTE 域拥有。
+pub(crate) struct FileRangeRegistration {
+    data: Arc<FileRangeData>,
+}
+
+impl FileRangeRegistration {
+    /// 在候选 VMA 可见前登记；候选无可写叶，失败不会改变现有映射。
+    pub(crate) fn try_new(
+        inode: InodeRef,
+        domain: Arc<PteDomain>,
+        range: Range<usize>,
+        offset: u64,
+        private: bool,
+    ) -> Result<Self, BlockError> {
+        let data = Arc::try_new(FileRangeData {
+            inode,
+            domain,
+            range,
+            offset,
+            private,
+        })
+        .map_err(|_| BlockError::NoMemory)?;
+        data.inode.mapping().register_range(&data)?;
+        Ok(Self { data })
+    }
+
+    /// 借用不可变来源，不允许取得 Arc 可变权限或改变登记键。
+    pub(crate) fn data(&self) -> &Arc<FileRangeData> {
+        &self.data
+    }
+}
+
+impl Drop for FileRangeRegistration {
+    /// 摘离 Weak 在范围锁外析构；字段的最后强拥有也在索引摘离之后释放。
+    fn drop(&mut self) {
+        let detached = {
+            let mut ranges = self.data.inode.mapping().ranges.lock();
+            let key = FileRangeData::key(&self.data);
+            let index = ranges
+                .binary_search_by_key(&key, |(key, _)| *key)
+                .expect("file range registration disappeared");
+            ranges.remove(index)
+        };
+        drop(detached);
+    }
+}
+
+/// canonical inode 的稀疏页与弱文件范围索引；来源独立于当前驻留 backing。
 pub struct FileMapping {
     index: FolioIndex,
+    ranges: SpinLock<Vec<((u64, usize), Weak<FileRangeData>)>>,
 }
 
 impl FileMapping {
@@ -425,6 +494,7 @@ impl FileMapping {
     pub const fn new() -> Self {
         Self {
             index: FolioIndex::new(None, false),
+            ranges: SpinLock::new(Vec::new()),
         }
     }
 
@@ -436,6 +506,98 @@ impl FileMapping {
         index: u64,
     ) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
         self.index.get_or_prepare(index)
+    }
+
+    /// 短索引锁只核现有节点的原页身份，不增加 folio 引用或建立第二页缓存。
+    pub(crate) fn is_canonical(&self, index: u64, folio: &FolioRef) -> bool {
+        self.index
+            .entries
+            .lock()
+            .get(index)
+            .is_some_and(|node| node.folio.phys_addr() == folio.phys_addr())
+    }
+
+    /// 容量不足时在锁外准备替代存储；短锁内重查并仅转移原 Weak，不分配或析构。
+    fn register_range(&self, data: &Arc<FileRangeData>) -> Result<(), BlockError> {
+        let key = FileRangeData::key(data);
+        let mut spare = Vec::new();
+        loop {
+            let mut ranges = self.ranges.lock();
+            if ranges.len() < ranges.capacity() {
+                let index = ranges.partition_point(|(existing, _)| *existing < key);
+                ranges.insert(index, (key, Arc::downgrade(data)));
+                return Ok(());
+            }
+            let needed = ranges.len().checked_add(1).ok_or(BlockError::NoMemory)?;
+            if needed <= spare.capacity() {
+                spare.extend(ranges.drain(..));
+                core::mem::swap(&mut *ranges, &mut spare);
+                let index = ranges.partition_point(|(existing, _)| *existing < key);
+                ranges.insert(index, (key, Arc::downgrade(data)));
+                drop(ranges);
+                drop(spare);
+                return Ok(());
+            }
+            drop(ranges);
+            spare
+                .try_reserve_exact(needed)
+                .map_err(|_| BlockError::NoMemory)?;
+        }
+    }
+
+    /// 持真实 folio 内容锁逐个枚举 shared 文件范围，降权后在全部短锁外同步全 CPU。
+    /// 新写授权也取此内容锁，故候选登记及并发移除无需全局代次或整表快照。
+    pub(crate) fn mkclean(
+        &self,
+        index: u64,
+        folio: &FolioRef,
+        content: &mut FolioContent<'_>,
+    ) -> usize {
+        assert_eq!(content.folio().phys_addr(), folio.phys_addr());
+        let start = index
+            .checked_mul(PAGE_SIZE as u64)
+            .expect("file page offset overflow");
+        let end = start
+            .checked_add(PAGE_SIZE as u64)
+            .expect("file page end overflow");
+        let mut cursor: Option<Arc<FileRangeData>> = None;
+        let mut cleaned = 0;
+        loop {
+            let next = {
+                let ranges = self.ranges.lock();
+                let after = cursor.as_ref().map(FileRangeData::key);
+                let position = after.map_or(0, |key| {
+                    ranges.partition_point(|(existing, _)| *existing <= key)
+                });
+                ranges
+                    .get(position)
+                    .filter(|(key, _)| key.0 < end)
+                    .map(|(_, weak)| weak.upgrade().expect("registered file range lost owner"))
+            };
+            let Some(data) = next else { break };
+            if !data.private {
+                let (observed, changed) =
+                    data.domain.mkclean_range(&data, start, folio.phys_addr());
+                cleaned += changed;
+                if observed {
+                    let size = data
+                        .inode
+                        .metadata_snapshot()
+                        .expect("registered file inode is not loaded")
+                        .size;
+                    let valid = size.saturating_sub(start).min(PAGE_SIZE as u64) as usize;
+                    if 0 < valid {
+                        content
+                            .mark_prepared_dirty(valid)
+                            .expect("prepared file dirty range is invalid");
+                    }
+                }
+            }
+            cursor = Some(data);
+        }
+        // 范围换身份可已撤 W、尚未结束自己的 CSD；零命中也须结束旧远核翻译。
+        sync_all();
+        cleaned
     }
 
     /// 仅摘除无内容锁、Dirty、WB 和外部使用者的静止页。

@@ -5,9 +5,10 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use crate::arch::{self, UserAccess};
+use crate::cache::FileRangeRegistration;
 use crate::fs::FileRef;
 use crate::mm::anon::SharedAnon;
-use crate::mm::space::VmError;
+use crate::mm::space::{PteDomain, VmError};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
 
@@ -32,6 +33,7 @@ pub(crate) struct Vma {
     pub(crate) permissions: PagePermissions,
     pub(crate) maximum: PagePermissions,
     pub(crate) backing: VmaBacking,
+    pub(crate) file_range: Option<FileRangeRegistration>,
 }
 
 impl Vma {
@@ -41,17 +43,36 @@ impl Vma {
         permissions: PagePermissions,
         maximum: PagePermissions,
         backing: VmaBacking,
+        domain: Option<&Arc<PteDomain>>,
     ) -> Result<Arc<Self>, VmError> {
         validate_permissions(permissions)?;
         validate_permissions(maximum)?;
         if !permissions_within(permissions, maximum) {
             return Err(VmError::Permission);
         }
+        let file_range = match &backing {
+            VmaBacking::File {
+                file,
+                offset,
+                private,
+            } => Some(
+                FileRangeRegistration::try_new(
+                    file.path().inode().map_err(VmError::File)?.clone(),
+                    Arc::clone(domain.expect("file VMA requires its PTE domain")),
+                    range.clone(),
+                    *offset,
+                    *private,
+                )
+                .map_err(|error| VmError::File(error.into()))?,
+            ),
+            _ => None,
+        };
         Arc::try_new(Self {
             range,
             permissions,
             maximum,
             backing,
+            file_range,
         })
         .map_err(|_| VmError::NoMemory)
     }
@@ -68,6 +89,11 @@ impl Vma {
             VmaBacking::SharedAnonymous { .. } => false,
             VmaBacking::File { private, .. } => *private,
         }
+    }
+
+    /// 共享文件写必须经过原页准备，匿名共享与私有 COW 不走文件写授权。
+    pub(crate) fn is_shared_file(&self) -> bool {
+        matches!(&self.backing, VmaBacking::File { private: false, .. })
     }
 
     /// 从原范围拆出新身份，文件及共享匿名偏移随左边界移动，最大权限保持原义。
@@ -96,7 +122,13 @@ impl Vma {
                 private: *private,
             },
         };
-        Self::try_new(range, permissions, self.maximum, backing)
+        Self::try_new(
+            range,
+            permissions,
+            self.maximum,
+            backing,
+            self.file_range.as_ref().map(|range| &range.data().domain),
+        )
     }
 
     /// 只合并权限及真实后备连续的相邻范围，保留无访问范围的独立边界。
@@ -167,23 +199,24 @@ impl MmapState {
             .is_none_or(|vma| range.end <= vma.range.start)
     }
 
-    /// 在 mmap 写侧准备完整新索引及合并身份，成功后一次发表，失败保留原索引。
-    pub(crate) fn insert(&mut self, vma: Arc<Vma>) -> Result<(), VmError> {
-        if !self.vacant(&vma.range) {
-            return Err(VmError::Occupied);
-        }
-        let range = vma.range.clone();
-        let vmas = self.replacement(&range, Some(vma))?;
-        self.vmas = vmas;
-        Ok(())
-    }
-
-    /// 在独立 Mm 尚未发表时复制范围索引，共享不可变身份不合并驻留页责任。
-    pub(crate) fn snapshot(&self) -> Result<Self, VmError> {
+    /// 独立子 Mm 为每份文件 VMA 创建自己的登记，匿名不可变身份可以共享。
+    pub(crate) fn snapshot(&self, domain: &Arc<PteDomain>) -> Result<Self, VmError> {
         let mut vmas = Vec::new();
         vmas.try_reserve_exact(self.vmas.len())
             .map_err(|_| VmError::NoMemory)?;
-        vmas.extend(self.vmas.iter().cloned());
+        for vma in &self.vmas {
+            if vma.file_range.is_some() {
+                vmas.push(Vma::try_new(
+                    vma.range.clone(),
+                    vma.permissions,
+                    vma.maximum,
+                    vma.backing.clone(),
+                    Some(domain),
+                )?);
+            } else {
+                vmas.push(Arc::clone(vma));
+            }
+        }
         Ok(Self {
             vmas,
             heap_start: self.heap_start,
@@ -208,11 +241,6 @@ impl MmapState {
             }
             if !permissions_within(permissions, vma.maximum) {
                 return Err(VmError::Permission);
-            }
-            if let VmaBacking::File { private: false, .. } = &vma.backing {
-                if permissions.write {
-                    return Err(VmError::File(crate::fs::FsError::ReadOnly));
-                }
             }
             cursor = vma.range.end.min(range.end);
             if cursor == range.end {
@@ -306,6 +334,10 @@ fn coalesce(vmas: &mut Vec<Arc<Vma>>) -> Result<(), VmError> {
                 previous.permissions,
                 previous.maximum,
                 previous.backing.clone(),
+                previous
+                    .file_range
+                    .as_ref()
+                    .map(|range| &range.data().domain),
             )?;
             vmas[kept - 1] = merged;
         } else {

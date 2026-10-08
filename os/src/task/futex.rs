@@ -1,4 +1,4 @@
-//! 非 PI 用户同步沿实际 MM/共享匿名身份登记；固定桶只移出通知值，锁外进入调度器。
+//! 非 PI 用户同步按真实 MM、匿名或文件后备登记；固定桶移出通知值后才执行唤醒。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -9,7 +9,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::{self, UserAccess};
-use crate::mm::space::{FutexAccessError, FutexKey, Mm, VmError};
+use crate::mm::space::{FutexAccessError, FutexKey, FutexRead, Mm, VmError};
 use crate::sync::SpinLock;
 use crate::time::{self, MonotonicInstant};
 use crate::timer::{Timer, TimerKind};
@@ -18,12 +18,11 @@ use crate::wait::{WaitId, Waiter, Waker};
 const BUCKETS: usize = 32;
 const INLINE_NOTIFICATIONS: usize = 64;
 
-/// 核心只区分比较、参数、不支持后备及真实用户映射错误；ABI 层决定 errno。
+/// 核心保留比较、参数与真实用户映射错误，ABI 层决定 errno。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FutexError {
     Mismatch,
     InvalidArgument,
-    Unsupported,
     Vm(VmError),
 }
 
@@ -31,16 +30,6 @@ impl From<VmError> for FutexError {
     /// 不丢失实际用户访问失败原因。
     fn from(error: VmError) -> Self {
         Self::Vm(error)
-    }
-}
-
-impl From<FutexAccessError> for FutexError {
-    /// 共享文件同步限制仅在 futex 边界转换，不增加一般 VM 错误分支。
-    fn from(error: FutexAccessError) -> Self {
-        match error {
-            FutexAccessError::Vm(error) => Self::Vm(error),
-            FutexAccessError::Unsupported => Self::Unsupported,
-        }
     }
 }
 
@@ -320,6 +309,46 @@ fn timeout_notify(timer: Pin<&Timer>) {
     waker.notify();
 }
 
+/// 在原 mmap 读侧取得实际后备身份，缺页或私有文件 COW 先退出读侧再准备。
+fn read_key(
+    mm: &Arc<Mm>,
+    address: usize,
+    private: bool,
+) -> Result<(FutexRead<'_>, FutexKey), FutexError> {
+    loop {
+        let mapping = mm.futex_read();
+        match mapping.key(address, private) {
+            Ok(key) => return Ok((mapping, key)),
+            Err(FutexAccessError::Vm(error)) => return Err(error.into()),
+            Err(FutexAccessError::NeedsFault(access)) => {
+                drop(mapping);
+                mm.fault(address, access)?;
+            }
+        }
+    }
+}
+
+/// 两个重排身份来自同一 mmap 读侧，目的页准备结束后重新解析两端。
+fn read_keys(
+    mm: &Arc<Mm>,
+    source: usize,
+    destination: usize,
+    private: bool,
+) -> Result<(FutexRead<'_>, FutexKey, FutexKey), FutexError> {
+    loop {
+        let (mapping, source_key) = read_key(mm, source, private)?;
+        match mapping.key(destination, private) {
+            Ok(destination_key) => return Ok((mapping, source_key, destination_key)),
+            Err(FutexAccessError::Vm(error)) => return Err(error.into()),
+            Err(FutexAccessError::NeedsFault(access)) => {
+                drop(mapping);
+                drop(source_key);
+                mm.fault(destination, access)?;
+            }
+        }
+    }
+}
+
 /// 与当前字的比较和登记在 MM→PTE→bucket 内完成；被选择即成功，不要求用户字改变。
 pub fn wait(
     mm: &Arc<Mm>,
@@ -332,8 +361,7 @@ pub fn wait(
     validate(address, mask)?;
     loop {
         // mmap 读侧可能用自己的 Waiter 等待，必须先取得它，再建立本轮唯一 futex Waiter。
-        let mapping = mm.futex_read();
-        let key = mapping.key(address, private)?;
+        let (mapping, key) = read_key(mm, address, private)?;
         if mapping.with_word(address, |_| ()).is_none() {
             drop(mapping);
             drop(key);
@@ -427,7 +455,8 @@ pub fn wake(
     validate(address, mask)?;
     let mut notifications = Notifications::new();
     loop {
-        let key = mm.futex_read().key(address, private)?;
+        let (mapping, key) = read_key(mm, address, private)?;
+        drop(mapping);
         let needed = {
             let mut bucket = TABLE[key.hash() & (BUCKETS - 1)].lock();
             let quota = count.max(1);
@@ -506,9 +535,7 @@ pub fn requeue(
     validate(destination, u32::MAX)?;
     let mut notifications = Notifications::new();
     loop {
-        let mapping = mm.futex_read();
-        let source_key = mapping.key(address, private)?;
-        let destination_key = mapping.key(destination, private)?;
+        let (mapping, source_key, destination_key) = read_keys(mm, address, destination, private)?;
         if compare.is_some() && mapping.with_word(address, |_| ()).is_none() {
             drop(mapping);
             drop(source_key);
@@ -606,7 +633,8 @@ pub fn test_snapshot(
     mask: u32,
 ) -> Result<FutexSnapshot, FutexError> {
     validate(address, mask)?;
-    let key = mm.futex_read().key(address, private)?;
+    let (mapping, key) = read_key(mm, address, private)?;
+    drop(mapping);
     let bucket = TABLE[key.hash() & (BUCKETS - 1)].lock();
     let mut snapshot = FutexSnapshot {
         count: 0,

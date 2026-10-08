@@ -97,7 +97,6 @@ impl From<FutexError> for Errno {
         match error {
             FutexError::Mismatch => Self::Again,
             FutexError::InvalidArgument => Self::InvalidArgument,
-            FutexError::Unsupported => Self::Unsupported,
             FutexError::Vm(VmError::NoMemory) => Self::NoMemory,
             FutexError::Vm(VmError::File(error)) => error.into(),
             FutexError::Vm(_) => Self::BadAddress,

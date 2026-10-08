@@ -88,7 +88,7 @@ fn select_metadata_work(cache: &MetadataCache, budget: usize, mark: FolioMark) {
     }
 }
 
-/// 在当前块根读侧逐 FS 块交原 folio，未映射脏数据暴露为实际一致性错误。
+/// 在当前块根读侧逐 FS 块交原 folio；持内容锁撤共享 W 并完成 CSD 后才清脏。
 fn sync_file_page(inode: &InodeRef, index: u64, folio: &FolioRef) -> Result<(), FsError> {
     inode.with_map_read(|metadata, root| {
         let volume = inode.filesystem();
@@ -118,9 +118,10 @@ fn sync_file_page(inode: &InodeRef, index: u64, folio: &FolioRef) -> Result<(), 
                 .ok_or(FsError::Corrupt)?;
             let writeback = {
                 let mut content = folio.lock_content();
-                // SAFETY: 当前正式文件映射拒绝共享可写叶，私有文件写先 COW 到匿名页；
-                // 调用者已停止新文件写者，root 读侧保护物理块到 IO 全尾，内容锁
-                // 串行清脏与内核修改。凭证由唯一 Bio 保活到真实设备收权才完成。
+                inode.mapping().mkclean(index, folio, &mut content);
+                // SAFETY: mkclean 已在本内容 guard 内撤全部同源共享 W 并完成全 CPU 同步；
+                // guard 继续排斥 mkwrite 的新授权，root 读侧保护物理块到真实 IO 全尾。
+                // WB 期间最终授权拒绝该页；凭证由唯一 Bio 保活到设备收权才完成。
                 unsafe { content.begin_writeback(offset, block_size)? }
             };
             if let Some(writeback) = writeback {

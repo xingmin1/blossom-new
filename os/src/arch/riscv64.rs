@@ -17,9 +17,9 @@ mod uaccess;
 mod user;
 pub use mmu::{
     activate_kernel_root, activate_user_root, flush_user_translations, initialize_user_root,
-    sync_user_icache, user_empty_entry, user_entry_is_table, user_entry_physical, user_leaf_entry,
-    user_leaf_permissions, user_table_entry, SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS,
-    USER_STACK_TOP,
+    sync_user_icache, user_empty_entry, user_entry_is_table, user_entry_physical, user_leaf_dirty,
+    user_leaf_entry, user_leaf_mkclean, user_leaf_permissions, user_table_entry,
+    SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS, USER_STACK_TOP,
 };
 pub(crate) use signal::SIGNAL_MIN_STACK;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};

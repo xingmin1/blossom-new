@@ -50,6 +50,21 @@
     EXPECT \value, \number
 .endm
 
+# /// 控制字是普通共享匿名页；忙等期间不发 syscall，保留远核真实 W 翻译。
+.macro PHASE value
+    li t0, \value
+    fence rw, rw
+    sw t0, 0(s6)
+.endm
+# /// 每个阶段只消费协调者发布的单调许可，退出仍由普通 wait/join 核验。
+.macro GATE value
+991:
+    lw t0, 4(s6)
+    li t1, \value
+    bltu t0, t1, 991b
+    fence rw, rw
+.endm
+
 # /// argv 仅选择具体写、append 或真实 exec 交接，不使用测试 syscall。
 .global _start
 .type _start, @function
@@ -70,6 +85,22 @@ _start:
     beq t0, t1, .Lchild_image
     li t1, 'o'
     beq t0, t1, .Lold_released
+    li t1, 's'
+    beq t0, t1, .Lshared
+    li t1, 'r'
+    beq t0, t1, .Lremote
+    li t1, 'm'
+    beq t0, t1, .Lremote
+    li t1, 'c'
+    beq t0, t1, .Lremote
+    li t1, 'f'
+    beq t0, t1, .Lfile_futex
+    li t1, 'p'
+    beq t0, t1, .Lfile_futex
+    li t1, 'q'
+    beq t0, t1, .Lfile_futex
+    li t1, 'u'
+    beq t0, t1, .Lfile_futex
     j .Lexit
 
 # /// 源跨坏页只接受 17 字节，零前缀故障、负 pwrite 和定位写均不能改共享位置。
@@ -351,6 +382,208 @@ _start:
     EXPECT 0, 69
     j .Lpass
 
+# /// 只读 OFD 拒绝共享写；同源尾页 store 不增 EOF，增长后新增 gap 必须重新归零。
+.Lshared:
+    li s6, 0x49000000
+    OPEN .Lshared_path, 0, 75
+    mv s0, a0
+    ld s7, 24(s6)
+    li a0, 0x48000000
+    li a1, 8192
+    li a2, 3
+    li a3, 0x11
+    mv a4, s0
+    mv a5, s7
+    SC 222
+    EXPECT -13, 76
+    mv a0, s0
+    SC 57
+    EXPECT 0, 77
+    OPEN .Lshared_path, 2, 80
+    mv s0, a0
+    li a0, 0x48000000
+    li a1, 8192
+    li a2, 3
+    li a3, 0x11
+    mv a4, s0
+    mv a5, s7
+    SC 222
+    EXPECT 0x48000000, 81
+    mv s5, a0
+    li t0, 0x61
+    sb t0, 0(s5)
+    li t0, 0xde
+    sb t0, 128(s5)
+    PHASE 1
+    GATE 1
+    lbu a0, 1(s5)
+    EXPECT 0x62, 82
+    lbu a0, 128(s5)
+    EXPECT 0, 83
+    mv a0, s0
+    lla a1, .Lstat
+    SC 80
+    EXPECT 0, 84
+    lla t0, .Lstat
+    ld a0, 48(t0)
+    addi t1, s7, 513
+    bne a0, t1, .Lexit
+    li t0, 0x74
+    sb t0, 128(s5)
+    PHASE 2
+    GATE 2
+    j .Lpass
+
+# /// 首次 store 后仅忙等；同步撤 W 后第二次 store 必须经真实 mkwrite。
+.Lremote:
+    ld t0, 16(sp)
+    lbu s7, 0(t0)
+    li s6, 0x49000000
+    OPEN .Lmap_path, 2, 85
+    mv s0, a0
+    li a0, 0x48000000
+    li a1, 4096
+    li a2, 3
+    li a3, 0x11
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x48000000, 86
+    mv s5, a0
+    li t0, 0x81
+    sb t0, 0(s5)
+    PHASE 1
+    GATE 1
+    li t0, 'c'
+    beq s7, t0, .Lshared_fork
+    li t0, 0x82
+    sb t0, 1(s5)
+    PHASE 2
+    GATE 2
+    j .Lpass
+.Lshared_fork:
+    li a0, 17
+    li a1, 0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 87
+    beqz a0, .Lshared_child
+    mv s1, a0
+    sd a0, 16(s6)
+    PHASE 2
+    GATE 4
+    j .Lwait_child
+.Lshared_child:
+    li t0, 3
+    fence rw, rw
+    sw t0, 8(s6)
+    GATE 3
+    li t0, 0x83
+    sb t0, 2(s5)
+    li a0, 0
+    SC 93
+    j .Lexit
+
+# /// 真正的 fork 子在不同 VA 上 WAIT；父用普通 WAKE 核共享身份或 PRIVATE 隔离。
+.Lfile_futex:
+    ld t0, 16(sp)
+    lbu s7, 0(t0)
+    li s6, 0x49000000
+    OPEN .Lmap_path, 2, 90
+    mv s0, a0
+    li a0, 0x48000000
+    li a1, 4096
+    li a2, 3
+    li a3, 0x11
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x48000000, 91
+    mv s5, a0
+    li a0, 17
+    li a1, 0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 92
+    beqz a0, .Lfutex_child
+    mv s1, a0
+    sd a0, 16(s6)
+    GATE 1
+    addi a0, s5, 64
+    li a1, 1
+    li t0, 'p'
+    bne s7, t0, .Lfutex_wake
+    li a1, 129
+.Lfutex_wake:
+    li a2, 1
+    li a3, 0
+    li a4, 0
+    li a5, 0
+    SC 98
+    li t0, 'f'
+    bne s7, t0, .Lfutex_isolated
+    EXPECT 1, 93
+    j .Lwait_child
+.Lfutex_isolated:
+    EXPECT 0, 94
+.Lwait_child:
+    mv a0, s1
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 95
+    bne a0, s1, .Lexit
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 96
+    j .Lpass
+.Lfutex_child:
+    mv a0, s5
+    li a1, 4096
+    SC 215
+    EXPECT 0, 97
+    li t0, 'q'
+    bne s7, t0, .Lfutex_child_map
+    OPEN .Lshared_path, 2, 98
+    mv s0, a0
+.Lfutex_child_map:
+    li a0, 0x4a000000
+    li a1, 4096
+    li a2, 3
+    li a3, 0x11
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4a000000, 99
+    mv s5, a0
+    PHASE 1
+    addi a0, s5, 64
+    li a1, 0
+    li t0, 'p'
+    bne s7, t0, .Lfutex_wait
+    li a1, 128
+.Lfutex_wait:
+    li a2, 0
+    lla a3, .Lfutex_timeout
+    li a4, 0
+    li a5, 0
+    SC 98
+    li t0, 'f'
+    bne s7, t0, .Lfutex_cancelled
+    EXPECT 0, 100
+    j .Lfutex_child_exit
+.Lfutex_cancelled:
+    EXPECT -110, 101
+.Lfutex_child_exit:
+    li a0, 0
+    SC 93
+    j .Lexit
+
 # /// 核对整段常量字节，错误保留调用方的具名断言编号。
 .type .Lconstant, @function
 .Lconstant:
@@ -396,6 +629,7 @@ _start:
 
 .section .rodata
 .Luser_path: .asciz "/test/write-user"
+.Lshared_path: .asciz "/test/write-reserve"
 .Lmap_path: .asciz "/test/write-map"
 .Lappend_path: .asciz "/test/write-append"
 .Lself: .asciz "/test/bin/user-write"
@@ -408,6 +642,8 @@ _start:
 .Ldelta: .ascii "!?"
 .Lappend_expected: .ascii "alphaBETAxyz!?"
 .Lpayload: .byte 0x39
+.balign 8
+.Lfutex_timeout: .quad 5, 0
 
 .section .data
 .balign 8
