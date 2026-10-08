@@ -63,6 +63,14 @@
     dbar 0
 .endm
 
+# /// 每次 msync 都把完整参数装入真实普通 ABI，地址和 errno 不由控制页回声代替。
+.macro MS address, length, flags, result, number
+    move $a0, \address
+    li.d $a1, \length
+    li.d $a2, \flags
+    SC 227
+    EXPECT \result, \number
+.endm
 # /// argv 仅选择具体写、append 或真实 exec 交接，不使用测试 syscall。
 .global _start
 .type _start, @function
@@ -99,6 +107,14 @@ _start:
     beq $t0, $t1, .Lfile_futex
     li.d $t1, 'u'
     beq $t0, $t1, .Lfile_futex
+    li.d $t1, 'y'
+    beq $t0, $t1, .Lsync_abi
+    li.d $t1, 'b'
+    beq $t0, $t1, .Lsync_wait
+    li.d $t1, 'd'
+    beq $t0, $t1, .Lsync_write
+    li.d $t1, 'z'
+    beq $t0, $t1, .Lsync_write
     b .Lexit
 
 # /// 源跨坏页只接受 17 字节，零前缀故障、负 pwrite 和定位写均不能改共享位置。
@@ -582,6 +598,155 @@ _start:
     SC 93
     b .Lexit
 
+# /// 独立 open 的普通 fsync 在已有 WB 上等待，控制者核真实 Blocked 后才恢复 used 消费。
+.Lsync_wait:
+    li.d $s6, 0x49000000
+    OPEN .Lshared_path, 2, 110
+    move $s0, $a0
+    PHASE 1
+    GATE 1
+    move $a0, $s0
+    SC 82
+    EXPECT 0, 111
+    PHASE 2
+    GATE 2
+    move $a0, $s0
+    SC 83
+    EXPECT 0, 112
+    b .Lpass
+
+# /// 原始 __O_SYNC 由 open 归一化；F_SETFL 不撤同步位，错误 write 保已接受位置，pwrite 不改位置。
+.Lsync_write:
+    ld.d $t0, $sp, 16
+    ld.bu $s7, $t0, 0
+    li.d $s6, 0x49000000
+    li.d $t1, 'z'
+    beq $s7, $t1, .Lopen_dsync
+    OPEN .Lshared_path, 0x100002, 113
+    li.d $s4, 0x101002
+    b .Lsync_flags
+.Lopen_dsync:
+    OPEN .Lshared_path, 0x1002, 114
+    li.d $s4, 0x1002
+.Lsync_flags:
+    move $s0, $a0
+    st.d $s0, $s6, 16
+    move $a0, $s0
+    li.d $a1, 4
+    li.d $a2, 0
+    SC 25
+    EXPECT 0, 115
+    move $a0, $s0
+    li.d $a1, 3
+    SC 25
+    li.d $s8, 116
+    bne $a0, $s4, .Lexit
+    PHASE 1
+    GATE 1
+    move $a0, $s0
+    la.local $a1, .Lpayload
+    li.d $a2, 1
+    SC 64
+    EXPECT -5, 117
+    CURSOR $s0, 1, 118
+    PHASE 2
+    GATE 2
+    move $a0, $s0
+    la.local $a1, .Lpayload
+    li.d $a2, 1
+    li.d $a3, 2
+    SC 68
+    EXPECT 1, 119
+    CURSOR $s0, 1, 120
+    b .Lpass
+
+# /// shared 非零文件偏移、private COW、孔洞、合法零/异步/INVALIDATE 和冲突位均走普通 sys227。
+.Lsync_abi:
+    li.d $s6, 0x49000000
+    OPEN .Lshared_path, 2, 121
+    move $s0, $a0
+    li.d $a0, 0x48000000
+    li.d $a1, 4096
+    li.d $a2, 3
+    li.d $a3, 0x11
+    move $a4, $s0
+    li.d $a5, 4096
+    SC 222
+    EXPECT 0x48000000, 122
+    move $s5, $a0
+    li.d $t0, 0x79
+    st.b $t0, $s5, 29
+    PHASE 1
+    GATE 1
+    addi.d $s4, $s5, 1
+    MS $s4, 4096, 4, -22, 123
+    MS $s5, 4096, 8, -22, 124
+    MS $s5, 4096, 5, -22, 125
+    MS $s5, 4096, 0, 0, 126
+    MS $s5, 4096, 1, 0, 127
+    MS $s5, 4096, 2, 0, 128
+    MS $s5, 4096, 3, 0, 129
+    MS $s5, 0, 4, 0, 130
+    MS $s5, -1, 0, 0, 131
+    PHASE 2
+    GATE 2
+    MS $s5, 4096, 4, 0, 132
+    MS $s5, 8192, 4, -12, 133
+    li.d $s4, 0xfffffffffffff000
+    MS $s4, 8192, 0, -12, 134
+    li.d $s4, 0x48001000
+    MS $s4, 4096, 0, -12, 135
+    li.d $a0, 0x4a000000
+    li.d $a1, 4096
+    li.d $a2, 3
+    li.d $a3, 0x12
+    move $a4, $s0
+    li.d $a5, 0
+    SC 222
+    EXPECT 0x4a000000, 136
+    move $s4, $a0
+    li.d $t0, 0xaf
+    st.b $t0, $s4, 29
+    MS $s4, 4096, 4, 0, 137
+    move $a0, $s0
+    la.local $a1, .Lbuffer
+    li.d $a2, 1
+    li.d $a3, 29
+    SC 67
+    EXPECT 1, 138
+    la.local $t0, .Lbuffer
+    ld.bu $a0, $t0, 0
+    EXPECT 0x66, 139
+    move $a0, $s0
+    la.local $a1, .Lbuffer
+    li.d $a2, 1
+    li.d $a3, 4125
+    SC 67
+    EXPECT 1, 140
+    la.local $t0, .Lbuffer
+    ld.bu $a0, $t0, 0
+    EXPECT 0x79, 141
+    move $a0, $s0
+    SC 82
+    EXPECT 0, 142
+    move $a0, $s0
+    SC 83
+    EXPECT 0, 143
+    li.d $a0, -1
+    SC 82
+    EXPECT -9, 144
+    li.d $a0, -1
+    SC 83
+    EXPECT -9, 145
+    OPEN .Ldirectory, 0, 146
+    move $s1, $a0
+    SC 82
+    EXPECT 0, 147
+    move $a0, $s1
+    SC 83
+    EXPECT 0, 148
+    b .Lpass
+
 # /// 核对整段常量字节，错误保留调用方的具名断言编号。
 .type .Lconstant, @function
 .Lconstant:
@@ -628,6 +793,7 @@ _start:
 .section .rodata
 .Luser_path: .asciz "/test/write-user"
 .Lshared_path: .asciz "/test/write-reserve"
+.Ldirectory: .asciz "/test"
 .Lmap_path: .asciz "/test/write-map"
 .Lappend_path: .asciz "/test/write-append"
 .Lself: .asciz "/test/bin/user-write"

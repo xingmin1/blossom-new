@@ -679,6 +679,65 @@ impl Mm {
         Ok(())
     }
 
+    /// 逐个取得当前 VMA 的真实交集与原 OFD，放 mmap 读侧后同步准确文件范围。
+    /// 孔洞保留已完成进度并最终返回 Unmapped，后续真实同步错误优先；私有与匿名不写源。
+    /// 当前无锁定 VMA，invalidate 不撤 PTE；非同步请求只检查范围，不启动回写。
+    pub fn sync_mapping_range(
+        &self,
+        range: Range<usize>,
+        synchronous: bool,
+        _invalidate: bool,
+    ) -> Result<(), VmError> {
+        if range.end < range.start {
+            return Err(VmError::InvalidRange);
+        }
+        let mut cursor = range.start;
+        let mut unmapped = false;
+        while cursor < range.end {
+            let (end, sync) = {
+                let mmap = self.mmap.read();
+                let position = mmap.vmas.partition_point(|vma| vma.range.end <= cursor);
+                let Some(vma) = mmap.vmas.get(position) else {
+                    return Err(VmError::Unmapped);
+                };
+                if cursor < vma.range.start {
+                    unmapped = true;
+                    cursor = vma.range.start;
+                    if range.end <= cursor {
+                        return Err(VmError::Unmapped);
+                    }
+                }
+                let end = range.end.min(vma.range.end);
+                let sync = match &vma.backing {
+                    VmaBacking::File {
+                        file,
+                        offset,
+                        private: false,
+                    } if synchronous => {
+                        let start = offset
+                            .checked_add((cursor - vma.range.start) as u64)
+                            .ok_or(VmError::InvalidRange)?;
+                        let file_end = start
+                            .checked_add((end - cursor) as u64)
+                            .ok_or(VmError::InvalidRange)?;
+                        Some((Arc::clone(file), start..file_end))
+                    }
+                    _ => None,
+                };
+                (end, sync)
+            };
+            if let Some((file, file_range)) = sync {
+                file.sync_range(file_range, true).map_err(VmError::File)?;
+            }
+            cursor = end;
+        }
+        if unmapped {
+            Err(VmError::Unmapped)
+        } else {
+            Ok(())
+        }
+    }
+
     /// 页上取整用户长度并在同一写侧选址与发表；固定覆盖先备齐候选再解除旧叶。
     pub(crate) fn mmap(&self, request: MmapRequest) -> Result<usize, VmError> {
         if request.length == 0 {
@@ -870,7 +929,7 @@ impl Mm {
     }
 
     /// 文件写准备退出所有 FS guard 后重新检查范围；最终遵守 mmap→invalidate→folio→PTE。
-    /// WB 等待必须放开全部保护，来源变化返回 false 让 fault 按当前身份重新处理。
+    /// coherent 原页允许在已有 WB 时再次标脏授 W；来源变化返回 false，仍重核真实准备事实。
     fn mkwrite(&self, source: &FaultSource, address: usize) -> Result<bool, VmError> {
         let base = address & !(PAGE_SIZE - 1);
         let data = source
@@ -940,13 +999,6 @@ impl Mm {
         let (prepared, mut page, mut tables) = preparation?;
         let invalidate = data.inode.lock_invalidate().map_err(VmError::File)?;
         let mut content = prepared.folio().lock_content();
-        if content.writeback_sectors() != 0 {
-            drop(content);
-            drop(invalidate);
-            drop(mmap);
-            prepared.folio().wait_writeback();
-            return Ok(false);
-        }
         if !data
             .inode
             .finish_mkwrite(&prepared, &mut content)

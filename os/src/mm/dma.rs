@@ -1,7 +1,7 @@
 //! 当前 QEMU coherent 直连 DMA：页拥有权、设备地址与访问期分别保存。
 
 use crate::arch;
-use crate::block::IoResult;
+use crate::block::{BlockError, IoResult};
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
 use crate::mm::{alloc_pages, pages as page_map, FolioRead, FolioWriteback, OwnedPages};
@@ -119,6 +119,8 @@ pub struct MappedPages {
     offset: usize,
     segment: MappedSegment,
     device_owned: bool,
+    accepted: usize,
+    wb_error: Option<(usize, BlockError)>,
 }
 
 impl MappedPages {
@@ -141,6 +143,8 @@ impl MappedPages {
                 direction,
             },
             device_owned: false,
+            accepted: 0,
+            wb_error: None,
         })
     }
 
@@ -191,6 +195,8 @@ impl MappedPages {
                 direction: BufferDirection::DeviceToDriver,
             },
             device_owned: false,
+            accepted: 0,
+            wb_error: None,
         })
     }
 
@@ -216,6 +222,8 @@ impl MappedPages {
                 direction: BufferDirection::DriverToDevice,
             },
             device_owned: false,
+            accepted: 0,
+            wb_error: None,
         })
     }
 
@@ -287,6 +295,50 @@ impl MappedPages {
         }
     }
 
+    /// 返回原 WB 页的终身角色，普通独占页和读入来源不属于写回。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_writeback_metadata(&self) -> Option<bool> {
+        match &*self.backing {
+            PayloadBacking::Writeback(writeback) => Some(writeback.is_metadata()),
+            _ => None,
+        }
+    }
+
+    /// 原父在真实 submit 成功后登记本映射的连续接受窗口，不改变设备拥有期。
+    pub(crate) fn accept_range(&mut self, offset: usize, len: usize) {
+        assert_eq!(
+            offset, self.accepted,
+            "payload acceptance is not contiguous"
+        );
+        assert!(len <= self.len() - offset);
+        self.accepted += len;
+    }
+
+    /// 同一父账记录本映射实际失败位置，后部反序完成不覆盖前部错误。
+    pub(crate) fn record_writeback_result(
+        &mut self,
+        offset: usize,
+        len: usize,
+        completed: usize,
+        error: Option<BlockError>,
+    ) {
+        if !matches!(&*self.backing, PayloadBacking::Writeback(_)) {
+            return;
+        }
+        let end = offset + len;
+        // register 失败的 child 不属于已接受设备范围，不能给 WB 发布设备错误。
+        if self.accepted <= offset {
+            return;
+        }
+        assert!(end <= self.accepted && completed <= len);
+        if let Some(error) = error {
+            let failure = offset + completed;
+            if self.wb_error.is_none_or(|(first, _)| failure < first) {
+                self.wb_error = Some((failure, error));
+            }
+        }
+    }
+
     /// CPU-owned 独占来源可写初始化存储；共享 WB 来源始终拒绝内容切片。
     pub fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         assert!(!self.device_owned, "CPU access during DMA device ownership");
@@ -336,6 +388,9 @@ impl MappedPages {
             !self.is_folio_complete(),
             "completed folio cannot enter DMA"
         );
+        // 已收权的独占 Pages 可再次提交，每个设备访问期只保本轮父账。
+        self.accepted = 0;
+        self.wb_error = None;
         arch::dma_write_barrier();
         self.device_owned = true;
     }
@@ -352,11 +407,11 @@ impl MappedPages {
         self.device_owned = false;
     }
 
-    /// Bio 全尾收权后结束来源自己的初始化或 WB，保留新 Dirty 与原错误。
+    /// Bio 全尾收权后结束来源自己的初始化或 WB，保留每个原映射的接受范围。
     ///
     /// # Safety
     /// 本映射全部设备访问已经结束；独占读入者的 CPU 可变别名也须结束。
-    /// 结果属于本映射，成功前缀不能超过其范围；WB 失败不消除脏义务。
+    /// result 属于读入的整体连续前缀；WB 使用原父登记的真实接受与本映射错误。
     pub(crate) unsafe fn complete_folio(&mut self, result: IoResult) {
         assert!(!self.device_owned, "completing device-owned folio");
         match &mut *self.backing {
@@ -370,9 +425,19 @@ impl MappedPages {
                 }
             }
             PayloadBacking::Writeback(writeback) => {
-                // SAFETY: Bio 在全部 child 与生成者结束、真实收权和回调返回后调用，
-                // 本结果是该映射的实际前缀；凭证只结束自己的 WB，不清除新 Dirty。
-                unsafe { writeback.complete(result) };
+                let result = match self.wb_error {
+                    Some((completed, error)) => IoResult {
+                        completed,
+                        error: Some(error),
+                    },
+                    None => IoResult {
+                        completed: self.accepted,
+                        error: None,
+                    },
+                };
+                // SAFETY: Bio 已结束全部 child 与生成者且真实收权；accepted 只在
+                // submit 成功后登记，错误只由本映射已接受的实际 child 完成记录。
+                unsafe { writeback.complete(self.accepted, result) };
             }
             PayloadBacking::Pages(_) => {}
         }

@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::block::{AccessMode, Disk, DiskRef, FsClaim, IoResult, SECTOR_BYTES};
 use crate::cache::{BufferRef, MetadataCache};
-use crate::fs::inode::InodeMetadata;
+use crate::fs::inode::{InodeDomain, InodeMetadata, InodeRef};
 use crate::fs::FsError;
 use crate::mm::{FolioRead, PAGE_SIZE};
 use crate::sync::{SleepMutex, SpinLock};
@@ -156,7 +156,7 @@ pub struct Ext4Volume {
     metadata: Arc<MetadataCache>,
     geometry: Geometry,
     claim: FsClaim,
-    inode_domain: SpinLock<Weak<()>>,
+    inode_domain: SpinLock<Weak<InodeDomain>>,
     allocation: SleepMutex<()>,
     groups: Vec<allocation::GroupLayout>,
     #[cfg(feature = "ktest")]
@@ -258,7 +258,7 @@ impl Ext4Volume {
 
     /// 同一活卷只允许一个 inode 缓存域，旧 inode/外部文件页保留域身份时拒绝冲突。
     /// 反向仅存 Weak，cache 和 inode 的真实拥有退出后可由新域取得。
-    pub(crate) fn bind_inode_domain(&self, candidate: &Arc<()>) -> Result<(), FsError> {
+    pub(crate) fn bind_inode_domain(&self, candidate: &Arc<InodeDomain>) -> Result<(), FsError> {
         let retired = {
             let mut domain = self.inode_domain.lock();
             if let Some(previous) = domain.upgrade() {
@@ -271,6 +271,20 @@ impl Ext4Volume {
         };
         drop(retired);
         Ok(())
+    }
+
+    /// 返回准备时固定的弱登记预算，扫描不能因新 Dirty 无限延长。
+    pub(crate) fn dirty_inode_limit(&self) -> usize {
+        let domain = self.inode_domain.lock().upgrade();
+        domain.map_or(0, |domain| domain.dirty_inode_limit())
+    }
+
+    /// 只取得本卷同一 canonical inode 的真实脏义务，弱域和最后 put 均在短锁外。
+    pub(crate) fn dirty_inode_at(&self, position: usize) -> Option<InodeRef> {
+        let domain = self.inode_domain.lock().upgrade();
+        domain
+            .and_then(|domain| domain.dirty_inode_at(position))
+            .filter(|inode| core::ptr::eq(inode.filesystem().as_ref(), self))
     }
 
     /// 借用一次解码并验证的有效几何。

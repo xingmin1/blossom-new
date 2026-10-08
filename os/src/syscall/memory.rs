@@ -12,6 +12,9 @@ const FIXED: usize = 0x10;
 const ANONYMOUS: usize = 0x20;
 const FIXED_NOREPLACE: usize = 0x10_0000;
 const SUPPORTED: usize = SHARED | PRIVATE | FIXED | ANONYMOUS | FIXED_NOREPLACE;
+const MS_ASYNC: usize = 1;
+const MS_INVALIDATE: usize = 2;
+const MS_SYNC: usize = 4;
 const ALL: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -102,6 +105,30 @@ pub(super) fn mprotect(user: &UserThread, raw: [usize; 6]) -> SysResult {
     user.mm()
         .expect("mprotect has no MM")
         .protect(raw[0], length, permissions)?;
+    Ok(0)
+}
+
+/// 按 unsigned Linux ABI 解释页范围；零 flags 合法，异步和失效本身不发起写回或清除 PTE。
+pub(super) fn msync(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    // flags 是目标 ABI 的 int，地址与长度为 unsigned long/size_t。
+    let flags = raw[2] as u32 as usize;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || raw[0] & (PAGE_SIZE - 1) != 0
+        || flags & (MS_ASYNC | MS_SYNC) == (MS_ASYNC | MS_SYNC)
+    {
+        return Err(Errno::InvalidArgument);
+    }
+    // size_t 的页进位按 unsigned 算术回绕，只有最终地址相加溢出返回 ENOMEM。
+    let length = raw[1].wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = raw[0].checked_add(length).ok_or(Errno::NoMemory)?;
+    if end == raw[0] {
+        return Ok(0);
+    }
+    user.mm().expect("msync has no MM").sync_mapping_range(
+        raw[0]..end,
+        flags & MS_SYNC != 0,
+        flags & MS_INVALIDATE != 0,
+    )?;
     Ok(0)
 }
 

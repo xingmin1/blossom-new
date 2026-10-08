@@ -9,11 +9,11 @@ use core::ops::Range;
 
 use crate::block::{AccessMode, BlockError, FsClaim, SECTOR_BYTES};
 use crate::fs::ext4::Ext4Volume;
-use crate::fs::InodeRef;
+use crate::fs::{FsError, InodeRef};
 use crate::mm::folio::FolioContent;
 use crate::mm::space::{sync_all, PteDomain};
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
-use crate::sync::{SleepMutex, SpinLock};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use index::{Node, Tree};
 
 /// 内容状态从节点自己的 folio 读取；ToWrite 只标记本轮选中的原节点。
@@ -22,6 +22,118 @@ pub enum FolioMark {
     Dirty,
     Writeback,
     ToWrite,
+}
+
+const ERRSEQ_ERRNO: u32 = 4095;
+const ERRSEQ_SEEN: u32 = 1 << 12;
+const ERRSEQ_INCREMENT: u32 = 1 << 13;
+
+/// 固定宽度错误序列保留最后具体错误，不建立逐次错误链。
+struct WritebackError {
+    value: u32,
+    error: Option<FsError>,
+}
+
+impl WritebackError {
+    /// 零值表示从未发生错误，构造不分配存储。
+    const fn new() -> Self {
+        Self {
+            value: 0,
+            error: None,
+        }
+    }
+
+    /// 未观察错误从零采样，使新观察者仍能消费既有未见错误。
+    fn sample(&self) -> u32 {
+        if self.value & ERRSEQ_SEEN == 0 {
+            0
+        } else {
+            self.value
+        }
+    }
+
+    /// 仅在已有错误被观察后推进有限计数，保留低十二位真实 errno。
+    fn record(&mut self, error: FsError) {
+        let mut next = (self.value & !(ERRSEQ_ERRNO | ERRSEQ_SEEN)) | writeback_errno(error);
+        if self.value & ERRSEQ_SEEN != 0 {
+            next = next.wrapping_add(ERRSEQ_INCREMENT);
+        }
+        self.value = next;
+        self.error = Some(error);
+    }
+
+    /// 调用者串行自己的游标，短锁内标 SEEN 并只报告相对游标的新错误。
+    fn check_and_advance(&mut self, since: &mut u32) -> Result<(), FsError> {
+        if self.value == *since {
+            return Ok(());
+        }
+        self.value |= ERRSEQ_SEEN;
+        *since = self.value;
+        Err(self.error.expect("writeback errseq has no error"))
+    }
+}
+
+/// 内部错误保留具体类型，序列低位只编码对应的 Linux errno。
+fn writeback_errno(error: FsError) -> u32 {
+    match error {
+        FsError::NoMemory | FsError::Io(BlockError::NoMemory) => 12,
+        FsError::NoSpace => 28,
+        FsError::TextBusy => 26,
+        FsError::FileTooLarge => 27,
+        FsError::Unsupported | FsError::Io(BlockError::Unsupported) => 95,
+        FsError::NotFound | FsError::MissingRoot => 2,
+        FsError::NotDirectory => 20,
+        FsError::InvalidName
+        | FsError::InvalidOperation
+        | FsError::Io(BlockError::InvalidRange | BlockError::Misaligned) => 22,
+        FsError::Busy | FsError::Io(BlockError::Busy) => 16,
+        FsError::TooManySymlinks => 40,
+        FsError::BadFd => 9,
+        FsError::TooManyFiles => 24,
+        FsError::ReadOnly | FsError::Io(BlockError::ReadOnly) => 30,
+        FsError::IsDirectory => 21,
+        FsError::BadAddress => 14,
+        FsError::Permission => 13,
+        FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => 5,
+    }
+}
+
+/// 验收同一生产算法的未见采样、独立游标、具体错误和有限计数回绕，不产生 IO。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_wb_error_protocol() -> bool {
+    let mut error = WritebackError::new();
+    let mut first = error.sample();
+    if error.check_and_advance(&mut first) != Ok(()) {
+        return false;
+    }
+    error.record(FsError::NoMemory);
+    error.record(FsError::NoSpace);
+    if error.value != 28 || error.sample() != 0 {
+        return false;
+    }
+    let mut second = error.sample();
+    if error.check_and_advance(&mut first) != Err(FsError::NoSpace)
+        || error.check_and_advance(&mut second) != Err(FsError::NoSpace)
+        || error.check_and_advance(&mut first) != Ok(())
+        || first != second
+        || error.sample() != first
+    {
+        return false;
+    }
+    error.record(FsError::Io(BlockError::ShortIo));
+    if error.value != ERRSEQ_INCREMENT | 5
+        || error.sample() != 0
+        || error.check_and_advance(&mut first) != Err(FsError::Io(BlockError::ShortIo))
+    {
+        return false;
+    }
+    // 直接准备最大有限计数，回绕仍调用正式 record，不循环制造设备错误。
+    error.value = !(ERRSEQ_ERRNO | ERRSEQ_SEEN) | ERRSEQ_SEEN | 5;
+    error.record(FsError::NoMemory);
+    error.value == 12
+        && error.sample() == 0
+        && error.check_and_advance(&mut second) == Err(FsError::NoMemory)
+        && error.check_and_advance(&mut second) == Ok(())
 }
 
 struct FolioIndex {
@@ -143,7 +255,33 @@ impl FolioIndex {
         self.entries.lock().len
     }
 
-    /// 有界选择半开页范围，扫描与输出均受调用者片段限制；返回后续扫描起点。
+    /// 同一索引锁中标记当时的有限节点前缀，Dirty/WB取同一原页用途快照。
+    fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
+        let mut entries = self.entries.lock();
+        let budget = entries.len;
+        let mut cursor = start;
+        let mut selected = 0;
+        for _ in 0..budget {
+            let Some(node) = entries.lower_bound(cursor) else {
+                break;
+            };
+            let key = node.key;
+            if end <= key {
+                break;
+            }
+            let (dirty, writeback) = node.folio.writeback_state();
+            let pending = dirty != 0 || writeback != 0;
+            entries.set_to_write(key, pending);
+            selected += usize::from(pending);
+            let Some(next) = key.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        selected
+    }
+
+    /// 按半开范围有界选择；ToWrite填满输出片段，检查节点数不超过锁内现存有限数量。
     fn select_range(
         &self,
         start: u64,
@@ -154,7 +292,15 @@ impl FolioIndex {
         let entries = self.entries.lock();
         let mut cursor = start;
         let mut selected = 0;
-        for _ in 0..output.len() {
+        let budget = if mark == FolioMark::ToWrite {
+            entries.len
+        } else {
+            output.len()
+        };
+        for _ in 0..budget {
+            if selected == output.len() {
+                break;
+            }
             let node = entries.lower_bound(cursor)?;
             if end <= node.key {
                 return None;
@@ -185,9 +331,31 @@ pub struct MetadataCache {
     pub(crate) filesystem: SleepMutex<Weak<Ext4Volume>>,
     // 静止索引与弱关联先析构，最后一份 FS 占用才允许 raw writer 进入。
     claim: FsClaim,
+    writeback: SleepMutex<()>,
+    wb_error: SpinLock<WritebackError>,
 }
 
 impl MetadataCache {
+    /// 只串行共同元数据阶段的范围选择及完成，不覆盖文件数据 IO。
+    pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, ()> {
+        self.writeback.lock()
+    }
+
+    /// 为新观察者采样共同元数据的有限错误序列。
+    pub(crate) fn sample_wb_error(&self) -> u32 {
+        self.wb_error.lock().sample()
+    }
+
+    /// 推进同一观察者的元数据游标，保留原具体错误。
+    pub(crate) fn check_and_advance_wb_error(&self, since: &mut u32) -> Result<(), FsError> {
+        self.wb_error.lock().check_and_advance(since)
+    }
+
+    /// 在元数据 WB 退役或同步返回之前发布最后真实错误。
+    pub(crate) fn record_wb_error(&self, error: FsError) {
+        self.wb_error.lock().record(error);
+    }
+
     /// 相同 Disk 复用唯一缓存；活域请求不同页预算明确拒绝，不默默采用首个预算。
     pub fn shared(claim: &FsClaim, capacity: usize) -> Result<Arc<Self>, BlockError> {
         if capacity == 0 {
@@ -203,6 +371,8 @@ impl MetadataCache {
             claim: claim.clone(),
             index: FolioIndex::new(Some(capacity), true),
             filesystem: SleepMutex::new(Weak::new()),
+            writeback: SleepMutex::new(()),
+            wb_error: SpinLock::new(WritebackError::new()),
         })
         .map_err(|_| BlockError::NoMemory)?;
         let cache = claim.disk().intern_metadata_cache(&candidate);
@@ -279,6 +449,11 @@ impl MetadataCache {
             .set_to_write(byte_offset, selected);
     }
 
+    /// 持本缓存扫描互斥时选定半开物理 byte key 范围内的原节点，不纳入后来插入页。
+    pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
+        self.index.mark_to_write_range(start, end)
+    }
+
     /// 按物理 byte key 有界取得真实元数据页，调用者保持本缓存到全部消费结束。
     /// 移交 IO 的外部页须附原缓存 anchor，索引内部的引用不反持缓存。
     pub(crate) fn select_range(
@@ -331,6 +506,15 @@ impl MetadataCache {
             drop(node);
         }
         Ok(count)
+    }
+}
+
+impl Drop for MetadataCache {
+    /// 最后强拥有结束时摘本对象的 Disk 弱登记，锁外释放 Weak；原字段随后按声明顺序析构。
+    fn drop(&mut self) {
+        let identity = self as *const Self;
+        let retired = self.claim.disk().unregister_metadata_cache(identity);
+        drop(retired);
     }
 }
 
@@ -487,14 +671,55 @@ impl Drop for FileRangeRegistration {
 pub struct FileMapping {
     index: FolioIndex,
     ranges: SpinLock<Vec<((u64, usize), Weak<FileRangeData>)>>,
+    writeback: SleepMutex<()>,
+    wb_error: SpinLock<WritebackError>,
 }
 
 impl FileMapping {
+    /// 串行同一 inode 的同步扫描与完成，不排斥其他 inode 数据 IO。
+    pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, ()> {
+        self.writeback.lock()
+    }
+
+    /// 新 OFD 保留尚未被任何观察者见到的旧错误。
+    pub(crate) fn sample_wb_error(&self) -> u32 {
+        self.wb_error.lock().sample()
+    }
+
+    /// 在调用者自己的 OFD 游标互斥下推进有限错误观察。
+    pub(crate) fn check_and_advance_wb_error(&self, since: &mut u32) -> Result<(), FsError> {
+        self.wb_error.lock().check_and_advance(since)
+    }
+
+    /// 完成者在撤销本轮 WB 前记录原文件的数据错误。
+    pub(crate) fn record_wb_error(&self, error: FsError) {
+        self.wb_error.lock().record(error);
+    }
+
+    /// 在原索引短锁下检查实际页义务，不复制状态或等待内容锁。
+    pub(crate) fn has_dirty_or_writeback(&self) -> bool {
+        let entries = self.index.entries.lock();
+        let mut cursor = 0;
+        while let Some(node) = entries.lower_bound(cursor) {
+            let (dirty, writeback) = node.folio.writeback_state();
+            if dirty != 0 || writeback != 0 {
+                return true;
+            }
+            let Some(next) = node.key.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        false
+    }
+
     /// 建立无预留节点的唯一文件页索引，miss 的真实内存不足由节点和页申请返回。
     pub const fn new() -> Self {
         Self {
             index: FolioIndex::new(None, false),
             ranges: SpinLock::new(Vec::new()),
+            writeback: SleepMutex::new(()),
+            wb_error: SpinLock::new(WritebackError::new()),
         }
     }
 
@@ -587,6 +812,7 @@ impl FileMapping {
                         .size;
                     let valid = size.saturating_sub(start).min(PAGE_SIZE as u64) as usize;
                     if 0 < valid {
+                        data.inode.note_dirty();
                         content
                             .mark_prepared_dirty(valid)
                             .expect("prepared file dirty range is invalid");
@@ -618,6 +844,11 @@ impl FileMapping {
     /// 在同一原节点标记或取消本轮待写选择，不创建第二份页拥有。
     pub fn set_to_write(&self, index: u64, selected: bool) {
         self.index.entries.lock().set_to_write(index, selected);
+    }
+
+    /// 持同 inode 扫描互斥时选定半开页 index 范围，包含已有 WB 而不复制页状态。
+    pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
+        self.index.mark_to_write_range(start, end)
     }
 
     /// 锁内只选有界范围和增加原引用；返回值是下一次有界扫描起点。

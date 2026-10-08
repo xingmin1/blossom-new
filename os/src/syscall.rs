@@ -159,6 +159,8 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         78 => file::readlink(user, raw),
         79 => file::statat(user, raw),
         80 => file::fstat(user, raw),
+        82 => file::fsync(user, raw[0]),
+        83 => file::fdatasync(user, raw[0]),
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
         154..=157 | 173 => task::identity(user, request.number, raw),
@@ -180,6 +182,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         221 => return task::execve(user, request),
         222 => memory::mmap(user, raw),
         226 => memory::mprotect(user, raw),
+        227 => memory::msync(user, raw),
         260 => return task::wait4(user, request),
         _ => Err(Errno::NoSyscall),
     };

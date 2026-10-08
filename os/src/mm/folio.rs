@@ -92,6 +92,7 @@ pub struct FolioWriteback {
     offset: u16,
     len: u16,
     completed: bool,
+    original_dirty: u8,
 }
 
 /// 普通 Task 借用的内容锁；文件页仅可原始复制，元数据页才可借用初始化范围。
@@ -460,8 +461,9 @@ impl FolioRef {
         }
     }
 
-    /// 用途短锁下取得独立内容锁，不将用途锁带入字节访问或等待。
-    fn try_lock_content(&self) -> Option<FolioContent<'_>> {
+    /// 尝试在用途短锁下取得内容 guard，失败不等待；调用者可先提交已准备前缀。
+    /// 元数据的全页 WB 仍排斥内容借用，文件 WB 不阻止 coherent 原始写。
+    pub(crate) fn try_lock_content(&self) -> Option<FolioContent<'_>> {
         let usage = self.descriptor.usage();
         let state = usage.folio();
         let shared = FolioState::shared(&usage);
@@ -496,6 +498,13 @@ impl FolioRef {
     /// 返回真实回写范围位图；本接口不建立回写、清脏或完成成功的责任。
     pub fn writeback_sectors(&self) -> u8 {
         FolioState::shared(&self.descriptor.usage()).writeback
+    }
+
+    /// 在同一次用途锁内取得 Dirty 与 WB，清脏转 WB 不会从两个快照之间漏失。
+    pub(crate) fn writeback_state(&self) -> (u8, u8) {
+        let usage = self.descriptor.usage();
+        let shared = FolioState::shared(&usage);
+        (shared.dirty, shared.writeback)
     }
 
     /// 普通 Task 等待当前页的全部真实 WB 结束；Dirty 为零不能替代这个条件。
@@ -802,6 +811,9 @@ impl FolioContent<'_> {
         if !matches!(&shared.contents, FolioContents::Metadata { .. }) {
             return Err(BlockError::InvalidRange);
         }
+        if shared.writeback & sector_mask(offset, len) != 0 {
+            return Err(BlockError::Busy);
+        }
         FolioState::range_ready(shared, offset, len)
     }
 
@@ -822,6 +834,7 @@ impl FolioContent<'_> {
         }
         let mask = sector_mask(offset, len);
         let folio = self.folio.clone();
+        let original_dirty;
         {
             let mut usage = self.folio.descriptor.usage();
             let shared = FolioState::shared_mut(&mut usage);
@@ -832,6 +845,7 @@ impl FolioContent<'_> {
                 return Ok(None);
             }
             FolioState::range_ready(shared, offset, len)?;
+            original_dirty = shared.dirty & mask;
             shared.writeback |= mask;
             shared.dirty &= !mask;
         }
@@ -840,6 +854,7 @@ impl FolioContent<'_> {
             offset: offset as u16,
             len: len as u16,
             completed: false,
+            original_dirty,
         }))
     }
 
@@ -895,34 +910,63 @@ impl FolioWriteback {
         usize::from(self.len)
     }
 
+    /// 只分类原页终身角色，不借用任何仍在途的内容。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn is_metadata(&self) -> bool {
+        matches!(
+            &FolioState::shared(&self.folio.descriptor.usage()).contents,
+            FolioContents::Metadata { .. }
+        )
+    }
+
     /// 完成后的凭证不能再次开始设备访问。
     pub(crate) fn is_completed(&self) -> bool {
         self.completed
     }
 
-    /// 在真实设备收权后结束自己的 WB，成功不清除后来产生的 Dirty。
+    /// 真实收权后只结束本轮 WB；未接受原脏范围恢复，已接受失败先记错且不重放。
     ///
     /// # Safety
-    /// 本凭证整个范围的全部设备访问已由真实 used 或确认 reset 结束；
-    /// 结果属于本轮传输，不能用超时、软件取消或另一个请求完成代替收权。
-    pub(crate) unsafe fn complete(&mut self, result: IoResult) {
+    /// 整个凭证范围的全部设备访问已由真实 used 或确认 reset 结束；
+    /// accepted 是真实提交成功的连续前缀，result 只属于该前缀的设备完成。
+    /// 软件取消、超时或其他请求完成不得用来证明收权。
+    pub(crate) unsafe fn complete(&mut self, accepted: usize, result: IoResult) {
+        assert!(accepted <= self.len() && result.completed <= accepted);
+        assert_eq!(accepted % SECTOR_SIZE, 0, "unaligned writeback acceptance");
         if !self.completed {
-            self.finish(result.error.is_none() && result.completed == self.len());
+            let error = result
+                .error
+                .or_else(|| (result.completed < accepted).then_some(BlockError::ShortIo));
+            if 0 < accepted {
+                if let Some(error) = error {
+                    match &self.folio.owner {
+                        Some(FolioOwner::File(inode)) => {
+                            inode.mapping().record_wb_error(error.into())
+                        }
+                        Some(FolioOwner::Metadata(cache)) => cache.record_wb_error(error.into()),
+                        None => {}
+                    }
+                }
+            }
+            self.finish(accepted);
         }
     }
 
-    /// 用途锁内结束本轮范围，失败恢复整范围义务，锁外通知内容与 WB 等待者。
-    fn finish(&mut self, success: bool) {
+    /// 错误已经发布；用途锁内退役本轮并恢复未接受原义务，锁外才唤醒。
+    fn finish(&mut self, accepted: usize) {
         let mask = sector_mask(self.offset(), self.len());
+        let unaccepted = if accepted < self.len() {
+            sector_mask(self.offset() + accepted, self.len() - accepted)
+        } else {
+            0
+        };
         let state = self.folio.state();
         {
             let mut usage = self.folio.descriptor.usage();
             let shared = FolioState::shared_mut(&mut usage);
             assert_eq!(shared.writeback & mask, mask, "folio writeback range lost");
+            shared.dirty |= self.original_dirty & unaccepted;
             shared.writeback &= !mask;
-            if !success {
-                shared.dirty |= mask;
-            }
             self.completed = true;
         }
         state.waiters.wake_all();
@@ -933,7 +977,7 @@ impl Drop for FolioWriteback {
     /// 未提交准备者恢复真实脏义务；设备拥有期由 DMA 外壳禁止提前析构。
     fn drop(&mut self) {
         if !self.completed {
-            self.finish(false);
+            self.finish(0);
         }
     }
 }

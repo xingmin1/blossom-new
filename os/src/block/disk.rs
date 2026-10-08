@@ -66,6 +66,8 @@ pub(super) struct QueueState {
     pub(super) ktest_stop: StopTestState,
     #[cfg(feature = "ktest")]
     ktest_folio_dma: Option<(usize, u64, usize, usize)>,
+    #[cfg(feature = "ktest")]
+    ktest_completion_error: Option<(TestCompletionKind, BlockError)>,
 }
 
 impl QueueState {
@@ -141,6 +143,9 @@ unsafe impl Sync for Disk {}
 pub(crate) struct TestSnapshot {
     pub submitted: usize,
     pub completed: usize,
+    pub data_submitted: usize,
+    pub metadata_submitted: usize,
+    pub flush_submitted: usize,
     pub peak_inflight: usize,
     pub notifications: usize,
     pub resource_parks: usize,
@@ -157,6 +162,32 @@ pub(crate) struct TestSnapshot {
     /// 实际 ISR 完全为空的次数，不包含仅配置变更的中断。
     #[cfg(feature = "ktest")]
     pub irq_empty: usize,
+}
+
+/// 一次性错误仅在匹配请求的真实 used 被认领后替换上层完成结果。
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestCompletionKind {
+    Data,
+    Metadata,
+    Flush,
+}
+
+#[cfg(feature = "ktest")]
+impl TestCompletionKind {
+    /// 按原 WB 来源分类，不将 raw Write 冒充文件或元数据写回。
+    fn matches(self, resources: &SlotResources) -> bool {
+        match self {
+            Self::Flush => resources.operation == BlkOperation::Flush,
+            Self::Data | Self::Metadata => {
+                resources.operation == BlkOperation::Write
+                    && resources.parts.iter().flatten().any(|part| {
+                        part.bio.ktest_writeback_metadata(part.offset)
+                            == Some(self == Self::Metadata)
+                    })
+            }
+        }
+    }
 }
 
 /// 停机用例只观察本盘生产转换；拒读确认开关不伪造硬件状态。
@@ -311,6 +342,8 @@ impl Disk {
                 ktest_stop: StopTestState::default(),
                 #[cfg(feature = "ktest")]
                 ktest_folio_dma: None,
+                #[cfg(feature = "ktest")]
+                ktest_completion_error: None,
             }),
             control: SleepMutex::new(()),
             irq: SpinLock::new(None),
@@ -428,6 +461,19 @@ impl Disk {
         };
         drop(retired);
         Arc::clone(candidate)
+    }
+
+    /// 析构者只摘自身 payload 身份的弱槽，复用后的新登记保持不变；返回的 Weak 须锁外释放。
+    pub(crate) fn unregister_metadata_cache(
+        &self,
+        identity: *const MetadataCache,
+    ) -> Option<Weak<MetadataCache>> {
+        let mut slot = self.metadata_cache.lock();
+        if slot.as_ptr() == identity {
+            Some(core::mem::take(&mut *slot))
+        } else {
+            None
+        }
     }
 
     /// 非 slot 的 Task 最后义务复用原域，并在 Bio 构造期预留独占执行栈及一次性尾部。
@@ -704,9 +750,17 @@ impl Disk {
                         }
                         q.heads[usize::from(used.head)] = None;
                         q.slot_states[usize::from(tag)] = SlotState::Finishing;
-                        // SAFETY: 本次转换认领此槽，设备已真实 used 且不会再访问 PDU/payload。
-                        unsafe {
-                            (*self.slots[usize::from(tag)].resources.get()).used_len = used.len;
+                        // SAFETY: Submitted→Finishing 唯一认领，真实 used 已结束本槽设备访问；
+                        // queue 锁保持槽不可复用，仅写本轮完成元数据，不访问 payload 内容。
+                        let resources =
+                            unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
+                        resources.used_len = used.len;
+                        #[cfg(feature = "ktest")]
+                        if let Some((kind, error)) = q.ktest_completion_error {
+                            if kind.matches(resources) {
+                                q.ktest_completion_error = None;
+                                resources.forced_error = Some(error);
+                            }
                         }
                         tags[count] = Some(tag);
                         count += 1;
@@ -853,6 +907,49 @@ impl Disk {
     #[cfg(feature = "ktest")]
     pub(crate) fn test_snapshot(&self) -> TestSnapshot {
         self.queue.lock().counters
+    }
+
+    /// 对下一次真实文件数据 used 注入一次上层完成错误，不改变硬件或准入。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_fail_next_data(&self, error: BlockError) {
+        self.test_arm_completion_error(TestCompletionKind::Data, error);
+    }
+
+    /// 对下一次真实共同元数据 used 注入一次完成错误。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_fail_next_metadata(&self, error: BlockError) {
+        self.test_arm_completion_error(TestCompletionKind::Metadata, error);
+    }
+
+    /// 对下一次真实 FLUSH used 注入一次完成错误，未协商能力仍走原拒绝。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_fail_next_flush(&self, error: BlockError) {
+        self.test_arm_completion_error(TestCompletionKind::Flush, error);
+    }
+
+    /// 测试控制只保存本 Disk 的一次性匹配，不伪造设备停止或 reset 确认。
+    #[cfg(feature = "ktest")]
+    fn test_arm_completion_error(&self, kind: TestCompletionKind, error: BlockError) {
+        assert!(matches!(
+            error,
+            BlockError::Io | BlockError::ShortIo | BlockError::NoMemory
+        ));
+        let mut q = self.queue.lock();
+        assert!(
+            q.accepts_children(),
+            "arming completion error on stopped disk"
+        );
+        assert!(
+            q.ktest_completion_error.is_none(),
+            "completion error already armed"
+        );
+        q.ktest_completion_error = Some((kind, error));
+    }
+
+    /// 观察一次性匹配是否仍未被真实 used 消费。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_completion_error_pending(&self) -> bool {
+        self.queue.lock().ktest_completion_error.is_some()
     }
 
     /// 只在本例全部请求和回调结束后捕获实际 Work 票尾，不能用 idle 或定长sleep代替。
@@ -1175,6 +1272,9 @@ impl PreparingSlot<'_> {
                     .submit(tag, resources.operation, &resources.sg)
             };
             if let Ok(head) = result {
+                for part in resources.parts.iter().flatten() {
+                    part.bio.accept_child(part.offset, part.length);
+                }
                 assert!(
                     q.heads[usize::from(head)].is_none(),
                     "submitted head is already owned"
@@ -1204,6 +1304,15 @@ impl PreparingSlot<'_> {
                 #[cfg(feature = "ktest")]
                 {
                     q.counters.submitted += 1;
+                    if TestCompletionKind::Data.matches(resources) {
+                        q.counters.data_submitted += 1;
+                    }
+                    if TestCompletionKind::Metadata.matches(resources) {
+                        q.counters.metadata_submitted += 1;
+                    }
+                    if TestCompletionKind::Flush.matches(resources) {
+                        q.counters.flush_submitted += 1;
+                    }
                     q.counters.inflight += 1;
                     q.counters.peak_inflight = q.counters.peak_inflight.max(q.counters.inflight);
                 }

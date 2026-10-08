@@ -1,13 +1,15 @@
 //! 每次打开拥有独立位置，描述符复制只共享同一个具体文件对象。
 
 use alloc::sync::Arc;
+use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
-use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess};
+use crate::block::{AccessMode, BlockError};
+use crate::fs::{writeback, DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess};
 use crate::mm::space::{Mm, VmError};
 use crate::mm::FolioRef;
-use crate::sync::SleepMutex;
+use crate::sync::{SleepMutex, SpinLock};
 
 /// 共享一个打开实例及其位置；最后引用释放该实例持有的路径。
 pub type FileRef = Arc<dyn FileLike>;
@@ -18,11 +20,13 @@ const O_CREAT: u32 = 0o100;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
+pub(crate) const O_DSYNC: u32 = 0x1000;
+pub(crate) const O_SYNC: u32 = 0x101000;
 pub(crate) const O_DIRECTORY: u32 = 0o200000;
 pub(crate) const O_NOFOLLOW: u32 = 0o400000;
 const O_CLOEXEC: u32 = 0o2000000;
 const MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
-const OPEN_FLAGS: u32 = MUTABLE_FLAGS | 0o100000 | O_DIRECTORY | O_NOFOLLOW | 0o400;
+const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | 0o100000 | O_DIRECTORY | O_NOFOLLOW | 0o400;
 
 /// 同一文件页循环的两个接收端，实际交付量独立于请求长度。
 pub struct ReadBuffer<'a> {
@@ -250,6 +254,10 @@ pub trait FileLike: Send + Sync {
     /// 只改变支持的可变状态位，不修改访问模式与打开时路径约束。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError>;
 
+    /// 同步半开字节范围及其必要元数据和设备缓存，并推进原 OFD 的错误观察游标。
+    /// 调用者不得持描述符表、位置、inode 写锁或 mmap/PTE 保护；本操作可能等待真实 I/O。
+    fn sync_range(&self, range: Range<u64>, data_only: bool) -> Result<(), FsError>;
+
     /// 在普通任务中等待唯一 inode 的缓存页，不获取位置锁；EOF 与私有尾页由映射调用者处理。
     fn file_page(&self, index: u64) -> Result<FolioRef, FsError>;
 
@@ -291,6 +299,8 @@ pub struct InodeFile {
     cursor: SleepMutex<u64>,
     flags: AtomicU32,
     write_access: Option<WriteAccess>,
+    /// 同一 OFD 的数据与共同元数据错误样本，短锁只覆盖检查与推进。
+    wb_errors: SpinLock<(u32, u32)>,
 }
 
 /// 目录的打开实例，枚举位置使用后端已有的字节记录边界。
@@ -298,6 +308,7 @@ pub struct DirectoryFile {
     path: Path,
     cursor: SleepMutex<u64>,
     flags: AtomicU32,
+    wb_error: SpinLock<u32>,
 }
 
 /// 内核默认只读打开与用户带标志打开共用唯一构造。
@@ -305,7 +316,7 @@ pub fn open_path(path: Path) -> Result<FileRef, FsError> {
     open_path_with_flags(path, 0)
 }
 
-/// 按真实访问模式建立 OFD；修改与同步标志未实现时保留具体拒绝错误。
+/// 按真实访问模式建立 OFD，同步状态固定于打开实例，修改名字与截断仍明确拒绝。
 pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
     let access = flags & O_ACCMODE;
     if access == O_ACCMODE {
@@ -318,6 +329,12 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
     if flags & !(OPEN_FLAGS | O_ACCMODE | O_CREAT | O_TRUNC) != 0 {
         return Err(FsError::Unsupported);
     }
+    // 独立的完整同步位同样隐含数据同步位，写后路径只需据 O_DSYNC 判断是否同步。
+    let flags = if flags & (O_SYNC & !O_DSYNC) != 0 {
+        flags | O_DSYNC
+    } else {
+        flags
+    };
     let inode = path.inode()?;
     let kind = inode.metadata_snapshot()?.kind;
     if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
@@ -334,11 +351,16 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
             if flags & (O_CREAT | O_TRUNC) != 0 {
                 return Err(FsError::Unsupported);
             }
+            let wb_errors = (
+                inode.mapping().sample_wb_error(),
+                inode.filesystem().metadata_cache().sample_wb_error(),
+            );
             Ok(Arc::try_new(InodeFile {
                 path,
                 cursor: SleepMutex::new(0),
                 flags: AtomicU32::new(flags),
                 write_access,
+                wb_errors: SpinLock::new(wb_errors),
             })
             .map_err(|_| FsError::NoMemory)?)
         }
@@ -349,10 +371,12 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
             if flags & O_CREAT != 0 {
                 return Err(FsError::Unsupported);
             }
+            let wb_error = inode.filesystem().metadata_cache().sample_wb_error();
             Ok(Arc::try_new(DirectoryFile {
                 path,
                 cursor: SleepMutex::new(0),
                 flags: AtomicU32::new(flags),
+                wb_error: SpinLock::new(wb_error),
             })
             .map_err(|_| FsError::NoMemory)?)
         }
@@ -393,6 +417,38 @@ impl FileLike for InodeFile {
         set_status_flags(&self.flags, raw)
     }
 
+    /// 在所有写入与位置保护之外同步实际范围，直接错误优先于后续阶段，样本仍全部推进。
+    fn sync_range(&self, range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
+        if range.end < range.start {
+            return Err(FsError::InvalidOperation);
+        }
+        let inode = self.path.inode()?;
+        let volume = inode.filesystem();
+        // 只读卷没有可提交的写义务；只读 OFD 或挂载视图仍须同步 RW 卷上的共同内容。
+        let writable = volume.mode() == AccessMode::ReadWrite;
+        let data = if writable {
+            writeback::sync_inode_range(&inode, range)
+        } else {
+            Ok(())
+        };
+        // 共同元数据包含当前 inode 记录、块树及分配依赖；当前不存在新名字的父目录义务。
+        // fdatasync 可写出更多共同元数据，但不能绕过使数据可寻址的记录和设备 FLUSH。
+        // 未确认设备停止时保持原在途拥有，禁止继续提交元数据或 FLUSH。
+        let metadata = if writable && !matches!(data, Err(FsError::Io(BlockError::StopUnconfirmed)))
+        {
+            writeback::sync_metadata(volume)
+        } else {
+            Ok(())
+        };
+        let mut samples = self.wb_errors.lock();
+        let data_error = inode.mapping().check_and_advance_wb_error(&mut samples.0);
+        let metadata_error = inode
+            .filesystem()
+            .metadata_cache()
+            .check_and_advance_wb_error(&mut samples.1);
+        data.and(data_error).and(metadata).and(metadata_error)
+    }
+
     /// 从完整路径保活的 inode 取得同源缓存页，不读取或修改打开实例的位置。
     fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
         require_read(self.flags())?;
@@ -422,9 +478,10 @@ impl FileLike for InodeFile {
         Err(FsError::NotDirectory)
     }
 
-    /// 共享位置锁跨请求保留，追加的实际起点只由 inode 写序列化决定。
+    /// 接受前缀先提交共享位置并释放写入保护，再执行打开时要求的同步；同步错误不回滚前缀。
     fn write_from(&self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
-        require_write(self.flags())?;
+        let flags = self.flags();
+        require_write(flags)?;
         self.path.check_writable()?;
         let mut cursor = self.cursor.lock();
         check_write_range(*cursor, source.len() - source.copied())?;
@@ -436,7 +493,7 @@ impl FileLike for InodeFile {
         let (start, bytes) = access.write_from(
             inode.filesystem().claim(),
             *cursor,
-            self.flags() & O_APPEND != 0,
+            flags & O_APPEND != 0,
             source,
         )?;
         if 0 < bytes {
@@ -444,12 +501,15 @@ impl FileLike for InodeFile {
                 .checked_add(bytes as u64)
                 .expect("inode write position overflow");
         }
+        drop(cursor);
+        sync_written(self, flags, start, bytes)?;
         Ok(bytes)
     }
 
-    /// pwrite 不参与共享位置串行化，O_APPEND 同样在 inode 锁内取得 EOF。
+    /// pwrite 不改变共享位置，追加起点由 inode 仲裁，接受前缀在写锁外完成同步。
     fn write_at_from(&self, offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
-        require_write(self.flags())?;
+        let flags = self.flags();
+        require_write(flags)?;
         self.path.check_writable()?;
         check_write_range(offset, source.len() - source.copied())?;
         let inode = self.path.inode()?;
@@ -457,15 +517,26 @@ impl FileLike for InodeFile {
             .write_access
             .as_ref()
             .expect("writable OFD has no write access");
-        access
-            .write_from(
-                inode.filesystem().claim(),
-                offset,
-                self.flags() & O_APPEND != 0,
-                source,
-            )
-            .map(|(_, bytes)| bytes)
+        let (start, bytes) = access.write_from(
+            inode.filesystem().claim(),
+            offset,
+            flags & O_APPEND != 0,
+            source,
+        )?;
+        sync_written(self, flags, start, bytes)?;
+        Ok(bytes)
     }
+}
+
+/// 仅对真实正接受量执行同步，O_SYNC 同时包含 O_DSYNC，失败返回原错误而非假正前缀。
+fn sync_written(file: &InodeFile, flags: u32, start: u64, bytes: usize) -> Result<(), FsError> {
+    if bytes == 0 || flags & O_DSYNC == 0 {
+        return Ok(());
+    }
+    let end = start
+        .checked_add(bytes as u64)
+        .expect("accepted write range overflow");
+    file.sync_range(start..end, flags & O_SYNC != O_SYNC)
 }
 
 /// 调用者位置和本次输入范围均须可表示为非负 loff_t，追加也不能跳过 ABI 范围检查。
@@ -503,6 +574,25 @@ impl FileLike for DirectoryFile {
     /// 目录状态与描述符属性分离，不改变枚举位置。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 目录同步沿其真实共同元数据与 FLUSH，不取得枚举位置锁或虚构名字创建依赖。
+    fn sync_range(&self, range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
+        if range.end < range.start {
+            return Err(FsError::InvalidOperation);
+        }
+        let inode = self.path.inode()?;
+        let volume = inode.filesystem();
+        let result = if volume.mode() == AccessMode::ReadWrite {
+            writeback::sync_metadata(volume)
+        } else {
+            Ok(())
+        };
+        let error = inode
+            .filesystem()
+            .metadata_cache()
+            .check_and_advance_wb_error(&mut self.wb_error.lock());
+        result.and(error)
     }
 
     /// 目录不能提供普通文件映射页，不建立缓存页或改变枚举位置。

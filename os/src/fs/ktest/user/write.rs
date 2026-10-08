@@ -26,6 +26,22 @@ const SHARED_CONTROL: usize = 0x4900_0000;
 const SHARED_FILE_OFFSET: usize = 24;
 const SHARED_ALIAS: usize = 0x4a00_0000;
 
+struct SyncObservation {
+    executor: SpinLock<Option<alloc::sync::Weak<Task>>>,
+    result: SpinLock<Option<Result<(), FsError>>>,
+}
+
+impl SyncObservation {
+    /// 只查询实际执行者的调度状态，entered 标记不能替代 Blocked。
+    fn blocked(&self) -> bool {
+        self.executor
+            .lock()
+            .as_ref()
+            .and_then(alloc::sync::Weak::upgrade)
+            .is_some_and(|task| sched::test_state(&task) == State::Blocked)
+    }
+}
+
 struct WriteOwner {
     user: UserOwner,
     inodes: Vec<InodeRef>,
@@ -33,6 +49,8 @@ struct WriteOwner {
     shared_mm: Option<Arc<Mm>>,
     prepare_gate: Option<Arc<Completion>>,
     consumers: [Option<JoinHandle>; 2],
+    cold_volume: Option<Arc<Ext4Volume>>,
+    cold_cache: Option<Arc<InodeCache>>,
 }
 
 impl WriteOwner {
@@ -183,6 +201,59 @@ impl WriteOwner {
             .ok_or(TestError("shared fork child binding missing"))
     }
 
+    /// 原 Task 运行真实同步调用，结果另存以消费预期错误，句柄保在 fixture 的清理边界外。
+    fn consume_sync(
+        &mut self,
+        index: usize,
+        operation: impl FnOnce() -> Result<(), FsError> + Send + 'static,
+    ) -> Result<Arc<SyncObservation>, TestError> {
+        assert!(self.consumers[index].is_none());
+        let observation = Arc::try_new(SyncObservation {
+            executor: SpinLock::new(None),
+            result: SpinLock::new(None),
+        })
+        .map_err(|_| TestError("sync observation OOM"))?;
+        let record = observation.clone();
+        let prepared = task::prepare_kernel_on(cpu::current().id, move || {
+            *record.executor.lock() = Some(Arc::downgrade(&task::current_task()));
+            *record.result.lock() = Some(operation());
+            0
+        })
+        .map_err(|_| TestError("sync consumer prepare failed"))?;
+        self.consumers[index] = Some(prepared.publish());
+        Ok(observation)
+    }
+
+    /// 冷消费者独立拥有完整 FS 层，设备仍借本例原 owner；旧 volume 的弱引用到期才允许下一次调用。
+    fn cold_open(&mut self, context: &TestContext<'_>) -> Result<FileRef, TestError> {
+        assert!(self.cold_volume.is_none() && self.cold_cache.is_none());
+        self.inodes
+            .try_reserve_exact(16)
+            .map_err(|_| TestError("cold inode slots OOM"))?;
+        let volume = checked(
+            context,
+            Ext4Volume::open(
+                self.user.path.owner.disk()?.clone(),
+                AccessMode::ReadWrite,
+                64,
+            ),
+        )?;
+        self.cold_volume = Some(volume.clone());
+        let cache = Arc::try_new(checked(context, InodeCache::try_new(64))?)
+            .map_err(|_| TestError("cold cache owner OOM"))?;
+        self.cold_cache = Some(cache.clone());
+        let vfs = checked(
+            context,
+            Vfs::try_new(volume, cache, 128, 4, AccessMode::ReadWrite),
+        )?;
+        let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
+        let path = checked(
+            context,
+            vfs.resolve(&fs_context, b"/test/write-reserve", ResolveMode::Follow),
+        )?;
+        self.inodes.push(checked(context, path.inode())?.clone());
+        checked(context, open_path_with_flags(path, 2))
+    }
     /// 未离栈句柄留在 fixture，错误返回仍先恢复设备完成再进行有限 join。
     fn join_consumers(&mut self) -> TestResult {
         for join in self.consumers.iter().flatten() {
@@ -190,14 +261,15 @@ impl WriteOwner {
                 join.try_join().is_some()
             })?;
         }
+        let mut first = None;
         for join in &mut self.consumers {
             if let Some(join) = join.take() {
-                if join.join() != 0 {
-                    return Err(TestError("shared kernel consumer failed"));
+                if join.join() != 0 && first.is_none() {
+                    first = Some(TestError("shared kernel consumer failed"));
                 }
             }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 }
 
@@ -214,6 +286,8 @@ impl Fixture<DeviceInventory> for WriteOwner {
             shared_mm: None,
             prepare_gate: None,
             consumers: core::array::from_fn(|_| None),
+            cold_volume: None,
+            cold_cache: None,
         })
     }
 
@@ -242,8 +316,15 @@ impl Fixture<DeviceInventory> for WriteOwner {
         if let Some(graph) = &self.user.graph {
             graph.request_root_exit(9);
         }
-        self.join_consumers()?;
-        self.user.path.owner.join_tasks()?;
+        let mut first = self.join_consumers().err();
+        if self.consumers.iter().any(Option::is_some) {
+            return Err(first.unwrap_or(TestError("consumer still owns original stack")));
+        }
+        if let Err(error) = self.user.path.owner.join_tasks() {
+            if first.is_none() {
+                first = Some(error);
+            }
+        }
         if self.user.running.is_some() {
             until("shared user cleanup did not leave original stack", || {
                 self.user
@@ -260,15 +341,57 @@ impl Fixture<DeviceInventory> for WriteOwner {
             self.user.reap_children(context, true)?;
         }
         self.user.release_pressure();
-        if self.user.graph.is_some() {
-            for inode in &self.inodes {
-                checked(context, crate::fs::writeback::sync_inode(inode))?;
+        for inode in &self.inodes {
+            let result = crate::fs::writeback::sync_inode(inode);
+            if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
+                return Err(TestError(
+                    "writeback stop unconfirmed; retaining original owners",
+                ));
             }
-            checked(context, crate::fs::writeback::sync_volume(&self.volume()))?;
+            if let Err(error) = checked(context, result) {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
+        }
+        if self
+            .inodes
+            .iter()
+            .any(|inode| inode.mapping().has_dirty_or_writeback())
+        {
+            return Err(first.unwrap_or(TestError("write cleanup retains actual Dirty or WB")));
+        }
+        let volume = self
+            .cold_volume
+            .clone()
+            .or_else(|| self.user.graph.as_ref().map(|_| self.volume()));
+        if let Some(volume) = volume {
+            let result = crate::fs::writeback::sync_metadata(&volume);
+            if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
+                return Err(TestError(
+                    "metadata stop unconfirmed; retaining original owners",
+                ));
+            }
+            if let Err(error) = checked(context, result) {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
+        }
+        if let Some(volume) = self.cold_volume.as_ref() {
+            if metadata_pending(volume) {
+                return Err(first.unwrap_or(TestError("cold cleanup retains metadata Dirty or WB")));
+            }
+        } else if self.user.graph.is_some() && metadata_pending(&self.volume()) {
+            return Err(first.unwrap_or(TestError("write cleanup retains metadata Dirty or WB")));
         }
         self.inodes.clear();
         drop(core::mem::take(&mut self.inodes));
-        <UserOwner as Fixture<DeviceInventory>>::quiesce(&mut self.user, context)
+        drop(self.cold_cache.take());
+        drop(self.cold_volume.take());
+        let cleanup = <UserOwner as Fixture<DeviceInventory>>::quiesce(&mut self.user, context);
+        context.expect_eq(first, None);
+        cleanup
     }
 
     /// 两层六域和 Task/worker/domain 均由原拥有者比较，不重置统计。
@@ -485,10 +608,13 @@ struct Tree {
     blocks: Vec<u64>,
 }
 
-/// 每个连接到树的物理块必须有自己的真实位图位，不能只靠总计数相等。
-fn account_block(volume: &Ext4Volume, physical: u64, tree: &mut Tree) -> Result<(), FsError> {
+/// 停稳其他分配与释放者后核物理位；几何排除或真实 used 返回 Some(true)，未初始化且仍有空闲返回 None。
+fn block_allocation_bit(volume: &Ext4Volume, physical: u64) -> Result<Option<bool>, FsError> {
     let g = volume.geometry();
-    g.validate_blocks(physical, 1)?;
+    // validate_blocks 只核卷边界和固定 super/GDT 保留范围，这些地址不能成为新 data。
+    if g.validate_blocks(physical, 1).is_err() {
+        return Ok(Some(true));
+    }
     let group = (physical - g.first_data_block) / g.blocks_per_group;
     let bit = (physical - g.first_data_block) % g.blocks_per_group;
     let byte = group * g.descriptor_size as u64;
@@ -503,11 +629,29 @@ fn account_block(volume: &Ext4Volume, physical: u64, tree: &mut Tree) -> Result<
     })?;
     drop(descriptor);
     let layout = codec::group_layout(g, group, &record[..g.descriptor_size])?;
+    let state = codec::group_state(g, &record[..g.descriptor_size])?;
+    if state.flags & 2 != 0 {
+        if group == 0 || g.features_ro_compat & (0x10 | codec::METADATA_CSUM) == 0 {
+            return Err(FsError::Corrupt);
+        }
+        // 未初始化 bitmap 不含权威位；正式 free_blocks=0 时 allocator 会跳过整组。
+        return Ok((state.free_blocks == 0).then_some(true));
+    }
     let bitmap = volume
         .metadata_cache()
         .get(layout.block_bitmap, g.block_size)?;
-    let used = bitmap.with_read(|bytes| bytes[bit as usize / 8] & (1 << (bit % 8)) != 0)?;
-    if !used || tree.blocks.capacity() == tree.blocks.len() {
+    bitmap.with_read(|bytes| {
+        codec::verify_bitmap(g, &record[..g.descriptor_size], bytes, false)?;
+        Ok(Some(bytes[bit as usize / 8] & (1 << (bit % 8)) != 0))
+    })?
+}
+
+/// 每个连接到树的物理块必须有自己的真实位图位，不能只靠总计数相等。
+fn account_block(volume: &Ext4Volume, physical: u64, tree: &mut Tree) -> Result<(), FsError> {
+    volume.geometry().validate_blocks(physical, 1)?;
+    if block_allocation_bit(volume, physical)? != Some(true)
+        || tree.blocks.capacity() == tree.blocks.len()
+    {
         return Err(FsError::Corrupt);
     }
     tree.blocks.push(physical);
@@ -672,9 +816,828 @@ impl PagePressure {
     }
 }
 
+/// 生产者停稳后逐个有界检查原 metadata 索引，残留真实义务时不得销毁 cache 平账。
+fn metadata_pending(volume: &Ext4Volume) -> bool {
+    let cache = volume.metadata_cache();
+    for mark in [
+        crate::cache::FolioMark::Dirty,
+        crate::cache::FolioMark::Writeback,
+    ] {
+        let mut cursor = 0;
+        for _ in 0..cache.len() {
+            let mut selected = [None];
+            let next = cache.select_range(cursor, u64::MAX, mark, &mut selected);
+            if selected[0].is_some() {
+                return true;
+            }
+            let Some(next) = next else {
+                break;
+            };
+            cursor = next;
+        }
+    }
+    false
+}
+
 #[ktest::suite(fixture = WriteOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-write", "fs-path", "fs-oom"), resources("root"), timeout_ms = 180000)]
 pub(crate) mod writes {
     use super::*;
+
+    /// 目标页确认为空洞后占住首原页的真实物理后继，多个父请求先发表并 kick，随后消费全部原尾。
+    #[test]
+    #[ktest(tags("W10", "fs-sync"), min_cpus = 2)]
+    fn original_folio_batch_publishes_prefix_before_wait(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        let inode = fixture.inodes.last().unwrap().clone();
+        let volume = inode.filesystem().clone();
+        let allocation_hint = (inode.number() - 1) / volume.geometry().inodes_per_group;
+        let block = volume.geometry().block_size as u64;
+        let base = checked(context, file.stat())?
+            .size
+            .div_ceil(PAGE_SIZE as u64)
+            * PAGE_SIZE as u64;
+        let end = base + 16 * PAGE_SIZE as u64;
+        checked(
+            context,
+            inode.with_map_read(|metadata, root| {
+                // 本地查询终点只放开 EOF 裁剪，不修改 canonical size 或块树。
+                let mut lookup = *metadata;
+                lookup.size = end;
+                for logical in base / block..end / block {
+                    let mapping = volume.map_block(&lookup, root, logical)?;
+                    if !matches!(mapping, BlockMapping::Hole { .. }) {
+                        context.diagnostic(format_args!(
+                            "W10 preparation requires actual hole logical={} mapping={:?}",
+                            logical, mapping
+                        ));
+                        return Err(FsError::InvalidOperation);
+                    }
+                }
+                Ok(())
+            }),
+        )?;
+        let mut folios: [Option<mm::FolioRef>; 16] = core::array::from_fn(|_| None);
+        let mut held = Vec::new();
+        let prepared = (|| -> Result<(u64, u64, u64, usize), TestError> {
+            context.expect_eq(checked(context, file.write_at(base, &[0xc4; 4096]))?, 4096);
+            folios[0] = Some(checked(context, file.file_page(base / PAGE_SIZE as u64))?);
+            let mapping = checked(context, inode.map_block(base / block))?;
+            context.diagnostic(format_args!("W10 first-page mapping={:?}", mapping));
+            let BlockMapping::Mapped {
+                physical: first, ..
+            } = mapping
+            else {
+                return Err(TestError("batch first file page not mapped"));
+            };
+            let target = first + PAGE_SIZE as u64 / block;
+            let budget = volume.geometry().blocks_count - volume.geometry().first_data_block;
+            // 本例没有并发分配者；second 的首 data 申请先于同次节点摘离，已占用目标此时不可申请。
+            let mut target_state = checked(context, block_allocation_bit(&volume, target))?;
+            context.diagnostic(format_args!(
+                "W10 fragmentation first-physical={} target-successor={} target-allocation-state={:?} reservation-budget={} second-unprepared=1",
+                first, target, target_state, budget
+            ));
+            let mut occupied = target_state == Some(true);
+            let mut reserved_bounds: Option<(u64, u64)> = None;
+            for _ in 0..budget {
+                if occupied {
+                    break;
+                }
+                // 容量准备先于新责任；同组较低空洞的 token 一并保留，直到真实目标位被占住。
+                held.try_reserve(1)
+                    .map_err(|_| TestError("W10 physical separator owner OOM"))?;
+                let separator = checked(context, volume.allocate_block(allocation_hint))?;
+                let physical = separator.physical();
+                held.push(separator);
+                reserved_bounds =
+                    Some(reserved_bounds.map_or((physical, physical), |(low, high)| {
+                        (low.min(physical), high.max(physical))
+                    }));
+                context.diagnostic(format_args!(
+                    "W10 fragmentation first-physical={} target-successor={} separator-physical={} reserved-physical-bounds={:?} held-reservations={} second-unprepared=1",
+                    first, target, physical, reserved_bounds, held.len()
+                ));
+                if physical == target {
+                    occupied = true;
+                    break;
+                }
+                if target_state.is_none() {
+                    // 只在本次真实分配之后重核未知组；不把 BLOCK_UNINIT 的随机位当已拥有。
+                    target_state = checked(context, block_allocation_bit(&volume, target))?;
+                    occupied = target_state == Some(true);
+                    context.diagnostic(format_args!(
+                        "W10 target-after-real-allocation first-physical={} target-successor={} target-allocation-state={:?} held-reservations={}",
+                        first, target, target_state, held.len()
+                    ));
+                }
+            }
+            if !occupied {
+                return Err(TestError("W10 physical successor neither unavailable nor reserved within geometry block budget"));
+            }
+            context.diagnostic(format_args!(
+                "W10 target-exclusion first-physical={} target-successor={} target-allocation-state={:?} exclusion-source={} reserved-physical-bounds={:?} held-reservations={}",
+                first, target, target_state,
+                if target_state == Some(true) { "existing-unavailable" } else { "owned-token" },
+                reserved_bounds, held.len()
+            ));
+            let separators = held.len();
+            let mut second = 0;
+            for (index, slot) in folios.iter_mut().enumerate().skip(1) {
+                context.expect_eq(
+                    checked(
+                        context,
+                        file.write_at(base + (index * PAGE_SIZE) as u64, &[0xc4; 4096]),
+                    )?,
+                    4096,
+                );
+                *slot = Some(checked(
+                    context,
+                    file.file_page(base / PAGE_SIZE as u64 + index as u64),
+                )?);
+                if index == 1 {
+                    let mapping =
+                        checked(context, inode.map_block((base + PAGE_SIZE as u64) / block))?;
+                    context.diagnostic(format_args!(
+                        "W10 second-page first-physical={} target-successor={} reserved-physical-bounds={:?} held-reservations={} mapping={:?}",
+                        first, target, reserved_bounds, held.len(), mapping
+                    ));
+                    let BlockMapping::Mapped { physical, .. } = mapping else {
+                        return Err(TestError("batch second file page not mapped"));
+                    };
+                    second = physical;
+                    context.diagnostic(format_args!(
+                        "W10 fragmentation first-physical={} target-successor={} second-physical={} reserved-physical-bounds={:?} held-reservations={}",
+                        first, target, second, reserved_bounds, held.len()
+                    ));
+                    for separator in held.drain(..) {
+                        volume.release_unpublished_block(separator);
+                    }
+                }
+            }
+            Ok((first, target, second, separators))
+        })();
+        // 任一步失败均先显式归还全部未发表 token；已接受文件内容仍由原 fixture 真实同步。
+        for separator in held.drain(..) {
+            volume.release_unpublished_block(separator);
+        }
+        let (first, target, second, separators) = prepared?;
+        context.expect_eq(first + PAGE_SIZE as u64 / block != second, true);
+        let disk = fixture.user.path.owner.disk()?.clone();
+        let before = disk.test_snapshot();
+        disk.test_suspend_completions();
+        let syncing = inode.clone();
+        let observed = fixture.consume_sync(0, move || {
+            crate::fs::writeback::sync_inode_range(&syncing, base..base + 16 * PAGE_SIZE as u64)
+        })?;
+        until(
+            "W10 accepted batch did not make progress before wait",
+            || {
+                1 < disk.test_snapshot().inflight
+                    && before.data_submitted + 1 < disk.test_snapshot().data_submitted
+                    && observed.blocked()
+            },
+        )?;
+        let accepted = disk.test_snapshot();
+        context.expect_eq(before.notifications < accepted.notifications, true);
+        context.expect_eq(
+            2 <= folios
+                .iter()
+                .flatten()
+                .filter(|folio| folio.writeback_sectors() != 0)
+                .count(),
+            true,
+        );
+        disk.test_resume_completions();
+        fixture.join_consumers()?;
+        context.expect_eq(*observed.result.lock(), Some(Ok(())));
+        context.expect_eq(
+            folios
+                .iter()
+                .flatten()
+                .all(|folio| folio.dirty_sectors() == 0 && folio.writeback_sectors() == 0),
+            true,
+        );
+        disk.test_flush_completions();
+        context.expect_eq(disk.test_snapshot().inflight, 0);
+        for index in 0..16 {
+            bytes_at(
+                context,
+                &file,
+                base + (index * PAGE_SIZE) as u64,
+                &[0xc4; 4096],
+            )?;
+            context.expect_eq(
+                folios[index].as_ref().unwrap().phys_addr(),
+                checked(
+                    context,
+                    file.file_page(base / PAGE_SIZE as u64 + index as u64),
+                )?
+                .phys_addr(),
+            );
+        }
+        context.diagnostic(format_args!("W10 real-accepted-prefix-before-wait=1 original-folios=16 real-parent-and-queue-tails=1 first-physical={} target-successor={} second-physical={} all-unpublished-separators-released={} accepted-inflight={} notifications={} hardware-reverse-order-tested=0", first, target, second, separators, accepted.inflight, accepted.notifications - before.notifications));
+        Ok(())
+    }
+
+    /// 正式数据、元数据与 FLUSH 后结束全部 FS 和 VMA 拥有，弱引用到期后重新读盘验证新根、CRC 和内容。
+    #[test]
+    #[ktest(tags("W07", "fs-write-cold", "fs-sync"))]
+    fn formal_sync_drop_all_owners_and_cold_reload(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        assert!(
+            fixture.user.graph.is_none()
+                && fixture.user.running.is_none()
+                && fixture.shared_mm.is_none()
+        );
+        assert!(
+            fixture.inodes.is_empty()
+                && fixture.cold_volume.is_none()
+                && fixture.cold_cache.is_none()
+        );
+        let disk = fixture.user.path.owner.disk()?.clone();
+        let file = fixture.cold_open(context)?;
+        let inode = fixture.inodes.last().unwrap().clone();
+        let volume = fixture.cold_volume.as_ref().unwrap().clone();
+        if !disk.limits().flush {
+            return Err(TestError("W07 cold reload requires real FLUSH"));
+        }
+        let block = volume.geometry().block_size as u64;
+        let base = checked(context, file.stat())?
+            .size
+            .div_ceil(PAGE_SIZE as u64)
+            * PAGE_SIZE as u64;
+        let traditional = checked(context, inode.metadata_snapshot())?.flags & 0x80000 == 0;
+        let logical = if traditional {
+            [0, 12, 268, 65804, 65806]
+        } else {
+            [0, 2, 4, 6, 8]
+        };
+        let mut physical = [0u64; 5];
+        for (index, logical) in logical.iter().copied().enumerate() {
+            let offset = base + logical * block;
+            let input = [0x41 + index as u8; 4096];
+            context.expect_eq(
+                file.write_at(offset, &input[..block as usize]),
+                Ok(block as usize),
+            );
+            let BlockMapping::Mapped {
+                physical: mapped, ..
+            } = checked(context, inode.map_block(offset / block))?
+            else {
+                return Err(TestError("cold producer block not mapped"));
+            };
+            physical[index] = mapped;
+        }
+        let mapped = tree(context, &inode)?;
+        if !traditional {
+            context.expect_eq(0 < mapped.depth, true);
+        }
+        let before = disk.test_snapshot();
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        let synced = disk.test_snapshot();
+        context.expect_eq(before.data_submitted < synced.data_submitted, true);
+        context.expect_eq(before.metadata_submitted < synced.metadata_submitted, true);
+        context.expect_eq(synced.flush_submitted - before.flush_submitted, 1);
+        let stat = checked(context, file.stat())?;
+        let metadata = checked(context, inode.metadata_snapshot())?;
+        let root = checked(context, inode.with_map_read(|_, root| Ok(*root)))?;
+        let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
+            .map_err(|_| TestError("cold VMA owner OOM"))?;
+        vm(
+            context,
+            mm.map_file(SOURCE, 4096, RO, RO, file.clone(), base, false),
+        )?;
+        mapped_bytes(context, &mm, SOURCE, &[0x41]);
+        let weak_mm = Arc::downgrade(&mm);
+        let weak_file = Arc::downgrade(&file);
+        let weak_volume = Arc::downgrade(&volume);
+        let weak_metadata = Arc::downgrade(volume.metadata_cache());
+        let weak_cache = Arc::downgrade(fixture.cold_cache.as_ref().unwrap());
+        drop((mm, file, inode, volume));
+        fixture.inodes.clear();
+        drop(fixture.cold_cache.take());
+        drop(fixture.cold_volume.take());
+        disk.test_flush_completions();
+        context.expect_eq(disk.test_snapshot().inflight, 0);
+        context.expect_eq(weak_mm.upgrade().is_none(), true);
+        context.expect_eq(weak_file.upgrade().is_none(), true);
+        context.expect_eq(weak_cache.upgrade().is_none(), true);
+        context.expect_eq(weak_metadata.upgrade().is_none(), true);
+        context.expect_eq(weak_volume.upgrade().is_none(), true);
+        if weak_mm.strong_count() != 0
+            || weak_file.strong_count() != 0
+            || weak_cache.strong_count() != 0
+            || weak_volume.strong_count() != 0
+            || weak_metadata.strong_count() != 0
+        {
+            return Err(TestError("cold reload still has old FS owners"));
+        }
+        let reads_before = disk.test_snapshot().submitted;
+        let reopened = fixture.cold_open(context)?;
+        let reloaded_inode = fixture.inodes.last().unwrap().clone();
+        let mut reloaded_stat = checked(context, reopened.stat())?;
+        context.expect_eq(reloaded_stat.device != stat.device, true);
+        // 新卷实例分配新的内核设备号；盘面属性仍须逐项相同。
+        reloaded_stat.device = stat.device;
+        context.expect_eq(reloaded_stat, stat);
+        context.expect_eq(
+            checked(context, reloaded_inode.metadata_snapshot())?,
+            metadata,
+        );
+        context.expect_eq(
+            checked(context, reloaded_inode.with_map_read(|_, root| Ok(*root)))?,
+            root,
+        );
+        let reloaded = tree(context, &reloaded_inode)?;
+        context.expect_eq(
+            (
+                reloaded.depth,
+                reloaded.extents,
+                reloaded.data,
+                reloaded.nodes,
+                &reloaded.blocks,
+            ),
+            (
+                mapped.depth,
+                mapped.extents,
+                mapped.data,
+                mapped.nodes,
+                &mapped.blocks,
+            ),
+        );
+        for (index, logical) in logical.iter().copied().enumerate() {
+            let offset = base + logical * block;
+            let expected = [0x41 + index as u8; 4096];
+            bytes_at(context, &reopened, offset, &expected[..block as usize])?;
+            let BlockMapping::Mapped {
+                physical: mapped, ..
+            } = checked(context, reloaded_inode.map_block(offset / block))?
+            else {
+                return Err(TestError("cold reloaded block not mapped"));
+            };
+            context.expect_eq(mapped, physical[index]);
+        }
+        context.expect_eq(reads_before < disk.test_snapshot().submitted, true);
+        context.diagnostic(format_args!("W07 cold-reload original-MM-OFD-inode-cache-metadata-volume-ended=1 fresh-volume-and-cache=1 real-device-reads=1 root-and-all-blocks=1 production-inode-and-tree-codec=1 format={} base={}", if traditional { "traditional" } else { "extent" }, base));
+        Ok(())
+    }
+
+    /// 真正在途的原页允许普通覆盖和映射再脏，旧父完成只撤自己的 WB，下一轮写出新义务。
+    #[test]
+    #[ktest(tags("W09", "fs-sync", "fs-shared"), min_cpus = 2)]
+    fn coherent_redirty_during_original_writeback(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        let offset = checked(context, file.stat())?
+            .size
+            .div_ceil(PAGE_SIZE as u64)
+            * PAGE_SIZE as u64;
+        context.expect_eq(file.write_at(offset, &[0x31; 4096]), Ok(4096));
+        let inode = fixture.inodes.last().unwrap().clone();
+        // 普通增长可能给旧 EOF 尾页留下合法义务，先真实同步它，再只覆盖本例新页。
+        checked(context, crate::fs::writeback::sync_inode(&inode))?;
+        context.expect_eq(file.write_at(offset, &[0x31; 4096]), Ok(4096));
+        let volume = fixture.volume();
+        context.expect_eq(
+            (0..volume.dirty_inode_limit())
+                .filter_map(|slot| volume.dirty_inode_at(slot))
+                .any(|dirty| dirty.ptr_eq(&inode)),
+            true,
+        );
+        let alias = shared_alias(context, &file, offset)?;
+        let folio = checked(context, file.file_page(offset / PAGE_SIZE as u64))?;
+        let disk = fixture.user.path.owner.disk()?.clone();
+        let before = disk.test_snapshot();
+        disk.test_suspend_completions();
+        let syncing = inode.clone();
+        let observed = fixture.consume_sync(0, move || {
+            crate::fs::writeback::sync_inode_range(&syncing, offset..offset + PAGE_SIZE as u64)
+        })?;
+        until("W09 original WB did not block with accepted IO", || {
+            folio.writeback_sectors() != 0
+                && disk.test_snapshot().inflight != 0
+                && observed.blocked()
+        })?;
+        context.expect_eq(folio.dirty_sectors(), 0);
+        let writing = file.clone();
+        let mapping = alias.clone();
+        let producer = fixture.consume_sync(1, move || {
+            if writing.write_at(offset + 1, &[0x52])? != 1 {
+                return Err(FsError::InvalidOperation);
+            }
+            let progress = mapping.copyout(SHARED_ALIAS + 2, &[0x73]);
+            if progress.copied == 1 && progress.error.is_none() {
+                Ok(())
+            } else {
+                Err(FsError::BadAddress)
+            }
+        })?;
+        until(
+            "W09 redirty producer did not reach a determinate state",
+            || producer.result.lock().is_some() || producer.blocked(),
+        )?;
+        context.expect_eq(*producer.result.lock(), Some(Ok(())));
+        context.expect_eq(
+            alias.mapping(SHARED_ALIAS).unwrap().physical,
+            folio.phys_addr(),
+        );
+        context.expect_eq(
+            (folio.dirty_sectors() != 0, folio.writeback_sectors() != 0),
+            (true, true),
+        );
+        bytes_at(context, &file, offset, &[0x31, 0x52, 0x73])?;
+        disk.test_resume_completions();
+        fixture.join_consumers()?;
+        context.expect_eq(*observed.result.lock(), Some(Ok(())));
+        context.expect_eq(folio.writeback_sectors(), 0);
+        context.expect_eq(folio.dirty_sectors() != 0, true);
+        context.expect_eq(
+            (0..volume.dirty_inode_limit())
+                .filter_map(|slot| volume.dirty_inode_at(slot))
+                .any(|dirty| dirty.ptr_eq(&inode)),
+            true,
+        );
+        let first = disk.test_snapshot();
+        checked(
+            context,
+            crate::fs::writeback::sync_inode_range(&inode, offset..offset + PAGE_SIZE as u64),
+        )?;
+        context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
+        context.expect_eq(before.data_submitted < first.data_submitted, true);
+        context.expect_eq(
+            first.data_submitted < disk.test_snapshot().data_submitted,
+            true,
+        );
+        context.expect_eq(
+            (0..volume.dirty_inode_limit())
+                .filter_map(|slot| volume.dirty_inode_at(slot))
+                .any(|dirty| dirty.ptr_eq(&inode)),
+            false,
+        );
+        context.diagnostic(format_args!("W09 original-folio={} original-parent-blocked=1 ordinary-and-mapped-redirty=1 old-completion-preserves-dirty=1 next-round-progress=1", folio.phys_addr()));
+        Ok(())
+    }
+
+    /// 两独立 OFD 各观察一次错误，dup 共游标；没有任何观察者的新错误仍由后来 open 报告。
+    #[test]
+    #[ktest(tags("W11", "fs-sync", "controlled-ledger"))]
+    fn independent_open_dup_and_unseen_old_errseq(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        context.expect_eq(crate::cache::ktest_wb_error_protocol(), true);
+        let first = fixture.open(context, b"/test/write-reserve", 2)?;
+        let second = fixture.open(context, b"/test/write-reserve", 2)?;
+        context.expect_eq(Arc::ptr_eq(&first, &second), false);
+        let inode = fixture.inodes.last().unwrap().clone();
+        let disk = fixture.user.path.owner.disk()?.clone();
+        let table = checked(context, FileTable::try_new(4))?;
+        let fd =
+            checked(context, table.reserve())?.publish(first.clone(), DescriptorFlags::default());
+        let duplicate = checked(context, table.dup(fd))?;
+        let duplicated = checked(context, table.lookup(duplicate))?;
+        context.expect_eq(Arc::ptr_eq(&first, &duplicated), true);
+        context.expect_eq(first.write_at(0, &[0x91; 4096]), Ok(4096));
+        disk.test_fail_next_data(BlockError::Io);
+        let error = Err(FsError::Io(BlockError::Io));
+        context.expect_eq(first.sync_range(0..u64::MAX, false), error);
+        context.expect_eq(disk.test_completion_error_pending(), false);
+        let failed = disk.test_snapshot();
+        context.expect_eq(second.sync_range(0..u64::MAX, false), error);
+        context.expect_eq(duplicated.sync_range(0..u64::MAX, false), Ok(()));
+        context.expect_eq(first.sync_range(0..u64::MAX, false), Ok(()));
+        let seen = fixture.open(context, b"/test/write-reserve", 2)?;
+        context.expect_eq(seen.sync_range(0..u64::MAX, false), Ok(()));
+        context.expect_eq(disk.test_snapshot().data_submitted, failed.data_submitted);
+        context.expect_eq(first.write_at(0, &[0xa2; 4096]), Ok(4096));
+        disk.test_fail_next_data(BlockError::Io);
+        context.expect_eq(crate::fs::writeback::sync_inode(&inode), error);
+        context.expect_eq(disk.test_completion_error_pending(), false);
+        let unseen = fixture.open(context, b"/test/write-reserve", 2)?;
+        context.expect_eq(unseen.sync_range(0..u64::MAX, false), error);
+        context.expect_eq(unseen.sync_range(0..u64::MAX, false), Ok(()));
+        context.expect_eq(first.sync_range(0..u64::MAX, false), error);
+        context.expect_eq(duplicated.sync_range(0..u64::MAX, false), Ok(()));
+        context.expect_eq(second.sync_range(0..u64::MAX, false), error);
+        let folio = checked(context, first.file_page(0))?;
+        context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
+        context.diagnostic(format_args!("W11 real-used-controlled-EIO=1 two-independent-observers=1 dup-shared-cursor=1 seen-new-open-skips=1 unseen-new-open-reports=1 accepted-error-no-replay=1"));
+        Ok(())
+    }
+
+    /// 页已清脏但原 WB 未完成时，普通 sys82 必须真实 Blocked，放行真实完成后才返回。
+    #[test]
+    #[ktest(tags("W12", "fs-sync", "user-fs"), min_cpus = 2)]
+    fn fsync_waits_for_existing_clean_writeback(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        context.expect_eq(file.write_at(0, &[0x45; 4096]), Ok(4096));
+        let inode = fixture.inodes.last().unwrap().clone();
+        let folio = checked(context, file.file_page(0))?;
+        let image = fixture.shared_image(context, b"b")?;
+        let mm = image.mm.clone();
+        fixture.start_shared(context, image)?;
+        fixture.phase(&mm, 0, 1)?;
+        let executor = fixture
+            .user
+            .graph()
+            .lookup_thread(fixture.user.running.as_ref().unwrap().pid)
+            .and_then(|user| user.executor())
+            .ok_or(TestError("W12 user executor missing"))?;
+        let disk = fixture.user.path.owner.disk()?.clone();
+        disk.test_suspend_completions();
+        let syncing = inode.clone();
+        let first = fixture.consume_sync(0, move || crate::fs::writeback::sync_inode(&syncing))?;
+        until("W12 clean original page not in WB", || {
+            folio.dirty_sectors() == 0
+                && folio.writeback_sectors() != 0
+                && disk.test_snapshot().inflight != 0
+                && first.blocked()
+        })?;
+        WriteOwner::release(&mm, 1)?;
+        until("W12 sys82 did not really block on existing WB", || {
+            sched::test_state(&executor) == State::Blocked
+        })?;
+        context.expect_eq(mm.load_user_u32(SHARED_CONTROL), Ok(1));
+        context.expect_eq(folio.dirty_sectors(), 0);
+        context.expect_eq(folio.writeback_sectors() != 0, true);
+        context.expect_eq(
+            fixture
+                .user
+                .running
+                .as_ref()
+                .unwrap()
+                .join
+                .try_join()
+                .is_none(),
+            true,
+        );
+        disk.test_resume_completions();
+        fixture.join_consumers()?;
+        context.expect_eq(*first.result.lock(), Some(Ok(())));
+        fixture.phase(&mm, 0, 2)?;
+        WriteOwner::release(&mm, 2)?;
+        fixture.finish_shared(context)?;
+        context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
+        context.diagnostic(format_args!("W12 Dirty0-WB1=1 original-data-parent-blocked=1 ordinary-sys82-blocked=1 completion-before-return=1"));
+        Ok(())
+    }
+
+    /// 数据真实完成后才消费一次元数据或 FLUSH 错误，显式后次同步和静止窗口都不得自动 replay。
+    #[test]
+    #[case("metadata", false)]
+    #[case("flush", true)]
+    #[ktest(tags("W13", "fs-sync", "controlled-ledger"))]
+    fn data_then_metadata_flush_error_without_replay(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+        flush: bool,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        let disk = fixture.user.path.owner.disk()?.clone();
+        if !disk.limits().flush {
+            return Err(TestError("W13 requires negotiated real FLUSH"));
+        }
+        context.expect_eq(file.write_at(0, &[0xb3; 4096]), Ok(4096));
+        let before = disk.test_snapshot();
+        if flush {
+            disk.test_fail_next_flush(BlockError::Io);
+        } else {
+            disk.test_fail_next_metadata(BlockError::Io);
+        }
+        context.expect_eq(
+            file.sync_range(0..u64::MAX, false),
+            Err(FsError::Io(BlockError::Io)),
+        );
+        context.expect_eq(disk.test_completion_error_pending(), false);
+        let failed = disk.test_snapshot();
+        context.expect_eq(before.data_submitted < failed.data_submitted, true);
+        context.expect_eq(before.metadata_submitted < failed.metadata_submitted, true);
+        if flush {
+            context.expect_eq(failed.flush_submitted - before.flush_submitted, 1);
+        }
+        let folio = checked(context, file.file_page(0))?;
+        context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
+        disk.test_flush_completions();
+        timer::sleep(time::Duration::from_millis(10));
+        context.expect_eq(disk.test_snapshot().submitted, failed.submitted);
+        context.expect_eq(file.sync_range(0..u64::MAX, false), Ok(()));
+        let next = disk.test_snapshot();
+        context.expect_eq(next.data_submitted, failed.data_submitted);
+        context.expect_eq(next.metadata_submitted, failed.metadata_submitted);
+        context.expect_eq(next.flush_submitted - failed.flush_submitted, 1);
+        bytes_at(context, &file, 0, &[0xb3; 4096])?;
+        context.diagnostic(format_args!("W13 kind={} actual-used-controlled-EIO=1 data-before-error=1 automatic-replay=0 explicit-next-sync-data-replay=0 explicit-next-sync-metadata-replay=0", if flush { "FLUSH" } else { "metadata" }));
+        Ok(())
+    }
+
+    /// 小块几何核同原页的精确 Dirty 交集；原 OFD 与 VMA 偏移决定写出范围，private COW 和异步不写源页。
+    #[test]
+    #[ktest(tags("W14", "fs-sync", "fs-shared", "user-fs"))]
+    fn msync_ranges_private_and_ordinary_abi(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        context.expect_eq(file.write_at(0, &[0x66; 8192]), Ok(8192));
+        let inode = fixture.inodes.last().unwrap().clone();
+        checked(context, crate::fs::writeback::sync_inode(&inode))?;
+        let first = checked(context, file.file_page(0))?;
+        let second = checked(context, file.file_page(1))?;
+        let block = inode.filesystem().geometry().block_size;
+        let disk = fixture.user.path.owner.disk()?.clone();
+        if block < PAGE_SIZE {
+            let (first_mask, neighbor_mask) = match block {
+                1024 => (0x03u8, 0x0cu8),
+                2048 => (0x0fu8, 0xf0u8),
+                _ => return Err(TestError("W14 unsupported small FS block geometry")),
+            };
+            let original = first.phys_addr();
+            context.expect_eq((first.dirty_sectors(), first.writeback_sectors()), (0, 0));
+            context.expect_eq(checked(context, file.write_at(64, &[0xa6; 3]))?, 3);
+            context.expect_eq(
+                checked(context, file.write_at(block as u64 + 64, &[0xb7; 3]))?,
+                3,
+            );
+            context.expect_eq(
+                (first.dirty_sectors(), first.writeback_sectors()),
+                (first_mask | neighbor_mask, 0),
+            );
+            let before_range = disk.test_snapshot();
+            checked(context, file.sync_range(64..67, true))?;
+            context.expect_eq(
+                (first.dirty_sectors(), first.writeback_sectors()),
+                (neighbor_mask, 0),
+            );
+            context.expect_eq(checked(context, file.file_page(0))?.phys_addr(), original);
+            context.expect_eq(
+                before_range.data_submitted < disk.test_snapshot().data_submitted,
+                true,
+            );
+            bytes_at(context, &file, 64, &[0xa6; 3])?;
+            bytes_at(context, &file, block as u64 + 64, &[0xb7; 3])?;
+            let before_neighbor = disk.test_snapshot();
+            checked(
+                context,
+                file.sync_range(block as u64 + 64..block as u64 + 67, true),
+            )?;
+            context.expect_eq((first.dirty_sectors(), first.writeback_sectors()), (0, 0));
+            context.expect_eq(checked(context, file.file_page(0))?.phys_addr(), original);
+            context.expect_eq(
+                before_neighbor.data_submitted < disk.test_snapshot().data_submitted,
+                true,
+            );
+            bytes_at(context, &file, 64, &[0xa6; 3])?;
+            bytes_at(context, &file, block as u64 + 64, &[0xb7; 3])?;
+            bytes_at(context, &file, 29, &[0x66])?;
+            context.diagnostic(format_args!("W14 small-FS-block-range block-size={} original-folio={} initial-dirty-mask={:#04x} neighbor-dirty-mask={:#04x} first-intersection-only=1 neighbor-explicit-sync=1 WB0-after-each-range=1", block, original, first_mask | neighbor_mask, neighbor_mask));
+        } else {
+            context.diagnostic(format_args!("W14 small-FS-block-range block-size={} branch-exercised=0 same-folio-neighbor-unavailable=1", block));
+        }
+        let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
+        vm(
+            context,
+            mm.map_file(SOURCE, 4096, RW, RW, file.clone(), 4096, false),
+        )?;
+        vm(
+            context,
+            mm.map_file(SHARED_ALIAS, 4096, RW, RW, file.clone(), 0, true),
+        )?;
+        context.expect_eq(mm.copyout(SOURCE + 29, &[0x77]).copied, 1);
+        context.expect_eq(mm.copyout(SHARED_ALIAS + 29, &[0x88]).copied, 1);
+        let before = disk.test_snapshot();
+        vm(
+            context,
+            mm.sync_mapping_range(SOURCE..SOURCE + 4096, false, true),
+        )?;
+        context.expect_eq(disk.test_snapshot().submitted, before.submitted);
+        context.expect_eq(mm.mapping(SOURCE).unwrap().permissions.write, true);
+        vm(
+            context,
+            mm.sync_mapping_range(SHARED_ALIAS..SHARED_ALIAS + 4096, true, false),
+        )?;
+        context.expect_eq(disk.test_snapshot().submitted, before.submitted);
+        context.expect_eq(second.dirty_sectors() != 0, true);
+        context.expect_eq(first.dirty_sectors(), 0);
+        context.expect_eq(
+            mm.sync_mapping_range(SOURCE..SOURCE + 8192, true, false),
+            Err(VmError::Unmapped),
+        );
+        context.expect_eq((second.dirty_sectors(), second.writeback_sectors()), (0, 0));
+        context.expect_eq(
+            before.data_submitted < disk.test_snapshot().data_submitted,
+            true,
+        );
+        bytes_at(context, &file, 4096 + 29, &[0x77])?;
+        bytes_at(context, &file, 29, &[0x66])?;
+        mapped_bytes(context, &mm, SHARED_ALIAS + 29, &[0x88]);
+        drop(mm);
+        let image = fixture.shared_image(context, b"y")?;
+        let user_mm = image.mm.clone();
+        fixture.start_shared(context, image)?;
+        fixture.phase(&user_mm, 0, 1)?;
+        let no_io = disk.test_snapshot();
+        WriteOwner::release(&user_mm, 1)?;
+        fixture.phase(&user_mm, 0, 2)?;
+        context.expect_eq(disk.test_snapshot().submitted, no_io.submitted);
+        context.expect_eq(second.dirty_sectors() != 0, true);
+        WriteOwner::release(&user_mm, 2)?;
+        fixture.finish_shared(context)?;
+        context.diagnostic(format_args!("W14 nonzero-file-offset=1 range-only-page=1 private-and-async-no-IO=1 invalidate-no-purge=1 hole-ENOMEM-after-progress=1 ordinary-sys82-83-227-flags-and-range=1"));
+        Ok(())
+    }
+
+    /// 同步 write 交数据和 cursor 后放写锁，独立覆盖可前进；用户完成 phase2 后才观察自己的错误完成。
+    #[test]
+    #[case("O_SYNC", b"d" as &[u8])]
+    #[case("O_DSYNC", b"z" as &[u8])]
+    #[ktest(tags("W14", "fs-sync", "user-fs"), min_cpus = 2)]
+    fn synchronous_write_releases_inode_and_cursor_locks(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+        mode: &[u8],
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        context.expect_eq(file.write_at(0, &[0x22; 4096]), Ok(4096));
+        let inode = fixture.inodes.last().unwrap().clone();
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        let image = fixture.shared_image(context, mode)?;
+        let mm = image.mm.clone();
+        fixture.start_shared(context, image)?;
+        fixture.phase(&mm, 0, 1)?;
+        let user = fixture
+            .user
+            .graph()
+            .lookup_thread(fixture.user.running.as_ref().unwrap().pid)
+            .ok_or(TestError("sync writer user missing"))?;
+        let executor = user
+            .executor()
+            .ok_or(TestError("sync writer executor missing"))?;
+        let user_fd = mm
+            .read_usize(SHARED_CONTROL + 16)
+            .map_err(|_| TestError("sync writer fd missing"))?;
+        let original = checked(
+            context,
+            user.runtime()
+                .ok_or(TestError("sync writer runtime missing"))?
+                .files
+                .lookup(user_fd),
+        )?;
+        let folio = checked(context, file.file_page(0))?;
+        let disk = fixture.user.path.owner.disk()?.clone();
+        disk.test_suspend_completions();
+        disk.test_fail_next_data(BlockError::Io);
+        WriteOwner::release(&mm, 1)?;
+        until("O_SYNC write did not block in actual accepted WB", || {
+            folio.writeback_sectors() != 0
+                && disk.test_snapshot().inflight != 0
+                && sched::test_state(&executor) == State::Blocked
+        })?;
+        let cursor = original.clone();
+        let writing = file.clone();
+        let unlocked = fixture.consume_sync(0, move || {
+            if cursor.seek(SeekFrom::Current(0))? != 1 {
+                return Err(FsError::InvalidOperation);
+            }
+            if writing.write_at(1, &[0x33])? != 1 {
+                return Err(FsError::InvalidOperation);
+            }
+            Ok(())
+        })?;
+        until(
+            "sync write lock probe did not reach a determinate state",
+            || unlocked.result.lock().is_some() || unlocked.blocked(),
+        )?;
+        context.expect_eq(*unlocked.result.lock(), Some(Ok(())));
+        context.expect_eq(folio.dirty_sectors() != 0, true);
+        disk.test_resume_completions();
+        fixture.join_consumers()?;
+        fixture.phase(&mm, 0, 2)?;
+        context.expect_eq(disk.test_completion_error_pending(), false);
+        bytes_at(context, &file, 0, &[0x39, 0x33])?;
+        context.expect_eq(original.seek(SeekFrom::Current(0)), Ok(1));
+        WriteOwner::release(&mm, 2)?;
+        fixture.finish_shared(context)?;
+        checked(context, crate::fs::writeback::sync_inode(&inode))?;
+        context.diagnostic(format_args!("W14 mode={} actual-sync-write-blocked=1 inode-lock-released=1 OFD-cursor-lock-released=1 accepted-data-and-cursor-not-rolled-back-on-EIO=1", if mode == b"d" { "O_SYNC" } else { "O_DSYNC" }));
+        Ok(())
+    }
 
     /// 源故障只接受真实前缀；写提交更新时间，共享只读尾页继续观察覆盖与同页增长。
     #[test]
@@ -1213,7 +2176,7 @@ pub(crate) mod writes {
         for inode in &fixture.inodes {
             checked(context, crate::fs::writeback::sync_inode(inode))?;
         }
-        checked(context, crate::fs::writeback::sync_volume(&volume))?;
+        checked(context, crate::fs::writeback::sync_metadata(&volume))?;
         let mut device_bytes = [0u8; 4096];
         for physical in first_split
             .blocks
@@ -1687,7 +2650,7 @@ pub(crate) mod writes {
         Ok(())
     }
 
-    /// 真实 fork 子叶先 RO，mprotect 只改许可，WB 完成后 copyout 才重新授权并标 Dirty。
+    /// 真实 fork 子叶先 RO，mprotect 只改许可，coherent WB 中 copyout 重新授权并留下新 Dirty。
     #[test]
     #[ktest(tags("W18", "fs-shared"), min_cpus = 2)]
     fn fork_protect_copyout_writeback_private_cow(
@@ -1735,11 +2698,7 @@ pub(crate) mod writes {
         context.expect_eq(mm.mapping(SOURCE).unwrap().permissions.write, false);
         context.expect_eq(child_mm.mapping(SOURCE).unwrap().permissions.write, false);
         let copying = child_mm.clone();
-        let observer = Arc::try_new(SpinLock::new(None::<alloc::sync::Weak<Task>>))
-            .map_err(|_| TestError("copyout task observer OOM"))?;
-        let record = observer.clone();
         let copy = task::prepare_kernel_on(cpu::current().id, move || {
-            *record.lock() = Some(Arc::downgrade(&task::current_task()));
             let progress = copying.copyout(SOURCE + 4, &[0x85]);
             if progress.copied == 1 && progress.error.is_none() {
                 0
@@ -1750,15 +2709,18 @@ pub(crate) mod writes {
         .map_err(|_| TestError("copyout consumer prepare failed"))?;
         let grants = child_mm.ktest_mkwrite_count();
         fixture.consumers[1] = Some(copy.publish());
-        until("copyout did not block on real WB", || {
-            let executor = observer
-                .lock()
-                .as_ref()
-                .and_then(alloc::sync::Weak::upgrade);
-            executor.is_some_and(|executor| sched::test_state(&executor) == State::Blocked)
+        until("coherent copyout did not progress during real WB", || {
+            fixture.consumers[1].as_ref().unwrap().try_join().is_some()
         })?;
-        context.expect_eq(child_mm.ktest_mkwrite_count(), grants);
-        context.expect_eq(child_mm.mapping(SOURCE).unwrap().permissions.write, false);
+        context.expect_eq(folio.writeback_sectors() != 0, true);
+        context.expect_eq(disk.test_snapshot().inflight != 0, true);
+        context.expect_eq(grants < child_mm.ktest_mkwrite_count(), true);
+        context.expect_eq(child_mm.mapping(SOURCE).unwrap().permissions.write, true);
+        context.expect_eq(
+            child_mm.mapping(SOURCE).unwrap().physical,
+            folio.phys_addr(),
+        );
+        context.expect_eq(folio.dirty_sectors() != 0, true);
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(folio.writeback_sectors(), 0);
@@ -1767,6 +2729,8 @@ pub(crate) mod writes {
         mapped_bytes(context, &mm, SOURCE + 4, &[0x85]);
         bytes_at(context, &file, 4, &[0x85])?;
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
+        let mut original = [0; 1];
+        context.expect_eq(file.read_at(5, &mut original), Ok(1));
         let private = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -1783,15 +2747,15 @@ pub(crate) mod writes {
             true,
         );
         context.expect_eq(folio.dirty_sectors(), 0);
-        bytes_at(context, &file, 5, &[5])?;
+        bytes_at(context, &file, 5, &original)?;
         mapped_bytes(context, &private, SHARED_ALIAS + 5, &[0xef]);
         WriteOwner::release(&mm, 3)?;
         until("shared fork child did not exit", || child.mm().is_none())?;
         bytes_at(context, &file, 2, &[0x83])?;
         WriteOwner::release(&mm, 4)?;
         fixture.finish_shared(context)?;
-        drop((private, child_mm, child, mm, folio, disk, observer));
-        context.diagnostic(format_args!("W18 fork-child-ro=1 protect-no-direct-w=1 copyout-wb-blocked=1 post-wb-dirty=1 private-cow-isolated=1"));
+        drop((private, child_mm, child, mm, folio, disk));
+        context.diagnostic(format_args!("W18 fork-child-ro=1 protect-no-direct-w=1 coherent-copyout-during-wb=1 original-dma-pfn=1 old-completion-preserves-dirty=1 private-cow-isolated=1"));
         Ok(())
     }
 

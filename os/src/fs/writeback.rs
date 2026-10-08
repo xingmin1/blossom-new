@@ -1,143 +1,247 @@
-//! 文件与元数据回写共用原页、范围 WB 凭证和唯一受限 FS Bio 提交。
+//! 文件与元数据回写共用原页、有限 ToWrite 选择和唯一 FS Bio 批次。
 
-use crate::block::BlockError;
-use crate::cache::{FileMapping, FolioMark, MetadataCache};
+use alloc::vec::Vec;
+use core::ops::Range;
+
+use crate::block::{BlockError, FsClaim, MAX_BATCH};
+use crate::cache::FolioMark;
 use crate::fs::{BlockMapping, Ext4Volume, FsError, InodeRef};
-use crate::mm::{FolioRef, PAGE_SIZE};
+use crate::mm::{FolioRef, FolioWriteback, PAGE_SIZE};
 
-/// 调用者停止该 inode 的新写入后排空本轮文件义务，不把此入口当完整用户 fsync。
-/// 块映射读保护延续到真实 IO 全尾；文件数据完成后仍须同步卷元数据和设备缓存。
-pub(crate) fn sync_inode(inode: &InodeRef) -> Result<(), FsError> {
-    let mapping = inode.mapping();
-    let budget = mapping.len();
-    select_inode_work(mapping, budget, FolioMark::Dirty);
-    select_inode_work(mapping, budget, FolioMark::Writeback);
-    let mut cursor = 0;
-    for _ in 0..budget {
-        let mut selected = [None];
-        let next = mapping.select_range(cursor, u64::MAX, FolioMark::ToWrite, &mut selected);
-        if let Some((index, folio)) = selected[0].take() {
-            let folio = folio.with_file_owner(inode.clone());
-            folio.wait_writeback();
-            sync_file_page(inode, index, &folio)?;
-            mapping.set_to_write(index, false);
-        }
-        let Some(next) = next else {
-            break;
-        };
-        cursor = next;
-    }
-    Ok(())
+const SECTORS_PER_PAGE: usize = PAGE_SIZE / 512;
+const WINDOW_RANGES: usize = MAX_BATCH * SECTORS_PER_PAGE;
+
+/// 一个有界准备窗口只保存原页引用和真实块地址，不复制页内容。
+struct FilePagePlan {
+    index: u64,
+    folio: FolioRef,
+    targets: [Option<u64>; SECTORS_PER_PAGE],
 }
 
-/// 卷新写者及所有文件数据义务停止后写出共同元数据并执行真实 FLUSH。
-/// 本入口不遍历另一份 inode 库存，调用者须先同步各个实际修改的 inode。
-pub(crate) fn sync_volume(volume: &Ext4Volume) -> Result<(), FsError> {
+/// 同步 inode 的全部文件范围，等待已有 WB 并只结束本轮选择。
+pub(crate) fn sync_inode(inode: &InodeRef) -> Result<(), FsError> {
+    sync_inode_range(inode, 0..u64::MAX)
+}
+
+/// 同步半开文件字节范围；同一 mapping 的选择及完成串行，其他 inode 独立。
+pub(crate) fn sync_inode_range(inode: &InodeRef, range: Range<u64>) -> Result<(), FsError> {
+    let _writeback = inode.mapping().lock_writeback();
+    let result = sync_inode_locked(inode, &range);
+    if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
+        return result;
+    }
+    let refreshed = inode.refresh_dirty_obligation();
+    result.and(refreshed)
+}
+
+/// 只协调共同元数据阶段及协商的真实 FLUSH，不串行不同 inode 的数据 IO。
+pub(crate) fn sync_metadata(volume: &Ext4Volume) -> Result<(), FsError> {
     let cache = volume.metadata_cache();
-    let budget = cache.len();
-    select_metadata_work(cache, budget, FolioMark::Dirty);
-    select_metadata_work(cache, budget, FolioMark::Writeback);
+    let _writeback = cache.lock_writeback();
+    let result = sync_metadata_locked(volume);
+    if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
+        return result;
+    }
+    let flush = volume.claim().flush().map_err(FsError::from);
+    if let Err(error) = flush {
+        cache.record_wb_error(error);
+    }
+    result.and(flush)
+}
+
+/// 有限标记及窗口提交只覆盖元数据；任何准备错误仍清理本轮选择并等待旧 WB。
+fn sync_metadata_locked(volume: &Ext4Volume) -> Result<(), FsError> {
+    let cache = volume.metadata_cache();
+    let mut remaining = cache.mark_to_write_range(0, u64::MAX);
     let mut cursor = 0;
-    for _ in 0..budget {
-        let mut selected = [None];
+    let mut first_error = None;
+    let mut ranges = if remaining == 0 {
+        Vec::new()
+    } else {
+        match reserve_ranges() {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                first_error = Some(error);
+                Vec::new()
+            }
+        }
+    };
+    while remaining != 0 {
+        let mut selected = [const { None }; MAX_BATCH];
         let next = cache.select_range(cursor, u64::MAX, FolioMark::ToWrite, &mut selected);
-        if let Some((byte_offset, folio)) = selected[0].take() {
-            let folio = folio.with_metadata_owner(cache.clone());
+        // 尚未建立本窗口 WB，旧 WB 等待不会阻止本窗口已接受的请求获得通知。
+        for (_, folio) in selected.iter().flatten() {
             folio.wait_writeback();
-            sync_metadata_page(volume, byte_offset, &folio)?;
+        }
+        for entry in &mut selected {
+            let Some((byte_offset, folio)) = entry.take() else {
+                continue;
+            };
+            remaining -= 1;
+            let folio = folio.with_metadata_owner(cache.clone());
+            if ranges.capacity() != 0 {
+                let result =
+                    prepare_metadata_page(volume.claim(), byte_offset, &folio, &mut ranges);
+                remember_error(&mut first_error, result);
+            }
             cache.set_to_write(byte_offset, false);
         }
-        let Some(next) = next else {
-            break;
-        };
+        remember_error(&mut first_error, submit_ranges(volume.claim(), &mut ranges));
+        let Some(next) = next else { break };
         cursor = next;
     }
-    volume.claim().flush()?;
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
-/// 按开始时的节点数标记有限工作集，扫描不随新 Dirty 无限扩大。
-fn select_inode_work(mapping: &FileMapping, budget: usize, mark: FolioMark) {
-    let mut cursor = 0;
-    for _ in 0..budget {
-        let mut selected = [None];
-        let next = mapping.select_range(cursor, u64::MAX, mark, &mut selected);
-        if let Some((index, _folio)) = selected[0].take() {
-            mapping.set_to_write(index, true);
-        }
-        let Some(next) = next else {
-            break;
-        };
-        cursor = next;
+/// 在原节点建立有限选择，每窗口先查物理地址再建立 WB 和提交父批次。
+fn sync_inode_locked(inode: &InodeRef, range: &Range<u64>) -> Result<(), FsError> {
+    let (start, end) = page_window(range)?;
+    if start == end {
+        return Ok(());
     }
-}
-
-/// 物理 byte key 沿同一稀疏索引建立有限元数据工作集，不保存页内容快照。
-fn select_metadata_work(cache: &MetadataCache, budget: usize, mark: FolioMark) {
-    let mut cursor = 0;
-    for _ in 0..budget {
-        let mut selected = [None];
-        let next = cache.select_range(cursor, u64::MAX, mark, &mut selected);
-        if let Some((byte_offset, _folio)) = selected[0].take() {
-            cache.set_to_write(byte_offset, true);
-        }
-        let Some(next) = next else {
-            break;
-        };
-        cursor = next;
-    }
-}
-
-/// 在当前块根读侧逐 FS 块交原 folio；持内容锁撤共享 W 并完成 CSD 后才清脏。
-fn sync_file_page(inode: &InodeRef, index: u64, folio: &FolioRef) -> Result<(), FsError> {
-    inode.with_map_read(|metadata, root| {
-        let volume = inode.filesystem();
-        let block_size = volume.geometry().block_size;
-        let page_start = index
-            .checked_mul(PAGE_SIZE as u64)
-            .ok_or(FsError::FileTooLarge)?;
-        for offset in (0..PAGE_SIZE).step_by(block_size) {
-            let position = page_start
-                .checked_add(offset as u64)
-                .ok_or(FsError::FileTooLarge)?;
-            if metadata.size <= position {
-                break;
+    let mapping = inode.mapping();
+    let mut remaining = mapping.mark_to_write_range(start, end);
+    let mut cursor = start;
+    let mut first_error = None;
+    let mut ranges = if remaining == 0 {
+        Vec::new()
+    } else {
+        match reserve_ranges() {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                first_error = Some(error);
+                Vec::new()
             }
-            let mask = range_mask(offset, block_size);
-            if folio.dirty_sectors() & mask == 0 {
+        }
+    };
+    while remaining != 0 {
+        let mut selected = [const { None }; MAX_BATCH];
+        let next = mapping.select_range(cursor, end, FolioMark::ToWrite, &mut selected);
+        let mut plans: [Option<FilePagePlan>; MAX_BATCH] = [const { None }; MAX_BATCH];
+        for (slot, entry) in selected.iter_mut().enumerate() {
+            let Some((index, folio)) = entry.take() else {
+                continue;
+            };
+            remaining -= 1;
+            let folio = folio.with_file_owner(inode.clone());
+            folio.wait_writeback();
+            if ranges.capacity() == 0 || folio.dirty_sectors() == 0 {
+                mapping.set_to_write(index, false);
                 continue;
             }
-            let logical = position / block_size as u64;
-            let BlockMapping::Mapped { physical, .. } =
-                volume.map_block(metadata, root, logical)?
-            else {
-                return Err(FsError::Corrupt);
-            };
-            let byte_offset = physical
-                .checked_mul(block_size as u64)
-                .ok_or(FsError::Corrupt)?;
-            let writeback = {
-                let mut content = folio.lock_content();
-                inode.mapping().mkclean(index, folio, &mut content);
-                // SAFETY: mkclean 已在本内容 guard 内撤全部同源共享 W 并完成全 CPU 同步；
-                // guard 继续排斥 mkwrite 的新授权，root 读侧保护物理块到真实 IO 全尾。
-                // WB 期间最终授权拒绝该页；凭证由唯一 Bio 保活到设备收权才完成。
-                unsafe { content.begin_writeback(offset, block_size)? }
-            };
-            if let Some(writeback) = writeback {
-                volume.claim().write_folio(byte_offset, writeback)?;
+            match prepare_file_targets(inode, index, range) {
+                Ok(targets) => {
+                    plans[slot] = Some(FilePagePlan {
+                        index,
+                        folio,
+                        targets,
+                    })
+                }
+                Err(error) => {
+                    mapping.set_to_write(index, false);
+                    remember_error(&mut first_error, Err(error));
+                }
             }
         }
-        Ok(())
+        for plan in IntoIterator::into_iter(plans).flatten() {
+            let result = prepare_file_page(inode, &plan, &mut ranges);
+            remember_error(&mut first_error, result);
+            mapping.set_to_write(plan.index, false);
+        }
+        remember_error(
+            &mut first_error,
+            submit_ranges(inode.filesystem().claim(), &mut ranges),
+        );
+        let Some(next) = next else { break };
+        cursor = next;
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// 根读保护只覆盖地址准备；IO 提交、额度等待及完成等待都在闭包返回之后。
+fn prepare_file_targets(
+    inode: &InodeRef,
+    index: u64,
+    range: &Range<u64>,
+) -> Result<[Option<u64>; SECTORS_PER_PAGE], FsError> {
+    let volume = inode.filesystem();
+    let size = volume.geometry().block_size;
+    let page = index
+        .checked_mul(PAGE_SIZE as u64)
+        .ok_or(FsError::FileTooLarge)?;
+    inode.with_map_read(|metadata, root| {
+        let mut targets = [None; SECTORS_PER_PAGE];
+        for offset in (0..PAGE_SIZE).step_by(size) {
+            let position = page
+                .checked_add(offset as u64)
+                .ok_or(FsError::FileTooLarge)?;
+            if metadata.size <= position || range.end <= position {
+                break;
+            }
+            if position.saturating_add(size as u64) <= range.start {
+                continue;
+            }
+            if let BlockMapping::Mapped { physical, .. } =
+                volume.map_block(metadata, root, position / size as u64)?
+            {
+                targets[offset / size] =
+                    Some(physical.checked_mul(size as u64).ok_or(FsError::Corrupt)?);
+            }
+        }
+        Ok(targets)
     })
 }
 
-/// 只写真实有效且 Dirty 的连续 sector，不扩大到页内未加载或设备之外的字节。
-fn sync_metadata_page(
-    volume: &Ext4Volume,
+/// 当前内容锁不能立即取得时，先提交并通知已准备的前缀再进入真实等待。
+fn prepare_file_page(
+    inode: &InodeRef,
+    plan: &FilePagePlan,
+    ranges: &mut Vec<(u64, FolioWriteback)>,
+) -> Result<(), FsError> {
+    let mut content = match plan.folio.try_lock_content() {
+        Some(content) => content,
+        None => {
+            submit_ranges(inode.filesystem().claim(), ranges)?;
+            plan.folio.lock_content()
+        }
+    };
+    inode
+        .mapping()
+        .mkclean(plan.index, &plan.folio, &mut content);
+    let size = inode.filesystem().geometry().block_size;
+    let dirty = plan.folio.dirty_sectors();
+    for offset in (0..PAGE_SIZE).step_by(size) {
+        if dirty & range_mask(offset, size) == 0 {
+            continue;
+        }
+        let Some(target) = plan.targets[offset / size] else {
+            continue;
+        };
+        // SAFETY: 本内容 guard 排斥许可提交；mkclean 已撤同源共享 W 并完成全 CPU CSD。
+        // 原页使用 coherent ToDevice，之后的原始写另记 Dirty，不导出 Rust 内容切片；
+        // 返回凭证移入唯一父 Bio，设备及生成者全尾前始终保活 inode 和原页。
+        if let Some(writeback) = unsafe { content.begin_writeback(offset, size)? } {
+            ranges.push((target, writeback));
+        }
+    }
+    Ok(())
+}
+
+/// 元数据 WB 只覆盖真实有效的 512B 窗口；内容借用不得跨其 DMA。
+fn prepare_metadata_page(
+    claim: &FsClaim,
     byte_offset: u64,
     folio: &FolioRef,
+    ranges: &mut Vec<(u64, FolioWriteback)>,
 ) -> Result<(), FsError> {
+    let mut content = match folio.try_lock_content() {
+        Some(content) => content,
+        None => {
+            submit_ranges(claim, ranges)?;
+            folio.wait_writeback();
+            folio.lock_content()
+        }
+    };
     let mut pending = folio.dirty_sectors();
     while pending != 0 {
         let start = pending.trailing_zeros() as usize;
@@ -147,23 +251,54 @@ fn sync_metadata_page(
         let target = byte_offset
             .checked_add(offset as u64)
             .ok_or(BlockError::InvalidRange)?;
-        let writeback = {
-            let mut content = folio.lock_content();
-            // SAFETY: 终身 Metadata 角色不授给用户，内容 guard 排斥可变切片；
-            // 本轮窗口只含已加载的真实 Dirty sector，凭证阻止新可变借用跨设备访问，
-            // 原 cache/claim 保活，Bio 全部 child 及生成者实际收权后才结束 WB。
-            unsafe { content.begin_writeback(offset, len)? }
-        };
-        if let Some(writeback) = writeback {
-            volume.claim().write_folio(target, writeback)?;
+        // SAFETY: 元数据终身不授给用户，content guard 排斥可变借用；begin_writeback
+        // 校验准确窗口已初始化并清脏，原 cache/claim 由凭证保活到真实设备全尾。
+        if let Some(writeback) = unsafe { content.begin_writeback(offset, len)? } {
+            ranges.push((target, writeback));
         }
         pending &= !range_mask(offset, len);
     }
     Ok(())
 }
 
-/// 把已验证页内 FS 块或 sector 窗口转换为实际八位范围。
+/// 为最多八页的准确 sector 范围预留存储，内容锁内 push 不分配。
+fn reserve_ranges() -> Result<Vec<(u64, FolioWriteback)>, FsError> {
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(WINDOW_RANGES)
+        .map_err(|_| FsError::NoMemory)?;
+    Ok(ranges)
+}
+
+/// 父批次沿原核心统一 kick 并观察全部完成后返回首错。
+fn submit_ranges(claim: &FsClaim, ranges: &mut Vec<(u64, FolioWriteback)>) -> Result<(), FsError> {
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    claim.writeback_batch(ranges).map_err(FsError::from)
+}
+
+/// 保留本轮首次错误，后续父仍完成自己的全部尾部。
+fn remember_error(first: &mut Option<FsError>, result: Result<(), FsError>) {
+    if first.is_none() {
+        *first = result.err();
+    }
+}
+
+/// 换算半开 byte 范围，整文件哨兵和非页对齐尾都不溢出。
+fn page_window(range: &Range<u64>) -> Result<(u64, u64), FsError> {
+    if range.end < range.start {
+        return Err(FsError::InvalidOperation);
+    }
+    let start = range.start / PAGE_SIZE as u64;
+    if range.start == range.end {
+        return Ok((start, start));
+    }
+    let end = range.end / PAGE_SIZE as u64 + u64::from(range.end % PAGE_SIZE as u64 != 0);
+    Ok((start, end))
+}
+
+/// 把已经校验的页内准确范围转换为原 PageDesc 的八位 sector mask。
 fn range_mask(offset: usize, len: usize) -> u8 {
-    let sectors = len / 512;
-    (((1u16 << sectors) - 1) << (offset / 512)) as u8
+    (((1u16 << (len / 512)) - 1) << (offset / 512)) as u8
 }

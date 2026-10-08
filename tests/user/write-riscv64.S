@@ -65,6 +65,14 @@
     fence rw, rw
 .endm
 
+# /// 每次 msync 都把完整参数装入真实普通 ABI，地址和 errno 不由控制页回声代替。
+.macro MS address, length, flags, result, number
+    mv a0, \address
+    li a1, \length
+    li a2, \flags
+    SC 227
+    EXPECT \result, \number
+.endm
 # /// argv 仅选择具体写、append 或真实 exec 交接，不使用测试 syscall。
 .global _start
 .type _start, @function
@@ -101,6 +109,14 @@ _start:
     beq t0, t1, .Lfile_futex
     li t1, 'u'
     beq t0, t1, .Lfile_futex
+    li t1, 'y'
+    beq t0, t1, .Lsync_abi
+    li t1, 'b'
+    beq t0, t1, .Lsync_wait
+    li t1, 'd'
+    beq t0, t1, .Lsync_write
+    li t1, 'z'
+    beq t0, t1, .Lsync_write
     j .Lexit
 
 # /// 源跨坏页只接受 17 字节，零前缀故障、负 pwrite 和定位写均不能改共享位置。
@@ -584,6 +600,155 @@ _start:
     SC 93
     j .Lexit
 
+# /// 独立 open 的普通 fsync 在已有 WB 上等待，控制者核真实 Blocked 后才恢复 used 消费。
+.Lsync_wait:
+    li s6, 0x49000000
+    OPEN .Lshared_path, 2, 110
+    mv s0, a0
+    PHASE 1
+    GATE 1
+    mv a0, s0
+    SC 82
+    EXPECT 0, 111
+    PHASE 2
+    GATE 2
+    mv a0, s0
+    SC 83
+    EXPECT 0, 112
+    j .Lpass
+
+# /// 原始 __O_SYNC 由 open 归一化；F_SETFL 不撤同步位，错误 write 保已接受位置，pwrite 不改位置。
+.Lsync_write:
+    ld t0, 16(sp)
+    lbu s7, 0(t0)
+    li s6, 0x49000000
+    li t1, 'z'
+    beq s7, t1, .Lopen_dsync
+    OPEN .Lshared_path, 0x100002, 113
+    li s4, 0x101002
+    j .Lsync_flags
+.Lopen_dsync:
+    OPEN .Lshared_path, 0x1002, 114
+    li s4, 0x1002
+.Lsync_flags:
+    mv s0, a0
+    sd s0, 16(s6)
+    mv a0, s0
+    li a1, 4
+    li a2, 0
+    SC 25
+    EXPECT 0, 115
+    mv a0, s0
+    li a1, 3
+    SC 25
+    li s11, 116
+    bne a0, s4, .Lexit
+    PHASE 1
+    GATE 1
+    mv a0, s0
+    lla a1, .Lpayload
+    li a2, 1
+    SC 64
+    EXPECT -5, 117
+    CURSOR s0, 1, 118
+    PHASE 2
+    GATE 2
+    mv a0, s0
+    lla a1, .Lpayload
+    li a2, 1
+    li a3, 2
+    SC 68
+    EXPECT 1, 119
+    CURSOR s0, 1, 120
+    j .Lpass
+
+# /// shared 非零文件偏移、private COW、孔洞、合法零/异步/INVALIDATE 和冲突位均走普通 sys227。
+.Lsync_abi:
+    li s6, 0x49000000
+    OPEN .Lshared_path, 2, 121
+    mv s0, a0
+    li a0, 0x48000000
+    li a1, 4096
+    li a2, 3
+    li a3, 0x11
+    mv a4, s0
+    li a5, 4096
+    SC 222
+    EXPECT 0x48000000, 122
+    mv s5, a0
+    li t0, 0x79
+    sb t0, 29(s5)
+    PHASE 1
+    GATE 1
+    addi s4, s5, 1
+    MS s4, 4096, 4, -22, 123
+    MS s5, 4096, 8, -22, 124
+    MS s5, 4096, 5, -22, 125
+    MS s5, 4096, 0, 0, 126
+    MS s5, 4096, 1, 0, 127
+    MS s5, 4096, 2, 0, 128
+    MS s5, 4096, 3, 0, 129
+    MS s5, 0, 4, 0, 130
+    MS s5, -1, 0, 0, 131
+    PHASE 2
+    GATE 2
+    MS s5, 4096, 4, 0, 132
+    MS s5, 8192, 4, -12, 133
+    li s4, 0xfffffffffffff000
+    MS s4, 8192, 0, -12, 134
+    li s4, 0x48001000
+    MS s4, 4096, 0, -12, 135
+    li a0, 0x4a000000
+    li a1, 4096
+    li a2, 3
+    li a3, 0x12
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4a000000, 136
+    mv s4, a0
+    li t0, 0xaf
+    sb t0, 29(s4)
+    MS s4, 4096, 4, 0, 137
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 1
+    li a3, 29
+    SC 67
+    EXPECT 1, 138
+    lla t0, .Lbuffer
+    lbu a0, 0(t0)
+    EXPECT 0x66, 139
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 1
+    li a3, 4125
+    SC 67
+    EXPECT 1, 140
+    lla t0, .Lbuffer
+    lbu a0, 0(t0)
+    EXPECT 0x79, 141
+    mv a0, s0
+    SC 82
+    EXPECT 0, 142
+    mv a0, s0
+    SC 83
+    EXPECT 0, 143
+    li a0, -1
+    SC 82
+    EXPECT -9, 144
+    li a0, -1
+    SC 83
+    EXPECT -9, 145
+    OPEN .Ldirectory, 0, 146
+    mv s1, a0
+    SC 82
+    EXPECT 0, 147
+    mv a0, s1
+    SC 83
+    EXPECT 0, 148
+    j .Lpass
+
 # /// 核对整段常量字节，错误保留调用方的具名断言编号。
 .type .Lconstant, @function
 .Lconstant:
@@ -630,6 +795,7 @@ _start:
 .section .rodata
 .Luser_path: .asciz "/test/write-user"
 .Lshared_path: .asciz "/test/write-reserve"
+.Ldirectory: .asciz "/test"
 .Lmap_path: .asciz "/test/write-map"
 .Lappend_path: .asciz "/test/write-append"
 .Lself: .asciz "/test/bin/user-write"

@@ -42,6 +42,7 @@ struct BioState {
     generating: bool,
     registered_end: usize,
     registered_children: usize,
+    accepted_end: usize,
     first_error: Option<(usize, BlockError)>,
     result: Option<IoResult>,
     completion_owner: Option<DiskRef>,
@@ -118,6 +119,7 @@ impl Bio {
                     generating: false,
                     registered_end: 0,
                     registered_children: 0,
+                    accepted_end: 0,
                     first_error: None,
                     result: None,
                     completion_owner: None,
@@ -225,6 +227,17 @@ impl BioCompletion {
         }
     }
 
+    /// 观察原父的登记与真实设备接受前缀，登记失败的 child 不会扩大接受账。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_acceptance(&self) -> (usize, usize, usize) {
+        let state = self.inner.state.lock();
+        (
+            state.registered_children,
+            state.registered_end,
+            state.accepted_end,
+        )
+    }
+
     /// 只观察已有父 finalizer 的原生任务；弱观察升级不申请新的执行资源。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_finalizer_task(&self) -> Option<Arc<crate::task::Task>> {
@@ -280,14 +293,37 @@ impl BioInner {
             .map(MappedPages::segment)
     }
 
-    /// 已登记 child 观察单个 folio 原页与页内起点，不导出 DMA 内容借用。
+    /// 按父 payload 次序投影到实际原 folio，支持一个 Bio 内的多个原映射。
     #[cfg(feature = "ktest")]
     pub(super) fn ktest_folio_origin(&self, offset: usize) -> Option<(usize, usize)> {
         let state = self.state.lock();
-        let [mapped] = state.memory.as_deref()? else {
-            return None;
-        };
-        Some((mapped.ktest_folio_phys_addr()?, mapped.offset() + offset))
+        let mut base = 0;
+        for mapped in state.memory.as_ref()? {
+            let end = base + mapped.len();
+            if base <= offset && offset < end {
+                return Some((
+                    mapped.ktest_folio_phys_addr()?,
+                    mapped.offset() + offset - base,
+                ));
+            }
+            base = end;
+        }
+        None
+    }
+
+    /// 只分类本 child 的实际 WB 来源，用于本盘一次性受控错误。
+    #[cfg(feature = "ktest")]
+    pub(super) fn ktest_writeback_metadata(&self, offset: usize) -> Option<bool> {
+        let state = self.state.lock();
+        let mut base = 0;
+        for mapped in state.memory.as_ref()? {
+            let end = base + mapped.len();
+            if base <= offset && offset < end {
+                return mapped.ktest_writeback_metadata();
+            }
+            base = end;
+        }
+        None
     }
 
     /// slot 在 IRQ 分派前检查是否必须使用预建完成 Work。
@@ -361,6 +397,29 @@ impl BioInner {
             .expect("bio pending count overflow");
     }
 
+    /// driver.submit 成功后仍持同一 queue 锁登记真实接受，IRQ 尚不能认领完成。
+    pub(super) fn accept_child(&self, offset: usize, length: usize) {
+        let end = offset.checked_add(length).expect("bio acceptance overflow");
+        let mut state = self.state.lock();
+        assert_eq!(state.phase, Phase::Active);
+        assert!(state.generating && end <= state.registered_end);
+        assert_eq!(
+            offset, state.accepted_end,
+            "bio acceptance is not contiguous"
+        );
+        let mut base = 0;
+        for mapped in state.memory.as_mut().expect("active bio memory missing") {
+            let mapped_end = base + mapped.len();
+            let start = offset.max(base);
+            let stop = end.min(mapped_end);
+            if start < stop {
+                mapped.accept_range(start - base, stop - start);
+            }
+            base = mapped_end;
+        }
+        state.accepted_end = end;
+    }
+
     /// 唯一 slot 完成者在 used 或已确认 reset 后结束 child；Task 回调须由 slot Work 执行。
     /// 未发表的失败 child 也消费同一登记义务，生成者仍保住此前在途原页。
     pub(super) fn finish_child(
@@ -385,6 +444,27 @@ impl BioInner {
             );
             if let Some(error) = error {
                 state.record_error(offset + completed, error);
+            }
+            let mut base = 0;
+            for mapped in state.memory.as_mut().expect("active bio memory missing") {
+                let mapped_end = base + mapped.len();
+                let start = offset.max(base);
+                let stop = end.min(mapped_end);
+                if start < stop {
+                    let progress = (offset + completed).saturating_sub(start).min(stop - start);
+                    let mapped_error = if progress < stop - start || completed == length {
+                        error
+                    } else {
+                        None
+                    };
+                    mapped.record_writeback_result(
+                        start - base,
+                        stop - start,
+                        progress,
+                        mapped_error,
+                    );
+                }
+                base = mapped_end;
             }
             state.end_obligation(self.len)
         };
@@ -510,7 +590,7 @@ impl BioInner {
             let completed = remaining.min(mapped.len());
             remaining = remaining.saturating_sub(mapped.len());
             // SAFETY: complete 已结束全部 child 与生成者并真实收权，回调全部返回；
-            // 连续前缀属于该映射，初始化与 WB 各结束自己的责任，失败保留原原因。
+            // 读入沿父连续前缀，WB 沿同一父为该映射登记的真实接受与实际错误结束。
             unsafe {
                 mapped.complete_folio(IoResult {
                     completed,

@@ -110,6 +110,24 @@ pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.write_at_from(raw[3] as u64, &mut source)? as isize)
 }
 
+/// lookup 取得原强 OFD 后在表锁外同步全文件，独立打开与 dup 保持各自观察归属。
+pub(super) fn fsync(user: &UserThread, raw: usize) -> SysResult {
+    sync_file(user, raw, false)
+}
+
+/// 数据同步仍包含使已写字节可寻址的元数据及真实设备 FLUSH。
+pub(super) fn fdatasync(user: &UserThread, raw: usize) -> SysResult {
+    sync_file(user, raw, true)
+}
+
+/// 本次操作始终使用 lookup 返回的原文件，不重查可能已经关闭复用的整数编号。
+fn sync_file(user: &UserThread, raw: usize, data_only: bool) -> SysResult {
+    let runtime = user.runtime().expect("file sync has no runtime");
+    let file = runtime.files.lookup(descriptor(raw)?)?;
+    file.sync_range(0..u64::MAX, data_only)?;
+    Ok(0)
+}
+
 /// 共享位置的位移在原OFD锁中提交，不能把失败后的游标在表层回滚。
 pub(super) fn seek(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let delta = raw[1] as i64;

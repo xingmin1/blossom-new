@@ -319,6 +319,8 @@ struct Owner {
     claim: Option<FsClaim>,
     fill: usize,
     model_live: Option<usize>,
+    wb_folios: Vec<mm::FolioRef>,
+    wb_active: Option<Bio>,
 }
 
 impl Owner {
@@ -543,6 +545,7 @@ impl Owner {
                                 Some("reverse_short_prefix" | "minimum_error_prefix") => 3,
                                 Some("generation_failure_prefix") => 2,
                                 Some("synchronous_child_producer_hold") => 1,
+                                Some("wb_inline" | "wb_reverse" | "wb_rejected_tail") => 1,
                                 _ => return Err(TestError("unknown controlled ledger parameter")),
                             },
                             0,
@@ -700,6 +703,8 @@ impl Owner {
             fill,
             claim: None,
             model_live: None,
+            wb_folios: Vec::new(),
+            wb_active: None,
         })
     }
 
@@ -1515,6 +1520,7 @@ impl Owner {
                     error: None,
                 }
             }
+            Ledger::WbInline | Ledger::WbReverse | Ledger::WbRejectedTail => unreachable!(),
         };
         self.requests[index].reclaim(context, expected, None)?;
         self.model_live = None;
@@ -1522,6 +1528,222 @@ impl Owner {
         context.diagnostic(format_args!(
             "aggregation scope=controlled-ledger addresses-not-published=1"
         ));
+        Ok(())
+    }
+
+    /// 私有 scratch 原页调用生产 WB、父 child 和真实接受账；反序仅由控制者驱动，不代表硬件乱序。
+    fn writeback_ledger(&mut self, context: &mut TestContext<'_>, mode: Ledger) -> TestResult {
+        self.ready()?;
+        let unit = self.disk.limits().logical_block_size as usize;
+        self.wb_folios
+            .try_reserve_exact(3)
+            .map_err(|_| TestError("WB ledger folio owners OOM"))?;
+        let mut memory = Vec::new();
+        memory
+            .try_reserve_exact(3)
+            .map_err(|_| TestError("WB ledger mapped owners OOM"))?;
+        for _ in 0..3 {
+            let page = mm::alloc_pages(0, true).ok_or(TestError("WB ledger original page OOM"))?;
+            let folio = mm::FolioRef::from_pages(page)
+                .map_err(|_| TestError("WB ledger folio conversion failed"))?;
+            let mut read = folio
+                .begin_read(0, mm::PAGE_SIZE)
+                .map_err(|_| TestError("WB ledger initialization failed"))?;
+            // SAFETY: alloc_pages 已真实零化整原页；页未发表，无设备或外部 CPU 写者，初始化访问已结束。
+            unsafe {
+                read.complete(IoResult {
+                    completed: mm::PAGE_SIZE,
+                    error: None,
+                })
+            };
+            self.wb_folios.push(folio);
+        }
+        let mut identities = [0usize; 3];
+        for (index, folio) in self.wb_folios.iter().enumerate() {
+            let mut content = folio.lock_content();
+            content
+                .copy_from(0, &[0x40 + index as u8; 4096][..unit])
+                .map_err(|_| TestError("WB ledger original write failed"))?;
+            identities[index] = folio.phys_addr();
+            // SAFETY: 这些页只在当前 fixture 私有持有，没有 VMA/PTE；内容 guard 排斥内核修改，范围已初始化。
+            let wb = unsafe { content.begin_writeback(0, unit) }
+                .map_err(|_| TestError("WB ledger begin failed"))?
+                .ok_or(TestError("WB ledger lost original Dirty"))?;
+            memory.push(
+                MappedPages::from_writeback(wb)
+                    .map_err(|_| TestError("WB ledger mapping failed"))?,
+            );
+        }
+        // SAFETY: WB 凭证保同一原 folio，全部字节初始化且无 VMA；控制账本从不把地址发表到硬件。
+        // begin/child/generation 使用生产对象；每项控制完成代表本模型的唯一访问尾部。
+        self.wb_active = Some(
+            unsafe { Bio::try_new(&self.disk, BlkOperation::Write, 32, memory, 0, None) }
+                .map_err(|_| TestError("WB ledger parent preparation failed"))?,
+        );
+        let parent = self.wb_active.as_ref().unwrap().inner.clone();
+        let completion = self.wb_active.as_ref().unwrap().completion();
+        let before = self.disk.test_snapshot();
+        parent.begin();
+        self.wb_folios[0]
+            .lock_content()
+            .copy_from(0, &[0x7e])
+            .map_err(|_| TestError("WB ledger new Dirty failed"))?;
+        for index in 0..3 {
+            parent.register_child(index * unit, unit);
+            if mode != Ledger::WbRejectedTail || index < 2 {
+                parent.accept_child(index * unit, unit);
+            }
+            if mode == Ledger::WbInline {
+                parent.finish_child(index * unit, unit, unit, None);
+                context.expect_eq(completion.is_complete(), false);
+                context.expect_eq(completion.take_memory().err(), Some(BlockError::Busy));
+                context.expect_eq(
+                    self.wb_folios
+                        .iter()
+                        .all(|folio| folio.writeback_sectors() != 0),
+                    true,
+                );
+            }
+        }
+        let accepted = if mode == Ledger::WbRejectedTail {
+            2 * unit
+        } else {
+            3 * unit
+        };
+        context.expect_eq(completion.test_acceptance(), (3, 3 * unit, accepted));
+        let expected = match mode {
+            Ledger::WbInline => {
+                parent.finish_generation(None, None);
+                IoResult {
+                    completed: 3 * unit,
+                    error: None,
+                }
+            }
+            Ledger::WbReverse => {
+                parent.finish_child(2 * unit, unit, 0, Some(BlockError::Io));
+                parent.finish_child(unit, unit, unit, None);
+                parent.finish_generation(None, None);
+                context.expect_eq(completion.is_complete(), false);
+                context.expect_eq(self.wb_folios[0].writeback_sectors() != 0, true);
+                parent.finish_child(0, unit, unit, None);
+                IoResult {
+                    completed: 2 * unit,
+                    error: Some(BlockError::Io),
+                }
+            }
+            Ledger::WbRejectedTail => {
+                parent.finish_child(2 * unit, unit, 0, Some(BlockError::QueueStopped));
+                parent.finish_generation(Some((2 * unit, BlockError::QueueStopped)), None);
+                parent.finish_child(unit, unit, unit, None);
+                context.expect_eq(completion.is_complete(), false);
+                context.expect_eq(self.wb_folios[2].writeback_sectors() != 0, true);
+                parent.finish_child(0, unit, unit, None);
+                IoResult {
+                    completed: 2 * unit,
+                    error: Some(BlockError::QueueStopped),
+                }
+            }
+            _ => unreachable!(),
+        };
+        context.expect_eq(completion.wait(), expected);
+        let reclaimed = completion
+            .take_memory()
+            .map_err(|_| TestError("WB ledger original payload not returned"))?;
+        for (mapped, identity) in reclaimed.iter().zip(identities) {
+            context.expect_eq(mapped.segment().address.value(), identity as u64);
+            context.expect_eq(mapped.segment().direction, BufferDirection::DriverToDevice);
+            context.expect_eq(mapped.is_device_owned(), false);
+        }
+        context.expect_eq(completion.take_memory().err(), Some(BlockError::Busy));
+        context.expect_eq(
+            self.wb_folios
+                .iter()
+                .all(|folio| folio.writeback_sectors() == 0),
+            true,
+        );
+        context.expect_eq(self.wb_folios[0].dirty_sectors() != 0, true);
+        context.expect_eq(self.wb_folios[1].dirty_sectors(), 0);
+        context.expect_eq(
+            self.wb_folios[2].dirty_sectors() != 0,
+            mode == Ledger::WbRejectedTail,
+        );
+        context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
+        drop((reclaimed, completion, parent));
+        self.wb_active.take();
+        self.sync_model_dirty()?;
+        context.expect_eq(
+            self.wb_folios
+                .iter()
+                .all(|folio| folio.dirty_sectors() == 0 && folio.writeback_sectors() == 0),
+            true,
+        );
+        context.diagnostic(format_args!("W10 scope=controlled-parent-ledger original-folio-DMA=1 inline-producer-hold=1 accepted-prefix={} hardware-reverse-order-tested=0 restored-and-new-dirty-real-scratch-sync=1", accepted));
+        Ok(())
+    }
+
+    /// 控制账本留下的新 Dirty 和未接受尾部随后由真实 scratch I/O 同步，禁止清 Dirty 代替归还。
+    fn sync_model_dirty(&mut self) -> TestResult {
+        let unit = self.disk.limits().logical_block_size as usize;
+        for (index, folio) in self.wb_folios.iter().enumerate() {
+            if folio.dirty_sectors() == 0 {
+                continue;
+            }
+            let mut memory = Vec::new();
+            memory
+                .try_reserve_exact(1)
+                .map_err(|_| TestError("WB scratch sync mapping OOM"))?;
+            let mut content = folio.lock_content();
+            // SAFETY: 模型父已全尾且从不发表硬件地址；私有原页无 VMA，guard 保对应真实脏范围。
+            let wb = unsafe { content.begin_writeback(0, unit) }
+                .map_err(|_| TestError("WB scratch sync begin failed"))?
+                .ok_or(TestError("WB scratch sync lost Dirty"))?;
+            drop(content);
+            memory.push(
+                MappedPages::from_writeback(wb)
+                    .map_err(|_| TestError("WB scratch sync map failed"))?,
+            );
+            // SAFETY: 原 WB 范围完整初始化，无 CPU 裸别名；Disk 将其保到真正设备和父完成尾部。
+            let bio = unsafe {
+                Bio::try_new(
+                    &self.disk,
+                    BlkOperation::Write,
+                    32 + (index * unit / 512) as u64,
+                    memory,
+                    0,
+                    None,
+                )
+            }
+            .map_err(|_| TestError("WB scratch sync parent OOM"))?;
+            let complete = bio.completion();
+            self.disk.submit_bio(bio);
+            until("WB scratch sync did not reach real parent tail", || {
+                complete.is_complete()
+            })?;
+            if complete.wait()
+                != (IoResult {
+                    completed: unit,
+                    error: None,
+                })
+            {
+                return Err(TestError("WB scratch real sync failed"));
+            }
+            drop(
+                complete
+                    .take_memory()
+                    .map_err(|_| TestError("WB scratch original payload missing"))?,
+            );
+            let mut readback = [0u8; mm::PAGE_SIZE];
+            self.disk
+                .read_exact_at(32 * 512 + (index * unit) as u64, &mut readback[..unit])
+                .map_err(|_| TestError("WB scratch full readback failed"))?;
+            if readback[0] != if index == 0 { 0x7e } else { 0x40 + index as u8 }
+                || readback[1..unit]
+                    .iter()
+                    .any(|byte| *byte != 0x40 + index as u8)
+            {
+                return Err(TestError("WB scratch original full bytes differ"));
+            }
+        }
         Ok(())
     }
 
@@ -1561,6 +1783,15 @@ impl Owner {
         if self.disk.queue.lock().phase == QueuePhase::Live {
             self.disk.test_resume_completions();
         }
+        if let Some(bio) = &self.wb_active {
+            if !bio.completion().is_complete() {
+                return Err(TestError(
+                    "WB controlled parent retains unfinished original obligations",
+                ));
+            }
+        }
+        drop(self.wb_active.take());
+        self.sync_model_dirty()?;
         drop(core::mem::take(&mut self.prepared));
         // peer 尚未提交而主体提前退出时，应先真实拒绝它，让已进入的回调合法返回。
         for index in 0..self.requests.len() {
@@ -1621,12 +1852,15 @@ impl Owner {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Ledger {
     Reverse,
     MinimumError,
     GenerationFailure,
     Synchronous,
+    WbInline,
+    WbReverse,
+    WbRejectedTail,
 }
 
 macro_rules! fixture {
@@ -1825,7 +2059,7 @@ mod exact {
         fixture.0.exact(context)
     }
 }
-#[ktest::suite(fixture = Model, suite_resources = DeviceInventory, context = "Thread", isolation = "Case", tags("block", "controlled-ledger", "T5"), resources("root"), timeout_ms = 15000)]
+#[ktest::suite(fixture = Model, suite_resources = DeviceInventory, context = "Thread", isolation = "Case", tags("block", "controlled-ledger", "T5"), timeout_ms = 15000)]
 mod ledger {
     use super::*;
     /// 受控 child 顺序与生成尾部仅证明账本，不宣称硬件反序成功。
@@ -1834,12 +2068,27 @@ mod ledger {
     #[case("minimum_error_prefix", Ledger::MinimumError)]
     #[case("generation_failure_prefix", Ledger::GenerationFailure)]
     #[case("synchronous_child_producer_hold", Ledger::Synchronous)]
+    #[ktest(resources("root"))]
     fn controlled_aggregation(
         context: &mut TestContext<'_>,
         fixture: &mut Model,
         mode: Ledger,
     ) -> TestResult {
         fixture.0.model(context, mode)
+    }
+
+    /// 三个真实原 folio 的 WB 责任随同一父账消费，控制次序和真正 scratch 收尾分开报告。
+    #[test]
+    #[case("wb_inline", Ledger::WbInline)]
+    #[case("wb_reverse", Ledger::WbReverse)]
+    #[case("wb_rejected_tail", Ledger::WbRejectedTail)]
+    #[ktest(tags("W10", "fs-sync"), resources("scratch"))]
+    fn original_folio_writeback_parent(
+        context: &mut TestContext<'_>,
+        fixture: &mut Model,
+        mode: Ledger,
+    ) -> TestResult {
+        fixture.0.writeback_ledger(context, mode)
     }
 }
 #[ktest::suite(fixture = Progress, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("block", "callback", "T5"), resources("root"), timeout_ms = 15000)]

@@ -68,27 +68,90 @@ impl FsClaim {
         self.disk().submit_batch_from(bios, Some(self));
     }
 
-    /// 普通 Task 把本轮原页 WB 交唯一 Bio 核心，等待实际设备全尾及范围责任结束。
-    /// 准备与准入失败保留 Dirty；没有 shadow 页或额外可睡眠完成 Task。
-    pub(crate) fn write_folio(
+    /// 多原页相邻范围共用一个父，每批最多八父，统一通知后观察全部真实尾部。
+    /// 准备拒尾仍提交此前可用前缀；未接受凭证由原协议恢复 Dirty，不重放接受失败。
+    pub(crate) fn writeback_batch(
         &self,
-        byte_offset: u64,
-        writeback: FolioWriteback,
+        ranges: &mut Vec<(u64, FolioWriteback)>,
     ) -> Result<(), BlockError> {
+        let mut pending = ranges.drain(..);
+        while pending.len() != 0 {
+            let mut bios = Vec::new();
+            bios.try_reserve_exact(MAX_BATCH)
+                .map_err(|_| BlockError::NoMemory)?;
+            let mut completions: [Option<(BioCompletion, usize)>; MAX_BATCH] =
+                [const { None }; MAX_BATCH];
+            let mut preparation_error = None;
+            for completion in &mut completions {
+                if pending.len() == 0 {
+                    break;
+                }
+                match self.prepare_writeback_bio(&mut pending) {
+                    Ok((bio, len)) => {
+                        *completion = Some((bio.completion(), len));
+                        bios.push(bio);
+                    }
+                    Err(error) => {
+                        preparation_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            self.submit_batch(bios);
+            let mut first_error = None;
+            for (completion, len) in IntoIterator::into_iter(completions).flatten() {
+                let result = completion.wait();
+                let error = result
+                    .error
+                    .or_else(|| (result.completed < len).then_some(BlockError::ShortIo));
+                if first_error.is_none() {
+                    first_error = error;
+                }
+            }
+            if let Some(error) = first_error.or(preparation_error) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// 只将真实连续物理 byte 范围放入同一 Bio，锁外准备映射及父完成存储。
+    fn prepare_writeback_bio(
+        &self,
+        pending: &mut alloc::vec::Drain<'_, (u64, FolioWriteback)>,
+    ) -> Result<(Bio, usize), BlockError> {
+        let byte_offset = pending.as_slice()[0].0;
         if byte_offset % SECTOR_BYTES != 0 {
             return Err(BlockError::Misaligned);
         }
-        let len = writeback.len();
+        let mut end = byte_offset;
+        let mut count = 0;
+        let mut len = 0usize;
+        for (offset, writeback) in pending.as_slice() {
+            if *offset != end {
+                break;
+            }
+            end = end
+                .checked_add(writeback.len() as u64)
+                .ok_or(BlockError::InvalidRange)?;
+            len = len
+                .checked_add(writeback.len())
+                .ok_or(BlockError::InvalidRange)?;
+            count += 1;
+        }
         let mut memory = Vec::new();
         memory
-            .try_reserve_exact(1)
+            .try_reserve_exact(count)
             .map_err(|_| BlockError::NoMemory)?;
-        let mapped =
-            MappedPages::from_writeback(writeback).map_err(|(error, _)| map_error(error))?;
-        memory.push(mapped);
-        // SAFETY: WB 凭证保实际原页、完整初始化范围及对应映射撤权责任；
-        // 不借出 CPU 切片，无完成回调。唯一 Bio 持凭证到全部 child 与生成者
-        // 结束及实际设备收权，然后才结束本轮 WB，失败保留 Dirty。
+        for _ in 0..count {
+            let (_, writeback) = pending.next().expect("writeback prefix disappeared");
+            memory.push(
+                MappedPages::from_writeback(writeback).map_err(|(error, _)| map_error(error))?,
+            );
+        }
+        // SAFETY: 凭证来自已初始化原页，已完成对应共享撤权及 CSD；不导出内容切片。
+        // 相邻物理范围共享此父，各映射只记录自己的真实接受、完成及未接受恢复责任。
+        // 同一父保活原页与 FS claim，全部 child 和生成者收权前不结束 WB。
         let bio = unsafe {
             Bio::try_new(
                 self.disk(),
@@ -99,17 +162,7 @@ impl FsClaim {
                 None,
             )
         }?;
-        let completion = bio.completion();
-        self.submit_bio(bio);
-        self.disk().unplug();
-        let result = completion.wait();
-        if let Some(error) = result.error {
-            return Err(error);
-        }
-        if result.completed != len {
-            return Err(BlockError::ShortIo);
-        }
-        Ok(())
+        Ok((bio, len))
     }
 
     /// 沿同一受限 FS 准入提交真实设备 FLUSH，失败不作重放或软件成功替身。
