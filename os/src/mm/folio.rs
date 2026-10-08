@@ -168,6 +168,12 @@ impl FolioRef {
     /// 为外部文件页句柄附上实际 inode 引用，内部索引不得保存此句柄。
     /// 重复附同一对象保留原拥有者，不同对象或内容角色暴露为协议错误。
     pub(crate) fn with_file_owner(mut self, owner: InodeRef) -> Self {
+        self.attach_file_owner(owner);
+        self
+    }
+
+    /// 为原引用就地附来源，文件页句柄和读入凭证共用同一角色与身份检查。
+    fn attach_file_owner(&mut self, owner: InodeRef) {
         {
             let usage = self.descriptor.usage();
             assert!(
@@ -185,7 +191,6 @@ impl FolioRef {
             }
             Some(FolioOwner::Metadata(_)) => panic!("folio owner role changed"),
         }
-        self
     }
 
     /// 为外部元数据页句柄附上真实 Arc 缓存，内部索引不得保存此句柄。
@@ -490,6 +495,15 @@ impl FolioRef {
             && !usage.folio().locked.load(Ordering::Acquire)
     }
 
+    /// canonical 索引准入只接受没有外部页引用、填充或 WB 的原页，Dirty 由后续同步处理。
+    pub(crate) fn is_cache_only(&self) -> bool {
+        let usage = self.descriptor.usage();
+        let shared = FolioState::shared(&usage);
+        shared.references == 1
+            && shared.writeback == 0
+            && !usage.folio().locked.load(Ordering::Acquire)
+    }
+
     /// 返回实际 512 字节脏范围位图；该快照不代表已经提交或持久化。
     pub fn dirty_sectors(&self) -> u8 {
         FolioState::shared(&self.descriptor.usage()).dirty
@@ -633,20 +647,26 @@ impl FolioContent<'_> {
     }
 
     /// 只重标当前 EOF 内已真实准备的整 FS 块；hole 与 EOF 外块不产生脏义务。
-    pub(crate) fn mark_prepared_dirty(&mut self, valid_bytes: usize) -> Result<(), BlockError> {
-        if PAGE_SIZE < valid_bytes {
+    /// 调用者须保留同一 canonical inode，并按其 invalidate 协议持有本页内容锁；
+    /// block_size 必须来自该 inode 所属文件系统的几何。索引内部引用可以没有外部 inode，
+    /// 因此文件与元数据角色由固定原页状态区分。
+    pub(crate) fn mark_prepared_dirty(
+        &mut self,
+        valid_bytes: usize,
+        block_size: usize,
+    ) -> Result<(), BlockError> {
+        if PAGE_SIZE < valid_bytes || !matches!(block_size, 1024 | 2048 | 4096) {
             return Err(BlockError::InvalidRange);
         }
-        let Some(FolioOwner::File(inode)) = &self.folio.owner else {
+        let mut usage = self.folio.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        if !matches!(&shared.contents, FolioContents::File { .. }) {
             return Err(BlockError::InvalidRange);
-        };
+        }
         if valid_bytes == 0 {
             return Ok(());
         }
-        let size = inode.filesystem().geometry().block_size;
-        let end = valid_bytes.div_ceil(size) * size;
-        let mut usage = self.folio.descriptor.usage();
-        let shared = FolioState::shared_mut(&mut usage);
+        let end = valid_bytes.div_ceil(block_size) * block_size;
         FolioState::range_ready(shared, 0, end)?;
         shared.dirty |= shared.file_prepared & sector_mask(0, end);
         Ok(())
@@ -674,6 +694,39 @@ impl FolioContent<'_> {
             // SAFETY: 内容 guard 保活并串行内核修改，完整窗口已初始化且在原页内；
             // 独占零片段不与目标重叠，文件内容仅作原始访问，不建立共享 RAM 引用。
             unsafe { arch::copy_user_bytes((address + part) as *mut u8, zeros.as_ptr(), count) };
+        }
+        Ok(())
+    }
+
+    /// 缩小后的原文件尾页保留有效前缀，只清已删除整 FS 块的准备和脏义务。
+    ///
+    /// # Safety
+    /// 调用者持同 inode 写序列化、invalidate 独占和 mapping WB 互斥；新 size 已发表。
+    /// 本页的共享写许可已撤且全部 CPU 失效完成，唯一填充和真实 WB 已结束；
+    /// 删除范围无需落盘，保留的部分 FS 块仍由真实块树负责尾零持久化。
+    pub(crate) unsafe fn truncate_file_tail(
+        &mut self,
+        valid: usize,
+        block_size: usize,
+    ) -> Result<(), BlockError> {
+        if valid == 0 || PAGE_SIZE <= valid || !matches!(block_size, 1024 | 2048 | 4096) {
+            return Err(BlockError::InvalidRange);
+        }
+        assert_eq!(
+            self.writeback_sectors(),
+            0,
+            "file truncate retains writeback"
+        );
+        self.zero_file_range(valid, PAGE_SIZE - valid)?;
+        let retained = valid.div_ceil(block_size) * block_size;
+        let keep = sector_mask(0, retained);
+        let mut usage = self.folio.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        shared.dirty &= keep;
+        shared.file_prepared &= keep;
+        if valid % block_size != 0 {
+            let start = valid / block_size * block_size;
+            shared.dirty |= shared.file_prepared & sector_mask(start, block_size);
         }
         Ok(())
     }
@@ -983,6 +1036,13 @@ impl Drop for FolioWriteback {
 }
 
 impl FolioRead {
+    /// 交设备前为唯一文件读入凭证附原 inode，真实设备及隔离拥有保该来源到全尾结束。
+    /// 仅修改本凭证中的原 FolioRef，索引内部引用仍不反持 inode。
+    pub(crate) fn with_file_owner(mut self, owner: InodeRef) -> Self {
+        self.folio.attach_file_owner(owner);
+        self
+    }
+
     /// 返回仍由本读入者保活的原页地址，DMA 层须维护其自身交权与收权协议。
     pub fn phys_addr(&self) -> usize {
         self.folio.phys_addr()

@@ -12,6 +12,7 @@ use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::task::{UserRuntime, UserThread};
 
 const AT_FDCWD: i32 = -100;
+const TRUNC: u32 = 0x200;
 const CLOEXEC: u32 = 0x8_0000;
 const DIRECTORY: u32 = 0x1_0000;
 const NOFOLLOW: u32 = 0x2_0000;
@@ -20,7 +21,7 @@ const AT_EMPTY_PATH: usize = 0x1000;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-/// 预留归属原文件表，锁外按真实访问模式检查路径权限后发表完整 OFD。
+/// 先预留 fd，再按当前凭据完成含截断写意图的权限检查；完整 OFD 准备后才允许破坏文件。
 pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("openat has no runtime");
     let mm = user.mm().expect("openat has no MM");
@@ -41,7 +42,7 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
         2 => 6,
         _ => return Err(Errno::InvalidArgument),
     };
-    let access = if flags & 0x200 != 0 {
+    let access = if flags & TRUNC != 0 {
         access | 2
     } else {
         access
@@ -54,6 +55,45 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
             close_on_exec: flags & CLOEXEC != 0,
         },
     ) as isize)
+}
+
+/// 负长度先于用户路径访问失败；最终链接按 Follow 解析，临时写拥有只覆盖这次截断。
+pub(super) fn truncate(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let length = raw[1] as i64;
+    if length < 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("truncate has no runtime");
+    let mm = user.mm().expect("truncate has no MM");
+    let path = resolve(
+        &runtime,
+        &mm,
+        AT_FDCWD as usize,
+        raw[0],
+        ResolveMode::Follow,
+    )?;
+    let inode = path.inode()?;
+    match inode.metadata_snapshot()?.kind {
+        InodeKind::Regular => {}
+        InodeKind::Directory => return Err(Errno::IsDirectory),
+        _ => return Err(Errno::InvalidArgument),
+    }
+    path.check_access(runtime.credentials.uid, runtime.credentials.gid, 2)?;
+    let access = inode.acquire_write()?;
+    access.truncate(inode.filesystem().claim(), length as u64)?;
+    Ok(0)
+}
+
+/// 负长度先于 fd 查找失败；持原强 OFD 在表锁外截断，不读取或修改共享位置。
+pub(super) fn ftruncate(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let length = raw[1] as i64;
+    if length < 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("ftruncate has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    file.truncate(length as u64)?;
+    Ok(0)
 }
 
 /// 查表先取得稳定OFD，用户接收端只按真实交付前缀推进共享位置。

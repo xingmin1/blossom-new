@@ -117,6 +117,7 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     unsafe { time::initialize(resources) };
     timer::initialize_services().expect("timer service task allocation failed");
     workqueue::initialize_services().expect("worker pool service task allocation failed");
+    fs::initialize_inode_eviction().expect("inode eviction service allocation failed");
     klog::initialize_service().expect("log printer task allocation failed");
     #[cfg(not(feature = "ktest"))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
@@ -242,7 +243,7 @@ fn init() -> i32 {
     0
 }
 
-/// 普通 init 保留真实根与存储拥有直到磁盘程序退出和离栈回收，不建立用户 PID1 服务。
+/// 普通 init 保留真实根到磁盘程序退出和离栈回收，全部路径与缓存退场后才结束文件系统消费者。
 #[cfg(not(feature = "ktest"))]
 fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError> {
     use alloc::sync::Arc;
@@ -256,6 +257,7 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         .map(|index| storage.disk(index).ok_or(fs::FsError::MissingRoot))
         .transpose()?;
     let inodes = Arc::try_new(fs::InodeCache::try_new(64)?).map_err(|_| fs::FsError::NoMemory)?;
+    let inode_eviction = inodes.watch();
     let vfs = Arc::try_new(fs::system::mount_disks(root, extra, inodes)?)
         .map_err(|_| fs::FsError::NoMemory)?;
     let context = fs::FsContext::new(vfs.root(), vfs.root())?;
@@ -347,8 +349,11 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         }
     }
     drop(graph);
+    drop(context);
     vfs.prune_unused();
     drop(vfs);
+    inode_eviction.wait_retired()?;
+    drop(inode_eviction);
     crate::klog!(klog::Level::Info, "ROOTFS completed");
     Ok(())
 }

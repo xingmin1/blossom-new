@@ -9,13 +9,13 @@ use crate::block::{self, AccessMode, BlockError, Disk, DiskRef};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{Ext4Volume, InodeKind};
-use crate::fs::inode::{InodeCache, InodeRef};
+use crate::fs::inode::{InodeCache, InodeCacheWatch, InodeRef};
 use crate::fs::{
     DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, OpenOptions, Path,
     ResolveMode, Vfs,
 };
 use crate::mm::{FolioRead, FolioRef};
-use crate::sync::{Completion, SpinLock};
+use crate::sync::{Completion, ReadGuard, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
 use crate::{cpu, drivers, mm, sched, time, timer};
@@ -132,6 +132,19 @@ fn checked<T>(context: &TestContext<'_>, result: Result<T, FsError>) -> Result<T
     })
 }
 
+/// caller 已在选择原页之前取得同 inode 的 invalidate 共享侧，读入凭证已附原 inode；此借用保到数据全尾。
+fn fill_file_page(
+    inode: &InodeRef,
+    index: u64,
+    read: FolioRead,
+    _invalidate: &ReadGuard<'_, ()>,
+) -> Result<(), FsError> {
+    match crate::fs::writeback::prepare_file_targets(inode, index, &(0..u64::MAX)) {
+        Ok((size, targets)) => inode.filesystem().fill_page(index, size, &targets, read),
+        Err(error) => Err(crate::fs::ext4::finish_error(read, error)),
+    }
+}
+
 impl Fixture for DeviceInventory {
     /// 整组用例只发现一次真实库存，并在首例基线前等待常驻工作服务进入阻塞稳态。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -199,8 +212,6 @@ enum Job {
     Fill {
         inode: InodeRef,
         page: u64,
-        read: FolioRead,
-        folio: FolioRef,
     },
     Oom {
         cache: Arc<InodeCache>,
@@ -358,8 +369,9 @@ impl Observation {
     }
 }
 
-/// 普通原生任务消费真实 API；结果只观察已初始化内容或实际原错误。
-fn perform(job: Job, cancelled: &AtomicBool) -> Result<Returned, FsError> {
+/// 普通原生任务先取得保护再准备页；FILL 停点和取消保原加载结果，全尾后才交付观察引用。
+fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
+    let cancelled = &observer.cancelled;
     match job {
         Job::Append {
             file,
@@ -512,26 +524,41 @@ fn perform(job: Job, cancelled: &AtomicBool) -> Result<Returned, FsError> {
                 .ok_or(FsError::Corrupt)?;
             let mut bytes = [0xa7; mm::PAGE_SIZE];
             let count = inode.read_at(offset, &mut bytes)?;
+            let _invalidate = inode.lock_invalidate()?;
             let (folio, read) = inode.mapping().get_or_prepare(page)?;
-            if read.is_some() {
-                return Err(FsError::Corrupt);
+            if let Some(read) = read {
+                return Err(crate::fs::ext4::finish_error(
+                    read.with_file_owner(inode.clone()),
+                    FsError::Corrupt,
+                ));
             }
             folio.wait_ready()?;
+            let folio = folio.with_file_owner(inode.clone());
             Ok(Returned::Page {
                 folio,
                 bytes: count,
                 valid: patterned(&bytes[..count], offset),
             })
         }
-        Job::Fill {
-            inode,
-            page,
-            read,
-            folio,
-        } => {
-            inode.with_map_read(|metadata, root| {
-                inode.filesystem().fill_page(metadata, root, page, read)
-            })?;
+        Job::Fill { inode, page } => {
+            let invalidate = inode.lock_invalidate()?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(FsError::LoadAborted);
+            }
+            let (folio, read) = inode.mapping().get_or_prepare(page)?;
+            let folio = folio.with_file_owner(inode.clone());
+            let read = read.ok_or(FsError::Corrupt)?.with_file_owner(inode.clone());
+            if observer.hold_loader.load(Ordering::Acquire) {
+                observer.loader_entered.fetch_add(1, Ordering::AcqRel);
+                observer.gate.wait();
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(crate::fs::ext4::finish_error(
+                    read,
+                    FsError::Io(BlockError::QueueStopped),
+                ));
+            }
+            fill_file_page(&inode, page, read, &invalidate)?;
             folio.wait_ready()?;
             let mut bytes = [0xa7; mm::PAGE_SIZE];
             folio.copy_to(0, &mut bytes)?;
@@ -562,6 +589,7 @@ fn perform(job: Job, cancelled: &AtomicBool) -> Result<Returned, FsError> {
                 return Err(FsError::Corrupt);
             }
             folio.wait_ready()?;
+            let folio = folio.with_file_owner(inode.clone());
             let returned = Returned::Oom {
                 producer_cpu: cpu::current().id,
                 evidence,
@@ -587,6 +615,7 @@ struct Owner {
     disks: Vec<DiskRef>,
     queue: WorkQueue,
     cache: Option<Arc<InodeCache>>,
+    cache_watch: Option<InodeCacheWatch>,
     observation: Option<Arc<Observation>>,
     pressure: Option<crate::cache::ktest::HeapPressure>,
     prepared: [Option<PreparedTask>; 3],
@@ -684,13 +713,6 @@ impl Owner {
                 prepared[index] = Some(
                     task::prepare_kernel_on(index % cpu::count(), move || {
                         observer.tasks.lock()[index] = Some(task::current_task());
-                        if index == 0 && observer.hold_loader.load(Ordering::Acquire) {
-                            let is_fill =
-                                matches!(&observer.jobs.lock()[index], Some(Job::Fill { .. }));
-                            if is_fill {
-                                observer.gate.wait();
-                            }
-                        }
                         let job = observer.jobs.lock()[index].take();
                         if observer.cancelled.load(Ordering::Acquire) {
                             drop(job);
@@ -700,7 +722,7 @@ impl Owner {
                         let Some(job) = job else {
                             return 1;
                         };
-                        let result = perform(job, &observer.cancelled);
+                        let result = perform(job, &observer);
                         observer.results.lock()[index] = Some(result);
                         0
                     })
@@ -734,6 +756,7 @@ impl Owner {
             disks,
             queue,
             cache: Some(cache),
+            cache_watch: None,
             observation: Some(observation),
             pressure,
             prepared,
@@ -811,7 +834,7 @@ impl Owner {
         Ok(())
     }
 
-    /// 停止控制者并等待原生任务离栈，归还结果和缓存引用后仍保活设备。
+    /// 停止控制者并等待原生任务离栈，结果引用结束后交出 cache owner；派生路径仍可在设备阶段之前退出。
     fn quiesce_jobs(&mut self) -> TestResult {
         let observer = self.observer().clone();
         observer.cancelled.store(true, Ordering::Release);
@@ -834,6 +857,8 @@ impl Owner {
         drop(tasks);
         if let Some(cache) = self.cache.take() {
             cache.ktest_set_load_hook(None);
+            assert!(self.cache_watch.is_none());
+            self.cache_watch = Some(cache.watch());
             drop(cache);
         }
         drop(self.observation.take());
@@ -842,8 +867,18 @@ impl Owner {
         Ok(())
     }
 
-    /// 文件系统拥有者已释放后核原六域，再停止 Disk、IRQ 和完成 Work。
+    /// 派生路径和最后 cache owner 已退出，先等原 canonical 域真实退场，再核原六域并停止设备。
     fn quiesce_devices(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        if let Some(watch) = self.cache_watch.as_ref() {
+            let result = watch.wait_retired();
+            if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
+                return Err(TestError(
+                    "canonical inode stop unconfirmed; retaining original owners",
+                ));
+            }
+            checked(context, result)?;
+            drop(self.cache_watch.take());
+        }
         recovered(
             context,
             "filesystem-before-disk-stop",

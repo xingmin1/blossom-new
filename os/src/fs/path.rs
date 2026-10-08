@@ -68,6 +68,19 @@ impl Path {
         &self.mount.volume
     }
 
+    /// 借用原挂载，为同卷零链接 inode 构造未入名字索引的路径，供打开实例保有原身份。
+    /// 调用者须在可睡眠任务中持合法 canonical inode；本操作不创建名字或替换挂载根。
+    pub(crate) fn unhashed_inode(&self, inode: InodeRef) -> Result<Self, FsError> {
+        if !Arc::ptr_eq(inode.filesystem(), &self.mount.volume) {
+            return Err(FsError::InvalidOperation);
+        }
+        let dentry = DentryRef::try_unhashed(inode)?;
+        Ok(Self {
+            mount: self.mount.clone(),
+            dentry,
+        })
+    }
+
     /// 先检查挂载、卷与设备写能力，再按当前 canonical owner/group/other mode 检查访问。
     pub fn check_access(&self, uid: u32, gid: u32, mask: u16) -> Result<(), FsError> {
         if mask & !7 != 0 {

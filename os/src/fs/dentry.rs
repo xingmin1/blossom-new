@@ -253,6 +253,23 @@ impl DentryRef {
         Ok(Self(dentry))
     }
 
+    /// 为零链接 inode 建立无父、空名字的正绑定；任务中完成加载检查，不登记名字或修改目录。
+    pub(crate) fn try_unhashed(inode: InodeRef) -> Result<Self, FsError> {
+        if inode.metadata_snapshot()?.links != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let dentry = Arc::try_new(Dentry {
+            parent: None,
+            name: Vec::new(),
+            binding: Once::new(),
+            waiters: WaitQueue::new(),
+            _pinned: PhantomPinned,
+        })
+        .map_err(|_| FsError::NoMemory)?;
+        dentry.binding.call_once(|| Ok(Binding::Positive(inode)));
+        Ok(Self(dentry))
+    }
+
     /// 锁外准备名字和稳定 Arc；分配失败不会占槽，也没有已登记等待者。
     fn try_child(parent: &Self, name: &[u8]) -> Result<Self, FsError> {
         let mut owned_name = Vec::new();

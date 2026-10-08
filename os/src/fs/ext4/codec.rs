@@ -7,6 +7,7 @@ use crate::fs::inode::InodeMetadata;
 use crate::fs::FsError;
 
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
+pub(crate) const EA_INODE: u32 = 0x0020_0000;
 pub(crate) const INDEX: u32 = 0x1000;
 pub(crate) const METADATA_CSUM: u32 = 0x400;
 
@@ -300,7 +301,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     if flags & EXTENTS != 0 && g.features_incompat & 0x40 == 0 {
         return Err(FsError::Corrupt);
     }
-    if flags & 0x200000 != 0 && g.features_incompat & 0x400 == 0 {
+    if flags & EA_INODE != 0 && g.features_incompat & 0x400 == 0 {
         return Err(FsError::Corrupt);
     }
     if kind == InodeKind::Symlink && flags & (0x10 | 0x20) != 0 {
@@ -341,7 +342,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         (g.block_size / 512) as u64
     };
     let fast_symlink = kind == InodeKind::Symlink
-        && if flags & 0x200000 == 0 {
+        && if flags & EA_INODE == 0 {
             blocks.checked_sub(ea_blocks).ok_or(FsError::Corrupt)? == 0
         } else {
             0 < size && size < 60
@@ -786,5 +787,162 @@ pub(crate) fn inode_checksum(g: &Geometry, record: &mut [u8], seed: u32, extra: 
     put16(record, 124, sum as u16);
     if 4 <= extra {
         put16(record, 130, (sum >> 16) as u16);
+    }
+}
+
+/// 最终回收只清当前 inode 的内容引用和分配计数，保留 generation、未知字段和邻记录。
+pub(crate) fn patch_inode_release(g: &Geometry, record: &mut [u8], seed: u32, extra: usize) {
+    let flags = le32(record, 32).expect("prepared freed inode flags") & !0x40000;
+    let deletion_time = le32(record, 12).expect("prepared freed inode ctime");
+    put32(record, 4, 0);
+    put32(record, 108, 0);
+    put32(record, 28, 0);
+    put16(record, 116, 0);
+    put16(record, 26, 0);
+    put32(record, 104, 0);
+    if g.features_incompat & 0x80 != 0 {
+        put16(record, 118, 0);
+    }
+    put32(record, 32, flags);
+    record[40..100].fill(0);
+    if flags & EXTENTS != 0 {
+        put16(record, 40, 0xf30a);
+        put16(record, 44, 4);
+    }
+    if g.features_incompat & 0x400 != 0 {
+        clear_inline_ea_references(record, extra);
+    }
+    put32(record, 20, deletion_time);
+    inode_checksum(g, record, seed, extra);
+}
+
+/// 外部 EA 的 CRC 使用卷种子和物理块号，校验字段按零参与整块计算。
+fn xattr_block_checksum(g: &Geometry, physical: u64, bytes: &[u8]) -> u32 {
+    let seed = crc32c(g.checksum_seed, &physical.to_le_bytes());
+    let prefix = crc32c(seed, &bytes[..16]);
+    crc32c(crc32c(prefix, &[0; 4]), &bytes[20..g.block_size])
+}
+
+/// 删除外部 EA 前校验真实头和物理块 CRC，返回其中隐藏 value inode 的准确编号。
+pub(crate) fn verify_xattr_release(
+    g: &Geometry,
+    physical: u64,
+    data: &[u8],
+    numbers: &mut [u64; 256],
+) -> Result<usize, FsError> {
+    let data = bytes(data, 0, g.block_size)?;
+    if le32(data, 0)? != 0xea02_0000 || le32(data, 8)? != 1 || le32(data, 4)? == 0 {
+        return Err(FsError::Corrupt);
+    }
+    if g.features_ro_compat & METADATA_CSUM != 0
+        && le32(data, 16)? != xattr_block_checksum(g, physical, data)
+    {
+        return Err(FsError::Checksum);
+    }
+    if g.features_incompat & 0x400 != 0 {
+        return xattr_ea_inodes(data, 32, numbers);
+    }
+    Ok(0)
+}
+
+/// inode 内 EA 的隐藏 value 逐项返回，普通内嵌值随本记录清除而不另占块。
+pub(crate) fn inline_ea_inodes(
+    g: &Geometry,
+    record: &[u8],
+    extra: usize,
+    numbers: &mut [u64; 256],
+) -> Result<usize, FsError> {
+    if g.features_incompat & 0x400 == 0 {
+        return Ok(0);
+    }
+    let header = 128 + extra;
+    if header + 4 <= record.len() && le32(record, header)? == 0xea02_0000 {
+        return xattr_ea_inodes(record, header + 4, numbers);
+    }
+    Ok(0)
+}
+
+/// entry 跨度由名字长度决定；固定数组覆盖 4KiB 块内全部最小 16 字节条目。
+fn xattr_ea_inodes(
+    data: &[u8],
+    mut offset: usize,
+    numbers: &mut [u64; 256],
+) -> Result<usize, FsError> {
+    let mut count = 0;
+    loop {
+        if le32(data, offset)? == 0 {
+            return Ok(count);
+        }
+        let entry = bytes(data, offset, 16)?;
+        let number = u64::from(le32(entry, 4)?);
+        if number != 0 {
+            numbers[count] = number;
+            count += 1;
+        }
+        offset += (16 + usize::from(entry[0]) + 3) & !3;
+    }
+}
+
+/// 准备阶段已验证 entry 跨度；最终清除隐藏引用和值长度，其他 EA 字节保持原样。
+fn clear_inline_ea_references(record: &mut [u8], extra: usize) {
+    let header = 128 + extra;
+    if record.len() < header + 4
+        || le32(record, header).expect("prepared inline EA header") != 0xea02_0000
+    {
+        return;
+    }
+    let mut offset = header + 4;
+    while le32(record, offset).expect("prepared inline EA entry") != 0 {
+        let span = (16 + usize::from(record[offset]) + 3) & !3;
+        if le32(record, offset + 4).expect("prepared inline EA reference") != 0 {
+            put32(record, offset + 4, 0);
+            put32(record, offset + 8, 0);
+        }
+        offset += span;
+    }
+}
+
+/// 隐藏 EA inode 的引用计数按 ctime 高半与 i_version 低半解码，单位为 EA 引用。
+pub(crate) fn ea_inode_references(record: &[u8]) -> Result<u64, FsError> {
+    Ok((u64::from(le32(record, 12)?) << 32) | u64::from(le32(record, 36)?))
+}
+
+/// canonical 写序列下仅减真实 EA 引用；最后引用清 nlink，存储仍由正常末使用回收。
+/// 准备已验证记录和计数，当前值仍由同卷元数据 WB 序列保护；不读盘或申请容量。
+pub(crate) fn patch_ea_inode_references(
+    g: &Geometry,
+    record: &mut [u8],
+    next: &mut InodeMetadata,
+    count: u64,
+) {
+    let references = ea_inode_references(record)
+        .expect("prepared EA inode reference")
+        .checked_sub(count)
+        .expect("EA inode reference underflow");
+    next.links = if references == 0 { 0 } else { 1 };
+    next.ctime = InodeTime {
+        seconds: (references >> 32) as i64,
+        nanoseconds: 0,
+    };
+    let ctime = time_encoding(next.ctime, 132, next.extra_isize).expect("prepared EA inode ctime");
+    put_time(record, 12, 132, ctime);
+    put32(record, 36, references as u32);
+    if 156 <= 128 + next.extra_isize {
+        put32(record, 152, 0);
+    }
+    put16(record, 26, next.links as u16);
+    inode_checksum(g, record, next.checksum_seed, next.extra_isize);
+}
+
+/// 共享 EA 只修改当前引用计数并重算物理块 CRC，不复制其余名字和值。
+pub(crate) fn patch_xattr_refcount(
+    g: &Geometry,
+    physical: u64,
+    record: &mut [u8],
+    references: u32,
+) {
+    put32(record, 4, references);
+    if g.features_ro_compat & METADATA_CSUM != 0 {
+        put32(record, 16, xattr_block_checksum(g, physical, record));
     }
 }

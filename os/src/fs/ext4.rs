@@ -1,6 +1,7 @@
 //! ext4 卷保存实际 FS 权限和共同元数据页，块映射由 canonical inode 的 data-sem 保护。
 
 mod allocation;
+pub(crate) use allocation::PreparedInodeRelease;
 pub use allocation::{UnpublishedBlock, UnpublishedInode};
 pub(crate) mod codec;
 pub(crate) mod crc;
@@ -273,7 +274,31 @@ impl Ext4Volume {
         Ok(())
     }
 
-    /// 返回准备时固定的弱登记预算，扫描不能因新 Dirty 无限延长。
+    /// 隐藏 EA 使用原活卷与 canonical 域取得，不创建第二个缓存或从裸地址构造 Arc。
+    pub(crate) fn iget_ea_inode(&self, number: u64) -> Result<InodeRef, FsError> {
+        let domain = self.inode_domain.lock().upgrade().ok_or(FsError::Busy)?;
+        let filesystem = self
+            .metadata
+            .filesystem
+            .lock()
+            .upgrade()
+            .ok_or(FsError::InvalidOperation)?;
+        if !core::ptr::eq(filesystem.as_ref(), self) {
+            return Err(FsError::InvalidOperation);
+        }
+        domain.iget(&filesystem, number, None)
+    }
+
+    /// 原 inode 位已临时取用但新记录尚未初始化，分配者须在 allocator 锁外等待旧 canonical 退场。
+    pub(crate) fn wait_inode_reuse(&self, number: u64) -> Result<(), FsError> {
+        let domain = self.inode_domain.lock().upgrade();
+        match domain {
+            Some(domain) => domain.wait_inode_reuse(self, number),
+            None => Ok(()),
+        }
+    }
+
+    /// 返回准备时固定的 canonical 槽预算，本轮扫描不随新 Dirty 或待回收对象无限扩大。
     pub(crate) fn dirty_inode_limit(&self) -> usize {
         let domain = self.inode_domain.lock().upgrade();
         domain.map_or(0, |domain| domain.dirty_inode_limit())
@@ -386,35 +411,27 @@ impl Ext4Volume {
         mapping::map(self, &inode, logical, end)
     }
 
-    /// caller 保持 data-sem 读侧到原页所有分段 IO 结束，全部初始化后才唯一发表。
+    /// caller 保持 invalidate 保护到真实 IO 全尾；块根仅准备 targets，不跨数据等待。
     pub fn fill_page(
         &self,
-        inode: &InodeMetadata,
-        root: &[u8; 60],
         index: u64,
+        file_size: u64,
+        targets: &[Option<u64>; PAGE_SIZE / 512],
         mut read: FolioRead,
     ) -> Result<(), FsError> {
         let start = match index.checked_mul(PAGE_SIZE as u64) {
             Some(start) if read.offset() == 0 && read.len() == PAGE_SIZE => start,
-            _ => return finish_error(read, FsError::Corrupt),
+            _ => return Err(finish_error(read, FsError::Corrupt)),
         };
         let size = self.geometry.block_size;
         let mut offset = 0usize;
         while offset < PAGE_SIZE {
             let byte = match start.checked_add(offset as u64) {
                 Some(byte) => byte,
-                None => return finish_error(read, FsError::Corrupt),
+                None => return Err(finish_error(read, FsError::Corrupt)),
             };
-            let mapping = match self.map_block(inode, root, byte / size as u64) {
-                Ok(mapping) => mapping,
-                Err(error) => return finish_error(read, error),
-            };
-            match mapping {
-                BlockMapping::Mapped { physical, .. } => {
-                    let disk_byte = match physical.checked_mul(size as u64) {
-                        Some(byte) => byte,
-                        None => return finish_error(read, FsError::Corrupt),
-                    };
+            match targets[offset / size] {
+                Some(disk_byte) => {
                     read = self.disk.fill_folio_range(disk_byte, read, offset, size)?;
                     #[cfg(feature = "ktest")]
                     {
@@ -424,12 +441,10 @@ impl Ext4Volume {
                         }
                     }
                 }
-                BlockMapping::Hole { .. } | BlockMapping::Unwritten { .. } | BlockMapping::Eof => {
-                    zero_range(&mut read, offset, size);
-                }
+                None => zero_range(&mut read, offset, size),
             }
-            if inode.size < byte.saturating_add(size as u64) {
-                let valid = min(inode.size.saturating_sub(byte), size as u64) as usize;
+            if file_size < byte.saturating_add(size as u64) {
+                let valid = min(file_size.saturating_sub(byte), size as u64) as usize;
                 zero_range(&mut read, offset + valid, size - valid);
             }
             offset += size;
@@ -538,6 +553,16 @@ impl Ext4Volume {
         mapping::prepare(self, &inode.with_block(root), logical)
     }
 
+    /// canonical 写序列化下准备准确截断窗口；失败不修改旧树、共同元数据或位图。
+    pub(crate) fn prepare_truncate(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        new_size: u64,
+    ) -> Result<mapping::PreparedTruncate, FsError> {
+        mapping::prepare_truncate(self, &inode.with_block(root), new_size)
+    }
+
     /// 先准备 inode-table 真实窗口，再在同一页锁内仅修改当前 inode 的字段和校验和。
     pub(crate) fn update_inode_metadata(
         &self,
@@ -560,7 +585,7 @@ impl Ext4Volume {
 }
 
 /// 将映射准备失败的原始原因发表给同页等待者，不依赖析构取消语义。
-fn finish_error(mut read: FolioRead, error: FsError) -> Result<(), FsError> {
+pub(crate) fn finish_error(mut read: FolioRead, error: FsError) -> FsError {
     // SAFETY: 映射准备时页仍由 CPU 独占，此前分段 DMA 已结束；失败不授予字节读取权。
     unsafe {
         read.complete(IoResult {
@@ -568,7 +593,7 @@ fn finish_error(mut read: FolioRead, error: FsError) -> Result<(), FsError> {
             error: Some(error.folio_error()),
         });
     }
-    Err(error)
+    error
 }
 
 /// CPU 收权阶段初始化原页的一段合法零内容，不发表中间可读状态。

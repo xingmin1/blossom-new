@@ -20,7 +20,7 @@
     b .Lexit
 991:
 .endm
-# /// openat 只消费本程序实际字节路径，不创建或截断文件。
+# /// openat 直接消费普通字节路径，截断意图由生产准入和 inode 实现决定。
 .macro OPEN pathname, flags, number
     li.d $a0, -100
     la.local $a1, \pathname
@@ -71,14 +71,16 @@
     SC 227
     EXPECT \result, \number
 .endm
-# /// argv 仅选择具体写、append 或真实 exec 交接，不使用测试 syscall。
+# /// argv 选择确定的普通文件、映射、同步和截断模式，所有返回值均消费真实 syscall。
 .global _start
 .type _start, @function
 _start:
     li.d $s8, 1
     ld.d $t0, $sp, 0
     li.d $t1, 2
-    bltu $t0, $t1, .Lexit
+    bgeu $t0, $t1, 991f
+    b .Lexit
+991:
     ld.d $t0, $sp, 16
     ld.bu $t0, $t0, 0
     li.d $t1, 'w'
@@ -115,6 +117,26 @@ _start:
     beq $t0, $t1, .Lsync_write
     li.d $t1, 'z'
     beq $t0, $t1, .Lsync_write
+    li.d $t1, 't'
+    bne $t0, $t1, 991f
+    b .Ltruncate
+991:
+    li.d $t1, 'v'
+    bne $t0, $t1, 991f
+    b .Ltruncate_ro
+991:
+    li.d $t1, 'h'
+    bne $t0, $t1, 991f
+    b .Ltruncate_dac
+991:
+    li.d $t1, 'k'
+    bne $t0, $t1, 991f
+    b .Ltruncate_cow
+991:
+    li.d $t1, 'j'
+    bne $t0, $t1, 991f
+    b .Ltruncate_wait
+991:
     b .Lexit
 
 # /// 源跨坏页只接受 17 字节，零前缀故障、负 pwrite 和定位写均不能改共享位置。
@@ -747,6 +769,293 @@ _start:
     EXPECT 0, 148
     b .Lpass
 
+# /// 真实 45/46 和 O_TRUNC 共享大小，dup 的位置不变；只读截断打开仍是只读 OFD。
+.Ltruncate:
+    OPEN .Lshared_path, 2, 150
+    move $s0, $a0
+    li.d $a1, 0
+    SC 46
+    EXPECT 0, 151
+    move $a0, $s0
+    la.local $a1, .Ltruncate_input
+    li.d $a2, 9
+    SC 64
+    EXPECT 9, 152
+    move $a0, $s0
+    li.d $a1, 123
+    li.d $a2, 0
+    SC 62
+    EXPECT 123, 153
+    move $a0, $s0
+    SC 23
+    OK 154
+    move $s2, $a0
+    move $a0, $s0
+    li.d $a1, 3
+    SC 46
+    EXPECT 0, 155
+    SIZE $s0, 3, 156
+    CURSOR $s0, 123, 157
+    CURSOR $s2, 123, 158
+    move $a0, $s0
+    li.d $a1, 9
+    SC 46
+    EXPECT 0, 159
+    SIZE $s0, 9, 160
+    move $a0, $s0
+    la.local $a1, .Lbuffer
+    li.d $a2, 9
+    li.d $a3, 0
+    SC 67
+    EXPECT 9, 161
+    la.local $a0, .Lbuffer
+    la.local $a1, .Ltruncate_expected
+    li.d $a2, 9
+    li.d $s8, 162
+    bl .Lequal
+    la.local $a0, .Lshared_path
+    li.d $a1, 0
+    SC 45
+    EXPECT 0, 163
+    SIZE $s0, 0, 164
+    CURSOR $s2, 123, 165
+    la.local $a0, .Lshared_path
+    li.d $a1, 9
+    SC 45
+    EXPECT 0, 166
+    SIZE $s0, 9, 167
+    move $a0, $s0
+    la.local $a1, .Lbuffer
+    li.d $a2, 9
+    li.d $a3, 0
+    SC 67
+    EXPECT 9, 168
+    la.local $a0, .Lbuffer
+    li.d $a1, 9
+    li.d $a2, 0
+    li.d $s8, 169
+    bl .Lconstant
+    li.d $a0, -1
+    li.d $a1, -1
+    SC 46
+    EXPECT -22, 170
+    li.d $a0, -1
+    li.d $a1, 0
+    SC 46
+    EXPECT -9, 171
+    li.d $a0, 0
+    li.d $a1, -1
+    SC 45
+    EXPECT -22, 172
+    li.d $a0, 0
+    li.d $a1, 0
+    SC 45
+    EXPECT -14, 173
+    move $a0, $s0
+    li.d $a1, -1
+    SC 46
+    EXPECT -22, 174
+    move $a0, $s0
+    li.d $a1, 0x7fffffffffffffff
+    SC 46
+    EXPECT -27, 175
+    la.local $a0, .Lshared_path
+    li.d $a1, 0x7fffffffffffffff
+    SC 45
+    EXPECT -27, 176
+    SIZE $s0, 9, 177
+    CURSOR $s0, 123, 178
+    OPEN .Lshared_path, 0, 179
+    move $s1, $a0
+    li.d $a1, 0
+    SC 46
+    EXPECT -22, 180
+    OPEN .Ldirectory, 0, 181
+    move $s3, $a0
+    li.d $a1, 0
+    SC 46
+    EXPECT -22, 182
+    la.local $a0, .Ldirectory
+    li.d $a1, 0
+    SC 45
+    EXPECT -21, 183
+    la.local $a0, .Lself
+    li.d $a1, 0
+    SC 45
+    EXPECT -26, 184
+    li.d $a0, -100
+    la.local $a1, .Lself
+    li.d $a2, 0x200
+    li.d $a3, 0
+    SC 56
+    EXPECT -26, 185
+    OPEN .Lshared_path, 0x200, 186
+    move $s4, $a0
+    li.d $a1, 3
+    li.d $a2, 0
+    SC 25
+    EXPECT 0, 187
+    SIZE $s4, 0, 188
+    SIZE $s0, 0, 189
+    CURSOR $s2, 123, 190
+    move $a0, $s4
+    la.local $a1, .Lpayload
+    li.d $a2, 1
+    SC 64
+    EXPECT -9, 191
+    move $a0, $s4
+    li.d $a1, 0
+    SC 46
+    EXPECT -22, 192
+    move $a0, $s0
+    la.local $a1, .Lpayload
+    li.d $a2, 1
+    li.d $a3, 0
+    SC 68
+    EXPECT 1, 193
+    OPEN .Lshared_path, 0x202, 194
+    move $s5, $a0
+    SIZE $s5, 0, 195
+    CURSOR $s0, 123, 196
+    b .Lpass
+
+# /// 只读挂载保 EROFS，负长度先于 fd 查找；只读 OFD 的 ftruncate 仍按类型返回 EINVAL。
+.Ltruncate_ro:
+    OPEN .Lmap_path, 0, 197
+    move $s0, $a0
+    CURSOR $s0, 0, 222
+    move $a0, $s0
+    li.d $a1, 0
+    SC 46
+    EXPECT -22, 198
+    la.local $a0, .Lmap_path
+    li.d $a1, 0
+    SC 45
+    EXPECT -30, 199
+    li.d $a0, -100
+    la.local $a1, .Lmap_path
+    li.d $a2, 0x200
+    li.d $a3, 0
+    SC 56
+    EXPECT -30, 200
+    li.d $a0, -100
+    la.local $a1, .Lmap_path
+    li.d $a2, 0x202
+    li.d $a3, 0
+    SC 56
+    EXPECT -30, 201
+    CURSOR $s0, 0, 223
+    b .Lpass
+
+# /// 当前非 root 凭据须有写权限才能按路径截断，失败不能改变真实大小或文件字节。
+.Ltruncate_dac:
+    OPEN .Lshared_path, 0, 202
+    move $s0, $a0
+    SIZE $s0, 9, 203
+    la.local $a0, .Lshared_path
+    li.d $a1, 0
+    SC 45
+    EXPECT -13, 204
+    li.d $a0, -100
+    la.local $a1, .Lshared_path
+    li.d $a2, 0x200
+    li.d $a3, 0
+    SC 56
+    EXPECT -13, 205
+    li.d $a0, -100
+    la.local $a1, .Lshared_path
+    li.d $a2, 0x202
+    li.d $a3, 0
+    SC 56
+    EXPECT -13, 206
+    SIZE $s0, 9, 207
+    move $a0, $s0
+    la.local $a1, .Lbuffer
+    li.d $a2, 9
+    li.d $a3, 0
+    SC 67
+    EXPECT 9, 208
+    la.local $a0, .Lbuffer
+    la.local $a1, .Ltruncate_input
+    li.d $a2, 9
+    li.d $s8, 209
+    bl .Lequal
+    b .Lpass
+
+# /// 新 private 写 fault 先准备真实匿名候选，首失效后完成 store 和普通 fork，子与父等最终失效后才退出。
+.Ltruncate_cow:
+    li.d $s6, 0x49000000
+    OPEN .Lshared_path, 0, 210
+    move $s0, $a0
+    li.d $a0, 0x48000000
+    li.d $a1, 4096
+    li.d $a2, 3
+    li.d $a3, 0x12
+    move $a4, $s0
+    ld.d $a5, $s6, 24
+    SC 222
+    EXPECT 0x48000000, 211
+    move $s5, $a0
+    PHASE 1
+    GATE 1
+    li.d $t0, 0xb6
+    st.b $t0, $s5, 0
+    ld.bu $a0, $s5, 0
+    EXPECT 0xb6, 212
+    PHASE 2
+    GATE 2
+    li.d $a0, 17
+    li.d $a1, 0
+    li.d $a2, 0
+    li.d $a3, 0
+    li.d $a4, 0
+    SC 220
+    OK 213
+    beqz $a0, .Ltruncate_cow_child
+    move $s1, $a0
+    st.d $s1, $s6, 16
+    PHASE 3
+    GATE 3
+    SIZE $s0, 4096, 214
+    move $a0, $s1
+    la.local $a1, .Lstatus
+    li.d $a2, 0
+    li.d $a3, 0
+    SC 260
+    li.d $s8, 215
+    bne $a0, $s1, .Lexit
+    la.local $t0, .Lstatus
+    ld.w $a0, $t0, 0
+    EXPECT 0, 216
+    b .Lpass
+.Ltruncate_cow_child:
+    li.d $t0, 3
+    dbar 0
+    st.w $t0, $s6, 8
+    GATE 3
+    b .Lpass
+
+# /// 普通 ftruncate 在原数据或元数据完成暂停时真实等待，返回后大小为零且 OFD 位置保持。
+.Ltruncate_wait:
+    li.d $s6, 0x49000000
+    OPEN .Lshared_path, 2, 217
+    move $s0, $a0
+    li.d $a1, 7
+    li.d $a2, 0
+    SC 62
+    EXPECT 7, 218
+    PHASE 1
+    GATE 1
+    move $a0, $s0
+    li.d $a1, 0
+    SC 46
+    EXPECT 0, 219
+    SIZE $s0, 0, 220
+    CURSOR $s0, 7, 221
+    PHASE 2
+    GATE 2
+    b .Lpass
+
 # /// 核对整段常量字节，错误保留调用方的具名断言编号。
 .type .Lconstant, @function
 .Lconstant:
@@ -806,6 +1115,8 @@ _start:
 .Ldelta: .ascii "!?"
 .Lappend_expected: .ascii "alphaBETAxyz!?"
 .Lpayload: .byte 0x39
+.Ltruncate_input: .ascii "123456789"
+.Ltruncate_expected: .byte 0x31, 0x32, 0x33, 0, 0, 0, 0, 0, 0
 .balign 8
 .Lfutex_timeout: .quad 5, 0
 

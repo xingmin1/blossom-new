@@ -137,6 +137,27 @@ pub struct RetiredTables {
     owners: TableOwners,
 }
 
+impl RetiredTables {
+    /// 合并已经摘离的原表页拥有，短锁内只移动节点，统一等锁外失效后归还。
+    pub(crate) fn append(&mut self, mut other: Self) {
+        while let Some(node) = other.owners.pop() {
+            self.owners.push(node);
+        }
+    }
+
+    /// 观察当前退休链的真实表页数，不从硬件地址重建拥有。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn len(&self) -> usize {
+        let mut count = 0;
+        let mut cursor = self.owners.head.as_deref();
+        while let Some(node) = cursor {
+            count += 1;
+            cursor = node.next.as_deref();
+        }
+        count
+    }
+}
+
 /// Mm 保活的用户根及私有中间页；共享内核表和常驻空表从不进入拥有链。
 /// 析构前必须结束全部 CPU 对此根的活动使用并完成本地翻译失效。
 /// 根物理地址只授予激活所需的标识，不授予外部修改硬件槽的权限。
@@ -324,7 +345,7 @@ impl UserPageTable {
     }
 
     /// 解除一个页并摘取沿途空中间表，任何归还都留给同步失效后的锁外阶段。
-    /// 非法或缺失页基址不改槽，返回空快照和空退休拥有。
+    /// 缺失叶仍可摘取已空的私有目录，覆盖换页清叶与文件失效之间的交错。
     ///
     /// # Safety
     /// 调用者必须串行化软件 PTE 修改，保活旧数据页，且不得在 PTE 锁内
@@ -350,9 +371,6 @@ impl UserPageTable {
         // 调用者保活旧数据页到后续同步失效完成。
         let old = unsafe { replace_slot(path[0], slot_index(va, 0), arch::user_empty_entry(0)) };
         let old = mapping(old);
-        if old.is_none() {
-            return (None, retired);
-        }
         for level in 0..arch::USER_LEVELS - 1 {
             // SAFETY: 此子页尚未摘离且由本表保活，短锁阻止软件新增叶或目录。
             if !unsafe { table_is_empty(path[level], level) } {

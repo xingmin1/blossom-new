@@ -2,8 +2,9 @@
 
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, GroupState};
-use crate::fs::ext4::{Ext4Volume, Geometry};
-use crate::fs::FsError;
+use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeKind};
+use crate::fs::{FsError, InodeRef};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GroupLayout {
@@ -32,16 +33,48 @@ pub struct UnpublishedBlock {
     reservation: Reservation,
 }
 
-/// 已有节点的预备释放窗口；准备时尚未摘树，取消计划只释放窗口引用。
+/// 已有数据或节点的预备释放窗口；准备时尚未摘树，取消只释放窗口引用。
 pub(crate) struct DetachedBlock {
     reservation: Reservation,
-    node: BufferRef,
+    /// 数据只保已经存在的物理元数据别名，节点始终保实际读取的准确窗口。
+    alias: Option<BufferRef>,
 }
 
 /// 尚未连接到名字的 inode 责任，位图、记录与释放窗口均由本次申请保留。
 pub struct UnpublishedInode {
     number: u64,
     reservation: Reservation,
+}
+
+/// 最后一个未链接 inode 的具体释放窗口；尚未清位图，析构不执行等待或盘面修改。
+pub(crate) struct PreparedInodeRelease {
+    reservation: Reservation,
+    record: BufferRef,
+    offset: usize,
+    seed: u32,
+    extra_isize: usize,
+    acl: Option<(u64, DetachedBlock)>,
+    ea: Vec<PreparedEaRelease>,
+}
+
+/// 一组真实 EA value 引用与其 canonical 使用、原记录窗口，取消时不改变计数。
+struct PreparedEaRelease {
+    inode: InodeRef,
+    record: BufferRef,
+    offset: usize,
+    count: u64,
+    references: u64,
+}
+
+impl DetachedBlock {
+    /// 新根和父字段发表后保留必须消费的释放责任，未发表准备仍可直接取消。
+    pub(crate) fn arm_release(&mut self) {
+        assert!(
+            !self.reservation.active,
+            "ext4 detached block already armed"
+        );
+        self.reservation.active = true;
+    }
 }
 
 impl UnpublishedBlock {
@@ -62,7 +95,7 @@ impl UnpublishedInode {
         self.number
     }
 
-    /// 名字与 inode 连接成功后消费临时拥有权。
+    /// 原 inode 已由 canonical 使用或名字保有后结束临时分配责任，位图仍保持已分配。
     pub(crate) fn publish(mut self) -> u64 {
         self.reservation.active = false;
         self.number
@@ -94,7 +127,7 @@ impl Ext4Volume {
         self.release_reservation(&mut block.reservation);
     }
 
-    /// 准备普通或目录 inode 的真实盘面记录，失败只返还本次尚未连接的 inode。
+    /// 取得临时 inode 位后先等待旧 canonical 身份退出，再初始化新记录；失败只归还本次临时位。
     pub fn allocate_inode(
         &self,
         hint: u64,
@@ -109,6 +142,11 @@ impl Ext4Volume {
         let mut reservation = self.reserve(hint, true, directory)?;
         let number =
             reservation.group * self.geometry.inodes_per_group + reservation.bit as u64 + 1;
+        // 临时位由 Reservation 保有，等待旧 canonical 身份退出时不持卷分配锁。
+        if let Err(error) = self.wait_inode_reuse(number) {
+            self.release_reservation(&mut reservation);
+            return Err(error);
+        }
         let result = self.inode_record(number);
         let (buffer, offset) = match result {
             Ok(record) => record,
@@ -158,44 +196,253 @@ impl Ext4Volume {
         self.release_reservation(&mut inode.reservation);
     }
 
-    /// 节点合并在发表之前保留释放所需窗口，尚不改变位图或空闲计数。
+    /// 节点合并或截断在发表之前保留真实节点和释放窗口，尚不改变位图或空闲计数。
     pub(crate) fn prepare_detached_block(&self, physical: u64) -> Result<DetachedBlock, FsError> {
+        let node = self.metadata_block(physical)?;
+        self.prepare_block_release(physical, Some(node))
+    }
+
+    /// 数据删除只查当前物理元数据别名，缺失时不申请缓存页或读入旧文件数据。
+    pub(crate) fn prepare_detached_data_block(
+        &self,
+        physical: u64,
+    ) -> Result<DetachedBlock, FsError> {
+        self.geometry.validate_blocks(physical, 1)?;
+        let alias = self
+            .metadata
+            .cached_buffer(physical, self.geometry.block_size)?;
+        self.prepare_block_release(physical, alias)
+    }
+
+    /// 具体物理块保留同卷的位图、描述符和超级块视图，原块仍由旧树拥有。
+    fn prepare_block_release(
+        &self,
+        physical: u64,
+        alias: Option<BufferRef>,
+    ) -> Result<DetachedBlock, FsError> {
         self.geometry.validate_blocks(physical, 1)?;
         let group = (physical - self.geometry.first_data_block) / self.geometry.blocks_per_group;
         let bit =
             ((physical - self.geometry.first_data_block) % self.geometry.blocks_per_group) as usize;
-        let (descriptor, offset) = self.group_buffer(group)?;
-        let bitmap = self.metadata_block(self.groups[group as usize].block_bitmap)?;
-        let superblock = self.metadata.get(0, 4096)?;
-        let node = self.metadata_block(physical)?;
         Ok(DetachedBlock {
-            reservation: Reservation {
-                volume: self.device,
-                group,
-                bit,
-                inode: false,
-                directory: false,
-                bitmap,
-                descriptor,
-                offset,
-                superblock,
-                active: false,
-            },
-            node,
+            reservation: self.prepare_release_reservation(group, bit, false, false)?,
+            alias,
         })
     }
 
-    /// 块根和 inode 记录均已去掉节点引用后，归还实际摘离节点的物理空间。
+    /// 块根和 inode 记录均已去掉引用后归还实际物理空间，可能等待共同元数据内容锁。
     ///
     /// # Safety
-    /// caller 必须保持 inode root 写侧并已摘离节点；旧树读者和 IO 已结束，
-    /// 新读者不能消费旧窗口，且失效前后的引用不能再提交旧内容。
+    /// 调用者保持 inode 根写侧且已摘离此块；旧数据填充、WB 和设备 I/O 已真实结束。
+    /// 旧物理别名的使用者已结束且不会再提交内容，准备之后不能新建旧块别名；
+    /// 元数据窗口只能由本次释放保留到 forget，不能把软件取消当作设备收权。
     pub(crate) unsafe fn release_detached_block(&self, mut block: DetachedBlock) {
-        // SAFETY: caller 证明真实摘树和旧使用者终结；node 保准确物理窗口，
-        // forget 在共同内容域等待真实 WB 收权，只失效本窗口，随后才归还位图。
-        unsafe { block.node.forget(&self.claim) }.expect("detached metadata node invalidation");
-        block.reservation.active = true;
+        assert!(
+            block.reservation.active,
+            "ext4 block still belongs to its old tree"
+        );
+        if let Some(alias) = &block.alias {
+            // SAFETY: 调用者已摘树、结束旧数据和别名使用并排除新旧窗口生产者；
+            // alias 保准确物理范围，forget 等本页真实 WB 收权后只失效该窗口，位图尚未归还。
+            unsafe { alias.forget(&self.claim) }.expect("detached physical block invalidation");
+        }
         self.release_reservation(&mut block.reservation);
+    }
+
+    /// 最后使用交接后、修改 EOF 前准备 inode、外部 EA 和隐藏 value 的全部释放视图。
+    /// 调用者保持 inode 写序列化和本卷元数据 WB 序列到消费结束；错误不改变原引用。
+    pub(crate) fn prepare_inode_release(
+        &self,
+        inode: &InodeData,
+    ) -> Result<PreparedInodeRelease, FsError> {
+        self.require_write(&self.claim)?;
+        let g = &self.geometry;
+        if inode.number < g.first_inode || g.inodes_count < inode.number || inode.links != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let (record, offset) = self.inode_record(inode.number)?;
+        let mut numbers = [0u64; 256];
+        let count = record.with_read(|bytes| {
+            let bytes = &bytes[offset..offset + g.inode_size];
+            let current = codec::decode_inode(g, inode.number, bytes)?;
+            if current.generation != inode.generation
+                || current.kind != inode.kind
+                || current.links != 0
+                || current.file_acl != inode.file_acl
+            {
+                return Err(FsError::Corrupt);
+            }
+            codec::inline_ea_inodes(g, bytes, inode.extra_isize, &mut numbers)
+        })??;
+        let mut ea = Vec::new();
+        self.prepare_ea_references(inode.number, &numbers[..count], &mut ea)?;
+        let group = (inode.number - 1) / g.inodes_per_group;
+        let bit = ((inode.number - 1) % g.inodes_per_group) as usize;
+        let reservation =
+            self.prepare_release_reservation(group, bit, true, inode.kind == InodeKind::Directory)?;
+        let acl = if inode.file_acl == 0 {
+            None
+        } else {
+            let block = self.prepare_detached_block(inode.file_acl)?;
+            let (references, count) = block
+                .alias
+                .as_ref()
+                .expect("external EA buffer")
+                .with_read(|bytes| {
+                    let count =
+                        codec::verify_xattr_release(g, inode.file_acl, bytes, &mut numbers)?;
+                    Ok::<_, FsError>((codec::le32(bytes, 4)?, count))
+                })??;
+            if references == 1 {
+                self.prepare_ea_references(inode.number, &numbers[..count], &mut ea)?;
+            }
+            Some((inode.file_acl, block))
+        };
+        for put in &ea {
+            if put.references < put.count {
+                return Err(FsError::Corrupt);
+            }
+        }
+        Ok(PreparedInodeRelease {
+            reservation,
+            record,
+            offset,
+            seed: inode.checksum_seed,
+            extra_isize: inode.extra_isize,
+            acl,
+            ea,
+        })
+    }
+
+    /// 内嵌 EA 和最后外部 EA 块的逐项引用合并，所有窗口和 canonical 使用在发表前取得。
+    fn prepare_ea_references(
+        &self,
+        parent: u64,
+        numbers: &[u64],
+        puts: &mut Vec<PreparedEaRelease>,
+    ) -> Result<(), FsError> {
+        for &number in numbers {
+            if number == parent {
+                return Err(FsError::Corrupt);
+            }
+            if let Some(put) = puts.iter_mut().find(|put| put.inode.number() == number) {
+                put.count += 1;
+                continue;
+            }
+            puts.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+            let (record, offset) = self.inode_record(number)?;
+            let references = record.with_read(|bytes| {
+                let bytes = &bytes[offset..offset + self.geometry.inode_size];
+                let data = codec::decode_inode(&self.geometry, number, bytes)?;
+                let references = codec::ea_inode_references(bytes)?;
+                if data.kind != InodeKind::Regular
+                    || data.flags & codec::EA_INODE == 0
+                    || data.links != 1
+                    || data.file_acl != 0
+                    || references == 0
+                    || (i64::MAX as u64) < references
+                {
+                    return Err(FsError::Corrupt);
+                }
+                Ok(references)
+            })??;
+            let inode = self.iget_ea_inode(number)?;
+            puts.push(PreparedEaRelease {
+                inode,
+                record,
+                offset,
+                count: 1,
+                references,
+            });
+        }
+        Ok(())
+    }
+
+    /// 消费最终回收窗口，清本 inode 记录及 EA 引用后归还 inode 位图和目录计数。
+    /// 不申请内存或读盘；共享 EA 的当前引用计数由原卷分配锁串行化。
+    ///
+    /// # Safety
+    /// 调用者已在 canonical 索引中禁止父 inode 新使用，nlink 为零且文件数据与树节点全部摘离。
+    /// 父文件页、填充、WB、设备 I/O 和旧别名已结束，原根写侧已排空并释放；
+    /// 持本卷元数据 WB 序列到返回，不能由 IRQ、任意 Drop 或索引短锁调用本睡眠操作。
+    pub(crate) unsafe fn release_inode(&self, mut prepared: PreparedInodeRelease) {
+        assert_eq!(prepared.reservation.volume, self.device);
+        prepared.reservation.active = true;
+        let g = &self.geometry;
+        prepared
+            .record
+            .update(&self.claim, |bytes| {
+                codec::patch_inode_release(
+                    g,
+                    &mut bytes[prepared.offset..prepared.offset + g.inode_size],
+                    prepared.seed,
+                    prepared.extra_isize,
+                )
+            })
+            .expect("prepared freed inode record");
+        if let Some((physical, mut block)) = prepared.acl.take() {
+            let shared = {
+                let _allocation = self.allocation.lock();
+                let alias = block.alias.as_ref().expect("retained external EA buffer");
+                let references = alias
+                    .with_read(|bytes| codec::le32(bytes, 4))
+                    .expect("retained external EA view")
+                    .expect("retained external EA header");
+                assert!(references != 0, "external EA already released");
+                if 1 < references {
+                    alias
+                        .update(&self.claim, |bytes| {
+                            codec::patch_xattr_refcount(g, physical, bytes, references - 1)
+                        })
+                        .expect("retained writable external EA");
+                    true
+                } else {
+                    false
+                }
+            };
+            if !shared {
+                block.arm_release();
+                // SAFETY: 最后 EA 引用已从本记录清除，卷分配锁下确认没有其他 inode 引用；
+                // 调用者已结束旧别名及元数据 WB，block 保原窗口到失效，随后才允许复用。
+                unsafe { self.release_detached_block(block) };
+            }
+        }
+        for put in &prepared.ea {
+            put.inode
+                .release_ea_references(&self.claim, &put.record, put.offset, put.count);
+        }
+        self.release_reservation(&mut prepared.reservation);
+    }
+
+    /// 只准备已分配资源的归还窗口，active 保持关闭，取消不会归还仍可寻址的位。
+    fn prepare_release_reservation(
+        &self,
+        group: u64,
+        bit: usize,
+        inode: bool,
+        directory: bool,
+    ) -> Result<Reservation, FsError> {
+        self.require_write(&self.claim)?;
+        let (descriptor, offset) = self.group_buffer(group)?;
+        let layout = self.groups[group as usize];
+        let bitmap = self.metadata_block(if inode {
+            layout.inode_bitmap
+        } else {
+            layout.block_bitmap
+        })?;
+        let superblock = self.metadata.get(0, 4096)?;
+        Ok(Reservation {
+            volume: self.device,
+            group,
+            bit,
+            inode,
+            directory,
+            bitmap,
+            descriptor,
+            offset,
+            superblock,
+            active: false,
+        })
     }
 
     /// 先取得所有可能睡眠的窗口；内容借用内只扫描、置位与计算 CRC。

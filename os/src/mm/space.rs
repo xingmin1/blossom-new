@@ -123,7 +123,7 @@ impl ResidentPage {
 
 /// 具体链只在短锁内移动已准备节点，回收采用迭代析构，避免用户页数转化为内核栈深度。
 #[derive(Default)]
-struct ResidentPages {
+pub(crate) struct ResidentPages {
     head: Option<Box<ResidentPage>>,
 }
 
@@ -174,7 +174,7 @@ impl ResidentPages {
     }
 
     /// 只计算当前范围的实际驻留数量，供写侧在短锁外准备结果容器。
-    fn count(&self, range: &Range<usize>) -> usize {
+    pub(crate) fn count(&self, range: &Range<usize>) -> usize {
         let mut count = 0;
         let mut cursor = self.head.as_deref();
         while let Some(page) = cursor {
@@ -263,6 +263,56 @@ impl PteDomain {
         unsafe { state.table.mkclean(address, physical) }
             .map_or((false, 0), |(dirty, changed)| (dirty, usize::from(changed)))
     }
+
+    /// 原文件范围锁内只摘当前来源和 PFN 对应的叶，退休链交调用者锁外失效后释放。
+    ///
+    /// # Safety
+    /// 调用者须持来源所属的原文件范围锁，并保活来源和域；
+    /// 传入的原退休页/表链须在全部短锁外同步全部 CPU 后才析构或复用。
+    pub(crate) unsafe fn unmap_range(
+        &self,
+        source: &FileRangeData,
+        range: &Range<u64>,
+        even_cows: bool,
+        retired_pages: &mut ResidentPages,
+        retired_tables: &mut RetiredTables,
+    ) -> usize {
+        let mut state = self.lock();
+        let PteState { table, pages } = &mut *state;
+        let mut link = &mut pages.head;
+        let mut unmapped = 0;
+        while let Some(page) = link.as_ref() {
+            if page.source.as_ptr() != source as *const FileRangeData
+                || !source.range.contains(&page.address)
+                || !even_cows && !matches!(&page.backing, ResidentBacking::File(_))
+            {
+                link = &mut link.as_mut().unwrap().next;
+                continue;
+            }
+            let offset = source
+                .offset
+                .checked_add((page.address - source.range.start) as u64)
+                .expect("registered file offset overflow");
+            if range.end <= offset
+                || offset.saturating_add(PAGE_SIZE as u64) <= range.start
+                || table
+                    .lookup(page.address)
+                    .is_some_and(|leaf| leaf.physical != page.backing.physical())
+            {
+                link = &mut link.as_mut().unwrap().next;
+                continue;
+            }
+            // SAFETY: 原范围锁排除来源换身份和 fork 提交；本 PTE 锁核当前来源/PFN。
+            // page 及下方原退休链保活旧页，表页只移入原退休链，调用者锁外 CSD 后才析构。
+            let (old, tables) = unsafe { table.unmap(page.address) };
+            unmapped += usize::from(old.is_some());
+            let mut page = link.take().unwrap();
+            *link = page.next.take();
+            retired_pages.push(page);
+            retired_tables.append(tables);
+        }
+        unmapped
+    }
 }
 
 struct FaultSource {
@@ -282,10 +332,16 @@ pub struct Mm {
     #[cfg(feature = "ktest")]
     mkwrite_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(feature = "ktest")]
+    fault_hook: SpinLock<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    #[cfg(feature = "ktest")]
+    fork_hook: SpinLock<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    #[cfg(feature = "ktest")]
+    vma_unmap_hook: SpinLock<Option<Arc<dyn Fn(usize, usize) + Send + Sync>>>,
+    #[cfg(feature = "ktest")]
     mkwrites: AtomicUsize,
 }
 
-type RetiredVmas = (Vec<Arc<Vma>>, Vec<Weak<FileRangeData>>);
+type RetiredVmas = (Vec<Arc<Vma>>, Vec<(usize, Weak<FileRangeData>)>);
 
 /// 一份真实用户线程地址空间绑定；页表、CPU 和 futex key 的 Arc 不参与计数。
 pub struct MmUser {
@@ -525,6 +581,12 @@ impl Mm {
             executable: None,
             #[cfg(feature = "ktest")]
             mkwrite_hook: SpinLock::new(None),
+            #[cfg(feature = "ktest")]
+            fault_hook: SpinLock::new(None),
+            #[cfg(feature = "ktest")]
+            fork_hook: SpinLock::new(None),
+            #[cfg(feature = "ktest")]
+            vma_unmap_hook: SpinLock::new(None),
             #[cfg(feature = "ktest")]
             mkwrites: AtomicUsize::new(0),
         })
@@ -876,16 +938,78 @@ impl Mm {
                 drop(preparation);
                 continue;
             }
-            let (page, mut prepared) = match preparation {
+            let (page, mut prepared, file) = match preparation {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    if self.table.lock().allows(base, access) {
-                        return Ok(());
+                    {
+                        let state = self.table.lock();
+                        if state.allows(base, access) {
+                            return Ok(());
+                        }
+                        if state
+                            .pages
+                            .find(base)
+                            .map(|resident| resident.backing.physical())
+                            != source.observed
+                        {
+                            continue;
+                        }
+                    }
+                    if !matches!(&source.backing, Some(ResidentBacking::Anonymous(_))) {
+                        if let Some(range) = &source.vma.file_range {
+                            let data = range.data();
+                            let offset = data
+                                .offset
+                                .checked_add((base - data.range.start) as u64)
+                                .ok_or(VmError::InvalidRange)?;
+                            if data.inode.metadata_snapshot().map_err(VmError::File)?.size <= offset
+                            {
+                                return Err(VmError::BeyondEof);
+                            }
+                        }
                     }
                     return Err(error);
                 }
             };
+            let content = file.as_ref().map(|folio| folio.lock_content());
+            if let Some(content) = &content {
+                let data = source
+                    .vma
+                    .file_range
+                    .as_ref()
+                    .expect("file fault lacks source")
+                    .data();
+                let offset = data
+                    .offset
+                    .checked_add((base - data.range.start) as u64)
+                    .ok_or(VmError::InvalidRange)?;
+                if !data
+                    .inode
+                    .mapping()
+                    .is_canonical(offset / PAGE_SIZE as u64, content.folio())
+                {
+                    continue;
+                }
+                if data.inode.metadata_snapshot().map_err(VmError::File)?.size <= offset {
+                    return Err(VmError::BeyondEof);
+                }
+                content
+                    .range_ready(0, PAGE_SIZE)
+                    .map_err(|error| VmError::File(error.into()))?;
+                #[cfg(feature = "ktest")]
+                {
+                    let hook = self.fault_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook(base);
+                    }
+                }
+            }
             {
+                let _ranges = source
+                    .vma
+                    .file_range
+                    .as_ref()
+                    .map(|range| range.data().inode.mapping().lock_ranges());
                 let mut state = self.table.lock();
                 let resident = state.pages.find(base);
                 if state.allows(base, access) {
@@ -897,18 +1021,36 @@ impl Mm {
                     continue;
                 }
                 if source.observed.is_some() {
-                    // SAFETY: 当前短锁同时核实驻留和实际叶，source 及 resident 保活旧页；
-                    // 只清叶而保留目录，mmap 写侧排除替换，短锁外同步完成后才发表新页。
+                    // SAFETY: 范围/PTE 短锁核当次来源和驻留，source 保活旧页；
+                    // 只清叶保留目录，锁外 CSD 后再次检查，不能假定文件失效未摘表。
                     let old = unsafe { state.table.clear_leaf(base) };
                     assert_eq!(old.map(|leaf| leaf.physical), source.observed);
                 }
             }
             sync_all();
             let old = {
+                let _ranges = source
+                    .vma
+                    .file_range
+                    .as_ref()
+                    .map(|range| range.data().inode.mapping().lock_ranges());
                 let mut state = self.table.lock();
+                if state
+                    .pages
+                    .find(base)
+                    .map(|resident| resident.backing.physical())
+                    != source.observed
+                    || source.needed < state.table.needed_tables(base)
+                {
+                    continue;
+                }
+                assert!(
+                    state.table.lookup(base).is_none(),
+                    "fault publication found a live leaf"
+                );
                 let permissions = page.permissions(current.permissions);
-                // SAFETY: 旧叶已解除且同步失效，mmap 写侧保身份和目录；新页已初始化，
-                // 新旧引用保活到各自翻译停止，shared file 叶在普通 fault 中只读。
+                // SAFETY: 旧叶已解除且真实 CSD 完成；同范围/PTE 锁重核旧驻留及缺表数。
+                // 新页完整初始化，原文件内容锁排除 detach，原叶和退休引用均仍保活。
                 let previous = unsafe {
                     state
                         .table
@@ -921,6 +1063,7 @@ impl Mm {
                 old
             };
             sync_all();
+            drop(content);
             drop(mmap);
             drop(old);
             drop(prepared);
@@ -1058,6 +1201,30 @@ impl Mm {
         drop(previous);
     }
 
+    /// 在原范围替换已发表新 VMA、旧叶仍待摘取时观察；callback 只暂停真实操作。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_set_vma_unmap_hook(
+        &self,
+        hook: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    ) {
+        let previous = core::mem::replace(&mut *self.vma_unmap_hook.lock(), hook);
+        drop(previous);
+    }
+
+    /// 在真实文件候选持源内容锁并重核 EOF 后暂停，只观察原 fault，不构造叶或页。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_set_fault_hook(&self, hook: Option<Arc<dyn Fn(usize) + Send + Sync>>) {
+        let previous = core::mem::replace(&mut *self.fault_hook.lock(), hook);
+        drop(previous);
+    }
+
+    /// 在真实 fork 取得原驻留引用后暂停，候选仍须通过当前父叶和来源的最终检查。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_set_fork_hook(&self, hook: Option<Arc<dyn Fn(usize) + Send + Sync>>) {
+        let previous = core::mem::replace(&mut *self.fork_hook.lock(), hook);
+        drop(previous);
+    }
+
     /// 观察真实 Dirty 后的 W 发表次数，不把 VMA 最大权限或诊断读取计入授权。
     #[cfg(feature = "ktest")]
     pub fn ktest_mkwrite_count(&self) -> usize {
@@ -1145,14 +1312,24 @@ impl Mm {
         *child.mmap.write() = snapshot;
         for &address in &addresses {
             let vma = mmap.find(address).expect("resident page has no VMA");
-            let (backing, cow) = {
+            let (backing, cow, source) = {
                 let state = self.table.lock();
-                let page = state
-                    .pages
-                    .find(address)
-                    .expect("fork resident disappeared");
-                (page.backing.clone(), page.cow || vma.is_private())
+                let Some(page) = state.pages.find(address) else {
+                    continue;
+                };
+                (
+                    page.backing.clone(),
+                    page.cow || vma.is_private(),
+                    page.source.as_ptr(),
+                )
             };
+            #[cfg(feature = "ktest")]
+            {
+                let hook = self.fork_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook(address);
+                }
+            }
             let mut page = ResidentPage::try_new(address, backing, cow)?;
             {
                 let child_mmap = child.mmap.read();
@@ -1164,23 +1341,76 @@ impl Mm {
                     page.source = Arc::downgrade(range.data());
                 }
             }
-            let needed = child.table.lock().table.needed_tables(address);
+            let mut needed = child.table.lock().table.needed_tables(address);
             let mut prepared = PreparedTables::try_new(needed)?;
-            {
+            let file = match &page.backing {
+                ResidentBacking::File(folio) => Some(folio.clone()),
+                ResidentBacking::Anonymous(_) => None,
+            };
+            let content = file.as_ref().map(|folio| folio.lock_content());
+            if let Some(content) = &content {
+                let data = vma
+                    .file_range
+                    .as_ref()
+                    .expect("fork file page lacks source")
+                    .data();
+                let offset = data
+                    .offset
+                    .checked_add((address - data.range.start) as u64)
+                    .ok_or(VmError::InvalidRange)?;
+                if !data
+                    .inode
+                    .mapping()
+                    .is_canonical(offset / PAGE_SIZE as u64, content.folio())
+                    || data.inode.metadata_snapshot().map_err(VmError::File)?.size <= offset
+                {
+                    continue;
+                }
+                content
+                    .range_ready(0, PAGE_SIZE)
+                    .map_err(|error| VmError::File(error.into()))?;
+            }
+            loop {
+                let ranges = vma
+                    .file_range
+                    .as_ref()
+                    .map(|range| range.data().inode.mapping().lock_ranges());
+                let parent = self.table.lock();
+                let physical = page.backing.physical();
+                if !parent.pages.find(address).is_some_and(|resident| {
+                    resident.backing.physical() == physical && resident.source.as_ptr() == source
+                }) || !parent
+                    .table
+                    .lookup(address)
+                    .is_some_and(|leaf| leaf.physical == physical)
+                {
+                    break;
+                }
                 let mut state = child.table.lock();
-                // SAFETY: child 尚不可见，父 mmap 写侧保证共享责任稳定；引用已克隆且
-                // 完整初始化，子私有叶只读，表页锁外准备，同一短锁移入驻留拥有。
+                let current = state.table.needed_tables(address);
+                if needed < current {
+                    drop(state);
+                    drop(parent);
+                    drop(ranges);
+                    needed = current;
+                    prepared = PreparedTables::try_new(needed)?;
+                    continue;
+                }
+                // SAFETY: 原文件范围锁串行全部范围撤叶与子叶提交；父 PTE 锁重核当前来源/PFN，
+                // child 尚不可运行，已初始化原页引用保活，子私有叶只读，表页锁外准备。
                 let old = unsafe {
                     state.table.map(
                         address,
-                        page.backing.physical(),
+                        physical,
                         page.permissions(vma.permissions),
                         &mut prepared,
                     )
                 }?;
                 assert!(old.is_none());
                 state.pages.push(page);
+                break;
             }
+            drop(content);
             drop(prepared);
         }
         for &address in &addresses {
@@ -1217,7 +1447,7 @@ impl Mm {
         mmap.check_protection(&range, permissions)?;
         let vmas = mmap.rewrite(&range, Some(permissions))?;
         let addresses = self.resident_addresses(&range)?;
-        let old_vmas = self.publish_vmas(&mut mmap, vmas)?;
+        let old_vmas = self.publish_vmas(&mut mmap, vmas, None)?;
         for &address in &addresses {
             let vma = mmap.find(address).expect("protected resident has no VMA");
             let mut state = self.table.lock();
@@ -1256,20 +1486,25 @@ impl Mm {
         }
         let range = vma.range.clone();
         let vmas = mmap.replacement(&range, Some(vma))?;
-        self.publish_vmas(mmap, vmas)
+        self.publish_vmas(mmap, vmas, None)
     }
 
-    /// mmap 写侧统一发表新范围身份；PTE 锁只移出 Weak，最后释放均交回锁外调用者。
+    /// mmap 写侧预备保留叶的来源清单，再以原范围锁→PTE 换身份；待摘叶保旧来源直到撤叶/CSD。
     fn publish_vmas(
         &self,
         mmap: &mut MmapState,
         vmas: Vec<Arc<Vma>>,
+        retiring: Option<&Range<usize>>,
     ) -> Result<RetiredVmas, VmError> {
         let count = {
             let state = self.table.lock();
             let mut cursor = state.pages.head.as_deref();
             let mut count = 0;
             while let Some(page) = cursor {
+                if retiring.is_some_and(|range| range.contains(&page.address)) {
+                    cursor = page.next.as_deref();
+                    continue;
+                }
                 let after = vmas.partition_point(|vma| vma.range.start <= page.address);
                 let next = after
                     .checked_sub(1)
@@ -1287,32 +1522,56 @@ impl Mm {
         sources
             .try_reserve_exact(count)
             .map_err(|_| VmError::NoMemory)?;
-        let old = core::mem::replace(&mut mmap.vmas, vmas);
-        let mut changed = false;
         {
-            let mut state = self.table.lock();
-            let PteState { table, pages } = &mut *state;
-            let mut cursor = pages.head.as_deref_mut();
+            let state = self.table.lock();
+            let mut cursor = state.pages.head.as_deref();
             while let Some(page) = cursor {
-                let next = mmap
-                    .find(page.address)
+                if retiring.is_some_and(|range| range.contains(&page.address)) {
+                    cursor = page.next.as_deref();
+                    continue;
+                }
+                let after = vmas.partition_point(|vma| vma.range.start <= page.address);
+                let next = after
+                    .checked_sub(1)
+                    .and_then(|index| vmas.get(index))
+                    .filter(|vma| page.address < vma.range.end)
                     .and_then(|vma| vma.file_range.as_ref());
                 let pointer =
                     next.map_or_else(|| Weak::new().as_ptr(), |range| Arc::as_ptr(range.data()));
                 if page.source.as_ptr() != pointer {
-                    if matches!(&page.backing, ResidentBacking::File(_)) {
-                        // SAFETY: 此短锁核实驻留 PFN；新来源身份不能继承旧共享 W，
-                        // 旧页一直保活，同 PFN 撤权后在短锁外同步全部 CPU。
-                        changed |= unsafe { table.mkclean(page.address, page.backing.physical()) }
-                            .is_some_and(|(_, changed)| changed);
-                    }
-                    let next = next.map_or_else(Weak::new, |range| Arc::downgrade(range.data()));
-                    let previous = core::mem::replace(&mut page.source, next);
                     assert!(sources.len() < sources.capacity());
-                    sources.push(previous);
+                    sources.push((page.address, page.source.clone()));
                 }
-                cursor = page.next.as_deref_mut();
+                cursor = page.next.as_deref();
             }
+        }
+        let old = core::mem::replace(&mut mmap.vmas, vmas);
+        let mut changed = false;
+        for (address, saved) in &mut sources {
+            let source = saved.upgrade();
+            let previous = {
+                let _ranges = source
+                    .as_ref()
+                    .map(|data| data.inode.mapping().lock_ranges());
+                let mut state = self.table.lock();
+                let PteState { table, pages } = &mut *state;
+                let Some(page) = pages.find_mut(*address) else {
+                    continue;
+                };
+                if page.source.as_ptr() != saved.as_ptr() {
+                    continue;
+                }
+                let next = mmap.find(*address).and_then(|vma| vma.file_range.as_ref());
+                if matches!(&page.backing, ResidentBacking::File(_)) {
+                    // SAFETY: 原范围锁排除全范围失效，PTE 短锁核驻留 PFN；来源换身份不继承 W。
+                    // 原页保活，全部改权在短锁外真实 CSD 后完成，Weak 不在此锁析构。
+                    changed |= unsafe { table.mkclean(*address, page.backing.physical()) }
+                        .is_some_and(|(_, changed)| changed);
+                }
+                let next = next.map_or_else(Weak::new, |range| Arc::downgrade(range.data()));
+                core::mem::replace(&mut page.source, next)
+            };
+            *saved = previous;
         }
         if changed {
             sync_all();
@@ -1325,30 +1584,33 @@ impl Mm {
         mmap: &mut MmapState,
         range: &Range<usize>,
         replacement: Option<Arc<Vma>>,
-    ) -> Result<(RetiredVmas, ResidentPages, Vec<RetiredTables>), VmError> {
+    ) -> Result<(RetiredVmas, ResidentPages, RetiredTables), VmError> {
         let vmas = mmap.replacement(range, replacement)?;
         let addresses = self.resident_addresses(range)?;
-        let mut tables = Vec::new();
-        tables
-            .try_reserve_exact(addresses.len())
-            .map_err(|_| VmError::NoMemory)?;
+        let mut tables = RetiredTables::default();
         let mut discarded = ResidentPages::default();
-        let old_vmas = self.publish_vmas(mmap, vmas)?;
+        let old_vmas = self.publish_vmas(mmap, vmas, Some(range))?;
+        #[cfg(feature = "ktest")]
+        {
+            let hook = self.vma_unmap_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(range.start, range.end);
+            }
+        }
         for address in addresses.iter().copied() {
             let retired = {
                 let mut state = self.table.lock();
-                let page = state
-                    .pages
-                    .remove(address)
-                    .expect("unmap resident disappeared");
-                // SAFETY: 写侧阻止叶与目录提交，具体退休链保活全部旧页；
-                // 摘取表页仅移入已足额预留的容器，归还晚于全部 CPU 翻译与取指失效。
+                let Some(page) = state.pages.remove(address) else {
+                    continue;
+                };
+                // SAFETY: mmap 写侧阻止新叶提交，PTE 短锁核真实驻留；并发文件失效已移出的页跳过。
+                // 原页和表页只移入各自原退休链，全部 CPU 翻译与目录遍历失效后才归还。
                 let (old, retired) = unsafe { state.table.unmap(address) };
                 assert_eq!(old.unwrap().physical, page.backing.physical());
                 discarded.push(page);
                 retired
             };
-            tables.push(retired);
+            tables.append(retired);
         }
         if !addresses.is_empty() {
             sync_all();
@@ -1356,7 +1618,7 @@ impl Mm {
         Ok((old_vmas, discarded, tables))
     }
 
-    /// 写侧保证驻留数量稳定，在 PTE 锁外预留容器，短锁只复制实际 VA 标识。
+    /// mmap 写侧阻止新增驻留，以当前数量预留上界；文件范围失效可并发减少实际页数。
     fn resident_addresses(&self, range: &Range<usize>) -> Result<Vec<usize>, VmError> {
         let count = self.table.lock().pages.count(range);
         let mut addresses = Vec::new();
@@ -1395,19 +1657,19 @@ impl Mm {
     }
 }
 
-/// 连同具体驻留节点和缺失目录完成锁外准备，准备失败也须先重查当前 VMA/PTE。
+/// 锁外准备驻留节点、目录及原文件来源；匿名候选仍保源 folio，提交时同内容锁核 canonical 和 EOF。
 fn prepare_fault(
     source: &FaultSource,
     base: usize,
     access: UserAccess,
-) -> Result<(Box<ResidentPage>, PreparedTables), VmError> {
-    let (backing, cow) = prepare_backing(source, base, access)?;
+) -> Result<(Box<ResidentPage>, PreparedTables, Option<FolioRef>), VmError> {
+    let (backing, cow, file) = prepare_backing(source, base, access)?;
     let mut page = ResidentPage::try_new(base, backing, cow)?;
     if let Some(range) = &source.vma.file_range {
         page.source = Arc::downgrade(range.data());
     }
     let tables = PreparedTables::try_new(source.needed)?;
-    Ok((page, tables))
+    Ok((page, tables, file))
 }
 
 /// 锁外准备具体驻留拥有；共享文件尾页保 canonical folio，私有 COW 不按引用数猜独占性。
@@ -1415,10 +1677,11 @@ fn prepare_backing(
     source: &FaultSource,
     base: usize,
     access: UserAccess,
-) -> Result<(ResidentBacking, bool), VmError> {
+) -> Result<(ResidentBacking, bool, Option<FolioRef>), VmError> {
     if let Some(backing) = &source.backing {
         // ponytail: 私有 COW 总复制一页；有实际映射独占证明后才考虑原页复用。
         let page = AnonPageRef::try_new().ok_or(VmError::NoMemory)?;
+        let mut file = None;
         match backing {
             ResidentBacking::Anonymous(source) => {
                 // SAFETY: source 克隆保活完整初始化原页，旧 COW 叶无硬件写权限；
@@ -1442,14 +1705,16 @@ fn prepare_backing(
                 folio
                     .copy_to(0, dst)
                     .map_err(|error| VmError::File(error.into()))?;
+                file = Some(folio.clone());
             }
         }
-        return Ok((ResidentBacking::Anonymous(page), false));
+        return Ok((ResidentBacking::Anonymous(page), false, file));
     }
     match &source.vma.backing {
         VmaBacking::Anonymous => Ok((
             ResidentBacking::Anonymous(AnonPageRef::try_new().ok_or(VmError::NoMemory)?),
             false,
+            None,
         )),
         VmaBacking::SharedAnonymous { owner, offset } => {
             let offset = offset
@@ -1458,6 +1723,7 @@ fn prepare_backing(
             Ok((
                 ResidentBacking::Anonymous(owner.page(offset / PAGE_SIZE as u64)?),
                 false,
+                None,
             ))
         }
         VmaBacking::File {
@@ -1481,7 +1747,7 @@ fn prepare_backing(
                     .lock_content()
                     .range_ready(0, PAGE_SIZE)
                     .map_err(|error| VmError::File(error.into()))?;
-                return Ok((ResidentBacking::File(folio), *private));
+                return Ok((ResidentBacking::File(folio.clone()), *private, Some(folio)));
             }
             let page = AnonPageRef::try_new().ok_or(VmError::NoMemory)?;
             // SAFETY: 新匿名页已完整清零，只有本地 page 引用，尚无映射、设备或其他访问；
@@ -1491,7 +1757,7 @@ fn prepare_backing(
             folio
                 .copy_to(0, dst)
                 .map_err(|error| VmError::File(error.into()))?;
-            Ok((ResidentBacking::Anonymous(page), false))
+            Ok((ResidentBacking::Anonymous(page), false, Some(folio)))
         }
     }
 }

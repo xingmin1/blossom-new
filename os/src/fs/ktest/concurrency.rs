@@ -227,11 +227,6 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
         if checksum { b"deep" } else { b"pattern" },
     )?;
     let page = if checksum { 0 } else { 3 };
-    let (folio, read) = inode
-        .mapping()
-        .get_or_prepare(page)
-        .map_err(|_| TestError("error page owner preparation failed"))?;
-    let read = read.ok_or(TestError("error page unexpected preexisting loader"))?;
     fixture
         .observer()
         .hold_loader
@@ -241,10 +236,16 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
         Job::Fill {
             inode: inode.clone(),
             page,
-            read,
-            folio: folio.clone(),
         },
     );
+    until("format error unique page loader did not pause", || {
+        fixture.observer().loader_entered.load(Ordering::Acquire) == 1
+    })?;
+    let (folio, read) = inode
+        .mapping()
+        .get_or_prepare(page)
+        .map_err(|_| TestError("error page owner preparation failed"))?;
+    context.expect_eq(read.is_none(), true);
     for index in 1..3 {
         fixture.publish(
             index,
@@ -329,12 +330,6 @@ pub(crate) mod file_loading {
         let volume = fixture.open(context)?;
         let inode = fixture.file(context, &volume, b"deep")?;
         let bs = volume.geometry().block_size;
-        let (folio, read) = inode
-            .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("segmented page preparation failed"))?;
-        let read = read.ok_or(TestError("segmented page unexpected old loader"))?;
-        let address = folio.phys_addr();
         let observer = fixture.observer().clone();
         let hook: Arc<dyn Fn(u64, usize) + Send + Sync> = Arc::try_new(move |page, end| {
             if page == 0 && end == bs && !observer.cancelled.load(Ordering::Acquire) {
@@ -349,13 +344,17 @@ pub(crate) mod file_loading {
             Job::Fill {
                 inode: inode.clone(),
                 page: 0,
-                read,
-                folio: folio.clone(),
             },
         );
         until("segment did not return original read from real IO", || {
             fixture.observer().loader_entered.load(Ordering::Acquire) == 1
         })?;
+        let (folio, read) = inode
+            .mapping()
+            .get_or_prepare(0)
+            .map_err(|_| TestError("segmented page preparation failed"))?;
+        context.expect_eq(read.is_none(), true);
+        let address = folio.phys_addr();
         let (same, read) = inode
             .mapping()
             .get_or_prepare(0)

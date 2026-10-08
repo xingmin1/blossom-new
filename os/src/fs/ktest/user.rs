@@ -335,11 +335,14 @@ impl UserOwner {
                 .resolve(self.path.context(), b"/test/data.bin", ResolveMode::Follow),
         )?;
         let inode = checked(context, path.inode())?.clone();
+        let invalidate = checked(context, inode.lock_invalidate())?;
         let (folio, read) = checked(
             context,
             inode.mapping().get_or_prepare(0).map_err(FsError::Io),
         )?;
-        let read = read.ok_or(TestError("fresh canonical file page already filled"))?;
+        let read = read
+            .ok_or(TestError("fresh canonical file page already filled"))?
+            .with_file_owner(inode.clone());
         self.warm_signal_program(context)?;
         let image = self.load_named(context, b"/test/bin/user-signal", b"r")?;
         #[cfg(target_arch = "riscv64")]
@@ -379,13 +382,9 @@ impl UserOwner {
             signals.interruption_pending(crate::wait::WaitMode::Interruptible),
             true,
         );
-        checked(
-            context,
-            inode.with_map_read(|metadata, root| {
-                inode.filesystem().fill_page(metadata, root, 0, read)
-            }),
-        )?;
+        checked(context, fill_file_page(&inode, 0, read, &invalidate))?;
         checked(context, folio.wait_ready().map_err(FsError::Io))?;
+        drop(invalidate);
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         self.reap_children(context, false)?;

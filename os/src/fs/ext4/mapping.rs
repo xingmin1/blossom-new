@@ -3,10 +3,10 @@
 use crate::cache::BufferRef;
 use crate::fs::ext4::allocation::DetachedBlock;
 use crate::fs::ext4::codec::{self, EXTENTS};
-use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData, UnpublishedBlock};
+use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData, InodeKind, UnpublishedBlock};
 use crate::fs::FsError;
 use alloc::vec::Vec;
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 
 #[derive(Clone, Copy)]
 enum Step {
@@ -303,6 +303,9 @@ impl PreparedMapping {
         }
         while let Some(block) = self.allocated.pop() {
             block.publish();
+        }
+        for block in &mut self.retired {
+            block.arm_release();
         }
         self.retired
     }
@@ -886,6 +889,350 @@ fn prepare_indirect(
             .push((parent, offsets[missing] * 4, next, false));
     } else {
         codec::put32(&mut prepared.root, offsets[0] * 4, next);
+    }
+    Ok(())
+}
+
+/// 截断只预备原树的尾部字段和释放窗口，失败或取消不会修改已发表的块树与位图。
+pub(crate) struct PreparedTruncate {
+    pub root: [u8; 60],
+    /// 实际摘离的文件系统块数，包括 initialized、unwritten 数据与外部树节点。
+    pub removed_blocks: u64,
+    retired: Vec<DetachedBlock>,
+    nodes: Vec<NodeEdit>,
+    indirect: Vec<(BufferRef, usize)>,
+}
+
+impl PreparedTruncate {
+    /// 调用者保持 inode 根写侧并已准备本记录；这里只修改当前节点字段，不分配或读盘。
+    /// 返回的窗口仍未归还位图，须在旧数据与元数据 I/O、别名使用全部结束后消费。
+    pub(crate) fn publish(mut self, volume: &Ext4Volume, seed: u32) -> Vec<DetachedBlock> {
+        for node in &self.nodes {
+            node.buffer
+                .as_ref()
+                .expect("external truncate node")
+                .update(volume.claim(), |bytes| {
+                    patch_node(volume.geometry(), bytes, node, seed)
+                })
+                .expect("prepared writable truncate extent");
+        }
+        for (buffer, first) in &self.indirect {
+            buffer
+                .update(volume.claim(), |bytes| bytes[*first * 4..].fill(0))
+                .expect("prepared writable truncate indirect");
+        }
+        for block in &mut self.retired {
+            block.arm_release();
+        }
+        self.retired
+    }
+}
+
+/// 在 inode 写序列化与根保护下预备字节 EOF 后的全部块；块内部分尾保留给页截断处理。
+/// 增长只保留原根；所有可失败的窗口和容量申请均在任何共同树字段修改之前完成。
+pub(crate) fn prepare_truncate(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    new_size: u64,
+) -> Result<PreparedTruncate, FsError> {
+    volume.require_write(volume.claim())?;
+    let g = volume.geometry();
+    let limit = if inode.flags & EXTENTS != 0 {
+        1u64 << 32
+    } else {
+        let n = (g.block_size / 4) as u64;
+        12 + n + n * n + n * n * n
+    };
+    let keep = codec::ceil_div(new_size, g.block_size as u64)?;
+    if limit < keep {
+        return Err(FsError::FileTooLarge);
+    }
+    let mut prepared = PreparedTruncate {
+        root: inode.block,
+        removed_blocks: 0,
+        retired: Vec::new(),
+        nodes: Vec::new(),
+        indirect: Vec::new(),
+    };
+    if inode.fast_symlink || inode.kind == InodeKind::Other {
+        if new_size != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        prepared.root.fill(0);
+        if inode.flags & EXTENTS != 0 {
+            codec::put16(&mut prepared.root, 0, 0xf30a);
+            codec::put16(&mut prepared.root, 4, 4);
+        }
+    } else if new_size <= inode.size {
+        validate_root(g, inode)?;
+        if inode.flags & EXTENTS != 0 {
+            prepare_extent_truncate(volume, inode, keep, &mut prepared)?;
+        } else {
+            prepare_indirect_truncate(volume, inode, keep, &mut prepared)?;
+        }
+    }
+    prepared.removed_blocks = prepared.retired.len() as u64;
+    Ok(prepared)
+}
+
+/// 数据块只保原位图与已缓存物理别名，不为删除读入文件数据或改动分配状态。
+fn retire_data(
+    volume: &Ext4Volume,
+    physical: u64,
+    count: u64,
+    prepared: &mut PreparedTruncate,
+) -> Result<(), FsError> {
+    prepared
+        .retired
+        .try_reserve(usize::try_from(count).map_err(|_| FsError::NoMemory)?)
+        .map_err(|_| FsError::NoMemory)?;
+    for block in physical..physical + count {
+        prepared
+            .retired
+            .push(volume.prepare_detached_data_block(block)?);
+    }
+    Ok(())
+}
+
+/// 外部树节点只在确认从准备根不可寻址后登记，准备计划析构仍只放窗口引用。
+fn retire_node(
+    volume: &Ext4Volume,
+    physical: u64,
+    prepared: &mut PreparedTruncate,
+) -> Result<(), FsError> {
+    prepared
+        .retired
+        .try_reserve(1)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .retired
+        .push(volume.prepare_detached_block(physical)?);
+    Ok(())
+}
+
+/// 在共同内容借用外申请条目容量，读取时沿原 extent 格式校验深度、父边界与 CRC。
+fn load_truncate_extent(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    physical: u64,
+    depth: u16,
+    low: u64,
+    high: u64,
+) -> Result<NodeEdit, FsError> {
+    let g = volume.geometry();
+    let entries = entry_storage((g.block_size - 12) / 12)?;
+    let buffer = volume.metadata_block(physical)?;
+    let mut node = buffer.with_read(|bytes| {
+        extent_step(g, inode, bytes, low, Some(depth), Some(low), high)?;
+        read_node(bytes, entries)
+    })??;
+    node.buffer = Some(buffer);
+    node.physical = physical;
+    Ok(node)
+}
+
+/// 从右向左缩短叶尾并逐级摘空索引；只保留仍可寻址且确实变化的外部节点字段。
+fn truncate_extent_node(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    node: &mut NodeEdit,
+    keep: u64,
+    mut high: u64,
+    prepared: &mut PreparedTruncate,
+) -> Result<(), FsError> {
+    if node.depth == 0 {
+        while let Some(entry) = node.entries.last().copied() {
+            let start = entry_key(&entry);
+            let (physical, len, unwritten) = leaf_fields(&entry)?;
+            if start + len <= keep {
+                break;
+            }
+            let remaining = keep.saturating_sub(start).min(len);
+            retire_data(volume, physical + remaining, len - remaining, prepared)?;
+            if remaining == 0 {
+                node.entries.pop();
+            } else {
+                let slot = node.entries.len() - 1;
+                node.entries[slot] = leaf_entry(start, physical, remaining, unwritten);
+            }
+            node.dirty = true;
+        }
+        return Ok(());
+    }
+    while let Some(entry) = node.entries.last().copied() {
+        if high <= keep {
+            break;
+        }
+        let low = entry_key(&entry);
+        let physical = index_physical(&entry);
+        let mut child = load_truncate_extent(volume, inode, physical, node.depth - 1, low, high)?;
+        truncate_extent_node(volume, inode, &mut child, keep, high, prepared)?;
+        if child.entries.is_empty() {
+            retire_node(volume, physical, prepared)?;
+            node.entries.pop();
+            node.dirty = true;
+            high = low;
+        } else {
+            if child.dirty {
+                prepared
+                    .nodes
+                    .try_reserve(1)
+                    .map_err(|_| FsError::NoMemory)?;
+                prepared.nodes.push(child);
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// 空树恢复 inline 叶根；单子节点四项内逐级降深，不申请新磁盘块。
+fn prepare_extent_truncate(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    keep: u64,
+    prepared: &mut PreparedTruncate,
+) -> Result<(), FsError> {
+    let mut root = read_node(&inode.block, entry_storage(4)?)?;
+    truncate_extent_node(volume, inode, &mut root, keep, 1u64 << 32, prepared)?;
+    if root.entries.is_empty() {
+        root.depth = 0;
+        root.max = 4;
+    }
+    while root.depth != 0 && root.entries.len() == 1 {
+        let entry = root.entries[0];
+        let physical = index_physical(&entry);
+        let staged = prepared
+            .nodes
+            .iter()
+            .position(|node| node.physical == physical);
+        let child = if let Some(index) = staged {
+            if 4 < prepared.nodes[index].entries.len() {
+                break;
+            }
+            prepared.nodes.remove(index)
+        } else {
+            let child = load_truncate_extent(
+                volume,
+                inode,
+                physical,
+                root.depth - 1,
+                entry_key(&entry),
+                1u64 << 32,
+            )?;
+            if 4 < child.entries.len() {
+                break;
+            }
+            child
+        };
+        retire_node(volume, physical, prepared)?;
+        root.entries.clear();
+        for entry in child.entries {
+            root.entries.push(entry);
+        }
+        root.depth = child.depth;
+        root.max = 4;
+    }
+    patch_node(
+        volume.geometry(),
+        &mut prepared.root,
+        &root,
+        inode.checksum_seed,
+    );
+    Ok(())
+}
+
+/// 读取间接节点的指针字段到固定栈空间，内容锁内只解码和检查物理范围。
+fn read_truncate_indirect(
+    g: &Geometry,
+    bytes: &[u8],
+    pointers: &mut [u32; 1024],
+) -> Result<(), FsError> {
+    for (index, pointer) in pointers[..g.block_size / 4].iter_mut().enumerate() {
+        *pointer = codec::le32(bytes, index * 4)?;
+        if *pointer != 0 {
+            g.validate_blocks(u64::from(*pointer), 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// 传统树从尾部向上预备释放；剩余节点只记录要清零的指针后缀，不发表旧块快照。
+fn truncate_indirect_node(
+    volume: &Ext4Volume,
+    physical: u64,
+    depth: usize,
+    low: u64,
+    keep: u64,
+    prepared: &mut PreparedTruncate,
+) -> Result<bool, FsError> {
+    let g = volume.geometry();
+    let n = g.block_size / 4;
+    let span = (n as u64).pow((depth - 1) as u32);
+    let buffer = volume.metadata_block(physical)?;
+    let mut pointers = [0u32; 1024];
+    buffer.with_read(|bytes| read_truncate_indirect(g, bytes, &mut pointers))??;
+    let mut first = n;
+    for index in (0..n).rev() {
+        let start = low + index as u64 * span;
+        if start + span <= keep {
+            break;
+        }
+        let child = u64::from(pointers[index]);
+        if child == 0 {
+            continue;
+        }
+        let empty = if depth == 1 {
+            retire_data(volume, child, 1, prepared)?;
+            true
+        } else {
+            truncate_indirect_node(volume, child, depth - 1, start, keep, prepared)?
+        };
+        if empty {
+            pointers[index] = 0;
+            first = index;
+        }
+    }
+    let empty = pointers[..n].iter().all(|pointer| *pointer == 0);
+    if empty {
+        retire_node(volume, physical, prepared)?;
+    } else if first < n {
+        prepared
+            .indirect
+            .try_reserve(1)
+            .map_err(|_| FsError::NoMemory)?;
+        prepared.indirect.push((buffer, first));
+    }
+    Ok(empty)
+}
+
+/// 先处理 direct 尾指针，再按各层逻辑跨度处理 single、double、triple 和空根。
+fn prepare_indirect_truncate(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    keep: u64,
+    prepared: &mut PreparedTruncate,
+) -> Result<(), FsError> {
+    for slot in (keep.min(12) as usize..12).rev() {
+        let physical = u64::from(codec::le32(&inode.block, slot * 4)?);
+        if physical != 0 {
+            retire_data(volume, physical, 1, prepared)?;
+            codec::put32(&mut prepared.root, slot * 4, 0);
+        }
+    }
+    let n = (volume.geometry().block_size / 4) as u64;
+    let mut low = 12;
+    let mut span = n;
+    for depth in 1..=3 {
+        let physical = u64::from(codec::le32(&inode.block, (11 + depth) * 4)?);
+        if keep < low + span
+            && physical != 0
+            && truncate_indirect_node(volume, physical, depth, low, keep, prepared)?
+        {
+            codec::put32(&mut prepared.root, (11 + depth) * 4, 0);
+        }
+        low += span;
+        span *= n;
     }
     Ok(())
 }

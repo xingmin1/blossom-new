@@ -147,6 +147,8 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         23 => file::dup(user, raw[0]),
         24 => file::dup3(user, raw),
         25 => file::fcntl(user, raw),
+        45 => file::truncate(user, raw),
+        46 => file::ftruncate(user, raw),
         49 => file::chdir(user, raw[0]),
         56 => file::openat(user, raw),
         57 => file::close(user, raw[0]),

@@ -254,6 +254,9 @@ pub trait FileLike: Send + Sync {
     /// 只改变支持的可变状态位，不修改访问模式与打开时路径约束。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError>;
 
+    /// 在表锁与共享位置锁外截断普通可写文件，保持原位置；本操作可能等待真实 I/O。
+    fn truncate(&self, new_size: u64) -> Result<(), FsError>;
+
     /// 同步半开字节范围及其必要元数据和设备缓存，并推进原 OFD 的错误观察游标。
     /// 调用者不得持描述符表、位置、inode 写锁或 mmap/PTE 保护；本操作可能等待真实 I/O。
     fn sync_range(&self, range: Range<u64>, data_only: bool) -> Result<(), FsError>;
@@ -316,7 +319,8 @@ pub fn open_path(path: Path) -> Result<FileRef, FsError> {
     open_path_with_flags(path, 0)
 }
 
-/// 按真实访问模式建立 OFD，同步状态固定于打开实例，修改名字与截断仍明确拒绝。
+/// 按真实访问模式建立完整 OFD 后截断；只读截断的临时写拥有不转移到打开实例。
+/// 需要发表描述符的调用者须先预留槽位，截断之后不再申请 OFD 存储。
 pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
     let access = flags & O_ACCMODE;
     if access == O_ACCMODE {
@@ -342,27 +346,40 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
     }
     match kind {
         InodeKind::Regular => {
-            let write_access = if access != 0 || flags & O_TRUNC != 0 {
+            let mut write_access = if access != 0 || flags & O_TRUNC != 0 {
                 Some(inode.acquire_write()?)
             } else {
                 None
             };
-            // 截断先经过写排斥检查，不能将活映像的 ETXTBSY 掩盖成未实现。
-            if flags & (O_CREAT | O_TRUNC) != 0 {
+            if flags & O_CREAT != 0 {
                 return Err(FsError::Unsupported);
             }
             let wb_errors = (
                 inode.mapping().sample_wb_error(),
                 inode.filesystem().metadata_cache().sample_wb_error(),
             );
-            Ok(Arc::try_new(InodeFile {
+            let file = Arc::try_new(InodeFile {
                 path,
                 cursor: SleepMutex::new(0),
-                flags: AtomicU32::new(flags),
-                write_access,
+                flags: AtomicU32::new(flags & !O_TRUNC),
+                write_access: if access != 0 {
+                    write_access.take()
+                } else {
+                    None
+                },
                 wb_errors: SpinLock::new(wb_errors),
             })
-            .map_err(|_| FsError::NoMemory)?)
+            .map_err(|_| FsError::NoMemory)?;
+            // 完整 OFD 已分配，截断后只交出原拥有，描述符调用者再消费预留槽位。
+            if flags & O_TRUNC != 0 {
+                let access = file
+                    .write_access
+                    .as_ref()
+                    .or(write_access.as_ref())
+                    .expect("truncating open has no write access");
+                access.truncate(file.path.inode()?.filesystem().claim(), 0)?;
+            }
+            Ok(file)
         }
         InodeKind::Directory => {
             if access != 0 || flags & O_TRUNC != 0 {
@@ -415,6 +432,20 @@ impl FileLike for InodeFile {
     /// 更新同一 OFD 的可变状态，dup 的所有引用观察相同状态。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 借用此 OFD 的原写拥有改变文件大小，不重新检查当前凭据、不消费位置或追加状态。
+    fn truncate(&self, new_size: u64) -> Result<(), FsError> {
+        if self.flags() & O_ACCMODE == 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        self.path.check_writable()?;
+        let inode = self.path.inode()?;
+        let access = self
+            .write_access
+            .as_ref()
+            .expect("writable OFD has no write access");
+        access.truncate(inode.filesystem().claim(), new_size)
     }
 
     /// 在所有写入与位置保护之外同步实际范围，直接错误优先于后续阶段，样本仍全部推进。
@@ -574,6 +605,11 @@ impl FileLike for DirectoryFile {
     /// 目录状态与描述符属性分离，不改变枚举位置。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 目录描述符不提供普通文件截断，错误不改变枚举位置。
+    fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
     }
 
     /// 目录同步沿其真实共同元数据与 FLUSH，不取得枚举位置锁或虚构名字创建依赖。

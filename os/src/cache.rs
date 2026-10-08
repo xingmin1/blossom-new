@@ -11,9 +11,10 @@ use crate::block::{AccessMode, BlockError, FsClaim, SECTOR_BYTES};
 use crate::fs::ext4::Ext4Volume;
 use crate::fs::{FsError, InodeRef};
 use crate::mm::folio::FolioContent;
-use crate::mm::space::{sync_all, PteDomain};
+use crate::mm::space::{sync_all, PteDomain, ResidentPages};
+use crate::mm::user_table::RetiredTables;
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
-use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock, SpinLockGuard};
 use index::{Node, Tree};
 
 /// 内容状态从节点自己的 folio 读取；ToWrite 只标记本轮选中的原节点。
@@ -399,6 +400,26 @@ impl MetadataCache {
         })
     }
 
+    /// 只取得已经存在的准确物理窗口，不填充、读盘或申请节点；有效性由使用者另行检查。
+    pub(crate) fn cached_buffer(
+        self: &Arc<Self>,
+        block: u64,
+        block_size: usize,
+    ) -> Result<Option<BufferRef>, BlockError> {
+        let (byte, offset) = self.block_range(block, block_size)?;
+        let folio = {
+            let entries = self.index.entries.lock();
+            entries
+                .get(byte - offset as u64)
+                .map(|node| node.folio.clone())
+        };
+        Ok(folio.map(|folio| BufferRef {
+            folio: folio.with_metadata_owner(self.clone()),
+            offset,
+            len: block_size,
+        }))
+    }
+
     /// 在发表候选前解释块几何、设备容量和准确页内范围。
     fn block_range(&self, block: u64, block_size: usize) -> Result<(u64, usize), BlockError> {
         if !matches!(block_size, 1024 | 2048 | 4096) {
@@ -667,12 +688,22 @@ impl Drop for FileRangeRegistration {
     }
 }
 
+/// 文件范围失效的真实同步边界；两处观察均仍保有原退休页及表页。
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileUnmapPhase {
+    BeforeSync,
+    AfterSync,
+}
+
 /// canonical inode 的稀疏页与弱文件范围索引；来源独立于当前驻留 backing。
 pub struct FileMapping {
     index: FolioIndex,
     ranges: SpinLock<Vec<((u64, usize), Weak<FileRangeData>)>>,
     writeback: SleepMutex<()>,
     wb_error: SpinLock<WritebackError>,
+    #[cfg(feature = "ktest")]
+    unmap_hook: SpinLock<Option<Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>>>,
 }
 
 impl FileMapping {
@@ -720,6 +751,8 @@ impl FileMapping {
             ranges: SpinLock::new(Vec::new()),
             writeback: SleepMutex::new(()),
             wb_error: SpinLock::new(WritebackError::new()),
+            #[cfg(feature = "ktest")]
+            unmap_hook: SpinLock::new(None),
         }
     }
 
@@ -733,6 +766,16 @@ impl FileMapping {
         self.index.get_or_prepare(index)
     }
 
+    /// 只取得原索引已有页，不填充、读盘或申请节点；调用者保原 inode 到内容检查结束。
+    /// 返回引用不附 inode，不能脱离该来源保护交给外部使用者或设备。
+    pub(crate) fn cached_folio(&self, index: u64) -> Option<FolioRef> {
+        self.index
+            .entries
+            .lock()
+            .get(index)
+            .map(|node| node.folio.clone())
+    }
+
     /// 短索引锁只核现有节点的原页身份，不增加 folio 引用或建立第二页缓存。
     pub(crate) fn is_canonical(&self, index: u64, folio: &FolioRef) -> bool {
         self.index
@@ -740,6 +783,162 @@ impl FileMapping {
             .lock()
             .get(index)
             .is_some_and(|node| node.folio.phys_addr() == folio.phys_addr())
+    }
+
+    /// 与全范围失效串行来源换身份及 fork 叶提交；持此 guard 时只允许原 PTE 短锁操作。
+    pub(crate) fn lock_ranges(
+        &self,
+    ) -> SpinLockGuard<'_, Vec<((u64, usize), Weak<FileRangeData>)>> {
+        self.ranges.lock()
+    }
+
+    /// 撤销文件字节半开范围所覆盖的当前叶，私有匿名 COW 由原文件来源定位。
+    /// 不改变 VMA，不取得 mmap；原页和表页统一在范围/PTE 锁外真实 CSD 后释放。
+    pub fn unmap_range(&self, range: Range<u64>, even_cows: bool) -> usize {
+        if range.end <= range.start {
+            return 0;
+        }
+        let mut pages = ResidentPages::default();
+        let mut tables = RetiredTables::default();
+        let mut unmapped = 0;
+        {
+            // ponytail: 同 inode 的短锁覆盖全范围撤叶；实际大映射延迟成为瓶颈时再调整范围锁协议。
+            let ranges = self.ranges.lock();
+            for ((offset, _), weak) in ranges.iter() {
+                if range.end <= *offset {
+                    break;
+                }
+                // SAFETY: 已登记的 Weak 由 FileRangeRegistration 的强 data 拥有支持；
+                // registration 必须先持本范围锁摘登记才析构 data，当前锁使其保持存活。
+                // 这里只借不可变来源，不增加或析构 Arc，域锁内只移动原退休拥有。
+                let data = unsafe { &*weak.as_ptr() };
+                // SAFETY: 同一范围锁保来源登记和 fork/换身份互斥；原退休页及表链在此处只接收拥有，
+                // 下方在全部范围/PTE 锁外完成真实 CSD 后才析构，不提前归还数据页或目录页。
+                unmapped += unsafe {
+                    data.domain
+                        .unmap_range(data, &range, even_cows, &mut pages, &mut tables)
+                };
+            }
+        }
+        #[cfg(feature = "ktest")]
+        let hook = self.unmap_hook.lock().clone();
+        #[cfg(feature = "ktest")]
+        if let Some(hook) = &hook {
+            hook(
+                FileUnmapPhase::BeforeSync,
+                pages.count(&(0..usize::MAX)),
+                tables.len(),
+            );
+        }
+        sync_all();
+        #[cfg(feature = "ktest")]
+        if let Some(hook) = &hook {
+            hook(
+                FileUnmapPhase::AfterSync,
+                pages.count(&(0..usize::MAX)),
+                tables.len(),
+            );
+        }
+        drop(pages);
+        drop(tables);
+        unmapped
+    }
+
+    /// 观察真实撤叶与 CSD 边界，callback 不改变叶或替代硬件同步；旧 callback 锁外释放。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_set_unmap_hook(
+        &self,
+        hook: Option<Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>>,
+    ) {
+        let previous = core::mem::replace(&mut *self.unmap_hook.lock(), hook);
+        drop(previous);
+    }
+
+    /// 在正式截断协议下摘除完整尾页并清零部分尾页，旧对象永不重新插回索引。
+    ///
+    /// # Safety
+    /// 调用者须持同 inode 写序列化、invalidate 独占及本 mapping 的 WB 互斥，
+    /// 已发表 new_size 且完成第一次完整尾范围 even_cows 撤叶/CSD，阻止新填充和 WB。
+    /// 原索引页属于本 inode；旧填充和真实 WB 的完成不得依赖调用者持有的锁。
+    /// 返回后仍须第二次 even_cows 撤叶/CSD，再结束旧块别名及设备使用并归还磁盘块；
+    /// 部分保留 FS 块的盘上尾零由文件系统负责，删除义务不能当作回写成功。
+    pub(crate) unsafe fn truncate_pages(
+        &self,
+        new_size: u64,
+        block_size: usize,
+    ) -> Result<(), FsError> {
+        if !matches!(block_size, 1024 | 2048 | 4096) {
+            return Err(FsError::InvalidOperation);
+        }
+        let first = new_size.div_ceil(PAGE_SIZE as u64);
+        loop {
+            let next = {
+                let entries = self.index.entries.lock();
+                entries
+                    .lower_bound(first)
+                    .map(|node| (node.key, node.folio.clone()))
+            };
+            let Some((index, folio)) = next else { break };
+            let mut content = folio.lock_content();
+            folio.wait_writeback();
+            let start = index
+                .checked_mul(PAGE_SIZE as u64)
+                .expect("file page offset overflow");
+            self.unmap_range(start..start.saturating_add(PAGE_SIZE as u64), false);
+            let detached = {
+                let mut entries = self.index.entries.lock();
+                assert!(
+                    entries
+                        .get(index)
+                        .is_some_and(|node| { node.folio.phys_addr() == folio.phys_addr() }),
+                    "truncate file page identity changed"
+                );
+                entries.remove(index).unwrap()
+            };
+            // SAFETY: 调用者阻止新填充/WB；内容锁已等唯一填充，真实 WB 已结束。
+            // 本原节点已摘索引，仍指本 folio 的文件叶已撤且 CSD 完成；
+            // 迟到候选同内容锁重核 canonical，私有匿名副本不再访问该原页。
+            unsafe { content.discard() };
+            drop(content);
+            drop(detached);
+            drop(folio);
+        }
+        let valid = (new_size % PAGE_SIZE as u64) as usize;
+        if valid == 0 {
+            return Ok(());
+        }
+        let index = new_size / PAGE_SIZE as u64;
+        let folio = {
+            let entries = self.index.entries.lock();
+            entries.get(index).map(|node| node.folio.clone())
+        };
+        if let Some(folio) = folio {
+            let mut content = folio.lock_content();
+            folio.wait_writeback();
+            self.mkclean(index, &folio, &mut content);
+            // SAFETY: 同 inode 写/invalidate/WB 保护来自调用者；原内容 guard 已等填充，
+            // 真实 WB 已结束，mkclean 在短锁外完成全部 CPU 写许可失效。
+            // 仅作废删除的整 FS 块，有效前缀及私有匿名页保持原内容。
+            unsafe { content.truncate_file_tail(valid, block_size) }?;
+            self.set_to_write(index, false);
+        }
+        Ok(())
+    }
+
+    /// 在 canonical 准入短锁内辨别纯缓存拥有，允许脏义务留给后续真实同步。
+    pub(crate) fn is_cache_only(&self) -> bool {
+        let entries = self.index.entries.lock();
+        let mut cursor = 0;
+        while let Some(node) = entries.lower_bound(cursor) {
+            if !node.folio.is_cache_only() {
+                return false;
+            }
+            let Some(next) = node.key.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        true
     }
 
     /// 容量不足时在锁外准备替代存储；短锁内重查并仅转移原 Weak，不分配或析构。
@@ -812,9 +1011,10 @@ impl FileMapping {
                         .size;
                     let valid = size.saturating_sub(start).min(PAGE_SIZE as u64) as usize;
                     if 0 < valid {
+                        let block_size = data.inode.filesystem().geometry().block_size;
                         data.inode.note_dirty();
                         content
-                            .mark_prepared_dirty(valid)
+                            .mark_prepared_dirty(valid, block_size)
                             .expect("prepared file dirty range is invalid");
                     }
                 }

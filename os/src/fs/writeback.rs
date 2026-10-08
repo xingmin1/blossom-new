@@ -23,10 +23,12 @@ pub(crate) fn sync_inode(inode: &InodeRef) -> Result<(), FsError> {
     sync_inode_range(inode, 0..u64::MAX)
 }
 
-/// 同步半开文件字节范围；同一 mapping 的选择及完成串行，其他 inode 独立。
+/// 同步半开文件字节范围；数据互斥结束后再按 invalidate→WB 顺序重核脏义务。
 pub(crate) fn sync_inode_range(inode: &InodeRef, range: Range<u64>) -> Result<(), FsError> {
-    let _writeback = inode.mapping().lock_writeback();
-    let result = sync_inode_locked(inode, &range);
+    let result = {
+        let _writeback = inode.mapping().lock_writeback();
+        sync_inode_locked(inode, &range)
+    };
     if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
         return result;
     }
@@ -49,8 +51,8 @@ pub(crate) fn sync_metadata(volume: &Ext4Volume) -> Result<(), FsError> {
     result.and(flush)
 }
 
-/// 有限标记及窗口提交只覆盖元数据；任何准备错误仍清理本轮选择并等待旧 WB。
-fn sync_metadata_locked(volume: &Ext4Volume) -> Result<(), FsError> {
+/// 调用者持共同元数据 WB 互斥；只结束有限原页选择及真实 IO，不代替正式同步的 FLUSH。
+pub(crate) fn sync_metadata_locked(volume: &Ext4Volume) -> Result<(), FsError> {
     let cache = volume.metadata_cache();
     let mut remaining = cache.mark_to_write_range(0, u64::MAX);
     let mut cursor = 0;
@@ -93,8 +95,8 @@ fn sync_metadata_locked(volume: &Ext4Volume) -> Result<(), FsError> {
     first_error.map_or(Ok(()), Err)
 }
 
-/// 在原节点建立有限选择，每窗口先查物理地址再建立 WB 和提交父批次。
-fn sync_inode_locked(inode: &InodeRef, range: &Range<u64>) -> Result<(), FsError> {
+/// 调用者已持本 mapping 的 WB 互斥；地址准备结束后才建立 WB 和提交父批次。
+pub(crate) fn sync_inode_locked(inode: &InodeRef, range: &Range<u64>) -> Result<(), FsError> {
     let (start, end) = page_window(range)?;
     if start == end {
         return Ok(());
@@ -130,7 +132,7 @@ fn sync_inode_locked(inode: &InodeRef, range: &Range<u64>) -> Result<(), FsError
                 continue;
             }
             match prepare_file_targets(inode, index, range) {
-                Ok(targets) => {
+                Ok((_, targets)) => {
                     plans[slot] = Some(FilePagePlan {
                         index,
                         folio,
@@ -158,12 +160,12 @@ fn sync_inode_locked(inode: &InodeRef, range: &Range<u64>) -> Result<(), FsError
     first_error.map_or(Ok(()), Err)
 }
 
-/// 根读保护只覆盖地址准备；IO 提交、额度等待及完成等待都在闭包返回之后。
-fn prepare_file_targets(
+/// 回写和填充共用真实块地址及同根尺寸；根读保护不跨数据 IO、额度或完成等待。
+pub(crate) fn prepare_file_targets(
     inode: &InodeRef,
     index: u64,
     range: &Range<u64>,
-) -> Result<[Option<u64>; SECTORS_PER_PAGE], FsError> {
+) -> Result<(u64, [Option<u64>; SECTORS_PER_PAGE]), FsError> {
     let volume = inode.filesystem();
     let size = volume.geometry().block_size;
     let page = index
@@ -188,7 +190,7 @@ fn prepare_file_targets(
                     Some(physical.checked_mul(size as u64).ok_or(FsError::Corrupt)?);
             }
         }
-        Ok(targets)
+        Ok((metadata.size, targets))
     })
 }
 
