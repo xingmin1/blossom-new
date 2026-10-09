@@ -1,5 +1,6 @@
 //! 普通磁盘 ELF 复用原设备/路径夹具；用户 wait 与真实离栈 join 分别完成后才释放根。
 
+use crate::fs::ext4::codec;
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
@@ -229,6 +230,116 @@ impl UserOwner {
             program, mode, event.status
         ));
         Ok(event)
+    }
+
+    /// 普通写程序同步退出后关闭原缓存域，在同盘只读新生命周期核全文与内嵌链接盘面格式。
+    fn production_writeback_cold_reopen(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        const PROGRAM: &[u8] = b"/test/bin/user-writeback";
+        self.prepare_mode(context, AccessMode::ReadWrite)?;
+        let event = self.run_named(context, PROGRAM, b"w", false)?;
+        context.expect_eq(event.status, 0);
+        if event.status != 0 {
+            return Err(TestError("production writeback writer failed"));
+        }
+        let disk = self.path.owner.disk()?.clone();
+        let root = self.path.vfs().root();
+        let old_device = root.filesystem().device();
+        let weak_volume = Arc::downgrade(root.filesystem());
+        let weak_metadata = Arc::downgrade(root.filesystem().metadata_cache());
+        let weak_root = root.dentry().downgrade();
+        let weak_vfs = Arc::downgrade(self.path.vfs());
+        let weak_graph = Arc::downgrade(self.graph());
+        drop(root);
+        drop(self.graph.take());
+        self.path.release_view();
+
+        // 开放缓存仍持卷绑定；必须关闭最后 cache owner 并等原收据，不能把清槽当作冷重开。
+        let cache = self
+            .path
+            .owner
+            .cache
+            .take()
+            .ok_or(TestError("production writeback original cache missing"))?;
+        cache.ktest_set_load_hook(None);
+        let weak_cache = Arc::downgrade(&cache);
+        assert!(self.path.owner.cache_watch.is_none());
+        self.path.owner.cache_watch = Some(cache.watch());
+        drop(cache);
+        checked(
+            context,
+            self.path
+                .owner
+                .cache_watch
+                .as_ref()
+                .expect("production writeback retirement watch missing")
+                .wait_retired(),
+        )?;
+        if weak_cache.strong_count() != 0
+            || weak_volume.strong_count() != 0
+            || weak_metadata.strong_count() != 0
+            || weak_root.strong_count() != 0
+            || weak_vfs.strong_count() != 0
+            || weak_graph.strong_count() != 0
+        {
+            return Err(TestError(
+                "production writeback still has old FS or user owners",
+            ));
+        }
+        drop((
+            weak_cache,
+            weak_volume,
+            weak_metadata,
+            weak_root,
+            weak_vfs,
+            weak_graph,
+        ));
+        disk.test_flush_completions();
+        if disk.test_snapshot().inflight != 0 {
+            return Err(TestError("production writeback old IO is still inflight"));
+        }
+        drop(self.path.owner.cache_watch.take());
+        let reads_before = disk.test_snapshot().submitted;
+        self.path.owner.cache = Some(
+            Arc::try_new(checked(context, InodeCache::try_new(64))?)
+                .map_err(|_| TestError("production writeback cold cache OOM"))?,
+        );
+        self.prepare_mode(context, AccessMode::ReadOnly)?;
+        let root = self.path.vfs().root();
+        context.expect_eq(root.filesystem().disk().identity(), disk.identity());
+        context.expect_eq(root.filesystem().mode(), AccessMode::ReadOnly);
+        context.expect_eq(root.filesystem().device() != old_device, true);
+        drop(root);
+        let event = self.run_named(context, PROGRAM, b"r", false)?;
+        context.expect_eq(event.status, 0);
+        if event.status != 0 {
+            return Err(TestError("production writeback cold reader failed"));
+        }
+        {
+            let link = checked(
+                context,
+                self.path.vfs().resolve(
+                    self.path.context(),
+                    b"/test/writeback-dir/link",
+                    ResolveMode::NoFollow,
+                ),
+            )?;
+            let inode = checked(context, link.inode())?;
+            let metadata = checked(context, inode.metadata_snapshot())?;
+            context.expect_eq(metadata.fast_symlink, true);
+            context.expect_eq(metadata.flags & codec::EXTENTS, 0);
+        }
+        let reads_after = disk.test_snapshot().submitted;
+        context.expect_eq(reads_before < reads_after, true);
+        if reads_after <= reads_before {
+            return Err(TestError(
+                "production writeback cold reader issued no disk IO",
+            ));
+        }
+        context.diagnostic(format_args!(
+            "W35 production-writeback bytes=8229 writer-status=0 reader-status=0 old-cache-strong=0 old-volume-strong=0 old-metadata-strong=0 old-root-strong=0 old-vfs-strong=0 old-graph-strong=0 same-disk=1 cold-read-submitted={} disk-stopped=0",
+            reads_after - reads_before
+        ));
+        Ok(())
     }
 
     /// 逐个消费转亲的其他子组并等全部成员离栈，取消的退出状态不充当主体断言。
@@ -1142,6 +1253,16 @@ pub(crate) mod programs {
         let event = fixture.run_named(context, b"/test/bin/user-io", b"raw", false)?;
         context.expect_eq(event.status, 0);
         Ok(())
+    }
+
+    /// 同一磁盘 ELF 的普通写入与同步后冷读取复用原 UserOwner、真实退出和最终资源比较。
+    #[test]
+    #[ktest(min_cpus = 2, tags("W35", "fs-writeback"))]
+    fn production_writeback_sync_and_cold_reopen(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.production_writeback_cold_reopen(context)
     }
 
     /// 非owner用户指令核目录读DAC、逐组件search及拒绝后原游标和最低空槽。

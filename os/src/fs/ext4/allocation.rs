@@ -5,6 +5,7 @@ use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, GroupState};
 use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeKind, InodeMetadata};
 use crate::fs::{FsError, InodeRef};
+use crate::time;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy)]
@@ -619,6 +620,7 @@ impl Ext4Volume {
                 state.block_checksum = checksum;
             }
             self.commit_group(group, &descriptor, offset, state);
+            let now_ns = time::now().as_nanos();
             superblock
                 .update(&self.claim, |bytes| {
                     codec::patch_super_counts(
@@ -626,6 +628,7 @@ impl Ext4Volume {
                         &mut bytes[1024..2048],
                         if inode { 0 } else { -1 },
                         if inode { -1 } else { 0 },
+                        now_ns,
                     )
                 })
                 .expect("prepared writable superblock");
@@ -756,6 +759,7 @@ impl Ext4Volume {
             reservation.offset,
             state,
         );
+        let now_ns = time::now().as_nanos();
         reservation
             .superblock
             .update(&self.claim, |bytes| {
@@ -764,6 +768,7 @@ impl Ext4Volume {
                     &mut bytes[1024..2048],
                     if reservation.inode { 0 } else { 1 },
                     if reservation.inode { 1 } else { 0 },
+                    now_ns,
                 )
             })
             .expect("retained writable superblock");

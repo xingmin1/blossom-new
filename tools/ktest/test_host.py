@@ -66,13 +66,13 @@ def catalog_of(cases):
 
 
 def options(**overrides):
-    """为纯行为回归提供明确输入，没有隐式机器资源。"""
+    """为纯行为回归提供明确选择和挂载模式，没有隐式机器资源。"""
     args = SimpleNamespace(exact=[], include=[], parameter=[], tag=[], exclude=[], include_ignored=False,
                            shard=None, repeat=1, shuffle=False, seed=17, isolation="suite", jobs=2,
                            arch="riscv64", cpus=2, mode="debug", panic="unwind", disks={}, read_only=[],
                            uart_payload=None, uart_expect=None, scratch_bytes=4096, logical_block_size=512,
                            ap_freeze=False, gdb=None,
-                           iommu_platform=False, modern=False, root=None, extra_root=None,
+                           iommu_platform=False, modern=False, root=None, root_mode="ro", extra_root=None,
                            startup_timeout=10, setup_timeout=5, case_timeout=10, cleanup_timeout=5)
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -107,6 +107,44 @@ def case_lines(case, position=1, status="Pass"):
     return [f"  # KTEST case-begin {cid}", f"  # KTEST phase {cid} setup",
             f"  # KTEST phase {cid} body", f"  # KTEST phase {cid} cleanup",
             f"  # KTEST status {cid} {status}", f"  {result} {position} {name}"]
+
+
+class RootModeInputTests(unittest.TestCase):
+    """真实宿主入口在资源准备前拒绝非法根挂载模式。"""
+
+    def test_invalid_mode_is_rejected_without_replacing_work_disks(self):
+        """命令行和 Make 拒绝未知或多 token 值，已有恢复盘与源文件必须保留。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source.img"
+            source.write_bytes(b"original source")
+            work = base / "work"
+            work.mkdir()
+            disk = work / "root.raw"
+            disk.write_bytes(b"preserved working disk")
+            commands = [
+                [sys.executable, str(TOOLS / "run.py"), "--arch", "riscv64",
+                 "--kernel", str(base / "missing.elf"), "--image", str(source),
+                 "--work-dir", str(work)],
+                [sys.executable, str(TOOLS / "ktest.py"), "list", "--arch", "riscv64",
+                 "--report-dir", str(base / "report")],
+                [sys.executable, str(TOOLS / "ktest.py"), "run", "--arch", "riscv64",
+                 "--report-dir", str(base / "report")],
+            ]
+            for mode in ("", "RO", "rwx", "ro rw", "ro=foo", "rw=foo", "%"):
+                for command in commands:
+                    with self.subTest(command=command, mode=mode):
+                        result = subprocess.run(command + ["--root-mode", mode],
+                                                capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 2)
+                with self.subTest(command="make", mode=mode):
+                    result = subprocess.run(["make", "--no-print-directory", "-n", "run",
+                                             f"ROOT_MODE={mode}"], cwd=TOOLS.parent,
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(source.read_bytes(), b"original source")
+                self.assertEqual(disk.read_bytes(), b"preserved working disk")
+                self.assertFalse((base / "report").exists())
 
 
 class BootELFTests(unittest.TestCase):

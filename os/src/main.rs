@@ -35,6 +35,9 @@ mod wait;
 mod workqueue;
 
 #[cfg(not(feature = "ktest"))]
+use alloc::sync::Arc;
+
+#[cfg(not(feature = "ktest"))]
 use crate::drivers::DeviceInventory;
 
 static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -243,11 +246,9 @@ fn init() -> i32 {
     0
 }
 
-/// 普通 init 保留真实根到磁盘程序退出和离栈回收，全部路径与缓存退场后才结束文件系统消费者。
+/// 普通 init 按明确根权限运行磁盘程序，全部路径、回写和缓存退场后才结束文件系统消费者。
 #[cfg(not(feature = "ktest"))]
 fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError> {
-    use alloc::sync::Arc;
-
     let selected = fs::system::boot_devices(boot::info().bootargs())?;
     let root = storage
         .disk(selected.root)
@@ -258,15 +259,21 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         .transpose()?;
     let inodes = Arc::try_new(fs::InodeCache::try_new(64)?).map_err(|_| fs::FsError::NoMemory)?;
     let inode_eviction = inodes.watch();
-    let vfs = Arc::try_new(fs::system::mount_disks(root, extra, inodes)?)
-        .map_err(|_| fs::FsError::NoMemory)?;
+    let vfs = Arc::try_new(fs::system::mount_disks(
+        root,
+        extra,
+        inodes,
+        selected.root_mode,
+    )?)
+    .map_err(|_| fs::FsError::NoMemory)?;
     let context = fs::FsContext::new(vfs.root(), vfs.root())?;
     let files = fs::FileTable::try_new(4)?;
     crate::klog!(
         klog::Level::Info,
-        "ROOTFS selected root={} extra={:?}",
+        "ROOTFS selected root={} extra={:?} mode={:?}",
         selected.root,
-        selected.extra
+        selected.extra,
+        selected.root_mode
     );
     const PATHS: &[(&str, bool)] = &[
         ("/test/identity", false),
@@ -293,61 +300,49 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
             summary.crc32c
         );
     }
-    drop(files);
     let graph = task::process::TaskGraph::try_new(128)?;
-    const PROGRAMS: &[(&[u8], &[u8], &[&[u8]])] = &[
-        (b"/test/bin/user-smoke", b"raw", &[b"USER_SMOKE=1"]),
-        (b"/test/bin/user-io", b"raw", &[]),
-        (b"/test/bin/user-clone", b"F0", &[]),
-        (b"/test/bin/user-clone", b"t3", &[]),
-        (b"/test/bin/user-signal", b"f", &[]),
-        (b"/test/bin/user-lifecycle", b"u", &[]),
+    run_disk_program(
+        &graph,
+        &vfs,
+        &context,
+        b"/test/bin/user-smoke",
+        b"raw",
+        &[b"USER_SMOKE=1"],
+    )?;
+    // 该普通程序断言 EROFS，只在真实只读根验证；可写根由独立写入程序消费。
+    if selected.root_mode == block::AccessMode::ReadOnly {
+        run_disk_program(&graph, &vfs, &context, b"/test/bin/user-io", b"raw", &[])?;
+    }
+    const PROGRAMS: &[(&[u8], &[u8])] = &[
+        (b"/test/bin/user-clone", b"F0"),
+        (b"/test/bin/user-clone", b"t3"),
+        (b"/test/bin/user-signal", b"f"),
+        (b"/test/bin/user-lifecycle", b"u"),
     ];
-    for &(program, argument, environment) in PROGRAMS {
-        let path = vfs.resolve(&context, program, fs::ResolveMode::Follow)?;
-        let file = fs::open_path(path)?;
-        let arguments =
-            task::exec::Arguments::from_kernel(program, &[program, argument], environment)?;
-        let runtime =
-            task::UserRuntime::try_new(Arc::clone(&vfs), context.clone(), task::Credentials::ROOT)?;
-        let image = task::exec::load(file, &arguments, 0, 0)?;
-        let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
-        let pid = prepared.pid();
-        let child = prepared.publish()?;
-        let event = graph.wait(None, pid)?;
-        let task_status = child.join();
+    for &(program, argument) in PROGRAMS {
+        run_disk_program(&graph, &vfs, &context, program, argument, &[])?;
+    }
+    if selected.root_mode == block::AccessMode::ReadWrite {
+        run_disk_program(
+            &graph,
+            &vfs,
+            &context,
+            b"/test/bin/user-writeback",
+            b"a",
+            &[],
+        )?;
+        let pathname = "/test/writeback-dir/result";
+        let summary = fs::system::read_summary(&files, &vfs, &context, pathname.as_bytes())?;
+        assert_eq!(summary.bytes, 8229, "writeback result size is inconsistent");
         crate::klog!(
             klog::Level::Info,
-            "USER exited program={} argument={} pid={} task={} status={} task_status={} interrupts={} timers={} cpu={}",
-            core::str::from_utf8(program).expect("static program path is ASCII"),
-            core::str::from_utf8(argument).expect("static program argument is ASCII"),
-            event.pid,
-            event.task_id.as_usize(),
-            event.status,
-            task_status,
-            event.user_interrupts,
-            event.user_timer_interrupts,
-            event.cpu
+            "fs-system-summary path={} bytes={} crc32c={:08x}",
+            pathname,
+            summary.bytes,
+            summary.crc32c
         );
-        loop {
-            match graph.wait_root() {
-                Ok(event) => {
-                    crate::klog!(
-                        klog::Level::Info,
-                        "USER child-reaped pid={} task={} status={} interrupts={} timers={} cpu={}",
-                        event.pid,
-                        event.task_id.as_usize(),
-                        event.status,
-                        event.user_interrupts,
-                        event.user_timer_interrupts,
-                        event.cpu
-                    );
-                }
-                Err(task::process::ProcessError::NoChild) => break,
-                Err(error) => return Err(error.into()),
-            }
-        }
     }
+    drop(files);
     drop(graph);
     drop(context);
     vfs.prune_unused();
@@ -356,6 +351,66 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
     drop(inode_eviction);
     crate::klog!(klog::Level::Info, "ROOTFS completed");
     Ok(())
+}
+
+/// 同一正式 loader 运行一个磁盘程序，核主体与离栈状态并逐个回收转亲后的全部子组。
+#[cfg(not(feature = "ktest"))]
+fn run_disk_program(
+    graph: &Arc<task::process::TaskGraph>,
+    vfs: &Arc<fs::Vfs>,
+    context: &fs::FsContext,
+    program: &[u8],
+    argument: &[u8],
+    environment: &[&[u8]],
+) -> Result<(), task::ProgramError> {
+    let path = vfs.resolve(context, program, fs::ResolveMode::Follow)?;
+    let file = fs::open_path(path)?;
+    let arguments = task::exec::Arguments::from_kernel(program, &[program, argument], environment)?;
+    let runtime =
+        task::UserRuntime::try_new(Arc::clone(vfs), context.clone(), task::Credentials::ROOT)?;
+    let image = task::exec::load(file, &arguments, 0, 0)?;
+    let prepared = task::prepare_program(graph, None, image, runtime, task::Placement::Any)?;
+    let pid = prepared.pid();
+    let child = prepared.publish()?;
+    let task_id = child.task_id();
+    let event = graph.wait(None, pid)?;
+    let task_status = child.join();
+    crate::klog!(
+        klog::Level::Info,
+        "USER exited program={} argument={} pid={} task={} status={} task_status={} interrupts={} timers={} cpu={}",
+        core::str::from_utf8(program).expect("static program path is ASCII"),
+        core::str::from_utf8(argument).expect("static program argument is ASCII"),
+        event.pid,
+        event.task_id.as_usize(),
+        event.status,
+        task_status,
+        event.user_interrupts,
+        event.user_timer_interrupts,
+        event.cpu
+    );
+    assert_eq!(event.pid, pid, "user wait returned another process");
+    assert_eq!(event.task_id, task_id, "user wait returned another task");
+    assert_eq!(event.status, 0, "ordinary user program failed");
+    assert_eq!(task_status, event.status, "user join disagrees with wait");
+    loop {
+        match graph.wait_root() {
+            Ok(event) => {
+                crate::klog!(
+                    klog::Level::Info,
+                    "USER child-reaped pid={} task={} status={} interrupts={} timers={} cpu={}",
+                    event.pid,
+                    event.task_id.as_usize(),
+                    event.status,
+                    event.user_interrupts,
+                    event.user_timer_interrupts,
+                    event.cpu
+                );
+                assert_eq!(event.status, 0, "ordinary user child failed");
+            }
+            Err(task::process::ProcessError::NoChild) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 /// 只记录启用 MMIO 槽、实际 block 候选与 PCI 功能资源，不触碰设备队列或读取磁盘。

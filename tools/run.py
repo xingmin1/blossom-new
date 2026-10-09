@@ -72,6 +72,7 @@ def main(argv=None):
     parser.add_argument("--extra-image", type=Path)
     parser.add_argument("--scratch-image", type=Path)
     parser.add_argument("--root", default="/dev/vda", help="explicit guest root device; no fallback")
+    parser.add_argument("--root-mode", choices=("ro", "rw"), default="ro", help="guest root mount mode; independent of device read-only")
     parser.add_argument("--extra-root", help="explicit guest extra mount device; absent means no extra mount")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--modern", action="store_true")

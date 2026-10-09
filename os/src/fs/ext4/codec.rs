@@ -984,8 +984,14 @@ pub(crate) fn verify_bitmap(
     Ok(())
 }
 
-/// 在主超级块当前字段上调整空闲计数，调用者已经串行化卷的分配。
-pub(crate) fn patch_super_counts(g: &Geometry, record: &mut [u8], blocks: i64, inodes: i64) {
+/// 在主超级块当前字段上提交空闲计数与本次写入时间；调用者已经串行化卷的分配。
+pub(crate) fn patch_super_counts(
+    g: &Geometry,
+    record: &mut [u8],
+    blocks: i64,
+    inodes: i64,
+    now_ns: u64,
+) {
     let old_blocks = u64::from(le32(record, 12).expect("prepared superblock"))
         | if g.features_incompat & 0x80 != 0 {
             u64::from(le32(record, 344).expect("prepared superblock")) << 32
@@ -1005,6 +1011,10 @@ pub(crate) fn patch_super_counts(g: &Geometry, record: &mut [u8], blocks: i64, i
         put32(record, 344, (next_blocks >> 32) as u32);
     }
     put32(record, 16, next_inodes as u32);
+    // ABI: s_wtime 与 s_wtime_hi 共同编码 40 位秒数，使用与 inode 时间相同的时钟。
+    let write_seconds = now_ns / 1_000_000_000;
+    put32(record, 48, write_seconds as u32);
+    record[0x274] = (write_seconds >> 32) as u8;
     if g.features_ro_compat & METADATA_CSUM != 0 {
         put32(record, 1020, crc32c(!0, &record[..1020]));
     }

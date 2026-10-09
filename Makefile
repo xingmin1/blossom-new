@@ -10,6 +10,7 @@ FEATURES ?=
 OUTPUT ?= build/$(ARCH)/kernel.elf
 TEST ?=
 ROOT ?= /dev/vda
+ROOT_MODE ?= ro
 EXTRA_ROOT ?=
 IDENTITY ?= root
 IMAGE ?= build/$(if $(filter extra,$(IDENTITY)),extra,system)-$(ARCH).img
@@ -21,7 +22,7 @@ WORK_DIR ?= build/run-$(ARCH)
 RESUME ?= 0
 LLVM_MC ?= llvm-mc
 USER_LD ?= rust-lld
-USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write)
+USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback)
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -44,6 +45,13 @@ $(error CPUS 必须是一个核数)
 endif
 ifeq ($(filter $(CPUS),1 2 4),)
 $(error 当前阶段 CPUS 只支持 1、2、4)
+endif
+
+ifneq ($(words $(ROOT_MODE)),1)
+$(error ROOT_MODE 必须是一个挂载模式)
+endif
+ifneq ($(ROOT_MODE),$(filter ro rw,$(ROOT_MODE)))
+$(error ROOT_MODE 只支持 ro 或 rw)
 endif
 
 ifeq ($(MODE),release)
@@ -74,7 +82,7 @@ image:
 
 run debug: build
 	@case "$(RESUME)" in 0|1) ;; *) echo "RESUME 只支持 0 或 1"; exit 1;; esac
-	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(ROOT)" --work-dir "$(WORK_DIR)" $(if $(filter 1,$(RESUME)),--resume) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
+	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(ROOT)" --root-mode "$(ROOT_MODE)" --work-dir "$(WORK_DIR)" $(if $(filter 1,$(RESUME)),--resume) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
 
 
 ifeq ($(PANIC),unwind)
@@ -92,10 +100,10 @@ ktest-build:
 	cp "build/ktest-target/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
 
 ktest-list:
-	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 ktest:
-	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 .PHONY: user-tests
 user-tests: $(USER_OUTPUTS)

@@ -82,6 +82,7 @@ def arguments(argv=None):
     parser.add_argument("--isolation", choices=("suite", "case"), default="suite")
     parser.add_argument("--disk", action="append", default=[], metavar="root|extra|scratch=PATH")
     parser.add_argument("--root", help="explicit root block name, such as /dev/vda")
+    parser.add_argument("--root-mode", choices=("ro", "rw"), default="ro", help="guest root mount mode; independent of device read-only")
     parser.add_argument("--extra-root", help="explicit extra filesystem block name")
     parser.add_argument("--read-only", action="append", default=[], choices=("root", "extra", "scratch"))
     parser.add_argument("--scratch-bytes", type=natural, default=64 * 1024 * 1024)

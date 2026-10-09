@@ -666,7 +666,7 @@ impl Ext4Volume {
         ))
     }
 
-    /// 初始化仍由 UnpublishedInode 保有的完整原始格式，canonical iget 只能在此后发生。
+    /// 初始化仍由 UnpublishedInode 保有的格式，内嵌链接撤销 extent 位后才能 canonical iget。
     pub(crate) fn initialize_unpublished_inode(
         &self,
         allocation: &UnpublishedInode,
@@ -701,12 +701,15 @@ impl Ext4Volume {
         expected.blocks = next.blocks;
         expected.flags = next.flags;
         expected.fast_symlink = next.fast_symlink;
-        let inode_layout_flags = 0x40000 | codec::INDEX;
-        if expected != *next || next.flags & !inode_layout_flags != old.flags & !inode_layout_flags
+        let fast_symlink = next.kind == InodeKind::Symlink && next.blocks == 0 && next.size < 60;
+        let inode_layout_flags =
+            0x40000 | codec::INDEX | if fast_symlink { codec::EXTENTS } else { 0 };
+        if expected != *next
+            || next.flags & !inode_layout_flags != old.flags & !inode_layout_flags
+            || (fast_symlink && next.flags & codec::EXTENTS != 0)
         {
             return Err(FsError::InvalidOperation);
         }
-        let fast_symlink = next.kind == InodeKind::Symlink && next.blocks == 0 && next.size < 60;
         if next.fast_symlink != fast_symlink {
             return Err(FsError::InvalidOperation);
         }

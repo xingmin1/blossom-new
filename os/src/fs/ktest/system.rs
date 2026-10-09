@@ -50,7 +50,7 @@ impl SystemOwner {
         Ok((root.clone(), extra))
     }
 
-    /// 正文从实际命令行构造完整视图、上下文和表，所有局部准备成功后才发表。
+    /// 正文按实际命令行的同一根权限构造卷与视图，所有局部准备成功后才发表。
     fn prepare(&mut self, context: &mut TestContext<'_>) -> Result<BootDevices, TestError> {
         self.owner.disk()?;
         let selection = checked(context, boot_devices(crate::boot::info().bootargs()))?;
@@ -58,7 +58,7 @@ impl SystemOwner {
         self.owner.cache().ktest_set_load_hook(None);
         let vfs = Arc::try_new(checked(
             context,
-            mount_disks(root, extra, self.owner.cache().clone()),
+            mount_disks(root, extra, self.owner.cache().clone(), selection.root_mode),
         )?)
         .map_err(|_| TestError("system VFS owner OOM"))?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
@@ -68,10 +68,25 @@ impl SystemOwner {
             vfs.root().filesystem().disk().identity(),
             self.owner.disks[selection.root].identity(),
         );
+        context.expect_eq(vfs.root().filesystem().mode(), selection.root_mode);
+        let writable = match selection.root_mode {
+            AccessMode::ReadOnly => Err(FsError::ReadOnly),
+            AccessMode::ReadWrite => Ok(()),
+        };
+        context.expect_eq(vfs.root().check_writable(), writable);
+        if selection.extra.is_some() {
+            let extra = checked(
+                context,
+                vfs.resolve(&fs_context, b"/mnt/extra", ResolveMode::Follow),
+            )?;
+            context.expect_eq(extra.filesystem().mode(), AccessMode::ReadOnly);
+            context.expect_eq(extra.check_writable(), Err(FsError::ReadOnly));
+        }
         context.diagnostic(format_args!(
-            "fs-system-selection root={} extra={:?} identity={:?}",
+            "fs-system-selection root={} extra={:?} mode={:?} identity={:?}",
             selection.root,
             selection.extra,
+            selection.root_mode,
             self.owner.disks[selection.root].identity()
         ));
         self.vfs = Some(vfs);
@@ -347,7 +362,7 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 6] {
 )]
 pub(crate) mod arguments {
     use super::*;
-    /// 纯命令行模型覆盖空白、末值与缺根边界，实际固件选择由其它 suite 单独消费。
+    /// 纯命令行模型覆盖根权限默认值、完整 token 及末值优先，实际设备权限由挂载消费者验证。
     #[test]
     #[ktest(tags("B01"))]
     fn parser_boundaries_are_not_boot_selection(context: &mut TestContext<'_>) -> TestResult {
@@ -357,6 +372,7 @@ pub(crate) mod arguments {
                 BootDevices {
                     root: 0,
                     extra: None,
+                    root_mode: AccessMode::ReadOnly,
                 },
             ),
             (
@@ -364,6 +380,7 @@ pub(crate) mod arguments {
                 BootDevices {
                     root: 1,
                     extra: Some(0),
+                    root_mode: AccessMode::ReadOnly,
                 },
             ),
             (
@@ -371,6 +388,7 @@ pub(crate) mod arguments {
                 BootDevices {
                     root: 0,
                     extra: Some(2),
+                    root_mode: AccessMode::ReadOnly,
                 },
             ),
             (
@@ -378,6 +396,7 @@ pub(crate) mod arguments {
                 BootDevices {
                     root: 25,
                     extra: None,
+                    root_mode: AccessMode::ReadOnly,
                 },
             ),
             (
@@ -385,6 +404,55 @@ pub(crate) mod arguments {
                 BootDevices {
                     root: 1,
                     extra: Some(0),
+                    root_mode: AccessMode::ReadOnly,
+                },
+            ),
+            (
+                b"rw root=/dev/vda ro rw",
+                BootDevices {
+                    root: 0,
+                    extra: None,
+                    root_mode: AccessMode::ReadWrite,
+                },
+            ),
+            (
+                b"root=/dev/vda rw ro",
+                BootDevices {
+                    root: 0,
+                    extra: None,
+                    root_mode: AccessMode::ReadOnly,
+                },
+            ),
+            (
+                b"root=/dev/vda rw=1 ro=1 xrw rwx xro rox",
+                BootDevices {
+                    root: 0,
+                    extra: None,
+                    root_mode: AccessMode::ReadOnly,
+                },
+            ),
+            (
+                b"root=/dev/vda rw ro=1 xro rox",
+                BootDevices {
+                    root: 0,
+                    extra: None,
+                    root_mode: AccessMode::ReadWrite,
+                },
+            ),
+            (
+                b"rw\troot=/dev/vdz\rro\nroot=/dev/vdb\x0brw\x0cextra=/dev/vda ",
+                BootDevices {
+                    root: 1,
+                    extra: Some(0),
+                    root_mode: AccessMode::ReadWrite,
+                },
+            ),
+            (
+                b"root=/dev/vda rw\x85ro rw\0ro",
+                BootDevices {
+                    root: 0,
+                    extra: None,
+                    root_mode: AccessMode::ReadOnly,
                 },
             ),
         ] {
@@ -400,6 +468,8 @@ pub(crate) mod arguments {
             b"root=UUID=abc",
             b"root=/dev/vda root=",
             b"root=/dev/vda extra=",
+            b"rw root=/dev/vda root= ro",
+            b"ro root=/dev/vda extra= rw",
         ] {
             context.expect_eq(boot_devices(bytes), Err(FsError::MissingRoot));
         }

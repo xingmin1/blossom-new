@@ -1,4 +1,4 @@
-//! 明确选择启动盘，复用只读挂载与文件表完成有限内核读取。
+//! 明确选择启动盘及根权限，复用正式挂载与文件表完成有限内核读取。
 
 use alloc::sync::Arc;
 
@@ -14,23 +14,30 @@ use crate::mm::PAGE_SIZE;
 pub(crate) struct BootDevices {
     pub root: usize,
     pub extra: Option<usize>,
+    pub root_mode: AccessMode,
 }
 
-/// 按 ASCII 空白消费 root/extra 的最后值，无分配且不隐式选择其他磁盘。
+/// 按 ASCII 空白消费 root/extra 和完整 ro/rw token 的最后值，根权限默认只读。
 /// 仅支持完整的 /dev/vd[a-z] 块选择名；缺 root 或最后值不支持时返回 MissingRoot。
 pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices, FsError> {
     let mut root = None;
     let mut extra = None;
+    let mut root_mode = AccessMode::ReadOnly;
     for argument in arguments.split(|byte| byte.is_ascii_whitespace() || *byte == 0x0b) {
         if let Some(value) = argument.strip_prefix(b"root=") {
             root = Some(value);
         } else if let Some(value) = argument.strip_prefix(b"extra=") {
             extra = Some(value);
+        } else if argument == b"ro" {
+            root_mode = AccessMode::ReadOnly;
+        } else if argument == b"rw" {
+            root_mode = AccessMode::ReadWrite;
         }
     }
     Ok(BootDevices {
         root: device_index(root.ok_or(FsError::MissingRoot)?)?,
         extra: extra.map(device_index).transpose()?,
+        root_mode,
     })
 }
 
@@ -42,15 +49,16 @@ fn device_index(name: &[u8]) -> Result<usize, FsError> {
     }
 }
 
-/// 普通可睡眠 Task 明确以 RO 卷和 RO 挂载构造根视图，仅显式附盘才挂到 /mnt/extra。
+/// 普通可睡眠 Task 以同一权限构造根卷和根挂载，仅显式附盘才以只读挂到 /mnt/extra。
 /// 卷与路径只保活原设备及缓存，不停止设备，也不建立全局文件系统拥有者。
 pub(crate) fn mount_disks(
     root: DiskRef,
     extra: Option<DiskRef>,
     inodes: Arc<InodeCache>,
+    root_mode: AccessMode,
 ) -> Result<Vfs, FsError> {
-    let volume = Ext4Volume::open(root, AccessMode::ReadOnly, 64)?;
-    let vfs = Vfs::try_new(volume, inodes, 128, 4, AccessMode::ReadOnly)?;
+    let volume = Ext4Volume::open(root, root_mode, 64)?;
+    let vfs = Vfs::try_new(volume, inodes, 128, 4, root_mode)?;
     if let Some(extra) = extra {
         let root = vfs.root();
         let context = FsContext::new(root.clone(), root)?;

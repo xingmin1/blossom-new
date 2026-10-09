@@ -1255,7 +1255,7 @@ impl InodeCache {
         )
     }
 
-    /// 分配 inode 后先完成盘面格式和 canonical 加载；任何返回的对象仍为 links=0。
+    /// 分配 inode 后完成块映射或内嵌链接格式及 canonical 加载；返回对象仍为 links=0。
     fn prepare_new_inode(
         &self,
         volume: &Arc<Ext4Volume>,
@@ -1311,6 +1311,7 @@ impl InodeCache {
                 prepared.directory = Some(edit);
             }
             NewInodeContent::Symlink(target) if target.len() < 60 => {
+                root.fill(0);
                 root[..target.len()].copy_from_slice(target);
                 size = target.len() as u64;
             }
@@ -1323,6 +1324,9 @@ impl InodeCache {
             }
         }
         let mut next = initial_inode_metadata(volume, initial, size, blocks, now_ns)?;
+        if next.fast_symlink {
+            next.flags &= !codec::EXTENTS;
+        }
         if let Some(flags) = directory_flags {
             let permitted = codec::INDEX | 0x40000;
             if flags & !permitted != initial.flags & !permitted {
