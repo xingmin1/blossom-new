@@ -2,7 +2,7 @@
 
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, GroupState};
-use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeKind};
+use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeKind, InodeMetadata};
 use crate::fs::{FsError, InodeRef};
 use alloc::vec::Vec;
 
@@ -44,6 +44,8 @@ pub(crate) struct DetachedBlock {
 pub struct UnpublishedInode {
     number: u64,
     reservation: Reservation,
+    record: BufferRef,
+    offset: usize,
 }
 
 /// 最后一个未链接 inode 的具体释放窗口；尚未清位图，析构不执行等待或盘面修改。
@@ -95,6 +97,15 @@ impl UnpublishedInode {
         self.number
     }
 
+    /// 确认临时 inode 位仍属于给定卷且尚未转移到 canonical inode。
+    pub(crate) fn belongs_to(&self, volume: &Ext4Volume) -> bool {
+        self.reservation.active && self.reservation.volume == volume.device
+    }
+    /// 借用本次分配预留的 inode-table 窗口，不能转移其 bitmap 责任。
+    pub(crate) fn record(&self) -> (&BufferRef, usize) {
+        (&self.record, self.offset)
+    }
+
     /// 原 inode 已由 canonical 使用或名字保有后结束临时分配责任，位图仍保持已分配。
     pub(crate) fn publish(mut self) -> u64 {
         self.reservation.active = false;
@@ -136,7 +147,7 @@ impl Ext4Volume {
         gid: u32,
     ) -> Result<UnpublishedInode, FsError> {
         let directory = mode & 0xf000 == 0x4000;
-        if !directory && mode & 0xf000 != 0x8000 {
+        if !matches!(mode & 0xf000, 0x4000 | 0x8000 | 0xa000) {
             return Err(FsError::InvalidOperation);
         }
         let mut reservation = self.reserve(hint, true, directory)?;
@@ -188,12 +199,58 @@ impl Ext4Volume {
         Ok(UnpublishedInode {
             number,
             reservation,
+            record: buffer,
+            offset,
         })
     }
 
     /// 本次 inode 尚未连接名字时归还位图与目录计数，不对已有对象作清理。
     pub fn release_unpublished_inode(&self, mut inode: UnpublishedInode) {
         self.release_reservation(&mut inode.reservation);
+    }
+
+    /// 按父目录 setgid、kind mode 和当前主 group 准备新 inode owner。
+    pub(crate) fn allocate_inode_for_parent(
+        &self,
+        parent: &InodeMetadata,
+        kind: InodeKind,
+        requested_mode: u16,
+        umask: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<UnpublishedInode, FsError> {
+        if parent.kind != InodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let kind_mode = match kind {
+            InodeKind::Regular => 0x8000,
+            InodeKind::Directory => 0x4000,
+            InodeKind::Symlink => 0xa000,
+            InodeKind::Other => return Err(FsError::InvalidOperation),
+        };
+        let parent_setgid = parent.mode & 0o2000 != 0;
+        let mut mode = kind_mode
+            | if kind == InodeKind::Symlink {
+                0o777
+            } else {
+                requested_mode & 0o7777
+            };
+        if kind == InodeKind::Directory && parent_setgid {
+            mode |= 0o2000;
+        } else if kind != InodeKind::Directory
+            && parent_setgid
+            && mode & 0o2010 == 0o2010
+            && gid != parent.gid
+        {
+            mode &= !0o2000;
+        }
+        if kind != InodeKind::Symlink {
+            mode &= !(umask & 0o777);
+        }
+        let gid = if parent_setgid { parent.gid } else { gid };
+        let hint =
+            parent.number.checked_sub(1).ok_or(FsError::Corrupt)? / self.geometry.inodes_per_group;
+        self.allocate_inode(hint, mode, uid, gid)
     }
 
     /// 节点合并或截断在发表之前保留真实节点和释放窗口，尚不改变位图或空闲计数。

@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
 use crate::block::{AccessMode, BlockError};
+use crate::fs::ext4::DirectoryCursor;
 use crate::fs::{writeback, DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess};
 use crate::mm::space::{Mm, VmError};
 use crate::mm::FolioRef;
@@ -16,7 +17,6 @@ pub type FileRef = Arc<dyn FileLike>;
 
 const O_ACCMODE: u32 = 0o3;
 const O_WRONLY: u32 = 0o1;
-const O_CREAT: u32 = 0o100;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
@@ -306,10 +306,10 @@ pub struct InodeFile {
     wb_errors: SpinLock<(u32, u32)>,
 }
 
-/// 目录的打开实例，枚举位置使用后端已有的字节记录边界。
+/// 目录的打开实例保存后端cookie和相同hash项的真实续读位置。
 pub struct DirectoryFile {
     path: Path,
-    cursor: SleepMutex<u64>,
+    cursor: SleepMutex<DirectoryCursor>,
     flags: AtomicU32,
     wb_error: SpinLock<u32>,
 }
@@ -319,18 +319,18 @@ pub fn open_path(path: Path) -> Result<FileRef, FsError> {
     open_path_with_flags(path, 0)
 }
 
-/// 按真实访问模式建立完整 OFD 后截断；只读截断的临时写拥有不转移到打开实例。
-/// 需要发表描述符的调用者须先预留槽位，截断之后不再申请 OFD 存储。
+/// 按已确定的真实对象建立完整 OFD；创建候选由 VFS 在名字发表前交入。
+/// O_TRUNC 在 OFD 存储准备后执行；只读截断的临时写拥有不转入打开实例。
 pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
     let access = flags & O_ACCMODE;
     if access == O_ACCMODE {
         return Err(FsError::InvalidOperation);
     }
-    if access != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
+    if access != 0 || flags & O_TRUNC != 0 {
         path.check_writable()?;
     }
     let flags = flags & !O_CLOEXEC;
-    if flags & !(OPEN_FLAGS | O_ACCMODE | O_CREAT | O_TRUNC) != 0 {
+    if flags & !(OPEN_FLAGS | O_ACCMODE | O_TRUNC) != 0 {
         return Err(FsError::Unsupported);
     }
     // 独立的完整同步位同样隐含数据同步位，写后路径只需据 O_DSYNC 判断是否同步。
@@ -351,9 +351,6 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
             } else {
                 None
             };
-            if flags & O_CREAT != 0 {
-                return Err(FsError::Unsupported);
-            }
             let wb_errors = (
                 inode.mapping().sample_wb_error(),
                 inode.filesystem().metadata_cache().sample_wb_error(),
@@ -385,13 +382,11 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
             if access != 0 || flags & O_TRUNC != 0 {
                 return Err(FsError::IsDirectory);
             }
-            if flags & O_CREAT != 0 {
-                return Err(FsError::Unsupported);
-            }
+            let cursor = inode.directory_cursor(0)?;
             let wb_error = inode.filesystem().metadata_cache().sample_wb_error();
             Ok(Arc::try_new(DirectoryFile {
                 path,
-                cursor: SleepMutex::new(0),
+                cursor: SleepMutex::new(cursor),
                 flags: AtomicU32::new(flags),
                 wb_error: SpinLock::new(wb_error),
             })
@@ -636,9 +631,9 @@ impl FileLike for DirectoryFile {
         Err(FsError::IsDirectory)
     }
 
-    /// 设置目录字节位置，后续枚举由后端检查该位置的记录边界。
+    /// 按真实后端cookie定位；显式seek从新位置重新枚举hash碰撞。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError> {
-        seek_path(&self.path, &self.cursor, from)
+        seek_directory(&self.path, &self.cursor, from)
     }
 
     /// 目录属性直接来自真实 inode，不获取枚举位置锁。
@@ -646,24 +641,24 @@ impl FileLike for DirectoryFile {
         stat_path(&self.path)
     }
 
-    /// 内核单项枚举保留原拥有语义，与流式枚举共用完整项提交。
+    /// 内核单项枚举保留真实后端cookie和hash碰撞续读状态。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
         let mut cursor = self.cursor.lock();
-        let entry = self.path.inode()?.dir_next(*cursor)?;
+        let entry = self.path.inode()?.dir_next(&cursor)?;
         if let Some(entry) = &entry {
             commit_dirent(&mut cursor, entry);
         }
         Ok(entry)
     }
 
-    /// 锁内串行真实目录流，消费者在完整记录交付后才授权推进 cookie。
+    /// 只有消费者完整接受一项后才提交其后端cookie及碰撞续读状态。
     fn for_each_dirent(
         &self,
         emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
     ) -> Result<(), FsError> {
         let mut cursor = self.cursor.lock();
         let inode = self.path.inode()?;
-        while let Some(entry) = inode.dir_next(*cursor)? {
+        while let Some(entry) = inode.dir_next(&cursor)? {
             if !emit(&entry)? {
                 break;
             }
@@ -714,9 +709,9 @@ fn set_status_flags(flags: &AtomicU32, raw: u32) -> Result<(), FsError> {
     Ok(())
 }
 
-/// 已完整交付目录项的拥有值或字节后，提交后端提供的下一记录边界。
-fn commit_dirent(cursor: &mut u64, entry: &DirectoryEntry) {
-    *cursor = entry.next_offset;
+/// 完整交付后同时提交可见cookie和后端续读状态。
+fn commit_dirent(cursor: &mut DirectoryCursor, entry: &DirectoryEntry) {
+    *cursor = entry.next_cursor;
 }
 
 /// 同一位置锁内计算并校验非负loff_t，再提交共享位置，失败不改变游标。
@@ -737,6 +732,34 @@ fn seek_path(path: &Path, cursor: &SleepMutex<u64>, from: SeekFrom) -> Result<u6
     }
     *cursor = position;
     Ok(position)
+}
+/// 显式seek按后端cookie重置碰撞状态；SEEK_CUR(0)保留真实续读位置。
+fn seek_directory(
+    path: &Path,
+    cursor: &SleepMutex<DirectoryCursor>,
+    from: SeekFrom,
+) -> Result<u64, FsError> {
+    let mut cursor = cursor.lock();
+    let position = match from {
+        SeekFrom::Start(position) => position,
+        SeekFrom::Current(0) => return Ok(cursor.cookie()),
+        SeekFrom::Current(delta) => cursor
+            .cookie()
+            .checked_add_signed(delta)
+            .ok_or(FsError::InvalidOperation)?,
+        SeekFrom::End(delta) => path
+            .inode()?
+            .directory_end_cookie()?
+            .checked_add_signed(delta)
+            .ok_or(FsError::InvalidOperation)?,
+    };
+    if (i64::MAX as u64) < position {
+        return Err(FsError::InvalidOperation);
+    }
+    let next = path.inode()?.directory_cursor(position)?;
+    let cookie = next.cookie();
+    *cursor = next;
+    Ok(cookie)
 }
 
 /// 从 canonical inode 一次读取当前属性快照，未打开的符号链接同样能取得属性。

@@ -12,6 +12,7 @@ pub(crate) mod system;
 pub(crate) mod writeback;
 
 pub use dentry::{DentryCache, DentryRef};
+pub(crate) use ext4::DirectoryCursor;
 pub use ext4::{
     BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind, InodeTime,
 };
@@ -21,9 +22,11 @@ pub use file::{
 };
 pub use file::{ReadBuffer, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
-pub(crate) use inode::{initialize_inode_eviction, InodeCacheWatch, PreparedMkwrite};
+pub(crate) use inode::{
+    initialize_inode_eviction, DirectoryWriteGuard, InodeCacheWatch, PreparedMkwrite,
+};
 pub use inode::{ExecAccess, InodeCache, InodeMetadata, InodeRef, WriteAccess};
-pub use path::{FsContext, Path, ResolveMode, Vfs};
+pub use path::{FsContext, LastComponent, LookupParent, Path, ResolveMode, Vfs};
 
 use crate::block::BlockError;
 
@@ -38,6 +41,12 @@ pub enum FsError {
     Checksum,
     Unsupported,
     NotFound,
+    Exists,
+    NotEmpty,
+    CrossDevice,
+    TooManyLinks,
+    NameTooLong,
+    NotPermitted,
     MissingRoot,
     NotDirectory,
     InvalidName,
@@ -74,6 +83,12 @@ impl FsError {
             | Self::BadAddress
             | Self::Permission
             | Self::NotFound
+            | Self::Exists
+            | Self::NotEmpty
+            | Self::CrossDevice
+            | Self::TooManyLinks
+            | Self::NameTooLong
+            | Self::NotPermitted
             | Self::MissingRoot
             | Self::NotDirectory
             | Self::InvalidName

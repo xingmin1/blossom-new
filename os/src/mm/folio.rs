@@ -1064,6 +1064,15 @@ impl FolioRead {
         self.completed
     }
 
+    /// 只观察读入原页的终身文件角色，不借用内容或改变初始化责任。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_is_file(&self) -> bool {
+        matches!(
+            &FolioState::shared(&self.folio.descriptor.usage()).contents,
+            FolioContents::File { .. }
+        )
+    }
+
     /// 完成前只借用本 owner 的缺失初始化范围；交设备后 DMA 层不得调用此入口。
     pub fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         assert!(

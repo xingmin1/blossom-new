@@ -285,15 +285,10 @@ fn enumerate_names(
     let count = if indexed { DIRECTORY_ENTRIES } else { 40 };
     let mut seen = [false; DIRECTORY_ENTRIES];
     let mut dots = 0;
-    let mut offset = 0;
     while let Some(entry) = checked(context, table.readdir(fd))? {
-        if entry.next_offset <= offset {
-            return Err(TestError("file directory cursor failed to advance"));
-        }
-        offset = entry.next_offset;
         context.expect_eq(
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,
-            offset,
+            entry.next_cookie,
         );
         if entry.name == b"." || entry.name == b".." {
             dots += 1;
@@ -356,28 +351,43 @@ pub(crate) mod directories {
             let duplicate = checked(context, table.dup(fd))?;
             let first = checked(context, table.readdir(fd))?
                 .ok_or(TestError("directory first entry absent"))?;
-            let cookie = first.next_offset;
+            let reread_cookie = first.next_cookie;
             context.expect_eq(checked(context, table.readdir(independent))?, Some(first));
             let next = checked(context, table.readdir(duplicate))?
                 .ok_or(TestError("directory second entry absent"))?;
-            checked(context, table.seek(independent, SeekFrom::Start(cookie)))?;
+            let position_cookie = next.next_cookie;
+            checked(
+                context,
+                table.seek(independent, SeekFrom::Start(reread_cookie)),
+            )?;
             context.expect_eq(checked(context, table.readdir(independent))?, Some(next));
             context.expect_eq(
                 checked(context, table.seek(fd, SeekFrom::Current(0)))?,
                 checked(context, table.seek(duplicate, SeekFrom::Current(0)))?,
             );
-            checked(context, table.seek(fd, SeekFrom::Start(1)))?;
-            context.expect_eq(table.readdir(fd).err(), Some(FsError::InvalidOperation));
-            context.expect_eq(checked(context, table.seek(fd, SeekFrom::Current(0)))?, 1);
-            context.expect_eq(checked(context, table.seek(fd, SeekFrom::Current(-1)))?, 0);
-            let size = checked(context, table.stat(fd))?.size;
-            context.expect_eq(checked(context, table.seek(fd, SeekFrom::End(0)))?, size);
+            context.expect_eq(
+                table.seek(fd, SeekFrom::Start(i64::MAX as u64 + 1)).err(),
+                Some(FsError::InvalidOperation),
+            );
+            context.expect_eq(
+                checked(context, table.seek(fd, SeekFrom::Current(0)))?,
+                position_cookie,
+            );
+            let end_cookie = checked(context, table.seek(fd, SeekFrom::End(0)))?;
             context.expect_eq(checked(context, table.readdir(fd))?, None);
+            context.expect_eq(
+                checked(context, table.seek(fd, SeekFrom::Current(0)))?,
+                end_cookie,
+            );
             context.expect_eq(
                 table.seek(fd, SeekFrom::End(i64::MIN)).err(),
                 Some(FsError::InvalidOperation),
             );
-            context.expect_eq(checked(context, table.seek(fd, SeekFrom::Start(0)))?, 0);
+            context.expect_eq(
+                checked(context, table.seek(fd, SeekFrom::Current(0)))?,
+                end_cookie,
+            );
+            checked(context, table.seek(fd, SeekFrom::Start(0)))?;
             enumerate_names(context, table, duplicate, indexed)?;
             let mut byte = [0xa7; 1];
             context.expect_eq(table.read(fd, &mut byte).err(), Some(FsError::IsDirectory));

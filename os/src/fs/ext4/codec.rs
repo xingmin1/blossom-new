@@ -28,6 +28,270 @@ pub(crate) fn le32(data: &[u8], offset: usize) -> Result<u32, FsError> {
     let b = bytes(data, offset, 4)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
+/// 按目录哈希版本计算原始字节的 major/minor 哈希。
+pub(crate) fn directory_hash(
+    geometry: &Geometry,
+    hash_version: u8,
+    name: &[u8],
+) -> Result<(u32, u32), FsError> {
+    let version = if hash_version <= 2 && geometry.hash_unsigned {
+        hash_version + 3
+    } else {
+        hash_version
+    };
+    let (mut major, minor) = match version {
+        0 => (legacy_hash(name, false), 0),
+        1 | 4 => half_md4_hash(name, version == 4, geometry.hash_seed),
+        2 | 5 => tea_hash(name, version == 5, geometry.hash_seed),
+        3 => (legacy_hash(name, true), 0),
+        6 => return Err(FsError::Unsupported),
+        _ => return Err(FsError::Unsupported),
+    };
+    major &= !1;
+    if major == u32::MAX - 1 {
+        major = u32::MAX - 3;
+    }
+    Ok((major, minor))
+}
+
+/// 计算不使用目录种子的旧版 32 位名字哈希。
+fn legacy_hash(name: &[u8], unsigned: bool) -> u32 {
+    let mut hash0 = 0x12a3_fe2d_u32;
+    let mut hash1 = 0x37ab_e8f9_u32;
+    for &byte in name {
+        let value = if unsigned {
+            i32::from(byte) as u32
+        } else {
+            i32::from(byte as i8) as u32
+        };
+        let mut hash = hash1.wrapping_add(hash0 ^ value.wrapping_mul(7_152_373));
+        if hash & 0x8000_0000 != 0 {
+            hash = hash.wrapping_sub(0x7fff_ffff);
+        }
+        hash1 = hash0;
+        hash0 = hash;
+    }
+    hash0.wrapping_shl(1)
+}
+
+/// 将一个名字分组转换为半 MD4 使用的整数缓冲。
+fn hash_buffer(
+    name: &[u8],
+    offset: usize,
+    remaining: usize,
+    words: usize,
+    unsigned: bool,
+) -> [u32; 8] {
+    let pad = (remaining as u32) | ((remaining as u32) << 8);
+    let pad = pad | (pad << 16);
+    let mut result = [pad; 8];
+    let mut value = pad;
+    let mut word = 0usize;
+    let count = core::cmp::min(remaining, words * 4);
+    for index in 0..count {
+        let byte = if unsigned {
+            i32::from(name[offset + index])
+        } else {
+            i32::from(name[offset + index] as i8)
+        };
+        value = (byte as u32).wrapping_add(value.wrapping_shl(8));
+        if index % 4 == 3 {
+            result[word] = value;
+            word += 1;
+            value = pad;
+        }
+    }
+    if count % 4 != 0 {
+        result[word] = value;
+    }
+    result
+}
+
+/// 以三轮布尔函数更新半 MD4 状态并返回其主要哈希字。
+fn half_md4_transform(state: &mut [u32; 4], input: &[u32; 8]) -> u32 {
+    let [mut a, mut b, mut c, mut d] = *state;
+    macro_rules! round {
+        ($f:expr, $a:ident, $b:ident, $c:ident, $d:ident, $x:expr, $s:expr) => {
+            $a = $a
+                .wrapping_add($f($b, $c, $d))
+                .wrapping_add($x)
+                .rotate_left($s);
+        };
+    }
+    let f = |x: u32, y: u32, z: u32| z ^ (x & (y ^ z));
+    let g = |x: u32, y: u32, z: u32| (x & y).wrapping_add((x ^ y) & z);
+    let h = |x: u32, y: u32, z: u32| x ^ y ^ z;
+
+    round!(f, a, b, c, d, input[0], 3);
+    round!(f, d, a, b, c, input[1], 7);
+    round!(f, c, d, a, b, input[2], 11);
+    round!(f, b, c, d, a, input[3], 19);
+    round!(f, a, b, c, d, input[4], 3);
+    round!(f, d, a, b, c, input[5], 7);
+    round!(f, c, d, a, b, input[6], 11);
+    round!(f, b, c, d, a, input[7], 19);
+
+    const K2: u32 = 0x5a82_7999;
+    round!(g, a, b, c, d, input[1].wrapping_add(K2), 3);
+    round!(g, d, a, b, c, input[3].wrapping_add(K2), 5);
+    round!(g, c, d, a, b, input[5].wrapping_add(K2), 9);
+    round!(g, b, c, d, a, input[7].wrapping_add(K2), 13);
+    round!(g, a, b, c, d, input[0].wrapping_add(K2), 3);
+    round!(g, d, a, b, c, input[2].wrapping_add(K2), 5);
+    round!(g, c, d, a, b, input[4].wrapping_add(K2), 9);
+    round!(g, b, c, d, a, input[6].wrapping_add(K2), 13);
+
+    const K3: u32 = 0x6ed9_eba1;
+    round!(h, a, b, c, d, input[3].wrapping_add(K3), 3);
+    round!(h, d, a, b, c, input[7].wrapping_add(K3), 9);
+    round!(h, c, d, a, b, input[2].wrapping_add(K3), 11);
+    round!(h, b, c, d, a, input[6].wrapping_add(K3), 15);
+    round!(h, a, b, c, d, input[1].wrapping_add(K3), 3);
+    round!(h, d, a, b, c, input[5].wrapping_add(K3), 9);
+    round!(h, c, d, a, b, input[0].wrapping_add(K3), 11);
+    round!(h, b, c, d, a, input[4].wrapping_add(K3), 15);
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[1]
+}
+
+/// 计算半 MD4 的 major/minor 哈希。
+fn half_md4_hash(name: &[u8], unsigned: bool, seed: [u32; 4]) -> (u32, u32) {
+    let mut state = if seed.iter().all(|&word| word == 0) {
+        [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
+    } else {
+        seed
+    };
+    let mut offset = 0usize;
+    while offset < name.len() {
+        let remaining = name.len() - offset;
+        let input = hash_buffer(name, offset, remaining, 8, unsigned);
+        half_md4_transform(&mut state, &input);
+        offset += 32;
+    }
+    (state[1], state[2])
+}
+
+/// 执行 TEA 目录哈希的一轮十六步变换。
+fn tea_transform(state: &mut [u32; 4], input: &[u32; 8]) {
+    const DELTA: u32 = 0x9e37_79b9;
+    let mut sum = 0u32;
+    let mut b0 = state[0];
+    let mut b1 = state[1];
+    for _ in 0..16 {
+        sum = sum.wrapping_add(DELTA);
+        b0 = b0.wrapping_add(
+            (b1.wrapping_shl(4).wrapping_add(input[0]))
+                ^ b1.wrapping_add(sum)
+                ^ (b1.wrapping_shr(5).wrapping_add(input[1])),
+        );
+        b1 = b1.wrapping_add(
+            (b0.wrapping_shl(4).wrapping_add(input[2]))
+                ^ b0.wrapping_add(sum)
+                ^ (b0.wrapping_shr(5).wrapping_add(input[3])),
+        );
+    }
+    state[0] = state[0].wrapping_add(b0);
+    state[1] = state[1].wrapping_add(b1);
+}
+
+/// 计算 TEA 的 major/minor 哈希。
+fn tea_hash(name: &[u8], unsigned: bool, seed: [u32; 4]) -> (u32, u32) {
+    let mut state = if seed.iter().all(|&word| word == 0) {
+        [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
+    } else {
+        seed
+    };
+    let mut offset = 0usize;
+    while offset < name.len() {
+        let remaining = name.len() - offset;
+        let input = hash_buffer(name, offset, remaining, 4, unsigned);
+        tea_transform(&mut state, &input);
+        offset += 16;
+    }
+    (state[0], state[1])
+}
+
+/// 重新计算带 metadata_csum 的普通目录尾 CRC。
+pub(crate) fn update_directory_checksum(
+    geometry: &Geometry,
+    inode: &InodeMetadata,
+    data: &mut [u8],
+) -> Result<(), FsError> {
+    if geometry.features_ro_compat & METADATA_CSUM == 0 {
+        return Ok(());
+    }
+    let end = geometry
+        .block_size
+        .checked_sub(12)
+        .ok_or(FsError::Corrupt)?;
+    let tail = data
+        .get_mut(end..geometry.block_size)
+        .ok_or(FsError::Corrupt)?;
+    tail.fill(0);
+    put16(data, end + 4, 12);
+    data[end + 7] = 0xde;
+    let checksum = crc32c(inode.checksum_seed, bytes(data, 0, end)?);
+    put32(data, end + 8, checksum);
+    Ok(())
+}
+
+/// 按 dx 中实际使用的条目计算 root 或 index-node 尾 CRC。
+pub(crate) fn update_dx_checksum(
+    inode: &InodeMetadata,
+    data: &mut [u8],
+    entries_end: usize,
+    tail: usize,
+) -> Result<(), FsError> {
+    put32(data, tail, 0);
+    put32(data, tail + 4, 0);
+    let checksum = dx_checksum(inode.checksum_seed, data, entries_end, tail)?;
+    put32(data, tail + 4, checksum);
+    Ok(())
+}
+
+/// dx checksum 覆盖已用条目、tail 保留字与置零的 checksum 字段。
+pub(crate) fn dx_checksum(
+    seed: u32,
+    data: &[u8],
+    entries_end: usize,
+    tail: usize,
+) -> Result<u32, FsError> {
+    let mut checksum = crc32c(seed, bytes(data, 0, entries_end)?);
+    checksum = crc32c(checksum, bytes(data, tail, 4)?);
+    Ok(crc32c(checksum, &[0; 4]))
+}
+
+/// 从 metadata_csum 目录尾验证普通 dirent 块 CRC。
+pub(crate) fn verify_directory_checksum(
+    geometry: &Geometry,
+    inode: &InodeMetadata,
+    data: &[u8],
+    end: usize,
+) -> Result<(), FsError> {
+    if geometry.features_ro_compat & METADATA_CSUM != 0
+        && crc32c(inode.checksum_seed, bytes(data, 0, end)?) != le32(data, end + 8)?
+    {
+        return Err(FsError::Checksum);
+    }
+    Ok(())
+}
+
+/// 解码 dx 根或 index-node 的已用条目数并验证真实尾 CRC。
+pub(crate) fn verify_dx_checksum(
+    inode: &InodeMetadata,
+    data: &[u8],
+    entries_end: usize,
+    tail: usize,
+) -> Result<(), FsError> {
+    if dx_checksum(inode.checksum_seed, data, entries_end, tail)? != le32(data, tail + 4)? {
+        return Err(FsError::Checksum);
+    }
+    Ok(())
+}
 
 /// 向上取整块数，不让外部计数加法溢出。
 pub(crate) fn ceil_div(value: u64, unit: u64) -> Result<u64, FsError> {
@@ -153,6 +417,18 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     } else {
         crc32c(!0, &uuid)
     };
+    let hash_seed = [
+        le32(data, 236)?,
+        le32(data, 240)?,
+        le32(data, 244)?,
+        le32(data, 248)?,
+    ];
+    let hash_flags = le32(data, 352)?;
+    let hash_unsigned = hash_flags & 2 != 0 || hash_flags & 3 == 0;
+    let default_hash_version = data[252];
+    if 5 < default_hash_version {
+        return Err(FsError::Unsupported);
+    }
     let log_groups_per_flex = data[372];
     if 31 < log_groups_per_flex {
         return Err(FsError::Corrupt);
@@ -172,6 +448,9 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         groups_count,
         descriptor_blocks,
         checksum_seed,
+        hash_seed,
+        hash_unsigned,
+        default_hash_version,
         uuid,
         reserved_gdt_blocks: u64::from(le16(data, 206)?),
         backup_groups: [le32(data, 588)?, le32(data, 592)?],

@@ -253,7 +253,7 @@ pub(crate) struct PreparedMapping {
     pub removed_blocks: u64,
     retired: Vec<DetachedBlock>,
     nodes: Vec<NodeEdit>,
-    indirect: Vec<(BufferRef, usize, u32, bool)>,
+    indirect: Vec<IndirectEdit>,
     allocated: Vec<UnpublishedBlock>,
 }
 
@@ -268,9 +268,75 @@ struct NodeEdit {
     new: bool,
 }
 
+struct IndirectEdit {
+    buffer: BufferRef,
+    physical: u64,
+    offset: usize,
+    pointer: u32,
+    initialize: bool,
+}
+
+/// 目录一次扩展所需的新逻辑块映射，所有根和块 token 同属一个准备。
+pub(crate) struct PreparedDirectoryMappings {
+    mapping: PreparedMapping,
+    logical: Vec<u64>,
+    physical: Vec<u64>,
+    seed: u32,
+}
+
+impl PreparedDirectoryMappings {
+    /// 返回批次中逻辑目录块对应的实际物理块。
+    pub(crate) fn physical(&self, logical: u64) -> Option<u64> {
+        self.logical
+            .iter()
+            .position(|candidate| *candidate == logical)
+            .map(|index| self.physical[index])
+    }
+
+    /// 返回完成整批修改后的 inline inode 块根。
+    pub(crate) fn root(&self) -> &[u8; 60] {
+        &self.mapping.root
+    }
+
+    /// 返回数据块和 extent/indirect 节点的总文件系统块数。
+    pub(crate) fn added_blocks(&self) -> u64 {
+        self.mapping.added_blocks
+    }
+
+    /// 目录块内容提交后接入全部映射节点，并消费所有未发表块位。
+    pub(crate) fn publish(self, volume: &Ext4Volume) {
+        let retired = self.mapping.publish(volume, self.seed);
+        assert!(retired.is_empty(), "directory mapping retired old blocks");
+    }
+
+    /// 目录准备失败时只归还本批次仍未连接的块。
+    pub(crate) fn cancel(self, volume: &Ext4Volume) {
+        self.mapping.cancel(volume);
+    }
+}
+
 impl PreparedMapping {
     /// 映射准备或目的页准备失败时只释放本次尚未连接的全部块。
     pub(crate) fn cancel(mut self, volume: &Ext4Volume) {
+        for node in &self.nodes {
+            if node.new {
+                let buffer = node.buffer.as_ref().expect("new extent node lacks buffer");
+                // SAFETY: 该块仍由本计划 reservation 保有且未接入旧根；metadata_block 读取已结束，
+                // 新节点未发表写回且没有旧树消费者，失效准确窗口后才归还位图。
+                unsafe { buffer.forget(volume.claim()) }.expect("new extent alias invalidation");
+            }
+        }
+        for edit in &self.indirect {
+            if edit.initialize {
+                // SAFETY: initialize 仅标记本计划新间接节点；旧读取已结束、指针尚未进旧根，
+                // 其 BufferRef 没有写回或其他消费者，失效窗口后才归还物理位。
+                unsafe { edit.buffer.forget(volume.claim()) }
+                    .expect("new indirect alias invalidation");
+            }
+        }
+        self.nodes.clear();
+        self.indirect.clear();
+        self.retired.clear();
         while let Some(block) = self.allocated.pop() {
             volume.release_unpublished_block(block);
         }
@@ -291,13 +357,13 @@ impl PreparedMapping {
             }
         }
         // 新间接链先初始化，最后才连接已有父指针；读者仍受 inode root 写侧排斥。
-        for (buffer, offset, physical, new) in &self.indirect {
-            buffer
+        for edit in &self.indirect {
+            edit.buffer
                 .update(volume.claim(), |bytes| {
-                    if *new {
+                    if edit.initialize {
                         bytes.fill(0);
                     }
-                    codec::put32(bytes, *offset, *physical);
+                    codec::put32(bytes, edit.offset, edit.pointer);
                 })
                 .expect("prepared writable indirect node");
         }
@@ -308,6 +374,21 @@ impl PreparedMapping {
             block.arm_release();
         }
         self.retired
+    }
+}
+
+/// 建立一份仅持本次计划、不隐含任何已发表块拥有的修改容器。
+fn empty_mapping(root: [u8; 60]) -> PreparedMapping {
+    PreparedMapping {
+        root,
+        physical: 0,
+        zero: false,
+        added_blocks: 0,
+        removed_blocks: 0,
+        retired: Vec::new(),
+        nodes: Vec::new(),
+        indirect: Vec::new(),
+        allocated: Vec::new(),
     }
 }
 
@@ -328,24 +409,14 @@ pub(crate) fn prepare(
         return Err(FsError::FileTooLarge);
     }
     let existing = map(volume, inode, logical, logical + 1)?;
-    let mut prepared = PreparedMapping {
-        root: inode.block,
-        physical: 0,
-        zero: false,
-        added_blocks: 0,
-        removed_blocks: 0,
-        nodes: Vec::new(),
-        indirect: Vec::new(),
-        allocated: Vec::new(),
-        retired: Vec::new(),
-    };
+    let mut prepared = empty_mapping(inode.block);
     if let BlockMapping::Mapped { physical, .. } = existing {
         prepared.physical = physical;
         return Ok(prepared);
     }
     prepared.zero = true;
     let result = if inode.flags & EXTENTS != 0 {
-        prepare_extent(volume, inode, logical, existing, &mut prepared)
+        prepare_extent(volume, inode, logical, existing, &mut prepared, true)
     } else {
         prepare_indirect(volume, inode, logical, &mut prepared)
     };
@@ -356,6 +427,100 @@ pub(crate) fn prepare(
     prepared.added_blocks = prepared.allocated.len() as u64;
     prepared.removed_blocks = prepared.retired.len() as u64;
     Ok(prepared)
+}
+
+/// 为一次目录扩展预留全部数据块和块树修改；新映射在统一发表前不接入旧 inode 根。
+pub(crate) fn prepare_directory_mappings(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    root: &[u8; 60],
+    logical_blocks: &[u64],
+) -> Result<PreparedDirectoryMappings, FsError> {
+    if inode.kind != InodeKind::Directory {
+        return Err(FsError::InvalidOperation);
+    }
+    prepare_mapping_batch(volume, inode, root, logical_blocks)
+}
+
+/// 符号链接使用相同的 block-tree planner 和 reservation path。
+pub(crate) fn prepare_symlink_mappings(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    root: &[u8; 60],
+    logical_blocks: &[u64],
+) -> Result<PreparedDirectoryMappings, FsError> {
+    if inode.kind != InodeKind::Symlink {
+        return Err(FsError::InvalidOperation);
+    }
+    prepare_mapping_batch(volume, inode, root, logical_blocks)
+}
+
+/// 为一组连续空洞在一个 prepared tree 上累积映射，不先发表中间根。
+fn prepare_mapping_batch(
+    volume: &Ext4Volume,
+    inode: &InodeData,
+    root: &[u8; 60],
+    logical_blocks: &[u64],
+) -> Result<PreparedDirectoryMappings, FsError> {
+    if inode.block != *root {
+        return Err(FsError::InvalidOperation);
+    }
+    let mut logical = Vec::new();
+    logical
+        .try_reserve_exact(logical_blocks.len())
+        .map_err(|_| FsError::NoMemory)?;
+    let mut physical = Vec::new();
+    physical
+        .try_reserve_exact(logical_blocks.len())
+        .map_err(|_| FsError::NoMemory)?;
+    let mut previous: Option<u64> = None;
+    for &block in logical_blocks {
+        if previous.is_some_and(|previous| previous.checked_add(1) != Some(block)) {
+            return Err(FsError::InvalidOperation);
+        }
+        if !matches!(
+            map(
+                volume,
+                inode,
+                block,
+                block.checked_add(1).ok_or(FsError::FileTooLarge)?
+            )?,
+            BlockMapping::Hole { .. }
+        ) {
+            return Err(FsError::Corrupt);
+        }
+        logical.push(block);
+        previous = Some(block);
+    }
+
+    let mut mapping = empty_mapping(*root);
+    for &block in &logical {
+        mapping.zero = true;
+        let result = if inode.flags & EXTENTS != 0 {
+            prepare_extent(
+                volume,
+                inode,
+                block,
+                BlockMapping::Hole { len: 1 },
+                &mut mapping,
+                false,
+            )
+        } else {
+            prepare_indirect(volume, inode, block, &mut mapping)
+        };
+        if let Err(error) = result {
+            mapping.cancel(volume);
+            return Err(error);
+        }
+        physical.push(mapping.physical);
+        mapping.added_blocks = mapping.allocated.len() as u64;
+    }
+    Ok(PreparedDirectoryMappings {
+        mapping,
+        logical,
+        physical,
+        seed: inode.checksum_seed,
+    })
 }
 
 /// 准备条目容量在任何共同 Buffer 内容借用之前完成。
@@ -395,9 +560,14 @@ fn prepare_extent(
     logical: u64,
     existing: BlockMapping,
     prepared: &mut PreparedMapping,
+    consolidate: bool,
 ) -> Result<(), FsError> {
     let g = volume.geometry();
-    let depth = codec::extent_header(&inode.block, None)?.depth as usize;
+    let depth = if prepared.nodes.is_empty() {
+        codec::extent_header(&inode.block, None)?.depth as usize
+    } else {
+        prepared.nodes[0].depth as usize
+    };
     if 32 < depth {
         return Err(FsError::FileTooLarge);
     }
@@ -409,25 +579,32 @@ fn prepare_extent(
         .allocated
         .try_reserve_exact(depth + 4)
         .map_err(|_| FsError::NoMemory)?;
-    prepared
-        .retired
-        .try_reserve_exact(depth * 2)
-        .map_err(|_| FsError::NoMemory)?;
-    prepared
-        .nodes
-        .push(read_node(&inode.block, entry_storage(4)?)?);
+    if consolidate {
+        prepared
+            .retired
+            .try_reserve_exact(depth * 2)
+            .map_err(|_| FsError::NoMemory)?;
+    }
+    if prepared.nodes.is_empty() {
+        prepared
+            .nodes
+            .push(read_node(&inode.block, entry_storage(4)?)?);
+    }
+
+    let mut path = [0usize; 33];
     let mut slots = [0usize; 33];
     let mut visited = [0u64; 32];
     let mut high = 1u64 << 32;
     for level in 0..depth {
-        let node = &prepared.nodes[level];
+        let parent_index = path[level];
+        let node = &prepared.nodes[parent_index];
         let selected = node
             .entries
             .iter()
             .rposition(|entry| entry_key(entry) <= logical)
             .unwrap_or(0);
         slots[level] = selected;
-        let entry = &node.entries[selected];
+        let entry = node.entries.get(selected).ok_or(FsError::Corrupt)?;
         let physical = index_physical(entry);
         let next_low = entry_key(entry);
         let next_high = node
@@ -439,26 +616,39 @@ fn prepare_extent(
             return Err(FsError::Corrupt);
         }
         visited[level] = physical;
-        let entries = entry_storage((g.block_size - 12) / 12)?;
-        let buffer = volume.metadata_block(physical)?;
-        // 插入最左端可早于旧首 key；节点验证仍使用原父边界。
-        let mut child = buffer.with_read(|bytes| {
-            extent_step(
-                g,
-                inode,
-                bytes,
-                logical.max(next_low),
-                Some((depth - level - 1) as u16),
-                Some(next_low),
-                next_high,
-            )?;
-            read_node(bytes, entries)
-        })??;
-        child.buffer = Some(buffer);
-        child.physical = physical;
-        prepared.nodes.push(child);
+        let child_index = if let Some(index) = prepared
+            .nodes
+            .iter()
+            .position(|candidate| candidate.physical == physical)
+        {
+            if prepared.nodes[index].depth != (depth - level - 1) as u16 {
+                return Err(FsError::Corrupt);
+            }
+            index
+        } else {
+            let entries = entry_storage((g.block_size - 12) / 12)?;
+            let buffer = volume.metadata_block(physical)?;
+            let mut child = buffer.with_read(|bytes| {
+                extent_step(
+                    g,
+                    inode,
+                    bytes,
+                    logical.max(next_low),
+                    Some((depth - level - 1) as u16),
+                    Some(next_low),
+                    next_high,
+                )?;
+                read_node(bytes, entries)
+            })??;
+            child.buffer = Some(buffer);
+            child.physical = physical;
+            prepared.nodes.push(child);
+            prepared.nodes.len() - 1
+        };
+        path[level + 1] = child_index;
         high = next_high;
     }
+
     prepared.physical = match existing {
         BlockMapping::Unwritten { physical, .. } => physical,
         BlockMapping::Hole { .. } => {
@@ -473,28 +663,31 @@ fn prepare_extent(
         }
         _ => return Err(FsError::Corrupt),
     };
+    let leaf = path[depth];
     change_leaf(
-        &mut prepared.nodes[depth].entries,
+        &mut prepared.nodes[leaf].entries,
         logical,
         prepared.physical,
     )?;
-    prepared.nodes[depth].dirty = true;
+    prepared.nodes[leaf].dirty = true;
+
     let mut split_nodes = false;
     let mut level = depth;
     loop {
-        let count = prepared.nodes[level].entries.len();
-        if prepared.nodes[level].max < count {
+        let node_index = path[level];
+        let count = prepared.nodes[node_index].entries.len();
+        if prepared.nodes[node_index].max < count {
             split_nodes = true;
             let split = count / 2;
-            let node_depth = prepared.nodes[level].depth;
+            let node_depth = prepared.nodes[node_index].depth;
             let right = new_node(volume, inode, prepared, node_depth)?;
             let right_index = prepared.nodes.len() - 1;
             for index in split..count {
-                let entry = prepared.nodes[level].entries[index];
+                let entry = prepared.nodes[node_index].entries[index];
                 prepared.nodes[right_index].entries.push(entry);
             }
-            prepared.nodes[level].entries.truncate(split);
-            prepared.nodes[level].dirty = true;
+            prepared.nodes[node_index].entries.truncate(split);
+            prepared.nodes[node_index].dirty = true;
             let right_key = entry_key(&prepared.nodes[right_index].entries[0]);
             if level == 0 {
                 if 32 <= prepared.nodes[0].depth {
@@ -517,16 +710,18 @@ fn prepare_extent(
                 prepared.nodes[0].max = 4;
                 break;
             }
-            let left_key = entry_key(&prepared.nodes[level].entries[0]);
-            let parent = &mut prepared.nodes[level - 1];
+            let left_key = entry_key(&prepared.nodes[node_index].entries[0]);
+            let parent_index = path[level - 1];
+            let parent = &mut prepared.nodes[parent_index];
             codec::put32(&mut parent.entries[slots[level - 1]], 0, left_key as u32);
             parent
                 .entries
                 .insert(slots[level - 1] + 1, index_entry(right_key, right));
             parent.dirty = true;
         } else if level != 0 {
-            let key = entry_key(&prepared.nodes[level].entries[0]);
-            let parent = &mut prepared.nodes[level - 1];
+            let key = entry_key(&prepared.nodes[node_index].entries[0]);
+            let parent_index = path[level - 1];
+            let parent = &mut prepared.nodes[parent_index];
             codec::put32(&mut parent.entries[slots[level - 1]], 0, key as u32);
             parent.dirty = true;
         }
@@ -535,7 +730,7 @@ fn prepare_extent(
         }
         level -= 1;
     }
-    if !split_nodes {
+    if consolidate && !split_nodes {
         consolidate_path(volume, inode, prepared, &mut slots, depth)?;
     }
     patch_node(
@@ -559,6 +754,14 @@ fn new_node(
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(max + 2)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .nodes
+        .try_reserve(1)
+        .map_err(|_| FsError::NoMemory)?;
+    prepared
+        .allocated
+        .try_reserve(1)
         .map_err(|_| FsError::NoMemory)?;
     let block = volume.allocate_block((inode.number - 1) / g.inodes_per_group)?;
     let physical = block.physical();
@@ -836,7 +1039,34 @@ fn indirect_offsets(g: &Geometry, logical: u64) -> Result<([usize; 4], usize), F
     Ok((offsets, depth + 1))
 }
 
-/// 传统分支全部准备后才连接第一个缺失链接；已有 direct/single/double/triple 原样保留。
+/// 从真实节点窗口或本批修改中读取传统指针，不把未写入的新节点旧盘字节当成有效内容。
+fn indirect_pointer(
+    prepared: &PreparedMapping,
+    buffer: &BufferRef,
+    physical: u64,
+    offset: usize,
+) -> Result<u64, FsError> {
+    if let Some(edit) = prepared
+        .indirect
+        .iter()
+        .rev()
+        .find(|edit| edit.physical == physical && edit.offset == offset)
+    {
+        return Ok(u64::from(edit.pointer));
+    }
+    if prepared
+        .indirect
+        .iter()
+        .any(|edit| edit.physical == physical && edit.initialize)
+    {
+        return Ok(0);
+    }
+    Ok(u64::from(
+        buffer.with_read(|bytes| codec::le32(bytes, offset))??,
+    ))
+}
+
+/// 传统 direct/single/double/triple 分支累积到同一准备中再发表。
 fn prepare_indirect(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -854,12 +1084,13 @@ fn prepare_indirect(
         .map_err(|_| FsError::NoMemory)?;
     let mut parent = None;
     let mut missing = 0;
-    let mut physical = u64::from(codec::le32(&inode.block, offsets[0] * 4)?);
+    let mut physical = u64::from(codec::le32(&prepared.root, offsets[0] * 4)?);
     while physical != 0 && missing + 1 < length {
-        let buffer = volume.metadata_block(physical)?;
+        let node_physical = physical;
+        let buffer = volume.metadata_block(node_physical)?;
         missing += 1;
-        physical = buffer.with_read(|bytes| codec::le32(bytes, offsets[missing] * 4))?? as u64;
-        parent = Some(buffer);
+        physical = indirect_pointer(prepared, &buffer, node_physical, offsets[missing] * 4)?;
+        parent = Some((buffer, node_physical));
     }
     if physical != 0 {
         return Err(FsError::Corrupt);
@@ -877,16 +1108,24 @@ fn prepare_indirect(
             prepared.physical = physical;
         } else {
             let buffer = volume.metadata_block(physical)?;
-            prepared
-                .indirect
-                .push((buffer, offsets[level + 1] * 4, next, true));
+            prepared.indirect.push(IndirectEdit {
+                buffer,
+                physical,
+                offset: offsets[level + 1] * 4,
+                pointer: next,
+                initialize: true,
+            });
         }
         next = physical as u32;
     }
-    if let Some(parent) = parent {
-        prepared
-            .indirect
-            .push((parent, offsets[missing] * 4, next, false));
+    if let Some((buffer, physical)) = parent {
+        prepared.indirect.push(IndirectEdit {
+            buffer,
+            physical,
+            offset: offsets[missing] * 4,
+            pointer: next,
+            initialize: false,
+        });
     } else {
         codec::put32(&mut prepared.root, offsets[0] * 4, next);
     }

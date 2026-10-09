@@ -326,6 +326,21 @@ impl BioInner {
         None
     }
 
+    /// 按本 child 的 payload 起点识别实际文件读入，不访问 DMA 内容。
+    #[cfg(feature = "ktest")]
+    pub(super) fn ktest_file_read(&self, offset: usize) -> Option<bool> {
+        let state = self.state.lock();
+        let mut base = 0;
+        for mapped in state.memory.as_ref()? {
+            let end = base + mapped.len();
+            if base <= offset && offset < end {
+                return Some(mapped.ktest_file_read());
+            }
+            base = end;
+        }
+        None
+    }
+
     /// slot 在 IRQ 分派前检查是否必须使用预建完成 Work。
     pub(super) fn needs_task(&self) -> bool {
         matches!(self.end_io, Some(EndIo::Task(_)))

@@ -33,7 +33,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 保留格式、inode、路径、文件与系统盘模块的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 22],
+    [&'static ::ktest::SuiteSlot; 23],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -62,6 +62,7 @@ pub(crate) fn anchors() -> (
             concurrency::failed_loading::__ktest_anchor(),
             user::anchor(),
             user::write_anchor(),
+            user::namespace_anchor(),
         ],
         path::anchors(),
         file::anchors(),
@@ -498,7 +499,9 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             let submitted_before = disk.test_snapshot().submitted;
             let len_before = vfs.dcache().len();
             let evidence = pressure.exhaust();
-            let same = vfs.dcache().lookup(vfs.inodes(), &parent, cached.name())?;
+            let same = vfs
+                .dcache()
+                .lookup(vfs.inodes(), &parent, cached.name().as_slice())?;
             let error = vfs.dcache().lookup(vfs.inodes(), &parent, name).err();
             let returned = Returned::LookupOom {
                 producer_cpu: cpu::current().id,

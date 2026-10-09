@@ -304,6 +304,12 @@ impl MappedPages {
         }
     }
 
+    /// 只识别文件原页的读入凭证，raw 页和 WB 来源均不属于文件读入。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_file_read(&self) -> bool {
+        matches!(&*self.backing, PayloadBacking::Folio { read, .. } if read.ktest_is_file())
+    }
+
     /// 原父在真实 submit 成功后登记本映射的连续接受窗口，不改变设备拥有期。
     pub(crate) fn accept_range(&mut self, offset: usize, len: usize) {
         assert_eq!(

@@ -335,13 +335,10 @@ pub(crate) mod volume {
         let mut bytes = [0xa7; 9];
         context.expect_eq(checked(context, raw.read_at(0, &mut bytes))?, 9);
         context.expect_eq(bytes, *b"raw-name\n");
-        let mut offset = 0;
+        let mut cursor = checked(context, root.directory_cursor(0))?;
         let mut raw_entries = 0;
-        while let Some(entry) = checked(context, root.dir_next(offset))? {
-            if entry.next_offset <= offset {
-                return Err(TestError("byte-name directory cursor failed to advance"));
-            }
-            offset = entry.next_offset;
+        while let Some(entry) = checked(context, root.dir_next(&cursor))? {
+            cursor = entry.next_cursor;
             if entry.name == b"name-\xff\xfe" {
                 context.expect_eq(entry.number, raw.number());
                 context.expect_eq(entry.kind, Some(InodeKind::Regular));
@@ -388,13 +385,9 @@ pub(crate) mod volume {
         );
         let mut seen = [false; DIRECTORY_ENTRIES];
         let mut dots = 0;
-        let mut offset = 0;
-        while let Some(entry) = checked(context, directory.dir_next(offset))? {
-            context.expect_eq(offset < entry.next_offset, true);
-            if entry.next_offset <= offset {
-                return Err(TestError("directory cursor failed to advance"));
-            }
-            offset = entry.next_offset;
+        let mut cursor = checked(context, directory.directory_cursor(0))?;
+        while let Some(entry) = checked(context, directory.dir_next(&cursor))? {
+            cursor = entry.next_cursor;
             if entry.name == b"." || entry.name == b".." {
                 dots += 1;
                 continue;
@@ -437,12 +430,9 @@ pub(crate) mod volume {
         );
         let plain = fixture.file(context, &volume, b"plain")?;
         let mut count = 0;
-        let mut offset = 0;
-        while let Some(entry) = checked(context, plain.dir_next(offset))? {
-            if entry.next_offset <= offset {
-                return Err(TestError("plain directory cursor failed to advance"));
-            }
-            offset = entry.next_offset;
+        let mut cursor = checked(context, plain.directory_cursor(0))?;
+        while let Some(entry) = checked(context, plain.dir_next(&cursor))? {
+            cursor = entry.next_cursor;
             count += 1;
         }
         context.expect_eq(count, 42);
@@ -772,7 +762,13 @@ pub(crate) mod bad_directory {
     fn leaf_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         let volume = fixture.open(context)?;
         let directory = fixture.file(context, &volume, b"plain")?;
-        context.expect_eq(directory.dir_next(0).err(), Some(FsError::Checksum));
+        context.expect_eq(
+            directory
+                .directory_cursor(0)
+                .and_then(|cursor| directory.dir_next(&cursor))
+                .err(),
+            Some(FsError::Checksum),
+        );
         context.expect_eq(
             directory.lookup(fixture.cache(), b"item-0000").err(),
             Some(FsError::Checksum),
@@ -790,7 +786,13 @@ pub(crate) mod bad_dx {
     fn index_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         let volume = fixture.open(context)?;
         let directory = fixture.file(context, &volume, b"indexed")?;
-        context.expect_eq(directory.dir_next(0).err(), Some(FsError::Checksum));
+        context.expect_eq(
+            directory
+                .directory_cursor(0)
+                .and_then(|cursor| directory.dir_next(&cursor))
+                .err(),
+            Some(FsError::Checksum),
+        );
         context.expect_eq(
             directory.lookup(fixture.cache(), &indexed_name(0)).err(),
             Some(FsError::Checksum),
@@ -811,7 +813,13 @@ pub(crate) mod bad_directory_layout {
     ) -> TestResult {
         let volume = fixture.open(context)?;
         let directory = fixture.file(context, &volume, b"plain")?;
-        context.expect_eq(directory.dir_next(0).err(), Some(FsError::Corrupt));
+        context.expect_eq(
+            directory
+                .directory_cursor(0)
+                .and_then(|cursor| directory.dir_next(&cursor))
+                .err(),
+            Some(FsError::Corrupt),
+        );
         context.expect_eq(
             directory.lookup(fixture.cache(), b"item-0000").err(),
             Some(FsError::Corrupt),
@@ -829,7 +837,13 @@ pub(crate) mod bad_dx_layout {
     fn rejects_empty_index(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         let volume = fixture.open(context)?;
         let directory = fixture.file(context, &volume, b"indexed")?;
-        context.expect_eq(directory.dir_next(0).err(), Some(FsError::Corrupt));
+        context.expect_eq(
+            directory
+                .directory_cursor(0)
+                .and_then(|cursor| directory.dir_next(&cursor))
+                .err(),
+            Some(FsError::Corrupt),
+        );
         context.expect_eq(
             directory.lookup(fixture.cache(), &indexed_name(0)).err(),
             Some(FsError::Corrupt),

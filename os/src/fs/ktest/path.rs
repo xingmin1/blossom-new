@@ -33,7 +33,9 @@ impl PathOwner {
         let observer = self.owner.observer().clone();
         let hook: Arc<dyn Fn(&DentryRef) + Send + Sync> =
             Arc::try_new(move |dentry: &DentryRef| {
-                if dentry.name() == b"pattern" && observer.hold_loader.load(Ordering::Acquire) {
+                if dentry.name().as_slice() == b"pattern"
+                    && observer.hold_loader.load(Ordering::Acquire)
+                {
                     observer.loader_entered.fetch_add(1, Ordering::AcqRel);
                     observer.gate.wait();
                 }
@@ -57,6 +59,15 @@ impl PathOwner {
             .as_ref()
             .expect("path context consumed before body")
     }
+    /// 真实任务已停稳、外部 Path 已释放后撤观察入口并释放本例 FS 视图。
+    pub(super) fn release_view(&mut self) {
+        if let Some(vfs) = &self.vfs {
+            vfs.dcache().ktest_set_lookup_hook(None);
+        }
+        drop(self.context.take());
+        drop(self.vfs.take());
+        drop(self.volume.take());
+    }
 
     /// 普通路径错误保留生产原因，成功结果仍由调用者拥有。
     fn resolve(&self, context: &TestContext<'_>, pathname: &[u8]) -> Result<Path, TestError> {
@@ -78,9 +89,7 @@ impl PathOwner {
             .store(false, Ordering::Release);
         self.owner.observer().gate.complete();
         self.owner.quiesce_jobs()?;
-        drop(self.context.take());
-        drop(self.vfs.take());
-        drop(self.volume.take());
+        self.release_view();
         self.owner.quiesce_devices(context)
     }
 }
@@ -207,12 +216,16 @@ pub(crate) mod walk {
                 .err(),
             Some(FsError::NotFound),
         );
-        for name in [b"".as_slice(), b"a/b", b"a\0b", &[b'n'; 256]] {
+        for name in [b"".as_slice(), b"a/b", b"a\0b"] {
             context.expect_eq(
                 lookup_error(vfs, root.dentry(), name),
                 Some(FsError::InvalidName),
             );
         }
+        context.expect_eq(
+            lookup_error(vfs, root.dentry(), &[b'n'; 256]),
+            Some(FsError::NameTooLong),
+        );
         let file = fixture.resolve(context, b"/pattern")?;
         let hard = fixture.resolve(context, b"/hardlink")?;
         context.expect_eq(
@@ -234,7 +247,7 @@ pub(crate) mod walk {
         read_pattern(context, &file)?;
         read_pattern(context, &hard)?;
         let raw = fixture.resolve(context, b"/name-\xff\xfe")?;
-        context.expect_eq(raw.dentry().name(), b"name-\xff\xfe".as_slice());
+        context.expect_eq(raw.dentry().name().as_slice(), b"name-\xff\xfe".as_slice());
         let mut bytes = [0xa7; 9];
         context.expect_eq(
             checked(
@@ -496,11 +509,17 @@ pub(crate) mod mounts {
             false,
         );
         read_pattern(context, &file)?;
+        checked(
+            context,
+            vfs.mount(&other, volume.clone(), AccessMode::ReadOnly),
+        )?;
+        let alias = fixture.resolve(context, b"/walk")?;
+        context.expect_eq(alias.ptr_eq(&mounted), false);
         context.expect_eq(
-            vfs.mount(&other, volume.clone(), AccessMode::ReadOnly)
-                .err(),
-            Some(FsError::Busy),
+            checked(context, alias.inode())?.ptr_eq(checked(context, mounted.inode())?),
+            true,
         );
+        context.expect_eq(vfs.unmount(&other).err(), Some(FsError::Busy));
         context.expect_eq(
             vfs.mount(
                 &other,
@@ -510,6 +529,8 @@ pub(crate) mod mounts {
             .err(),
             Some(FsError::Busy),
         );
+        drop(alias);
+        checked(context, vfs.unmount(&other))?;
         context.expect_eq(vfs.unmount(&covered).err(), Some(FsError::Busy));
         drop(extra_context);
         drop(mounted);
@@ -591,14 +612,14 @@ pub(crate) mod pruning {
             .ok_or(TestError("path child parent absent"))?;
         vfs.dcache().prune_unused();
         context.expect_eq(
-            fixture.resolve(context, b"/walk")?.dentry().ptr_eq(parent),
+            fixture.resolve(context, b"/walk")?.dentry().ptr_eq(&parent),
             true,
         );
         context.expect_eq(
             fixture
                 .resolve(context, b"/walk/sub/..")?
                 .dentry()
-                .ptr_eq(parent),
+                .ptr_eq(&parent),
             true,
         );
         Ok(())

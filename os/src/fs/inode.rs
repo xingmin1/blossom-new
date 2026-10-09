@@ -1,6 +1,6 @@
 //! canonical inode 的加载结果、运行属性和块映射分别受实际拥有与同步协议保护。
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomPinned;
 use core::ops::Deref;
@@ -12,16 +12,18 @@ use spin::Once;
 
 use crate::block::{AccessMode, FsClaim};
 use crate::cache::{BufferRef, FileMapping};
+use crate::fs::dentry::{Dentry, DentryCache, DentryRef};
 use crate::fs::ext4::{
-    codec, finish_error, BlockMapping, DirectoryEntry, Ext4Volume, InodeData, InodeKind, InodeTime,
-    PreparedInodeRelease,
+    codec, finish_error, BlockMapping, DirectoryCursor, DirectoryEntry, Ext4Volume, InodeData,
+    InodeKind, InodeTime, PreparedDirectoryEdit, PreparedDirectoryMappings, PreparedInodeMapping,
+    PreparedInodeRelease, UnpublishedInode,
 };
 use crate::fs::writeback;
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::mm::folio::FolioContent;
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::sched;
-use crate::sync::{ReadGuard, SleepMutex, SleepRwLock, SpinLock};
+use crate::sync::{ReadGuard, SleepRwLock, SpinLock, WriteGuard};
 use crate::time;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
@@ -39,7 +41,7 @@ pub struct InodeCache {
     loads: AtomicUsize,
 }
 
-/// 固定槽同时保存缓存或待回收的强拥有，外部使用由 InodeRef 在此索引锁内登记。
+/// canonical inode 槽和名字域弱登记共用短索引锁；外部使用由 InodeRef 在同锁内登记。
 pub(crate) struct InodeDomain {
     index: SpinLock<InodeIndex>,
     work: Once<Pin<Arc<Work>>>,
@@ -49,6 +51,8 @@ pub(crate) struct InodeDomain {
 }
 
 struct InodeIndex {
+    /// 活视图唯一共享的有限名字索引，失去最后拥有后可重新选择预算。
+    dentry_cache: Weak<DentryCache>,
     slots: Vec<Option<InodeSlot>>,
     cache_open: bool,
     evicted: usize,
@@ -60,6 +64,8 @@ struct InodeSlot {
     inode: Arc<Inode>,
     users: usize,
     eviction: Eviction,
+    /// 若此 inode 是卷根，弱登记身份但不阻止名字对象和 inode 回收。
+    root_dentry: Weak<Dentry>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,12 +75,34 @@ enum Eviction {
     Running,
     Failed(FsError),
 }
+impl InodeSlot {
+    /// 优先复用仍存活的卷根名字；弱登记不延长 dentry 或 canonical inode 的寿命。
+    fn bind_root(&mut self, candidate: DentryRef) -> (DentryRef, Option<DentryRef>) {
+        if let Some(root) = DentryRef::upgrade(&self.root_dentry) {
+            (root, Some(candidate))
+        } else {
+            self.root_dentry = candidate.downgrade();
+            (candidate, None)
+        }
+    }
+}
+
+/// 以稳定 canonical inode 身份定位其有限索引槽。
+fn root_slot_position(index: &InodeIndex, inode: &InodeRef) -> usize {
+    index
+        .slots
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| Arc::ptr_eq(&slot.inode, &inode.0))
+        })
+        .expect("canonical root inode has no cache slot")
+}
 
 /// 常驻域仅供具体 inode 回收使用，执行者仍来自原共享 pool。
 static EVICTION_QUEUE: Once<WorkQueue> = Once::new();
 /// 失败的删除义务由独立服务强持，链上节点不反向拥有服务或自身。
 static FAILED_EVICTIONS: SpinLock<Option<Arc<InodeDomain>>> = SpinLock::new(None);
-
 /// BSP 在原共享 pool 准备后、发布服务运行许可之前准备具体 inode 回收域。
 pub(crate) fn initialize_inode_eviction() -> Result<(), FsError> {
     assert!(
@@ -101,6 +129,7 @@ impl InodeDomain {
         slots.resize_with(capacity, || None);
         let domain = Arc::try_new(Self {
             index: SpinLock::new(InodeIndex {
+                dentry_cache: Weak::new(),
                 slots,
                 cache_open: true,
                 evicted: 0,
@@ -259,7 +288,8 @@ impl InodeDomain {
         }
     }
 
-    /// 双查同身份后发表 Loading；槽强拥有不计作外部使用，唯一加载者先承担失败清理。
+    /// 双查同身份后发表 Loading；槽强拥有不计作外部使用。
+    /// 返回 None 将首次加载责任留给调用者，调用者随后必须完成原候选的结果发表。
     fn publish(
         self: &Arc<Self>,
         candidate: &InodeRef,
@@ -292,6 +322,7 @@ impl InodeDomain {
                 inode: candidate.0.clone(),
                 users: 1,
                 eviction: Eviction::Cached,
+                root_dentry: Weak::new(),
             });
             return Ok(None);
         }
@@ -391,6 +422,76 @@ impl InodeDomain {
     /// Loading 和失败待回收对象均占固定槽，预算不足不能跳过未结束的原拥有。
     fn is_full(&self) -> bool {
         self.index.lock().slots.iter().all(Option::is_some)
+    }
+    /// 借用仍存活的 canonical 名字索引；不同预算不能改写现有有限容量。
+    fn shared_dentry_cache(&self, capacity: usize) -> Result<Option<Arc<DentryCache>>, FsError> {
+        let index = self.index.lock();
+        let Some(cache) = index.dentry_cache.upgrade() else {
+            return Ok(None);
+        };
+        if cache.capacity() != capacity {
+            drop(index);
+            drop(cache);
+            return Err(FsError::InvalidOperation);
+        }
+        Ok(Some(cache))
+    }
+
+    /// 在 inode 索引短锁内仲裁共享名字索引和卷根，候选准备与输家析构均在锁外。
+    fn publish_dentry_namespace(
+        &self,
+        candidate_cache: Arc<DentryCache>,
+        root_inode: &InodeRef,
+        candidate_root: DentryRef,
+    ) -> Result<(Arc<DentryCache>, DentryRef), FsError> {
+        let mut index = self.index.lock();
+        let position = root_slot_position(&index, root_inode);
+        let (cache, unused_cache) = match index.dentry_cache.upgrade() {
+            Some(cache) => {
+                if cache.capacity() != candidate_cache.capacity() {
+                    drop(index);
+                    drop(cache);
+                    drop(candidate_cache);
+                    drop(candidate_root);
+                    return Err(FsError::InvalidOperation);
+                }
+                (cache, Some(candidate_cache))
+            }
+            None => {
+                index.dentry_cache = Arc::downgrade(&candidate_cache);
+                (candidate_cache, None)
+            }
+        };
+        let (root, unused_root) = index.slots[position]
+            .as_mut()
+            .expect("canonical root inode slot disappeared")
+            .bind_root(candidate_root);
+        drop(index);
+        drop(unused_cache);
+        drop(unused_root);
+        Ok((cache, root))
+    }
+
+    /// 读取卷根的弱身份登记；没有活根时由调用者锁外准备候选。
+    fn canonical_root(&self, inode: &InodeRef) -> Option<DentryRef> {
+        let index = self.index.lock();
+        let slot = index.slots[root_slot_position(&index, inode)]
+            .as_ref()
+            .expect("canonical root inode slot disappeared");
+        DentryRef::upgrade(&slot.root_dentry)
+    }
+
+    /// 在 canonical inode 索引锁内发表或复用根 dentry，未发表候选锁外释放。
+    fn publish_root(&self, inode: &InodeRef, candidate: DentryRef) -> DentryRef {
+        let mut index = self.index.lock();
+        let position = root_slot_position(&index, inode);
+        let slot = index.slots[position]
+            .as_mut()
+            .expect("canonical root inode slot disappeared");
+        let (root, unused) = slot.bind_root(candidate);
+        drop(index);
+        drop(unused);
+        root
     }
 }
 
@@ -503,11 +604,297 @@ pub struct InodeMetadata {
 }
 
 struct InodeState {
-    write: SleepMutex<()>,
+    write: SleepRwLock<()>,
     invalidate: SleepRwLock<()>,
     metadata: SpinLock<InodeMetadata>,
     root: SleepRwLock<[u8; 60]>,
     writecount: SpinLock<isize>,
+}
+/// inode 的唯一写序列化责任，属性和块根仍使用各自的短期保护。
+pub(crate) struct InodeWriteGuard<'a> {
+    inode: &'a InodeRef,
+    state: &'a InodeState,
+    _lock: WriteGuard<'a, ()>,
+}
+
+/// 目录读取 guard 同时排斥名字提交与旧目录加载快照。
+pub(crate) struct DirectoryReadGuard<'a> {
+    inode: &'a InodeRef,
+    state: &'a InodeState,
+    _lock: ReadGuard<'a, ()>,
+}
+
+/// 目录修改 guard 复用 canonical inode 的唯一写侧，不另建目录锁。
+pub(crate) struct DirectoryWriteGuard<'a> {
+    inode: &'a InodeRef,
+    state: &'a InodeState,
+    _lock: WriteGuard<'a, ()>,
+}
+
+/// 一项已经预留 inode-table 窗口且校验完字段的属性变更。
+pub(crate) struct PreparedInodeMetadata {
+    inode: InodeRef,
+    record: BufferRef,
+    offset: usize,
+    old: InodeMetadata,
+    next: InodeMetadata,
+}
+/// 目录内容和 inode-table 均已预备，Drop 只撤销尚未发表的目录块票。
+pub(crate) struct PreparedDirectoryMutation {
+    parent: InodeRef,
+    volume: Arc<Ext4Volume>,
+    edit: Option<PreparedDirectoryEdit>,
+    inode_mapping: Option<PreparedInodeMapping>,
+    root: [u8; 60],
+    next: InodeMetadata,
+    changed: bool,
+}
+
+/// 新 inode 的三种真实磁盘初始内容。
+#[derive(Clone, Copy)]
+enum NewInodeContent<'a> {
+    Regular,
+    Directory,
+    Symlink(&'a [u8]),
+}
+
+/// 名字出现前拥有 raw inode、canonical inode 与可提交的初始链接数。
+pub(crate) struct PreparedNewInode {
+    volume: Arc<Ext4Volume>,
+    allocation: Option<UnpublishedInode>,
+    inode: Option<InodeRef>,
+    initial: Option<InodeData>,
+    record_initialized: bool,
+    directory: Option<PreparedDirectoryEdit>,
+    symlink: Option<PreparedSymlink>,
+    link_update: Option<PreparedInodeMetadata>,
+}
+
+/// 长符号链接的真实块映射、目标内容和清理所需 metadata aliases。
+struct PreparedSymlink {
+    volume: Arc<Ext4Volume>,
+    mappings: Option<PreparedDirectoryMappings>,
+    buffers: Vec<BufferRef>,
+    target: Vec<u8>,
+    block_size: usize,
+    root: [u8; 60],
+    blocks: u64,
+    publishing: bool,
+}
+
+impl PreparedSymlink {
+    /// 预备连续逻辑块、唯一映射计划和干净数据窗口，目标仅在最终发表时写入。
+    fn try_new(
+        volume: &Arc<Ext4Volume>,
+        inode: &InodeData,
+        target: &[u8],
+    ) -> Result<Self, FsError> {
+        if target.len() < 60 || PAGE_SIZE < target.len() || target.is_empty() || target.contains(&0)
+        {
+            return Err(if PAGE_SIZE < target.len() {
+                FsError::NameTooLong
+            } else {
+                FsError::InvalidName
+            });
+        }
+        let block_size = volume.geometry().block_size;
+        let count = target.len().div_ceil(block_size);
+        let mut owned_target = Vec::new();
+        owned_target
+            .try_reserve_exact(target.len())
+            .map_err(|_| FsError::NoMemory)?;
+        owned_target.extend_from_slice(target);
+        let mut logical = Vec::new();
+        logical
+            .try_reserve_exact(count)
+            .map_err(|_| FsError::NoMemory)?;
+        for block in 0..count {
+            logical.push(block as u64);
+        }
+        let mut buffers = Vec::new();
+        buffers
+            .try_reserve_exact(count)
+            .map_err(|_| FsError::NoMemory)?;
+        let mappings = volume.prepare_symlink_mappings(inode, &inode.block, &logical)?;
+        let root = *mappings.root();
+        let mut prepared = Self {
+            volume: Arc::clone(volume),
+            mappings: Some(mappings),
+            buffers,
+            target: owned_target,
+            block_size,
+            root,
+            blocks: inode.blocks,
+            publishing: false,
+        };
+        let sectors = (block_size / 512) as u64;
+        let added = prepared
+            .mappings
+            .as_ref()
+            .expect("prepared symlink mapping")
+            .added_blocks()
+            .checked_mul(sectors)
+            .ok_or(FsError::FileTooLarge)?;
+        prepared.blocks = inode
+            .blocks
+            .checked_add(added)
+            .ok_or(FsError::FileTooLarge)?;
+        for &logical in &logical {
+            let physical = prepared
+                .mappings
+                .as_ref()
+                .expect("prepared symlink mapping")
+                .physical(logical)
+                .ok_or(FsError::Corrupt)?;
+            prepared.buffers.push(volume.metadata_block(physical)?);
+        }
+        Ok(prepared)
+    }
+
+    /// 把预先拥有的目标写入原 metadata aliases，再发表同一批 extent/indirect 映射。
+    fn publish(mut self) {
+        self.publishing = true;
+        let mut offset = 0usize;
+        for buffer in &self.buffers {
+            let count = (self.target.len() - offset).min(self.block_size);
+            let data = &self.target[offset..offset + count];
+            buffer
+                .update(self.volume.claim(), |bytes| {
+                    bytes.fill(0);
+                    bytes[..data.len()].copy_from_slice(data);
+                })
+                .expect("prepared writable symlink data block");
+            offset += count;
+        }
+        self.mappings
+            .take()
+            .expect("prepared symlink mapping")
+            .publish(&self.volume);
+    }
+}
+
+impl Drop for PreparedSymlink {
+    /// 目标尚未写入时先失效整批数据块的缓存窗口，再归还未发表映射。
+    fn drop(&mut self) {
+        if !self.publishing {
+            let mappings = self
+                .mappings
+                .as_ref()
+                .expect("unpublished symlink mapping absent");
+            for logical in 0..self.target.len().div_ceil(self.block_size) {
+                let physical = mappings
+                    .physical(logical as u64)
+                    .expect("unpublished symlink data mapping absent");
+                let buffer = self
+                    .volume
+                    .metadata_cache()
+                    .cached_buffer(physical, self.block_size)
+                    .expect("unpublished symlink cache range invalid");
+                let Some(buffer) = buffer else {
+                    continue;
+                };
+                buffer.folio().wait_writeback();
+                // SAFETY: 该物理块仍由未发表 reservation 独占，inode 根尚未连接本批块；
+                // metadata_block 返回或失败时读入责任已收回，且 wait_writeback 已结束原页写回。
+                unsafe { buffer.forget(self.volume.claim()) }
+                    .expect("unpublished symlink data alias invalidation");
+            }
+            self.mappings
+                .take()
+                .expect("unpublished symlink mapping absent")
+                .cancel(&self.volume);
+        }
+    }
+}
+
+impl PreparedNewInode {
+    /// 借用已经完整格式化并进入本缓存域的未链接 canonical inode。
+    pub(crate) fn inode(&self) -> &InodeRef {
+        self.inode
+            .as_ref()
+            .expect("prepared inode canonical object absent")
+    }
+
+    /// 发表初始内容和 links 后把 bitmap 责任移交给已连接的 canonical inode。
+    pub(crate) fn publish(mut self) -> InodeRef {
+        self.publish_storage();
+        let inode = self
+            .inode
+            .as_ref()
+            .expect("prepared inode canonical object absent");
+        let guard = inode
+            .inode_write()
+            .expect("prepared inode load remains valid");
+        guard.publish_metadata(
+            self.link_update
+                .take()
+                .expect("prepared inode link update absent"),
+        );
+        drop(guard);
+        self.allocation
+            .take()
+            .expect("unpublished inode reservation absent")
+            .publish();
+        self.inode
+            .take()
+            .expect("prepared inode canonical object absent")
+    }
+
+    /// 先完成实际目录或符号链接块，再允许 inode links 和父名称发表。
+    fn publish_storage(&mut self) {
+        if let Some(directory) = self.directory.take() {
+            let result = directory.publish(&self.volume);
+            let (metadata, root) = self
+                .inode()
+                .with_map_read(|metadata, root| Ok((*metadata, *root)))
+                .expect("prepared new directory remains loaded");
+            assert_eq!(result.root, root, "new directory root publication mismatch");
+            assert_eq!(
+                result.size, metadata.size,
+                "new directory size publication mismatch"
+            );
+            assert_eq!(
+                result.blocks, metadata.blocks,
+                "new directory block count publication mismatch"
+            );
+            assert_eq!(
+                result.flags, metadata.flags,
+                "new directory flags publication mismatch"
+            );
+        }
+        if let Some(symlink) = self.symlink.take() {
+            symlink.publish();
+        }
+    }
+}
+
+impl Drop for PreparedNewInode {
+    /// iget 前清理未发表记录；iget 后复用原 nlink=0 Work 回收真实存储。
+    fn drop(&mut self) {
+        if self.inode.is_some() {
+            self.publish_storage();
+            if let Some(allocation) = self.allocation.take() {
+                allocation.publish();
+            }
+            return;
+        }
+        let Some(allocation) = self.allocation.take() else {
+            return;
+        };
+        if self.record_initialized {
+            self.volume.clear_unpublished_inode(
+                &allocation,
+                self.initial
+                    .as_ref()
+                    .expect("initialized unpublished inode lacks original record"),
+            );
+        }
+        if let Some(directory) = self.directory.take() {
+            directory.cancel(&self.volume);
+        }
+        drop(self.symlink.take());
+        self.volume.release_unpublished_inode(allocation);
+    }
 }
 
 impl InodeMetadata {
@@ -563,7 +950,7 @@ impl InodeState {
     /// 完成真实加载后一次安装同步容器，初始化不执行额外 IO。
     fn new(data: InodeData) -> Self {
         Self {
-            write: SleepMutex::new(()),
+            write: SleepRwLock::new(()),
             invalidate: SleepRwLock::new(()),
             metadata: SpinLock::new(InodeMetadata::from_data(&data)),
             root: SleepRwLock::new(data.block),
@@ -679,6 +1066,194 @@ impl InodeCache {
     /// 名字查找与内部 EA 取得共享同一 canonical 域，真实加载和回收等待均在短锁外。
     pub fn iget(&self, filesystem: &Arc<Ext4Volume>, number: u64) -> Result<InodeRef, FsError> {
         self.domain.iget(filesystem, number, Some(self))
+    }
+    /// 为实际卷取得 canonical 根与共享名字索引；活域保原有限容量，失去最后索引拥有后可重新选预算。
+    pub(crate) fn dentry_namespace(
+        &self,
+        volume: &Arc<Ext4Volume>,
+        capacity: usize,
+    ) -> Result<(Arc<DentryCache>, DentryRef), FsError> {
+        if let Some(cache) = self.domain.shared_dentry_cache(capacity)? {
+            let root = self.root_dentry(volume)?;
+            return Ok((cache, root));
+        }
+        let candidate_cache = DentryCache::try_new(capacity)?;
+        let root_inode = self.iget(volume, 2)?;
+        let candidate_root = DentryRef::try_root(root_inode.clone())?;
+        self.domain
+            .publish_dentry_namespace(candidate_cache, &root_inode, candidate_root)
+    }
+
+    /// 从 canonical inode 槽弱登记中复用卷根，候选在索引锁外准备。
+    pub(crate) fn root_dentry(&self, volume: &Arc<Ext4Volume>) -> Result<DentryRef, FsError> {
+        let inode = self.iget(volume, 2)?;
+        if let Some(root) = self.domain.canonical_root(&inode) {
+            return Ok(root);
+        }
+        let candidate = DentryRef::try_root(inode.clone())?;
+        Ok(self.domain.publish_root(&inode, candidate))
+    }
+    /// 准备真正链接前的普通文件记录和 canonical 对象。
+    pub(crate) fn prepare_regular_inode(
+        &self,
+        volume: &Arc<Ext4Volume>,
+        parent: &InodeMetadata,
+        mode: u16,
+        umask: u16,
+        uid: u32,
+        gid: u32,
+        now_ns: u64,
+    ) -> Result<PreparedNewInode, FsError> {
+        self.prepare_new_inode(
+            volume,
+            parent,
+            NewInodeContent::Regular,
+            mode,
+            umask,
+            uid,
+            gid,
+            now_ns,
+        )
+    }
+
+    /// 先构造真实点目录与父链接记录，再准备尚未连接的目录 inode。
+    pub(crate) fn prepare_directory_inode(
+        &self,
+        volume: &Arc<Ext4Volume>,
+        parent: &InodeMetadata,
+        mode: u16,
+        umask: u16,
+        uid: u32,
+        gid: u32,
+        now_ns: u64,
+    ) -> Result<PreparedNewInode, FsError> {
+        self.prepare_new_inode(
+            volume,
+            parent,
+            NewInodeContent::Directory,
+            mode,
+            umask,
+            uid,
+            gid,
+            now_ns,
+        )
+    }
+
+    /// 以原始目标字节准备 fast 或块存储符号链接，不应用进程 umask。
+    pub(crate) fn prepare_symlink_inode(
+        &self,
+        volume: &Arc<Ext4Volume>,
+        parent: &InodeMetadata,
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+        now_ns: u64,
+    ) -> Result<PreparedNewInode, FsError> {
+        self.prepare_new_inode(
+            volume,
+            parent,
+            NewInodeContent::Symlink(target),
+            0,
+            0,
+            uid,
+            gid,
+            now_ns,
+        )
+    }
+
+    /// 分配 inode 后先完成盘面格式和 canonical 加载；任何返回的对象仍为 links=0。
+    fn prepare_new_inode(
+        &self,
+        volume: &Arc<Ext4Volume>,
+        parent: &InodeMetadata,
+        content: NewInodeContent<'_>,
+        mode: u16,
+        umask: u16,
+        uid: u32,
+        gid: u32,
+        now_ns: u64,
+    ) -> Result<PreparedNewInode, FsError> {
+        let (kind, link_count) = match content {
+            NewInodeContent::Regular => (InodeKind::Regular, 1),
+            NewInodeContent::Directory => (InodeKind::Directory, 2),
+            NewInodeContent::Symlink(target) => {
+                if target.is_empty() || target.contains(&0) {
+                    return Err(FsError::InvalidName);
+                }
+                if PAGE_SIZE < target.len() {
+                    return Err(FsError::NameTooLong);
+                }
+                (InodeKind::Symlink, 1)
+            }
+        };
+        let allocation = volume.allocate_inode_for_parent(parent, kind, mode, umask, uid, gid)?;
+        let number = allocation.number();
+        let mut prepared = PreparedNewInode {
+            volume: Arc::clone(volume),
+            allocation: Some(allocation),
+            inode: None,
+            initial: None,
+            record_initialized: false,
+            directory: None,
+            symlink: None,
+            link_update: None,
+        };
+        let initial = volume.load_inode(number)?;
+        prepared.initial = Some(initial);
+        let initial = prepared.initial.as_ref().expect("initial inode loaded");
+        let mut root = initial.block;
+        let mut size = 0u64;
+        let mut blocks = initial.blocks;
+        let mut directory_flags = None;
+        match content {
+            NewInodeContent::Regular => {}
+            NewInodeContent::Directory => {
+                let metadata = InodeMetadata::from_data(initial);
+                let edit = volume.prepare_directory_new(&metadata, &root, parent.number)?;
+                root = *edit.root();
+                size = edit.size();
+                blocks = edit.blocks();
+                directory_flags = Some(edit.flags());
+                prepared.directory = Some(edit);
+            }
+            NewInodeContent::Symlink(target) if target.len() < 60 => {
+                root[..target.len()].copy_from_slice(target);
+                size = target.len() as u64;
+            }
+            NewInodeContent::Symlink(target) => {
+                let symlink = PreparedSymlink::try_new(volume, initial, target)?;
+                root = symlink.root;
+                size = target.len() as u64;
+                blocks = symlink.blocks;
+                prepared.symlink = Some(symlink);
+            }
+        }
+        let mut next = initial_inode_metadata(volume, initial, size, blocks, now_ns)?;
+        if let Some(flags) = directory_flags {
+            let permitted = codec::INDEX | 0x40000;
+            if flags & !permitted != initial.flags & !permitted {
+                return Err(FsError::InvalidOperation);
+            }
+            let (_, huge) = codec::blocks_encoding(volume.geometry(), next.blocks)?;
+            next.flags = (flags & !0x40000) | if huge { 0x40000 } else { 0 };
+        }
+        volume.initialize_unpublished_inode(
+            prepared
+                .allocation
+                .as_ref()
+                .expect("inode reservation absent"),
+            initial,
+            &next,
+            &root,
+        )?;
+        prepared.record_initialized = true;
+        prepared.inode = Some(self.iget(volume, number)?);
+        let update = {
+            let guard = prepared.inode().inode_write()?;
+            guard.prepare_link_delta(link_count, now_ns)?
+        };
+        prepared.link_update = Some(update);
+        Ok(prepared)
     }
 
     /// 把 cache-only 页和真实脏义务交给原 pool 中的 Task，返回已经结束回收的槽数。
@@ -854,6 +1429,67 @@ impl InodeRef {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// 普通 inode 属性或链接变化取得 canonical 唯一写侧。
+    pub(crate) fn inode_write(&self) -> Result<InodeWriteGuard<'_>, FsError> {
+        let state = self.wait_loaded()?;
+        let lock = state.write.write();
+        Ok(InodeWriteGuard {
+            inode: self,
+            state,
+            _lock: lock,
+        })
+    }
+
+    /// 目录读取 guard 覆盖名字缓存查询、后端加载和等待者读取首次结果。
+    pub(crate) fn directory_read(&self) -> Result<DirectoryReadGuard<'_>, FsError> {
+        let state = self.wait_loaded()?;
+        let lock = state.write.read();
+        if state.metadata.lock().kind != InodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(DirectoryReadGuard {
+            inode: self,
+            state,
+            _lock: lock,
+        })
+    }
+
+    /// 目录修改 guard 复用 inode 写侧并让持锁重查不递归取得读锁。
+    pub(crate) fn directory_write(&self) -> Result<DirectoryWriteGuard<'_>, FsError> {
+        let state = self.wait_loaded()?;
+        let lock = state.write.write();
+        if state.metadata.lock().kind != InodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(DirectoryWriteGuard {
+            inode: self,
+            state,
+            _lock: lock,
+        })
+    }
+
+    /// 普通名字查找通过目录读侧返回首个结果，缺失仍由调用者收到 NotFound。
+    pub fn lookup(&self, cache: &InodeCache, name: &[u8]) -> Result<InodeRef, FsError> {
+        self.directory_read()?
+            .lookup(cache, name)?
+            .ok_or(FsError::NotFound)
+    }
+
+    /// 用户游标按当前目录格式重置碰撞续读状态。
+    pub(crate) fn directory_cursor(&self, cookie: u64) -> Result<DirectoryCursor, FsError> {
+        self.directory_read()?.cursor_at(cookie)
+    }
+
+    /// 返回普通字节目录或 HTree 各自定义的目录结尾 cookie。
+    pub(crate) fn directory_end_cookie(&self) -> Result<u64, FsError> {
+        self.directory_read()?.end_cookie()
+    }
+
+    /// 取下一真实目录项，查询全程持目录读侧。
+    pub fn dir_next(&self, cursor: &DirectoryCursor) -> Result<Option<DirectoryEntry>, FsError> {
+        self.directory_read()?.dir_next(cursor)
+    }
+
     /// 在 invalidate 保护及页内容锁内先发布卷义务，再使原页 Dirty 可见；不分配。
     pub(crate) fn note_dirty(&self) {
         self.dirty_obligation.store(true, Ordering::Release);
@@ -908,7 +1544,7 @@ impl InodeRef {
     fn truncate(&self, claim: &FsClaim, new_size: u64) -> Result<(), FsError> {
         self.filesystem.require_write(claim)?;
         let state = self.wait_loaded()?;
-        let _write = state.write.lock();
+        let _write = state.write.write();
         let old = *state.metadata.lock();
         if old.kind != InodeKind::Regular || old.flags & codec::EA_INODE != 0 {
             return Err(FsError::InvalidOperation);
@@ -934,6 +1570,9 @@ impl InodeRef {
         let g = volume.geometry();
         let old = *state.metadata.lock();
         let now = time::now().as_nanos();
+        if deleting && old.kind == InodeKind::Symlink && old.fast_symlink {
+            return self.truncate_fast_symlink_locked(state, claim, &old, now);
+        }
         let mut size_next = write_metadata(g, &old, 0, 0, 0, 0, now)?;
         size_next.size = new_size;
         let tail = if old.size < new_size {
@@ -1052,11 +1691,67 @@ impl InodeRef {
         Ok(())
     }
 
+    /// 释放 fast symlink 时只清 inode size/EA 义务，不把 inline target 当块树。
+    fn truncate_fast_symlink_locked(
+        &self,
+        state: &InodeState,
+        claim: &FsClaim,
+        old: &InodeMetadata,
+        now_ns: u64,
+    ) -> Result<(), FsError> {
+        let volume = self.filesystem();
+        let g = volume.geometry();
+        let mut next = write_metadata(g, old, 0, 0, 0, 0, now_ns)?;
+        next.size = 0;
+        let _metadata_writeback = volume.metadata_cache().lock_writeback();
+        let (record, offset) = volume.inode_record(old.number)?;
+        let release = {
+            let root = state.root.write();
+            let current = record.with_read(|bytes| {
+                codec::decode_inode(g, old.number, &bytes[offset..offset + g.inode_size])
+            })??;
+            if InodeMetadata::from_data(&current) != *old || current.block != *root {
+                return Err(FsError::Corrupt);
+            }
+            let release = volume.prepare_inode_release(&current)?;
+            record
+                .update(claim, |bytes| {
+                    codec::patch_inode_mapping(
+                        g,
+                        &mut bytes[offset..offset + g.inode_size],
+                        &next,
+                        &*root,
+                    )
+                })
+                .expect("prepared fast symlink size record");
+            *state.metadata.lock() = next;
+            release
+        };
+        self.mapping.unmap_range(0..u64::MAX, true);
+        let _writeback = self.mapping.lock_writeback();
+        // SAFETY: inode.write 与 invalidate 独占仍由末次使用者持有，首轮完整撤叶/CSD 已结束；
+        // symlink target 从不进入 FileMapping，mapping 仅清理意外保留的旧页并等待真实 I/O 尾。
+        let pages = unsafe { self.mapping.truncate_pages(0, g.block_size) };
+        self.mapping.unmap_range(0..u64::MAX, true);
+        if let Err(error) = pages {
+            return Err(error);
+        }
+        if !self.mapping.is_empty() {
+            return Err(FsError::Busy);
+        }
+        // SAFETY: links 为零的原 canonical slot 仍处于 Running 且无外部使用；
+        // inline root 未作为块树读取，EA 与 inode 窗口由准备 token 保活，mapping 与 root 均已放开。
+        unsafe { volume.release_inode(release) };
+        self.storage_released.store(true, Ordering::Release);
+        self.refresh_dirty_obligation_locked();
+        Ok(())
+    }
+
     /// 回收工作已禁止新取得；真正返盘块后仍写出剩余元数据，最后卷拥有不能带 Dirty 退出。
     fn evict(&self) -> Result<(), FsError> {
         sched::assert_switchable();
         let state = self.wait_loaded()?;
-        let _write = state.write.lock();
+        let _write = state.write.write();
         let old = *state.metadata.lock();
         let writable = self.filesystem.mode() == AccessMode::ReadWrite;
         let deleting = old.links == 0 && writable;
@@ -1107,7 +1802,7 @@ impl InodeRef {
             .require_write(claim)
             .expect("prepared EA inode write claim");
         let state = self.loaded_state();
-        let _write = state.write.lock();
+        let _write = state.write.write();
         let _root = state.root.write();
         let mut next = *state.metadata.lock();
         assert!(
@@ -1151,7 +1846,7 @@ impl InodeRef {
         volume.require_write(volume.claim())?;
         let _access = self.acquire_write()?;
         let state = self.wait_loaded()?;
-        let _write = state.write.lock();
+        let _write = state.write.write();
         let _invalidate = state.invalidate.read();
         let metadata = *state.metadata.lock();
         if metadata.kind != InodeKind::Regular {
@@ -1305,7 +2000,7 @@ impl InodeRef {
     ) -> Result<(u64, usize), FsError> {
         self.filesystem.require_write(claim)?;
         let state = self.wait_loaded()?;
-        let _write = state.write.lock();
+        let _write = state.write.write();
         let initial = *state.metadata.lock();
         if initial.kind == InodeKind::Directory {
             return Err(FsError::IsDirectory);
@@ -1685,7 +2380,7 @@ impl Inode {
             return Err(FsError::InvalidOperation);
         }
         let state = self.wait_loaded()?;
-        let _write = state.write.lock();
+        let _write = state.write.write();
         let _root = state.root.write();
         let old = *state.metadata.lock();
         if old.flags & codec::EA_INODE != 0 {
@@ -1704,19 +2399,6 @@ impl Inode {
         &self.mapping
     }
 
-    /// 原始单组件名字经真实目录后端查找，再在同缓存域获取硬链接的唯一对象。
-    pub fn lookup(&self, cache: &InodeCache, name: &[u8]) -> Result<InodeRef, FsError> {
-        let number = self
-            .with_map_read(|metadata, root| self.filesystem.lookup(metadata, root, name))?
-            .ok_or(FsError::NotFound)?;
-        cache.iget(&self.filesystem, number)
-    }
-
-    /// 沿盘上字节位置枚举下一个有效目录项，不构造整目录副本。
-    pub fn dir_next(&self, offset: u64) -> Result<Option<DirectoryEntry>, FsError> {
-        self.with_map_read(|metadata, root| self.filesystem.dir_next(metadata, root, offset))
-    }
-
     /// 由后端按真实 inode 存储规则返回符号链接的原始字节。
     pub fn read_link(&self) -> Result<Vec<u8>, FsError> {
         self.with_map_read(|metadata, root| self.filesystem.read_link(metadata, root))
@@ -1728,6 +2410,466 @@ impl Inode {
         // 本模块从不 unwrap、移出或替换对象，Arc 的原分配保持到本共享借用终止之后。
         unsafe { Pin::new_unchecked(self) }
     }
+}
+
+impl InodeWriteGuard<'_> {
+    /// 短属性锁内复制当前属性；写侧继续保护后续存储提交。
+    pub(crate) fn metadata_snapshot(&self) -> InodeMetadata {
+        *self.state.metadata.lock()
+    }
+    /// 预备硬链接数及 ctime；格式或 inode-table 失败发生在目录名提交前。
+    pub(crate) fn prepare_link_delta(
+        &self,
+        delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedInodeMetadata, FsError> {
+        prepare_link_delta(self.inode, self.state, delta, now_ns)
+    }
+
+    /// 预备仅改变 ctime 的 inode-table 记录。
+    pub(crate) fn prepare_ctime(&self, now_ns: u64) -> Result<PreparedInodeMetadata, FsError> {
+        prepare_inode_ctime(self.inode, self.state, now_ns)
+    }
+
+    /// 在已持有的 canonical 写侧内消费记录准备并发布属性。
+    pub(crate) fn publish_metadata(&self, prepared: PreparedInodeMetadata) {
+        publish_inode_metadata(self.inode, self.state, prepared);
+    }
+}
+
+impl DirectoryReadGuard<'_> {
+    /// 借用与当前读侧同一份 canonical 属性快照。
+    pub(crate) fn metadata_snapshot(&self) -> InodeMetadata {
+        *self.state.metadata.lock()
+    }
+
+    /// 在既有目录读侧内查找并取得 canonical 子 inode，不再递归读锁。
+    pub(crate) fn lookup(
+        &self,
+        cache: &InodeCache,
+        name: &[u8],
+    ) -> Result<Option<InodeRef>, FsError> {
+        lookup_locked(self.inode, cache, name)
+    }
+
+    /// 按目录真实磁盘游标返回下一项，读侧覆盖所有元数据窗口访问。
+    pub(crate) fn dir_next(
+        &self,
+        cursor: &DirectoryCursor,
+    ) -> Result<Option<DirectoryEntry>, FsError> {
+        self.inode
+            .with_map_read(|metadata, root| self.inode.filesystem.dir_next(metadata, root, cursor))
+    }
+
+    /// 将调用者 cookie 重新解析为普通字节或 HTree 游标。
+    pub(crate) fn cursor_at(&self, cookie: u64) -> Result<DirectoryCursor, FsError> {
+        self.inode.with_map_read(|metadata, root| {
+            self.inode
+                .filesystem
+                .directory_cursor(metadata, root, cookie)
+        })
+    }
+
+    /// 返回后端规定的 SEEK_END cookie，indexed 目录使用 HTree EOF。
+    pub(crate) fn end_cookie(&self) -> Result<u64, FsError> {
+        self.inode.with_map_read(|metadata, root| {
+            self.inode.filesystem.directory_end_cookie(metadata, root)
+        })
+    }
+}
+
+impl DirectoryWriteGuard<'_> {
+    /// 借用与当前写侧同一份 canonical 属性快照。
+    pub(crate) fn metadata_snapshot(&self) -> InodeMetadata {
+        *self.state.metadata.lock()
+    }
+
+    /// 持写侧重查目录项，不尝试获取该 inode 的读侧。
+    pub(crate) fn lookup(
+        &self,
+        cache: &InodeCache,
+        name: &[u8],
+    ) -> Result<Option<InodeRef>, FsError> {
+        lookup_locked(self.inode, cache, name)
+    }
+    /// 目录目标的链接变化复用当前目录写侧，不递归取得 inode 写锁。
+    pub(crate) fn prepare_link_delta(
+        &self,
+        delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedInodeMetadata, FsError> {
+        prepare_link_delta(self.inode, self.state, delta, now_ns)
+    }
+
+    /// 目录本身仅改变 ctime 时继续消费当前写侧。
+    pub(crate) fn prepare_ctime(&self, now_ns: u64) -> Result<PreparedInodeMetadata, FsError> {
+        prepare_inode_ctime(self.inode, self.state, now_ns)
+    }
+
+    /// 在当前目录写侧内消费属性准备，目录查找者尚未取得读侧。
+    pub(crate) fn publish_metadata(&self, prepared: PreparedInodeMetadata) {
+        publish_inode_metadata(self.inode, self.state, prepared);
+    }
+    /// 真实扫描点目录与普通项，保留后端 checksum 和 I/O 错误。
+    pub(crate) fn is_empty(&self) -> Result<bool, FsError> {
+        let metadata = self.metadata_snapshot();
+        let root = *self.state.root.read();
+        self.inode.filesystem.directory_is_empty(&metadata, &root)
+    }
+
+    /// 预备新目录项及父目录属性，所有可失败操作先于名字提交。
+    pub(crate) fn prepare_insert(
+        &self,
+        name: &[u8],
+        number: u64,
+        kind: InodeKind,
+        parent_links_delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedDirectoryMutation, FsError> {
+        let metadata = self.metadata_snapshot();
+        let root = *self.state.root.read();
+        let edit = self
+            .inode
+            .filesystem
+            .prepare_directory_add(&metadata, &root, name, number, kind)?;
+        self.prepare_edit(edit, parent_links_delta, now_ns)
+    }
+
+    /// 预备删除已在同一父写侧重新查到的名称。
+    pub(crate) fn prepare_remove(
+        &self,
+        name: &[u8],
+        parent_links_delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedDirectoryMutation, FsError> {
+        let metadata = self.metadata_snapshot();
+        let root = *self.state.root.read();
+        let edit = self
+            .inode
+            .filesystem
+            .prepare_directory_remove(&metadata, &root, name)?;
+        self.prepare_edit(edit, parent_links_delta, now_ns)
+    }
+
+    /// 预备跨父 rename 覆盖目标目录项。
+    pub(crate) fn prepare_replace(
+        &self,
+        name: &[u8],
+        number: u64,
+        kind: InodeKind,
+        parent_links_delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedDirectoryMutation, FsError> {
+        let metadata = self.metadata_snapshot();
+        let root = *self.state.root.read();
+        let edit = self
+            .inode
+            .filesystem
+            .prepare_directory_replace(&metadata, &root, name, number, kind)?;
+        self.prepare_edit(edit, parent_links_delta, now_ns)
+    }
+
+    /// 单次准备覆盖目标并移走源项，避免同一旧根上的两份互相覆盖编辑。
+    pub(crate) fn prepare_move(
+        &self,
+        old_name: &[u8],
+        new_name: &[u8],
+        number: u64,
+        kind: InodeKind,
+        target: Option<(u64, InodeKind)>,
+        parent_links_delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedDirectoryMutation, FsError> {
+        let metadata = self.metadata_snapshot();
+        let root = *self.state.root.read();
+        let edit = self
+            .inode
+            .filesystem
+            .prepare_directory_move(&metadata, &root, old_name, new_name, number, kind, target)?;
+        self.prepare_edit(edit, parent_links_delta, now_ns)
+    }
+
+    /// 预备被移动目录的实际 `..` 记录和修改时间。
+    pub(crate) fn prepare_dotdot(
+        &self,
+        parent_number: u64,
+        now_ns: u64,
+    ) -> Result<PreparedDirectoryMutation, FsError> {
+        let metadata = self.metadata_snapshot();
+        let root = *self.state.root.read();
+        let edit =
+            self.inode
+                .filesystem
+                .prepare_directory_dotdot(&metadata, &root, parent_number)?;
+        self.prepare_edit(edit, 0, now_ns)
+    }
+
+    /// 目录编辑和父 inode 记录完全准备后，先阻止映射读者再执行无失败发表。
+    pub(crate) fn publish(&self, mut prepared: PreparedDirectoryMutation) {
+        assert!(
+            self.inode.ptr_eq(&prepared.parent),
+            "directory edit parent mismatch"
+        );
+        assert!(
+            Arc::ptr_eq(self.inode.filesystem(), &prepared.volume),
+            "directory edit volume mismatch"
+        );
+        let edit = prepared
+            .edit
+            .take()
+            .expect("directory edit already consumed");
+        if !prepared.changed {
+            assert!(prepared.inode_mapping.is_none());
+            edit.cancel(&prepared.volume);
+            return;
+        }
+        let mut root = self.state.root.write();
+        let result = edit.publish(&prepared.volume);
+        assert_eq!(result.root, prepared.root, "directory edit root changed");
+        assert_eq!(
+            result.size, prepared.next.size,
+            "directory edit size changed"
+        );
+        assert_eq!(
+            result.blocks, prepared.next.blocks,
+            "directory edit blocks changed"
+        );
+        assert_eq!(
+            result.flags, prepared.next.flags,
+            "directory edit flags changed"
+        );
+        let inode_mapping = prepared
+            .inode_mapping
+            .take()
+            .expect("directory inode record already consumed");
+        prepared.volume.publish_inode_mapping(inode_mapping);
+        *root = prepared.root;
+        *self.state.metadata.lock() = prepared.next;
+    }
+
+    /// 父 guard 持有期间把目录后端编辑与记录窗口绑定为同一可取消准备。
+    fn prepare_edit(
+        &self,
+        edit: PreparedDirectoryEdit,
+        parent_links_delta: i32,
+        now_ns: u64,
+    ) -> Result<PreparedDirectoryMutation, FsError> {
+        let volume = Arc::clone(self.inode.filesystem());
+        let old = self.metadata_snapshot();
+        let old_root = *self.state.root.read();
+        let root = *edit.root();
+        let changed = edit.changed();
+        if !changed {
+            if parent_links_delta != 0 {
+                edit.cancel(&volume);
+                return Err(FsError::InvalidOperation);
+            }
+            return Ok(PreparedDirectoryMutation {
+                parent: self.inode.clone(),
+                volume,
+                edit: Some(edit),
+                inode_mapping: None,
+                root: old_root,
+                next: old,
+                changed,
+            });
+        }
+        let result = (|| {
+            let flags = edit.flags();
+            let permitted = codec::INDEX | 0x40000;
+            if flags & !permitted != old.flags & !permitted {
+                return Err(FsError::InvalidOperation);
+            }
+            let mut next = old;
+            next.size = edit.size();
+            next.blocks = edit.blocks();
+            next.links = updated_link_count(old.links, parent_links_delta)?;
+            let (mtime, ctime) = codec::prepare_inode_write_times(now_ns, old.extra_isize)?;
+            next.mtime = mtime;
+            next.ctime = ctime;
+            let (_, huge) = codec::blocks_encoding(volume.geometry(), next.blocks)?;
+            next.flags = (flags & !0x40000) | if huge { 0x40000 } else { 0 };
+            let mapping = volume.prepare_inode_mapping(&old, &old_root, &next, &root)?;
+            Ok::<_, FsError>((next, mapping))
+        })();
+        match result {
+            Ok((next, inode_mapping)) => Ok(PreparedDirectoryMutation {
+                parent: self.inode.clone(),
+                volume,
+                edit: Some(edit),
+                inode_mapping: Some(inode_mapping),
+                root,
+                next,
+                changed,
+            }),
+            Err(error) => {
+                edit.cancel(&volume);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl PreparedDirectoryMutation {
+    /// 判断本次准备是否修改了名字或父目录元数据。
+    pub(crate) fn changed(&self) -> bool {
+        self.changed
+    }
+}
+
+impl Drop for PreparedDirectoryMutation {
+    /// 尚未提交的目录树只撤销本次预留块，不触碰旧名称和 canonical 状态。
+    fn drop(&mut self) {
+        if let Some(edit) = self.edit.take() {
+            edit.cancel(&self.volume);
+        }
+    }
+}
+
+/// 把目录 link count 的变化限定在 ext4 记录可表示范围内。
+fn updated_link_count(current: u32, delta: i32) -> Result<u32, FsError> {
+    let links = if delta < 0 {
+        current.checked_sub(delta.unsigned_abs())
+    } else {
+        current.checked_add(delta as u32)
+    }
+    .ok_or(FsError::InvalidOperation)?;
+    if u32::from(u16::MAX) < links {
+        return Err(FsError::TooManyLinks);
+    }
+    Ok(links)
+}
+
+/// 构造尚未连接目录名的 canonical 初值，并验证 ext4 sector/时间编码。
+fn initial_inode_metadata(
+    volume: &Ext4Volume,
+    initial: &InodeData,
+    size: u64,
+    blocks: u64,
+    now_ns: u64,
+) -> Result<InodeMetadata, FsError> {
+    if (i64::MAX as u64) < size {
+        return Err(FsError::FileTooLarge);
+    }
+    let (mtime, ctime) = codec::prepare_inode_write_times(now_ns, initial.extra_isize)?;
+    let atime = if 144 <= 128 + initial.extra_isize {
+        mtime
+    } else {
+        InodeTime {
+            nanoseconds: 0,
+            ..mtime
+        }
+    };
+    let (_, huge) = codec::blocks_encoding(volume.geometry(), blocks)?;
+    let mut metadata = InodeMetadata::from_data(initial);
+    metadata.size = size;
+    metadata.blocks = blocks;
+    metadata.atime = atime;
+    metadata.mtime = mtime;
+    metadata.ctime = ctime;
+    metadata.flags = (initial.flags & !0x40000) | if huge { 0x40000 } else { 0 };
+    metadata.fast_symlink = metadata.kind == InodeKind::Symlink && blocks == 0 && size < 60;
+    Ok(metadata)
+}
+
+/// 计算链接数与 ctime 的新值，再预留并验证共同 inode-table 记录。
+fn prepare_link_delta(
+    inode: &InodeRef,
+    state: &InodeState,
+    delta: i32,
+    now_ns: u64,
+) -> Result<PreparedInodeMetadata, FsError> {
+    let old = *state.metadata.lock();
+    let links = updated_link_count(old.links, delta)?;
+    let (_, ctime) = codec::prepare_inode_write_times(now_ns, old.extra_isize)?;
+    let mut next = old;
+    next.links = links;
+    next.ctime = ctime;
+    prepare_inode_metadata(inode, state, old, next)
+}
+
+/// 计算 ctime 的可表示盘面值并预备当前 inode 记录。
+fn prepare_inode_ctime(
+    inode: &InodeRef,
+    state: &InodeState,
+    now_ns: u64,
+) -> Result<PreparedInodeMetadata, FsError> {
+    let old = *state.metadata.lock();
+    let (_, ctime) = codec::prepare_inode_write_times(now_ns, old.extra_isize)?;
+    let mut next = old;
+    next.ctime = ctime;
+    prepare_inode_metadata(inode, state, old, next)
+}
+
+/// 记录修改 guard 先核对当前 inode 记录与 canonical 根，再锁外保留准确窗口。
+fn prepare_inode_metadata(
+    inode: &InodeRef,
+    state: &InodeState,
+    old: InodeMetadata,
+    next: InodeMetadata,
+) -> Result<PreparedInodeMetadata, FsError> {
+    let volume = inode.filesystem();
+    volume.require_write(volume.claim())?;
+    if old.flags & codec::EA_INODE != 0 {
+        return Err(FsError::InvalidOperation);
+    }
+    codec::validate_inode_metadata_update(&old, &next)?;
+    let (record, offset) = volume.inode_record(old.number)?;
+    let root = state.root.read();
+    let current = record.with_read(|bytes| {
+        codec::decode_inode(
+            volume.geometry(),
+            old.number,
+            &bytes[offset..offset + volume.geometry().inode_size],
+        )
+    })??;
+    if InodeMetadata::from_data(&current) != old || current.block != *root {
+        return Err(FsError::Corrupt);
+    }
+    Ok(PreparedInodeMetadata {
+        inode: inode.clone(),
+        record,
+        offset,
+        old,
+        next,
+    })
+}
+
+/// 写入已校验的当前记录，再发布同一份 canonical 属性快照。
+fn publish_inode_metadata(inode: &InodeRef, state: &InodeState, prepared: PreparedInodeMetadata) {
+    assert!(
+        inode.ptr_eq(&prepared.inode),
+        "inode metadata token mismatch"
+    );
+    assert_eq!(*state.metadata.lock(), prepared.old);
+    let volume = inode.filesystem();
+    let g = volume.geometry();
+    prepared
+        .record
+        .update(volume.claim(), |bytes| {
+            codec::patch_inode_metadata(
+                g,
+                &mut bytes[prepared.offset..prepared.offset + g.inode_size],
+                &prepared.old,
+                &prepared.next,
+            )
+        })
+        .expect("prepared writable inode metadata")
+        .expect("prepared inode metadata patch");
+    *state.metadata.lock() = prepared.next;
+}
+
+/// 只由已取得目录读侧或写侧的 guard 调用，加载子 inode 时仍保父锁。
+fn lookup_locked(
+    inode: &InodeRef,
+    cache: &InodeCache,
+    name: &[u8],
+) -> Result<Option<InodeRef>, FsError> {
+    let number =
+        inode.with_map_read(|metadata, root| inode.filesystem.lookup(metadata, root, name))?;
+    number
+        .map(|number| cache.iget(inode.filesystem(), number))
+        .transpose()
 }
 
 impl LoadGuard<'_> {

@@ -83,6 +83,12 @@ fn writeback_errno(error: FsError) -> u32 {
         FsError::FileTooLarge => 27,
         FsError::Unsupported | FsError::Io(BlockError::Unsupported) => 95,
         FsError::NotFound | FsError::MissingRoot => 2,
+        FsError::Exists => 17,
+        FsError::NotEmpty => 39,
+        FsError::CrossDevice => 18,
+        FsError::TooManyLinks => 31,
+        FsError::NameTooLong => 36,
+        FsError::NotPermitted => 1,
         FsError::NotDirectory => 20,
         FsError::InvalidName
         | FsError::InvalidOperation
@@ -325,6 +331,10 @@ impl FolioIndex {
     }
 }
 
+/// 元数据槽已发表且范围读尚未认领时的锁外观察点，仅验收镜像保存回调。
+#[cfg(feature = "ktest")]
+pub(crate) type MetadataLoadHook = Arc<dyn Fn(&Arc<MetadataCache>, u64, usize) + Send + Sync>;
+
 /// Disk 弱反向槽取得同一物理元数据域；外部视图保留本缓存和真实 FS 占用。
 pub struct MetadataCache {
     index: FolioIndex,
@@ -334,6 +344,8 @@ pub struct MetadataCache {
     claim: FsClaim,
     writeback: SleepMutex<()>,
     wb_error: SpinLock<WritebackError>,
+    #[cfg(feature = "ktest")]
+    load_hook: SpinLock<Option<MetadataLoadHook>>,
 }
 
 impl MetadataCache {
@@ -374,6 +386,8 @@ impl MetadataCache {
             filesystem: SleepMutex::new(Weak::new()),
             writeback: SleepMutex::new(()),
             wb_error: SpinLock::new(WritebackError::new()),
+            #[cfg(feature = "ktest")]
+            load_hook: SpinLock::new(None),
         })
         .map_err(|_| BlockError::NoMemory)?;
         let cache = claim.disk().intern_metadata_cache(&candidate);
@@ -383,11 +397,25 @@ impl MetadataCache {
         Ok(cache)
     }
 
+    /// 更换槽发表后的观察者，旧回调在短锁外析构，回调不得遗留未结束的读入责任。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_set_load_hook(&self, hook: Option<MetadataLoadHook>) {
+        let retired = core::mem::replace(&mut *self.load_hook.lock(), hook);
+        drop(retired);
+    }
+
     /// 取得准确 1/2/4KiB 窗口；缺失段逐次认领，已有有效或脏字节不会被重新读盘覆盖。
     pub fn get(self: &Arc<Self>, block: u64, block_size: usize) -> Result<BufferRef, BlockError> {
         let (byte, offset) = self.block_range(block, block_size)?;
         let page = byte - offset as u64;
         let (folio, _) = self.index.get_or_prepare(page)?;
+        #[cfg(feature = "ktest")]
+        {
+            let hook = self.load_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(self, block, block_size);
+            }
+        }
         while let Some(read) = folio.begin_metadata_read(offset, block_size)? {
             self.claim
                 .disk()

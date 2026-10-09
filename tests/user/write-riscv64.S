@@ -8,6 +8,7 @@
     ecall
 .endm
 # /// 每个断言点保留独立退出码，分支只跨一条远跳。
+# /// t0 用于比较值；调用者在断言后必须重新取得仍要使用的地址。
 .macro EXPECT value, number
     li s11, \number
     li t0, \value
@@ -49,6 +50,14 @@
     ld a0, 48(t0)
     EXPECT \value, \number
 .endm
+# /// 两目标使用 asm-generic stat；mode 和 nlink 是独立的 32 位字段，不能合并读为 64 位。
+.macro NSSTAT fd, number
+    mv a0, \fd
+    lla a1, .Lstat
+    SC 80
+    EXPECT 0, \number
+.endm
+
 
 # /// 控制字是普通共享匿名页；忙等期间不发 syscall，保留远核真实 W 翻译。
 .macro PHASE value
@@ -172,6 +181,31 @@ _start:
     li t1, 'j'
     bne t0, t1, 991f
     j .Ltruncate_wait
+991:
+    li t1, 'N'
+    bne t0, t1, 991f
+    j .Lnamespace_dispatch
+991:
+    j .Lexit
+
+.Lnamespace_dispatch:
+    ld t0, 16(sp)
+    lbu t0, 1(t0)
+    li t1, '3'
+    bne t0, t1, 991f
+    j .Lnamespace_create
+991:
+    li t1, '4'
+    bne t0, t1, 991f
+    j .Lnamespace_unlink
+991:
+    li t1, '5'
+    bne t0, t1, 991f
+    j .Lnamespace_rename
+991:
+    li t1, '6'
+    bne t0, t1, 991f
+    j .Lnamespace_directories
 991:
     j .Lexit
 
@@ -1100,6 +1134,1843 @@ _start:
     GATE 2
     j .Lpass
 
+# /// 真实用户创建对象后停在匿名控制页，控制者只接收inode并同步盘面。
+.Lnamespace_create:
+    li s6, 0x49000000
+    li a0, 0x1017
+    SC 166
+    EXPECT 0x12, 300
+    mv s2, a0
+
+    li a0, -100
+    lla a1, .Lns_mode
+    li a2, 0xc2
+    li a3, 0xfff
+    SC 56
+    OK 301
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 303
+    mv a0, s0
+    SC 57
+    EXPECT 0, 304
+    li a0, -100
+    lla a1, .Lns_data
+    li a2, 0xc2
+    li a3, 0x1b6
+    SC 56
+    OK 645
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_mode
+    li a2, 4
+    SC 64
+    EXPECT 4, 646
+    mv a0, s0
+    SC 82
+    EXPECT 0, 647
+    mv a0, s0
+    SC 57
+    EXPECT 0, 648
+
+    li s3, 12
+    li a0, 0x311
+    lla a1, .Lns_stack_a
+    li t0, 16384
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 305
+    beqz a0, .Lns_race_child
+    mv s4, a0
+    li s3, 16
+    li a0, 0x311
+    lla a1, .Lns_stack_b
+    li t0, 16384
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 306
+    beqz a0, .Lns_race_child
+    mv s5, a0
+    li t0, 1
+    fence rw, w
+    sw t0, 8(s6)
+    mv a0, s4
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 307
+    beq a0, s4, 991f
+    j .Lexit
+991:
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 308
+    mv a0, s5
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 309
+    beq a0, s5, 991f
+    j .Lexit
+991:
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 310
+    lw t0, 12(s6)
+    lw t1, 16(s6)
+    add a0, t0, t1
+    EXPECT 1, 311
+    OPEN .Lns_race, 0, 638
+    mv s0, a0
+    NSSTAT s0, 639
+    lla t0, .Lstat
+    ld t1, 8(t0)
+    mv s4, t1
+    OPEN .Lns_race, 0, 640
+    mv s1, a0
+    NSSTAT s1, 641
+    lla t0, .Lstat
+    ld t0, 8(t0)
+    li s11, 642
+    beq t0, s4, 991f
+    j .Lexit
+991:
+    mv a0, s1
+    SC 57
+    EXPECT 0, 643
+    mv a0, s0
+    SC 57
+    EXPECT 0, 644
+    OPEN .Lns_race, 2, 312
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_race
+    li a2, 4
+    SC 64
+    EXPECT 4, 313
+    mv a0, s0
+    SC 82
+    EXPECT 0, 314
+    mv a0, s0
+    SC 57
+    EXPECT 0, 315
+
+    li a0, 0x311
+    lla a1, .Lns_stack_a
+    li t0, 16384
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 316
+    beqz a0, .Lns_shared_umask_child
+    mv s4, a0
+    mv a0, s4
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 317
+    beq a0, s4, 991f
+    j .Lexit
+991:
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 318
+    li a0, 0
+    SC 166
+    EXPECT 7, 319
+    li a0, 0x17
+    SC 166
+    EXPECT 0, 320
+
+    li a0, 0x111
+    lla a1, .Lns_stack_a
+    li t0, 16384
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 321
+    beqz a0, .Lns_copy_umask_child
+    mv s4, a0
+    mv a0, s4
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 322
+    beq a0, s4, 991f
+    j .Lexit
+991:
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 323
+    li a0, 0
+    SC 166
+    EXPECT 0x17, 324
+    li a0, 0x17
+    SC 166
+    EXPECT 0, 325
+
+    li a0, -100
+    lla a1, .Lns_ro
+    li a2, 0x40
+    li a3, 0x1b6
+    SC 56
+    OK 326
+    mv s0, a0
+    NSSTAT s0, 327
+    lla t0, .Lstat
+    lwu a0, 16(t0)
+    slli a0, a0, 52
+    srli a0, a0, 52
+    EXPECT 0x1a0, 328
+    mv a0, s0
+    lla a1, .Lns_payload_mode
+    li a2, 1
+    SC 64
+    EXPECT -9, 329
+    mv a0, s0
+    SC 82
+    EXPECT 0, 330
+    mv a0, s0
+    SC 57
+    EXPECT 0, 331
+
+    li a0, -100
+    lla a1, .Lns_mode
+    li a2, 0x40
+    li a3, 0x180
+    SC 56
+    OK 332
+    mv s0, a0
+    NSSTAT s0, 333
+    lla t0, .Lstat
+    lwu a0, 16(t0)
+    slli a0, a0, 52
+    srli a0, a0, 52
+    EXPECT 0xfe8, 334
+    mv a0, s0
+    lla a1, .Lns_payload_race
+    li a2, 1
+    SC 64
+    EXPECT -9, 335
+    mv a0, s0
+    SC 57
+    EXPECT 0, 336
+    li a0, -100
+    lla a1, .Lns_mode
+    li a2, 0xc2
+    li a3, 0x1b6
+    SC 56
+    EXPECT -17, 337
+
+    li a0, -100
+    lla a1, .Lns_dir
+    li a2, 0x3ff
+    SC 34
+    EXPECT 0, 338
+    OPEN .Lns_dir, 0x10000, 339
+    mv s0, a0
+    NSSTAT s0, 340
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 2, 341
+    lla t0, .Lstat
+    lwu a0, 16(t0)
+    slli a0, a0, 52
+    srli a0, a0, 52
+    EXPECT 0x7e8, 342
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 128
+    SC 61
+    li t0, 48
+    bgeu a0, t0, 991f
+    j .Lexit
+991:
+    # s9 在这段 getdents 核验中保持当前记录地址；EXPECT 会覆盖 t0。
+    lla s9, .Lbuffer
+    lbu a0, 19(s9)
+    EXPECT '.', 645
+    lbu a0, 20(s9)
+    EXPECT 0, 646
+    lhu a0, 16(s9)
+    EXPECT 24, 647
+    lbu a0, 18(s9)
+    EXPECT 4, 648
+    lhu t1, 16(s9)
+    add s9, s9, t1
+    lbu a0, 19(s9)
+    EXPECT '.', 649
+    lbu a0, 20(s9)
+    EXPECT '.', 650
+    lbu a0, 21(s9)
+    EXPECT 0, 651
+
+    mv a0, s0
+    SC 82
+    EXPECT 0, 343
+    mv a0, s0
+    SC 57
+    EXPECT 0, 344
+
+    lla a0, .Lns_data
+    li a1, -100
+    lla a2, .Lns_short
+    SC 36
+    EXPECT 0, 345
+    lla a0, .Lns_long_target
+    li a1, -100
+    lla a2, .Lns_long
+    SC 36
+    EXPECT 0, 346
+    lla a0, .Lns_missing
+    li a1, -100
+    lla a2, .Lns_dangling
+    SC 36
+    EXPECT 0, 347
+
+    li a0, -100
+    lla a1, .Lns_raw
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 348
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_raw
+    li a2, 4
+    SC 64
+    EXPECT 4, 349
+    mv a0, s0
+    SC 82
+    EXPECT 0, 350
+    mv a0, s0
+    SC 57
+    EXPECT 0, 351
+
+    li a0, -100
+    lla a1, .Lns_missing_parent
+    li a2, 0x42
+    li a3, 0x180
+    SC 56
+    EXPECT -2, 352
+    li a0, -100
+    lla a1, .Lns_trailing
+    li a2, 0x20000
+    li a3, 0
+    SC 56
+    EXPECT -20, 353
+    li a0, -100
+    lla a1, .Lns_rooted
+    li a2, 0
+    li a3, 0
+    SC 56
+    OK 354
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 355
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_mode
+    li a2, 4
+    li s11, 356
+    call .Lequal
+    mv a0, s0
+    SC 57
+    EXPECT 0, 357
+
+    li a0, -100
+    lla a1, .Lns_permission_denied
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    EXPECT -13, 358
+
+    li s0, 0
+.Lns_fill_fds:
+    li a0, -100
+    lla a1, .Lns_mode
+    li a2, 0
+    li a3, 0
+    SC 56
+    li t0, -24
+    beq a0, t0, .Lns_fds_full
+    bgez a0, 991f
+    j .Lexit
+991:
+    li t1, 512
+    bltu s0, t1, 991f
+    j .Lexit
+991:
+    slli t1, s0, 3
+    lla t2, .Lns_fd_table
+    add t1, t1, t2
+    sd a0, 0(t1)
+    addi s0, s0, 1
+    j .Lns_fill_fds
+.Lns_fds_full:
+    beqz s0, .Lexit
+    li a0, -100
+    lla a1, .Lns_missing
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    EXPECT -24, 359
+    li s1, 0
+.Lns_close_fds:
+    bgeu s1, s0, .Lns_fds_closed
+    slli t1, s1, 3
+    lla t2, .Lns_fd_table
+    add t1, t1, t2
+    ld a0, 0(t1)
+    SC 57
+    EXPECT 0, 360
+    addi s1, s1, 1
+    j .Lns_close_fds
+.Lns_fds_closed:
+    li a0, -100
+    lla a1, .Lns_missing
+    li a2, 0
+    li a3, 0
+    SC 56
+    EXPECT -2, 361
+
+    OPEN .Lns_parent, 0x10000, 362
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 363
+    mv a0, s0
+    SC 57
+    EXPECT 0, 364
+    PHASE 1
+    GATE 1
+
+    li a0, -100
+    lla a1, .Lns_dangling
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    EXPECT -17, 365
+    li a0, -100
+    lla a1, .Lns_dangling
+    li a2, 0x20000
+    li a3, 0
+    SC 56
+    EXPECT -40, 366
+    li a0, -100
+    lla a1, .Lns_dangling
+    li a2, 0x42
+    li a3, 0x180
+    SC 56
+    OK 367
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_dangling
+    li a2, 4
+    SC 64
+    EXPECT 4, 368
+    mv a0, s0
+    SC 82
+    EXPECT 0, 369
+    mv a0, s0
+    SC 57
+    EXPECT 0, 370
+
+    OPEN .Lns_short, 0, 371
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 372
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_mode
+    li a2, 4
+    li s11, 373
+    call .Lequal
+    mv a0, s0
+    SC 57
+    EXPECT 0, 374
+    OPEN .Lns_long, 0, 375
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 376
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_mode
+    li a2, 4
+    li s11, 377
+    call .Lequal
+    mv a0, s0
+    SC 57
+    EXPECT 0, 378
+    OPEN .Lns_dangling, 0, 379
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 380
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_dangling
+    li a2, 4
+    li s11, 381
+    call .Lequal
+    mv a0, s0
+    SC 57
+    EXPECT 0, 382
+
+    li a0, -100
+    lla a1, .Lns_sgid_child
+    li a2, 0xc2
+    li a3, 0xfff
+    SC 56
+    OK 383
+    mv s0, a0
+    NSSTAT s0, 384
+    lla t0, .Lstat
+    lwu a0, 28(t0)
+    EXPECT 1001, 385
+    lla t0, .Lstat
+    lwu a0, 16(t0)
+    slli a0, a0, 52
+    srli a0, a0, 52
+    EXPECT 0xfe8, 386
+    mv a0, s0
+    lla a1, .Lns_payload_alias
+    li a2, 4
+    SC 64
+    EXPECT 4, 387
+    mv a0, s0
+    SC 82
+    EXPECT 0, 388
+    mv a0, s0
+    SC 57
+    EXPECT 0, 389
+
+    OPEN .Lns_parent, 0x10000, 390
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 391
+    mv a0, s0
+    SC 57
+    EXPECT 0, 392
+    PHASE 2
+    GATE 2
+    li a0, 0x12
+    SC 166
+    EXPECT 0x17, 393
+
+    li a0, -100
+    lla a1, .Lns_race
+    li a2, 0
+    SC 35
+    EXPECT 0, 394
+    li a0, -100
+    lla a1, .Lns_mode
+    li a2, 0
+    SC 35
+    EXPECT 0, 395
+    li a0, -100
+    lla a1, .Lns_data
+    li a2, 0
+    SC 35
+    EXPECT 0, 649
+    li a0, -100
+    lla a1, .Lns_ro
+    li a2, 0
+    SC 35
+    EXPECT 0, 396
+    li a0, -100
+    lla a1, .Lns_shared
+    li a2, 0
+    SC 35
+    EXPECT 0, 397
+    li a0, -100
+    lla a1, .Lns_copy
+    li a2, 0
+    SC 35
+    EXPECT 0, 398
+    li a0, -100
+    lla a1, .Lns_raw
+    li a2, 0
+    SC 35
+    EXPECT 0, 399
+    li a0, -100
+    lla a1, .Lns_missing
+    li a2, 0
+    SC 35
+    EXPECT 0, 400
+    li a0, -100
+    lla a1, .Lns_sgid_child
+    li a2, 0
+    SC 35
+    EXPECT 0, 401
+    li a0, -100
+    lla a1, .Lns_short
+    li a2, 0
+    SC 35
+    EXPECT 0, 402
+    li a0, -100
+    lla a1, .Lns_long
+    li a2, 0
+    SC 35
+    EXPECT 0, 403
+    li a0, -100
+    lla a1, .Lns_dangling
+    li a2, 0
+    SC 35
+    EXPECT 0, 404
+    li a0, -100
+    lla a1, .Lns_dir
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 405
+    OPEN .Lns_parent, 0x10000, 406
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 407
+    mv a0, s0
+    SC 57
+    EXPECT 0, 408
+    j .Lpass
+.Lns_race_child:
+    li t0, 0
+.Lns_race_gate:
+    lw t0, 8(s6)
+    beqz t0, .Lns_race_gate
+    fence rw, rw
+    li a0, -100
+    lla a1, .Lns_race
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    bgez a0, .Lns_race_won
+    li t1, -17
+    beq a0, t1, 991f
+    j .Lexit
+991:
+    li t0, 0
+    j .Lns_race_record
+.Lns_race_won:
+    mv s0, a0
+    li t0, 1
+.Lns_race_record:
+    add t1, s6, s3
+    sw t0, 0(t1)
+    beqz t0, .Lns_race_exit
+    mv a0, s0
+    SC 57
+    EXPECT 0, 409
+.Lns_race_exit:
+    li a0, 0
+    SC 93
+    j .Lexit
+.Lns_shared_umask_child:
+    li a0, 7
+    SC 166
+    EXPECT 0x17, 410
+    li a0, -100
+    lla a1, .Lns_shared
+    li a2, 0xc2
+    li a3, 0x1b6
+    SC 56
+    OK 411
+    mv s0, a0
+    NSSTAT s0, 412
+    lla t0, .Lstat
+    lwu a0, 16(t0)
+    slli a0, a0, 52
+    srli a0, a0, 52
+    EXPECT 0x1b0, 413
+    mv a0, s0
+    lla a1, .Lns_payload_shared
+    li a2, 4
+    SC 64
+    EXPECT 4, 414
+    mv a0, s0
+    SC 82
+    EXPECT 0, 415
+    mv a0, s0
+    SC 57
+    EXPECT 0, 416
+    li a0, 0
+    SC 93
+    j .Lexit
+.Lns_copy_umask_child:
+    li a0, 0x3f
+    SC 166
+    EXPECT 0x17, 417
+    li a0, -100
+    lla a1, .Lns_copy
+    li a2, 0xc2
+    li a3, 0x1b6
+    SC 56
+    OK 418
+    mv s0, a0
+    NSSTAT s0, 419
+    lla t0, .Lstat
+    lwu a0, 16(t0)
+    slli a0, a0, 52
+    srli a0, a0, 52
+    EXPECT 0x180, 420
+    mv a0, s0
+    lla a1, .Lns_payload_copy
+    li a2, 4
+    SC 64
+    EXPECT 4, 421
+    mv a0, s0
+    SC 82
+    EXPECT 0, 422
+    mv a0, s0
+    SC 57
+    EXPECT 0, 423
+    li a0, 0
+    SC 93
+    j .Lexit
+
+# /// 同一 inode 的旧 fd、共享页与私有页跨 unlink 和同名新建仍保持原内容。
+.Lnamespace_unlink:
+    li s6, 0x49000000
+    li a0, -100
+    lla a1, .Lns_old
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 430
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_old
+    li a2, 4
+    SC 64
+    EXPECT 4, 431
+    mv a0, s0
+    SC 82
+    EXPECT 0, 432
+    li a0, -100
+    lla a1, .Lns_old
+    li a2, -100
+    lla a3, .Lns_alias
+    li a4, 0
+    SC 37
+    EXPECT 0, 433
+    NSSTAT s0, 434
+    lla t0, .Lstat
+    ld t1, 8(t0)
+    mv s4, t1
+    lwu a0, 20(t0)
+    EXPECT 2, 435
+    OPEN .Lns_alias, 0, 436
+    mv s1, a0
+    NSSTAT s1, 437
+    lla t0, .Lstat
+    ld t1, 8(t0)
+    li s11, 438
+    beq t1, s4, 991f
+    j .Lexit
+991:
+    mv a0, s1
+    SC 57
+    EXPECT 0, 439
+
+    li a0, 0x4b000000
+    li a1, 4096
+    li a2, 1
+    li a3, 1
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4b000000, 440
+    mv s2, a0
+    li a0, 0x4c000000
+    li a1, 4096
+    li a2, 1
+    li a3, 2
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4c000000, 441
+    mv s3, a0
+    mv a0, s2
+    lla a1, .Lns_payload_old
+    li a2, 4
+    li s11, 442
+    call .Lequal
+    mv a0, s3
+    lla a1, .Lns_payload_old
+    li a2, 4
+    li s11, 443
+    call .Lequal
+    OPEN .Lns_parent, 0x10000, 645
+    mv s1, a0
+    mv a0, s1
+    SC 82
+    EXPECT 0, 646
+    mv a0, s1
+    SC 57
+    EXPECT 0, 647
+    PHASE 1
+    GATE 1
+
+    li a0, -100
+    lla a1, .Lns_old
+    li a2, 0
+    SC 35
+    EXPECT 0, 444
+    li a0, -100
+    lla a1, .Lns_alias
+    li a2, 0
+    SC 35
+    EXPECT 0, 445
+    NSSTAT s0, 446
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 0, 447
+    lla t0, .Lstat
+    ld a0, 48(t0)
+    EXPECT 4, 448
+    li a0, -100
+    lla a1, .Lns_old
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 449
+    mv s5, a0
+    mv a0, s5
+    lla a1, .Lns_payload_new
+    li a2, 4
+    SC 64
+    EXPECT 4, 450
+    mv a0, s5
+    SC 82
+    EXPECT 0, 451
+    NSSTAT s5, 452
+    lla t0, .Lstat
+    ld t1, 8(t0)
+    li s11, 453
+    bne t1, s4, 991f
+    j .Lexit
+991:
+    lwu a0, 20(t0)
+    EXPECT 1, 454
+    PHASE 2
+    GATE 2
+
+    mv a0, s0
+    li a1, 0
+    li a2, 0
+    SC 62
+    EXPECT 0, 455
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 456
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_old
+    li a2, 4
+    li s11, 457
+    call .Lequal
+    mv a0, s2
+    lla a1, .Lns_payload_old
+    li a2, 4
+    li s11, 458
+    call .Lequal
+    mv a0, s3
+    lla a1, .Lns_payload_old
+    li a2, 4
+    li s11, 459
+    call .Lequal
+    NSSTAT s0, 460
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 0, 461
+    mv a0, s0
+    SC 57
+    EXPECT 0, 462
+    mv a0, s2
+    li a1, 4096
+    SC 215
+    EXPECT 0, 463
+    mv a0, s3
+    li a1, 4096
+    SC 215
+    EXPECT 0, 464
+    PHASE 3
+    GATE 3
+
+    mv a0, s5
+    SC 82
+    EXPECT 0, 465
+    li a0, -100
+    lla a1, .Lns_old
+    li a2, 0
+    SC 35
+    EXPECT 0, 466
+    OPEN .Lns_parent, 0x10000, 467
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 468
+    mv a0, s0
+    SC 57
+    EXPECT 0, 469
+    mv a0, s5
+    SC 57
+    EXPECT 0, 470
+    j .Lpass
+
+# /// renameat2 覆盖真实目标项后，旧 descriptor 与映射仍指向原 inode。
+.Lnamespace_rename:
+    li s6, 0x49000000
+    li a0, -100
+    lla a1, .Lns_source
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 480
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lns_payload_source
+    li a2, 4
+    SC 64
+    EXPECT 4, 481
+    mv a0, s1
+    SC 82
+    EXPECT 0, 482
+    mv a0, s1
+    SC 57
+    EXPECT 0, 483
+    li a0, -100
+    lla a1, .Lns_target
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 484
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_target
+    li a2, 4
+    SC 64
+    EXPECT 4, 485
+    mv a0, s0
+    SC 82
+    EXPECT 0, 486
+    NSSTAT s0, 487
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 1, 488
+
+    li a0, -100
+    lla a1, .Lns_plain_source
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 489
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lns_payload_plain
+    li a2, 5
+    SC 64
+    EXPECT 5, 490
+    mv a0, s1
+    SC 82
+    EXPECT 0, 491
+    mv a0, s1
+    SC 57
+    EXPECT 0, 492
+    li a0, -100
+    lla a1, .Lns_noreplace_source
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 493
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lns_payload_copy
+    li a2, 4
+    SC 64
+    EXPECT 4, 494
+    mv a0, s1
+    SC 82
+    EXPECT 0, 495
+    mv a0, s1
+    SC 57
+    EXPECT 0, 496
+
+    li a0, 0x4b000000
+    li a1, 4096
+    li a2, 1
+    li a3, 1
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4b000000, 497
+    mv s2, a0
+    li a0, 0x4c000000
+    li a1, 4096
+    li a2, 1
+    li a3, 2
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4c000000, 498
+    mv s3, a0
+    OPEN .Lns_parent, 0x10000, 545
+    mv s1, a0
+    mv a0, s1
+    SC 82
+    EXPECT 0, 546
+    mv a0, s1
+    SC 57
+    EXPECT 0, 547
+    PHASE 1
+    GATE 1
+
+    li a0, -100
+    lla a1, .Lns_source
+    li a2, -100
+    lla a3, .Lns_target
+    li a4, 0
+    SC 276
+    EXPECT 0, 499
+    OPEN .Lns_target, 0, 500
+    mv s4, a0
+    mv a0, s4
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 501
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_source
+    li a2, 4
+    li s11, 502
+    call .Lequal
+    NSSTAT s0, 503
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 0, 504
+    NSSTAT s4, 505
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 1, 506
+    OPEN .Lns_plain_source, 0, 507
+    mv s5, a0
+    li a0, -100
+    lla a1, .Lns_plain_source
+    li a2, -100
+    lla a3, .Lns_plain_target
+    li a4, 0
+    SC 276
+    EXPECT 0, 508
+    li a0, -100
+    lla a1, .Lns_noreplace_source
+    li a2, -100
+    lla a3, .Lns_plain_target
+    li a4, 1
+    SC 276
+    EXPECT -17, 509
+    OPEN .Lns_plain_target, 0, 510
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lbuffer
+    li a2, 5
+    SC 63
+    EXPECT 5, 511
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_plain
+    li a2, 5
+    li s11, 512
+    call .Lequal
+    mv a0, s1
+    SC 57
+    EXPECT 0, 542
+    OPEN .Lns_noreplace_source, 0, 513
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 514
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_copy
+    li a2, 4
+    li s11, 515
+    call .Lequal
+    mv a0, s1
+    SC 57
+    EXPECT 0, 516
+    li a0, -100
+    lla a1, .Lns_noreplace_source
+    li a2, -100
+    lla a3, .Lns_noreplace_target
+    li a4, 1
+    SC 276
+    EXPECT 0, 517
+    OPEN .Lns_noreplace_target, 0, 518
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 519
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_copy
+    li a2, 4
+    li s11, 520
+    call .Lequal
+    mv a0, s1
+    SC 57
+    EXPECT 0, 521
+    OPEN .Lns_parent, 0x10000, 522
+    mv s1, a0
+    mv a0, s1
+    SC 82
+    EXPECT 0, 523
+    mv a0, s1
+    SC 57
+    EXPECT 0, 524
+    PHASE 2
+    GATE 2
+
+    mv a0, s0
+    li a1, 0
+    li a2, 0
+    SC 62
+    EXPECT 0, 525
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    SC 63
+    EXPECT 4, 526
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_target
+    li a2, 4
+    li s11, 527
+    call .Lequal
+    mv a0, s2
+    lla a1, .Lns_payload_target
+    li a2, 4
+    li s11, 528
+    call .Lequal
+    mv a0, s3
+    lla a1, .Lns_payload_target
+    li a2, 4
+    li s11, 529
+    call .Lequal
+    mv a0, s0
+    SC 57
+    EXPECT 0, 530
+    mv a0, s2
+    li a1, 4096
+    SC 215
+    EXPECT 0, 531
+    mv a0, s3
+    li a1, 4096
+    SC 215
+    EXPECT 0, 532
+    mv a0, s4
+    SC 57
+    EXPECT 0, 534
+    mv a0, s5
+    SC 57
+    EXPECT 0, 535
+    li a0, -100
+    lla a1, .Lns_target
+    li a2, 0
+    SC 35
+    EXPECT 0, 536
+    li a0, -100
+    lla a1, .Lns_plain_target
+    li a2, 0
+    SC 35
+    EXPECT 0, 537
+    li a0, -100
+    lla a1, .Lns_noreplace_target
+    li a2, 0
+    SC 35
+    EXPECT 0, 538
+    OPEN .Lns_parent, 0x10000, 539
+    mv s1, a0
+    mv a0, s1
+    SC 82
+    EXPECT 0, 540
+    mv a0, s1
+    SC 57
+    EXPECT 0, 541
+    j .Lpass
+
+# /// 同 inode 别名、目录拓扑与反向父目录改名由真实普通用户 syscall 消费。
+.Lnamespace_directories:
+    li s6, 0x49000000
+    li a0, -100
+    lla a1, .Lns_alias_source
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 550
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_alias
+    li a2, 4
+    SC 64
+    EXPECT 4, 551
+    mv a0, s0
+    SC 82
+    EXPECT 0, 552
+    mv a0, s0
+    SC 57
+    EXPECT 0, 553
+    li a0, -100
+    lla a1, .Lns_alias_source
+    li a2, -100
+    lla a3, .Lns_alias_target
+    li a4, 0
+    SC 37
+    EXPECT 0, 554
+    li a0, -100
+    lla a1, .Lns_cross_a
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 660
+    mv s0, a0
+    mv a0, s0
+    lla a1, .Lns_payload_cross_a
+    li a2, 4
+    SC 64
+    EXPECT 4, 661
+    mv a0, s0
+    SC 82
+    EXPECT 0, 662
+    lla t0, .Lns_cross_fds
+    sd s0, 0(t0)
+    li a0, -100
+    lla a1, .Lns_cross_b
+    li a2, 0xc2
+    li a3, 0x180
+    SC 56
+    OK 663
+    mv s1, a0
+    mv a0, s1
+    lla a1, .Lns_payload_cross_b
+    li a2, 4
+    SC 64
+    EXPECT 4, 664
+    mv a0, s1
+    SC 82
+    EXPECT 0, 665
+    lla t0, .Lns_cross_fds
+    sd s1, 8(t0)
+    li a0, -100
+    lla a1, .Lns_d1
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 666
+    li a0, -100
+    lla a1, .Lns_d2
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 667
+    li a0, -100
+    lla a1, .Lns_cross_a
+    li a2, -100
+    lla a3, .Lns_d1_a
+    li a4, 0
+    SC 37
+    EXPECT 0, 668
+    li a0, -100
+    lla a1, .Lns_cross_a
+    li a2, -100
+    lla a3, .Lns_d2_a
+    li a4, 0
+    SC 37
+    EXPECT 0, 669
+    li a0, -100
+    lla a1, .Lns_cross_b
+    li a2, -100
+    lla a3, .Lns_d1_b
+    li a4, 0
+    SC 37
+    EXPECT 0, 670
+    li a0, -100
+    lla a1, .Lns_cross_b
+    li a2, -100
+    lla a3, .Lns_d2_b
+    li a4, 0
+    SC 37
+    EXPECT 0, 671
+    NSSTAT s0, 672
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 3, 673
+    NSSTAT s1, 674
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 3, 675
+    OPEN .Lns_d1, 0x10000, 676
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 677
+    mv a0, s0
+    SC 57
+    EXPECT 0, 678
+    OPEN .Lns_d2, 0x10000, 679
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 680
+    mv a0, s0
+    SC 57
+    EXPECT 0, 681
+
+    li a0, -100
+    lla a1, .Lns_a
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 555
+    li a0, -100
+    lla a1, .Lns_b
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 556
+    li a0, -100
+    lla a1, .Lns_ax
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 557
+    li a0, -100
+    lla a1, .Lns_a2
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 558
+    li a0, -100
+    lla a1, .Lns_by
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 559
+    li a0, -100
+    lla a1, .Lns_cwd
+    li a2, 0x1ff
+    SC 34
+    EXPECT 0, 560
+    OPEN .Lns_a, 0x10000, 561
+    mv s0, a0
+    NSSTAT s0, 562
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 4, 563
+    mv a0, s0
+    SC 82
+    EXPECT 0, 564
+    mv a0, s0
+    SC 57
+    EXPECT 0, 565
+    OPEN .Lns_b, 0x10000, 566
+    mv s0, a0
+    NSSTAT s0, 567
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 3, 568
+    mv a0, s0
+    SC 82
+    EXPECT 0, 569
+    mv a0, s0
+    SC 57
+    EXPECT 0, 570
+    OPEN .Lns_parent, 0x10000, 571
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 572
+    mv a0, s0
+    SC 57
+    EXPECT 0, 573
+    PHASE 1
+    GATE 1
+    li a0, -100
+    lla a1, .Lns_cross_a
+    li a2, 0
+    SC 35
+    EXPECT 0, 680
+    li a0, -100
+    lla a1, .Lns_cross_b
+    li a2, 0
+    SC 35
+    EXPECT 0, 681
+    OPEN .Lns_parent, 0x10000, 682
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 683
+    mv a0, s0
+    SC 57
+    EXPECT 0, 684
+
+
+    li a0, -100
+    lla a1, .Lns_alias_source
+    li a2, -100
+    lla a3, .Lns_alias_target
+    li a4, 0
+    SC 276
+    EXPECT 0, 574
+    li a0, -100
+    lla a1, .Lns_missing
+    li a2, -100
+    lla a3, .Lns_missing
+    li a4, 0
+    SC 276
+    EXPECT -2, 575
+    li a0, -100
+    lla a1, .Lns_a
+    li a2, -100
+    lla a3, .Lns_ax
+    li a4, 0
+    SC 276
+    EXPECT -22, 716
+    li a0, -100
+    lla a1, .Lns_a
+    li a2, -100
+    lla a3, .Lns_descendant
+    li a4, 0
+    SC 276
+    EXPECT -22, 576
+    li a0, -100
+    lla a1, .Lns_ax
+    li a2, -100
+    lla a3, .Lns_bx
+    li a4, 0
+    SC 276
+    EXPECT 0, 577
+    OPEN .Lns_a, 0x10000, 578
+    mv s0, a0
+    NSSTAT s0, 579
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 3, 580
+    mv a0, s0
+    SC 57
+    EXPECT 0, 581
+    OPEN .Lns_b, 0x10000, 582
+    mv s0, a0
+    NSSTAT s0, 583
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 4, 584
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    mv s3, a0
+    mv a0, s0
+    SC 57
+    EXPECT 0, 585
+    OPEN .Lns_bx_parent, 0x10000, 586
+    mv s1, a0
+    NSSTAT s1, 587
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    li s11, 588
+    beq a0, s3, 991f
+    j .Lexit
+991:
+    mv a0, s1
+    SC 57
+    EXPECT 0, 635
+991:
+    lla a0, .Lns_cwd
+    SC 49
+    EXPECT 0, 589
+    li a0, -100
+    lla a1, .Lns_cwd
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 590
+    li a0, -100
+    lla a1, .Lns_child
+    li a2, 0x1ff
+    SC 34
+    EXPECT -2, 591
+    lla a0, .Lns_parent
+    SC 49
+    EXPECT 0, 592
+    li a0, -100
+    lla a1, .Lns_alias_source
+    li a2, -100
+    lla a3, .Lns_alias_target
+    li a4, 2
+    SC 276
+    EXPECT -22, 593
+    li a0, -100
+    lla a1, .Lns_alias_source
+    li a2, -100
+    lla a3, .Lns_alias_target
+    li a4, 4
+    SC 276
+    EXPECT -22, 594
+    li a0, -100
+    lla a1, .Lns_a
+    li a2, 0x201
+    SC 35
+    EXPECT -22, 595
+
+    li s3, 12
+    li a0, 0x311
+    lla a1, .Lns_stack_a
+    li t0, 16384
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 596
+    beqz a0, .Lns_move_a2_child
+    mv s4, a0
+    li s3, 16
+    li a0, 0x311
+    lla a1, .Lns_stack_b
+    li t0, 16384
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 597
+    beqz a0, .Lns_move_y_child
+    mv s5, a0
+    li t0, 1
+    fence rw, w
+    sw t0, 8(s6)
+    mv a0, s4
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 598
+    beq a0, s4, 991f
+    j .Lexit
+991:
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 599
+    mv a0, s5
+    lla a1, .Lstatus
+    li a2, 0
+    li a3, 0
+    SC 260
+    li s11, 600
+    beq a0, s5, 991f
+    j .Lexit
+991:
+    lla t0, .Lstatus
+    lw a0, 0(t0)
+    EXPECT 0, 601
+    ld a0, 12(s6)
+    EXPECT 0, 602
+    ld a0, 16(s6)
+    EXPECT 0, 603
+    lla t0, .Lns_cross_fds
+    ld s0, 0(t0)
+    ld s1, 8(t0)
+    NSSTAT s0, 640
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 1, 641
+    lla t0, .Lstat
+    ld s4, 8(t0)
+    OPEN .Lns_d1_b, 0, 642
+    mv s5, a0
+    NSSTAT s5, 643
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    li s11, 644
+    beq a0, s4, 991f
+    j .Lexit
+991:
+    mv a0, s5
+    lla a1, .Lbuffer
+    li a2, 4
+    li a3, 0
+    SC 67
+    EXPECT 4, 645
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_cross_a
+    li a2, 4
+    li s11, 646
+    call .Lequal
+    mv a0, s5
+    SC 57
+    EXPECT 0, 647
+    NSSTAT s1, 648
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 1, 649
+    lla t0, .Lstat
+    ld s4, 8(t0)
+    OPEN .Lns_d2_a, 0, 650
+    mv s5, a0
+    NSSTAT s5, 651
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    li s11, 652
+    beq a0, s4, 991f
+    j .Lexit
+991:
+    mv a0, s5
+    lla a1, .Lbuffer
+    li a2, 4
+    li a3, 0
+    SC 67
+    EXPECT 4, 653
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_cross_b
+    li a2, 4
+    li s11, 654
+    call .Lequal
+    mv a0, s5
+    SC 57
+    EXPECT 0, 655
+    mv a0, s0
+    li a1, 0
+    li a2, 0
+    SC 62
+    EXPECT 0, 656
+    mv a0, s0
+    lla a1, .Lbuffer
+    li a2, 4
+    li a3, 0
+    SC 67
+    EXPECT 4, 657
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_cross_a
+    li a2, 4
+    li s11, 658
+    call .Lequal
+    mv a0, s1
+    li a1, 0
+    li a2, 0
+    SC 62
+    EXPECT 0, 659
+    mv a0, s1
+    lla a1, .Lbuffer
+    li a2, 4
+    li a3, 0
+    SC 67
+    EXPECT 4, 660
+    lla a0, .Lbuffer
+    lla a1, .Lns_payload_cross_b
+    li a2, 4
+    li s11, 661
+    call .Lequal
+
+    OPEN .Lns_a, 0x10000, 604
+    mv s0, a0
+    NSSTAT s0, 605
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 3, 606
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    mv s2, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 607
+    mv a0, s0
+    SC 57
+    EXPECT 0, 608
+    OPEN .Lns_b, 0x10000, 609
+    mv s0, a0
+    NSSTAT s0, 610
+    lla t0, .Lstat
+    lwu a0, 20(t0)
+    EXPECT 4, 611
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    mv s3, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 612
+    mv a0, s0
+    SC 57
+    EXPECT 0, 613
+    OPEN .Lns_bx_parent, 0x10000, 614
+    mv s1, a0
+    NSSTAT s1, 615
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    li s11, 616
+    beq a0, s3, 991f
+    j .Lexit
+991:
+    mv a0, s1
+    SC 57
+    EXPECT 0, 636
+    OPEN .Lns_ay_parent, 0x10000, 617
+    mv s1, a0
+    NSSTAT s1, 618
+    lla t0, .Lstat
+    ld a0, 8(t0)
+    li s11, 619
+    beq a0, s2, 991f
+    j .Lexit
+991:
+    mv a0, s1
+    SC 57
+    EXPECT 0, 637
+    OPEN .Lns_parent, 0x10000, 620
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 621
+    mv a0, s0
+    SC 57
+    EXPECT 0, 622
+    PHASE 2
+    GATE 2
+    lla t0, .Lns_cross_fds
+    ld a0, 0(t0)
+    SC 57
+    EXPECT 0, 662
+    lla t0, .Lns_cross_fds
+    ld a0, 8(t0)
+    SC 57
+    EXPECT 0, 663
+
+    li a0, -100
+    lla a1, .Lns_alias_source
+    li a2, 0
+    SC 35
+    EXPECT 0, 623
+    li a0, -100
+    lla a1, .Lns_alias_target
+    li a2, 0
+    SC 35
+    EXPECT 0, 624
+    li a0, -100
+    lla a1, .Lns_d1_b
+    li a2, 0
+    SC 35
+    EXPECT 0, 638
+    li a0, -100
+    lla a1, .Lns_d2_a
+    li a2, 0
+    SC 35
+    EXPECT 0, 639
+    li a0, -100
+    lla a1, .Lns_bx
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 625
+    li a0, -100
+    lla a1, .Lns_ba2
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 626
+    li a0, -100
+    lla a1, .Lns_ay
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 627
+    li a0, -100
+    lla a1, .Lns_a
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 628
+    li a0, -100
+    lla a1, .Lns_b
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 629
+    li a0, -100
+    lla a1, .Lns_d1
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 640
+    li a0, -100
+    lla a1, .Lns_d2
+    li a2, 0x200
+    SC 35
+    EXPECT 0, 641
+    OPEN .Lns_parent, 0x10000, 630
+    mv s0, a0
+    mv a0, s0
+    SC 82
+    EXPECT 0, 631
+    mv a0, s0
+    SC 57
+    EXPECT 0, 632
+    j .Lpass
+.Lns_move_a2_child:
+    lw t0, 8(s6)
+    beqz t0, .Lns_move_a2_child
+    fence rw, rw
+    li a0, -100
+    lla a1, .Lns_d1_a
+    li a2, -100
+    lla a3, .Lns_d1_b
+    li a4, 0
+    SC 276
+    EXPECT 0, 664
+    fence rw, rw
+    li a0, -100
+    lla a1, .Lns_a2
+    li a2, -100
+    lla a3, .Lns_ba2
+    li a4, 0
+    SC 276
+    EXPECT 0, 633
+    li t0, 0
+    add t1, s6, s3
+    sw t0, 0(t1)
+    li a0, 0
+    SC 93
+    j .Lexit
+.Lns_move_y_child:
+    lw t0, 8(s6)
+    beqz t0, .Lns_move_y_child
+    fence rw, rw
+    li a0, -100
+    lla a1, .Lns_d2_b
+    li a2, -100
+    lla a3, .Lns_d2_a
+    li a4, 0
+    SC 276
+    EXPECT 0, 665
+    li a0, -100
+    lla a1, .Lns_by
+    li a2, -100
+    lla a3, .Lns_ay
+    li a4, 0
+    SC 276
+    EXPECT 0, 634
+    li t0, 0
+    add t1, s6, s3
+    sw t0, 0(t1)
+    li a0, 0
+    SC 93
+    j .Lexit
+
 # /// 核对整段常量字节，错误保留调用方的具名断言编号。
 .type .Lconstant, @function
 .Lconstant:
@@ -1161,6 +3032,78 @@ _start:
 .Lpayload: .byte 0x39
 .Ltruncate_input: .ascii "123456789"
 .Ltruncate_expected: .byte 0x31, 0x32, 0x33, 0, 0, 0, 0, 0, 0
+.Lns_parent: .asciz "/test/ns-work"
+.Lns_permission: .asciz "/test/ns-work/ns-permission"
+.Lns_permission_denied: .asciz "/test/ns-work/ns-permission/denied"
+.Lns_race: .asciz "/test/ns-work/ns-race"
+.Lns_mode: .asciz "/test/ns-work/ns-mode"
+.Lns_data: .asciz "/test/ns-work/ns-data"
+.Lns_ro: .asciz "/test/ns-work/ns-ro"
+.Lns_shared: .asciz "/test/ns-work/ns-shared"
+.Lns_copy: .asciz "/test/ns-work/ns-copy"
+.Lns_dir: .asciz "/test/ns-work/ns-dir"
+.Lns_raw:
+    .ascii "/test/ns-work/ns-raw-"
+    .byte 0xff, 0
+.Lns_short: .asciz "/test/ns-work/ns-short"
+.Lns_long: .asciz "/test/ns-work/ns-long"
+.Lns_long_target:
+    .ascii "/test/ns-work"
+    .rept 30
+    .ascii "/."
+    .endr
+    .asciz "/ns-data"
+.Lns_dangling: .asciz "/test/ns-work/ns-dangling"
+.Lns_missing: .asciz "/test/ns-work/ns-missing"
+.Lns_sgid_child: .asciz "/test/ns-work/ns-sgid-child"
+.Lns_trailing: .asciz "/test/ns-work/ns-mode/"
+.Lns_rooted: .asciz "/../../test/ns-work/ns-data"
+.Lns_missing_parent: .asciz "/test/ns-work/ns-absent/../ns-lex"
+.Lns_old: .asciz "/test/ns-work/ns-old"
+.Lns_alias: .asciz "/test/ns-work/ns-alias"
+.Lns_source: .asciz "/test/ns-work/ns-source"
+.Lns_target: .asciz "/test/ns-work/ns-target"
+.Lns_noreplace_source: .asciz "/test/ns-work/ns-noreplace-source"
+.Lns_noreplace_target: .asciz "/test/ns-work/ns-noreplace-target"
+.Lns_plain_source: .asciz "/test/ns-work/ns-plain-source"
+.Lns_plain_target: .asciz "/test/ns-work/ns-plain-target"
+.Lns_alias_source: .asciz "/test/ns-work/ns-alias-source"
+.Lns_alias_target: .asciz "/test/ns-work/ns-alias-target"
+.Lns_cross_a: .asciz "/test/ns-work/ns-cross-a"
+.Lns_cross_b: .asciz "/test/ns-work/ns-cross-b"
+.Lns_d1: .asciz "/test/ns-work/ns-d1"
+.Lns_d2: .asciz "/test/ns-work/ns-d2"
+.Lns_d1_a: .asciz "/test/ns-work/ns-d1/a"
+.Lns_d1_b: .asciz "/test/ns-work/ns-d1/b"
+.Lns_d2_a: .asciz "/test/ns-work/ns-d2/a"
+.Lns_d2_b: .asciz "/test/ns-work/ns-d2/b"
+.Lns_a: .asciz "/test/ns-work/ns-a"
+.Lns_b: .asciz "/test/ns-work/ns-b"
+.Lns_ax: .asciz "/test/ns-work/ns-a/x"
+.Lns_a2: .asciz "/test/ns-work/ns-a/a2"
+.Lns_by: .asciz "/test/ns-work/ns-b/y"
+.Lns_bx: .asciz "/test/ns-work/ns-b/x"
+.Lns_ba2: .asciz "/test/ns-work/ns-b/a2"
+.Lns_ay: .asciz "/test/ns-work/ns-a/y"
+.Lns_bx_parent: .asciz "/test/ns-work/ns-b/x/.."
+.Lns_ay_parent: .asciz "/test/ns-work/ns-a/y/.."
+.Lns_descendant: .asciz "/test/ns-work/ns-a/x/moved"
+.Lns_cwd: .asciz "/test/ns-work/ns-cwd"
+.Lns_child: .asciz "child"
+.Lns_payload_mode: .ascii "MODE"
+.Lns_payload_cross_a: .ascii "AAAA"
+.Lns_payload_cross_b: .ascii "BBBB"
+.Lns_payload_race: .ascii "RACE"
+.Lns_payload_shared: .ascii "SHRD"
+.Lns_payload_copy: .ascii "COPY"
+.Lns_payload_raw: .ascii "RAW!"
+.Lns_payload_dangling: .ascii "DANG"
+.Lns_payload_old: .ascii "OLD!"
+.Lns_payload_new: .ascii "NEW!"
+.Lns_payload_source: .ascii "SRC!"
+.Lns_payload_target: .ascii "TGT!"
+.Lns_payload_plain: .ascii "PLAIN"
+.Lns_payload_alias: .ascii "LINK"
 .balign 8
 .Lfutex_timeout: .quad 5, 0
 
@@ -1175,3 +3118,8 @@ _start:
 .Lstat: .space 128
 .Lstatus: .space 4
 .byte 0
+.balign 16
+.Lns_stack_a: .space 16384
+.Lns_stack_b: .space 16384
+.Lns_fd_table: .space 4096
+.Lns_cross_fds: .space 16

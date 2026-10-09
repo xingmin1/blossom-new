@@ -11,6 +11,7 @@ use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
 mod layout;
 mod lifecycle;
+mod namespace;
 mod preparation;
 mod write;
 
@@ -1077,6 +1078,11 @@ pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
 /// 可写消费者仍注册在原文件测试目录，不构造另一运行入口。
 pub(crate) fn write_anchor() -> &'static ::ktest::SuiteSlot {
     write::writes::__ktest_anchor()
+}
+
+/// 新名字空间消费者沿唯一 user ELF 锚点进入现有具名测试目录。
+pub(crate) fn namespace_anchor() -> &'static ::ktest::SuiteSlot {
+    namespace::anchor()
 }
 
 #[ktest::suite(fixture = UserOwner, suite_resources = DeviceInventory, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]

@@ -6,7 +6,9 @@ pub use allocation::{UnpublishedBlock, UnpublishedInode};
 pub(crate) mod codec;
 pub(crate) mod crc;
 mod directory;
+pub(crate) use directory::{DirectoryCursor, PreparedDirectoryEdit};
 mod mapping;
+pub(crate) use mapping::PreparedDirectoryMappings;
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -19,7 +21,7 @@ use crate::cache::{BufferRef, MetadataCache};
 use crate::fs::inode::{InodeDomain, InodeMetadata, InodeRef};
 use crate::fs::FsError;
 use crate::mm::{FolioRead, PAGE_SIZE};
-use crate::sync::{SleepMutex, SpinLock};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
 #[cfg(feature = "ktest")]
 type SegmentHook = Arc<dyn Fn(u64, usize) + Send + Sync>;
@@ -41,6 +43,12 @@ pub struct Geometry {
     pub groups_count: u64,
     pub descriptor_blocks: u64,
     pub checksum_seed: u32,
+    /// 超级块为 HTree 名字哈希保存的四个 seed 字。
+    pub hash_seed: [u32; 4],
+    /// ext4 名字哈希把输入字节解释为无符号值时为 true。
+    pub hash_unsigned: bool,
+    /// 新建 indexed 目录选择的超级块默认哈希版本。
+    pub default_hash_version: u8,
     pub uuid: [u8; 16],
     pub reserved_gdt_blocks: u64,
     pub backup_groups: [u32; 2],
@@ -148,7 +156,18 @@ pub struct DirectoryEntry {
     pub number: u64,
     pub name: Vec<u8>,
     pub kind: Option<InodeKind>,
-    pub next_offset: u64,
+    pub next_cookie: u64,
+    pub(crate) next_cursor: DirectoryCursor,
+}
+
+/// inode size、映射根或 links 提交所需的现有 inode 记录窗口。
+pub(crate) struct PreparedInodeMapping {
+    record: BufferRef,
+    offset: usize,
+    old: InodeMetadata,
+    attributes: InodeMetadata,
+    next: InodeMetadata,
+    root: [u8; 60],
 }
 
 pub struct Ext4Volume {
@@ -158,6 +177,7 @@ pub struct Ext4Volume {
     geometry: Geometry,
     claim: FsClaim,
     inode_domain: SpinLock<Weak<InodeDomain>>,
+    rename: SleepMutex<()>,
     allocation: SleepMutex<()>,
     groups: Vec<allocation::GroupLayout>,
     #[cfg(feature = "ktest")]
@@ -217,6 +237,7 @@ impl Ext4Volume {
             geometry,
             claim,
             inode_domain: SpinLock::new(Weak::new()),
+            rename: SleepMutex::new(()),
             allocation: SleepMutex::new(()),
             groups: Vec::new(),
             #[cfg(feature = "ktest")]
@@ -245,6 +266,11 @@ impl Ext4Volume {
     /// 返回卷自己的 FS 能力，不推导任何 Path/Mount 的写许可。
     pub fn mode(&self) -> AccessMode {
         self.claim.mode()
+    }
+
+    /// 在本卷内串行 rename 的拓扑检查与目录提交。
+    pub(crate) fn lock_rename(&self) -> SleepMutexGuard<'_, ()> {
+        self.rename.lock()
     }
 
     /// 借用真实 FS 占用；授权的 Bio 仍通过唯一 Disk 请求核心提交。
@@ -470,14 +496,33 @@ impl Ext4Volume {
         directory::lookup(self, inode, root, name)
     }
 
-    /// caller 持块映射读保护，返回下一真实目录项及后端字节游标。
+    /// caller 持目录读侧和块映射保护，按真实后端 cookie 取下一项。
     pub fn dir_next(
         &self,
         inode: &InodeMetadata,
         root: &[u8; 60],
-        offset: u64,
+        cursor: &DirectoryCursor,
     ) -> Result<Option<DirectoryEntry>, FsError> {
-        directory::next(self, inode, root, offset)
+        directory::next(self, inode, root, cursor)
+    }
+
+    /// 把用户 lseek cookie 转为后端游标，并清除旧的哈希碰撞续读位置。
+    pub(crate) fn directory_cursor(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        cookie: u64,
+    ) -> Result<DirectoryCursor, FsError> {
+        directory::cursor_at(self, inode, root, cookie)
+    }
+
+    /// 返回当前目录格式定义的 SEEK_END cookie，不将 HTree 哈希当作字节大小。
+    pub(crate) fn directory_end_cookie(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+    ) -> Result<u64, FsError> {
+        directory::end_cookie(self, inode, root)
     }
 
     /// caller 持块映射读保护，按当前属性与块根读取符号链接原始字节。
@@ -543,6 +588,118 @@ impl Ext4Volume {
         ))
     }
 
+    /// 初始化仍由 UnpublishedInode 保有的完整原始格式，canonical iget 只能在此后发生。
+    pub(crate) fn initialize_unpublished_inode(
+        &self,
+        allocation: &UnpublishedInode,
+        old: &InodeData,
+        next: &InodeMetadata,
+        root: &[u8; 60],
+    ) -> Result<(), FsError> {
+        if !allocation.belongs_to(self)
+            || allocation.number() != old.number
+            || next.number != old.number
+            || next.kind != old.kind
+            || old.links != 0
+            || next.links != 0
+            || old.file_acl != 0
+            || next.file_acl != 0
+            || old.flags & codec::EA_INODE != 0
+            || old.kind == InodeKind::Other
+        {
+            return Err(FsError::InvalidOperation);
+        }
+        self.require_write(&self.claim)?;
+        let old_root = old.block;
+        let old = InodeMetadata::from_data(old);
+        let mut expected = old;
+        expected.mode = next.mode;
+        expected.uid = next.uid;
+        expected.gid = next.gid;
+        expected.atime = next.atime;
+        expected.mtime = next.mtime;
+        expected.ctime = next.ctime;
+        expected.size = next.size;
+        expected.blocks = next.blocks;
+        expected.flags = next.flags;
+        expected.fast_symlink = next.fast_symlink;
+        let inode_layout_flags = 0x40000 | codec::INDEX;
+        if expected != *next || next.flags & !inode_layout_flags != old.flags & !inode_layout_flags
+        {
+            return Err(FsError::InvalidOperation);
+        }
+        let fast_symlink = next.kind == InodeKind::Symlink && next.blocks == 0 && next.size < 60;
+        if next.fast_symlink != fast_symlink {
+            return Err(FsError::InvalidOperation);
+        }
+        if (i64::MAX as u64) < next.size {
+            return Err(FsError::FileTooLarge);
+        }
+        if next.kind == InodeKind::Symlink {
+            if next.size == 0 {
+                return Err(FsError::InvalidName);
+            }
+            if (PAGE_SIZE as u64) < next.size {
+                return Err(FsError::NameTooLong);
+            }
+        }
+        let mut attributes = old;
+        attributes.mode = next.mode;
+        attributes.uid = next.uid;
+        attributes.gid = next.gid;
+        attributes.atime = next.atime;
+        attributes.mtime = next.mtime;
+        attributes.ctime = next.ctime;
+        codec::validate_inode_metadata_update(&old, &attributes)?;
+        codec::blocks_encoding(&self.geometry, next.blocks)?;
+        let (record, offset) = allocation.record();
+        let current = record.with_read(|bytes| {
+            codec::decode_inode(
+                &self.geometry,
+                old.number,
+                &bytes[offset..offset + self.geometry.inode_size],
+            )
+        })??;
+        if InodeMetadata::from_data(&current) != old || current.block != old_root {
+            return Err(FsError::Corrupt);
+        }
+        record
+            .update(&self.claim, |bytes| {
+                let record = &mut bytes[offset..offset + self.geometry.inode_size];
+                codec::patch_inode_metadata(&self.geometry, record, &old, &attributes)
+                    .expect("prepared unpublished inode attributes");
+                codec::patch_inode_mapping(&self.geometry, record, next, root);
+            })
+            .map_err(FsError::Io)?;
+        Ok(())
+    }
+
+    /// iget 失败时清除仍未发表 inode 根，之后才能取消其块映射 reservation。
+    pub(crate) fn clear_unpublished_inode(
+        &self,
+        allocation: &UnpublishedInode,
+        initial: &InodeData,
+    ) {
+        assert!(
+            allocation.belongs_to(self),
+            "unpublished inode volume changed"
+        );
+        assert_eq!(allocation.number(), initial.number);
+        let metadata = InodeMetadata::from_data(initial);
+        let (record, offset) = allocation.record();
+        let g = &self.geometry;
+        record
+            .update(&self.claim, |bytes| {
+                codec::patch_inode_mapping(
+                    g,
+                    &mut bytes[offset..offset + g.inode_size],
+                    &metadata,
+                    &initial.block,
+                )
+            })
+            .expect("prepared unpublished inode reset");
+    }
+
     /// caller 保持 inode 写序列化；准备不会连接新资源，失败有显式本次释放。
     pub(crate) fn prepare_write(
         &self,
@@ -551,6 +708,176 @@ impl Ext4Volume {
         logical: u64,
     ) -> Result<mapping::PreparedMapping, FsError> {
         mapping::prepare(self, &inode.with_block(root), logical)
+    }
+
+    /// 准备一次目录索引增长所需的整批逻辑块，不发表 inode 块根。
+    pub(crate) fn prepare_directory_mappings(
+        &self,
+        inode: &InodeData,
+        root: &[u8; 60],
+        logical: &[u64],
+    ) -> Result<mapping::PreparedDirectoryMappings, FsError> {
+        mapping::prepare_directory_mappings(self, inode, root, logical)
+    }
+
+    /// 符号链接短块树预备复用唯一 extent/indirect 分配与提交算法。
+    pub(crate) fn prepare_symlink_mappings(
+        &self,
+        inode: &InodeData,
+        root: &[u8; 60],
+        logical: &[u64],
+    ) -> Result<mapping::PreparedDirectoryMappings, FsError> {
+        mapping::prepare_symlink_mappings(self, inode, root, logical)
+    }
+
+    /// 预备目录项插入及其可能新增的真实叶块和索引块。
+    pub(crate) fn prepare_directory_add(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        name: &[u8],
+        number: u64,
+        kind: InodeKind,
+    ) -> Result<PreparedDirectoryEdit, FsError> {
+        directory::prepare_add(self, inode, root, name, number, kind)
+    }
+
+    /// 在父名发表之前准备新目录的真实 `.`、`..` 与 HTree 根。
+    pub(crate) fn prepare_directory_new(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        parent_number: u64,
+    ) -> Result<PreparedDirectoryEdit, FsError> {
+        directory::prepare_new_directory(self, inode, root, parent_number)
+    }
+
+    /// 预备移除指定目录名，旧目录内容只在该 token 的 publish 中改变。
+    pub(crate) fn prepare_directory_remove(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        name: &[u8],
+    ) -> Result<PreparedDirectoryEdit, FsError> {
+        directory::prepare_remove(self, inode, root, name)
+    }
+
+    /// 预备把现存目录项替换为新的 inode 身份。
+    pub(crate) fn prepare_directory_replace(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        name: &[u8],
+        number: u64,
+        kind: InodeKind,
+    ) -> Result<PreparedDirectoryEdit, FsError> {
+        directory::prepare_replace(self, inode, root, name, number, kind)
+    }
+
+    /// 预备同目录中的原生 rename，可在同一份树编辑里覆盖目标项。
+    pub(crate) fn prepare_directory_move(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        old_name: &[u8],
+        new_name: &[u8],
+        number: u64,
+        kind: InodeKind,
+        target: Option<(u64, InodeKind)>,
+    ) -> Result<PreparedDirectoryEdit, FsError> {
+        directory::prepare_move(self, inode, root, old_name, new_name, number, kind, target)
+    }
+
+    /// 预备移动目录时的真实 `..` 记录，不拆为独立目录写入。
+    pub(crate) fn prepare_directory_dotdot(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+        parent_number: u64,
+    ) -> Result<PreparedDirectoryEdit, FsError> {
+        directory::prepare_dotdot(self, inode, root, parent_number)
+    }
+
+    /// 校验目录是否只有 `.` 和 `..` 两个实际记录。
+    pub(crate) fn directory_is_empty(
+        &self,
+        inode: &InodeMetadata,
+        root: &[u8; 60],
+    ) -> Result<bool, FsError> {
+        directory::is_empty(self, inode, root)
+    }
+
+    /// 为目录内容和新块映射先预留 inode-table 窗口，不改变共同记录。
+    pub(crate) fn prepare_inode_mapping(
+        &self,
+        old: &InodeMetadata,
+        old_root: &[u8; 60],
+        next: &InodeMetadata,
+        root: &[u8; 60],
+    ) -> Result<PreparedInodeMapping, FsError> {
+        self.require_write(&self.claim)?;
+        let mut expected = *old;
+        expected.mode = next.mode;
+        expected.uid = next.uid;
+        expected.gid = next.gid;
+        expected.links = next.links;
+        expected.size = next.size;
+        expected.blocks = next.blocks;
+        expected.atime = next.atime;
+        expected.mtime = next.mtime;
+        expected.ctime = next.ctime;
+        expected.flags = next.flags;
+        let inode_layout_flags = 0x40000 | codec::INDEX;
+        if expected != *next || next.flags & !inode_layout_flags != old.flags & !inode_layout_flags
+        {
+            return Err(FsError::InvalidOperation);
+        }
+        let mut attributes = *old;
+        attributes.mode = next.mode;
+        attributes.uid = next.uid;
+        attributes.gid = next.gid;
+        attributes.links = next.links;
+        attributes.atime = next.atime;
+        attributes.mtime = next.mtime;
+        attributes.ctime = next.ctime;
+        codec::validate_inode_metadata_update(old, &attributes)?;
+        codec::blocks_encoding(&self.geometry, next.blocks)?;
+        if (i64::MAX as u64) < next.size {
+            return Err(FsError::FileTooLarge);
+        }
+        let (record, offset) = self.inode_record(old.number)?;
+        let current = record.with_read(|bytes| {
+            codec::decode_inode(
+                &self.geometry,
+                old.number,
+                &bytes[offset..offset + self.geometry.inode_size],
+            )
+        })??;
+        if InodeMetadata::from_data(&current) != *old || current.block != *old_root {
+            return Err(FsError::Corrupt);
+        }
+        Ok(PreparedInodeMapping {
+            record,
+            offset,
+            old: *old,
+            attributes,
+            next: *next,
+            root: *root,
+        })
+    }
+
+    /// 目录项与映射块已写入后无失败地提交 inode 记录；canonical 状态由持锁 guard 发布。
+    pub(crate) fn publish_inode_mapping(&self, prepared: PreparedInodeMapping) {
+        let g = &self.geometry;
+        prepared
+            .record
+            .update(&self.claim, |bytes| {
+                let record = &mut bytes[prepared.offset..prepared.offset + g.inode_size];
+                codec::patch_inode_metadata(g, record, &prepared.old, &prepared.attributes)
+                    .expect("prepared directory inode attributes");
+                codec::patch_inode_mapping(g, record, &prepared.next, &prepared.root);
+            })
+            .expect("prepared writable directory inode record");
     }
 
     /// canonical 写序列化下准备准确截断窗口；失败不修改旧树、共同元数据或位图。

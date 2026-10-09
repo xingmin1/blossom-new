@@ -2,7 +2,7 @@
 
 use crate::arch::UserAccess;
 use crate::cache::FileUnmapPhase;
-use crate::fs::ext4::{codec, BlockMapping, InodeData};
+use crate::fs::ext4::{codec, BlockMapping, InodeData, InodeKind};
 use crate::fs::file::{open_path_with_flags, WriteBuffer};
 use crate::fs::inode::{InodeCacheWatch, InodeRef, TruncatePhase};
 use crate::fs::ktest::user::*;
@@ -28,19 +28,25 @@ const SHARED_CONTROL: usize = 0x4900_0000;
 const SHARED_FILE_OFFSET: usize = 24;
 const SHARED_ALIAS: usize = 0x4a00_0000;
 
-struct SyncObservation {
+/// 普通测试消费者的真实 Task 状态与同步结果观察，不承担 join 或文件拥有。
+
+pub(super) struct SyncObservation {
     executor: SpinLock<Option<alloc::sync::Weak<Task>>>,
     result: SpinLock<Option<Result<(), FsError>>>,
 }
 
 impl SyncObservation {
     /// 只查询实际执行者的调度状态，entered 标记不能替代 Blocked。
-    fn blocked(&self) -> bool {
+    pub(super) fn blocked(&self) -> bool {
         self.executor
             .lock()
             .as_ref()
             .and_then(alloc::sync::Weak::upgrade)
             .is_some_and(|task| sched::test_state(&task) == State::Blocked)
+    }
+    /// 返回真实同步调用已经写下的结果，不用观察任务退出代替底层结果。
+    pub(super) fn result(&self) -> Option<Result<(), FsError>> {
+        *self.result.lock()
     }
 }
 
@@ -68,15 +74,17 @@ impl TruncateControls {
     }
 }
 
-struct WriteOwner {
-    user: UserOwner,
-    inodes: Vec<InodeRef>,
+/// 复用原用户、任务、卷及异步消费者拥有边界的可写文件夹具。
+
+pub(super) struct WriteOwner {
+    pub(super) user: UserOwner,
+    pub(super) inodes: Vec<InodeRef>,
     append_gate: Option<Arc<Completion>>,
     shared_mm: Option<Arc<Mm>>,
     prepare_gate: Option<Arc<Completion>>,
     truncate_controls: Option<Arc<TruncateControls>>,
     consumers: [Option<JoinHandle>; 2],
-    cold_volume: Option<Arc<Ext4Volume>>,
+    pub(super) cold_volume: Option<Arc<Ext4Volume>>,
     cold_cache: Option<Arc<InodeCache>>,
     eviction: Option<InodeCacheWatch>,
 }
@@ -89,9 +97,65 @@ impl WriteOwner {
             .map_err(|_| TestError("write inode owner OOM"))?;
         self.user.prepare_mode(context, AccessMode::ReadWrite)
     }
+    /// 原生 namespace 消费者沿同一 RW PathOwner 准备，并让原清理无论 graph 状态都同步此卷。
+    pub(super) fn prepare_namespace(&mut self, context: &TestContext<'_>) -> TestResult {
+        self.prepare(context)?;
+        assert!(self.cold_volume.is_none() && self.cold_cache.is_none());
+        self.cold_volume = Some(self.volume());
+        Ok(())
+    }
+    /// 准备可由测试组写入的 setgid 目录与只允许 root 搜索的负例子目录。
+    fn prepare_namespace_parent(&mut self, context: &TestContext<'_>) -> TestResult {
+        let vfs = self.user.path.vfs().clone();
+        let fs_context = self.user.path.context().clone();
+        let root = vfs.root();
+        checked(
+            context,
+            vfs.mkdir_from(&fs_context, &root, b"/test/ns-work", 0o777, (0, 0), 0),
+        )?;
+        let workspace = self.open(context, b"/test/ns-work", 0x10000)?;
+        let inode = checked(context, workspace.path().inode())?.clone();
+        // mkdir 不接受 SGID 模式位；父目录的继承属性通过受保护元数据更新设置。
+        checked(
+            context,
+            inode.update_metadata(inode.filesystem().claim(), |metadata| {
+                metadata.mode |= 0o2000;
+                metadata.gid = 1001;
+            }),
+        )?;
+        drop(workspace);
+        checked(
+            context,
+            vfs.mkdir_from(
+                &fs_context,
+                &root,
+                b"/test/ns-work/ns-permission",
+                0o700,
+                (0, 0),
+                0,
+            ),
+        )?;
+        drop(self.open(context, b"/test/ns-work/ns-permission", 0x10000)?);
+        Ok(())
+    }
+    /// 删除普通用户无权移除的预置权限目录与最后一层测试目录。
+    fn remove_namespace_parent(&self, context: &TestContext<'_>) -> TestResult {
+        let vfs = self.user.path.vfs();
+        let fs_context = self.user.path.context();
+        let root = vfs.root();
+        checked(
+            context,
+            vfs.rmdir_from(fs_context, &root, b"/test/ns-work/ns-permission", (0, 0)),
+        )?;
+        checked(
+            context,
+            vfs.rmdir_from(fs_context, &root, b"/test/ns-work", (0, 0)),
+        )?;
+        Ok(())
+    }
 
     /// 保留实际 inode 到同步排空之后；失败路径也不能丢弃已接受修改。
-    fn open(
+    pub(super) fn open(
         &mut self,
         context: &TestContext<'_>,
         pathname: &[u8],
@@ -113,9 +177,31 @@ impl WriteOwner {
         }
         checked(context, open_path_with_flags(path, flags))
     }
+    /// 保留末组件本身的 canonical inode，symlink 不跟随到其目标。
+    fn hold_nofollow(
+        &mut self,
+        context: &TestContext<'_>,
+        pathname: &[u8],
+    ) -> Result<InodeRef, TestError> {
+        let path = checked(
+            context,
+            self.user
+                .path
+                .vfs()
+                .resolve(self.user.path.context(), pathname, ResolveMode::NoFollow),
+        )?;
+        let inode = checked(context, path.inode())?.clone();
+        if !self.inodes.iter().any(|old| old.ptr_eq(&inode)) {
+            if self.inodes.len() == self.inodes.capacity() {
+                return Err(TestError("write inode owner capacity"));
+            }
+            self.inodes.push(inode.clone());
+        }
+        Ok(inode)
+    }
 
     /// 从同一原根取得卷，根引用仅在正文和同步期间短暂保活。
-    fn volume(&self) -> Arc<Ext4Volume> {
+    pub(super) fn volume(&self) -> Arc<Ext4Volume> {
         self.user.path.vfs().root().filesystem().clone()
     }
 
@@ -168,6 +254,16 @@ impl WriteOwner {
     fn start_shared(&mut self, context: &TestContext<'_>, image: LoadedImage) -> TestResult {
         self.user
             .start_program(context, image, true, false, Credentials::ROOT)
+    }
+    /// 按指定的真实用户身份启动同一普通 ELF，并保留原 UserOwner 的 wait/join。
+    fn start_shared_as(
+        &mut self,
+        context: &TestContext<'_>,
+        image: LoadedImage,
+        credentials: Credentials,
+    ) -> TestResult {
+        self.user
+            .start_program(context, image, true, false, credentials)
     }
 
     /// 实际退出离栈必须在原十秒内可观察，随后消费原 wait 事件和全部子进程。
@@ -230,7 +326,7 @@ impl WriteOwner {
     }
 
     /// 原 Task 运行真实同步调用，结果另存以消费预期错误，句柄保在 fixture 的清理边界外。
-    fn consume_sync(
+    pub(super) fn consume_sync(
         &mut self,
         index: usize,
         operation: impl FnOnce() -> Result<(), FsError> + Send + 'static,
@@ -325,7 +421,7 @@ impl WriteOwner {
         Ok((self.cold_open(context)?, reads_before))
     }
     /// 未离栈句柄留在 fixture，错误返回仍先恢复设备完成再进行有限 join。
-    fn join_consumers(&mut self) -> TestResult {
+    pub(super) fn join_consumers(&mut self) -> TestResult {
         for join in self.consumers.iter().flatten() {
             until("shared kernel consumer did not leave stack", || {
                 join.try_join().is_some()
@@ -587,7 +683,7 @@ fn mapped_bytes(context: &mut TestContext<'_>, mm: &Mm, address: usize, expected
 }
 
 /// 位图只在 writer 已停稳后读取；未初始化组仍使用正式描述符合法计数。
-fn allocation_counts(
+pub(super) fn allocation_counts(
     context: &mut TestContext<'_>,
     volume: &Ext4Volume,
 ) -> Result<(u64, u64), TestError> {
@@ -702,7 +798,7 @@ fn allocation_counts(
 }
 
 /// 正常分配和末使用释放都从当前共同位图取真实 inode 位，并验证同一记录的 checksum。
-fn inode_allocation_bit(volume: &Ext4Volume, number: u64) -> Result<bool, FsError> {
+pub(super) fn inode_allocation_bit(volume: &Ext4Volume, number: u64) -> Result<bool, FsError> {
     let g = volume.geometry();
     let group = (number - 1) / g.inodes_per_group;
     let bit = (number - 1) % g.inodes_per_group;
@@ -741,7 +837,10 @@ struct Tree {
 }
 
 /// 停稳其他分配与释放者后核物理位；几何排除或真实 used 返回 Some(true)，未初始化且仍有空闲返回 None。
-fn block_allocation_bit(volume: &Ext4Volume, physical: u64) -> Result<Option<bool>, FsError> {
+pub(super) fn block_allocation_bit(
+    volume: &Ext4Volume,
+    physical: u64,
+) -> Result<Option<bool>, FsError> {
     let g = volume.geometry();
     // validate_blocks 只核卷边界和固定 super/GDT 保留范围，这些地址不能成为新 data。
     if g.validate_blocks(physical, 1).is_err() {
@@ -4313,6 +4412,572 @@ pub(crate) mod writes {
         }
         fixture.shared_mm.take();
         context.diagnostic(format_args!("mandatory-file-retirement replacement={} new-VMA-published-old-leaf-still-live=1 real-old-file-truncate-finds-source=1 old-leaf-cleared=1 original-page-and-table-owners-held-through-CSD=1 actual-new-fault-or-unmapped=1 native-MM=1 active-user-root-claim=0 fail-before-runtime-claim=0", replacement));
+        Ok(())
+    }
+    /// 普通用户通过真实 ABI 创建、竞态排他、umask、短长链接与原始字节名字。
+    #[test]
+    #[ktest(tags("W23", "user-fs", "fs-path"), min_cpus = 2)]
+    fn user_create_exclusive_umask_links_and_raw_names(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare_namespace(context)?;
+        fixture.prepare_namespace_parent(context)?;
+        let vfs = fixture.user.path.vfs().clone();
+        let fs_context = fixture.user.path.context().clone();
+        let image = fixture.shared_image(context, b"N3")?;
+        let mm = image.mm.clone();
+        fixture.start_shared_as(
+            context,
+            image,
+            Credentials {
+                uid: 1001,
+                gid: 1001,
+            },
+        )?;
+        fixture.phase(&mm, 0, 1)?;
+
+        let race = fixture.open(context, b"/test/ns-work/ns-race", 2)?;
+        let race_again = fixture.open(context, b"/test/ns-work/ns-race", 2)?;
+        context.expect_eq(
+            checked(context, race.path().inode())?
+                .ptr_eq(checked(context, race_again.path().inode())?),
+            true,
+        );
+        let race_stat = checked(context, race.stat())?;
+        context.expect_eq((race_stat.links, race_stat.size), (1, 4));
+        let mode = fixture.open(context, b"/test/ns-work/ns-mode", 2)?;
+        let mode_stat = checked(context, mode.stat())?;
+        context.expect_eq(mode_stat.kind, InodeKind::Regular);
+        context.expect_eq((mode_stat.links, mode_stat.size), (1, 0));
+        context.expect_eq(mode_stat.mode & 0o7777, 0o7750);
+        let data = fixture.open(context, b"/test/ns-work/ns-data", 2)?;
+        let data_stat = checked(context, data.stat())?;
+        context.expect_eq((data_stat.links, data_stat.size), (1, 4));
+        context.expect_eq(data_stat.mode & 0o777, 0o640);
+        bytes_at(context, &data, 0, b"MODE")?;
+        let readonly = fixture.open(context, b"/test/ns-work/ns-ro", 0)?;
+        let readonly_stat = checked(context, readonly.stat())?;
+        context.expect_eq((readonly_stat.size, readonly_stat.mode & 0o777), (0, 0o640));
+        let shared = fixture.open(context, b"/test/ns-work/ns-shared", 0)?;
+        let copied = fixture.open(context, b"/test/ns-work/ns-copy", 0)?;
+        context.expect_eq(checked(context, shared.stat())?.mode & 0o777, 0o660);
+        context.expect_eq(checked(context, copied.stat())?.mode & 0o777, 0o600);
+        let directory = fixture.open(context, b"/test/ns-work/ns-dir", 0x10000)?;
+        let directory_stat = checked(context, directory.stat())?;
+        context.expect_eq(directory_stat.links, 2);
+        context.expect_eq(directory_stat.mode & 0o7777, 0o3750);
+        let raw = fixture.open(context, b"/test/ns-work/ns-raw-\xff", 2)?;
+        let mut raw_bytes = [0; 4];
+        context.expect_eq(checked(context, raw.read_at(0, &mut raw_bytes))?, 4);
+        context.expect_eq(&raw_bytes, b"RAW!");
+        let short = fixture.hold_nofollow(context, b"/test/ns-work/ns-short")?;
+        context.expect_eq(
+            checked(context, short.metadata_snapshot())?.kind,
+            InodeKind::Symlink,
+        );
+        context.expect_eq(
+            checked(context, short.read_link())?.as_slice(),
+            b"/test/ns-work/ns-data",
+        );
+        let long = fixture.hold_nofollow(context, b"/test/ns-work/ns-long")?;
+        context.expect_eq(60 < checked(context, long.read_link())?.len(), true);
+        let dangling = fixture.hold_nofollow(context, b"/test/ns-work/ns-dangling")?;
+        context.expect_eq(
+            checked(context, dangling.read_link())?.as_slice(),
+            b"/test/ns-work/ns-missing",
+        );
+        let workspace = fixture.open(context, b"/test/ns-work", 0x10000)?;
+        context.expect_eq(checked(context, workspace.stat())?.gid, 1001);
+        context.expect_eq(
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-lex", ResolveMode::Follow)
+                .err(),
+            Some(FsError::NotFound),
+        );
+        for inode in [&short, &long, &dangling] {
+            checked(context, crate::fs::writeback::sync_inode(inode))?;
+        }
+        let volume = fixture.volume();
+        checked(context, crate::fs::writeback::sync_metadata(&volume))?;
+        WriteOwner::release(&mm, 1)?;
+
+        fixture.phase(&mm, 0, 2)?;
+        let missing = fixture.open(context, b"/test/ns-work/ns-missing", 2)?;
+        let missing_stat = checked(context, missing.stat())?;
+        context.expect_eq((missing_stat.uid, missing_stat.gid), (1001, 1001));
+        let inherited = fixture.open(context, b"/test/ns-work/ns-sgid-child", 2)?;
+        let inherited_stat = checked(context, inherited.stat())?;
+        context.expect_eq((inherited_stat.uid, inherited_stat.gid), (1001, 1001));
+        context.expect_eq(inherited_stat.mode & 0o7777, 0o7750);
+        WriteOwner::release(&mm, 2)?;
+        fixture.finish_shared(context)?;
+
+        context.expect_eq(
+            vfs.resolve(
+                &fs_context,
+                b"/test/ns-work/ns-permission/denied",
+                ResolveMode::Follow,
+            )
+            .err(),
+            Some(FsError::NotFound),
+        );
+        fixture.remove_namespace_parent(context)?;
+        for pathname in [
+            b"/test/ns-work/ns-race".as_slice(),
+            b"/test/ns-work/ns-mode",
+            b"/test/ns-work/ns-data",
+            b"/test/ns-work/ns-ro",
+            b"/test/ns-work/ns-shared",
+            b"/test/ns-work/ns-copy",
+            b"/test/ns-work/ns-dir",
+            b"/test/ns-work/ns-raw-\xff",
+            b"/test/ns-work/ns-short",
+            b"/test/ns-work/ns-long",
+            b"/test/ns-work/ns-dangling",
+            b"/test/ns-work/ns-missing",
+            b"/test/ns-work/ns-sgid-child",
+        ] {
+            context.expect_eq(
+                vfs.resolve(&fs_context, pathname, ResolveMode::Follow)
+                    .err(),
+                Some(FsError::NotFound),
+            );
+        }
+        context.diagnostic(format_args!(
+            "W23 ordinary-openat=1 exclusive-race=2 one-winner=1 shared-canonical=1 umask-old-and-inheritance=1 file-mode-special-bits=1 directory-dot-nlink=1 short-long-dangling-symlink=1 nofollow-and-exclusive-symlink=1 raw-byte-name=1 sgid-gid-inheritance=1 fd-reservation-EMFILE=1 permission-tail-slash-root-boundary=1"
+        ));
+        Ok(())
+    }
+
+    /// 硬链接unlink后旧OFD与两类mmap仍读原内容；旧页真实used后的WB软件责任暂留，末使用等待其尾部。
+    #[test]
+    #[ktest(tags("W24", "user-fs", "fs-sync", "fs-inode-lifetime"), min_cpus = 2)]
+    fn user_unlink_keeps_old_descriptors_until_real_writeback_retires(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare_namespace(context)?;
+        fixture.prepare_namespace_parent(context)?;
+        let image = fixture.shared_image(context, b"N4")?;
+        let mm = image.mm.clone();
+        fixture.start_shared_as(
+            context,
+            image,
+            Credentials {
+                uid: 1001,
+                gid: 1001,
+            },
+        )?;
+        fixture.phase(&mm, 0, 1)?;
+
+        let old = fixture.open(context, b"/test/ns-work/ns-old", 2)?;
+        let old_inode = fixture.inodes.last().unwrap().clone();
+        let number = old_inode.number();
+        let volume = fixture.volume();
+        let cache = fixture.user.path.owner.cache().clone();
+        let watch = cache.watch();
+        let disk = fixture.user.path.owner.disk()?.clone();
+        let old_stat = checked(context, old.stat())?;
+        context.expect_eq((old_stat.links, old_stat.size), (2, 4));
+        let folio = checked(context, old.file_page(0))?;
+        context.expect_eq(old.write_at(0, b"OLD!"), Ok(4));
+        let old_tree = tree(context, &old_inode)?;
+        context.expect_eq(old_tree.data, 1);
+        let ranges = checked(
+            context,
+            prepare_unlinked_original_writeback(&old_inode, &folio),
+        )?;
+        let before = disk.test_snapshot();
+        disk.test_hold_file_writeback(&folio);
+        let syncing_volume = volume.clone();
+        let observed = fixture.consume_sync(0, move || {
+            let mut ranges = ranges;
+            syncing_volume
+                .claim()
+                .writeback_batch(&mut ranges)
+                .map_err(FsError::from)
+        })?;
+        until(
+            "W24 old-file WB did not remain held after real used",
+            || {
+                let snapshot = disk.test_snapshot();
+                before.data_submitted < snapshot.data_submitted
+                    && folio.writeback_sectors() != 0
+                    && snapshot.inflight != 0
+                    && observed.blocked()
+                    && disk.test_file_writeback_is_held(&folio)
+            },
+        )?;
+
+        WriteOwner::release(&mm, 1)?;
+        fixture.phase(&mm, 0, 2)?;
+        let replacement = fixture.open(context, b"/test/ns-work/ns-old", 2)?;
+        let replacement_stat = checked(context, replacement.stat())?;
+        context.expect_eq((replacement_stat.links, replacement_stat.size), (1, 4));
+        context.expect_eq(
+            checked(context, replacement.path().inode())?.ptr_eq(&old_inode),
+            false,
+        );
+        context.expect_eq(checked(context, old.stat())?.links, 0);
+        bytes_at(context, &old, 0, b"OLD!")?;
+        bytes_at(context, &replacement, 0, b"NEW!")?;
+        context.expect_eq(disk.test_snapshot().inflight != 0, true);
+        WriteOwner::release(&mm, 2)?;
+        fixture.phase(&mm, 0, 3)?;
+        context.expect_eq(disk.test_file_writeback_is_held(&folio), true);
+        context.expect_eq(folio.writeback_sectors() != 0, true);
+
+        fixture.inodes.retain(|inode| !inode.ptr_eq(&old_inode));
+        drop((old, old_inode, folio));
+        context.expect_eq(disk.test_snapshot().inflight != 0, true);
+        context.expect_eq(watch.contains(number), true);
+        context.expect_eq(
+            checked(context, inode_allocation_bit(&volume, number))?,
+            true,
+        );
+        for physical in &old_tree.blocks {
+            context.expect_eq(
+                checked(context, block_allocation_bit(&volume, *physical))?,
+                Some(true),
+            );
+        }
+
+        disk.test_resume_completions();
+        fixture.join_consumers()?;
+        if observed.result() != Some(Ok(())) {
+            if let Ok(inode) = cache.iget(&volume, number) {
+                fixture.inodes.push(inode);
+            }
+            return Err(TestError("W24 old-file WB failed after user unlink"));
+        }
+        disk.test_flush_completions();
+        checked(context, watch.wait())?;
+        checked(context, volume.wait_inode_reuse(number))?;
+        context.expect_eq(watch.contains(number), false);
+        context.expect_eq(
+            checked(context, inode_allocation_bit(&volume, number))?,
+            false,
+        );
+        for physical in &old_tree.blocks {
+            context.expect_eq(
+                checked(context, block_allocation_bit(&volume, *physical))?,
+                Some(false),
+            );
+        }
+
+        WriteOwner::release(&mm, 3)?;
+        fixture.finish_shared(context)?;
+        fixture.remove_namespace_parent(context)?;
+        context.expect_eq(
+            fixture
+                .user
+                .path
+                .vfs()
+                .resolve(
+                    fixture.user.path.context(),
+                    b"/test/ns-work/ns-old",
+                    ResolveMode::Follow,
+                )
+                .err(),
+            Some(FsError::NotFound),
+        );
+        context.diagnostic(format_args!("W24 real-user-hardlink-unlink=1 old-fd-shared-map-private-map=1 replacement-distinct-canonical=1 accepted-data-WB-used-held-during-unlink=1 old-user-owners-closed-before-WB-release=1 old-slot-and-blocks-held-by-original-WB=1 real-join-and-per-inode-reuse-gate=1 old-slot-and-blocks-returned-after-WB=1"));
+        Ok(())
+    }
+
+    /// 覆盖rename之后新路径指向source，旧target fd与映射仍锚定原canonical inode。
+    #[test]
+    #[ktest(tags("W25", "user-fs", "fs-path"), min_cpus = 2)]
+    fn user_rename_replaces_name_without_replacing_open_target(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare_namespace(context)?;
+        fixture.prepare_namespace_parent(context)?;
+        let image = fixture.shared_image(context, b"N5")?;
+        let mm = image.mm.clone();
+        fixture.start_shared_as(
+            context,
+            image,
+            Credentials {
+                uid: 1001,
+                gid: 1001,
+            },
+        )?;
+        fixture.phase(&mm, 0, 1)?;
+
+        let source = fixture.open(context, b"/test/ns-work/ns-source", 2)?;
+        let old_target = fixture.open(context, b"/test/ns-work/ns-target", 2)?;
+        let source_stat = checked(context, source.stat())?;
+        let target_stat = checked(context, old_target.stat())?;
+        context.expect_eq((source_stat.links, source_stat.size), (1, 4));
+        context.expect_eq((target_stat.links, target_stat.size), (1, 4));
+        context.expect_eq(
+            checked(context, source.path().inode())?
+                .ptr_eq(checked(context, old_target.path().inode())?),
+            false,
+        );
+        WriteOwner::release(&mm, 1)?;
+        fixture.phase(&mm, 0, 2)?;
+
+        let new_target = fixture.open(context, b"/test/ns-work/ns-target", 2)?;
+        context.expect_eq(
+            checked(context, new_target.path().inode())?
+                .ptr_eq(checked(context, source.path().inode())?),
+            true,
+        );
+        context.expect_eq(
+            checked(context, new_target.path().inode())?
+                .ptr_eq(checked(context, old_target.path().inode())?),
+            false,
+        );
+        context.expect_eq(checked(context, old_target.stat())?.links, 0);
+        context.expect_eq(checked(context, source.stat())?.links, 1);
+        bytes_at(context, &new_target, 0, b"SRC!")?;
+        bytes_at(context, &old_target, 0, b"TGT!")?;
+        let plain_target = fixture.open(context, b"/test/ns-work/ns-plain-target", 0)?;
+        bytes_at(context, &plain_target, 0, b"PLAIN")?;
+        for pathname in [
+            b"/test/ns-work/ns-source".as_slice(),
+            b"/test/ns-work/ns-plain-source",
+            b"/test/ns-work/ns-noreplace-source",
+        ] {
+            context.expect_eq(
+                fixture
+                    .user
+                    .path
+                    .vfs()
+                    .resolve(fixture.user.path.context(), pathname, ResolveMode::Follow)
+                    .err(),
+                Some(FsError::NotFound),
+            );
+        }
+        WriteOwner::release(&mm, 2)?;
+        fixture.finish_shared(context)?;
+        fixture.remove_namespace_parent(context)?;
+        for pathname in [
+            b"/test/ns-work/ns-target".as_slice(),
+            b"/test/ns-work/ns-plain-target",
+            b"/test/ns-work/ns-noreplace-target",
+        ] {
+            context.expect_eq(
+                fixture
+                    .user
+                    .path
+                    .vfs()
+                    .resolve(fixture.user.path.context(), pathname, ResolveMode::Follow)
+                    .err(),
+                Some(FsError::NotFound),
+            );
+        }
+        context.diagnostic(format_args!("W25 real-renameat2-overwrite=1 new-lookup-source-canonical=1 old-target-fd-and-maps-old-content=1 target-nlink-zero=1 source-nlink-preserved=1 ordinary-rename=1 noreplace-EEXIST-and-success=1 metadata-flush-cleanup=1"));
+        Ok(())
+    }
+
+    /// 真实用户目录改名更新点点与父 nlink，并以共享匿名门同时启动反向父锁顺序。
+    #[test]
+    #[ktest(tags("W26", "user-fs", "fs-path"), min_cpus = 2)]
+    fn user_directory_rename_topology_and_opposite_race(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare_namespace(context)?;
+        fixture.prepare_namespace_parent(context)?;
+        let vfs = fixture.user.path.vfs().clone();
+        let fs_context = fixture.user.path.context().clone();
+        let image = fixture.shared_image(context, b"N6")?;
+        let mm = image.mm.clone();
+        fixture.start_shared_as(
+            context,
+            image,
+            Credentials {
+                uid: 1001,
+                gid: 1001,
+            },
+        )?;
+        fixture.phase(&mm, 0, 1)?;
+
+        let alias_source = fixture.open(context, b"/test/ns-work/ns-alias-source", 2)?;
+        let alias_target = fixture.open(context, b"/test/ns-work/ns-alias-target", 2)?;
+        context.expect_eq(
+            checked(context, alias_source.path().inode())?
+                .ptr_eq(checked(context, alias_target.path().inode())?),
+            true,
+        );
+        context.expect_eq(checked(context, alias_source.stat())?.links, 2);
+        let cross_a = fixture.open(context, b"/test/ns-work/ns-cross-a", 2)?;
+        let cross_b = fixture.open(context, b"/test/ns-work/ns-cross-b", 2)?;
+        context.expect_eq(
+            (
+                checked(context, cross_a.stat())?.links,
+                checked(context, cross_b.stat())?.links,
+            ),
+            (3, 3),
+        );
+        let d1 = fixture.open(context, b"/test/ns-work/ns-d1", 0x10000)?;
+        let d2 = fixture.open(context, b"/test/ns-work/ns-d2", 0x10000)?;
+        context.expect_eq(
+            (
+                checked(context, d1.stat())?.links,
+                checked(context, d2.stat())?.links,
+            ),
+            (2, 2),
+        );
+        let d1_a = fixture.open(context, b"/test/ns-work/ns-d1/a", 0)?;
+        let d1_b = fixture.open(context, b"/test/ns-work/ns-d1/b", 0)?;
+        let d2_a = fixture.open(context, b"/test/ns-work/ns-d2/a", 0)?;
+        let d2_b = fixture.open(context, b"/test/ns-work/ns-d2/b", 0)?;
+        context.expect_eq(
+            checked(context, d1_a.path().inode())?
+                .ptr_eq(checked(context, cross_a.path().inode())?),
+            true,
+        );
+        context.expect_eq(
+            checked(context, d2_a.path().inode())?
+                .ptr_eq(checked(context, cross_a.path().inode())?),
+            true,
+        );
+        context.expect_eq(
+            checked(context, d1_b.path().inode())?
+                .ptr_eq(checked(context, cross_b.path().inode())?),
+            true,
+        );
+        context.expect_eq(
+            checked(context, d2_b.path().inode())?
+                .ptr_eq(checked(context, cross_b.path().inode())?),
+            true,
+        );
+        drop((d1_a, d1_b, d2_a, d2_b));
+        context.expect_eq(
+            (
+                checked(context, d1.stat())?.links,
+                checked(context, d2.stat())?.links,
+            ),
+            (2, 2),
+        );
+        let a = fixture.open(context, b"/test/ns-work/ns-a", 0x10000)?;
+        let b = fixture.open(context, b"/test/ns-work/ns-b", 0x10000)?;
+        let a_stat = checked(context, a.stat())?;
+        let b_stat = checked(context, b.stat())?;
+        context.expect_eq((a_stat.links, b_stat.links), (4, 3));
+        for pathname in [
+            b"/test/ns-work/ns-a/x".as_slice(),
+            b"/test/ns-work/ns-a/a2",
+            b"/test/ns-work/ns-b/y",
+            b"/test/ns-work/ns-cwd",
+        ] {
+            drop(fixture.open(context, pathname, 0x10000)?);
+        }
+        WriteOwner::release(&mm, 1)?;
+        fixture.phase(&mm, 0, 2)?;
+
+        let a_stat = checked(context, a.stat())?;
+        let b_stat = checked(context, b.stat())?;
+        context.expect_eq((a_stat.links, b_stat.links), (3, 4));
+        let a_path = checked(
+            context,
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-a", ResolveMode::Follow),
+        )?;
+        let b_path = checked(
+            context,
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-b", ResolveMode::Follow),
+        )?;
+        context.expect_eq(
+            checked(
+                context,
+                vfs.resolve(&fs_context, b"/test/ns-work/ns-b/x/..", ResolveMode::Follow),
+            )?
+            .ptr_eq(&b_path),
+            true,
+        );
+        context.expect_eq(
+            checked(
+                context,
+                vfs.resolve(&fs_context, b"/test/ns-work/ns-a/y/..", ResolveMode::Follow),
+            )?
+            .ptr_eq(&a_path),
+            true,
+        );
+        context.expect_eq(
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-a/x", ResolveMode::Follow)
+                .err(),
+            Some(FsError::NotFound),
+        );
+        context.expect_eq(
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-b/a2", ResolveMode::Follow)
+                .is_ok(),
+            true,
+        );
+        context.expect_eq(
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-a/y", ResolveMode::Follow)
+                .is_ok(),
+            true,
+        );
+        context.expect_eq(checked(context, cross_a.stat())?.links, 1);
+        context.expect_eq(checked(context, cross_b.stat())?.links, 1);
+        bytes_at(context, &cross_a, 0, b"AAAA")?;
+        bytes_at(context, &cross_b, 0, b"BBBB")?;
+        let d1_b = fixture.open(context, b"/test/ns-work/ns-d1/b", 0)?;
+        let d2_a = fixture.open(context, b"/test/ns-work/ns-d2/a", 0)?;
+        context.expect_eq(
+            checked(context, d1_b.path().inode())?
+                .ptr_eq(checked(context, cross_a.path().inode())?),
+            true,
+        );
+        context.expect_eq(
+            checked(context, d2_a.path().inode())?
+                .ptr_eq(checked(context, cross_b.path().inode())?),
+            true,
+        );
+        bytes_at(context, &d1_b, 0, b"AAAA")?;
+        bytes_at(context, &d2_a, 0, b"BBBB")?;
+        drop((d1_b, d2_a));
+        for pathname in [
+            b"/test/ns-work/ns-d1/a".as_slice(),
+            b"/test/ns-work/ns-d2/b",
+        ] {
+            context.expect_eq(
+                vfs.resolve(&fs_context, pathname, ResolveMode::Follow)
+                    .err(),
+                Some(FsError::NotFound),
+            );
+        }
+        context.expect_eq(checked(context, alias_source.stat())?.links, 2);
+        context.expect_eq(
+            checked(context, alias_source.path().inode())?
+                .ptr_eq(checked(context, alias_target.path().inode())?),
+            true,
+        );
+        context.expect_eq(
+            vfs.resolve(&fs_context, b"/test/ns-work/ns-cwd", ResolveMode::Follow)
+                .err(),
+            Some(FsError::NotFound),
+        );
+        WriteOwner::release(&mm, 2)?;
+        fixture.finish_shared(context)?;
+        fixture.remove_namespace_parent(context)?;
+        for pathname in [
+            b"/test/ns-work/ns-alias-source".as_slice(),
+            b"/test/ns-work/ns-alias-target",
+            b"/test/ns-work/ns-a",
+            b"/test/ns-work/ns-b",
+            b"/test/ns-work/ns-cwd",
+            b"/test/ns-work/ns-d1",
+            b"/test/ns-work/ns-d2",
+            b"/test/ns-work/ns-d1/a",
+            b"/test/ns-work/ns-d1/b",
+            b"/test/ns-work/ns-d2/a",
+            b"/test/ns-work/ns-d2/b",
+            b"/test/ns-work/ns-cross-a",
+            b"/test/ns-work/ns-cross-b",
+        ] {
+            context.expect_eq(
+                vfs.resolve(&fs_context, pathname, ResolveMode::Follow)
+                    .err(),
+                Some(FsError::NotFound),
+            );
+        }
+        context.diagnostic(format_args!("W26 same-inode-same-parent-noop=1 missing-missing-ENOENT=1 descendant-move-EINVAL=1 sequential-cross-parent-dotdot-nlink=1 old-cwd-rmdir-and-create-rejected=1 opposite-parent-clones-shared-gate-reaped=1 reverse-hardlink-inode-lock-order-rename-complete=1 old-fd-content-and-nlink=1 new-parent-lookups-canonical=1 exchange-whiteout-flags-rejected=1"));
         Ok(())
     }
 }

@@ -68,6 +68,12 @@ pub(super) struct QueueState {
     ktest_folio_dma: Option<(usize, u64, usize, usize)>,
     #[cfg(feature = "ktest")]
     ktest_completion_error: Option<(TestCompletionKind, BlockError)>,
+    #[cfg(feature = "ktest")]
+    // 只匹配目标文件原页的 Data-WB，不改变真实 used ring 消费。
+    ktest_hold_file_writeback_page: Option<usize>,
+    #[cfg(feature = "ktest")]
+    // 已收真实 used 但仍须走原 finish_slot 的软件完成责任。
+    ktest_held_file_writeback_slots: [Option<u16>; MAX_BATCH],
 }
 
 impl QueueState {
@@ -146,6 +152,8 @@ pub(crate) struct TestSnapshot {
     pub data_submitted: usize,
     pub metadata_submitted: usize,
     pub flush_submitted: usize,
+    /// 实际接受且承载文件原页读入的设备请求数。
+    pub file_read_submitted: usize,
     pub peak_inflight: usize,
     pub notifications: usize,
     pub resource_parks: usize,
@@ -171,14 +179,23 @@ enum TestCompletionKind {
     Data,
     Metadata,
     Flush,
+    FileRead,
 }
 
 #[cfg(feature = "ktest")]
 impl TestCompletionKind {
-    /// 按原 WB 来源分类，不将 raw Write 冒充文件或元数据写回。
+    /// 按原 folio 来源区分读入与 WB，raw 请求不参与文件内容分类。
     fn matches(self, resources: &SlotResources) -> bool {
         match self {
             Self::Flush => resources.operation == BlkOperation::Flush,
+            Self::FileRead => {
+                resources.operation == BlkOperation::Read
+                    && resources
+                        .parts
+                        .iter()
+                        .flatten()
+                        .any(|part| part.bio.ktest_file_read(part.offset) == Some(true))
+            }
             Self::Data | Self::Metadata => {
                 resources.operation == BlkOperation::Write
                     && resources.parts.iter().flatten().any(|part| {
@@ -344,6 +361,10 @@ impl Disk {
                 ktest_folio_dma: None,
                 #[cfg(feature = "ktest")]
                 ktest_completion_error: None,
+                #[cfg(feature = "ktest")]
+                ktest_hold_file_writeback_page: None,
+                #[cfg(feature = "ktest")]
+                ktest_held_file_writeback_slots: [None; MAX_BATCH],
             }),
             control: SleepMutex::new(()),
             irq: SpinLock::new(None),
@@ -762,7 +783,36 @@ impl Disk {
                                 resources.forced_error = Some(error);
                             }
                         }
-                        tags[count] = Some(tag);
+                        #[cfg(feature = "ktest")]
+                        {
+                            let held_page = q.ktest_hold_file_writeback_page;
+                            let hold = held_page.is_some_and(|physical| {
+                                resources.operation == BlkOperation::Write
+                                    && resources.parts.iter().flatten().any(|part| {
+                                        part.bio.ktest_writeback_metadata(part.offset)
+                                            == Some(false)
+                                            && part
+                                                .bio
+                                                .ktest_folio_origin(part.offset)
+                                                .is_some_and(|(origin, _)| origin == physical)
+                                    })
+                            });
+                            if hold {
+                                // used 已推进 ring；仅保留目标 folio 的软件 WB 责任，其他 slot 继续派发。
+                                let slot = q
+                                    .ktest_held_file_writeback_slots
+                                    .iter_mut()
+                                    .find(|slot| slot.is_none())
+                                    .expect("held file writeback slots exhausted");
+                                *slot = Some(tag);
+                            } else {
+                                tags[count] = Some(tag);
+                            }
+                        }
+                        #[cfg(not(feature = "ktest"))]
+                        {
+                            tags[count] = Some(tag);
+                        }
                         count += 1;
                     }
                     Ok(None) => break,
@@ -909,10 +959,16 @@ impl Disk {
         self.queue.lock().counters
     }
 
-    /// 对下一次真实文件数据 used 注入一次上层完成错误，不改变硬件或准入。
+    /// 对下一次真实文件 WB used 注入一次上层完成错误，不改变硬件或准入。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_data(&self, error: BlockError) {
         self.test_arm_completion_error(TestCompletionKind::Data, error);
+    }
+
+    /// 对下一次真实文件原页读入的 used 注入一次上层完成错误。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_fail_next_file_read(&self, error: BlockError) {
+        self.test_arm_completion_error(TestCompletionKind::FileRead, error);
     }
 
     /// 对下一次真实共同元数据 used 注入一次完成错误。
@@ -973,6 +1029,38 @@ impl Disk {
         q.counters.merges += merges;
     }
 
+    /// 指定文件原页真实 Data-WB 的used到达后暂留其软件完成责任；其他I/O仍沿原IRQ与完成路径。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_hold_file_writeback(&self, folio: &crate::mm::FolioRef) {
+        let mut q = self.queue.lock();
+        assert!(
+            q.accepts_children(),
+            "holding file writeback on a stopped disk"
+        );
+        assert!(
+            !q.test_paused,
+            "file writeback hold cannot combine with queue pause"
+        );
+        assert!(
+            q.ktest_hold_file_writeback_page.is_none()
+                && q.ktest_held_file_writeback_slots
+                    .iter()
+                    .all(Option::is_none),
+            "file writeback hold is already active"
+        );
+        q.ktest_hold_file_writeback_page = Some(folio.phys_addr());
+    }
+
+    /// 只有原页身份匹配的真实 used slot 已进入 Finishing 时才返回真。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_file_writeback_is_held(&self, folio: &crate::mm::FolioRef) -> bool {
+        let q = self.queue.lock();
+        q.ktest_hold_file_writeback_page == Some(folio.phys_addr())
+            && q.ktest_held_file_writeback_slots
+                .iter()
+                .any(Option::is_some)
+    }
+
     /// 暂停本 queue 的完成消费，仍确认真实 ISR，不 mask 共享源也不伪造 used。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_suspend_completions(&self) {
@@ -989,24 +1077,32 @@ impl Disk {
         .set_interrupts(false);
     }
 
-    /// 重装真实 queue flags 后复查已发表的 used，用预建 Work 保证恢复进度。
+    /// 恢复 queue 完成并重派已收 used 的暂留 slot，再用预建 Work 接续其他真实 used。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_resume_completions(&self) {
-        let pending = {
+        let (pending, held) = {
             let mut q = self.queue.lock();
             q.test_paused = false;
-            if !q.accepts_children() {
-                return;
-            }
-            // SAFETY: 后端只在 queue 锁内借用，reset 使用同锁且控制区仍有效。
-            unsafe {
-                q.device
-                    .as_mut()
-                    .expect("live disk has no device")
-                    .driver_mut()
-            }
-            .enable_interrupts_and_recheck()
+            let held =
+                core::mem::replace(&mut q.ktest_held_file_writeback_slots, [None; MAX_BATCH]);
+            q.ktest_hold_file_writeback_page = None;
+            let pending = if q.accepts_children() {
+                // SAFETY: 后端只在 queue 锁内借用，reset 使用同锁且控制区仍有效。
+                unsafe {
+                    q.device
+                        .as_mut()
+                        .expect("live disk has no device")
+                        .driver_mut()
+                }
+                .enable_interrupts_and_recheck()
+            } else {
+                false
+            };
+            (pending, held)
         };
+        for tag in core::iter::IntoIterator::into_iter(held).flatten() {
+            self.dispatch_slot(tag);
+        }
         if pending {
             self.queue_progress();
         }
@@ -1312,6 +1408,9 @@ impl PreparingSlot<'_> {
                     }
                     if TestCompletionKind::Flush.matches(resources) {
                         q.counters.flush_submitted += 1;
+                    }
+                    if TestCompletionKind::FileRead.matches(resources) {
+                        q.counters.file_read_submitted += 1;
                     }
                     q.counters.inflight += 1;
                     q.counters.peak_inflight = q.counters.peak_inflight.max(q.counters.inflight);

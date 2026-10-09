@@ -13,48 +13,219 @@ use crate::task::{UserRuntime, UserThread};
 
 const AT_FDCWD: i32 = -100;
 const TRUNC: u32 = 0x200;
+const CREATE: u32 = 0o100;
+const EXCLUSIVE: u32 = 0o200;
 const CLOEXEC: u32 = 0x8_0000;
 const DIRECTORY: u32 = 0x1_0000;
 const NOFOLLOW: u32 = 0x2_0000;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
+const AT_REMOVEDIR: u32 = 0x200;
+const AT_SYMLINK_FOLLOW: u32 = 0x400;
+const RENAME_NOREPLACE: u32 = 1;
+const OPENAT_SUPPORTED: u32 = 0o3
+    | CREATE
+    | EXCLUSIVE
+    | TRUNC
+    | 0o2000
+    | 0o4000
+    | 0x101000
+    | 0o100000
+    | DIRECTORY
+    | NOFOLLOW
+    | 0o400
+    | CLOEXEC;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-/// 先预留 fd，再按当前凭据完成含截断写意图的权限检查；完整 OFD 准备后才允许破坏文件。
+/// 先预留描述符，再让 VFS 决定最终名字；创建分支在名字发表前构造完整 OFD。
 pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("openat has no runtime");
     let mm = user.mm().expect("openat has no MM");
     let flags = raw[2] as u32;
     let reservation = runtime.files.reserve()?;
-    let mode = if flags & NOFOLLOW != 0 {
-        ResolveMode::NoFollow
-    } else {
-        ResolveMode::Follow
-    };
-    let path = resolve(&runtime, &mm, raw[0], raw[1], mode)?;
-    if flags & DIRECTORY != 0 && path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
-        return Err(Errno::NotDirectory);
+    if flags & 3 == 3 {
+        return Err(Errno::InvalidArgument);
     }
-    let access = match flags & 3 {
-        0 => 4,
-        1 => 2,
-        2 => 6,
-        _ => return Err(Errno::InvalidArgument),
-    };
-    let access = if flags & TRUNC != 0 {
-        access | 2
+    if flags & !OPENAT_SUPPORTED != 0 {
+        return Err(Errno::Unsupported);
+    }
+    if flags & EXCLUSIVE != 0 && flags & CREATE == 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
+    let (vfs, context) = fs_snapshot(&runtime);
+    let start = resolve_start(&runtime, &context, raw[0], &pathname)?;
+    let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+    let file = if flags & CREATE != 0 {
+        vfs.open_with(
+            &context,
+            &start,
+            &pathname,
+            credentials,
+            Some((raw[3] as u16, context.umask())),
+            flags & EXCLUSIVE != 0,
+            flags & NOFOLLOW != 0,
+            |path, created| prepare_open(path, flags, credentials, created),
+        )?
     } else {
-        access
+        let mode = if flags & NOFOLLOW != 0 {
+            ResolveMode::NoFollow
+        } else {
+            ResolveMode::Follow
+        };
+        let path = vfs.resolve_from(&context, &start, &pathname, mode, Some(credentials))?;
+        prepare_open(path, flags, credentials, false)?
     };
-    path.check_access(runtime.credentials.uid, runtime.credentials.gid, access)?;
-    let file = fs::open_path_with_flags(path, flags)?;
     Ok(reservation.publish(
         file,
         DescriptorFlags {
             close_on_exec: flags & CLOEXEC != 0,
         },
     ) as isize)
+}
+/// 按最终 inode 决定 DAC 与 OFD；刚创建的空对象不重新核自身 mode，也不执行 O_TRUNC。
+fn prepare_open(
+    path: Path,
+    flags: u32,
+    credentials: (u32, u32),
+    created: bool,
+) -> Result<fs::FileRef, fs::FsError> {
+    let access = flags & 3;
+    if access == 3 {
+        return Err(fs::FsError::InvalidOperation);
+    }
+    let kind = path.inode()?.metadata_snapshot()?.kind;
+    if flags & CREATE != 0 && !created && kind == InodeKind::Directory {
+        return Err(fs::FsError::IsDirectory);
+    }
+    if flags & DIRECTORY != 0 && kind != InodeKind::Directory {
+        return Err(fs::FsError::NotDirectory);
+    }
+    if !created {
+        let access = match access {
+            0 => 4,
+            1 => 2,
+            2 => 6,
+            _ => unreachable!(),
+        };
+        let access = if flags & TRUNC != 0 {
+            access | 2
+        } else {
+            access
+        };
+        path.check_access(credentials.0, credentials.1, access)?;
+    }
+    let flags = flags & !(CREATE | EXCLUSIVE | if created { TRUNC } else { 0 });
+    fs::open_path_with_flags(path, flags)
+}
+/// mkdirat 按本次 FsContext umask 建目录，路径逐组件从当前目录或真实 dirfd 开始。
+pub(super) fn mkdirat(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("mkdirat has no runtime");
+    let mm = user.mm().expect("mkdirat has no MM");
+    let pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
+    let (vfs, context) = fs_snapshot(&runtime);
+    let start = resolve_start(&runtime, &context, raw[0], &pathname)?;
+    let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+    vfs.mkdir_from(
+        &context,
+        &start,
+        &pathname,
+        raw[2] as u16,
+        credentials,
+        context.umask(),
+    )?;
+    Ok(0)
+}
+
+/// unlinkat 仅接受 AT_REMOVEDIR；具体 unlink 或 rmdir 由真实目录后端执行。
+pub(super) fn unlinkat(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let flags = raw[2] as u32;
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("unlinkat has no runtime");
+    let mm = user.mm().expect("unlinkat has no MM");
+    let pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
+    let (vfs, context) = fs_snapshot(&runtime);
+    let start = resolve_start(&runtime, &context, raw[0], &pathname)?;
+    let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+    if flags & AT_REMOVEDIR != 0 {
+        vfs.rmdir_from(&context, &start, &pathname, credentials)?;
+    } else {
+        vfs.unlink_from(&context, &start, &pathname, credentials)?;
+    }
+    Ok(0)
+}
+
+/// symlinkat 保留目标和链接名的原始字节；只有链接名按当前 FsContext 解析。
+pub(super) fn symlinkat(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("symlinkat has no runtime");
+    let mm = user.mm().expect("symlinkat has no MM");
+    let target = mm.read_c_string(raw[0], MAX_PATH_BYTES)?;
+    let pathname = mm.read_c_string(raw[2], MAX_PATH_BYTES)?;
+    let (vfs, context) = fs_snapshot(&runtime);
+    let start = resolve_start(&runtime, &context, raw[1], &pathname)?;
+    let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+    vfs.symlink_from(&context, &start, &pathname, &target, credentials)?;
+    Ok(0)
+}
+
+/// linkat 默认链接原末 symlink；AT_SYMLINK_FOLLOW 只改变源路径的最终跟随。
+pub(super) fn linkat(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let flags = raw[4] as u32;
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("linkat has no runtime");
+    let mm = user.mm().expect("linkat has no MM");
+    let old_pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
+    let new_pathname = mm.read_c_string(raw[3], MAX_PATH_BYTES)?;
+    let (vfs, context) = fs_snapshot(&runtime);
+    let old_start = resolve_start(&runtime, &context, raw[0], &old_pathname)?;
+    let new_start = resolve_start(&runtime, &context, raw[2], &new_pathname)?;
+    let mode = if flags & AT_SYMLINK_FOLLOW != 0 {
+        ResolveMode::Follow
+    } else {
+        ResolveMode::NoFollow
+    };
+    let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+    let source = vfs.resolve_from(&context, &old_start, &old_pathname, mode, Some(credentials))?;
+    vfs.link_from(&source, &context, &new_start, &new_pathname, credentials)?;
+    Ok(0)
+}
+
+/// renameat2 仅公开普通替换和 RENAME_NOREPLACE，不降级其他 rename flags。
+pub(super) fn renameat2(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let flags = raw[4] as u32;
+    if flags & !RENAME_NOREPLACE != 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("renameat2 has no runtime");
+    let mm = user.mm().expect("renameat2 has no MM");
+    let old_pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
+    let new_pathname = mm.read_c_string(raw[3], MAX_PATH_BYTES)?;
+    let (vfs, context) = fs_snapshot(&runtime);
+    let old_start = resolve_start(&runtime, &context, raw[0], &old_pathname)?;
+    let new_start = resolve_start(&runtime, &context, raw[2], &new_pathname)?;
+    let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+    vfs.rename_from(
+        &context,
+        &old_start,
+        &old_pathname,
+        &new_start,
+        &new_pathname,
+        flags & RENAME_NOREPLACE != 0,
+        credentials,
+    )?;
+    Ok(0)
+}
+
+/// 在共享 UserFs 锁内交换 umask 并返回旧值，CLONE_FS 使用同一组属性。
+pub(super) fn umask(user: &UserThread, raw: usize) -> SysResult {
+    let runtime = user.runtime().expect("umask has no runtime");
+    let previous = runtime.fs.lock().context.exchange_umask(raw as u16);
+    Ok(previous as isize)
 }
 
 /// 负长度先于用户路径访问失败；最终链接按 Follow 解析，临时写拥有只覆盖这次截断。
@@ -306,7 +477,7 @@ pub(super) fn getdents(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         let mut bytes = [0u8; 280];
         bytes[0..8].copy_from_slice(&entry.number.to_le_bytes());
-        bytes[8..16].copy_from_slice(&entry.next_offset.to_le_bytes());
+        bytes[8..16].copy_from_slice(&entry.next_cookie.to_le_bytes());
         bytes[16..18].copy_from_slice(&(length as u16).to_le_bytes());
         bytes[18] = dirent_type(entry);
         bytes[19..19 + entry.name.len()].copy_from_slice(&entry.name);
@@ -341,7 +512,7 @@ pub(super) fn readlink(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(count as isize)
 }
 
-/// 查找和目录/root验证全部锁外完成，共享FS短提交仅移动新快照。
+/// 锁外解析并验证真实目录；提交时只替换原共享 FsContext 的 cwd。
 pub(super) fn chdir(user: &UserThread, address: usize) -> SysResult {
     let runtime = user.runtime().expect("chdir has no runtime");
     let mm = user.mm().expect("chdir has no MM");
@@ -352,15 +523,11 @@ pub(super) fn chdir(user: &UserThread, address: usize) -> SysResult {
         address,
         ResolveMode::Follow,
     )?;
-    let (_, context) = fs_snapshot(&runtime);
-    let replacement = FsContext::new(context.root().clone(), path)?;
-    replacement
-        .cwd()
-        .check_access(runtime.credentials.uid, runtime.credentials.gid, 1)?;
-    let retired = {
-        let mut current = runtime.fs.lock();
-        core::mem::replace(&mut current.context, replacement)
-    };
+    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
+        return Err(Errno::NotDirectory);
+    }
+    path.check_access(runtime.credentials.uid, runtime.credentials.gid, 1)?;
+    let retired = runtime.fs.lock().context.exchange_cwd(path);
     drop(retired);
     Ok(0)
 }
@@ -380,6 +547,28 @@ fn fs_snapshot(runtime: &UserRuntime) -> (Arc<Vfs>, FsContext) {
     let current = runtime.fs.lock();
     (current.vfs.clone(), current.context.clone())
 }
+/// 绝对路径从本次 root 开始，其他路径复用 cwd 或已打开目录的真实 Path。
+fn resolve_start(
+    runtime: &UserRuntime,
+    context: &FsContext,
+    dirfd: usize,
+    pathname: &[u8],
+) -> Result<Path, Errno> {
+    if pathname.is_empty() {
+        return Err(Errno::NotFound);
+    }
+    if pathname[0] == b'/' {
+        return Ok(context.root().clone());
+    }
+    if dirfd as i32 == AT_FDCWD {
+        return Ok(context.cwd().clone());
+    }
+    let file = runtime.files.lookup(descriptor(dirfd)?)?;
+    if file.stat()?.kind != InodeKind::Directory {
+        return Err(Errno::NotDirectory);
+    }
+    Ok(file.path().clone())
+}
 
 /// 路径只从当前Mm读取一次原始NUL字节串，不要求UTF8。
 fn resolve(
@@ -393,28 +582,15 @@ fn resolve(
     resolve_bytes(runtime, dirfd, &pathname, mode)
 }
 
-/// 绝对路径忽略dirfd，相对路径使用已取得的真实目录Path，每次search权限由VFS执行。
+/// 绝对路径忽略 dirfd，相对路径从已取得的真实起点行走并逐组件核 search 权限。
 pub(super) fn resolve_bytes(
     runtime: &UserRuntime,
     dirfd: usize,
     pathname: &[u8],
     mode: ResolveMode,
 ) -> Result<Path, Errno> {
-    if pathname.is_empty() {
-        return Err(Errno::NotFound);
-    }
     let (vfs, context) = fs_snapshot(runtime);
-    let start = if pathname[0] == b'/' {
-        context.root().clone()
-    } else if dirfd as i32 == AT_FDCWD {
-        context.cwd().clone()
-    } else {
-        let file = runtime.files.lookup(descriptor(dirfd)?)?;
-        if file.stat()?.kind != InodeKind::Directory {
-            return Err(Errno::NotDirectory);
-        }
-        file.path().clone()
-    };
+    let start = resolve_start(runtime, &context, dirfd, pathname)?;
     vfs.resolve_from(
         &context,
         &start,
