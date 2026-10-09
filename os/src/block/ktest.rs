@@ -7,7 +7,9 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use virtio_drivers::{BufferDirection, MappedSegment};
 
 use super::disk::QueuePhase;
-use super::{Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, IoResult};
+use super::{
+    Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, IoResult,
+};
 use crate::drivers::virtio::VirtioDevice;
 use crate::mm::dma::MappedPages;
 use crate::sync::{Completion, SpinLock};
@@ -153,7 +155,7 @@ fn bio(
     let mapped = MappedPages::new(pages, 0, unit, direction)
         .map_err(|_| TestError("scratch original page mapping failed"))?;
     let original = mapped.segment();
-    let mut memory = Vec::new();
+    let mut memory = Vec::new_in(BioAllocator::Heap);
     memory
         .try_reserve_exact(1)
         .map_err(|_| TestError("scratch owner vector allocation failed"))?;

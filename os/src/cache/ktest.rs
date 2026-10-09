@@ -8,8 +8,8 @@ use core::alloc::Layout;
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::block::{self, AccessMode, BlockError, Disk, DiskRef, IoResult};
-use crate::cache::{BufferRef, FileMapping, MetadataCache};
+use crate::block::{self, AccessMode, BioAllocator, BlockError, Disk, DiskRef, IoResult};
+use crate::cache::{BufferRef, FolioIndex, MetadataCache};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{codec, Ext4Volume};
@@ -341,7 +341,7 @@ fn prepare_oom_read(observation: &Observation, disk: &DiskRef) -> Result<(), Blo
         .take()
         .expect("cache prepare-OOM original read missing");
     let result = if evidence == (true, true) {
-        disk.load_folio(OFFSET, read)
+        disk.load_folio(OFFSET, read, Vec::new_in(BioAllocator::Heap))
     } else {
         // 探测未证明耗尽时取消未发表 owner；正文将拒绝该证据，不冒称准备 OOM。
         drop(read);
@@ -398,7 +398,7 @@ struct Owner {
     queue: WorkQueue,
     metadata: Option<Arc<MetadataCache>>,
     extra_metadata: Option<Arc<MetadataCache>>,
-    mapping: Arc<FileMapping>,
+    mapping: Arc<FolioIndex>,
     observation: Arc<Observation>,
     held: [Option<Returned>; 3],
     prepared: Vec<PreparedTask>,
@@ -545,7 +545,7 @@ impl Owner {
             } else {
                 None
             };
-            let mapping = Arc::try_new(FileMapping::new())
+            let mapping = Arc::try_new(FolioIndex::new(None, false))
                 .map_err(|_| TestError("mapping owner preparation OOM"))?;
             let extra_metadata = extra
                 .as_ref()
@@ -558,7 +558,7 @@ impl Owner {
             let (failure_folio, read) =
                 if matches!(scenario, Scenario::Failure | Scenario::PrepareOom) {
                     let (folio, read) = mapping
-                        .get_or_prepare(64)
+                        .get_or_prepare(64, None)
                         .map_err(|_| TestError("failure placeholder preparation failed"))?;
                     (Some(folio), read)
                 } else {
@@ -650,7 +650,7 @@ impl Owner {
                             cache
                                 .as_ref()
                                 .unwrap()
-                                .get(key, mm::PAGE_SIZE)
+                                .get(key, mm::PAGE_SIZE, None)
                                 .map(Returned::Buffer)
                         } else if scenario == Scenario::PrepareOom && index == 0 {
                             prepare_oom_read(&observer, &task_disk)
@@ -662,12 +662,16 @@ impl Owner {
                                 .take()
                                 .expect("failure original read owner missing");
                             task_disk
-                                .load_folio(OFFSET, read)
+                                .load_folio(OFFSET, read, Vec::new_in(BioAllocator::Heap))
                                 .map(|()| Returned::Folio(failure_folio.unwrap()))
                         } else {
-                            match file.get_or_prepare(key) {
+                            match file.get_or_prepare(key, None) {
                                 Ok((folio, Some(read))) => task_disk
-                                    .load_folio(key * mm::PAGE_SIZE as u64, read)
+                                    .load_folio(
+                                        key * mm::PAGE_SIZE as u64,
+                                        read,
+                                        Vec::new_in(BioAllocator::Heap),
+                                    )
                                     .map(|()| Returned::Folio(folio)),
                                 Ok((folio, None)) => {
                                     folio.wait_ready().map(|()| Returned::Folio(folio))
@@ -886,7 +890,7 @@ impl Owner {
         );
         let (hit, owner) = self
             .mapping
-            .get_or_prepare(64)
+            .get_or_prepare(64, None)
             .map_err(|_| TestError("failure hit disappeared"))?;
         context.expect_eq(hit.phys_addr(), folio.phys_addr());
         context.expect_eq(owner.is_none(), true);
@@ -910,10 +914,10 @@ impl Owner {
                 .metadata
                 .as_ref()
                 .unwrap()
-                .get(33, size)
+                .get(33, size, None)
                 .map_err(|_| TestError("root metadata view read failed"))?;
             let second = extra
-                .get(33, size)
+                .get(33, size, None)
                 .map_err(|_| TestError("extra metadata view read failed"))?;
             context.expect_eq(root.len(), size);
             context.expect_eq(root.offset(), offset as usize % mm::PAGE_SIZE);
@@ -930,11 +934,15 @@ impl Owner {
         Ok(())
     }
 
-    /// FileMapping 的 Some 唯一 owner 由实际 Disk 填充，再沿原 folio 等待成功。
+    /// 裸页索引的唯一填充 owner 由实际 Disk 消费，不伪造 canonical inode 或文件 LRU。
     fn file_page(&self, index: u64) -> Result<FolioRef, BlockError> {
-        let (folio, read) = self.mapping.get_or_prepare(index)?;
+        let (folio, read) = self.mapping.get_or_prepare(index, None)?;
         if let Some(read) = read {
-            self.disk.load_folio(index * mm::PAGE_SIZE as u64, read)?;
+            self.disk.load_folio(
+                index * mm::PAGE_SIZE as u64,
+                read,
+                Vec::new_in(BioAllocator::Heap),
+            )?;
         }
         folio.wait_ready()?;
         Ok(folio)
@@ -947,20 +955,20 @@ impl Owner {
             self.metadata
                 .as_ref()
                 .unwrap()
-                .get(64, mm::PAGE_SIZE)
+                .get(64, mm::PAGE_SIZE, None)
                 .map_err(|_| TestError("bounded first metadata read failed"))?,
         ));
         self.held[1] = Some(Returned::Buffer(
             self.metadata
                 .as_ref()
                 .unwrap()
-                .get(65, mm::PAGE_SIZE)
+                .get(65, mm::PAGE_SIZE, None)
                 .map_err(|_| TestError("bounded second metadata read failed"))?,
         ));
         self.disk.test_flush_completions();
         context.expect_eq(
             matches!(
-                self.metadata.as_ref().unwrap().get(66, mm::PAGE_SIZE),
+                self.metadata.as_ref().unwrap().get(66, mm::PAGE_SIZE, None),
                 Err(BlockError::NoMemory)
             ),
             true,
@@ -971,7 +979,7 @@ impl Owner {
             self.metadata
                 .as_ref()
                 .unwrap()
-                .get(66, mm::PAGE_SIZE)
+                .get(66, mm::PAGE_SIZE, None)
                 .map_err(|_| TestError("bounded clean metadata victim did not retire"))?,
         ));
         context.expect_eq(self.metadata.as_ref().unwrap().len(), 2);
@@ -1001,7 +1009,7 @@ impl Owner {
             Some(Returned::Folio(self.file_page(66).map_err(|_| {
                 TestError("sparse third live file page failed")
             })?));
-        context.expect_eq(self.mapping.prune_unused(), 0);
+        context.expect_eq(self.mapping.prune_unused(None), 0);
         for (index, held) in self.held.iter().flatten().enumerate() {
             context.expect_eq(
                 held.valid((64 + index as u64) * mm::PAGE_SIZE as u64),
@@ -1012,7 +1020,7 @@ impl Owner {
         drop(self.held[1].take());
         drop(self.held[2].take());
         self.disk.test_flush_completions();
-        context.expect_eq(self.mapping.prune_unused(), 3);
+        context.expect_eq(self.mapping.prune_unused(None), 3);
         context.expect_eq(self.mapping.len(), 0);
         Ok(())
     }
@@ -1044,7 +1052,7 @@ impl Owner {
         self.exhaust_pages(context)?;
         context.expect_eq(
             matches!(
-                self.mapping.get_or_prepare(index),
+                self.mapping.get_or_prepare(index, None),
                 Err(BlockError::NoMemory)
             ),
             true,
@@ -1052,18 +1060,22 @@ impl Owner {
         self.pressure.clear();
         let (folio, read) = self
             .mapping
-            .get_or_prepare(index)
+            .get_or_prepare(index, None)
             .map_err(|_| TestError("sparse miss did not recover after releasing pressure"))?;
         let read = read.ok_or(TestError("recovered miss did not own its fill"))?;
         let (hit, duplicate) = self
             .mapping
-            .get_or_prepare(index)
+            .get_or_prepare(index, None)
             .map_err(|_| TestError("recovered placeholder disappeared"))?;
         context.expect_eq(hit.phys_addr(), folio.phys_addr());
         context.expect_eq(duplicate.is_none(), true);
         context.expect_eq(folio.is_ready(), false);
         self.disk
-            .load_folio(index * mm::PAGE_SIZE as u64, read)
+            .load_folio(
+                index * mm::PAGE_SIZE as u64,
+                read,
+                Vec::new_in(BioAllocator::Heap),
+            )
             .map_err(|_| TestError("recovered original folio real read failed"))?;
         context.expect_eq(
             Returned::Folio(folio).valid(index * mm::PAGE_SIZE as u64),
@@ -1079,7 +1091,7 @@ impl Owner {
             self.metadata
                 .as_ref()
                 .unwrap()
-                .get(64, mm::PAGE_SIZE)
+                .get(64, mm::PAGE_SIZE, None)
                 .map_err(|_| TestError("OOM warm metadata read failed"))?,
         ));
         self.held[1] = Some(Returned::Folio(
@@ -1092,7 +1104,7 @@ impl Owner {
             .metadata
             .as_ref()
             .unwrap()
-            .get(64, mm::PAGE_SIZE)
+            .get(64, mm::PAGE_SIZE, None)
             .map_err(|_| TestError("metadata hit allocated under OOM"))?;
         context.expect_eq(
             buffer.folio().phys_addr(),
@@ -1104,7 +1116,7 @@ impl Owner {
         );
         let (folio, read) = self
             .mapping
-            .get_or_prepare(64)
+            .get_or_prepare(64, None)
             .map_err(|_| TestError("file hit allocated under OOM"))?;
         context.expect_eq(read.is_none(), true);
         context.expect_eq(
@@ -1114,13 +1126,16 @@ impl Owner {
         context.expect_eq(Returned::Folio(folio).valid(OFFSET), Ok(true));
         context.expect_eq(
             matches!(
-                self.metadata.as_ref().unwrap().get(65, mm::PAGE_SIZE),
+                self.metadata.as_ref().unwrap().get(65, mm::PAGE_SIZE, None),
                 Err(BlockError::NoMemory)
             ),
             true,
         );
         context.expect_eq(
-            matches!(self.mapping.get_or_prepare(65), Err(BlockError::NoMemory)),
+            matches!(
+                self.mapping.get_or_prepare(65, None),
+                Err(BlockError::NoMemory)
+            ),
             true,
         );
         self.pressure.clear();
@@ -1167,7 +1182,7 @@ impl Owner {
         );
         let (hit, read) = self
             .mapping
-            .get_or_prepare(64)
+            .get_or_prepare(64, None)
             .map_err(|_| TestError("prepare-OOM live placeholder disappeared"))?;
         context.expect_eq(hit.phys_addr(), folio.phys_addr());
         context.expect_eq(read.is_none(), true);
@@ -1198,7 +1213,7 @@ impl Owner {
         context.expect_eq(Arc::ptr_eq(cache, &same), true);
         context.expect_eq(MetadataCache::shared(&claim, 7).is_err(), true);
         let tiny = cache
-            .get(1, 1024)
+            .get(1, 1024, None)
             .map_err(|_| TestError("private 1KiB metadata read failed"))?;
         let pfn = tiny.folio().phys_addr();
         context.expect_eq(tiny.folio().range_ready(1024, 1024), Ok(()));
@@ -1218,7 +1233,7 @@ impl Owner {
             Err(BlockError::ReadOnly),
         );
         let two = same
-            .get(0, 2048)
+            .get(0, 2048, None)
             .map_err(|_| TestError("private 2KiB metadata read failed"))?;
         context.expect_eq(two.folio().phys_addr(), pfn);
         context.expect_eq(
@@ -1230,7 +1245,7 @@ impl Owner {
         two.update(&claim, |bytes| bytes[..512].fill(0x19))
             .map_err(|_| TestError("private 2KiB metadata update failed"))?;
         let super_view = cache
-            .get(0, mm::PAGE_SIZE)
+            .get(0, mm::PAGE_SIZE, None)
             .map_err(|_| TestError("private super metadata read failed"))?;
         context.expect_eq(super_view.folio().phys_addr(), pfn);
         context.expect_eq(
@@ -1277,7 +1292,7 @@ impl Owner {
             ));
         }
         let root = volume
-            .load_inode(2)
+            .load_inode(2, None)
             .map_err(|_| TestError("record root inode failed"))?;
         let pattern = volume
             .lookup(&InodeMetadata::from_data(&root), &root.block, b"pattern")
@@ -1298,7 +1313,7 @@ impl Owner {
             let offset = (descriptor % g.block_size as u64) as usize;
             // 主描述符属于保留元数据范围，按卷的原缓存读取，不能当作普通数据块校验。
             let table = source_cache
-                .get(block, g.block_size)
+                .get(block, g.block_size, None)
                 .map_err(|_| TestError("record group descriptor read failed"))?
                 .with_read(|bytes| {
                     codec::decode_group(g, group, codec::bytes(bytes, offset, g.descriptor_size)?)
@@ -1334,7 +1349,7 @@ impl Owner {
             .map_err(|_| TestError("private record RW claim failed"))?;
         let cache = self.metadata.as_ref().unwrap().clone();
         let buffer = cache
-            .get(0, mm::PAGE_SIZE)
+            .get(0, mm::PAGE_SIZE, None)
             .map_err(|_| TestError("private record scratch read failed"))?;
         buffer
             .update(&claim, |bytes| {
@@ -1409,7 +1424,7 @@ impl Owner {
         }
         for index in 0..2 {
             let unchanged = volume
-                .load_inode(numbers[index])
+                .load_inode(numbers[index], None)
                 .map_err(|_| TestError("record original root reread failed"))?;
             context.expect_eq(InodeMetadata::from_data(&unchanged), before[index]);
         }
@@ -1527,15 +1542,14 @@ mod folio {
         fixture.identity(context)
     }
 
-    /// 有序、逆序和大跨度键超过旧固定槽；真实 OOM 下命中原页且 AVL 删除保持平衡。
+    /// 有序、逆序和大跨度键保留各自原页，真实 OOM 命中与外部 pin 后的两次 prune 共享原拥有。
     #[test]
     fn sparse_index_insert_hit_and_prune(
         context: &mut TestContext<'_>,
         _: &mut Pages,
     ) -> TestResult {
         for pass in 0..3 {
-            let mapping = FileMapping::new();
-            context.expect_eq(mapping.ktest_validate(), (0, 0));
+            let mapping = FolioIndex::new(None, false);
             let key = |index: usize| match pass {
                 0 => index as u64,
                 1 => (95 - index) as u64,
@@ -1545,7 +1559,7 @@ mod folio {
             let mut addresses = [0usize; 96];
             for (index, address) in addresses.iter_mut().enumerate() {
                 let (folio, read) = mapping
-                    .get_or_prepare(key(index))
+                    .get_or_prepare(key(index), None)
                     .map_err(|_| TestError("sparse AVL insertion failed"))?;
                 let mut read = read.ok_or(TestError("sparse miss did not own initialization"))?;
                 for byte in read.bytes_mut() {
@@ -1560,15 +1574,11 @@ mod folio {
                     });
                 }
                 *address = folio.phys_addr();
-                context.expect_eq(mapping.ktest_validate().0, index + 1);
             }
-            let (count, height) = mapping.ktest_validate();
-            context.expect_eq(count, 96);
-            context.expect_eq(height <= 8, true);
             if pass == 0 {
                 let mut pressure = HeapPressure::prepare()?;
                 let evidence = pressure.exhaust();
-                let result = mapping.get_or_prepare(key(48));
+                let result = mapping.get_or_prepare(key(48), None);
                 drop(pressure);
                 context.expect_eq(evidence, (true, true));
                 let (hit, read) =
@@ -1578,7 +1588,7 @@ mod folio {
             }
             for (index, address) in addresses.iter().enumerate() {
                 let (hit, read) = mapping
-                    .get_or_prepare(key(index))
+                    .get_or_prepare(key(index), None)
                     .map_err(|_| TestError("sparse AVL hit lost original page"))?;
                 context.expect_eq(hit.phys_addr(), *address);
                 context.expect_eq(read.is_none(), true);
@@ -1587,27 +1597,25 @@ mod folio {
                 context.expect_eq(byte[0], index as u8);
             }
             let first = mapping
-                .get_or_prepare(key(0))
+                .get_or_prepare(key(0), None)
                 .map_err(|_| TestError("sparse first pin failed"))?
                 .0;
             let middle = mapping
-                .get_or_prepare(key(48))
+                .get_or_prepare(key(48), None)
                 .map_err(|_| TestError("sparse middle pin failed"))?
                 .0;
             let last = mapping
-                .get_or_prepare(key(95))
+                .get_or_prepare(key(95), None)
                 .map_err(|_| TestError("sparse last pin failed"))?
                 .0;
-            context.expect_eq(mapping.prune_unused(), 93);
-            context.expect_eq(mapping.ktest_validate(), (3, 2));
+            context.expect_eq(mapping.prune_unused(None), 93);
             drop(first);
             drop(middle);
             drop(last);
-            context.expect_eq(mapping.prune_unused(), 3);
-            context.expect_eq(mapping.ktest_validate(), (0, 0));
+            context.expect_eq(mapping.prune_unused(None), 3);
         }
         context.diagnostic(format_args!(
-            "sparse-index orders=ascending/descending/sparse pages-per-order=96 old-fixed-slot-limit=none real-OOM-hit=1 same-PFN=1 AVL-checked=1 prune-live=93 prune-final=3"
+            "sparse-index orders=ascending/descending/sparse pages-per-order=96 real-OOM-hit=1 same-PFN-and-content=1 prune-live=93 prune-final=3"
         ));
         Ok(())
     }

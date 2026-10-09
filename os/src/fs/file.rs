@@ -273,7 +273,11 @@ pub trait FileLike: Send + Sync {
     fn sync_range(&self, range: Range<u64>, data_only: bool) -> Result<(), FsError>;
 
     /// 在普通任务中等待唯一 inode 的缓存页，不获取位置锁；EOF 与私有尾页由映射调用者处理。
-    fn file_page(&self, index: u64) -> Result<FolioRef, FsError>;
+    fn file_page(
+        &self,
+        index: u64,
+        attempt: &mut crate::mm::reclaim::ReclaimAttempt,
+    ) -> Result<FolioRef, FsError>;
 
     /// 更新共享字节位置，负值或溢出不修改原位置。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError>;
@@ -500,9 +504,13 @@ impl FileLike for InodeFile {
     }
 
     /// 从完整路径保活的 inode 取得同源缓存页，不读取或修改打开实例的位置。
-    fn file_page(&self, index: u64) -> Result<FolioRef, FsError> {
+    fn file_page(
+        &self,
+        index: u64,
+        attempt: &mut crate::mm::reclaim::ReclaimAttempt,
+    ) -> Result<FolioRef, FsError> {
         require_read(self.flags())?;
-        self.path.inode()?.file_page(index)
+        self.path.inode()?.file_page(index, attempt)
     }
 
     /// 与顺序读取共用位置锁，允许定位到文件末尾之后。
@@ -657,7 +665,11 @@ impl FileLike for DirectoryFile {
     }
 
     /// 目录不能提供普通文件映射页，不建立缓存页或改变枚举位置。
-    fn file_page(&self, _index: u64) -> Result<FolioRef, FsError> {
+    fn file_page(
+        &self,
+        _index: u64,
+        _attempt: &mut crate::mm::reclaim::ReclaimAttempt,
+    ) -> Result<FolioRef, FsError> {
         Err(FsError::IsDirectory)
     }
 

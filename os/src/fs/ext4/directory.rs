@@ -256,7 +256,7 @@ fn directory_block(
     map_root: &[u8; 60],
     logical: u64,
 ) -> Result<BufferRef, FsError> {
-    let physical = match volume.map_block(inode, map_root, logical)? {
+    let physical = match volume.map_block(inode, map_root, logical, None)? {
         BlockMapping::Mapped { physical, .. } => physical,
         _ => return Err(FsError::Corrupt),
     };

@@ -12,8 +12,8 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 
 use super::disk::QueuePhase;
 use super::{
-    AccessMode, Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim,
-    IoResult,
+    AccessMode, Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo,
+    FsClaim, IoResult,
 };
 use crate::drivers::virtio::VirtioDevice;
 use crate::drivers::DeviceInventory;
@@ -237,7 +237,7 @@ fn bio(
     let mapped = MappedPages::new(pages, 0, unit, direction)
         .map_err(|_| TestError("quota original page mapping failed"))?;
     let original = mapped.segment();
-    let mut memory = Vec::new();
+    let mut memory = Vec::new_in(BioAllocator::Heap);
     memory
         .try_reserve_exact(1)
         .map_err(|_| TestError("quota original owner vector failed"))?;

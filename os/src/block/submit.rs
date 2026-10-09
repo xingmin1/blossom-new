@@ -9,11 +9,12 @@ use virtio_drivers::{BufferDirection, MappedSegment};
 use crate::block::bio::BioInner;
 use crate::block::disk::{ActiveBio, PreparingSlot};
 use crate::block::{
-    Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, FsClaim, IoResult, QueueLimits,
-    MAX_BATCH, SECTOR_BYTES,
+    Bio, BioAllocator, BioCompletion, BioLane, BioLease, BioMemory, BlkOperation, BlockError, Disk,
+    DiskRef, FsClaim, IoResult, QueueLimits, MAX_BATCH, SECTOR_BYTES,
 };
 #[cfg(feature = "ktest")]
 use crate::drivers::virtio::VirtioIdentity;
+use crate::fs::background::WritebackDomain;
 use crate::mm::dma::{DmaError, MappedPages};
 use crate::mm::{alloc_pages, FolioRead, FolioWriteback, PAGE_SIZE};
 #[cfg(feature = "ktest")]
@@ -168,7 +169,7 @@ impl FsClaim {
     }
 
     /// 显式 FS 批次沿同一原 Bio 准入、有限合并及 split 路径，不另建提交引擎。
-    pub fn submit_batch(&self, bios: Vec<Bio>) {
+    pub fn submit_batch(&self, bios: impl IntoIterator<Item = Bio>) {
         self.disk().submit_batch_from(bios, Some(self));
     }
 
@@ -243,7 +244,7 @@ impl FsClaim {
         if count == 0 {
             return Err(BlockError::InvalidRange);
         }
-        let mut memory = Vec::new();
+        let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(count)
             .map_err(|_| BlockError::NoMemory)?;
@@ -286,28 +287,60 @@ impl FsClaim {
         snapshot.filter(|snapshot| snapshot.disk == self.disk().identity())
     }
 
-    /// 多原页相邻范围共用一个父，每批最多八父，统一通知后观察全部真实尾部。
-    /// 准备拒尾仍提交此前可用前缀；未接受凭证由原协议恢复 Dirty，不重放接受失败。
+    /// 多原页相邻范围共用一个父，固定父槽和观察者复用同一预建窗口。
+    /// 准备拒尾仍先提交已映射前缀，实际全尾后才允许 book 内的后继窗重用存储。
     pub(crate) fn writeback_batch(
         &self,
         ranges: &mut Vec<(u64, FolioWriteback)>,
+        lane: Option<&BioLane>,
+        bios: &mut [Option<Bio>; MAX_BATCH],
+        completions: &mut [Option<(BioCompletion, usize)>; MAX_BATCH],
+        domain: &Arc<WritebackDomain>,
+        stopped: impl Fn() -> bool,
     ) -> Result<(), BlockError> {
+        assert!(bios.iter().all(Option::is_none));
+        assert!(completions.iter().all(Option::is_none));
         let mut pending = ranges.drain(..);
         while pending.len() != 0 {
-            let mut bios = Vec::new();
-            bios.try_reserve_exact(MAX_BATCH)
-                .map_err(|_| BlockError::NoMemory)?;
-            let mut completions: [Option<(BioCompletion, usize)>; MAX_BATCH] =
-                [const { None }; MAX_BATCH];
+            let width = lane.map_or(MAX_BATCH, BioLane::len);
+            let (first_slot, mut first_lease) = match lane {
+                Some(lane) => {
+                    let (slot, lease) = lane.lease_available(&stopped)?;
+                    (slot, Some(lease))
+                }
+                None => (0, None),
+            };
             let mut preparation_error = None;
-            for completion in &mut completions {
+            for step in 0..width {
+                let slot = (first_slot + step) % width;
                 if pending.len() == 0 {
                     break;
                 }
-                match self.prepare_writeback_bio(&mut pending) {
-                    Ok((bio, len)) => {
-                        *completion = Some((bio.completion(), len));
-                        bios.push(bio);
+                let lease = if step == 0 {
+                    first_lease.take()
+                } else {
+                    match lane {
+                        Some(lane) => match lane.try_lease(slot, &stopped) {
+                            Ok(Some(lease)) => Some(lease),
+                            Ok(None) => continue,
+                            Err(error) => {
+                                preparation_error = Some(error);
+                                break;
+                            }
+                        },
+                        None => None,
+                    }
+                };
+                let prepared = self.prepare_writeback_bio(&mut pending, lease);
+                match prepared {
+                    Ok((bio, len, error)) => {
+                        bio.inner.track_writeback(domain);
+                        completions[step] = Some((bio.completion(), len));
+                        bios[step] = Some(bio);
+                        if error.is_some() {
+                            preparation_error = error;
+                            break;
+                        }
                     }
                     Err(error) => {
                         preparation_error = Some(error);
@@ -315,9 +348,12 @@ impl FsClaim {
                     }
                 }
             }
-            self.submit_batch(bios);
+            self.submit_batch(bios.iter_mut().filter_map(Option::take));
             let mut first_error = None;
-            for (completion, len) in IntoIterator::into_iter(completions).flatten() {
+            for entry in completions.iter_mut() {
+                let Some((completion, len)) = entry.take() else {
+                    continue;
+                };
                 let result = completion.wait();
                 let error = result
                     .error
@@ -325,6 +361,13 @@ impl FsClaim {
                 if first_error.is_none() {
                     first_error = error;
                 }
+                match completion.take_memory() {
+                    Ok(memory) => drop(memory),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                drop(completion);
             }
             if let Some(error) = first_error.or(preparation_error) {
                 return Err(error);
@@ -333,43 +376,59 @@ impl FsClaim {
         Ok(())
     }
 
-    /// 只将真实连续物理 byte 范围放入同一 Bio，锁外准备映射及父完成存储。
+    /// 只合并真实连续 byte 范围，储备父最多八映射；失败前的映射仍构造真实父提交。
     fn prepare_writeback_bio(
         &self,
         pending: &mut alloc::vec::Drain<'_, (u64, FolioWriteback)>,
-    ) -> Result<(Bio, usize), BlockError> {
+        lease: Option<BioLease>,
+    ) -> Result<(Bio, usize, Option<BlockError>), BlockError> {
+        let mut memory = match &lease {
+            Some(lease) => lease.memory()?,
+            None => Vec::new_in(BioAllocator::Heap),
+        };
         let byte_offset = pending.as_slice()[0].0;
         if byte_offset % SECTOR_BYTES != 0 {
             return Err(BlockError::Misaligned);
         }
         let mut end = byte_offset;
         let mut count = 0;
-        let mut len = 0usize;
-        for (offset, writeback) in pending.as_slice() {
+        for (offset, writeback) in pending
+            .as_slice()
+            .iter()
+            .take(memory.allocator().mapping_limit())
+        {
             if *offset != end {
                 break;
             }
             end = end
                 .checked_add(writeback.len() as u64)
                 .ok_or(BlockError::InvalidRange)?;
-            len = len
-                .checked_add(writeback.len())
-                .ok_or(BlockError::InvalidRange)?;
             count += 1;
         }
-        let mut memory = Vec::new();
         memory
             .try_reserve_exact(count)
             .map_err(|_| BlockError::NoMemory)?;
+        let mut len = 0;
+        let mut preparation_error = None;
         for _ in 0..count {
             let (_, writeback) = pending.next().expect("writeback prefix disappeared");
-            memory.push(
-                MappedPages::from_writeback(writeback).map_err(|(error, _)| map_error(error))?,
-            );
+            match MappedPages::from_writeback(writeback) {
+                Ok(mapped) => {
+                    len += mapped.len();
+                    memory.push(mapped);
+                }
+                Err((error, writeback)) => {
+                    drop(writeback);
+                    preparation_error = Some(map_error(error));
+                    break;
+                }
+            }
         }
-        // SAFETY: 凭证来自已初始化原页，已完成对应共享撤权及 CSD；不导出内容切片。
-        // 相邻物理范围共享此父，各映射只记录自己的真实接受、完成及未接受恢复责任。
-        // 同一父保活原页与 FS claim，全部 child 和生成者收权前不结束 WB。
+        if memory.is_empty() {
+            return Err(preparation_error.expect("empty writeback prefix has no error"));
+        }
+        // SAFETY: 凭证来自已初始化原页，已完成共享撤权及 CSD，不导出内容切片。
+        // 每映射只记录自己的真实接受和未接受恢复；全部 child 与生成者收权前不结束 WB。
         let bio = unsafe {
             Bio::try_new(
                 self.disk(),
@@ -380,23 +439,23 @@ impl FsClaim {
                 None,
             )
         }?;
-        Ok((bio, len))
+        drop(lease);
+        Ok((bio, len, preparation_error))
     }
 
-    /// 沿同一受限 FS 准入提交真实设备 FLUSH，失败不作重放或软件成功替身。
-    pub(crate) fn flush(&self) -> Result<(), BlockError> {
-        // SAFETY: Flush 没有数据映射或 CPU 别名，不含回调；
-        // Bio 仍承担唯一生成者、全部 child 和真实设备完成责任。
-        let bio =
-            unsafe { Bio::try_new(self.disk(), BlkOperation::Flush, 0, Vec::new(), 0, None) }?;
+    /// 使用调用者业务锁外准备的同一来源提交真实 FLUSH，内部观察者全部结束后返回。
+    pub(crate) fn flush(&self, memory: BioMemory) -> Result<(), BlockError> {
+        // SAFETY: Flush 没有数据映射或 CPU 别名，也不含回调；
+        // genuine Bio 仍承担生成者、全部 child 和真实完成责任。
+        let bio = unsafe { Bio::try_new(self.disk(), BlkOperation::Flush, 0, memory, 0, None) }?;
         let completion = bio.completion();
         self.submit_bio(bio);
         self.disk().unplug();
         let result = completion.wait();
-        match result.error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        let memory = completion.take_memory();
+        drop(completion);
+        drop(memory?);
+        result.error.map_or(Ok(()), Err)
     }
 }
 
@@ -432,7 +491,7 @@ impl Disk {
             Ok(accepted) => active[0] = Some(accepted),
             Err((bio, error)) => {
                 self.unplug();
-                bio.inner.reject(error);
+                BioInner::reject(&bio.inner, error);
                 return;
             }
         }
@@ -440,14 +499,18 @@ impl Disk {
     }
 
     /// raw 批次没有 FS 授权，每组最多八个生成者，组内相邻普通范围才允许合并。
-    pub(crate) fn submit_batch(self: &DiskRef, bios: Vec<Bio>) {
+    pub(crate) fn submit_batch(self: &DiskRef, bios: impl IntoIterator<Item = Bio>) {
         self.submit_batch_from(bios, None);
     }
 
     /// 两种来源共用批次准入及 child 生成，拒绝的父只清自身准备资源。
-    fn submit_batch_from(self: &DiskRef, bios: Vec<Bio>, claim: Option<&FsClaim>) {
+    fn submit_batch_from(
+        self: &DiskRef,
+        bios: impl IntoIterator<Item = Bio>,
+        claim: Option<&FsClaim>,
+    ) {
         drop(task::current_task());
-        let mut pending = bios.into_iter();
+        let mut pending = bios.into_iter().peekable();
         loop {
             let mut active: [Option<ActiveBio<'_>>; MAX_BATCH] = [const { None }; MAX_BATCH];
             for entry in &mut active {
@@ -458,12 +521,12 @@ impl Disk {
                     Ok(accepted) => *entry = Some(accepted),
                     Err((bio, error)) => {
                         self.unplug();
-                        bio.inner.reject(error);
+                        BioInner::reject(&bio.inner, error);
                     }
                 }
             }
             self.submit_accepted(&mut active);
-            if pending.len() == 0 {
+            if pending.peek().is_none() {
                 return;
             }
         }
@@ -600,9 +663,17 @@ impl Disk {
     }
 
     /// 将原 folio 的完整读入范围交给 Bio，等待真实 DMA 全尾及内容结果发布。
-    pub fn load_folio(self: &DiskRef, byte_offset: u64, read: FolioRead) -> Result<(), BlockError> {
+    pub(crate) fn load_folio(
+        self: &DiskRef,
+        byte_offset: u64,
+        read: FolioRead,
+        memory: BioMemory,
+    ) -> Result<(), BlockError> {
         let len = read.len();
-        let (_, result) = self.read_folio_bio(byte_offset, read, None)?;
+        let (completion, result) = self.read_folio_bio(byte_offset, read, None, memory)?;
+        let memory = completion.take_memory();
+        drop(completion);
+        drop(memory?);
         if let Some(error) = result.error {
             return Err(error);
         }
@@ -621,7 +692,12 @@ impl Disk {
         offset: usize,
         len: usize,
     ) -> Result<FolioRead, BlockError> {
-        let (completion, result) = self.read_folio_bio(byte_offset, read, Some((offset, len)))?;
+        let (completion, result) = self.read_folio_bio(
+            byte_offset,
+            read,
+            Some((offset, len)),
+            Vec::new_in(BioAllocator::Heap),
+        )?;
         if let Some(error) = result.error {
             return Err(error);
         }
@@ -651,9 +727,9 @@ impl Disk {
         byte_offset: u64,
         mut read: FolioRead,
         range: Option<(usize, usize)>,
+        mut memory: BioMemory,
     ) -> Result<(BioCompletion, IoResult), BlockError> {
         drop(task::current_task());
-        let mut memory = Vec::new();
         let prepared = if byte_offset % SECTOR_BYTES != 0 {
             Err(BlockError::Misaligned)
         } else {
@@ -741,7 +817,7 @@ impl Disk {
         }
         let total = dst.len();
         let page_count = total / PAGE_SIZE + usize::from(total % PAGE_SIZE != 0);
-        let mut memory = Vec::new();
+        let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(page_count)
             .map_err(|_| BlockError::NoMemory)?;

@@ -1,15 +1,18 @@
 //! 卷级有限回写使用共享 worker；原页状态、真实完成带宽和 writer 等待共用同一责任域。
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::ops::{Deref, DerefMut};
 use core::pin::{pin, Pin};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Once;
 
-use crate::block::BlockError;
+use crate::block::{BioReserve, BlockError, MetadataIoContext};
 use crate::fs::{writeback, Ext4Volume, FsError, InodeRef};
 use crate::mm::{self, PAGE_SIZE};
 use crate::sched;
 use crate::sync::{SleepMutex, SpinLock};
+use crate::task::ReclaimScope;
 use crate::time::{self, Duration, MonotonicInstant};
 use crate::timer::{Timer, TimerKind};
 use crate::wait::{WaitNode, WaitQueue, Waiter, Waker};
@@ -130,6 +133,8 @@ struct State {
     completion: Completion,
     contribution: u64,
     rounds: u64,
+    finished_rounds: u64,
+    stop_sequence: u64,
     round: Round,
     writer_waits: u64,
     writer_wakes: u64,
@@ -141,11 +146,75 @@ pub(crate) struct WritebackDomain {
     work: Once<Pin<Arc<DelayedWork>>>,
     state: SpinLock<State>,
     stop: SleepMutex<()>,
+    source: Option<Arc<BioReserve>>,
+    scratch: SpinLock<Option<Box<writeback::WbStorage>>>,
     dirty_pages: AtomicUsize,
     writeback_pages: AtomicUsize,
+    submitted_bytes: AtomicU64,
     waiters: WaitQueue,
     #[cfg(feature = "ktest")]
     round_hook: SpinLock<Option<Arc<dyn Fn(WritebackSnapshot) + Send + Sync>>>,
+}
+
+/// 值边界只记录真实域事实，不保活后继轮或把开始计数当完成。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WritebackBoundary {
+    identity: usize,
+    completion_sequence: u64,
+    error_sequence: u64,
+    finished_rounds: u64,
+    stop_sequence: u64,
+    submitted_bytes: u64,
+    completed_bytes: u64,
+    inactive: bool,
+    halted: bool,
+}
+
+/// 本边界之后的真实增量；停止或零提交轮结束并不冒称释放了文件页。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WritebackProgress {
+    pub submitted_bytes: u64,
+    pub completed_bytes: u64,
+    pub stopped: bool,
+    pub error: bool,
+}
+
+/// 借出时把唯一预建 Box 移出域，不让 idle scratch 反持活请求或 inode。
+pub(crate) struct WbStorageLease {
+    domain: Arc<WritebackDomain>,
+    storage: Option<Box<writeback::WbStorage>>,
+    _scope: ReclaimScope,
+}
+
+impl Deref for WbStorageLease {
+    type Target = writeback::WbStorage;
+
+    /// 正式借用只暴露仍由本 guard 唯一持有的窗口。
+    fn deref(&self) -> &Self::Target {
+        self.storage
+            .as_deref()
+            .expect("writeback storage lease ended")
+    }
+}
+
+impl DerefMut for WbStorageLease {
+    /// 原窗口没有第二份拥有，可在同一 Task 的 guard 下逐窗复用。
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.storage
+            .as_deref_mut()
+            .expect("writeback storage lease ended")
+    }
+}
+
+impl Drop for WbStorageLease {
+    /// 临时凭证及 book 在域锁外清空，再归还空 Box 并通知所有真实等待者。
+    fn drop(&mut self) {
+        let storage = self
+            .storage
+            .take()
+            .expect("writeback storage returned twice");
+        self.domain.return_storage(storage);
+    }
 }
 
 /// 同卷真实状态快照；本轮实际完成者发布 accepted 账，提交瞬间与在途数仍由原 Disk/Bio 观察。
@@ -153,6 +222,7 @@ pub(crate) struct WritebackDomain {
 pub(crate) struct WritebackSnapshot {
     pub dirty_pages: usize,
     pub writeback_pages: usize,
+    pub submitted_bytes: u64,
     pub accepted_bytes: u64,
     pub completed_bytes: u64,
     pub completion_seq: u64,
@@ -165,6 +235,8 @@ pub(crate) struct WritebackSnapshot {
     #[cfg(feature = "ktest")]
     pub sample_end_ns: u64,
     pub rounds: u64,
+    pub finished_rounds: u64,
+    pub stop_sequence: u64,
     pub round_limit: usize,
     pub round_scanned: usize,
     pub round_selected_data: usize,
@@ -211,7 +283,15 @@ pub(crate) fn initialize() -> Result<(), FsError> {
 
 impl WritebackDomain {
     /// 卷发表前准备全部控制对象；context 只定位本域，接受异步工作时另交真实卷票。
-    pub(crate) fn try_new(_volume: &Arc<Ext4Volume>) -> Result<Arc<Self>, FsError> {
+    pub(crate) fn try_new(volume: &Arc<Ext4Volume>) -> Result<Arc<Self>, FsError> {
+        let source = volume.metadata_cache().reserve();
+        let scratch = match &source {
+            Some(source) => Some(
+                Box::try_new(writeback::WbStorage::try_reserved(source.clone())?)
+                    .map_err(|_| FsError::NoMemory)?,
+            ),
+            None => None,
+        };
         let domain = Arc::try_new(Self {
             work: Once::new(),
             state: SpinLock::new(State {
@@ -225,14 +305,19 @@ impl WritebackDomain {
                 completion: Completion::new(),
                 contribution: 0,
                 rounds: 0,
+                finished_rounds: 0,
+                stop_sequence: 0,
                 round: Round::default(),
                 writer_waits: 0,
                 writer_wakes: 0,
                 waiting_writers: 0,
             }),
             stop: SleepMutex::new(()),
+            source,
+            scratch: SpinLock::new(scratch),
             dirty_pages: AtomicUsize::new(0),
             writeback_pages: AtomicUsize::new(0),
+            submitted_bytes: AtomicU64::new(0),
             waiters: WaitQueue::new(),
             #[cfg(feature = "ktest")]
             round_hook: SpinLock::new(None),
@@ -247,6 +332,180 @@ impl WritebackDomain {
         .map_err(|_| FsError::NoMemory)?;
         domain.work.call_once(|| work);
         Ok(domain)
+    }
+
+    /// 同时捕获域与来源旧边界，再在所有 FS 业务锁外等待唯一 scratch 和完整 lane。
+    pub(crate) fn borrow_storage(self: &Arc<Self>) -> Result<WbStorageLease, FsError> {
+        sched::assert_switchable();
+        let source = self.source.as_ref().ok_or(FsError::ReadOnly)?;
+        let (boundary, metadata_boundary) = {
+            let state = self.state.lock();
+            if !state.active || state.stopping || state.halted {
+                return Err(FsError::Io(BlockError::QueueStopped));
+            }
+            // 停止先写此 state，再推进 source；domain→source 只读捕获不可能得到旧域+新源。
+            (state.stop_sequence, source.metadata_io_context().boundary())
+        };
+        loop {
+            if self.storage_stopped(boundary) {
+                return Err(FsError::Io(BlockError::QueueStopped));
+            }
+            let storage = self.scratch.lock().take();
+            if let Some(mut storage) = storage {
+                let scope = ReclaimScope::noio();
+                match source.acquire_wb_lane(|| self.storage_stopped(boundary)) {
+                    Ok(lane) => {
+                        storage.bind_lane(lane, boundary, metadata_boundary);
+                        return Ok(WbStorageLease {
+                            domain: self.clone(),
+                            storage: Some(storage),
+                            _scope: scope,
+                        });
+                    }
+                    Err(error) => {
+                        self.return_storage(storage);
+                        return Err(FsError::from(error));
+                    }
+                }
+            }
+            let waiter = Waiter::new();
+            let mut node = pin!(WaitNode::new(waiter.waker()));
+            // SAFETY: self 的真实 Arc 保域，pin 栈节点，所有出口先结束登记。
+            let _registration = unsafe { self.waiters.register(node.as_mut()) };
+            if self.storage_stopped(boundary) {
+                return Err(FsError::Io(BlockError::QueueStopped));
+            }
+            if self.scratch.lock().is_some() {
+                continue;
+            }
+            waiter.park();
+        }
+    }
+
+    /// 原借用只能核原单调边界，stop 后新 activate 不能复活它。
+    pub(crate) fn storage_stopped(&self, boundary: u64) -> bool {
+        let state = self.state.lock();
+        state.stop_sequence != boundary || !state.active || state.stopping || state.halted
+    }
+
+    /// ctx 借域原源，旧 sequence 来自本次借用而不是此处重新采样。
+    pub(crate) fn metadata_io_context(&self, boundary: u64) -> MetadataIoContext<'_> {
+        MetadataIoContext::from_boundary(
+            self.source
+                .as_ref()
+                .expect("read-only domain has no reserved metadata source"),
+            boundary,
+        )
+    }
+
+    /// 清空和来源通知都在短锁外；锁内只移回唯一空窗口。
+    fn return_storage(&self, mut storage: Box<writeback::WbStorage>) {
+        storage.clear();
+        {
+            let mut scratch = self.scratch.lock();
+            assert!(scratch.is_none(), "writeback scratch returned twice");
+            *scratch = Some(storage);
+        }
+        self.waiters.wake_all();
+    }
+
+    /// 停止等待实际借出 Box 归还，不以 running=false 或来源控制可用代替业务尾。
+    fn wait_storage_returned(&self) {
+        if self.source.is_none() {
+            return;
+        }
+        loop {
+            if self.scratch.lock().is_some() {
+                return;
+            }
+            let waiter = Waiter::new();
+            let mut node = pin!(WaitNode::new(waiter.waker()));
+            // SAFETY: stop caller 保域，固定栈节点在返回前撤销登记。
+            let _registration = unsafe { self.waiters.register(node.as_mut()) };
+            if self.scratch.lock().is_some() {
+                return;
+            }
+            waiter.park();
+        }
+    }
+
+    /// driver 接受前缀时只做原子记账，不能在 Bio/Request 锁下转取本域短锁。
+    pub(crate) fn note_submitted(&self, bytes: usize) {
+        self.submitted_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// 在调度前记录真实尾边界；拒准入明确返回停止/错误事实，不合成完成。
+    pub(crate) fn request_progress(
+        self: &Arc<Self>,
+        volume: &Arc<Ext4Volume>,
+    ) -> WritebackBoundary {
+        let boundary = {
+            let state = self.state.lock();
+            WritebackBoundary {
+                identity: self.as_ref() as *const Self as usize,
+                completion_sequence: state.completion.sequence,
+                error_sequence: state.completion.error_sequence,
+                finished_rounds: state.finished_rounds,
+                stop_sequence: state.stop_sequence,
+                submitted_bytes: self.submitted_bytes.load(Ordering::Relaxed),
+                completed_bytes: state.completion.completed_bytes,
+                inactive: !state.active || state.stopping,
+                halted: state.halted,
+            }
+        };
+        if !boundary.inactive && !boundary.halted {
+            self.schedule(volume, Duration::ZERO);
+        }
+        boundary
+    }
+
+    /// 最多等待一个真实完成/error/有限轮尾/stop 边界，不轮询 rounds 开始或 WB0。
+    pub(crate) fn wait_progress(&self, boundary: WritebackBoundary) -> WritebackProgress {
+        assert_eq!(
+            boundary.identity, self as *const Self as usize,
+            "foreign writeback boundary"
+        );
+        sched::assert_switchable();
+        loop {
+            if let Some(progress) = self.progress_after(boundary) {
+                return progress;
+            }
+            let waiter = Waiter::new();
+            let mut node = pin!(WaitNode::new(waiter.waker()));
+            // SAFETY: caller 保真实域，节点固定且登记先于二次边界检查。
+            let _registration = unsafe { self.waiters.register(node.as_mut()) };
+            if let Some(progress) = self.progress_after(boundary) {
+                return progress;
+            }
+            waiter.park();
+        }
+    }
+
+    /// 值读取只报告本边界之后的实际 byte 与停止/错误，不把提交量当完成量。
+    fn progress_after(&self, boundary: WritebackBoundary) -> Option<WritebackProgress> {
+        let state = self.state.lock();
+        let stopped = boundary.inactive || state.stop_sequence != boundary.stop_sequence;
+        let error = boundary.halted || state.completion.error_sequence != boundary.error_sequence;
+        if !stopped
+            && !error
+            && state.completion.sequence == boundary.completion_sequence
+            && state.finished_rounds == boundary.finished_rounds
+        {
+            return None;
+        }
+        Some(WritebackProgress {
+            submitted_bytes: self
+                .submitted_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(boundary.submitted_bytes),
+            completed_bytes: state
+                .completion
+                .completed_bytes
+                .saturating_sub(boundary.completed_bytes),
+            stopped,
+            error,
+        })
     }
 
     /// 真正新 canonical 域绑定后开放原服务；此前停止必须已经结束全部回调尾部。
@@ -329,11 +588,16 @@ impl WritebackDomain {
             let mut state = self.state.lock();
             state.active = false;
             state.stopping = true;
+            state.stop_sequence += 1;
             ACTIVE_BANDWIDTH.fetch_sub(state.contribution, Ordering::Relaxed);
             state.contribution = 0;
         }
         self.waiters.wake_all();
+        if let Some(source) = &self.source {
+            source.wake_stopped();
+        }
         self.work().cancel_sync();
+        self.wait_storage_returned();
         let ticket = {
             let mut state = self.state.lock();
             assert!(!state.running, "writeback callback survived cancellation");
@@ -426,6 +690,7 @@ impl WritebackDomain {
         WritebackSnapshot {
             dirty_pages: self.dirty_pages.load(Ordering::Relaxed),
             writeback_pages: self.writeback_pages.load(Ordering::Relaxed),
+            submitted_bytes: self.submitted_bytes.load(Ordering::Relaxed),
             accepted_bytes: state.completion.accepted_bytes,
             completed_bytes: state.completion.completed_bytes,
             completion_seq: state.completion.sequence,
@@ -438,6 +703,8 @@ impl WritebackDomain {
             #[cfg(feature = "ktest")]
             sample_end_ns: state.completion.last_sample_end_ns,
             rounds: state.rounds,
+            finished_rounds: state.finished_rounds,
+            stop_sequence: state.stop_sequence,
             round_limit: state.round.limit,
             round_scanned: state.round.scanned,
             round_selected_data: state.round.selected_data,
@@ -524,34 +791,46 @@ impl WritebackDomain {
         };
         let mut first_error = None;
         let mut unconfirmed = false;
-        for offset in 0..limit {
-            let remaining = DATA_BUDGET - self.state.lock().round.selected_data;
-            if remaining == 0 {
-                break;
-            }
-            let slot = (start + offset) % limit;
-            {
-                let mut state = self.state.lock();
-                state.round.scanned += 1;
-                state.next_slot = (slot + 1) % limit;
-            }
-            let Some(inode) = volume.dirty_inode_at(slot) else {
-                continue;
-            };
-            if let Err(error) = writeback::sync_inode_budget(&inode, remaining) {
-                first_error.get_or_insert(error);
-                self.note_error();
-                if error == FsError::Io(BlockError::StopUnconfirmed) {
-                    unconfirmed = true;
-                    break;
+        match self.borrow_storage() {
+            Ok(mut storage) => {
+                for offset in 0..limit {
+                    let remaining = DATA_BUDGET - self.state.lock().round.selected_data;
+                    if remaining == 0 || storage.stopped(self) {
+                        break;
+                    }
+                    let slot = (start + offset) % limit;
+                    {
+                        let mut state = self.state.lock();
+                        state.round.scanned += 1;
+                        state.next_slot = (slot + 1) % limit;
+                    }
+                    let Some(inode) = volume.dirty_inode_at(slot) else {
+                        continue;
+                    };
+                    if let Err(error) =
+                        writeback::sync_inode_budget(&inode, remaining, &mut storage)
+                    {
+                        first_error.get_or_insert(error);
+                        self.note_error();
+                        if error == FsError::Io(BlockError::StopUnconfirmed) {
+                            unconfirmed = true;
+                            break;
+                        }
+                    }
+                }
+                if !unconfirmed && !storage.stopped(self) {
+                    if let Err(error) =
+                        writeback::sync_metadata_budget(volume, METADATA_BUDGET, &mut storage)
+                    {
+                        first_error.get_or_insert(error);
+                        self.note_error();
+                        unconfirmed = error == FsError::Io(BlockError::StopUnconfirmed);
+                    }
                 }
             }
-        }
-        if !unconfirmed {
-            if let Err(error) = writeback::sync_metadata_budget(volume, METADATA_BUDGET) {
-                first_error.get_or_insert(error);
+            Err(error) => {
+                first_error = Some(error);
                 self.note_error();
-                unconfirmed = error == FsError::Io(BlockError::StopUnconfirmed);
             }
         }
         let pending = self.pressure() != 0 || volume.metadata_cache().has_dirty_or_writeback();
@@ -560,6 +839,7 @@ impl WritebackDomain {
             state.round.later_dirty = pending;
             state.halted = unconfirmed;
             state.running = false;
+            state.finished_rounds += 1;
             state.active && !state.halted && (pending || state.notified)
         };
         self.waiters.wake_all();
@@ -587,6 +867,10 @@ impl Drop for WritebackDomain {
         assert_eq!(state.pending, 0, "dropping pending writeback volume ticket");
         assert!(!state.running, "dropping running writeback domain");
         assert_eq!(state.contribution, 0, "dropping active writeback bandwidth");
+        assert!(
+            self.source.is_none() || self.scratch.lock().is_some(),
+            "dropping borrowed writeback scratch"
+        );
     }
 }
 

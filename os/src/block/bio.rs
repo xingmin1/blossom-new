@@ -1,14 +1,15 @@
 //! 逻辑请求拥有原页；生成者与已登记 child 共同决定唯一父完成。
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::pin::{pin, Pin};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use virtio_drivers::MappedSegment;
 
+use crate::block::{BioAllocator, BioMemory};
 use crate::block::{BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim, IoResult};
 use crate::drivers::virtio::VirtioIdentity;
+use crate::fs::background::WritebackDomain;
 use crate::mm::dma::MappedPages;
 use crate::sched;
 use crate::sync::SpinLock;
@@ -17,13 +18,13 @@ use crate::workqueue::Work;
 
 /// 唯一可提交凭证；完成观察者只克隆同一父对象，不能重新提交。
 pub struct Bio {
-    pub(super) inner: Arc<BioInner>,
+    pub(super) inner: BioArc,
 }
 
 /// 完成观察者不拥有 Disk，也不创建新的等待存储或内存副本。
 #[derive(Clone)]
 pub struct BioCompletion {
-    inner: Arc<BioInner>,
+    inner: BioArc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +38,7 @@ enum Phase {
 
 struct BioState {
     phase: Phase,
-    memory: Option<Vec<MappedPages>>,
+    memory: Option<BioMemory>,
     remaining: usize,
     generating: bool,
     registered_end: usize,
@@ -47,6 +48,8 @@ struct BioState {
     result: Option<IoResult>,
     completion_owner: Option<DiskRef>,
     fs_claim: Option<FsClaim>,
+    finalizer_ticket: Option<BioRawTicket>,
+    writeback_domain: Option<Arc<WritebackDomain>>,
 }
 
 /// 不可变范围与常数完成账本分开；队列 part 只强拥有此对象。
@@ -61,6 +64,34 @@ pub(super) struct BioInner {
     state: SpinLock<BioState>,
     ready: AtomicBool,
     waiters: WaitQueue,
+}
+
+/// 所有父、子请求及观察者同时携带原 allocator 拥有。
+pub(super) type BioArc = Arc<BioInner, BioAllocator>;
+
+/// 一张真实 raw strong 与其转出的原 allocator 值共同移动。
+struct BioRawTicket {
+    pointer: *const BioInner,
+    allocator: BioAllocator,
+}
+
+// SAFETY: pointer 来自真实 into_raw_with_allocator strong；票只由一次
+// Work 移交，状态锁保护其存取，allocator 覆盖回调及真正 deallocate。
+unsafe impl Send for BioRawTicket {}
+
+impl BioRawTicket {
+    /// 消费真 Arc 并保留原 allocator，不新建计数或猜来源。
+    fn from_arc(owner: BioArc) -> Self {
+        let (pointer, allocator) = Arc::into_raw_with_allocator(owner);
+        Self { pointer, allocator }
+    }
+
+    /// 同一票一次恢复原 strong 与 allocator owning。
+    fn into_arc(self) -> BioArc {
+        // SAFETY: 本票的 pointer/allocator 从同一次真实 into_raw 转移；
+        // 没有其它 from_raw 消费者，allocator 值恰好移回这一份 Arc。
+        unsafe { Arc::from_raw_in(self.pointer, self.allocator) }
+    }
 }
 
 impl Bio {
@@ -78,11 +109,11 @@ impl Bio {
     /// 两种回调都不得泄露 memory 借用或在返回后继续访问其裸别名。
     /// Task 回调的现存工作域须保开放至本 Bio 被拒绝或完成，沿用域 owner 停外部生产源后关闭的规则。
     /// Task Bio 构造期另备同域独占执行栈；拒绝或生成者最后完成也不能耗尽设备完成的准入。
-    pub unsafe fn try_new(
+    pub(crate) unsafe fn try_new(
         disk: &Disk,
         operation: BlkOperation,
         sector: u64,
-        mut memory: Vec<MappedPages>,
+        mut memory: BioMemory,
         attributes: u32,
         end_io: Option<EndIo>,
     ) -> Result<Self, BlockError> {
@@ -104,35 +135,44 @@ impl Bio {
                 memory.iter().map(MappedPages::segment),
                 attributes,
             )?;
-            let inner = Arc::try_new(BioInner {
-                target: disk.identity(),
-                operation,
-                sector,
-                len,
-                segment_count: memory.len(),
-                end_io,
-                finalizer_work: None,
-                state: SpinLock::new(BioState {
-                    phase: Phase::New,
-                    memory: None,
-                    remaining: 0,
-                    generating: false,
-                    registered_end: 0,
-                    registered_children: 0,
-                    accepted_end: 0,
-                    first_error: None,
-                    result: None,
-                    completion_owner: None,
-                    fs_claim: None,
-                }),
-                ready: AtomicBool::new(false),
-                waiters: WaitQueue::new(),
-            })
-            .map_err(|_| BlockError::NoMemory)?;
+            let allocator = memory.allocator().control();
+            let mut uninit = Arc::<BioInner, BioAllocator>::try_new_uninit_in(allocator)
+                .map_err(|_| BlockError::NoMemory)?;
+            Arc::get_mut(&mut uninit)
+                .expect("new bio has another owner")
+                .write(BioInner {
+                    target: disk.identity(),
+                    operation,
+                    sector,
+                    len,
+                    segment_count: memory.len(),
+                    end_io,
+                    finalizer_work: None,
+                    state: SpinLock::new(BioState {
+                        phase: Phase::New,
+                        memory: None,
+                        remaining: 0,
+                        generating: false,
+                        registered_end: 0,
+                        registered_children: 0,
+                        accepted_end: 0,
+                        first_error: None,
+                        result: None,
+                        completion_owner: None,
+                        fs_claim: None,
+                        finalizer_ticket: None,
+                        writeback_domain: None,
+                    }),
+                    ready: AtomicBool::new(false),
+                    waiters: WaitQueue::new(),
+                });
+            // SAFETY: 新 uninit Arc 尚未发表且没有其它引用，全部字段已写齐，
+            // 原 allocator 值随同同一真实控制分配继续存在。
+            let inner = unsafe { uninit.assume_init() };
             if inner.needs_task() {
-                let raw = Arc::into_raw(inner);
-                // SAFETY: 此原 Arc 尚未发表、未创建弱引用，局部恢复唯一构造拥有。
-                let owner = unsafe { Arc::from_raw(raw) };
+                let ticket = BioRawTicket::from_arc(inner);
+                let raw = ticket.pointer;
+                let owner = ticket.into_arc();
                 let work = disk.prepare_finalizer(finalizer_callback, raw as usize)?;
                 // SAFETY: Work 尚无票，原映射未移入，没有任何回调或第二份 Bio 引用。
                 unsafe { (*raw.cast_mut()).finalizer_work = Some(work) };
@@ -207,7 +247,7 @@ impl BioCompletion {
     /// 完成后只允许一个观察者移出原 memory，未完成或重复领取返回 Busy。
     /// Read 错误和短读的尾部仍可能未初始化；返回映射只提供安全 MaybeUninit 写入口，
     /// unsafe bytes 的全范围初始化义务不因领取 memory 而解除。
-    pub fn take_memory(&self) -> Result<Vec<MappedPages>, BlockError> {
+    pub(crate) fn take_memory(&self) -> Result<BioMemory, BlockError> {
         if !self.is_complete() {
             return Err(BlockError::Busy);
         }
@@ -217,6 +257,12 @@ impl BioCompletion {
             .memory
             .take()
             .ok_or(BlockError::Busy)
+    }
+
+    /// 延长原 Arc 控制及其 owning allocator 的弱尾，不复制计数或保留父强引用。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_weak(&self) -> impl Send + Sync + 'static {
+        Arc::downgrade(&self.inner)
     }
 
     /// 验收等待已预备父 finalizer 的真实票尾，不以 ready 推测 worker 已返还。
@@ -346,6 +392,14 @@ impl BioInner {
         matches!(self.end_io, Some(EndIo::Task(_)))
     }
 
+    /// 唯一 WB 准备者在准入前登记真实统计域，不分配新控制对象。
+    pub(super) fn track_writeback(&self, domain: &Arc<WritebackDomain>) {
+        let mut state = self.state.lock();
+        assert_eq!(state.phase, Phase::New);
+        assert!(state.writeback_domain.is_none());
+        state.writeback_domain = Some(domain.clone());
+    }
+
     /// 已接受 FS 来源在交权前保存共享占用，拒绝的 Bio 从不取得该责任。
     pub(super) fn retain_fs_claim(&self, claim: &FsClaim) {
         let mut state = self.state.lock();
@@ -433,12 +487,15 @@ impl BioInner {
             base = mapped_end;
         }
         state.accepted_end = end;
+        if let Some(domain) = &state.writeback_domain {
+            domain.note_submitted(length);
+        }
     }
 
     /// 唯一 slot 完成者在 used 或已确认 reset 后结束 child；Task 回调须由 slot Work 执行。
     /// 未发表的失败 child 也消费同一登记义务，生成者仍保住此前在途原页。
     pub(super) fn finish_child(
-        self: &Arc<Self>,
+        bio: &BioArc,
         offset: usize,
         length: usize,
         completed: usize,
@@ -447,10 +504,10 @@ impl BioInner {
         let end = offset
             .checked_add(length)
             .expect("bio child range overflow");
-        assert!(end <= self.len && completed <= length);
+        assert!(end <= bio.len && completed <= length);
         let error = error.or_else(|| (completed < length).then_some(BlockError::ShortIo));
         let completion = {
-            let mut state = self.state.lock();
+            let mut state = bio.state.lock();
             assert_eq!(state.phase, Phase::Active);
             assert!(end <= state.registered_end);
             assert!(
@@ -481,23 +538,23 @@ impl BioInner {
                 }
                 base = mapped_end;
             }
-            state.end_obligation(self.len)
+            state.end_obligation(bio.len)
         };
         if let Some((memory, result)) = completion {
-            self.complete(memory, result, true, None, false);
+            Self::complete(bio, memory, result, true, None, false);
         }
     }
 
     /// 结束生成者账本；true 表示可睡完成及 accepted 尾部已移交构造期同域预留 Work。
     /// accepted 生成者借用实际 DiskRef；只有独立完成 Work 接责时才取得强拥有。
     pub(super) fn finish_generation(
-        self: &Arc<Self>,
+        bio: &BioArc,
         error: Option<(usize, BlockError)>,
         owner: Option<&DiskRef>,
     ) -> bool {
         sched::assert_switchable();
         let completion = {
-            let mut state = self.state.lock();
+            let mut state = bio.state.lock();
             assert_eq!(state.phase, Phase::Active);
             assert!(state.generating, "bio generation ended twice");
             if let Some((offset, error)) = error {
@@ -505,30 +562,31 @@ impl BioInner {
                 state.record_error(offset, error);
             } else {
                 assert_eq!(
-                    state.registered_end, self.len,
+                    state.registered_end, bio.len,
                     "bio generation is incomplete"
                 );
                 assert!(0 < state.registered_children, "bio generated no child");
             }
             state.generating = false;
-            state.end_obligation(self.len)
+            state.end_obligation(bio.len)
         };
         if let Some((memory, result)) = completion {
-            return self.complete(memory, result, true, owner, true);
+            return Self::complete(bio, memory, result, true, owner, true);
         }
         false
     }
 
     /// 普通 Task 在未 admission 时立即失败，原 memory 从未交设备，回调仍在锁外。
-    pub(super) fn reject(self: &Arc<Self>, error: BlockError) {
+    pub(super) fn reject(bio: &BioArc, error: BlockError) {
         sched::assert_switchable();
         let memory = {
-            let mut state = self.state.lock();
+            let mut state = bio.state.lock();
             assert_eq!(state.phase, Phase::New, "rejecting an admitted bio");
             state.phase = Phase::Finishing;
             state.memory.take().expect("rejected bio memory missing")
         };
-        self.complete(
+        Self::complete(
+            bio,
             memory,
             IoResult {
                 completed: 0,
@@ -542,8 +600,8 @@ impl BioInner {
 
     /// 最后义务先锁外收原映射；非 slot 的 Task 完成独立排队，不阻塞批次生成者。
     fn complete(
-        self: &Arc<Self>,
-        mut memory: Vec<MappedPages>,
+        bio: &BioArc,
+        mut memory: BioMemory,
         result: IoResult,
         device_owned: bool,
         owner: Option<&DiskRef>,
@@ -556,9 +614,11 @@ impl BioInner {
                 unsafe { mapped.finish_device_access() };
             }
         }
-        if queue_task && self.needs_task() {
+        if queue_task && bio.needs_task() {
+            let ticket = BioRawTicket::from_arc(Arc::clone(bio));
+            let owned = ticket.pointer;
             {
-                let mut state = self.state.lock();
+                let mut state = bio.state.lock();
                 assert_eq!(state.phase, Phase::Finishing);
                 assert!(
                     state.memory.is_none()
@@ -569,9 +629,10 @@ impl BioInner {
                 state.result = Some(result);
                 // 所有 child 已结束并从槽移出，临时 owner 没有 Disk→本 Bio 的返回边。
                 state.completion_owner = owner.cloned();
+                assert!(state.finalizer_ticket.is_none());
+                state.finalizer_ticket = Some(ticket);
             }
-            let owned = Arc::into_raw(Arc::clone(self));
-            let work = self
+            let work = bio
                 .finalizer_work
                 .as_ref()
                 .expect("Task bio has no prepared finalizer");
@@ -584,13 +645,13 @@ impl BioInner {
             );
             return true;
         }
-        drop(self.finalize(memory, result));
+        drop(bio.finalize(memory, result));
         false
     }
 
     /// 唯一完成者锁外执行回调及 folio 收权，Release 发布父完成后移出 FS 占用。
     /// 返回的占用由 accepted 生成者或 part 保活至各自队列尾，最后 put 不在状态锁内。
-    fn finalize(&self, mut memory: Vec<MappedPages>, result: IoResult) -> Option<FsClaim> {
+    fn finalize(&self, mut memory: BioMemory, result: IoResult) -> Option<FsClaim> {
         match self.end_io {
             Some(EndIo::Inline(callback)) => callback(&result, &memory),
             Some(EndIo::Task(callback)) => {
@@ -630,18 +691,26 @@ impl BioInner {
 
 /// 消费队列化的真实 Bio 拥有，归还生成者/临时 Disk；Work 票尾部自动释放一次性执行预留。
 fn finalizer_callback(work: Pin<&Work>) {
-    // SAFETY: complete 在唯一最后义务移交同一 Arc::into_raw 强引用；Work 只能排一次，
-    // 该强拥有保 context 和 memory 至此 callback，原 Work 票另保自身至执行尾部。
-    let bio = unsafe { Arc::from_raw(work.context() as *const BioInner) };
-    let (memory, result, owner) = {
-        let mut state = bio.state.lock();
+    let pointer = work.context() as *const BioInner;
+    // SAFETY: complete 已把真实 raw strong 和原 allocator 整票放入本状态；
+    // 该 owning 票保地址至回调取走，Work 自身另有真实运行票。
+    let inner = unsafe { &*pointer };
+    let (ticket, memory, result, owner) = {
+        let mut state = inner.state.lock();
         assert_eq!(state.phase, Phase::Finishing);
+        let ticket = state
+            .finalizer_ticket
+            .take()
+            .expect("finalizer lost its raw ticket");
+        assert_eq!(ticket.pointer, pointer);
         (
+            ticket,
             state.memory.take().expect("finalizer memory missing"),
             state.result.take().expect("finalizer result missing"),
             state.completion_owner.take(),
         )
     };
+    let bio = ticket.into_arc();
     let claim = bio.finalize(memory, result);
     if let Some(owner) = owner {
         owner.finish_generation_tail(bio.operation());
@@ -658,7 +727,7 @@ impl BioState {
     }
 
     /// 消费一个已登记义务，只在最后归零时把唯一原页向锁外完成者移交。
-    fn end_obligation(&mut self, len: usize) -> Option<(Vec<MappedPages>, IoResult)> {
+    fn end_obligation(&mut self, len: usize) -> Option<(BioMemory, IoResult)> {
         assert!(0 < self.remaining, "bio obligation ended twice");
         self.remaining -= 1;
         if self.remaining != 0 {

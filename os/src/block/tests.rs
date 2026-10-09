@@ -1,5 +1,6 @@
 //! 只验证父完成账本的受控顺序，不冒充硬件反序 used 或磁盘 I/O。
 
+use super::bio::BioInner;
 use super::{Bio, Disk, DiskRef};
 
 /// 只读真实设备 used.idx，固定布局与同一控制区 owner 保活，不消费或合成元素。
@@ -33,7 +34,7 @@ pub(crate) fn generation_pair(disk: &DiskRef, first: Bio, second: Bio) {
     for active in [&first, &second] {
         let length = active.bio.len();
         active.bio.register_child(0, length);
-        active.bio.finish_child(0, length, length, None);
+        BioInner::finish_child(&active.bio, 0, length, length, None);
     }
     first.finish(None);
     second.finish(None);
@@ -46,6 +47,6 @@ pub(crate) fn generation_last(disk: &DiskRef, bio: Bio) {
         .unwrap_or_else(|(_, error)| panic!("controlled generation admission: {:?}", error));
     let length = active.bio.len();
     active.bio.register_child(0, length);
-    active.bio.finish_child(0, length, length, None);
+    BioInner::finish_child(&active.bio, 0, length, length, None);
     active.finish(None);
 }

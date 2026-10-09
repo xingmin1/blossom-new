@@ -17,7 +17,9 @@ use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Once;
 
-use crate::block::{AccessMode, BlockError, Disk, DiskRef, FsClaim, IoResult, SECTOR_BYTES};
+use crate::block::{
+    AccessMode, BlockError, Disk, DiskRef, FsClaim, IoResult, MetadataIoContext, SECTOR_BYTES,
+};
 use crate::cache::{BufferRef, MetadataCache};
 use crate::fs::background::WritebackDomain;
 use crate::fs::inode::{InodeDomain, InodeMetadata, InodeRef};
@@ -217,7 +219,7 @@ impl Ext4Volume {
             .checked_mul(SECTOR_BYTES)
             .ok_or(FsError::Corrupt)?;
         // 主超级块在 1024 字节处；读设备对齐的整页后仅解码其固定范围。
-        let superblock = metadata.get(0, PAGE_SIZE)?;
+        let superblock = metadata.get(0, PAGE_SIZE, None)?;
         let geometry = superblock
             .with_read(|data| codec::decode_super(codec::bytes(data, 1024, 1024)?, capacity))??;
         drop(superblock);
@@ -253,7 +255,7 @@ impl Ext4Volume {
             .try_reserve_exact(volume.geometry.groups_count as usize)
             .map_err(|_| FsError::NoMemory)?;
         for group in 0..volume.geometry.groups_count {
-            let (buffer, offset) = volume.group_buffer(group)?;
+            let (buffer, offset) = volume.group_buffer(group, None)?;
             let layout = buffer.with_read(|data| {
                 codec::group_layout(
                     &volume.geometry,
@@ -262,6 +264,9 @@ impl Ext4Volume {
                 )
             })??;
             volume.groups.push(layout);
+        }
+        if mode == AccessMode::ReadWrite {
+            metadata.prepare_reserve()?;
         }
         let volume = Arc::try_new(volume).map_err(|_| FsError::NoMemory)?;
         let writeback = WritebackDomain::try_new(&volume)?;
@@ -349,7 +354,11 @@ impl Ext4Volume {
     }
 
     /// 隐藏 EA 使用原活卷与 canonical 域取得，不创建第二个缓存或从裸地址构造 Arc。
-    pub(crate) fn iget_ea_inode(&self, number: u64) -> Result<InodeRef, FsError> {
+    pub(crate) fn iget_ea_inode(
+        &self,
+        number: u64,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<InodeRef, FsError> {
         let domain = self.inode_domain.lock().upgrade().ok_or(FsError::Busy)?;
         let filesystem = self
             .metadata
@@ -360,7 +369,7 @@ impl Ext4Volume {
         if !core::ptr::eq(filesystem.as_ref(), self) {
             return Err(FsError::InvalidOperation);
         }
-        domain.iget(&filesystem, number, None)
+        domain.iget(&filesystem, number, None, context)
     }
 
     /// 原 inode 位已临时取用但新记录尚未初始化，分配者须在 allocator 锁外等待旧 canonical 退场。
@@ -416,11 +425,17 @@ impl Ext4Volume {
     /// 普通任务读取一个已验证物理地址的元数据块，等待不跨内容借用。
     pub(crate) fn metadata_block(&self, physical: u64) -> Result<BufferRef, FsError> {
         self.geometry.validate_blocks(physical, 1)?;
-        Ok(self.metadata.get(physical, self.geometry.block_size)?)
+        Ok(self
+            .metadata
+            .get(physical, self.geometry.block_size, None)?)
     }
 
     /// 定位主描述符的共同窗口，取得内容之前不持任何元数据短锁。
-    fn group_buffer(&self, group: u64) -> Result<(BufferRef, usize), FsError> {
+    fn group_buffer(
+        &self,
+        group: u64,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<(BufferRef, usize), FsError> {
         let g = &self.geometry;
         if g.groups_count <= group {
             return Err(FsError::Corrupt);
@@ -428,7 +443,7 @@ impl Ext4Volume {
         let byte = group * g.descriptor_size as u64;
         let block = g.first_data_block + 1 + byte / g.block_size as u64;
         Ok((
-            self.metadata.get(block, g.block_size)?,
+            self.metadata.get(block, g.block_size, context)?,
             (byte % g.block_size as u64) as usize,
         ))
     }
@@ -442,7 +457,11 @@ impl Ext4Volume {
     }
 
     /// 定位并校验一个完整 inode，外部编号不能穿过组或设备边界。
-    pub fn load_inode(&self, number: u64) -> Result<InodeData, FsError> {
+    pub(crate) fn load_inode(
+        &self,
+        number: u64,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<InodeData, FsError> {
         let g = &self.geometry;
         if number == 0 || g.inodes_count < number {
             return Err(FsError::Corrupt);
@@ -453,7 +472,8 @@ impl Ext4Volume {
         let physical = table
             .checked_add(byte / g.block_size as u64)
             .ok_or(FsError::Corrupt)?;
-        let buffer = self.metadata_block(physical)?;
+        g.validate_blocks(physical, 1)?;
+        let buffer = self.metadata.get(physical, g.block_size, context)?;
         let inode = buffer.with_read(|data| {
             codec::decode_inode(
                 g,
@@ -468,12 +488,16 @@ impl Ext4Volume {
     }
 
     /// caller 保持 data-sem 读侧到真实查询结束，合法空洞与 EOF 不掩盖格式错误。
-    pub fn map_block(
+    pub(crate) fn map_block(
         &self,
         metadata: &InodeMetadata,
         root: &[u8; 60],
         logical: u64,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<BlockMapping, FsError> {
+        if let Some(context) = context {
+            context.check()?;
+        }
         let inode = metadata.with_block(root);
         if inode.fast_symlink || inode.kind == InodeKind::Other {
             return Err(FsError::Unsupported);
@@ -482,7 +506,7 @@ impl Ext4Volume {
         if end <= logical {
             return Ok(BlockMapping::Eof);
         }
-        mapping::map(self, &inode, logical, end)
+        mapping::map(self, &inode, logical, end, context)
     }
 
     /// caller 保持 invalidate 保护到真实 IO 全尾；块根仅准备 targets，不跨数据等待。
@@ -592,7 +616,7 @@ impl Ext4Volume {
             let mut offset = 0usize;
             while offset < len {
                 let logical = offset / self.geometry.block_size;
-                let physical = match self.map_block(inode, root, logical as u64)? {
+                let physical = match self.map_block(inode, root, logical as u64, None)? {
                     BlockMapping::Mapped { physical, .. } => physical,
                     _ => return Err(FsError::Corrupt),
                 };
@@ -623,15 +647,21 @@ impl Ext4Volume {
     }
 
     /// 在块树或目的内容发表前保留本 inode 的真实记录窗口。
-    pub(crate) fn inode_record(&self, number: u64) -> Result<(BufferRef, usize), FsError> {
+    pub(crate) fn inode_record(
+        &self,
+        number: u64,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<(BufferRef, usize), FsError> {
         let g = &self.geometry;
         if number == 0 || g.inodes_count < number {
             return Err(FsError::Corrupt);
         }
         let table = self.inode_table((number - 1) / g.inodes_per_group)?;
         let byte = ((number - 1) % g.inodes_per_group) * g.inode_size as u64;
+        let physical = table + byte / g.block_size as u64;
+        g.validate_blocks(physical, 1)?;
         Ok((
-            self.metadata_block(table + byte / g.block_size as u64)?,
+            self.metadata.get(physical, g.block_size, context)?,
             (byte % g.block_size as u64) as usize,
         ))
     }
@@ -893,7 +923,7 @@ impl Ext4Volume {
         if (i64::MAX as u64) < next.size {
             return Err(FsError::FileTooLarge);
         }
-        let (record, offset) = self.inode_record(old.number)?;
+        let (record, offset) = self.inode_record(old.number, None)?;
         let current = record.with_read(|bytes| {
             codec::decode_inode(
                 &self.geometry,
@@ -934,8 +964,9 @@ impl Ext4Volume {
         inode: &InodeMetadata,
         root: &[u8; 60],
         new_size: u64,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<mapping::PreparedTruncate, FsError> {
-        mapping::prepare_truncate(self, &inode.with_block(root), new_size)
+        mapping::prepare_truncate(self, &inode.with_block(root), new_size, context)
     }
 
     /// 先准备 inode-table 真实窗口，再在同一页锁内仅修改当前 inode 的字段和校验和。

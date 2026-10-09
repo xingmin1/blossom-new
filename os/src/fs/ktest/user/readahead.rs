@@ -1,13 +1,14 @@
 //! 同一 canonical inode 上的独立读历史、真实多原页 DMA、文件 fault 与截断等待。
 
 use crate::arch::UserAccess;
-use crate::block::{Bio, BlkOperation, IoResult, SECTOR_BYTES};
+use crate::block::{Bio, BioAllocator, BlkOperation, IoResult, SECTOR_BYTES};
 use crate::fs::ext4::BlockMapping;
 use crate::fs::ktest::user::write::WriteOwner;
 use crate::fs::ktest::*;
 use crate::fs::readahead::ReadaheadSnapshot;
 use crate::fs::SeekFrom;
 use crate::mm::dma::MappedPages;
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
@@ -235,7 +236,8 @@ pub(crate) mod reads {
         context.expect_eq(history(&random)?, empty);
 
         // 暖页只供故障者验证 cursor 不形成等待环，首页及其整个预读窗仍为空。
-        let fault_page = checked(context, first.file_page(63))?;
+        let mut fault_attempt = ReclaimAttempt::new();
+        let fault_page = checked(context, first.file_page(63, &mut fault_attempt))?;
         let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("readahead fault MM owner OOM"))?;
         vm(
@@ -450,7 +452,8 @@ pub(crate) mod reads {
             checked(context, first.seek(SeekFrom::Current(0)))?,
             2 * PAGE_SIZE as u64,
         );
-        let canonical = checked(context, random.file_page(30))?;
+        let mut canonical_attempt = ReclaimAttempt::new();
+        let canonical = checked(context, random.file_page(30, &mut canonical_attempt))?;
         context.expect_eq(
             mm.mapping(FAULT_ADDRESS + PAGE_SIZE)
                 .map(|leaf| leaf.physical),
@@ -472,8 +475,10 @@ pub(crate) mod reads {
             checked(context, random.seek(SeekFrom::Current(0)))?,
             53 * PAGE_SIZE as u64,
         );
-        let same_first = checked(context, first.file_page(40))?;
-        let same_random = checked(context, random.file_page(40))?;
+        let mut first_attempt = ReclaimAttempt::new();
+        let same_first = checked(context, first.file_page(40, &mut first_attempt))?;
+        let mut random_attempt = ReclaimAttempt::new();
+        let same_random = checked(context, random.file_page(40, &mut random_attempt))?;
         context.expect_eq(same_first.phys_addr(), same_random.phys_addr());
         finish_reads(&disk)?;
         context.diagnostic(format_args!(
@@ -505,7 +510,11 @@ pub(crate) mod reads {
             true,
         );
         context.expect_eq(checked(context, file.read_at(FILE_BYTES, &mut bytes))?, 0);
-        let tail = checked(context, file.file_page(FULL_PAGES as u64))?;
+        let mut tail_attempt = ReclaimAttempt::new();
+        let tail = checked(
+            context,
+            file.file_page(FULL_PAGES as u64, &mut tail_attempt),
+        )?;
         let mut page = [0xa7; PAGE_SIZE];
         checked(context, tail.copy_to(0, &mut page).map_err(FsError::Io))?;
         context.expect_eq(
@@ -649,24 +658,36 @@ pub(crate) mod reads {
                 "prefix regression requires one real two-page read slot",
             ));
         }
-        let mut memory = Vec::new();
+        let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(2)
             .map_err(|_| TestError("prefix DMA owner vector OOM"))?;
         let mut originals = [None, None];
+        let mut attempt = ReclaimAttempt::new();
+        let mut prepared = [const { None }; 2];
+        for (index, candidate) in prepared.iter_mut().enumerate() {
+            *candidate = Some(checked(
+                context,
+                inode
+                    .mapping()
+                    .prepare_file(&inode, first_page + index as u64, &mut attempt)
+                    .map_err(FsError::Io),
+            )?);
+        }
         let invalidate = checked(context, inode.lock_invalidate())?;
         for (index, original) in originals.iter_mut().enumerate() {
             let (folio, read) = checked(
                 context,
                 inode
                     .mapping()
-                    .get_or_prepare(first_page + index as u64)
+                    .publish_file(&inode, first_page + index as u64, &mut prepared[index])
                     .map_err(FsError::Io),
-            )?;
-            let read = read
-                .ok_or(TestError("prefix regression file page was not cold"))?
-                .with_file_owner(inode.clone());
-            *original = Some(folio.with_file_owner(inode.clone()));
+            )?
+            .ok_or(TestError(
+                "prefix file candidate retired before publication",
+            ))?;
+            let read = read.ok_or(TestError("prefix regression file page was not cold"))?;
+            *original = Some(folio);
             let mapped = MappedPages::from_folio(read).map_err(|(error, _read)| {
                 context.diagnostic(format_args!(
                     "prefix original-page DMA preparation error={:?}",
@@ -695,6 +716,7 @@ pub(crate) mod reads {
         disk.test_fail_next_file_read_after(PAGE_SIZE, BlockError::Io);
         inode.filesystem().claim().submit_bio(bio);
         drop(invalidate);
+        drop(prepared);
         let result = completion.wait();
         completion.test_flush_finalizer();
         finish_reads(&disk)?;

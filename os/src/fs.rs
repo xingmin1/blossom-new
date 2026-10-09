@@ -25,7 +25,7 @@ pub use file::{
 pub use file::{ReadBuffer, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
 pub(crate) use inode::{
-    initialize_inode_eviction, DirectoryWriteGuard, InodeCacheWatch, PreparedMkwrite,
+    initialize_inode_eviction, DirectoryWriteGuard, InodeCacheWatch, InodeWeak, PreparedMkwrite,
 };
 pub use inode::{ExecAccess, InodeCache, InodeMetadata, InodeRef, WriteAccess};
 pub use path::{FsContext, LastComponent, LookupParent, Path, ResolveMode, Vfs};

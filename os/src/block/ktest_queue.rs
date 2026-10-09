@@ -6,10 +6,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use virtio_drivers::{BufferDirection, MappedSegment};
 
+use super::bio::BioInner;
 use super::disk::{QueuePhase, SlotState};
 use super::{
-    AccessMode, Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim,
-    IoResult,
+    AccessMode, Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo,
+    FsClaim, IoResult,
 };
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
@@ -196,7 +197,7 @@ impl Request {
         end_io: Option<EndIo>,
     ) -> Result<Self, TestError> {
         let count = (bytes + first_offset).div_ceil(mm::PAGE_SIZE);
-        let mut memory = Vec::new();
+        let mut memory = Vec::new_in(BioAllocator::Heap);
         let mut originals = Vec::new();
         memory
             .try_reserve_exact(count)
@@ -1455,16 +1456,15 @@ impl Owner {
                 for index in 0..3 {
                     bio.inner.register_child(index * unit, unit);
                 }
-                bio.inner.finish_child(2 * unit, unit, unit, None);
-                bio.inner.finish_child(0, unit, unit, None);
-                bio.inner.finish_generation(None, None);
+                BioInner::finish_child(&bio.inner, 2 * unit, unit, unit, None);
+                BioInner::finish_child(&bio.inner, 0, unit, unit, None);
+                BioInner::finish_generation(&bio.inner, None, None);
                 context.expect_eq(self.requests[index].completion.is_complete(), false);
                 context.expect_eq(
                     self.requests[index].completion.take_memory().err(),
                     Some(BlockError::Busy),
                 );
-                bio.inner
-                    .finish_child(unit, unit, unit / 4, Some(BlockError::Io));
+                BioInner::finish_child(&bio.inner, unit, unit, unit / 4, Some(BlockError::Io));
                 IoResult {
                     completed: unit + unit / 4,
                     error: Some(BlockError::Io),
@@ -1474,18 +1474,22 @@ impl Owner {
                 for offset in [0, unit, 2 * unit] {
                     bio.inner.register_child(offset, unit);
                 }
-                bio.inner
-                    .finish_child(2 * unit, unit, unit / 2, Some(BlockError::ShortIo));
-                bio.inner
-                    .finish_child(unit, unit, unit / 4, Some(BlockError::Io));
+                BioInner::finish_child(
+                    &bio.inner,
+                    2 * unit,
+                    unit,
+                    unit / 2,
+                    Some(BlockError::ShortIo),
+                );
+                BioInner::finish_child(&bio.inner, unit, unit, unit / 4, Some(BlockError::Io));
                 context.expect_eq(self.requests[index].completion.is_complete(), false);
-                bio.inner.finish_generation(None, None);
+                BioInner::finish_generation(&bio.inner, None, None);
                 context.expect_eq(self.requests[index].completion.is_complete(), false);
                 context.expect_eq(
                     self.requests[index].completion.take_memory().err(),
                     Some(BlockError::Busy),
                 );
-                bio.inner.finish_child(0, unit, unit, None);
+                BioInner::finish_child(&bio.inner, 0, unit, unit, None);
                 IoResult {
                     completed: unit + unit / 4,
                     error: Some(BlockError::Io),
@@ -1493,14 +1497,13 @@ impl Owner {
             }
             Ledger::GenerationFailure => {
                 bio.inner.register_child(0, unit);
-                bio.inner
-                    .finish_generation(Some((unit, BlockError::NoMemory)), None);
+                BioInner::finish_generation(&bio.inner, Some((unit, BlockError::NoMemory)), None);
                 context.expect_eq(self.requests[index].completion.is_complete(), false);
                 context.expect_eq(
                     self.requests[index].completion.take_memory().err(),
                     Some(BlockError::Busy),
                 );
-                bio.inner.finish_child(0, unit, unit, None);
+                BioInner::finish_child(&bio.inner, 0, unit, unit, None);
                 IoResult {
                     completed: unit,
                     error: Some(BlockError::NoMemory),
@@ -1508,13 +1511,13 @@ impl Owner {
             }
             Ledger::Synchronous => {
                 bio.inner.register_child(0, unit);
-                bio.inner.finish_child(0, unit, unit, None);
+                BioInner::finish_child(&bio.inner, 0, unit, unit, None);
                 context.expect_eq(self.requests[index].completion.is_complete(), false);
                 context.expect_eq(
                     self.requests[index].completion.take_memory().err(),
                     Some(BlockError::Busy),
                 );
-                bio.inner.finish_generation(None, None);
+                BioInner::finish_generation(&bio.inner, None, None);
                 IoResult {
                     completed: unit,
                     error: None,
@@ -1538,7 +1541,7 @@ impl Owner {
         self.wb_folios
             .try_reserve_exact(3)
             .map_err(|_| TestError("WB ledger folio owners OOM"))?;
-        let mut memory = Vec::new();
+        let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(3)
             .map_err(|_| TestError("WB ledger mapped owners OOM"))?;
@@ -1594,7 +1597,7 @@ impl Owner {
                 parent.accept_child(index * unit, unit);
             }
             if mode == Ledger::WbInline {
-                parent.finish_child(index * unit, unit, unit, None);
+                BioInner::finish_child(&parent, index * unit, unit, unit, None);
                 context.expect_eq(completion.is_complete(), false);
                 context.expect_eq(completion.take_memory().err(), Some(BlockError::Busy));
                 context.expect_eq(
@@ -1613,31 +1616,35 @@ impl Owner {
         context.expect_eq(completion.test_acceptance(), (3, 3 * unit, accepted));
         let expected = match mode {
             Ledger::WbInline => {
-                parent.finish_generation(None, None);
+                BioInner::finish_generation(&parent, None, None);
                 IoResult {
                     completed: 3 * unit,
                     error: None,
                 }
             }
             Ledger::WbReverse => {
-                parent.finish_child(2 * unit, unit, 0, Some(BlockError::Io));
-                parent.finish_child(unit, unit, unit, None);
-                parent.finish_generation(None, None);
+                BioInner::finish_child(&parent, 2 * unit, unit, 0, Some(BlockError::Io));
+                BioInner::finish_child(&parent, unit, unit, unit, None);
+                BioInner::finish_generation(&parent, None, None);
                 context.expect_eq(completion.is_complete(), false);
                 context.expect_eq(self.wb_folios[0].writeback_sectors() != 0, true);
-                parent.finish_child(0, unit, unit, None);
+                BioInner::finish_child(&parent, 0, unit, unit, None);
                 IoResult {
                     completed: 2 * unit,
                     error: Some(BlockError::Io),
                 }
             }
             Ledger::WbRejectedTail => {
-                parent.finish_child(2 * unit, unit, 0, Some(BlockError::QueueStopped));
-                parent.finish_generation(Some((2 * unit, BlockError::QueueStopped)), None);
-                parent.finish_child(unit, unit, unit, None);
+                BioInner::finish_child(&parent, 2 * unit, unit, 0, Some(BlockError::QueueStopped));
+                BioInner::finish_generation(
+                    &parent,
+                    Some((2 * unit, BlockError::QueueStopped)),
+                    None,
+                );
+                BioInner::finish_child(&parent, unit, unit, unit, None);
                 context.expect_eq(completion.is_complete(), false);
                 context.expect_eq(self.wb_folios[2].writeback_sectors() != 0, true);
-                parent.finish_child(0, unit, unit, None);
+                BioInner::finish_child(&parent, 0, unit, unit, None);
                 IoResult {
                     completed: 2 * unit,
                     error: Some(BlockError::QueueStopped),
@@ -1688,7 +1695,7 @@ impl Owner {
             if folio.dirty_sectors() == 0 {
                 continue;
             }
-            let mut memory = Vec::new();
+            let mut memory = Vec::new_in(BioAllocator::Heap);
             memory
                 .try_reserve_exact(1)
                 .map_err(|_| TestError("WB scratch sync mapping OOM"))?;
@@ -1798,7 +1805,7 @@ impl Owner {
             if self.requests[index].pending.is_some() {
                 // 没有运行 producer 仍能触碰此 Bio；先清其未发表拥有，再由其原账本 reject 唤醒 peer。
                 let bio = self.requests[index].pending.take().unwrap();
-                bio.inner.reject(BlockError::QueueStopped);
+                BioInner::reject(&bio.inner, BlockError::QueueStopped);
             }
         }
         self.drained()?;

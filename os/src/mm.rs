@@ -9,6 +9,7 @@ mod heap_allocator;
 pub(crate) mod ktest;
 mod page;
 mod pcp;
+pub(crate) mod reclaim;
 mod slub;
 pub(crate) mod space;
 pub(crate) mod uaccess;

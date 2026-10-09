@@ -1,5 +1,6 @@
 //! 卷内分配序列保护共同位图与计数；本次未发表资源由显式释放归还。
 
+use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, GroupState};
 use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeKind, InodeMetadata};
@@ -158,7 +159,7 @@ impl Ext4Volume {
             self.release_reservation(&mut reservation);
             return Err(error);
         }
-        let result = self.inode_record(number);
+        let result = self.inode_record(number, None);
         let (buffer, offset) = match result {
             Ok(record) => record,
             Err(error) => {
@@ -254,21 +255,29 @@ impl Ext4Volume {
     }
 
     /// 节点合并或截断在发表之前保留真实节点和释放窗口，尚不改变位图或空闲计数。
-    pub(crate) fn prepare_detached_block(&self, physical: u64) -> Result<DetachedBlock, FsError> {
-        let node = self.metadata_block(physical)?;
-        self.prepare_block_release(physical, Some(node))
+    pub(crate) fn prepare_detached_block(
+        &self,
+        physical: u64,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<DetachedBlock, FsError> {
+        self.geometry.validate_blocks(physical, 1)?;
+        let node = self
+            .metadata
+            .get(physical, self.geometry.block_size, context)?;
+        self.prepare_block_release(physical, Some(node), context)
     }
 
     /// 数据删除只查当前物理元数据别名，缺失时不申请缓存页或读入旧文件数据。
     pub(crate) fn prepare_detached_data_block(
         &self,
         physical: u64,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<DetachedBlock, FsError> {
         self.geometry.validate_blocks(physical, 1)?;
         let alias = self
             .metadata
             .cached_buffer(physical, self.geometry.block_size)?;
-        self.prepare_block_release(physical, alias)
+        self.prepare_block_release(physical, alias, context)
     }
 
     /// 具体物理块保留同卷的位图、描述符和超级块视图，原块仍由旧树拥有。
@@ -276,13 +285,14 @@ impl Ext4Volume {
         &self,
         physical: u64,
         alias: Option<BufferRef>,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<DetachedBlock, FsError> {
         self.geometry.validate_blocks(physical, 1)?;
         let group = (physical - self.geometry.first_data_block) / self.geometry.blocks_per_group;
         let bit =
             ((physical - self.geometry.first_data_block) % self.geometry.blocks_per_group) as usize;
         Ok(DetachedBlock {
-            reservation: self.prepare_release_reservation(group, bit, false, false)?,
+            reservation: self.prepare_release_reservation(group, bit, false, false, context)?,
             alias,
         })
     }
@@ -311,13 +321,14 @@ impl Ext4Volume {
     pub(crate) fn prepare_inode_release(
         &self,
         inode: &InodeData,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<PreparedInodeRelease, FsError> {
         self.require_write(&self.claim)?;
         let g = &self.geometry;
         if inode.number < g.first_inode || g.inodes_count < inode.number || inode.links != 0 {
             return Err(FsError::InvalidOperation);
         }
-        let (record, offset) = self.inode_record(inode.number)?;
+        let (record, offset) = self.inode_record(inode.number, context)?;
         let mut numbers = [0u64; 256];
         let count = record.with_read(|bytes| {
             let bytes = &bytes[offset..offset + g.inode_size];
@@ -332,15 +343,20 @@ impl Ext4Volume {
             codec::inline_ea_inodes(g, bytes, inode.extra_isize, &mut numbers)
         })??;
         let mut ea = Vec::new();
-        self.prepare_ea_references(inode.number, &numbers[..count], &mut ea)?;
+        self.prepare_ea_references(inode.number, &numbers[..count], &mut ea, context)?;
         let group = (inode.number - 1) / g.inodes_per_group;
         let bit = ((inode.number - 1) % g.inodes_per_group) as usize;
-        let reservation =
-            self.prepare_release_reservation(group, bit, true, inode.kind == InodeKind::Directory)?;
+        let reservation = self.prepare_release_reservation(
+            group,
+            bit,
+            true,
+            inode.kind == InodeKind::Directory,
+            context,
+        )?;
         let acl = if inode.file_acl == 0 {
             None
         } else {
-            let block = self.prepare_detached_block(inode.file_acl)?;
+            let block = self.prepare_detached_block(inode.file_acl, context)?;
             let (references, count) = block
                 .alias
                 .as_ref()
@@ -351,7 +367,7 @@ impl Ext4Volume {
                     Ok::<_, FsError>((codec::le32(bytes, 4)?, count))
                 })??;
             if references == 1 {
-                self.prepare_ea_references(inode.number, &numbers[..count], &mut ea)?;
+                self.prepare_ea_references(inode.number, &numbers[..count], &mut ea, context)?;
             }
             Some((inode.file_acl, block))
         };
@@ -377,6 +393,7 @@ impl Ext4Volume {
         parent: u64,
         numbers: &[u64],
         puts: &mut Vec<PreparedEaRelease>,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<(), FsError> {
         for &number in numbers {
             if number == parent {
@@ -387,7 +404,7 @@ impl Ext4Volume {
                 continue;
             }
             puts.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-            let (record, offset) = self.inode_record(number)?;
+            let (record, offset) = self.inode_record(number, context)?;
             let references = record.with_read(|bytes| {
                 let bytes = &bytes[offset..offset + self.geometry.inode_size];
                 let data = codec::decode_inode(&self.geometry, number, bytes)?;
@@ -403,7 +420,7 @@ impl Ext4Volume {
                 }
                 Ok(references)
             })??;
-            let inode = self.iget_ea_inode(number)?;
+            let inode = self.iget_ea_inode(number, context)?;
             puts.push(PreparedEaRelease {
                 inode,
                 record,
@@ -478,16 +495,21 @@ impl Ext4Volume {
         bit: usize,
         inode: bool,
         directory: bool,
+        context: Option<MetadataIoContext<'_>>,
     ) -> Result<Reservation, FsError> {
         self.require_write(&self.claim)?;
-        let (descriptor, offset) = self.group_buffer(group)?;
+        let (descriptor, offset) = self.group_buffer(group, context)?;
         let layout = self.groups[group as usize];
-        let bitmap = self.metadata_block(if inode {
+        let physical = if inode {
             layout.inode_bitmap
         } else {
             layout.block_bitmap
-        })?;
-        let superblock = self.metadata.get(0, 4096)?;
+        };
+        self.geometry.validate_blocks(physical, 1)?;
+        let bitmap = self
+            .metadata
+            .get(physical, self.geometry.block_size, context)?;
+        let superblock = self.metadata.get(0, 4096, context)?;
         Ok(Reservation {
             volume: self.device,
             group,
@@ -508,7 +530,7 @@ impl Ext4Volume {
         // ponytail: 卷分配睡眠锁串行化计数，真实分配竞争成为瓶颈时拆每组锁。
         let _allocation = self.allocation.lock();
         let g = &self.geometry;
-        let superblock = self.metadata.get(0, 4096)?;
+        let superblock = self.metadata.get(0, 4096, None)?;
         let available = superblock.with_read(|bytes| -> Result<u64, FsError> {
             let record = &bytes[1024..2048];
             if inode {
@@ -526,7 +548,7 @@ impl Ext4Volume {
         }
         for step in 0..g.groups_count {
             let group = (hint % g.groups_count + step) % g.groups_count;
-            let (descriptor, offset) = self.group_buffer(group)?;
+            let (descriptor, offset) = self.group_buffer(group, None)?;
             let mut state = descriptor.with_read(|bytes| {
                 let record = codec::bytes(bytes, offset, g.descriptor_size)?;
                 codec::decode_group(g, group, record)?;

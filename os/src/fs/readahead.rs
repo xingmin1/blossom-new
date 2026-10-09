@@ -3,8 +3,10 @@
 use alloc::vec::Vec;
 use core::ops::Range;
 
+use crate::cache::PreparedFile;
 use crate::fs::ext4::finish_error;
 use crate::fs::{writeback, FsError, InodeRef};
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::{FolioRead, PAGE_SIZE};
 use crate::sync::SpinLock;
 
@@ -145,6 +147,7 @@ pub(crate) fn prepare(
     state: &SpinLock<ReadaheadState>,
     position: u64,
     requested: usize,
+    attempt: &mut ReclaimAttempt,
 ) -> Result<(), FsError> {
     if requested == 0 {
         return Ok(());
@@ -162,13 +165,12 @@ pub(crate) fn prepare(
     let Some(mut window) = window else {
         return Ok(());
     };
-    let _invalidate = inode.lock_invalidate()?;
     let size = inode.metadata_snapshot()?.size;
     window.end = window.end.min(size.div_ceil(PAGE_SIZE as u64));
     if window.end <= window.start {
         return Ok(());
     }
-    submit_window(inode, window, index)
+    submit_window(inode, window, index, attempt)
 }
 
 /// 真实交付后记录末位置；用户故障的正前缀同样推进，零交付调用者不进入本接口。
@@ -176,8 +178,13 @@ pub(crate) fn note_read(state: &SpinLock<ReadaheadState>, actual_end: u64) {
     state.lock().prev_pos = actual_end;
 }
 
-/// 同一 invalidate 读侧下认领原页；准备拒尾仍先提交前缀，需求页再观察自身真实完成。
-fn submit_window(inode: &InodeRef, window: Range<u64>, demand: u64) -> Result<(), FsError> {
+/// 页、Node 和 IO 片段先在 invalidate 外 fallible 准备；拒尾仍提交真实前缀，输家锁外结束。
+fn submit_window(
+    inode: &InodeRef,
+    mut window: Range<u64>,
+    demand: u64,
+    attempt: &mut ReclaimAttempt,
+) -> Result<(), FsError> {
     let volume = inode.filesystem();
     let mut ranges: Vec<(u64, FolioRead)> = Vec::new();
     if ranges
@@ -190,48 +197,73 @@ fn submit_window(inode: &InodeRef, window: Range<u64>, demand: u64) -> Result<()
             Ok(())
         };
     }
+    let mut candidates: [Option<PreparedFile>; RA_PAGES] = [const { None }; RA_PAGES];
     let mut demand_error = None;
-    for index in window {
-        let prepared = inode.mapping().get_or_prepare(index);
-        let read = match prepared {
-            Ok((_, None)) => continue,
-            Ok((_, Some(read))) => read.with_file_owner(inode.clone()),
+    for (slot, index) in window.clone().enumerate() {
+        match inode.mapping().prepare_file(inode, index, attempt) {
+            Ok(prepared) => candidates[slot] = Some(prepared),
             Err(error) => {
                 if index == demand {
                     demand_error = Some(error.into());
                 }
+                window.end = index;
                 break;
             }
-        };
-        let (size, targets) = match writeback::prepare_file_targets(inode, index, &(0..u64::MAX)) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let error = finish_error(read, error);
+        }
+    }
+    let result = (|| {
+        let _invalidate = inode.lock_invalidate()?;
+        window.end = window
+            .end
+            .min(inode.metadata_snapshot()?.size.div_ceil(PAGE_SIZE as u64));
+        for (slot, index) in window.clone().enumerate() {
+            let read = match inode
+                .mapping()
+                .publish_file(inode, index, &mut candidates[slot])
+            {
+                Ok(Some((_, None))) => continue,
+                Ok(Some((_, Some(read)))) => read,
+                Ok(None) => break,
+                Err(error) => {
+                    if index == demand {
+                        demand_error = Some(error.into());
+                    }
+                    break;
+                }
+            };
+            let (size, targets) =
+                match writeback::prepare_file_targets(inode, index, &(0..u64::MAX), None) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let error = finish_error(read, error);
+                        if index == demand {
+                            demand_error = Some(error);
+                        }
+                        break;
+                    }
+                };
+            if let Some(byte) = contiguous_page(index, size, volume.geometry().block_size, &targets)
+            {
+                ranges.push((byte, read));
+                continue;
+            }
+            if let Err(error) = volume.claim().read_folio_batch(&mut ranges) {
+                finish_error(read, error.into());
+                break;
+            }
+            if let Err(error) = volume.fill_page(index, size, &targets, read) {
                 if index == demand {
                     demand_error = Some(error);
                 }
                 break;
             }
-        };
-        if let Some(byte) = contiguous_page(index, size, volume.geometry().block_size, &targets) {
-            ranges.push((byte, read));
-            continue;
         }
-        if let Err(error) = volume.claim().read_folio_batch(&mut ranges) {
-            finish_error(read, error.into());
-            break;
-        }
-        if let Err(error) = volume.fill_page(index, size, &targets, read) {
-            if index == demand {
-                demand_error = Some(error);
-            }
-            break;
-        }
-    }
-    // 批次准备失败已给未提交原页发布具体错误；已接受前缀仍由原 read_page 等待自己的结果。
-    // 后继预取错误不能替换当前需求页的成功，也不能通过同步重读覆盖失败页。
-    let _ = volume.claim().read_folio_batch(&mut ranges);
-    demand_error.map_or(Ok(()), Err)
+        // 后继预取失败不能覆盖需求页实际成功，也不能同步重读已经失败的原页。
+        let _ = volume.claim().read_folio_batch(&mut ranges);
+        demand_error.map_or(Ok(()), Err)
+    })();
+    drop(candidates);
+    result
 }
 
 /// 只有 EOF 内整页且每个 FS 块都物理连续时才合并，孔、未写块、碎片和尾页保原填充语义。

@@ -7,6 +7,7 @@ use core::pin::Pin;
 
 use crate::arch;
 use crate::mm::page::PageDesc;
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::VmError;
 use crate::mm::{alloc_pages, pages, OwnedPages, PAGE_SIZE};
 use crate::sync::SpinLock;
@@ -29,6 +30,14 @@ impl AnonPageRef {
         let backing = alloc_pages(0, true)?;
         // SAFETY: 生产入口返回独占 order0 原页并清零完整页，清零访问已结束；
         // 尚无映射、设备或内容借用，原拥有者唯一持有归还权。
+        Some(unsafe { Self::from_owned(backing) })
+    }
+
+    /// 明确 fault 目标沿同一物理页入口慢路准备，仍在全部内容和映射锁外清零。
+    pub(crate) fn try_new_reclaim(attempt: &mut ReclaimAttempt) -> Option<Self> {
+        let backing = attempt.allocate_pages(0, true)?;
+        // SAFETY: 同一生产页入口返回完整清零的独占 order0 页，尚无映射或设备，
+        // 清零已经结束；慢路不会改变原拥有者及用途发表的协议。
         Some(unsafe { Self::from_owned(backing) })
     }
 
@@ -158,12 +167,16 @@ impl SharedAnon {
         .map_err(|_| VmError::NoMemory)
     }
 
-    /// 锁外准备零页和节点，锁内重查并仅移入拥有；失败候选和竞争输家均锁外释放。
-    pub(crate) fn page(&self, index: u64) -> Result<AnonPageRef, VmError> {
+    /// fault 在锁外准备共享原页及节点，与本请求目录页共用有限回收预算。
+    pub(crate) fn page(
+        &self,
+        index: u64,
+        attempt: &mut ReclaimAttempt,
+    ) -> Result<AnonPageRef, VmError> {
         if let Some(page) = self.pages.lock().find(index).cloned() {
             return Ok(page);
         }
-        let candidate = AnonPageRef::try_new()
+        let candidate = AnonPageRef::try_new_reclaim(attempt)
             .ok_or(VmError::NoMemory)
             .and_then(|page| {
                 Box::try_new(SharedPage {

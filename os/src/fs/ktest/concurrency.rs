@@ -188,11 +188,10 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
         fixture.disk()?.test_snapshot().inflight,
         if same { 1 } else { 2 },
     );
-    let (first_folio, first_read) = inode
+    let first_folio = inode
         .mapping()
-        .get_or_prepare(0)
-        .map_err(|_| TestError("inflight mapping disappeared"))?;
-    context.expect_eq(first_read.is_none(), true);
+        .cached_folio(0)
+        .ok_or(TestError("inflight mapping disappeared"))?;
     context.expect_eq(first_folio.is_ready(), false);
     context.expect_eq(first_folio.range_ready(0, 4096), Err(BlockError::NotReady));
     let address = first_folio.phys_addr();
@@ -205,11 +204,10 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
         pages_loaded * mm::PAGE_SIZE / volume.geometry().block_size,
     );
     pages(context, fixture, count, same)?;
-    let (ready, read) = inode
+    let ready = inode
         .mapping()
-        .get_or_prepare(0)
-        .map_err(|_| TestError("completed mapping disappeared"))?;
-    context.expect_eq(read.is_none(), true);
+        .cached_folio(0)
+        .ok_or(TestError("completed mapping disappeared"))?;
     context.expect_eq(ready.phys_addr(), address);
     let mut data = [0xa7; mm::PAGE_SIZE];
     checked(context, ready.copy_to(0, &mut data).map_err(FsError::from))?;
@@ -241,11 +239,10 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
     until("format error unique page loader did not pause", || {
         fixture.observer().loader_entered.load(Ordering::Acquire) == 1
     })?;
-    let (folio, read) = inode
+    let folio = inode
         .mapping()
-        .get_or_prepare(page)
-        .map_err(|_| TestError("error page owner preparation failed"))?;
-    context.expect_eq(read.is_none(), true);
+        .cached_folio(page)
+        .ok_or(TestError("error page owner disappeared"))?;
     for index in 1..3 {
         fixture.publish(
             index,
@@ -349,17 +346,15 @@ pub(crate) mod file_loading {
         until("segment did not return original read from real IO", || {
             fixture.observer().loader_entered.load(Ordering::Acquire) == 1
         })?;
-        let (folio, read) = inode
+        let folio = inode
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("segmented page preparation failed"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("segmented page disappeared"))?;
         let address = folio.phys_addr();
-        let (same, read) = inode
+        let same = inode
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("segmented original page disappeared"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("segmented original page disappeared"))?;
         context.expect_eq(same.phys_addr(), address);
         context.expect_eq(folio.is_ready(), false);
         context.expect_eq(folio.range_ready(0, 4096), Err(BlockError::NotReady));

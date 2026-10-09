@@ -2,6 +2,7 @@
 
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::*;
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
@@ -338,14 +339,24 @@ impl UserOwner {
                 .resolve(self.path.context(), b"/test/data.bin", ResolveMode::Follow),
         )?;
         let inode = checked(context, path.inode())?.clone();
+        let mut attempt = ReclaimAttempt::new();
+        let mut prepared = Some(checked(
+            context,
+            inode
+                .mapping()
+                .prepare_file(&inode, 0, &mut attempt)
+                .map_err(FsError::Io),
+        )?);
         let invalidate = checked(context, inode.lock_invalidate())?;
         let (folio, read) = checked(
             context,
-            inode.mapping().get_or_prepare(0).map_err(FsError::Io),
-        )?;
-        let read = read
-            .ok_or(TestError("fresh canonical file page already filled"))?
-            .with_file_owner(inode.clone());
+            inode
+                .mapping()
+                .publish_file(&inode, 0, &mut prepared)
+                .map_err(FsError::Io),
+        )?
+        .ok_or(TestError("fresh file candidate retired before publication"))?;
+        let read = read.ok_or(TestError("fresh canonical file page already filled"))?;
         self.warm_signal_program(context)?;
         let image = self.load_named(context, b"/test/bin/user-signal", b"r")?;
         #[cfg(target_arch = "riscv64")]
@@ -388,6 +399,7 @@ impl UserOwner {
         checked(context, fill_file_page(&inode, 0, read, &invalidate))?;
         checked(context, folio.wait_ready().map_err(FsError::Io))?;
         drop(invalidate);
+        drop(prepared);
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         self.reap_children(context, false)?;

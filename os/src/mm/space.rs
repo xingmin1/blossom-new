@@ -12,6 +12,7 @@ use crate::cache::FileRangeData;
 use crate::cpu;
 use crate::fs::{ExecAccess, FileRef, FsError, InodeKind, InodeRef};
 use crate::mm::anon::SharedAnon;
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::user_table::{
     Mapping, PagePermissions, PageTableError, PreparedTables, RetiredTables, UserPageTable,
 };
@@ -312,6 +313,53 @@ impl PteDomain {
             retired_tables.append(tables);
         }
         unmapped
+    }
+
+    /// 只撤当前文件页的同来源同 PFN 叶，私有匿名 COW 和其他文件页均保持。
+    ///
+    /// # Safety
+    /// 调用者须保活 source/folio 并持原文件范围锁；退休链在全部短锁外完成
+    /// 所有 CPU 的真实 CSD 后才析构，不能把页表摘离当作硬件已收权。
+    pub(crate) unsafe fn unmap_file_folio(
+        &self,
+        source: &Arc<FileRangeData>,
+        offset: u64,
+        physical: usize,
+        retired_pages: &mut ResidentPages,
+        retired_tables: &mut RetiredTables,
+    ) -> usize {
+        let Some(relative) = offset.checked_sub(source.offset) else {
+            return 0;
+        };
+        if (source.range.end - source.range.start) as u64 <= relative {
+            return 0;
+        }
+        let address = source.range.start + relative as usize;
+        let mut state = self.lock();
+        let Some(page) = state.pages.find(address) else {
+            return 0;
+        };
+        if page.source.as_ptr() != Arc::as_ptr(source)
+            || !matches!(&page.backing, ResidentBacking::File(_))
+            || page.backing.physical() != physical
+            || state
+                .table
+                .lookup(address)
+                .is_some_and(|leaf| leaf.physical != physical)
+        {
+            return 0;
+        }
+        // SAFETY: 同一 PTE 锁核当前来源/File backing/PFN，原 resident 和退休链保页，
+        // 父表摘离只转移原拥有，调用者承诺退出所有短锁后 CSD 再结束退休拥有。
+        let (old, tables) = unsafe { state.table.unmap(address) };
+        retired_pages.push(
+            state
+                .pages
+                .remove(address)
+                .expect("file resident disappeared under PTE lock"),
+        );
+        retired_tables.append(tables);
+        usize::from(old.is_some())
     }
 }
 
@@ -917,17 +965,18 @@ impl Mm {
     /// 按当前 VMA 与实际叶权限处理缺页、COW 或文件写准备，睡眠与复制均在映射锁外。
     pub fn fault(&self, address: usize, access: UserAccess) -> Result<(), VmError> {
         let base = address & !(PAGE_SIZE - 1);
+        let mut attempt = ReclaimAttempt::new();
         loop {
             let Some(source) = self.fault_source(address, access)? else {
                 return Ok(());
             };
             if access == UserAccess::Write && source.vma.is_shared_file() {
-                if self.mkwrite(&source, address)? {
+                if self.mkwrite(&source, address, &mut attempt)? {
                     return Ok(());
                 }
                 continue;
             }
-            let preparation = prepare_fault(&source, base, access);
+            let preparation = prepare_fault(&source, base, access, &mut attempt);
             let mmap = self.mmap.write();
             let current = mmap.find(address).ok_or(VmError::Unmapped)?;
             if !current.allows(access) {
@@ -1063,6 +1112,9 @@ impl Mm {
                 old
             };
             sync_all();
+            if let Some(folio) = &file {
+                folio.mark_accessed();
+            }
             drop(content);
             drop(mmap);
             drop(old);
@@ -1073,7 +1125,12 @@ impl Mm {
 
     /// 文件写准备退出所有 FS guard 后重新检查范围；最终遵守 mmap→invalidate→folio→PTE。
     /// coherent 原页允许在已有 WB 时再次标脏授 W；来源变化返回 false，仍重核真实准备事实。
-    fn mkwrite(&self, source: &FaultSource, address: usize) -> Result<bool, VmError> {
+    fn mkwrite(
+        &self,
+        source: &FaultSource,
+        address: usize,
+        attempt: &mut ReclaimAttempt,
+    ) -> Result<bool, VmError> {
         let base = address & !(PAGE_SIZE - 1);
         let data = source
             .vma
@@ -1090,7 +1147,10 @@ impl Mm {
             if data.inode.metadata_snapshot().map_err(VmError::File)?.size <= offset {
                 return Err(VmError::BeyondEof);
             }
-            let prepared = data.inode.prepare_mkwrite(index).map_err(VmError::File)?;
+            let prepared = data
+                .inode
+                .prepare_mkwrite(index, attempt)
+                .map_err(VmError::File)?;
             #[cfg(feature = "ktest")]
             {
                 let hook = self.mkwrite_hook.lock().clone();
@@ -1109,7 +1169,7 @@ impl Mm {
             } else {
                 None
             };
-            let tables = PreparedTables::try_new(source.needed)?;
+            let tables = PreparedTables::try_new_reclaim(source.needed, attempt)?;
             Ok((prepared, page, tables))
         })();
         let mmap = self.mmap.write();
@@ -1187,6 +1247,7 @@ impl Mm {
             #[cfg(feature = "ktest")]
             self.mkwrites.fetch_add(1, Ordering::Relaxed);
         }
+        prepared.folio().mark_accessed();
         drop(content);
         drop(invalidate);
         drop(mmap);
@@ -1251,6 +1312,9 @@ impl Mm {
                     && vma::allows(mapping.permissions, access)
                     && !(page.cow && access == UserAccess::Write)
             }) {
+                if let ResidentBacking::File(folio) = &page.backing {
+                    folio.mark_accessed();
+                }
                 return Ok(None);
             }
         } else {
@@ -1297,6 +1361,9 @@ impl Mm {
         }
         let direct = arch::phys_to_virt(mapping.physical) + (address - base);
         let result = visit(direct);
+        if let ResidentBacking::File(folio) = &page.backing {
+            folio.mark_accessed();
+        }
         drop(state);
         drop(mmap);
         Ok(Some(result))
@@ -1662,13 +1729,14 @@ fn prepare_fault(
     source: &FaultSource,
     base: usize,
     access: UserAccess,
+    attempt: &mut ReclaimAttempt,
 ) -> Result<(Box<ResidentPage>, PreparedTables, Option<FolioRef>), VmError> {
-    let (backing, cow, file) = prepare_backing(source, base, access)?;
+    let (backing, cow, file) = prepare_backing(source, base, access, attempt)?;
     let mut page = ResidentPage::try_new(base, backing, cow)?;
     if let Some(range) = &source.vma.file_range {
         page.source = Arc::downgrade(range.data());
     }
-    let tables = PreparedTables::try_new(source.needed)?;
+    let tables = PreparedTables::try_new_reclaim(source.needed, attempt)?;
     Ok((page, tables, file))
 }
 
@@ -1677,10 +1745,11 @@ fn prepare_backing(
     source: &FaultSource,
     base: usize,
     access: UserAccess,
+    attempt: &mut ReclaimAttempt,
 ) -> Result<(ResidentBacking, bool, Option<FolioRef>), VmError> {
     if let Some(backing) = &source.backing {
         // ponytail: 私有 COW 总复制一页；有实际映射独占证明后才考虑原页复用。
-        let page = AnonPageRef::try_new().ok_or(VmError::NoMemory)?;
+        let page = AnonPageRef::try_new_reclaim(attempt).ok_or(VmError::NoMemory)?;
         let mut file = None;
         match backing {
             ResidentBacking::Anonymous(source) => {
@@ -1712,7 +1781,9 @@ fn prepare_backing(
     }
     match &source.vma.backing {
         VmaBacking::Anonymous => Ok((
-            ResidentBacking::Anonymous(AnonPageRef::try_new().ok_or(VmError::NoMemory)?),
+            ResidentBacking::Anonymous(
+                AnonPageRef::try_new_reclaim(attempt).ok_or(VmError::NoMemory)?,
+            ),
             false,
             None,
         )),
@@ -1721,7 +1792,7 @@ fn prepare_backing(
                 .checked_add((base - source.vma.range.start) as u64)
                 .ok_or(VmError::InvalidRange)?;
             Ok((
-                ResidentBacking::Anonymous(owner.page(offset / PAGE_SIZE as u64)?),
+                ResidentBacking::Anonymous(owner.page(offset / PAGE_SIZE as u64, attempt)?),
                 false,
                 None,
             ))
@@ -1740,7 +1811,7 @@ fn prepare_backing(
             }
             let valid = (size - offset).min(PAGE_SIZE as u64) as usize;
             let folio = file
-                .file_page(offset / PAGE_SIZE as u64)
+                .file_page(offset / PAGE_SIZE as u64, attempt)
                 .map_err(VmError::File)?;
             if (!*private || valid == PAGE_SIZE) && access != UserAccess::Write {
                 folio
@@ -1749,7 +1820,7 @@ fn prepare_backing(
                     .map_err(|error| VmError::File(error.into()))?;
                 return Ok((ResidentBacking::File(folio.clone()), *private, Some(folio)));
             }
-            let page = AnonPageRef::try_new().ok_or(VmError::NoMemory)?;
+            let page = AnonPageRef::try_new_reclaim(attempt).ok_or(VmError::NoMemory)?;
             // SAFETY: 新匿名页已完整清零，只有本地 page 引用，尚无映射、设备或其他访问；
             // valid 不超过 PAGE_SIZE，folio 保活源原页，分配器返回的目标与其不重叠。
             // 仅匿名目标形成短独占切片，copy_to 原始读取有效前缀，目标尾部保留零初始化。

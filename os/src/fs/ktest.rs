@@ -9,13 +9,13 @@ use crate::block::{self, AccessMode, BlockError, Disk, DiskRef};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{Ext4Volume, InodeKind};
-use crate::fs::inode::{InodeCache, InodeCacheWatch, InodeRef};
+use crate::fs::inode::{InodeCache, InodeCacheWatch, InodeRef, InvalidateGuard};
 use crate::fs::{
     DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, OpenOptions, Path,
     ResolveMode, Vfs,
 };
 use crate::mm::{FolioRead, FolioRef};
-use crate::sync::{Completion, ReadGuard, SpinLock};
+use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
 use crate::{cpu, drivers, mm, sched, time, timer};
@@ -135,14 +135,14 @@ fn checked<T>(context: &TestContext<'_>, result: Result<T, FsError>) -> Result<T
     })
 }
 
-/// caller 已在选择原页之前取得同 inode 的 invalidate 共享侧，读入凭证已附原 inode；此借用保到数据全尾。
+/// 调用者持同 inode 的 invalidate 共享侧及 NOFS 范围，读入凭证保原 inode 到数据全尾。
 fn fill_file_page(
     inode: &InodeRef,
     index: u64,
     read: FolioRead,
-    _invalidate: &ReadGuard<'_, ()>,
+    _invalidate: &InvalidateGuard<'_>,
 ) -> Result<(), FsError> {
-    match crate::fs::writeback::prepare_file_targets(inode, index, &(0..u64::MAX)) {
+    match crate::fs::writeback::prepare_file_targets(inode, index, &(0..u64::MAX), None) {
         Ok((size, targets)) => inode.filesystem().fill_page(index, size, &targets, read),
         Err(error) => Err(crate::fs::ext4::finish_error(read, error)),
     }
@@ -372,7 +372,7 @@ impl Observation {
     }
 }
 
-/// 普通原生任务先取得保护再准备页；FILL 停点和取消保原加载结果，全尾后才交付观察引用。
+/// 普通原生任务在 invalidate 外准备候选，保护内发表；FILL 停点和取消保原加载结果。
 fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
     let cancelled = &observer.cancelled;
     match job {
@@ -530,15 +530,12 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             let mut bytes = [0xa7; mm::PAGE_SIZE];
             let count = inode.read_at(offset, &mut bytes)?;
             let _invalidate = inode.lock_invalidate()?;
-            let (folio, read) = inode.mapping().get_or_prepare(page)?;
-            if let Some(read) = read {
-                return Err(crate::fs::ext4::finish_error(
-                    read.with_file_owner(inode.clone()),
-                    FsError::Corrupt,
-                ));
-            }
+            let folio = inode
+                .mapping()
+                .cached_folio(page)
+                .ok_or(FsError::Corrupt)?
+                .with_file_owner(inode.clone());
             folio.wait_ready()?;
-            let folio = folio.with_file_owner(inode.clone());
             Ok(Returned::Page {
                 folio,
                 bytes: count,
@@ -546,33 +543,42 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             })
         }
         Job::Fill { inode, page } => {
-            let invalidate = inode.lock_invalidate()?;
-            if cancelled.load(Ordering::Acquire) {
-                return Err(FsError::LoadAborted);
-            }
-            let (folio, read) = inode.mapping().get_or_prepare(page)?;
-            let folio = folio.with_file_owner(inode.clone());
-            let read = read.ok_or(FsError::Corrupt)?.with_file_owner(inode.clone());
-            if observer.hold_loader.load(Ordering::Acquire) {
-                observer.loader_entered.fetch_add(1, Ordering::AcqRel);
-                observer.gate.wait();
-            }
-            if cancelled.load(Ordering::Acquire) {
-                return Err(crate::fs::ext4::finish_error(
-                    read,
-                    FsError::Io(BlockError::QueueStopped),
-                ));
-            }
-            fill_file_page(&inode, page, read, &invalidate)?;
-            folio.wait_ready()?;
-            let mut bytes = [0xa7; mm::PAGE_SIZE];
-            folio.copy_to(0, &mut bytes)?;
-            let valid = patterned(&bytes, page * mm::PAGE_SIZE as u64);
-            Ok(Returned::Page {
-                folio,
-                bytes: mm::PAGE_SIZE,
-                valid,
-            })
+            let mut attempt = mm::reclaim::ReclaimAttempt::new();
+            let mut prepared = Some(inode.mapping().prepare_file(&inode, page, &mut attempt)?);
+            let result = (|| {
+                let invalidate = inode.lock_invalidate()?;
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(FsError::LoadAborted);
+                }
+                let (folio, read) = inode
+                    .mapping()
+                    .publish_file(&inode, page, &mut prepared)?
+                    .ok_or(FsError::Corrupt)?;
+                let folio = folio.with_file_owner(inode.clone());
+                let read = read.ok_or(FsError::Corrupt)?.with_file_owner(inode.clone());
+                if observer.hold_loader.load(Ordering::Acquire) {
+                    observer.loader_entered.fetch_add(1, Ordering::AcqRel);
+                    observer.gate.wait();
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(crate::fs::ext4::finish_error(
+                        read,
+                        FsError::Io(BlockError::QueueStopped),
+                    ));
+                }
+                fill_file_page(&inode, page, read, &invalidate)?;
+                folio.wait_ready()?;
+                let mut bytes = [0xa7; mm::PAGE_SIZE];
+                folio.copy_to(0, &mut bytes)?;
+                let valid = patterned(&bytes, page * mm::PAGE_SIZE as u64);
+                Ok(Returned::Page {
+                    folio,
+                    bytes: mm::PAGE_SIZE,
+                    valid,
+                })
+            })();
+            drop(prepared);
+            result
         }
         Job::Oom {
             cache,
@@ -589,12 +595,12 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             let valid = patterned(&data[..bytes], 0);
             let inode_error = cache.iget(&volume, empty_number).err();
             let page_error = inode.read_at(mm::PAGE_SIZE as u64, &mut data).err();
-            let (folio, read) = inode.mapping().get_or_prepare(0)?;
-            if read.is_some() {
-                return Err(FsError::Corrupt);
-            }
+            let folio = inode
+                .mapping()
+                .cached_folio(0)
+                .ok_or(FsError::Corrupt)?
+                .with_file_owner(inode.clone());
             folio.wait_ready()?;
-            let folio = folio.with_file_owner(inode.clone());
             let returned = Returned::Oom {
                 producer_cpu: cpu::current().id,
                 evidence,

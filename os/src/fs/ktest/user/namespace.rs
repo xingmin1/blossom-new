@@ -4,7 +4,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use virtio_drivers::BufferDirection;
 
-use crate::block::{AccessMode, Bio, BlkOperation, BlockError, DiskRef, SECTOR_BYTES};
+use crate::block::{
+    AccessMode, Bio, BioAllocator, BlkOperation, BlockError, DiskRef, SECTOR_BYTES,
+};
 use crate::cache::ktest::HeapPressure;
 use crate::cache::{BufferRef, MetadataCache, MetadataLoadHook};
 use crate::fs::ext4::{codec, BlockMapping, DirectoryEntry, Ext4Volume, InodeKind};
@@ -117,7 +119,7 @@ fn observe_symlink_oom(
     let neighbor_block = (page..page + windows as u64)
         .find(|&candidate| candidate != block && Some(candidate) != prefix_block);
     let neighbor = neighbor_block
-        .map(|block| cache.get(block, block_size))
+        .map(|block| cache.get(block, block_size, None))
         .transpose()?;
     if let Some(neighbor) = &neighbor {
         neighbor.with_read(|bytes| {
@@ -373,7 +375,7 @@ fn select_unsigned_legacy_default(context: &mut TestContext<'_>, disk: &DiskRef)
     for (target, source) in mapped.bytes_mut().iter_mut().zip(&bytes[..length]) {
         target.write(*source);
     }
-    let mut memory = Vec::new();
+    let mut memory = Vec::new_in(BioAllocator::Heap);
     memory
         .try_reserve_exact(1)
         .map_err(|_| TestError("legacy hash Bio slot OOM"))?;
@@ -424,7 +426,7 @@ fn directory_block(
     map_root: &[u8; 60],
     logical: u64,
 ) -> Result<[u8; mm::PAGE_SIZE], FsError> {
-    let physical = match volume.map_block(metadata, map_root, logical)? {
+    let physical = match volume.map_block(metadata, map_root, logical, None)? {
         BlockMapping::Mapped { physical, .. } => physical,
         _ => return Err(FsError::Corrupt),
     };
@@ -794,7 +796,7 @@ fn set_root_hash_version(
     {
         return Err(TestError("legacy hash version changed the root layout"));
     }
-    let physical = match volume.map_block(&metadata, &map_root, 0) {
+    let physical = match volume.map_block(&metadata, &map_root, 0, None) {
         Ok(BlockMapping::Mapped { physical, .. }) => physical,
         Ok(_) => return Err(TestError("legacy root block is not mapped")),
         Err(error) => {
@@ -2192,7 +2194,7 @@ pub(crate) mod native {
             context,
             root_inode.with_map_read(|metadata, root| Ok((*metadata, *root))),
         )?;
-        let physical = match volume.map_block(&metadata, &map_root, 0) {
+        let physical = match volume.map_block(&metadata, &map_root, 0, None) {
             Ok(BlockMapping::Mapped { physical, .. }) => physical,
             Ok(_) => return Err(TestError("root directory block is not mapped")),
             Err(error) => {
@@ -2362,11 +2364,10 @@ pub(crate) mod native {
                 "same-page reader did not Block on the published folio",
                 || fixture.user.path.owner.observer().blocked(1),
             )?;
-            let (folio, read) = inode
+            let folio = inode
                 .mapping()
-                .get_or_prepare(0)
-                .map_err(|_| TestError("loading folio owner disappeared"))?;
-            context.expect_eq(read.is_none(), true);
+                .cached_folio(0)
+                .ok_or(TestError("loading folio owner disappeared"))?;
             context.expect_eq(folio.is_ready(), false);
             let file_read_requests = disk.test_snapshot().file_read_submitted;
             writer = Some(fixture.consume_sync(0, {
@@ -2489,11 +2490,10 @@ pub(crate) mod native {
                 "failed page waiter did not Block on unique loading folio",
                 || fixture.user.path.owner.observer().blocked(1),
             )?;
-            let (folio, read) = inode
+            let folio = inode
                 .mapping()
-                .get_or_prepare(0)
-                .map_err(|_| TestError("failing page disappeared before completion"))?;
-            context.expect_eq(read.is_none(), true);
+                .cached_folio(0)
+                .ok_or(TestError("failing page disappeared before completion"))?;
             context.expect_eq(folio.is_ready(), false);
             Ok(())
         })();
@@ -2516,11 +2516,10 @@ pub(crate) mod native {
                 Some(FsError::Io(BlockError::Io)),
             );
         }
-        let (failed, read) = inode
+        let failed = inode
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("failed page cache owner disappeared"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("failed page cache owner disappeared"))?;
         context.expect_eq(failed.wait_ready(), Err(BlockError::Io));
         drop(failed);
         context.expect_eq(0 < inode.mapping().prune_unused(), true);

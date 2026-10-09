@@ -7,6 +7,7 @@ use core::fmt::Debug;
 
 use crate::fs::ktest::user::{UserOwner, PROGRAM};
 use crate::fs::FileRef;
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::Mm;
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::task;
@@ -356,7 +357,7 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
     Err(TestError("initial auxv lacks bounded AT_NULL terminator"))
 }
 
-/// 保活数据首尾及中间的真实缓存页，并按位置保存该文件余下字节供私有写后比较。
+/// 保活数据首尾及中间的真实缓存页，并按位置保存该文件余下字节供私有写后比较；页快照共用一次回收预算。
 fn snapshot(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -380,13 +381,14 @@ fn snapshot(
     folios
         .try_reserve_exact(pages)
         .map_err(|_| TestError("NoMemory: ELF cache folio owners"))?;
+    let mut attempt = ReclaimAttempt::new();
     for index in 0..pages {
         let page = start / PAGE_SIZE as u64 + index as u64;
         folios.push(checked(
             context,
             "ELF cache folio read failed",
             page * PAGE_SIZE as u64,
-            file.file_page(page),
+            file.file_page(page, &mut attempt),
         )?);
     }
     Ok((start, bytes, folios))

@@ -15,11 +15,12 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::alloc::AllocError;
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::pin::pin;
 use core::ptr;
 #[cfg(feature = "ktest")]
 use core::sync::atomic::AtomicPtr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::mm::{alloc_pages, OwnedPages};
 use crate::sched::context::TaskContext;
@@ -47,6 +48,75 @@ impl TaskId {
         } else {
             Some(Self(value))
         }
+    }
+}
+
+const RECLAIM_NOFS: u8 = 1;
+const RECLAIM_NOIO: u8 = 2;
+
+/// 当前普通任务直接回收可进入的依赖范围；显式业务 I/O 不受该模式禁止。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReclaimMode {
+    Normal,
+    NoFs,
+    NoIo,
+}
+
+impl ReclaimMode {
+    /// 读取真实任务状态，迁核不改变作用域；原子及 IRQ 路径不得进入直接回收。
+    pub(crate) fn current() -> Self {
+        crate::sched::assert_switchable();
+        let flags = current_task().reclaim.load(Ordering::Acquire);
+        if flags & RECLAIM_NOIO != 0 {
+            Self::NoIo
+        } else if flags & RECLAIM_NOFS != 0 {
+            Self::NoFs
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+/// 只保存本次新增位的任务作用域；不可跨任务交接，嵌套退出保持外层限制。
+pub(crate) struct ReclaimScope {
+    task: Arc<Task>,
+    added: u8,
+    _task_local: PhantomData<*mut ()>,
+}
+
+impl ReclaimScope {
+    /// 持有文件系统依赖期间禁止直接回收再次取得文件系统锁或等待其写回。
+    pub(crate) fn nofs() -> Self {
+        Self::enter(RECLAIM_NOFS)
+    }
+
+    /// 持有 I/O 来源期间同时禁止直接回收进入 FS 与新 I/O，业务提交仍可继续。
+    pub(crate) fn noio() -> Self {
+        Self::enter(RECLAIM_NOFS | RECLAIM_NOIO)
+    }
+
+    /// 绑定当前普通任务，原子保存新增位，不修改 CPU 或新建任务的初始状态。
+    fn enter(requested: u8) -> Self {
+        crate::sched::assert_switchable();
+        let task = current_task();
+        let previous = task.reclaim.fetch_or(requested, Ordering::AcqRel);
+        Self {
+            task,
+            added: requested & !previous,
+            _task_local: PhantomData,
+        }
+    }
+}
+
+impl Drop for ReclaimScope {
+    /// 同任务退出只撤本次新增位，内层重复 save 不解除外层限制。
+    fn drop(&mut self) {
+        assert_eq!(
+            current_task().id(),
+            self.task.id(),
+            "reclaim scope changed task"
+        );
+        self.task.reclaim.fetch_and(!self.added, Ordering::Release);
     }
 }
 
@@ -143,6 +213,7 @@ impl JoinState {
 pub struct Task {
     id: TaskId,
     execution_ns: AtomicU64,
+    reclaim: AtomicU8,
     pub(crate) ctx: UnsafeCell<TaskContext>,
     pub(crate) scheduling: UnsafeCell<Scheduling>,
     pub(crate) resources: UnsafeCell<Resources>,
@@ -363,6 +434,7 @@ fn prepare(
     let value = Task {
         id,
         execution_ns: AtomicU64::new(0),
+        reclaim: AtomicU8::new(0),
         ctx: UnsafeCell::new(TaskContext::initial(stack_top)),
         scheduling: UnsafeCell::new(Scheduling {
             state: State::Ready,

@@ -11,7 +11,7 @@ use virtio_drivers::device::blk::{decode_status, prepare_pdu, PDU_STRIDE, STATUS
 use virtio_drivers::transport::{DeviceStatus, InterruptStatus};
 use virtio_drivers::{DmaRegion, Error, Hal, MappedSegment};
 
-use crate::block::bio::BioInner;
+use crate::block::bio::{BioArc, BioInner};
 #[cfg(feature = "ktest")]
 use crate::block::SECTOR_BYTES;
 use crate::block::{AccessMode, Bio, BlkOperation, BlockError, FsClaim, QueueLimits, MAX_BATCH};
@@ -91,7 +91,7 @@ impl QueueState {
 }
 
 pub(super) struct RequestPart {
-    pub(super) bio: Arc<BioInner>,
+    pub(super) bio: BioArc,
     pub(super) offset: usize,
     pub(super) length: usize,
     // 独立保占用到 slot 资源和队列计数归还；父 ready 不终止此责任。
@@ -905,8 +905,7 @@ impl Disk {
             } else {
                 None
             };
-            part.bio
-                .finish_child(part.offset, part.length, progress, part_error);
+            BioInner::finish_child(&part.bio, part.offset, part.length, progress, part_error);
         }
         resources.sg.clear();
         resources.part_count = 0;
@@ -1190,7 +1189,7 @@ impl Drop for Disk {
 }
 
 pub(super) struct ActiveBio<'a> {
-    pub(super) bio: Arc<BioInner>,
+    pub(super) bio: BioArc,
     pub(super) offset: usize,
     disk: &'a DiskRef,
     finished: bool,
@@ -1208,7 +1207,7 @@ impl ActiveBio<'_> {
         if self.finished {
             return;
         }
-        let deferred = self.bio.finish_generation(error, Some(self.disk));
+        let deferred = BioInner::finish_generation(&self.bio, error, Some(self.disk));
         self.finished = true;
         if !deferred {
             self.disk.finish_generation_tail(self.bio.operation());
@@ -1265,7 +1264,7 @@ impl PreparingSlot<'_> {
     /// 保存一个原 Bio 的有界责任，child 仅在真正发表前登记。
     pub(super) fn push_part(
         &mut self,
-        bio: Arc<BioInner>,
+        bio: BioArc,
         offset: usize,
         length: usize,
     ) -> Result<(), BlockError> {
@@ -1462,8 +1461,7 @@ impl PreparingSlot<'_> {
                 };
                 let resources = self.resources();
                 for part in resources.parts.iter().flatten() {
-                    part.bio
-                        .finish_child(part.offset, part.length, 0, Some(error));
+                    BioInner::finish_child(&part.bio, part.offset, part.length, 0, Some(error));
                 }
                 if fault {
                     disk.request_retire(error);

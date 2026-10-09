@@ -197,11 +197,10 @@ pub(crate) mod volume {
             context.expect_eq(patterned(&bytes[..expected], offset), true);
         }
         let last = PATTERN_SIZE / mm::PAGE_SIZE as u64;
-        let (folio, read) = file
+        let folio = file
             .mapping()
-            .get_or_prepare(last)
-            .map_err(|_| TestError("EOF folio missing"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(last)
+            .ok_or(TestError("EOF folio missing"))?;
         checked(
             context,
             folio
@@ -362,7 +361,10 @@ pub(crate) mod volume {
         );
         context.expect_eq(first.read_link().err(), Some(FsError::InvalidOperation));
         for number in [0, u64::MAX] {
-            context.expect_eq(volume.load_inode(number).err(), Some(FsError::Corrupt));
+            context.expect_eq(
+                volume.load_inode(number, None).err(),
+                Some(FsError::Corrupt),
+            );
             context.expect_eq(
                 fixture.cache().iget(&volume, number).err(),
                 Some(FsError::Corrupt),
@@ -499,11 +501,10 @@ pub(crate) mod bounded {
                 4096,
             );
             context.expect_eq(patterned(&bytes, page as u64 * 4096), true);
-            let (folio, read) = file
+            let folio = file
                 .mapping()
-                .get_or_prepare(page as u64)
-                .map_err(|_| TestError("live bounded folio missing"))?;
-            context.expect_eq(read.is_none(), true);
+                .cached_folio(page as u64)
+                .ok_or(TestError("live bounded folio missing"))?;
             held[page] = Some(folio);
         }
         context.expect_eq(checked(context, file.read_at(8192, &mut bytes))?, 4096);
@@ -533,11 +534,11 @@ pub(crate) mod bounded {
         cache.prune_unused();
         let only = checked(context, cache.iget(&volume, number))?;
         context.expect_eq(checked(context, only.read_at(0, &mut bytes))?, 4096);
-        let (detached, read) = only
+        let detached = only
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("detached original folio missing"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("detached original folio missing"))?
+            .with_file_owner(only.clone());
         let inode_address = &*only as *const _ as usize;
         let mapping_address = only.mapping() as *const _ as usize;
         let page_address = detached.phys_addr();
@@ -549,11 +550,10 @@ pub(crate) mod bounded {
         context.expect_eq(&*again as *const _ as usize, inode_address);
         context.expect_eq(again.mapping() as *const _ as usize, mapping_address);
         context.expect_eq(cache.ktest_load_count(), loads);
-        let (same_page, read) = again
+        let same_page = again
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("detached mapping identity lost"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("detached mapping identity lost"))?;
         context.expect_eq(same_page.phys_addr(), page_address);
         checked(
             context,
@@ -593,11 +593,10 @@ pub(crate) mod oom {
         .ok_or(TestError("OOM empty directory entry missing"))?;
         let mut bytes = [0xa7; 4096];
         context.expect_eq(checked(context, inode.read_at(0, &mut bytes))?, 4096);
-        let (folio, read) = inode
+        let folio = inode
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("OOM live page missing"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("OOM live page missing"))?;
         let pressure = fixture
             .pressure
             .take()
@@ -649,11 +648,10 @@ pub(crate) mod oom {
         context.expect_eq(checked(context, empty.metadata_snapshot())?.size, 0);
         context.expect_eq(checked(context, inode.read_at(4096, &mut bytes))?, 4096);
         context.expect_eq(patterned(&bytes, 4096), true);
-        let (original, read) = inode
+        let original = inode
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("OOM original page changed"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("OOM original page changed"))?;
         context.expect_eq(original.phys_addr(), address);
         context.diagnostic(format_args!("fs-allocator-OOM actual-producer-CPU={} real-page-NULL={} real-heap-NULL={} live-hit-original-PFN={} new-inode-NoMemory=1 new-page-NoMemory=1 released-pressure-recovered=1 hardware-EIO-covered=0", producer_cpu, evidence.0, evidence.1, address));
         Ok(())
@@ -691,7 +689,7 @@ pub(crate) mod bad_group {
                 context.diagnostic(format_args!("ext4-group-checksum rejected-at=open"));
             }
             Ok(volume) => {
-                context.expect_eq(volume.load_inode(2).err(), Some(FsError::Checksum));
+                context.expect_eq(volume.load_inode(2, None).err(), Some(FsError::Checksum));
                 context.diagnostic(format_args!("ext4-group-checksum rejected-at=inode-load"));
             }
         }
@@ -742,11 +740,10 @@ pub(crate) mod bad_extent {
         context.expect_eq(inode.map_block(0).err(), Some(FsError::Checksum));
         let mut bytes = [0xa7; 4096];
         context.expect_eq(inode.read_at(0, &mut bytes).err(), Some(FsError::Checksum));
-        let (folio, read) = inode
+        let folio = inode
             .mapping()
-            .get_or_prepare(0)
-            .map_err(|_| TestError("failed extent folio missing"))?;
-        context.expect_eq(read.is_none(), true);
+            .cached_folio(0)
+            .ok_or(TestError("failed extent folio missing"))?;
         context.expect_eq(folio.wait_ready(), Err(BlockError::Checksum));
         context.expect_eq(folio.range_ready(0, 4096), Err(BlockError::Checksum));
         Ok(())

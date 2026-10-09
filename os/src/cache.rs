@@ -7,15 +7,20 @@ use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::ops::Range;
 
-use crate::block::{AccessMode, BlockError, FsClaim, SECTOR_BYTES};
+use crate::block::{
+    AccessMode, BioAllocator, BioMemory, BioReserve, BlockError, FsClaim, MetadataIoContext,
+    SECTOR_BYTES,
+};
 use crate::fs::ext4::Ext4Volume;
 use crate::fs::{FsError, InodeRef};
 use crate::mm::folio::FolioContent;
+use crate::mm::reclaim::{ReclaimAttempt, ReclaimStats};
 use crate::mm::space::{sync_all, PteDomain, ResidentPages};
 use crate::mm::user_table::RetiredTables;
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
-use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock, SpinLockGuard};
-use index::{Node, Tree};
+use crate::sync::{SleepMutex, SleepMutexGuard, SleepRwLock, SpinLock, SpinLockGuard};
+use crate::task::{ReclaimMode, ReclaimScope};
+use index::{IndexAllocator, Node, NodeRef, RetiredNode, Tree};
 
 /// 内容状态从节点自己的 folio 读取；ToWrite 只标记本轮选中的原节点。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,7 +148,7 @@ pub(crate) fn ktest_wb_error_protocol() -> bool {
         && error.check_and_advance(&mut second) == Ok(())
 }
 
-struct FolioIndex {
+pub(crate) struct FolioIndex {
     entries: SpinLock<Tree>,
     capacity: Option<usize>,
     metadata: bool,
@@ -151,7 +156,7 @@ struct FolioIndex {
 
 impl FolioIndex {
     /// 文件索引不预留固定槽；元数据预算限制的是实际物理页数量。
-    const fn new(capacity: Option<usize>, metadata: bool) -> Self {
+    pub(crate) const fn new(capacity: Option<usize>, metadata: bool) -> Self {
         Self {
             entries: SpinLock::new(Tree::new()),
             capacity,
@@ -159,18 +164,20 @@ impl FolioIndex {
         }
     }
 
-    /// 在索引锁内仅移出可回收的静止页；全活、Dirty 或 WB 都不能腾空预算。
+    /// 元数据满预算只摘实际索引及可选源基准以外无拥有的静止页，锁外结束原节点。
     fn evict_if_full(
         &self,
         entries: &mut Tree,
-    ) -> Result<Option<alloc::boxed::Box<Node>>, BlockError> {
+        reserve: Option<&Arc<BioReserve>>,
+    ) -> Result<Option<RetiredNode>, BlockError> {
         if self.capacity.is_none_or(|capacity| entries.len < capacity) {
             return Ok(None);
         }
         let mut cursor = 0;
         while let Some(node) = entries.lower_bound(cursor) {
             let key = node.key;
-            if node.folio.can_prune() {
+            let baseline = reserve.is_some_and(|source| source.metadata_has_baseline(&node.folio));
+            if node.folio.index_unused(baseline, false) {
                 return Ok(entries.remove(key));
             }
             let Some(next) = key.checked_add(1) else {
@@ -181,8 +188,12 @@ impl FolioIndex {
         Err(BlockError::NoMemory)
     }
 
-    /// 命中不分配；候选页和 AVL 节点锁外准备，双查后只转移拥有。
-    fn get_or_prepare(&self, key: u64) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
+    /// raw/RO 从原 NOWAIT 来源准备；RW metadata 只从同 cache 原页及控制槽准备。
+    pub(crate) fn get_or_prepare(
+        &self,
+        key: u64,
+        reserve: Option<&Arc<BioReserve>>,
+    ) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
         let victim = {
             let mut entries = self.entries.lock();
             if entries.closed {
@@ -191,21 +202,37 @@ impl FolioIndex {
             if let Some(node) = entries.get(key) {
                 return Ok((node.folio.clone(), None));
             }
-            self.evict_if_full(&mut entries)?
+            self.evict_if_full(&mut entries, reserve)?
         };
-        drop(victim);
-        let candidate = if self.metadata {
-            FolioRef::allocate_metadata()
-        } else {
-            FolioRef::allocate()
+        if let Some(victim) = victim {
+            victim.release();
         }
-        .ok_or(BlockError::NoMemory)?;
+        let (candidate, allocator, lease) = if let Some(reserve) = reserve {
+            assert!(self.metadata, "file/raw index received a metadata source");
+            let lease = reserve.try_metadata_slot()?;
+            let candidate = lease.folio();
+            candidate.reset_metadata_inventory();
+            let allocator = IndexAllocator::Metadata {
+                reserve: Arc::clone(reserve),
+                slot: lease.slot(),
+            };
+            (candidate, allocator, Some(lease))
+        } else {
+            let candidate = if self.metadata {
+                FolioRef::allocate_metadata()
+            } else {
+                FolioRef::allocate()
+            }
+            .ok_or(BlockError::NoMemory)?;
+            (candidate, IndexAllocator::Heap, None)
+        };
         let read = if self.metadata {
             None
         } else {
             Some(candidate.begin_read(0, PAGE_SIZE)?)
         };
-        let mut prepared = Some(Node::prepare(key, candidate.clone())?);
+        let mut prepared = Some(Node::prepare(key, candidate.clone(), None, allocator)?);
+        drop(lease);
         let (existing, victim) = {
             let mut entries = self.entries.lock();
             if entries.closed {
@@ -214,12 +241,14 @@ impl FolioIndex {
             if let Some(node) = entries.get(key) {
                 (Some(node.folio.clone()), None)
             } else {
-                let victim = self.evict_if_full(&mut entries)?;
+                let victim = self.evict_if_full(&mut entries, reserve)?;
                 entries.insert(prepared.take().unwrap());
                 (None, victim)
             }
         };
-        drop(victim);
+        if let Some(victim) = victim {
+            victim.release();
+        }
         drop(prepared);
         if let Some(folio) = existing {
             drop(read);
@@ -228,8 +257,8 @@ impl FolioIndex {
         Ok((candidate, read))
     }
 
-    /// 每次只摘一个静止节点，原页和 Box 析构均在短锁外；只扫描当时的有界键前缀。
-    fn prune_unused(&self) -> usize {
+    /// 每次只移一个节点，源基准通过真实库存身份计入，原页和控制均在短锁外结束。
+    pub(crate) fn prune_unused(&self, reserve: Option<&Arc<BioReserve>>) -> usize {
         let budget = self.len();
         let mut cursor = 0;
         let mut removed = 0;
@@ -240,7 +269,9 @@ impl FolioIndex {
                     break;
                 };
                 let key = node.key;
-                let victim = if node.folio.can_prune() {
+                let baseline =
+                    reserve.is_some_and(|source| source.metadata_has_baseline(&node.folio));
+                let victim = if node.folio.index_unused(baseline, false) {
                     entries.remove(key)
                 } else {
                     None
@@ -248,7 +279,9 @@ impl FolioIndex {
                 (victim, key.checked_add(1))
             };
             removed += usize::from(victim.is_some());
-            drop(victim);
+            if let Some(victim) = victim {
+                victim.release();
+            }
             let Some(next) = next else {
                 break;
             };
@@ -258,7 +291,7 @@ impl FolioIndex {
     }
 
     /// 读取当前真实节点数，读入中与失败节点仍占元数据预算。
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.lock().len
     }
 
@@ -313,7 +346,7 @@ impl FolioIndex {
     }
 
     /// 按半开范围有界选择；ToWrite填满输出片段，检查节点数不超过锁内现存有限数量。
-    fn select_range(
+    pub(crate) fn select_range(
         &self,
         start: u64,
         end: u64,
@@ -339,7 +372,7 @@ impl FolioIndex {
             let matches = match mark {
                 FolioMark::Dirty => node.folio.dirty_sectors() != 0,
                 FolioMark::Writeback => node.folio.writeback_sectors() != 0,
-                FolioMark::ToWrite => node.to_write,
+                FolioMark::ToWrite => node.to_write(),
             };
             if matches {
                 assert!(
@@ -371,12 +404,103 @@ pub struct MetadataCache {
     wb_error: SpinLock<WritebackError>,
     #[cfg(feature = "ktest")]
     load_hook: SpinLock<Option<MetadataLoadHook>>,
+    reserve_init: SleepRwLock<()>,
+    reserve: SpinLock<Option<Arc<BioReserve>>>,
 }
 
 impl MetadataCache {
     /// 串行共同元数据范围选择及完成，并保护后台续扫位置，不覆盖文件数据 IO。
     pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, u64> {
         self.writeback.lock()
+    }
+
+    /// RW 卷发表前准备同一缓存的有限原页及 Arc 控制，现存热页保持原 PFN 和内容。
+    pub(crate) fn prepare_reserve(self: &Arc<Self>) -> Result<Arc<BioReserve>, BlockError> {
+        let _scope = ReclaimScope::noio();
+        let _init = self.reserve_init.write();
+        if let Some(reserve) = self.reserve() {
+            return Ok(reserve);
+        }
+        let mut hot = Vec::new();
+        hot.try_reserve_exact(self.capacity())
+            .map_err(|_| BlockError::NoMemory)?;
+        let mut cursor = 0;
+        loop {
+            let next = {
+                let entries = self.index.entries.lock();
+                if entries.closed {
+                    return Err(BlockError::QueueStopped);
+                }
+                entries
+                    .lower_bound(cursor)
+                    .map(|node| (node.key, node.folio.clone()))
+            };
+            let Some((key, folio)) = next else {
+                break;
+            };
+            hot.push((key, folio));
+            let Some(next) = key.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        let reserve =
+            BioReserve::try_new(self.capacity(), hot.iter().map(|(_, folio)| folio.clone()))?;
+        for slot in 0..self.capacity() {
+            Node::prime(&reserve, slot)?;
+        }
+        // 所有可失败申请已完成。已 prime 的控制使用同一实际 Arc Layout，
+        // 下方构造只消费原块；hot 原引用阻止 prune，miss/init 锁排除新发表。
+        for (slot, (key, folio)) in hot.into_iter().enumerate() {
+            let (selected, old) = {
+                let mut entries = self.index.entries.lock();
+                let node = entries
+                    .get(key)
+                    .expect("bootstrap metadata node disappeared");
+                assert_eq!(
+                    node.folio.phys_addr(),
+                    folio.phys_addr(),
+                    "bootstrap metadata identity changed"
+                );
+                let selected = node.to_write();
+                let old = entries.remove(key).unwrap();
+                (selected, old)
+            };
+            // 发表前没有 metadata Node observer 出口，旧 Heap 控制只有原索引拥有；
+            // 真 Drop 结束旧控制后重建 immutable key，原 baseline/Buffer/IO 不移动原页。
+            old.release();
+            let node = Node::prepare(
+                key,
+                folio,
+                None,
+                IndexAllocator::Metadata {
+                    reserve: Arc::clone(&reserve),
+                    slot,
+                },
+            )
+            .expect("primed metadata control allocation failed");
+            {
+                let mut entries = self.index.entries.lock();
+                entries.insert(node);
+                entries.set_to_write(key, selected);
+            }
+        }
+        reserve.mark_ready();
+        *self.reserve.lock() = Some(Arc::clone(&reserve));
+        Ok(reserve)
+    }
+
+    /// 只取得同缓存真实来源快照，IRQ 最后 put 不取得睡眠初始化锁。
+    pub(crate) fn reserve(&self) -> Option<Arc<BioReserve>> {
+        self.reserve.lock().clone()
+    }
+
+    /// Buffer/Read/WB 最后 put 已退出 PageUse 锁后通知原库存，通知不授予复用资格。
+    pub(crate) fn notify_metadata_available(&self) {
+        let reserve = self.reserve();
+        if let Some(reserve) = reserve {
+            reserve.notify_available();
+        }
     }
 
     /// 为新观察者采样共同元数据的有限错误序列。
@@ -411,6 +535,8 @@ impl MetadataCache {
             filesystem: SleepMutex::new(Weak::new()),
             writeback: SleepMutex::new(0),
             wb_error: SpinLock::new(WritebackError::new()),
+            reserve_init: SleepRwLock::new(()),
+            reserve: SpinLock::new(None),
             #[cfg(feature = "ktest")]
             load_hook: SpinLock::new(None),
         })
@@ -430,10 +556,41 @@ impl MetadataCache {
     }
 
     /// 取得准确 1/2/4KiB 窗口；缺失段逐次认领，已有有效或脏字节不会被重新读盘覆盖。
-    pub fn get(self: &Arc<Self>, block: u64, block_size: usize) -> Result<BufferRef, BlockError> {
+    pub(crate) fn get(
+        self: &Arc<Self>,
+        block: u64,
+        block_size: usize,
+        io_context: Option<MetadataIoContext<'_>>,
+    ) -> Result<BufferRef, BlockError> {
         let (byte, offset) = self.block_range(block, block_size)?;
         let page = byte - offset as u64;
-        let (folio, _) = self.index.get_or_prepare(page)?;
+        let initial = self.reserve();
+        let initial_context = match io_context {
+            Some(context) => Some(context),
+            None => initial.as_ref().map(BioReserve::metadata_io_context),
+        };
+        if let Some(context) = initial_context {
+            context.check()?;
+        }
+        let (folio, reserve) = {
+            let _init = self.reserve_init.read();
+            let reserve = self.reserve();
+            if let Some(context) = initial_context {
+                assert!(
+                    reserve
+                        .as_ref()
+                        .is_some_and(|source| context.belongs_to(source)),
+                    "metadata IO source changed"
+                );
+                context.check()?;
+            }
+            let (folio, _) = self.index.get_or_prepare(page, reserve.as_ref())?;
+            (folio.with_metadata_owner(Arc::clone(self)), reserve)
+        };
+        let context = match initial_context {
+            Some(context) => Some(context),
+            None => reserve.as_ref().map(BioReserve::metadata_io_context),
+        };
         #[cfg(feature = "ktest")]
         {
             let hook = self.load_hook.lock().clone();
@@ -441,13 +598,56 @@ impl MetadataCache {
                 hook(self, block, block_size);
             }
         }
-        while let Some(read) = folio.begin_metadata_read(offset, block_size)? {
+        // 首次 ready 与旧 Heap IO 由同一读写 gate 排斥；读侧不串行不同页的普通 RO IO。
+        // hook 已在 gate 外结束，完成/凭证归还均不反取 gate；已捕 Some 的旧边界不重采。
+        let _legacy_scope = reserve.is_none().then(ReclaimScope::noio);
+        let transition = reserve.is_none().then(|| self.reserve_init.read());
+        let published = if transition.is_some() {
+            self.reserve()
+        } else {
+            None
+        };
+        let source = reserve.as_ref().or(published.as_ref());
+        let context = match context {
+            Some(context) => Some(context),
+            None => source.map(BioReserve::metadata_io_context),
+        };
+        let _legacy_io = if source.is_none() {
+            transition
+        } else {
+            drop(transition);
+            None
+        };
+        loop {
+            if let Some(context) = context {
+                context.check()?;
+            }
+            match folio.range_ready(offset, block_size) {
+                Ok(()) => break,
+                Err(BlockError::NotReady) => {}
+                Err(error) => return Err(error),
+            }
+            let _scope = source.map(|_| ReclaimScope::noio());
+            let lease = match (source, context) {
+                (Some(source), Some(context)) => Some(source.acquire_aux(context)?),
+                (None, None) => None,
+                _ => unreachable!("metadata IO context lost its actual source"),
+            };
+            let memory = lease.as_ref().map(|lease| lease.memory()).transpose()?;
+            if let Some(context) = context {
+                context.check()?;
+            }
+            let Some(read) = folio.begin_metadata_read(offset, block_size)? else {
+                break;
+            };
+            let read = read.with_metadata_owner(Arc::clone(self));
+            let memory = memory.unwrap_or_else(|| BioMemory::new_in(BioAllocator::Heap));
             self.claim
                 .disk()
-                .load_folio(page + read.offset() as u64, read)?;
+                .load_folio(page + read.offset() as u64, read, memory)?;
         }
         Ok(BufferRef {
-            folio: folio.with_metadata_owner(self.clone()),
+            folio,
             offset,
             len: block_size,
         })
@@ -500,9 +700,10 @@ impl MetadataCache {
         Ok((byte, offset))
     }
 
-    /// 回收仅索引持有且无 Dirty、WB 或内容锁的页。
+    /// 摘离无外部 Buffer/Read/WB 的静止节点，基准原页仍归同 source，返回节点数。
     pub fn prune_unused(&self) -> usize {
-        self.index.prune_unused()
+        let reserve = self.reserve();
+        self.index.prune_unused(reserve.as_ref())
     }
 
     /// 返回在途、错误及有效范围共同占用的真实物理页数。
@@ -560,17 +761,29 @@ impl MetadataCache {
         self.index.capacity.unwrap()
     }
 
+    /// 只在 RW 源 ready 后观察原 Arc 控制尾；不在 bootstrap 暴露旧热节点或造假对象。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_node(&self, byte_offset: u64) -> Option<Weak<Node, IndexAllocator>> {
+        let _init = self.reserve_init.read();
+        self.reserve()?;
+        self.index.entries.lock().weak_node(byte_offset)
+    }
+
     /// 关闭私有域的新取得，摘离全部页后丢弃明确无需落盘的测试或未发表内容。
     ///
     /// # Safety
     /// 调用者必须已停止全部 get/update 生产者并结束全部 IO、WB 和外部视图使用。
     /// 这些字节只能属于未发表或私有 CPU 协议页，不得包含任何已接受的真实 FS 修改。
     pub unsafe fn discard_private(self: &Arc<Self>) -> Result<usize, BlockError> {
+        let reserve = self.reserve();
         let mut detached = {
             let mut entries = self.index.entries.lock();
             let mut cursor = 0;
             while let Some(node) = entries.lower_bound(cursor) {
-                if node.folio.ref_count() != 1 || node.folio.writeback_sectors() != 0 {
+                let baseline = reserve
+                    .as_ref()
+                    .is_some_and(|source| source.metadata_has_baseline(&node.folio));
+                if !node.folio.index_unused(baseline, true) {
                     return Err(BlockError::Busy);
                 }
                 let Some(next) = node.key.checked_add(1) else {
@@ -587,7 +800,7 @@ impl MetadataCache {
             let node = detached.remove(key).unwrap();
             let mut content = node.folio.lock_content();
             // SAFETY: 调用者已停止全部生产者和在途访问；索引已关闭并摘离全部节点，
-            // 上面的唯一引用检查拒绝外部视图。内容明确私有且无需落盘，guard 排斥 CPU 访问。
+            // 上面核索引及真实源基准以外无外部视图。内容明确私有且无需落盘，guard 排斥 CPU 访问。
             unsafe {
                 content.discard();
             }
@@ -772,6 +985,12 @@ pub(crate) enum FileUnmapPhase {
     AfterSync,
 }
 
+/// invalidate 外准备的真实命中引用或未发表页/Node/读入责任，失败与输家锁外结束。
+pub(crate) enum PreparedFile {
+    Cached(FolioRef),
+    New { node: NodeRef, read: FolioRead },
+}
+
 /// canonical inode 的稀疏页与弱文件范围索引；来源独立于当前驻留 backing。
 pub struct FileMapping {
     index: FolioIndex,
@@ -821,14 +1040,88 @@ impl FileMapping {
         }
     }
 
-    /// 内核加载者在锁外候选上取得同页唯一填充责任，命中只增加原页引用。
-    /// 文件来源须持有对应 InodeRef 到低层填充和使用全部结束；裸页交给外部
-    /// 拥有者前必须附同一 InodeRef anchor，普通文件消费者使用 InodeRef 的页出口。
-    pub(crate) fn get_or_prepare(
+    /// 在真实 owner 的 invalidate/root/content 之外准备原页及唯一 Node，有限 OOM 共用请求。
+    pub(crate) fn prepare_file(
         &self,
+        owner: &InodeRef,
         index: u64,
-    ) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
-        self.index.get_or_prepare(index)
+        attempt: &mut ReclaimAttempt,
+    ) -> Result<PreparedFile, BlockError> {
+        assert!(
+            core::ptr::eq(owner.mapping(), self),
+            "file mapping prepare owner changed"
+        );
+        let cached = {
+            let entries = self.index.entries.lock();
+            if entries.closed {
+                return Err(BlockError::QueueStopped);
+            }
+            entries.get(index).map(|node| node.folio.clone())
+        };
+        if let Some(folio) = cached {
+            return Ok(PreparedFile::Cached(folio.with_file_owner(owner.clone())));
+        }
+        attempt.prepare(|| {
+            let folio = FolioRef::allocate().ok_or(BlockError::NoMemory)?;
+            let read = folio
+                .begin_read(0, PAGE_SIZE)?
+                .with_file_owner(owner.clone());
+            let node = Node::prepare(
+                index,
+                folio,
+                Some(owner.downgrade_for_reclaim()),
+                IndexAllocator::Heap,
+            )?;
+            Ok(PreparedFile::New { node, read })
+        })
+    }
+
+    /// caller 重核 EOF 后二查 canonical；None 只表示旧命中已退休，私有输家仍由 caller 锁外结束。
+    pub(crate) fn publish_file(
+        &self,
+        owner: &InodeRef,
+        index: u64,
+        prepared: &mut Option<PreparedFile>,
+    ) -> Result<Option<(FolioRef, Option<FolioRead>)>, BlockError> {
+        assert!(
+            core::ptr::eq(owner.mapping(), self),
+            "file mapping publish owner changed"
+        );
+        let result = {
+            let mut entries = self.index.entries.lock();
+            if entries.closed {
+                return Err(BlockError::QueueStopped);
+            }
+            if let Some(node) = entries.get(index) {
+                match prepared {
+                    Some(PreparedFile::Cached(folio))
+                        if folio.phys_addr() == node.folio.phys_addr() =>
+                    {
+                        let Some(PreparedFile::Cached(folio)) = prepared.take() else {
+                            unreachable!();
+                        };
+                        return Ok(Some((folio, None)));
+                    }
+                    _ => (node.folio.clone(), None),
+                }
+            } else {
+                if !matches!(prepared, Some(PreparedFile::New { .. })) {
+                    return Ok(None);
+                }
+                let PreparedFile::New { node, read } = prepared.take().unwrap() else {
+                    unreachable!();
+                };
+                assert_eq!(node.key, index, "file candidate key changed");
+                assert!(
+                    node.file.as_ref().is_some_and(|key| key.matches(owner)),
+                    "file candidate owner changed"
+                );
+                let folio = node.folio.clone();
+                entries.insert(node);
+                (folio, Some(read))
+            }
+        };
+        Ok(Some((result.0.with_file_owner(owner.clone()), result.1)))
     }
 
     /// 只取得原索引已有页，不填充、读盘或申请节点；调用者保原 inode 到内容检查结束。
@@ -885,6 +1178,14 @@ impl FileMapping {
                 };
             }
         }
+        self.sync_retired(&pages, &tables);
+        drop(pages);
+        drop(tables);
+        unmapped
+    }
+
+    /// 原退休拥有始终覆盖真实全 CPU 同步及既有观察点，调用者随后才析构。
+    fn sync_retired(&self, pages: &ResidentPages, tables: &RetiredTables) {
         #[cfg(feature = "ktest")]
         let hook = self.unmap_hook.lock().clone();
         #[cfg(feature = "ktest")]
@@ -904,9 +1205,113 @@ impl FileMapping {
                 tables.len(),
             );
         }
+        #[cfg(not(feature = "ktest"))]
+        let _ = (pages, tables);
+    }
+
+    /// 普通清洁回收只查有限原来源，先 mkclean/CSD，再按同来源、File 与 PFN 撤叶。
+    /// 私有匿名 COW 保留；任何预算拒尾仍结束已撤叶的 CSD 和真实拥有，不归还原 file 页。
+    fn reclaim_mappings(
+        &self,
+        inode: &InodeRef,
+        node: &Node,
+        folio: &FolioRef,
+        content: &mut FolioContent<'_>,
+        attempt: &mut ReclaimAttempt,
+    ) -> bool {
+        const SOURCES: usize = 32;
+        let start = node
+            .key
+            .checked_mul(PAGE_SIZE as u64)
+            .expect("file reclaim offset overflow");
+        let end = start
+            .checked_add(PAGE_SIZE as u64)
+            .expect("file reclaim end overflow");
+        let mut sources: [Option<Arc<FileRangeData>>; SOURCES] = [const { None }; SOURCES];
+        let mut count = 0;
+        {
+            let ranges = self.ranges.lock();
+            for ((offset, _), weak) in ranges.iter() {
+                if end <= *offset {
+                    break;
+                }
+                if !attempt.rmap() {
+                    return false;
+                }
+                let data = weak
+                    .upgrade()
+                    .expect("registered reclaim source lost owner");
+                if data
+                    .offset
+                    .saturating_add((data.range.end - data.range.start) as u64)
+                    <= start
+                {
+                    continue;
+                }
+                if count == SOURCES {
+                    return false;
+                }
+                sources[count] = Some(data);
+                count += 1;
+            }
+        }
+        for data in sources[..count].iter().flatten() {
+            if !data.private {
+                let (observed, _) = data.domain.mkclean_range(data, start, folio.phys_addr());
+                if observed {
+                    let size = inode
+                        .metadata_snapshot()
+                        .expect("reclaim inode is not loaded")
+                        .size;
+                    let valid = size.saturating_sub(start).min(PAGE_SIZE as u64) as usize;
+                    if valid != 0 {
+                        inode.note_dirty();
+                        content
+                            .mark_prepared_dirty(valid, inode.filesystem().geometry().block_size)
+                            .expect("reclaim prepared dirty range changed");
+                    }
+                }
+            }
+        }
+        sync_all();
+        let (dirty, writeback) = folio.writeback_state();
+        if dirty != 0 || writeback != 0 {
+            return false;
+        }
+        let mut pages = ResidentPages::default();
+        let mut tables = RetiredTables::default();
+        let mut unmapped = 0;
+        let mut complete = true;
+        {
+            let _ranges = self.ranges.lock();
+            for data in sources[..count].iter().flatten() {
+                if !attempt.rmap() {
+                    complete = false;
+                    break;
+                }
+                // SAFETY: 原来源 Arc 保活，其登记/换身份/fork 与本范围锁串行；
+                // 只撤实际 File 后备、同来源及同 PFN，旧原页/表拥有移入退休链，
+                // 下方锁外无条件全 CPU CSD 完成以后才释放；匿名 COW 不匹配。
+                unmapped += unsafe {
+                    data.domain.unmap_file_folio(
+                        data,
+                        start,
+                        folio.phys_addr(),
+                        &mut pages,
+                        &mut tables,
+                    )
+                };
+            }
+        }
+        self.sync_retired(&pages, &tables);
         drop(pages);
-        drop(tables);
-        unmapped
+        let freed_tables = tables.release();
+        attempt.account(ReclaimStats {
+            unmapped,
+            freed_tables,
+            ..ReclaimStats::default()
+        });
+        complete
     }
 
     /// 观察真实撤叶与 CSD 边界，callback 不改变叶或替代硬件同步；旧 callback 锁外释放。
@@ -1100,7 +1505,7 @@ impl FileMapping {
 
     /// 仅摘除无内容锁、Dirty、WB 和外部使用者的静止页。
     pub fn prune_unused(&self) -> usize {
-        self.index.prune_unused()
+        self.index.prune_unused(None)
     }
 
     /// 返回已发表的稀疏节点数。
@@ -1144,12 +1549,6 @@ impl FileMapping {
     ) -> Option<u64> {
         self.index.select_range(start, end, mark, output)
     }
-
-    /// 验收原索引的排序和平衡，不以预期页数替代树中真实结构。
-    #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_validate(&self) -> (usize, u16) {
-        self.index.entries.lock().validate()
-    }
 }
 
 impl Default for FileMapping {
@@ -1161,3 +1560,152 @@ impl Default for FileMapping {
 
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
+
+/// 单一申请先收当前清洁原页，只有没有实际归页时才请求一次原卷有限 WB 值进度。
+pub(crate) fn reclaim_file(attempt: &mut ReclaimAttempt) {
+    let before = attempt.stats();
+    let mut writeback = None;
+    reclaim_pass(attempt, &mut writeback);
+    let after = attempt.stats();
+    if before.freed_file + before.freed_tables < after.freed_file + after.freed_tables {
+        return;
+    }
+    let Some(volume) = writeback else {
+        return;
+    };
+    if !attempt.wait_writeback() {
+        return;
+    }
+    let domain = volume.writeback_domain();
+    let boundary = domain.request_progress(&volume);
+    let progress = domain.wait_progress(boundary);
+    attempt.account(ReclaimStats {
+        submitted_bytes: progress.submitted_bytes as usize,
+        completed_bytes: progress.completed_bytes as usize,
+        io_error: progress.error,
+        ..ReclaimStats::default()
+    });
+    if progress.stopped || progress.error {
+        return;
+    }
+    reclaim_pass(attempt, &mut None);
+}
+
+/// 本轮只走入口队列前缀；老化后的 active 页不在同轮再次隔离，访问及弱失败也耗预算。
+fn reclaim_pass(attempt: &mut ReclaimAttempt, writeback: &mut Option<Arc<Ext4Volume>>) {
+    let (inactive, active) = index::lru_lengths();
+    let aging = active.min(16).min(attempt.scan_remaining());
+    for _ in 0..inactive.min(attempt.scan_remaining() - aging) {
+        if !attempt.can_isolate() {
+            break;
+        }
+        let Some(node) = index::isolate_inactive(attempt) else {
+            continue;
+        };
+        reclaim_node(node, attempt, writeback);
+    }
+    index::age_active(attempt, aging);
+}
+
+/// 隔离同票锁外升级真实 canonical owner；所有 guard 结束后才 putback 或实际最后释放。
+fn reclaim_node(
+    node: NodeRef,
+    attempt: &mut ReclaimAttempt,
+    writeback: &mut Option<Arc<Ext4Volume>>,
+) {
+    let Some(inode) = node.file.as_ref().and_then(|key| key.upgrade()) else {
+        let freed_file = index::putback(node);
+        attempt.account(ReclaimStats {
+            freed_file,
+            ..ReclaimStats::default()
+        });
+        return;
+    };
+    let mapping = inode.mapping();
+    let normal = attempt.mode() == ReclaimMode::Normal;
+    let mut scanner = None;
+    let mut needs_writeback = false;
+    let retired = if normal {
+        (|| {
+            let _scope = ReclaimScope::nofs();
+            let _invalidate = inode.lock_reclaim_invalidate().ok()?;
+            if !mapping.is_canonical(node.key, &node.folio) {
+                return None;
+            }
+            scanner = Some(node.folio.clone().with_file_owner(inode.clone()));
+            let folio = scanner.as_ref().unwrap();
+            let (dirty, wb) = folio.writeback_state();
+            if dirty != 0 || wb != 0 {
+                needs_writeback = true;
+                return None;
+            }
+            let mut content = folio.try_lock_content()?;
+            if !mapping.reclaim_mappings(&inode, &node, folio, &mut content, attempt) {
+                let (dirty, wb) = folio.writeback_state();
+                needs_writeback = dirty != 0 || wb != 0;
+                return None;
+            }
+            let mut entries = mapping.index.entries.lock();
+            if entries.closed
+                || !entries
+                    .get(node.key)
+                    .is_some_and(|current| core::ptr::eq(current, &*node))
+            {
+                return None;
+            }
+            index::with_lru(|| {
+                node.folio.retire_clean(Some(folio), Some(&content), || {
+                    entries
+                        .remove_isolated(node.key)
+                        .expect("reclaim canonical disappeared")
+                })
+            })
+        })()
+    } else {
+        let mut entries = mapping.index.entries.lock();
+        if entries.closed
+            || !entries
+                .get(node.key)
+                .is_some_and(|current| core::ptr::eq(current, &*node))
+        {
+            None
+        } else {
+            index::with_lru(|| {
+                node.folio.retire_clean(None, None, || {
+                    entries
+                        .remove_isolated(node.key)
+                        .expect("cache-only canonical disappeared")
+                })
+            })
+        }
+    };
+    if needs_writeback && writeback.is_none() && inode.filesystem().mode() == AccessMode::ReadWrite
+    {
+        *writeback = Some(Arc::clone(inode.filesystem()));
+    }
+    let mut freed_file = if let Some(retired) = retired {
+        let freed = retired.release();
+        freed + index::release_node(node)
+    } else {
+        index::putback(node)
+    };
+    if let Some(folio) = scanner {
+        freed_file += folio.release();
+    }
+    attempt.account(ReclaimStats {
+        freed_file,
+        ..ReclaimStats::default()
+    });
+}
+
+/// 实际两条 file LRU 的当前长度，不筛目标页、清账或修改状态。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_file_lru() -> (usize, usize) {
+    index::lru_lengths()
+}
+
+/// 返回本架构实际 Node payload 布局，不猜 Arc 控制头或额外预留控制对象。
+#[cfg(feature = "ktest")]
+pub(crate) const fn ktest_node_bytes() -> usize {
+    core::mem::size_of::<Node>()
+}

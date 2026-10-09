@@ -182,6 +182,10 @@ _start:
     bne t0, t1, 991f
     j .Ltruncate_wait
 991:
+    li t1, 'R'
+    bne t0, t1, 991f
+    j .Lreclaim
+991:
     li t1, 'N'
     bne t0, t1, 991f
     j .Lnamespace_dispatch
@@ -208,6 +212,91 @@ _start:
     j .Lnamespace_directories
 991:
     j .Lexit
+
+# /// 两个普通 fork Mm 在不同 VA 保留只读文件叶，私有匿名修改在回收和 refault 后仍可读取。
+.Lreclaim:
+    li s6, 0x49000000
+    li s5, 0x4b000000
+    li s7, 0x4c000000
+    OPEN .Lshared_path, 0, 200
+    mv s0, a0
+    mv a0, s5
+    li a1, 4096
+    li a2, 1
+    li a3, 0x11
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4b000000, 201
+    lbu a0, 0(s5)
+    EXPECT 0x62, 202
+    mv a0, s7
+    li a1, 4096
+    li a2, 3
+    li a3, 0x12
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4c000000, 203
+    li t0, 0xa5
+    sb t0, 0(s7)
+    li s2, 1
+    li a0, 17
+    li a1, 0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    SC 220
+    OK 204
+    beq a0, zero, .Lreclaim_child
+    mv s1, a0
+    sd a0, 16(s6)
+    fence rw, rw
+.Lreclaim_wait_child:
+    lw t0, 8(s6)
+    li t1, 1
+    bltu t0, t1, .Lreclaim_wait_child
+    PHASE 1
+    j .Lreclaim_resume
+.Lreclaim_child:
+    li s2, 0
+    mv a0, s5
+    li a1, 4096
+    SC 215
+    EXPECT 0, 205
+    li s5, 0x4d000000
+    mv a0, s5
+    li a1, 4096
+    li a2, 1
+    li a3, 0x11
+    mv a4, s0
+    li a5, 0
+    SC 222
+    EXPECT 0x4d000000, 206
+    lbu a0, 0(s5)
+    EXPECT 0x62, 207
+    li t0, 1
+    fence rw, rw
+    sw t0, 8(s6)
+.Lreclaim_resume:
+    GATE 1
+    lbu a0, 0(s5)
+    EXPECT 0x62, 208
+    lbu a0, 0(s7)
+    EXPECT 0xa5, 209
+    mv a0, s0
+    SC 57
+    EXPECT 0, 210
+    bne s2, zero, .Lreclaim_parent_done
+    li t0, 2
+    fence rw, rw
+    sw t0, 8(s6)
+    GATE 2
+    j .Lpass
+.Lreclaim_parent_done:
+    PHASE 2
+    GATE 2
+    j .Lwait_child
 
 # /// 源跨坏页只接受 17 字节，零前缀故障、负 pwrite 和定位写均不能改共享位置。
 .Lwrite:

@@ -1,6 +1,6 @@
 //! 明确启动盘选择、普通系统树读取与未挂原盘写入的真实消费者。
 
-use crate::block::{Bio, BlkOperation, IoResult};
+use crate::block::{Bio, BioAllocator, BioMemory, BlkOperation, IoResult};
 use crate::fs::ext4::crc::crc32c;
 use crate::fs::ktest::*;
 use crate::fs::system::{boot_devices, mount_disks, read_summary, BootDevices, FileSummary};
@@ -280,7 +280,7 @@ fn verify_probe(
 
 /// 一页独占原页复用正式 Bio，Write 在移交前按既有 scratch 图样完整初始化。
 fn raw_bio(disk: &Disk, operation: BlkOperation) -> Result<Bio, BlockError> {
-    let mut memory = Vec::new();
+    let mut memory = Vec::new_in(BioAllocator::Heap);
     if operation != BlkOperation::Flush {
         let bytes = disk.limits().logical_block_size as usize;
         if mm::PAGE_SIZE < bytes {
@@ -319,10 +319,7 @@ fn raw_bio(disk: &Disk, operation: BlkOperation) -> Result<Bio, BlockError> {
 }
 
 /// 真实提交并等待 DMA 收权后领回原 memory，错误前缀不被当作完整读写。
-fn raw_io(
-    disk: &DiskRef,
-    operation: BlkOperation,
-) -> Result<(IoResult, Vec<MappedPages>), BlockError> {
+fn raw_io(disk: &DiskRef, operation: BlkOperation) -> Result<(IoResult, BioMemory), BlockError> {
     let bio = raw_bio(disk, operation)?;
     let completion = bio.completion();
     disk.submit_bio(bio);

@@ -2,6 +2,7 @@
 //! 软件修改由 Mm 的 PTE 短锁串行化；硬件槽始终使用原子访问。
 
 use crate::arch;
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::{alloc_pages, OwnedPages, PAGE_SIZE};
 use alloc::boxed::Box;
 use core::mem::size_of;
@@ -45,6 +46,20 @@ impl TableNode {
     /// 在锁外申请并初始化指定层的表页；失败时正常归还此前取得的拥有。
     fn try_new(level: usize) -> Result<Box<Self>, PageTableError> {
         let pages = alloc_pages(0, false).ok_or(PageTableError::NoMemory)?;
+        let mut node =
+            Box::try_new(Self { pages, next: None }).map_err(|_| PageTableError::NoMemory)?;
+        node.initialize(level);
+        Ok(node)
+    }
+
+    /// 明确 fault 中间表物理页共用目标页的回收请求，小节点仍真实返回 NoMemory。
+    fn try_new_reclaim(
+        level: usize,
+        attempt: &mut ReclaimAttempt,
+    ) -> Result<Box<Self>, PageTableError> {
+        let pages = attempt
+            .allocate_pages(0, false)
+            .ok_or(PageTableError::NoMemory)?;
         let mut node =
             Box::try_new(Self { pages, next: None }).map_err(|_| PageTableError::NoMemory)?;
         node.initialize(level);
@@ -128,6 +143,21 @@ impl PreparedTables {
         }
         Ok(prepared)
     }
+
+    /// fault 在原短锁外按同一请求准备目录，不改变通用 try_new 的 NOWAIT 行为。
+    pub(crate) fn try_new_reclaim(
+        count: usize,
+        attempt: &mut ReclaimAttempt,
+    ) -> Result<Self, PageTableError> {
+        if arch::USER_LEVELS - 1 < count {
+            return Err(PageTableError::InvalidRange);
+        }
+        let mut prepared = Self::default();
+        for level in 0..count {
+            prepared.tables[level] = Some(TableNode::try_new_reclaim(level, attempt)?);
+        }
+        Ok(prepared)
+    }
 }
 
 /// 已摘离的私有表页；完成覆盖全部活动 CPU 的同步 TLB 失效后才能在锁外析构。
@@ -143,6 +173,16 @@ impl RetiredTables {
         while let Some(node) = other.owners.pop() {
             self.owners.push(node);
         }
+    }
+
+    /// 调用者已完成所有 CPU 的真实失效，逐个 Drop 原表拥有后才统计归页。
+    pub(crate) fn release(mut self) -> usize {
+        let mut freed = 0;
+        while let Some(node) = self.owners.pop() {
+            drop(node);
+            freed += 1;
+        }
+        freed
     }
 
     /// 观察当前退休链的真实表页数，不从硬件地址重建拥有。

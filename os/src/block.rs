@@ -10,6 +10,7 @@ pub(crate) mod ktest_irq;
 mod ktest_queue;
 #[cfg(feature = "ktest")]
 mod ktest_quota;
+mod reserve;
 mod stop;
 mod submit;
 #[cfg(feature = "ktest")]
@@ -17,6 +18,9 @@ pub(crate) mod tests;
 
 pub use bio::{Bio, BioCompletion};
 pub use disk::{Disk, DiskRef};
+pub(crate) use reserve::{
+    BioAllocator, BioLane, BioLease, BioMemory, BioReserve, MetadataIoContext,
+};
 pub use stop::FsClaim;
 pub use virtio_drivers::device::blk::BlkOperation;
 

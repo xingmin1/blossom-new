@@ -3,10 +3,10 @@
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::marker::{PhantomData, PhantomPinned};
-use core::mem::MaybeUninit;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::{pin, Pin};
 use core::slice;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::arch;
 use crate::block::{BlockError, IoResult};
@@ -20,6 +20,10 @@ use crate::wait::{WaitNode, WaitQueue, Waiter};
 
 const SECTOR_SIZE: usize = 512;
 const SECTORS_PER_PAGE: usize = PAGE_SIZE / SECTOR_SIZE;
+
+const CONTENT_LOCKED: u8 = 1;
+const REFERENCED: u8 = 2;
+const ACTIVATE: u8 = 4;
 
 /// 固定 4KiB 基本页内的 byte 窗口，验证后的起点和长度均可无损保存为 u16。
 #[derive(Clone, Copy)]
@@ -53,7 +57,7 @@ struct FolioShared {
 pub(crate) struct FolioState {
     backing: Option<OwnedPages>,
     shared: UnsafeCell<FolioShared>,
-    locked: AtomicBool,
+    flags: AtomicU8,
     waiters: WaitQueue,
     _pinned: PhantomPinned,
 }
@@ -158,15 +162,12 @@ impl FolioState {
             "removed folio retains references"
         );
         assert!(
-            !self.locked.load(Ordering::Acquire),
+            self.flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0,
             "removed folio retains a content owner"
         );
         let shared = self.shared.get_mut();
         assert_eq!(shared.dirty, 0, "removed folio retains dirty contents");
         assert_eq!(shared.writeback, 0, "removed folio retains writeback");
-        if matches!(&shared.contents, FolioContents::File { .. }) {
-            background::account_file_page(false);
-        }
         self.backing.take().expect("folio backing already removed")
     }
 }
@@ -203,6 +204,12 @@ impl FolioRef {
     /// 为外部元数据页句柄附上真实 Arc 缓存，内部索引不得保存此句柄。
     /// 拥有凭证由 caller 直接移交，不从缓存 payload 地址恢复 Arc。
     pub(crate) fn with_metadata_owner(mut self, owner: Arc<MetadataCache>) -> Self {
+        self.attach_metadata_owner(owner);
+        self
+    }
+
+    /// 原页视图和唯一读入凭证共用真实元数据域身份，内部索引仍无 anchor。
+    fn attach_metadata_owner(&mut self, owner: Arc<MetadataCache>) {
         {
             let usage = self.descriptor.usage();
             assert!(
@@ -223,7 +230,6 @@ impl FolioRef {
             }
             Some(FolioOwner::File(_)) => panic!("folio owner role changed"),
         }
-        self
     }
 
     /// 借用本外部句柄已有的元数据缓存拥有者，视图无需再保存一份等价 Arc。
@@ -270,7 +276,7 @@ impl FolioRef {
                     writeback: 0,
                     file_prepared: 0,
                 }),
-                locked: AtomicBool::new(false),
+                flags: AtomicU8::new(0),
                 waiters: WaitQueue::new(),
                 _pinned: PhantomPinned,
             });
@@ -323,7 +329,7 @@ impl FolioRef {
     /// 检查特定视图的可读性必须使用 range_ready，不能据此忽略失败或部分有效范围。
     pub fn is_ready(&self) -> bool {
         let usage = self.descriptor.usage();
-        if usage.folio().locked.load(Ordering::Acquire) {
+        if usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED != 0 {
             return false;
         }
         match &FolioState::shared(&usage).contents {
@@ -346,14 +352,14 @@ impl FolioRef {
                 FolioContents::File { .. } => return Err(BlockError::Busy),
                 FolioContents::Metadata { .. } => return Err(BlockError::InvalidRange),
             }
-            if state.locked.load(Ordering::Relaxed) {
+            if state.flags.load(Ordering::Relaxed) & CONTENT_LOCKED != 0 {
                 return Err(BlockError::Busy);
             }
             shared.references = shared
                 .references
                 .checked_add(1)
                 .expect("folio reference count overflow");
-            state.locked.store(true, Ordering::Release);
+            state.flags.fetch_or(CONTENT_LOCKED, Ordering::Acquire);
         }
         Ok(FolioRead {
             folio: Self {
@@ -440,7 +446,7 @@ impl FolioRef {
     pub fn range_ready(&self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_range(offset, len)?;
         let usage = self.descriptor.usage();
-        if usage.folio().locked.load(Ordering::Acquire) {
+        if usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED != 0 {
             return Err(BlockError::NotReady);
         }
         FolioState::range_ready(FolioState::shared(&usage), offset, len)
@@ -483,12 +489,12 @@ impl FolioRef {
         let usage = self.descriptor.usage();
         let state = usage.folio();
         let shared = FolioState::shared(&usage);
-        if state.locked.load(Ordering::Relaxed)
+        if state.flags.load(Ordering::Relaxed) & CONTENT_LOCKED != 0
             || matches!(&shared.contents, FolioContents::Metadata { .. }) && shared.writeback != 0
         {
             return None;
         }
-        state.locked.store(true, Ordering::Release);
+        state.flags.fetch_or(CONTENT_LOCKED, Ordering::Acquire);
         Some(FolioContent {
             folio: self,
             locked: true,
@@ -503,7 +509,7 @@ impl FolioRef {
         shared.references == 1
             && shared.dirty == 0
             && shared.writeback == 0
-            && !usage.folio().locked.load(Ordering::Acquire)
+            && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
     }
 
     /// canonical 索引准入只接受没有外部页引用、填充或 WB 的原页，Dirty 由后续同步处理。
@@ -512,7 +518,167 @@ impl FolioRef {
         let shared = FolioState::shared(&usage);
         shared.references == 1
             && shared.writeback == 0
-            && !usage.folio().locked.load(Ordering::Acquire)
+            && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
+    }
+
+    /// 真实读入消费、文件 fault 或 uaccess 标记访问；准备、预读及 WB 不调用。
+    pub(crate) fn mark_accessed(&self) {
+        let _ = self
+            .state()
+            .flags
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |flags| {
+                let access = if flags & REFERENCED == 0 {
+                    REFERENCED
+                } else {
+                    REFERENCED | ACTIVATE
+                };
+                Some(flags | access)
+            });
+    }
+
+    /// 老化只消费访问位，内容锁以及并发新访问均保留原原子协议。
+    pub(crate) fn take_accessed(&self) -> (bool, bool) {
+        let previous = self
+            .state()
+            .flags
+            .fetch_and(!(REFERENCED | ACTIVATE), Ordering::Relaxed);
+        (previous & REFERENCED != 0, previous & ACTIVATE != 0)
+    }
+
+    /// 消费一份真实引用并在实际归还 file 原页后返回一；拥有者在页用途锁外结束。
+    pub(crate) fn release(self) -> usize {
+        let mut this = ManuallyDrop::new(self);
+        let freed = this.put();
+        drop(this.owner.take());
+        freed
+    }
+
+    /// Drop 与显式回收共用最后 put，归页返回以后才记录 file 页账。
+    fn put(&mut self) -> usize {
+        let discarded = {
+            let mut usage = self.descriptor.usage();
+            let shared = FolioState::shared_mut(&mut usage);
+            shared.references = shared
+                .references
+                .checked_sub(1)
+                .expect("folio reference count underflow");
+            if shared.references == 0 {
+                assert_eq!(
+                    shared.dirty, 0,
+                    "last folio reference retains dirty contents"
+                );
+                assert_eq!(
+                    shared.writeback, 0,
+                    "last folio reference retains writeback"
+                );
+                let file = matches!(&shared.contents, FolioContents::File { .. });
+                assert_eq!(
+                    usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED,
+                    0,
+                    "last folio reference retains a content owner"
+                );
+                // SAFETY: 引用归零且无内容锁、Dirty、WB；读入和等待者均自持活引用，
+                // 全部固定投影已结束，take 只原地析构用途，页在退出用途锁后归还。
+                Some((unsafe { usage.take_folio() }, file))
+            } else {
+                None
+            }
+        };
+        if let Some(FolioOwner::Metadata(cache)) = &self.owner {
+            cache.notify_metadata_available();
+        }
+        if let Some((backing, file)) = discarded {
+            drop(backing);
+            if file {
+                background::account_file_page(false);
+            }
+            usize::from(file)
+        } else {
+            0
+        }
+    }
+
+    /// 元数据控制和旧外部凭证已结束后，只有实际源基准才允许重用原页。
+    pub(crate) fn metadata_inventory_available(&self) -> bool {
+        let usage = self.descriptor.usage();
+        let shared = FolioState::shared(&usage);
+        shared.references == 1
+            && matches!(&shared.contents, FolioContents::Metadata { .. })
+            && shared.dirty == 0
+            && shared.writeback == 0
+            && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
+            && self.owner.is_none()
+    }
+
+    /// 原索引基准及可选真实源基准以外没有 Buffer/Read/WB，才准许静止节点摘离。
+    pub(crate) fn index_unused(&self, metadata_baseline: bool, allow_dirty: bool) -> bool {
+        let usage = self.descriptor.usage();
+        let shared = FolioState::shared(&usage);
+        shared.references == 1 + usize::from(metadata_baseline)
+            && (allow_dirty || shared.dirty == 0)
+            && shared.writeback == 0
+            && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
+    }
+
+    /// 在 index→LRU→PageUse 同一最终锁域先核外部拥有，再检查真实 File 清洁状态。
+    /// retire 只摘拥有，不可分配、睡眠或析构；内容 guard 必须属于传入的扫描原引用。
+    pub(crate) fn retire_clean<T>(
+        &self,
+        scanner: Option<&Self>,
+        content: Option<&FolioContent<'_>>,
+        retire: impl FnOnce() -> T,
+    ) -> Option<T> {
+        if scanner.is_some_and(|folio| {
+            !core::ptr::eq(self.descriptor.get_ref(), folio.descriptor.get_ref())
+        }) {
+            return None;
+        }
+        let usage = self.descriptor.usage();
+        let shared = FolioState::shared(&usage);
+        if shared.references != 1 + usize::from(scanner.is_some()) {
+            return None;
+        }
+        let our_content = content.is_some_and(|guard| {
+            guard.locked
+                && core::ptr::eq(self.descriptor.get_ref(), guard.folio.descriptor.get_ref())
+        });
+        if (usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED != 0) != our_content
+            || shared.dirty != 0
+            || shared.writeback != 0
+            || !matches!(
+                &shared.contents,
+                FolioContents::File {
+                    initialized: Some(Ok(_))
+                }
+            )
+        {
+            return None;
+        }
+        Some(retire())
+    }
+
+    /// 源只有基准和本次私有准备者，全部旧责任结束后重设元数据有效与失败范围。
+    pub(crate) fn reset_metadata_inventory(&self) {
+        let content = self
+            .try_lock_content()
+            .expect("metadata inventory acquired a busy folio");
+        let mut usage = self.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        assert_eq!(
+            shared.references, 2,
+            "metadata inventory retains an external owner"
+        );
+        assert_eq!(shared.dirty, 0, "metadata inventory retains dirty contents");
+        assert_eq!(shared.writeback, 0, "metadata inventory retains writeback");
+        match &mut shared.contents {
+            FolioContents::Metadata { valid, errors } => {
+                *valid = 0;
+                *errors = [None; SECTORS_PER_PAGE];
+            }
+            FolioContents::File { .. } => panic!("metadata inventory has a file folio"),
+        }
+        drop(usage);
+        drop(content);
     }
 
     /// 返回实际 512 字节脏范围位图；该快照不代表已经提交或持久化。
@@ -611,39 +777,9 @@ impl Clone for FolioRef {
 }
 
 impl Drop for FolioRef {
-    /// 先 put 原页并结束用途锁，再由字段析构释放内容域拥有者，避免持锁析构整个索引。
-    /// 末引用仍拒绝有内容锁、Dirty 或 WB 的页，不以拥有者退出替代写入责任。
+    /// 最后 put 原页后再结束内容域拥有者；脏、内容锁和 WB 仍须由真实责任者结束。
     fn drop(&mut self) {
-        let discarded = {
-            let mut usage = self.descriptor.usage();
-            let shared = FolioState::shared_mut(&mut usage);
-            shared.references = shared
-                .references
-                .checked_sub(1)
-                .expect("folio reference count underflow");
-            if shared.references == 0 {
-                assert_eq!(
-                    shared.dirty, 0,
-                    "last folio reference retains dirty contents"
-                );
-                assert_eq!(
-                    shared.writeback, 0,
-                    "last folio reference retains writeback"
-                );
-                assert!(
-                    !usage.folio().locked.load(Ordering::Acquire),
-                    "last folio reference retains a content owner"
-                );
-                // SAFETY: 引用归零且无内容锁、Dirty、WB；读入 owner 自持引用，
-                // 等待登记和 guard 均借用活 FolioRef，不能跨越其析构。
-                // 所有固定投影已结束，只原地析构状态，退出用途锁后才归页。
-                Some(unsafe { usage.take_folio() })
-            } else {
-                None
-            }
-        };
-        // 等待者借用一份活引用，读入者另有保页引用；最后引用时二者均已结束。
-        drop(discarded);
+        self.put();
     }
 }
 
@@ -854,7 +990,7 @@ impl FolioContent<'_> {
         assert!(self.locked, "discard without a content guard");
         let mut usage = self.folio.descriptor.usage();
         assert!(
-            usage.folio().locked.load(Ordering::Relaxed),
+            usage.folio().flags.load(Ordering::Relaxed) & CONTENT_LOCKED != 0,
             "discard lost content lock"
         );
         let shared = FolioState::shared_mut(&mut usage);
@@ -1008,10 +1144,10 @@ impl Drop for FolioContent<'_> {
         {
             let usage = self.folio.descriptor.usage();
             assert!(
-                usage.folio().locked.load(Ordering::Relaxed),
+                usage.folio().flags.load(Ordering::Relaxed) & CONTENT_LOCKED != 0,
                 "folio content lock lost"
             );
-            state.locked.store(false, Ordering::Release);
+            state.flags.fetch_and(!CONTENT_LOCKED, Ordering::Release);
         }
         state.waiters.wake_all();
     }
@@ -1149,6 +1285,12 @@ impl FolioRead {
         self
     }
 
+    /// aux 交设备前附原缓存，等待和设备尾部都保活同一 MetadataCache。
+    pub(crate) fn with_metadata_owner(mut self, owner: Arc<MetadataCache>) -> Self {
+        self.folio.attach_metadata_owner(owner);
+        self
+    }
+
     /// 返回仍由本读入者保活的原页地址，DMA 层须维护其自身交权与收权协议。
     pub fn phys_addr(&self) -> usize {
         self.folio.phys_addr()
@@ -1220,7 +1362,7 @@ impl FolioRead {
             let mut usage = self.folio.descriptor.usage();
             let shared = FolioState::shared_mut(&mut usage);
             assert!(
-                state.locked.load(Ordering::Relaxed),
+                state.flags.load(Ordering::Relaxed) & CONTENT_LOCKED != 0,
                 "folio read lost its content lock"
             );
             match &mut shared.contents {
@@ -1253,7 +1395,7 @@ impl FolioRead {
                 }
             }
             self.completed = true;
-            state.locked.store(false, Ordering::Release);
+            state.flags.fetch_and(!CONTENT_LOCKED, Ordering::Release);
         }
         state.waiters.wake_all();
     }

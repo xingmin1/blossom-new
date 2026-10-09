@@ -2,7 +2,7 @@
 
 mod uart;
 
-use super::{Bio, BioCompletion, BlkOperation, Disk, DiskRef, IoResult};
+use super::{Bio, BioAllocator, BioCompletion, BlkOperation, Disk, DiskRef, IoResult};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::{self, DeviceInventory};
 use crate::mm::dma::MappedPages;
@@ -100,7 +100,7 @@ impl Request {
         let mapped = MappedPages::new(pages, 0, unit, BufferDirection::DeviceToDriver)
             .map_err(|_| TestError("IRQ original Read page mapping failed"))?;
         let original = mapped.segment();
-        let mut memory = Vec::new();
+        let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(1)
             .map_err(|_| TestError("IRQ Read owner storage allocation failed"))?;

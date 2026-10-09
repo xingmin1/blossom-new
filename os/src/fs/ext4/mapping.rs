@@ -1,5 +1,6 @@
 //! extent 与传统间接树只在内容借用中解码，树下降和真实 I/O 在借用之外。
 
+use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
 use crate::fs::ext4::allocation::DetachedBlock;
 use crate::fs::ext4::codec::{self, EXTENTS};
@@ -35,11 +36,12 @@ pub(crate) fn map(
     inode: &InodeData,
     logical: u64,
     end: u64,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<BlockMapping, FsError> {
     let mapping = if inode.flags & EXTENTS != 0 {
-        extent_map(volume, inode, logical)?
+        extent_map(volume, inode, logical, context)?
     } else {
-        indirect_map(volume, inode, logical)?
+        indirect_map(volume, inode, logical, context)?
     };
     Ok(match mapping {
         BlockMapping::Mapped { physical, len } => BlockMapping::Mapped {
@@ -62,6 +64,7 @@ fn extent_map(
     volume: &Ext4Volume,
     inode: &InodeData,
     logical: u64,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<BlockMapping, FsError> {
     if (1u64 << 32) <= logical {
         return Err(FsError::Corrupt);
@@ -84,7 +87,10 @@ fn extent_map(
                 }
                 visited[count] = physical;
                 count += 1;
-                let buffer = volume.metadata_block(physical)?;
+                g.validate_blocks(physical, 1)?;
+                let buffer = volume
+                    .metadata_cache()
+                    .get(physical, g.block_size, context)?;
                 step = buffer.with_read(|data| {
                     extent_step(g, inode, data, logical, Some(depth), Some(low), high)
                 })??;
@@ -191,6 +197,7 @@ fn indirect_map(
     volume: &Ext4Volume,
     inode: &InodeData,
     logical: u64,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<BlockMapping, FsError> {
     let g = volume.geometry();
     validate_pointers(g, &inode.block)?;
@@ -226,7 +233,10 @@ fn indirect_map(
             return Err(FsError::Corrupt);
         }
         visited[level] = physical;
-        let buffer = volume.metadata_block(physical)?;
+        g.validate_blocks(physical, 1)?;
+        let buffer = volume
+            .metadata_cache()
+            .get(physical, g.block_size, context)?;
         span /= pointers;
         let index = remaining / span;
         remaining %= span;
@@ -392,7 +402,7 @@ fn empty_mapping(root: [u8; 60]) -> PreparedMapping {
     }
 }
 
-/// 写映射使用与读取相同的格式分支，但不受当前 EOF 限制。
+/// 普通前台写按原读格式准备映射；调用者没有回写停止边界，查询不附 metadata IO context。
 pub(crate) fn prepare(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -408,7 +418,7 @@ pub(crate) fn prepare(
     if limit <= logical {
         return Err(FsError::FileTooLarge);
     }
-    let existing = map(volume, inode, logical, logical + 1)?;
+    let existing = map(volume, inode, logical, logical + 1, None)?;
     let mut prepared = empty_mapping(inode.block);
     if let BlockMapping::Mapped { physical, .. } = existing {
         prepared.physical = physical;
@@ -455,7 +465,7 @@ pub(crate) fn prepare_symlink_mappings(
     prepare_mapping_batch(volume, inode, root, logical_blocks)
 }
 
-/// 为一组连续空洞在一个 prepared tree 上累积映射，不先发表中间根。
+/// 普通目录或符号链接分配在同一预备树累积连续空洞，不继承回写停止边界或发表中间根。
 fn prepare_mapping_batch(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -483,7 +493,8 @@ fn prepare_mapping_batch(
                 volume,
                 inode,
                 block,
-                block.checked_add(1).ok_or(FsError::FileTooLarge)?
+                block.checked_add(1).ok_or(FsError::FileTooLarge)?,
+                None,
             )?,
             BlockMapping::Hole { .. }
         ) {
@@ -837,7 +848,7 @@ fn consolidate_path(
         } else {
             current.physical
         };
-        let release = volume.prepare_detached_block(detached)?;
+        let release = volume.prepare_detached_block(detached, None)?;
         if slot < sibling_slot {
             for entry in sibling.entries {
                 prepared.nodes[level].entries.push(entry);
@@ -867,7 +878,7 @@ fn consolidate_path(
         if index_physical(&prepared.nodes[0].entries[0]) != prepared.nodes[level].physical {
             break;
         }
-        let release = volume.prepare_detached_block(prepared.nodes[level].physical)?;
+        let release = volume.prepare_detached_block(prepared.nodes[level].physical, None)?;
         prepared.nodes[0].entries.clear();
         for index in 0..prepared.nodes[level].entries.len() {
             let entry = prepared.nodes[level].entries[index];
@@ -1173,6 +1184,7 @@ pub(crate) fn prepare_truncate(
     volume: &Ext4Volume,
     inode: &InodeData,
     new_size: u64,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<PreparedTruncate, FsError> {
     volume.require_write(volume.claim())?;
     let g = volume.geometry();
@@ -1205,9 +1217,9 @@ pub(crate) fn prepare_truncate(
     } else if new_size <= inode.size {
         validate_root(g, inode)?;
         if inode.flags & EXTENTS != 0 {
-            prepare_extent_truncate(volume, inode, keep, &mut prepared)?;
+            prepare_extent_truncate(volume, inode, keep, &mut prepared, context)?;
         } else {
-            prepare_indirect_truncate(volume, inode, keep, &mut prepared)?;
+            prepare_indirect_truncate(volume, inode, keep, &mut prepared, context)?;
         }
     }
     prepared.removed_blocks = prepared.retired.len() as u64;
@@ -1220,6 +1232,7 @@ fn retire_data(
     physical: u64,
     count: u64,
     prepared: &mut PreparedTruncate,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
     prepared
         .retired
@@ -1228,7 +1241,7 @@ fn retire_data(
     for block in physical..physical + count {
         prepared
             .retired
-            .push(volume.prepare_detached_data_block(block)?);
+            .push(volume.prepare_detached_data_block(block, context)?);
     }
     Ok(())
 }
@@ -1238,6 +1251,7 @@ fn retire_node(
     volume: &Ext4Volume,
     physical: u64,
     prepared: &mut PreparedTruncate,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
     prepared
         .retired
@@ -1245,7 +1259,7 @@ fn retire_node(
         .map_err(|_| FsError::NoMemory)?;
     prepared
         .retired
-        .push(volume.prepare_detached_block(physical)?);
+        .push(volume.prepare_detached_block(physical, context)?);
     Ok(())
 }
 
@@ -1257,10 +1271,14 @@ fn load_truncate_extent(
     depth: u16,
     low: u64,
     high: u64,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<NodeEdit, FsError> {
     let g = volume.geometry();
     let entries = entry_storage((g.block_size - 12) / 12)?;
-    let buffer = volume.metadata_block(physical)?;
+    g.validate_blocks(physical, 1)?;
+    let buffer = volume
+        .metadata_cache()
+        .get(physical, g.block_size, context)?;
     let mut node = buffer.with_read(|bytes| {
         extent_step(g, inode, bytes, low, Some(depth), Some(low), high)?;
         read_node(bytes, entries)
@@ -1278,6 +1296,7 @@ fn truncate_extent_node(
     keep: u64,
     mut high: u64,
     prepared: &mut PreparedTruncate,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
     if node.depth == 0 {
         while let Some(entry) = node.entries.last().copied() {
@@ -1287,7 +1306,13 @@ fn truncate_extent_node(
                 break;
             }
             let remaining = keep.saturating_sub(start).min(len);
-            retire_data(volume, physical + remaining, len - remaining, prepared)?;
+            retire_data(
+                volume,
+                physical + remaining,
+                len - remaining,
+                prepared,
+                context,
+            )?;
             if remaining == 0 {
                 node.entries.pop();
             } else {
@@ -1304,10 +1329,11 @@ fn truncate_extent_node(
         }
         let low = entry_key(&entry);
         let physical = index_physical(&entry);
-        let mut child = load_truncate_extent(volume, inode, physical, node.depth - 1, low, high)?;
-        truncate_extent_node(volume, inode, &mut child, keep, high, prepared)?;
+        let mut child =
+            load_truncate_extent(volume, inode, physical, node.depth - 1, low, high, context)?;
+        truncate_extent_node(volume, inode, &mut child, keep, high, prepared, context)?;
         if child.entries.is_empty() {
-            retire_node(volume, physical, prepared)?;
+            retire_node(volume, physical, prepared, context)?;
             node.entries.pop();
             node.dirty = true;
             high = low;
@@ -1331,9 +1357,18 @@ fn prepare_extent_truncate(
     inode: &InodeData,
     keep: u64,
     prepared: &mut PreparedTruncate,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
     let mut root = read_node(&inode.block, entry_storage(4)?)?;
-    truncate_extent_node(volume, inode, &mut root, keep, 1u64 << 32, prepared)?;
+    truncate_extent_node(
+        volume,
+        inode,
+        &mut root,
+        keep,
+        1u64 << 32,
+        prepared,
+        context,
+    )?;
     if root.entries.is_empty() {
         root.depth = 0;
         root.max = 4;
@@ -1358,13 +1393,14 @@ fn prepare_extent_truncate(
                 root.depth - 1,
                 entry_key(&entry),
                 1u64 << 32,
+                context,
             )?;
             if 4 < child.entries.len() {
                 break;
             }
             child
         };
-        retire_node(volume, physical, prepared)?;
+        retire_node(volume, physical, prepared, context)?;
         root.entries.clear();
         for entry in child.entries {
             root.entries.push(entry);
@@ -1404,11 +1440,15 @@ fn truncate_indirect_node(
     low: u64,
     keep: u64,
     prepared: &mut PreparedTruncate,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<bool, FsError> {
     let g = volume.geometry();
     let n = g.block_size / 4;
     let span = (n as u64).pow((depth - 1) as u32);
-    let buffer = volume.metadata_block(physical)?;
+    g.validate_blocks(physical, 1)?;
+    let buffer = volume
+        .metadata_cache()
+        .get(physical, g.block_size, context)?;
     let mut pointers = [0u32; 1024];
     buffer.with_read(|bytes| read_truncate_indirect(g, bytes, &mut pointers))??;
     let mut first = n;
@@ -1422,10 +1462,10 @@ fn truncate_indirect_node(
             continue;
         }
         let empty = if depth == 1 {
-            retire_data(volume, child, 1, prepared)?;
+            retire_data(volume, child, 1, prepared, context)?;
             true
         } else {
-            truncate_indirect_node(volume, child, depth - 1, start, keep, prepared)?
+            truncate_indirect_node(volume, child, depth - 1, start, keep, prepared, context)?
         };
         if empty {
             pointers[index] = 0;
@@ -1434,7 +1474,7 @@ fn truncate_indirect_node(
     }
     let empty = pointers[..n].iter().all(|pointer| *pointer == 0);
     if empty {
-        retire_node(volume, physical, prepared)?;
+        retire_node(volume, physical, prepared, context)?;
     } else if first < n {
         prepared
             .indirect
@@ -1451,11 +1491,12 @@ fn prepare_indirect_truncate(
     inode: &InodeData,
     keep: u64,
     prepared: &mut PreparedTruncate,
+    context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
     for slot in (keep.min(12) as usize..12).rev() {
         let physical = u64::from(codec::le32(&inode.block, slot * 4)?);
         if physical != 0 {
-            retire_data(volume, physical, 1, prepared)?;
+            retire_data(volume, physical, 1, prepared, context)?;
             codec::put32(&mut prepared.root, slot * 4, 0);
         }
     }
@@ -1466,7 +1507,7 @@ fn prepare_indirect_truncate(
         let physical = u64::from(codec::le32(&inode.block, (11 + depth) * 4)?);
         if keep < low + span
             && physical != 0
-            && truncate_indirect_node(volume, physical, depth, low, keep, prepared)?
+            && truncate_indirect_node(volume, physical, depth, low, keep, prepared, context)?
         {
             codec::put32(&mut prepared.root, (11 + depth) * 4, 0);
         }

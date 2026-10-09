@@ -4,6 +4,7 @@ use crate::arch::{self, UserAccess, UserContext, UserTrap};
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::*;
 use crate::fs::{DescriptorFlags, FileTable, OpenOptions, SeekFrom};
+use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
 use crate::mm::user_table::PagePermissions;
 use crate::task::UserThread;
@@ -1043,7 +1044,8 @@ pub(crate) mod vm_lifetime {
             expected.len()
         );
         assert!(patterned(&expected, 0));
-        let folio = checked(context, file.file_page(0))?;
+        let mut file_page_attempt = ReclaimAttempt::new();
+        let folio = checked(context, file.file_page(0, &mut file_page_attempt))?;
         let original = folio.phys_addr();
         let mm = vm_image()?;
         mm.map_file(
@@ -1146,8 +1148,11 @@ pub(crate) mod vm_lifetime {
         assert!(bytes.iter().all(|byte| *byte == 0));
         let directory = fixture.open(context, b"/", OpenOptions::default())?;
         let directory_file = checked(context, fixture.table().lookup(directory))?;
+        let mut directory_page_attempt = ReclaimAttempt::new();
         assert_eq!(
-            directory_file.file_page(0).err(),
+            directory_file
+                .file_page(0, &mut directory_page_attempt)
+                .err(),
             Some(FsError::IsDirectory)
         );
         assert_eq!(
@@ -1219,7 +1224,8 @@ pub(crate) mod vm_racing {
         fixture.path.owner.observer().gate.complete();
         fixture.join_vm_user(0)?;
         assert_eq!(mm.read_u64(VM_TARGET), Ok(0));
-        let old = checked(context, file.file_page(1))?;
+        let mut attempt = ReclaimAttempt::new();
+        let old = checked(context, file.file_page(1, &mut attempt))?;
         assert_ne!(mm.mapping(VM_TARGET).unwrap().physical, old.phys_addr());
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         checked(context, old.copy_to(0, &mut bytes).map_err(FsError::from))?;

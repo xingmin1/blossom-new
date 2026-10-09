@@ -146,6 +146,8 @@ _start:
     bne $t0, $t1, 991f
     b .Ltruncate_wait
 991:
+    li.d $t1, 'R'
+    beq $t0, $t1, .Lreclaim
     li.d $t1, 'N'
     beq $t0, $t1, .Lnamespace_dispatch
     b .Lexit
@@ -162,6 +164,91 @@ _start:
     li.d $t1, '6'
     beq $t0, $t1, .Lnamespace_directories
     b .Lexit
+
+# /// 两个普通 fork Mm 在不同 VA 保留只读文件叶，私有匿名修改在回收和 refault 后仍可读取。
+.Lreclaim:
+    li.d $s6, 0x49000000
+    li.d $s5, 0x4b000000
+    li.d $s7, 0x4c000000
+    OPEN .Lshared_path, 0, 200
+    move $s0, $a0
+    move $a0, $s5
+    li.d $a1, 4096
+    li.d $a2, 1
+    li.d $a3, 0x11
+    move $a4, $s0
+    li.d $a5, 0
+    SC 222
+    EXPECT 0x4b000000, 201
+    ld.bu $a0, $s5, 0
+    EXPECT 0x62, 202
+    move $a0, $s7
+    li.d $a1, 4096
+    li.d $a2, 3
+    li.d $a3, 0x12
+    move $a4, $s0
+    li.d $a5, 0
+    SC 222
+    EXPECT 0x4c000000, 203
+    li.d $t0, 0xa5
+    st.b $t0, $s7, 0
+    li.d $s2, 1
+    li.d $a0, 17
+    li.d $a1, 0
+    li.d $a2, 0
+    li.d $a3, 0
+    li.d $a4, 0
+    SC 220
+    OK 204
+    beq $a0, $zero, .Lreclaim_child
+    move $s1, $a0
+    st.d $a0, $s6, 16
+    dbar 0
+.Lreclaim_wait_child:
+    ld.w $t0, $s6, 8
+    li.d $t1, 1
+    bltu $t0, $t1, .Lreclaim_wait_child
+    PHASE 1
+    b .Lreclaim_resume
+.Lreclaim_child:
+    li.d $s2, 0
+    move $a0, $s5
+    li.d $a1, 4096
+    SC 215
+    EXPECT 0, 205
+    li.d $s5, 0x4d000000
+    move $a0, $s5
+    li.d $a1, 4096
+    li.d $a2, 1
+    li.d $a3, 0x11
+    move $a4, $s0
+    li.d $a5, 0
+    SC 222
+    EXPECT 0x4d000000, 206
+    ld.bu $a0, $s5, 0
+    EXPECT 0x62, 207
+    li.d $t0, 1
+    dbar 0
+    st.w $t0, $s6, 8
+.Lreclaim_resume:
+    GATE 1
+    ld.bu $a0, $s5, 0
+    EXPECT 0x62, 208
+    ld.bu $a0, $s7, 0
+    EXPECT 0xa5, 209
+    move $a0, $s0
+    SC 57
+    EXPECT 0, 210
+    bne $s2, $zero, .Lreclaim_parent_done
+    li.d $t0, 2
+    dbar 0
+    st.w $t0, $s6, 8
+    GATE 2
+    b .Lpass
+.Lreclaim_parent_done:
+    PHASE 2
+    GATE 2
+    b .Lwait_child
 
 # /// 源跨坏页只接受 17 字节，零前缀故障、负 pwrite 和定位写均不能改共享位置。
 .Lwrite:
