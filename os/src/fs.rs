@@ -1,5 +1,6 @@
 //! 文件内容、唯一 inode 身份与元数据视图共用原页缓存和块 I/O。
 
+pub(crate) mod background;
 mod dentry;
 pub(crate) mod ext4;
 mod file;
@@ -8,6 +9,7 @@ mod inode;
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
 mod path;
+pub(crate) mod readahead;
 pub(crate) mod system;
 pub(crate) mod writeback;
 

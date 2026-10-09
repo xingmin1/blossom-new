@@ -12,8 +12,12 @@ use crate::block::{
     Bio, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, FsClaim, IoResult, QueueLimits,
     MAX_BATCH, SECTOR_BYTES,
 };
+#[cfg(feature = "ktest")]
+use crate::drivers::virtio::VirtioIdentity;
 use crate::mm::dma::{DmaError, MappedPages};
 use crate::mm::{alloc_pages, FolioRead, FolioWriteback, PAGE_SIZE};
+#[cfg(feature = "ktest")]
+use crate::sync::SpinLock;
 use crate::task;
 
 /// 当前位置只引用父 Bio 的段编号，跨 child 保留游标避免从首页反复扫描。
@@ -56,6 +60,106 @@ struct GenerationPlan {
     splits: usize,
 }
 
+/// 最近一波原页读的真实接受事实；地址只复制数值，不延长页、inode 或 claim 的寿命。
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadBatchSnapshot {
+    pub sequence: u64,
+    pub disk: VirtioIdentity,
+    pub bios: usize,
+    pub multi_page_bios: usize,
+    pub pages: usize,
+    pub accepted_bytes: usize,
+    pub first_sector: u64,
+    /// 只保存本波前三十二个原映射中已完整接受的页，数组有效长度由本字段给出。
+    pub captured_pages: usize,
+    pub phys_addrs: [usize; 32],
+    pub dma_addrs: [u64; 32],
+}
+
+#[cfg(feature = "ktest")]
+static READ_BATCH: SpinLock<Option<ReadBatchSnapshot>> = SpinLock::new(None);
+
+/// 提交前保存原映射地址，提交后只读取原父接受账，设备完成者不访问本诊断存储。
+#[cfg(feature = "ktest")]
+struct ReadBatchObservation {
+    snapshot: ReadBatchSnapshot,
+    parents: [Option<(BioCompletion, usize)>; MAX_BATCH],
+}
+
+#[cfg(feature = "ktest")]
+impl ReadBatchObservation {
+    /// 原 Bio 尚未交设备时复制地址并保有限父观察者，避免与完成者移出 memory 的窗口竞争。
+    fn new(claim: &FsClaim, bios: &[Bio]) -> Self {
+        let mut observed = Self {
+            snapshot: ReadBatchSnapshot {
+                sequence: 0,
+                disk: claim.disk().identity(),
+                bios: 0,
+                multi_page_bios: 0,
+                pages: 0,
+                accepted_bytes: 0,
+                first_sector: bios.first().map_or(0, |bio| bio.inner.sector()),
+                captured_pages: 0,
+                phys_addrs: [0; 32],
+                dma_addrs: [0; 32],
+            },
+            parents: [const { None }; MAX_BATCH],
+        };
+        for (slot, bio) in bios.iter().enumerate() {
+            let pages = bio.inner.segment_count();
+            observed.parents[slot] = Some((bio.completion(), pages));
+            for index in 0..pages {
+                let output = observed.snapshot.captured_pages;
+                if output == observed.snapshot.phys_addrs.len() {
+                    break;
+                }
+                let (physical, offset) = bio
+                    .inner
+                    .ktest_folio_origin(index * PAGE_SIZE)
+                    .expect("read batch original folio missing");
+                assert_eq!(offset, 0, "read batch has a partial folio");
+                observed.snapshot.phys_addrs[output] = physical;
+                observed.snapshot.dma_addrs[output] = bio
+                    .inner
+                    .segment(index)
+                    .expect("read batch DMA segment missing")
+                    .address
+                    .value();
+                observed.snapshot.captured_pages += 1;
+            }
+        }
+        observed
+    }
+
+    /// 只统计实际 driver.submit 接受的完整原页；登记、尝试或失败父不冒充已提交。
+    fn publish(mut self) {
+        let captured = self.snapshot.captured_pages;
+        let mut source = 0;
+        let mut output = 0;
+        for (completion, pages) in IntoIterator::into_iter(self.parents).flatten() {
+            let accepted = completion.test_acceptance().2;
+            let accepted_pages = accepted / PAGE_SIZE;
+            self.snapshot.accepted_bytes += accepted;
+            self.snapshot.bios += usize::from(0 < accepted);
+            self.snapshot.multi_page_bios += usize::from(1 < accepted_pages);
+            self.snapshot.pages += accepted_pages;
+            for page in 0..accepted_pages.min(captured.saturating_sub(source)) {
+                self.snapshot.phys_addrs[output] = self.snapshot.phys_addrs[source + page];
+                self.snapshot.dma_addrs[output] = self.snapshot.dma_addrs[source + page];
+                output += 1;
+            }
+            source += pages;
+        }
+        self.snapshot.captured_pages = output;
+        let mut last = READ_BATCH.lock();
+        self.snapshot.sequence = last
+            .as_ref()
+            .map_or(1, |last| last.sequence.wrapping_add(1));
+        *last = Some(self.snapshot);
+    }
+}
+
 impl FsClaim {
     /// 以本占用提交 FS 请求，Write 仅允许 RW；Read 与设备支持的 Flush 可由 RO 使用。
     /// 接受的请求独立保占用至生成、设备收权、回调及原队列资源的全部尾部结束。
@@ -66,6 +170,120 @@ impl FsClaim {
     /// 显式 FS 批次沿同一原 Bio 准入、有限合并及 split 路径，不另建提交引擎。
     pub fn submit_batch(&self, bios: Vec<Bio>) {
         self.disk().submit_batch_from(bios, Some(self));
+    }
+
+    /// 连续磁盘范围组合多个整页读入凭证，每波最多八父，提交后不逐页等待真实完成。
+    /// 准备拒尾仍提交已有父，所有未交设备的原凭证发布同一个具体准备错误。
+    pub(crate) fn read_folio_batch(
+        &self,
+        ranges: &mut Vec<(u64, FolioRead)>,
+    ) -> Result<(), BlockError> {
+        let mut pending = ranges.drain(..);
+        while pending.len() != 0 {
+            let mut bios = Vec::new();
+            if bios.try_reserve_exact(MAX_BATCH).is_err() {
+                fail_pending_reads(&mut pending, BlockError::NoMemory);
+                return Err(BlockError::NoMemory);
+            }
+            let mut preparation_error = None;
+            for _ in 0..MAX_BATCH {
+                if pending.len() == 0 {
+                    break;
+                }
+                match self.prepare_read_bio(&mut pending) {
+                    Ok((bio, error)) => {
+                        bios.push(bio);
+                        if error.is_some() {
+                            preparation_error = error;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        preparation_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            #[cfg(feature = "ktest")]
+            let observation = ReadBatchObservation::new(self, &bios);
+            self.submit_batch(bios);
+            #[cfg(feature = "ktest")]
+            observation.publish();
+            if let Some(error) = preparation_error {
+                fail_pending_reads(&mut pending, error);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// 只合并整页且物理 byte 相邻的读范围，部分映射准备失败时保留已映射前缀供本波提交。
+    fn prepare_read_bio(
+        &self,
+        pending: &mut alloc::vec::Drain<'_, (u64, FolioRead)>,
+    ) -> Result<(Bio, Option<BlockError>), BlockError> {
+        let byte_offset = pending.as_slice()[0].0;
+        if byte_offset % SECTOR_BYTES != 0 {
+            return Err(BlockError::Misaligned);
+        }
+        let mut end = byte_offset;
+        let mut count = 0;
+        for (offset, read) in pending.as_slice() {
+            if *offset != end {
+                break;
+            }
+            if read.offset() != 0 || read.len() != PAGE_SIZE {
+                break;
+            }
+            end = end
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or(BlockError::InvalidRange)?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut memory = Vec::new();
+        memory
+            .try_reserve_exact(count)
+            .map_err(|_| BlockError::NoMemory)?;
+        let mut preparation_error = None;
+        for _ in 0..count {
+            let (_, read) = pending.next().expect("read batch prefix disappeared");
+            match MappedPages::from_folio(read) {
+                Ok(mapped) => memory.push(mapped),
+                Err((error, read)) => {
+                    let error = map_error(error);
+                    fail_read(read, error);
+                    preparation_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if memory.is_empty() {
+            return Err(preparation_error.expect("empty read batch has no preparation error"));
+        }
+        // SAFETY: 每份 read 独占一个原页内容锁且保原 inode，CPU 初始化别名均已结束。
+        // 连续磁盘范围直接映射这些原页；无回调，Bio 在全部真实 child 和生成者结束后
+        // 才收权并发布各页结果，FS claim 由同一正式准入保存到原队列全尾。
+        let bio = unsafe {
+            Bio::try_new(
+                self.disk(),
+                BlkOperation::Read,
+                byte_offset / SECTOR_BYTES,
+                memory,
+                0,
+                None,
+            )
+        }?;
+        Ok((bio, preparation_error))
+    }
+
+    /// 复制最近本盘读批次的真实接受事实，不等待或控制 I/O，也不保存设备拥有者。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_read_batch_snapshot(&self) -> Option<ReadBatchSnapshot> {
+        let snapshot = *READ_BATCH.lock();
+        snapshot.filter(|snapshot| snapshot.disk == self.disk().identity())
     }
 
     /// 多原页相邻范围共用一个父，每批最多八父，统一通知后观察全部真实尾部。
@@ -179,6 +397,24 @@ impl FsClaim {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+/// 所有这些读入凭证都尚未交设备，逐份结束准确失败责任，不由析构改成取消错误。
+fn fail_pending_reads(pending: &mut alloc::vec::Drain<'_, (u64, FolioRead)>, error: BlockError) {
+    for (_, read) in pending {
+        fail_read(read, error);
+    }
+}
+
+/// 准备失败直接发布原页错误；失败不初始化字节、不零填或重读。
+fn fail_read(mut read: FolioRead, error: BlockError) {
+    // SAFETY: 本凭证从未交设备，CPU 借用已结束；零完成错误不授予任何内容访问。
+    unsafe {
+        read.complete(IoResult {
+            completed: 0,
+            error: Some(error),
+        });
     }
 }
 

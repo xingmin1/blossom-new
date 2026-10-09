@@ -7,7 +7,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::arch;
 use crate::block::{AccessMode, BlockError};
 use crate::fs::ext4::DirectoryCursor;
-use crate::fs::{writeback, DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess};
+#[cfg(feature = "ktest")]
+use crate::fs::readahead::ReadaheadSnapshot;
+use crate::fs::readahead::ReadaheadState;
+use crate::fs::{
+    background, writeback, DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess,
+};
 use crate::mm::space::{Mm, VmError};
 use crate::mm::FolioRef;
 use crate::sync::{SleepMutex, SpinLock};
@@ -245,6 +250,12 @@ pub trait FileLike: Send + Sync {
     /// 按指定位置向接收端交付，不获取或修改共享位置。
     fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError>;
 
+    /// 只复制本打开实例的预读提示，目录没有文件读历史；不取得位置或页内容锁。
+    #[cfg(feature = "ktest")]
+    fn ktest_readahead_snapshot(&self) -> Option<ReadaheadSnapshot> {
+        None
+    }
+
     /// 借用保活挂载与 inode 的完整路径，dirfd 不暴露裸身份。
     fn path(&self) -> &Path;
 
@@ -300,6 +311,7 @@ pub trait FileLike: Send + Sync {
 pub struct InodeFile {
     path: Path,
     cursor: SleepMutex<u64>,
+    readahead: SpinLock<ReadaheadState>,
     flags: AtomicU32,
     write_access: Option<WriteAccess>,
     /// 同一 OFD 的数据与共同元数据错误样本，短锁只覆盖检查与推进。
@@ -358,6 +370,7 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
             let file = Arc::try_new(InodeFile {
                 path,
                 cursor: SleepMutex::new(0),
+                readahead: SpinLock::new(ReadaheadState::new()),
                 flags: AtomicU32::new(flags & !O_TRUNC),
                 write_access: if access != 0 {
                     write_access.take()
@@ -402,16 +415,27 @@ impl FileLike for InodeFile {
     fn read_into(&self, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
         require_read(self.flags())?;
         let mut cursor = self.cursor.lock();
-        let bytes = self.path.inode()?.read_into(*cursor, target)?;
+        let bytes = self
+            .path
+            .inode()?
+            .read_into(*cursor, target, Some(&self.readahead))?;
         // inode 限制交付不超过 size-cursor，EOF 与零长返回零。
         *cursor += bytes as u64;
         Ok(bytes)
     }
 
-    /// 按位置读取唯一 inode 的文件页，不参与共享位置的串行化。
+    /// 按位置读取更新同一 OFD 的短预读提示，不参与共享位置的串行化。
     fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
         require_read(self.flags())?;
-        self.path.inode()?.read_into(offset, target)
+        self.path
+            .inode()?
+            .read_into(offset, target, Some(&self.readahead))
+    }
+
+    /// 观察原 OFD 的提示快照，dup 读取同一状态，独立打开各自保存。
+    #[cfg(feature = "ktest")]
+    fn ktest_readahead_snapshot(&self) -> Option<ReadaheadSnapshot> {
+        Some(self.readahead.lock().snapshot())
     }
 
     /// 由完整路径保活挂载，调用者可克隆此路径作为 dirfd 起点。
@@ -504,7 +528,7 @@ impl FileLike for InodeFile {
         Err(FsError::NotDirectory)
     }
 
-    /// 接受前缀先提交共享位置并释放写入保护，再执行打开时要求的同步；同步错误不回滚前缀。
+    /// 接受前缀先提交位置并放写保护，再完成同步和脏节流；失败不回滚已提交位置。
     fn write_from(&self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
         let flags = self.flags();
         require_write(flags)?;
@@ -529,10 +553,13 @@ impl FileLike for InodeFile {
         }
         drop(cursor);
         sync_written(self, flags, start, bytes)?;
+        if 0 < bytes {
+            background::balance_dirty_pages(&inode);
+        }
         Ok(bytes)
     }
 
-    /// pwrite 不改变共享位置，追加起点由 inode 仲裁，接受前缀在写锁外完成同步。
+    /// pwrite 不取得共享位置，追加由 inode 仲裁，接受前缀在写保护外完成同步和脏节流。
     fn write_at_from(&self, offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
         let flags = self.flags();
         require_write(flags)?;
@@ -550,6 +577,9 @@ impl FileLike for InodeFile {
             source,
         )?;
         sync_written(self, flags, start, bytes)?;
+        if 0 < bytes {
+            background::balance_dirty_pages(&inode);
+        }
         Ok(bytes)
     }
 }

@@ -9,10 +9,12 @@ use crate::task::process::{TaskGraph, WaitEvent, WaitSelector};
 use crate::task::{Credentials, JoinObserver, Placement, TaskId, UserRuntime};
 use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
+mod background;
 mod layout;
 mod lifecycle;
 mod namespace;
 mod preparation;
+mod readahead;
 mod write;
 
 const PROGRAM: &[u8] = b"/test/bin/user-smoke";
@@ -1083,6 +1085,16 @@ pub(crate) fn write_anchor() -> &'static ::ktest::SuiteSlot {
 /// 新名字空间消费者沿唯一 user ELF 锚点进入现有具名测试目录。
 pub(crate) fn namespace_anchor() -> &'static ::ktest::SuiteSlot {
     namespace::anchor()
+}
+
+/// 独立读历史与真实多原页读批次沿现有原生宏注册槽保活。
+pub(crate) fn readahead_anchor() -> &'static ::ktest::SuiteSlot {
+    readahead::reads::__ktest_anchor()
+}
+
+/// 卷级后台进度消费者复用原设备库存与文件测试入口。
+pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
+    background::anchor()
 }
 
 #[ktest::suite(fixture = UserOwner, suite_resources = DeviceInventory, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]

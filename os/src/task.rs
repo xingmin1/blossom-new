@@ -213,6 +213,12 @@ pub(crate) fn test_live_tasks() -> usize {
     LIVE_TASKS.load(Ordering::Relaxed)
 }
 
+/// 读取已分配的真实任务序号总量，含未发表的已分配序号，不代表活任务数或执行栈峰值。
+#[cfg(feature = "ktest")]
+pub(crate) fn test_created_tasks() -> usize {
+    NEXT_ID.load(Ordering::Relaxed) - 1
+}
+
 pub struct JoinHandle {
     id: TaskId,
     join: Arc<JoinState>,

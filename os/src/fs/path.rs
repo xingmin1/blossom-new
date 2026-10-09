@@ -1462,38 +1462,22 @@ impl Vfs {
         Ok(())
     }
 
-    /// 以父视图覆盖点卸载；活路径或子挂载返回 Busy，成功摘除后的复杂释放在锁外。
+    /// 先核活路径和子挂载，再保原挂载锁外同步；同一实例重查通过后才摘表并释放。
     pub fn unmount(&self, covered: &Path) -> Result<(), FsError> {
+        let mount = {
+            let mounts = self.mounts.lock();
+            let position = unmount_position(&mounts, covered, None)?;
+            mounts[position].clone()
+        };
+        mount.volume.sync()?;
         let victim = {
             let mut mounts = self.mounts.lock();
-            if !contains_mount(&mounts, &covered.mount) {
-                return Err(FsError::InvalidOperation);
-            }
-            let position = mounts
-                .iter()
-                .position(|mount| {
-                    mount
-                        .covered
-                        .as_ref()
-                        .is_some_and(|path| path.ptr_eq(covered))
-                })
-                .ok_or(FsError::NotFound)?;
-            let mount = &mounts[position];
-            let has_children = mounts.iter().any(|child| {
-                child
-                    .covered
-                    .as_ref()
-                    .is_some_and(|path| Arc::ptr_eq(&path.mount, mount))
-            });
-            // 目标只有登记表的一份基数引用；每个活 Path 和子挂载各增加一份。
-            // 持锁排除新的向下取得；没有现存 Path 时 Clone 不能凭空制造活引用。
-            if has_children || Arc::strong_count(mount) != 1 {
-                return Err(FsError::Busy);
-            }
+            let position = unmount_position(&mounts, covered, Some(&mount))?;
             mounts.swap_remove(position)
         };
         let volume = victim.volume.clone();
         drop(victim);
+        drop(mount);
         self.dcache.prune_unused();
         self.inodes.prune_unused();
         volume.prune_unused();
@@ -1685,6 +1669,41 @@ fn try_raw_name(name: &[u8]) -> Result<Arc<Vec<u8>>, FsError> {
         .map_err(|_| FsError::NoMemory)?;
     bytes.extend_from_slice(name);
     Arc::try_new(bytes).map_err(|_| FsError::NoMemory)
+}
+
+/// 表锁内检查目标与活引用；held 只表示本次同步期间实际保有的一份原挂载拥有。
+fn unmount_position(
+    mounts: &[Arc<Mount>],
+    covered: &Path,
+    held: Option<&Arc<Mount>>,
+) -> Result<usize, FsError> {
+    if !contains_mount(mounts, &covered.mount) {
+        return Err(FsError::InvalidOperation);
+    }
+    let position = mounts
+        .iter()
+        .position(|mount| {
+            mount
+                .covered
+                .as_ref()
+                .is_some_and(|path| path.ptr_eq(covered))
+        })
+        .ok_or(FsError::NotFound)?;
+    let mount = &mounts[position];
+    if held.is_some_and(|expected| !Arc::ptr_eq(expected, mount)) {
+        return Err(FsError::NotFound);
+    }
+    let has_children = mounts.iter().any(|child| {
+        child
+            .covered
+            .as_ref()
+            .is_some_and(|path| Arc::ptr_eq(&path.mount, mount))
+    });
+    // 登记表和本次显式持有是仅有的基数引用；其余引用各自保一个活 Path 或子挂载。
+    if has_children || Arc::strong_count(mount) != 1 + usize::from(held.is_some()) {
+        return Err(FsError::Busy);
+    }
+    Ok(position)
 }
 
 /// 短锁内按私有挂载实例检查路径属于当前视图，不能仅按后端卷号判断。

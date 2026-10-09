@@ -262,8 +262,12 @@ impl FolioIndex {
         self.entries.lock().len
     }
 
-    /// 同一索引锁中标记当时的有限节点前缀，Dirty/WB取同一原页用途快照。
-    fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
+    /// 单向标记入口有限节点中的限量 Dirty/WB，返回选页数和下一轮起点。
+    /// 扫到范围末尾时续点归零，本轮不回绕；零预算保持原起点。
+    fn mark_to_write_range(&self, start: u64, end: u64, max_pages: usize) -> (usize, u64) {
+        if max_pages == 0 {
+            return (0, start);
+        }
         let mut entries = self.entries.lock();
         let budget = entries.len;
         let mut cursor = start;
@@ -276,6 +280,9 @@ impl FolioIndex {
             if end <= key {
                 break;
             }
+            if selected == max_pages {
+                return (selected, cursor);
+            }
             let (dirty, writeback) = node.folio.writeback_state();
             let pending = dirty != 0 || writeback != 0;
             entries.set_to_write(key, pending);
@@ -285,7 +292,24 @@ impl FolioIndex {
             };
             cursor = next;
         }
-        selected
+        (selected, 0)
+    }
+
+    /// 直接核原页的成对状态，索引锁下不复制脏页名单或等待内容锁。
+    fn has_dirty_or_writeback(&self) -> bool {
+        let entries = self.entries.lock();
+        let mut cursor = 0;
+        while let Some(node) = entries.lower_bound(cursor) {
+            let (dirty, writeback) = node.folio.writeback_state();
+            if dirty != 0 || writeback != 0 {
+                return true;
+            }
+            let Some(next) = node.key.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        false
     }
 
     /// 按半开范围有界选择；ToWrite填满输出片段，检查节点数不超过锁内现存有限数量。
@@ -338,19 +362,20 @@ pub(crate) type MetadataLoadHook = Arc<dyn Fn(&Arc<MetadataCache>, u64, usize) +
 /// Disk 弱反向槽取得同一物理元数据域；外部视图保留本缓存和真实 FS 占用。
 pub struct MetadataCache {
     index: FolioIndex,
-    // 卷弱关联只协调同一 FS 实例的取得；卷持缓存，不形成强环。
+    // 卷弱关联用于取得同一 FS 实例和标脏通知；卷持缓存，不形成强环。
     pub(crate) filesystem: SleepMutex<Weak<Ext4Volume>>,
     // 静止索引与弱关联先析构，最后一份 FS 占用才允许 raw writer 进入。
     claim: FsClaim,
-    writeback: SleepMutex<()>,
+    // 锁内保存下轮后台扫描的物理页 byte key，显式同步不改变它。
+    writeback: SleepMutex<u64>,
     wb_error: SpinLock<WritebackError>,
     #[cfg(feature = "ktest")]
     load_hook: SpinLock<Option<MetadataLoadHook>>,
 }
 
 impl MetadataCache {
-    /// 只串行共同元数据阶段的范围选择及完成，不覆盖文件数据 IO。
-    pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, ()> {
+    /// 串行共同元数据范围选择及完成，并保护后台续扫位置，不覆盖文件数据 IO。
+    pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, u64> {
         self.writeback.lock()
     }
 
@@ -384,7 +409,7 @@ impl MetadataCache {
             claim: claim.clone(),
             index: FolioIndex::new(Some(capacity), true),
             filesystem: SleepMutex::new(Weak::new()),
-            writeback: SleepMutex::new(()),
+            writeback: SleepMutex::new(0),
             wb_error: SpinLock::new(WritebackError::new()),
             #[cfg(feature = "ktest")]
             load_hook: SpinLock::new(None),
@@ -498,9 +523,24 @@ impl MetadataCache {
             .set_to_write(byte_offset, selected);
     }
 
-    /// 持本缓存扫描互斥时选定半开物理 byte key 范围内的原节点，不纳入后来插入页。
+    /// 持本缓存扫描互斥时选定入口的有限元数据集合，完整同步不限制页数。
     pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
-        self.index.mark_to_write_range(start, end)
+        self.index.mark_to_write_range(start, end, usize::MAX).0
+    }
+
+    /// 后台只为最多 max_pages 个原节点建立 ToWrite，并返回下轮单向续扫位置。
+    pub(crate) fn mark_to_write_budget(
+        &self,
+        start: u64,
+        end: u64,
+        max_pages: usize,
+    ) -> (usize, u64) {
+        self.index.mark_to_write_range(start, end, max_pages)
+    }
+
+    /// 检查共同元数据原页是否仍有实际 Dirty 或 WB 义务。
+    pub(crate) fn has_dirty_or_writeback(&self) -> bool {
+        self.index.has_dirty_or_writeback()
     }
 
     /// 按物理 byte key 有界取得真实元数据页，调用者保持本缓存到全部消费结束。
@@ -584,6 +624,7 @@ impl BufferRef {
 
     /// 同 Disk 的 RW 授权只修改准确视图，Dirty 在字节修改之前记录，已有 WB 不被清除。
     /// 闭包不得等待或用户复制；相邻 inode 记录与校验和在同一真实内容锁内保持一致。
+    /// 普通 Task 在内容锁释放后通知所属卷，通知期间不保留卷弱关联锁。
     pub fn update<T>(
         &self,
         claim: &FsClaim,
@@ -602,8 +643,15 @@ impl BufferRef {
         ) {
             return Err(BlockError::InvalidRange);
         }
-        let mut content = self.folio.lock_content();
-        Ok(update(content.metadata_bytes_mut(self.offset, self.len)?))
+        let result = {
+            let mut content = self.folio.lock_content();
+            update(content.metadata_bytes_mut(self.offset, self.len)?)
+        };
+        let volume = cache.filesystem.lock().upgrade();
+        if let Some(volume) = volume {
+            volume.writeback_domain().notify_dirty(&volume);
+        }
+        Ok(result)
     }
 
     /// 实际块树摘离节点后失效本窗口，等待原页 WB 收权而不影响同页其他元数据块。
@@ -728,15 +776,16 @@ pub(crate) enum FileUnmapPhase {
 pub struct FileMapping {
     index: FolioIndex,
     ranges: SpinLock<Vec<((u64, usize), Weak<FileRangeData>)>>,
-    writeback: SleepMutex<()>,
+    // 锁内保存下轮后台扫描的文件页号，显式同步不改变它。
+    writeback: SleepMutex<u64>,
     wb_error: SpinLock<WritebackError>,
     #[cfg(feature = "ktest")]
     unmap_hook: SpinLock<Option<Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>>>,
 }
 
 impl FileMapping {
-    /// 串行同一 inode 的同步扫描与完成，不排斥其他 inode 数据 IO。
-    pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, ()> {
+    /// 串行同一 inode 的同步扫描与完成，并保护后台续扫位置，不排斥其他 inode IO。
+    pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, u64> {
         self.writeback.lock()
     }
 
@@ -757,19 +806,7 @@ impl FileMapping {
 
     /// 在原索引短锁下检查实际页义务，不复制状态或等待内容锁。
     pub(crate) fn has_dirty_or_writeback(&self) -> bool {
-        let entries = self.index.entries.lock();
-        let mut cursor = 0;
-        while let Some(node) = entries.lower_bound(cursor) {
-            let (dirty, writeback) = node.folio.writeback_state();
-            if dirty != 0 || writeback != 0 {
-                return true;
-            }
-            let Some(next) = node.key.checked_add(1) else {
-                break;
-            };
-            cursor = next;
-        }
-        false
+        self.index.has_dirty_or_writeback()
     }
 
     /// 建立无预留节点的唯一文件页索引，miss 的真实内存不足由节点和页申请返回。
@@ -777,7 +814,7 @@ impl FileMapping {
         Self {
             index: FolioIndex::new(None, false),
             ranges: SpinLock::new(Vec::new()),
-            writeback: SleepMutex::new(()),
+            writeback: SleepMutex::new(0),
             wb_error: SpinLock::new(WritebackError::new()),
             #[cfg(feature = "ktest")]
             unmap_hook: SpinLock::new(None),
@@ -882,7 +919,7 @@ impl FileMapping {
         drop(previous);
     }
 
-    /// 在正式截断协议下摘除完整尾页并清零部分尾页，旧对象永不重新插回索引。
+    /// 在正式截断协议下附实际 inode 后清理原页，删除义务与本卷页账在同次状态转换中退出。
     ///
     /// # Safety
     /// 调用者须持同 inode 写序列化、invalidate 独占及本 mapping 的 WB 互斥，
@@ -892,9 +929,14 @@ impl FileMapping {
     /// 部分保留 FS 块的盘上尾零由文件系统负责，删除义务不能当作回写成功。
     pub(crate) unsafe fn truncate_pages(
         &self,
+        inode: &InodeRef,
         new_size: u64,
         block_size: usize,
     ) -> Result<(), FsError> {
+        assert!(
+            core::ptr::eq(inode.mapping(), self),
+            "truncate mapping owner changed"
+        );
         if !matches!(block_size, 1024 | 2048 | 4096) {
             return Err(FsError::InvalidOperation);
         }
@@ -907,6 +949,7 @@ impl FileMapping {
                     .map(|node| (node.key, node.folio.clone()))
             };
             let Some((index, folio)) = next else { break };
+            let folio = folio.with_file_owner(inode.clone());
             let mut content = folio.lock_content();
             folio.wait_writeback();
             let start = index
@@ -941,6 +984,7 @@ impl FileMapping {
             entries.get(index).map(|node| node.folio.clone())
         };
         if let Some(folio) = folio {
+            let folio = folio.with_file_owner(inode.clone());
             let mut content = folio.lock_content();
             folio.wait_writeback();
             self.mkclean(index, &folio, &mut content);
@@ -1074,9 +1118,19 @@ impl FileMapping {
         self.index.entries.lock().set_to_write(index, selected);
     }
 
-    /// 持同 inode 扫描互斥时选定半开页 index 范围，包含已有 WB 而不复制页状态。
+    /// 持同 inode 扫描互斥时选定入口完整集合，显式同步保留原半开范围。
     pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
-        self.index.mark_to_write_range(start, end)
+        self.index.mark_to_write_range(start, end, usize::MAX).0
+    }
+
+    /// 后台最多标记 max_pages 个原节点，并返回下轮单向续扫位置。
+    pub(crate) fn mark_to_write_budget(
+        &self,
+        start: u64,
+        end: u64,
+        max_pages: usize,
+    ) -> (usize, u64) {
+        self.index.mark_to_write_range(start, end, max_pages)
     }
 
     /// 锁内只选有界范围和增加原引用；返回值是下一次有界扫描起点。

@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch;
 use crate::block::{BlockError, IoResult};
 use crate::cache::MetadataCache;
+use crate::fs::background::{self, WritebackDomain};
 use crate::fs::InodeRef;
 use crate::mm::page::{PageDesc, PageUseGuard};
 use crate::mm::{alloc_pages, pages, OwnedPages, PAGE_SIZE};
@@ -93,6 +94,9 @@ pub struct FolioWriteback {
     len: u16,
     completed: bool,
     original_dirty: u8,
+    /// 实际提交者附卷统计拥有，元数据完成无需在 IRQ 升级卷的弱引用。
+    writeback_domain: Option<Arc<WritebackDomain>>,
+    background: bool,
 }
 
 /// 普通 Task 借用的内容锁；文件页仅可原始复制，元数据页才可借用初始化范围。
@@ -160,6 +164,9 @@ impl FolioState {
         let shared = self.shared.get_mut();
         assert_eq!(shared.dirty, 0, "removed folio retains dirty contents");
         assert_eq!(shared.writeback, 0, "removed folio retains writeback");
+        if matches!(&shared.contents, FolioContents::File { .. }) {
+            background::account_file_page(false);
+        }
         self.backing.take().expect("folio backing already removed")
     }
 }
@@ -248,6 +255,7 @@ impl FolioRef {
         if backing.order() != 0 {
             return Err(backing);
         }
+        let file_role = matches!(&contents, FolioContents::File { .. });
         let descriptor = pages()
             .get(backing.phys_addr() / PAGE_SIZE)
             .expect("folio PFN has no descriptor");
@@ -266,6 +274,9 @@ impl FolioRef {
                 waiters: WaitQueue::new(),
                 _pinned: PhantomPinned,
             });
+            if file_role {
+                background::account_file_page(true);
+            }
         }
         // SAFETY: 生产 PageMap 在独占元数据 RAM 中一次发布，描述符永久有效
         // 且不再移动；此 Pin 只借用描述符，活 folio 用途的固定由私有投影协议保证。
@@ -541,6 +552,33 @@ impl FolioRef {
         }
     }
 
+    /// 用途锁内只作原子转移，本卷账取真实外部 File owner，不取得调度锁。
+    fn account_state(&self, old_dirty: u8, old_wb: u8, shared: &FolioShared) {
+        background::account_folio(old_dirty, shared.dirty, old_wb, shared.writeback);
+        if let Some(FolioOwner::File(inode)) = &self.owner {
+            inode.filesystem().writeback_domain().account_folio(
+                old_dirty,
+                shared.dirty,
+                old_wb,
+                shared.writeback,
+            );
+        }
+    }
+
+    /// 用途锁外重报可见脏义务；只有可能减轻压力时唤醒 writer，新 Dirty 不制造空唤醒。
+    fn notify_dirty_state(&self, relieved: bool) {
+        if let Some(FolioOwner::File(inode)) = &self.owner {
+            let volume = inode.filesystem();
+            let domain = volume.writeback_domain();
+            if self.dirty_sectors() != 0 {
+                domain.notify_dirty(volume);
+            }
+            if relieved {
+                domain.wake_writers();
+            }
+        }
+    }
+
     /// 在用途短锁内定位状态，再投影绑定本活引用的共享 Pin，不将锁带入 IO 或等待。
     fn state(&self) -> Pin<&FolioState> {
         let pointer = {
@@ -668,7 +706,12 @@ impl FolioContent<'_> {
         }
         let end = valid_bytes.div_ceil(block_size) * block_size;
         FolioState::range_ready(shared, 0, end)?;
+        let old_dirty = shared.dirty;
         shared.dirty |= shared.file_prepared & sector_mask(0, end);
+        self.folio
+            .account_state(old_dirty, shared.writeback, shared);
+        drop(usage);
+        self.folio.notify_dirty_state(false);
         Ok(())
     }
 
@@ -722,12 +765,17 @@ impl FolioContent<'_> {
         let keep = sector_mask(0, retained);
         let mut usage = self.folio.descriptor.usage();
         let shared = FolioState::shared_mut(&mut usage);
+        let old_dirty = shared.dirty;
         shared.dirty &= keep;
         shared.file_prepared &= keep;
         if valid % block_size != 0 {
             let start = valid / block_size * block_size;
             shared.dirty |= shared.file_prepared & sector_mask(start, block_size);
         }
+        self.folio
+            .account_state(old_dirty, shared.writeback, shared);
+        drop(usage);
+        self.folio.notify_dirty_state(true);
         Ok(())
     }
 
@@ -811,6 +859,7 @@ impl FolioContent<'_> {
         );
         let shared = FolioState::shared_mut(&mut usage);
         assert_eq!(shared.writeback, 0, "discard retains writeback");
+        let old_dirty = shared.dirty;
         // 本 guard 独占内容锁，初始化 owner 无法同时存在；设备尾部与外部
         // 映射失效仍由 caller 证明，状态清除不能取消任何已接受的访问责任。
         match &mut shared.contents {
@@ -822,6 +871,10 @@ impl FolioContent<'_> {
         }
         shared.dirty = 0;
         shared.file_prepared = 0;
+        self.folio
+            .account_state(old_dirty, shared.writeback, shared);
+        drop(usage);
+        self.folio.notify_dirty_state(true);
     }
 
     /// 在真实元数据删除协议下失效准确窗口，保留同页其他块的内容与义务。
@@ -852,7 +905,10 @@ impl FolioContent<'_> {
         };
         *valid &= !mask;
         errors[offset / SECTOR_SIZE..(offset + len) / SECTOR_SIZE].fill(None);
+        let old_dirty = shared.dirty;
         shared.dirty &= !mask;
+        self.folio
+            .account_state(old_dirty, shared.writeback, shared);
         Ok(())
     }
 
@@ -899,8 +955,15 @@ impl FolioContent<'_> {
             }
             FolioState::range_ready(shared, offset, len)?;
             original_dirty = shared.dirty & mask;
+            let old_dirty = shared.dirty;
+            let old_wb = shared.writeback;
             shared.writeback |= mask;
             shared.dirty &= !mask;
+            self.folio.account_state(old_dirty, old_wb, shared);
+        }
+        background::note_writeback_start();
+        if let Some(FolioOwner::File(inode)) = &self.folio.owner {
+            inode.filesystem().writeback_domain().note_writeback_start();
         }
         Ok(Some(FolioWriteback {
             folio,
@@ -908,6 +971,8 @@ impl FolioContent<'_> {
             len: len as u16,
             completed: false,
             original_dirty,
+            writeback_domain: None,
+            background: false,
         }))
     }
 
@@ -923,7 +988,12 @@ impl FolioContent<'_> {
         {
             return Err(BlockError::Busy);
         }
+        let old_dirty = shared.dirty;
         shared.dirty |= mask;
+        self.folio
+            .account_state(old_dirty, shared.writeback, shared);
+        drop(usage);
+        self.folio.notify_dirty_state(false);
         Ok(())
     }
 }
@@ -948,6 +1018,20 @@ impl Drop for FolioContent<'_> {
 }
 
 impl FolioWriteback {
+    /// 为卷提交的凭证附真实统计域，后台标志只区分当前有限轮次的完成账。
+    pub(crate) fn with_writeback_domain(
+        mut self,
+        domain: &Arc<WritebackDomain>,
+        background: bool,
+    ) -> Self {
+        if !matches!(&self.folio.owner, Some(FolioOwner::File(_))) {
+            domain.note_writeback_start();
+        }
+        self.writeback_domain = Some(domain.clone());
+        self.background = background;
+        self
+    }
+
     /// 借用本轮仍保活的原页地址，只用于有界设备映射。
     pub(crate) fn phys_addr(&self) -> usize {
         self.folio.phys_addr()
@@ -1002,6 +1086,24 @@ impl FolioWriteback {
                 }
             }
             self.finish(accepted);
+            if 0 < accepted {
+                background::note_completion(accepted, result.completed);
+                if let Some(FolioOwner::File(inode)) = &self.folio.owner {
+                    inode.filesystem().writeback_domain().note_completion(
+                        accepted,
+                        result.completed,
+                        error.map(Into::into),
+                    );
+                } else if let Some(domain) = &self.writeback_domain {
+                    domain.note_completion(accepted, result.completed, error.map(Into::into));
+                }
+                if self.background {
+                    self.writeback_domain
+                        .as_ref()
+                        .expect("background writeback has no domain")
+                        .note_round_io(accepted, result.completed);
+                }
+            }
         }
     }
 
@@ -1018,11 +1120,15 @@ impl FolioWriteback {
             let mut usage = self.folio.descriptor.usage();
             let shared = FolioState::shared_mut(&mut usage);
             assert_eq!(shared.writeback & mask, mask, "folio writeback range lost");
+            let old_dirty = shared.dirty;
+            let old_wb = shared.writeback;
             shared.dirty |= self.original_dirty & unaccepted;
             shared.writeback &= !mask;
+            self.folio.account_state(old_dirty, old_wb, shared);
             self.completed = true;
         }
         state.waiters.wake_all();
+        self.folio.notify_dirty_state(accepted == 0);
     }
 }
 

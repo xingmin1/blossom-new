@@ -15,11 +15,13 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU32, Ordering};
+use spin::Once;
 
-use crate::block::{AccessMode, Disk, DiskRef, FsClaim, IoResult, SECTOR_BYTES};
+use crate::block::{AccessMode, BlockError, Disk, DiskRef, FsClaim, IoResult, SECTOR_BYTES};
 use crate::cache::{BufferRef, MetadataCache};
+use crate::fs::background::WritebackDomain;
 use crate::fs::inode::{InodeDomain, InodeMetadata, InodeRef};
-use crate::fs::FsError;
+use crate::fs::{writeback, FsError};
 use crate::mm::{FolioRead, PAGE_SIZE};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
@@ -177,6 +179,7 @@ pub struct Ext4Volume {
     geometry: Geometry,
     claim: FsClaim,
     inode_domain: SpinLock<Weak<InodeDomain>>,
+    writeback: Once<Arc<WritebackDomain>>,
     rename: SleepMutex<()>,
     allocation: SleepMutex<()>,
     groups: Vec<allocation::GroupLayout>,
@@ -193,6 +196,7 @@ impl Ext4Volume {
     /// 同 Disk 活缓存的容量须完全相同；不同活 inode 缓存域由真实 token 明确拒绝。
     /// 卷反向只存 Weak，外部文件页保 inode，元数据页保 cache；两者保持原占用。
     /// 加载失败不发表卷弱引用，局部 claim 与候选按 RAII 退出，不取消外部旧拥有。
+    /// 候选在锁外完成元数据与回写准备，弱索引短锁只负责双查和发表。
     pub fn open(
         disk: DiskRef,
         mode: AccessMode,
@@ -200,8 +204,8 @@ impl Ext4Volume {
     ) -> Result<Arc<Self>, FsError> {
         let claim = Disk::claim_fs(&disk, mode)?;
         let metadata = MetadataCache::shared(&claim, metadata_capacity)?;
-        let mut published = metadata.filesystem.lock();
-        if let Some(volume) = published.upgrade() {
+        let existing = metadata.filesystem.lock().upgrade();
+        if let Some(volume) = existing {
             if volume.mode() != mode {
                 return Err(FsError::Busy);
             }
@@ -237,6 +241,7 @@ impl Ext4Volume {
             geometry,
             claim,
             inode_domain: SpinLock::new(Weak::new()),
+            writeback: Once::new(),
             rename: SleepMutex::new(()),
             allocation: SleepMutex::new(()),
             groups: Vec::new(),
@@ -259,7 +264,19 @@ impl Ext4Volume {
             volume.groups.push(layout);
         }
         let volume = Arc::try_new(volume).map_err(|_| FsError::NoMemory)?;
-        *published = Arc::downgrade(&volume);
+        let writeback = WritebackDomain::try_new(&volume)?;
+        volume.writeback.call_once(|| writeback);
+        let mut published = metadata.filesystem.lock();
+        if let Some(existing) = published.upgrade() {
+            drop(published);
+            if existing.mode() != mode {
+                return Err(FsError::Busy);
+            }
+            return Ok(existing);
+        }
+        let retired = core::mem::replace(&mut *published, Arc::downgrade(&volume));
+        drop(published);
+        drop(retired);
         Ok(volume)
     }
 
@@ -278,14 +295,43 @@ impl Ext4Volume {
         &self.claim
     }
 
+    /// 借用发表前预备的卷回写服务，异步票独立保本卷到实际工作尾。
+    pub(crate) fn writeback_domain(&self) -> &Arc<WritebackDomain> {
+        self.writeback
+            .get()
+            .expect("published filesystem has no writeback domain")
+    }
+
+    /// 同步入口所见的有限 inode 集合及共同元数据；不追逐后继新写，首错保留。
+    pub(crate) fn sync(&self) -> Result<(), FsError> {
+        if self.mode() == AccessMode::ReadOnly {
+            return Ok(());
+        }
+        let mut result = Ok(());
+        let limit = self.dirty_inode_limit();
+        for position in 0..limit {
+            if let Some(inode) = self.dirty_inode_at(position) {
+                let current = writeback::sync_inode(&inode);
+                if current == Err(FsError::Io(BlockError::StopUnconfirmed)) {
+                    return current;
+                }
+                result = result.and(current);
+            }
+        }
+        result.and(writeback::sync_metadata(self))
+    }
+
     /// 正式回写借用同 Disk 的唯一元数据索引，不建立第二个设备内容域。
     pub fn metadata_cache(&self) -> &Arc<MetadataCache> {
         &self.metadata
     }
 
     /// 同一活卷只允许一个 inode 缓存域，旧 inode/外部文件页保留域身份时拒绝冲突。
-    /// 反向仅存 Weak，cache 和 inode 的真实拥有退出后可由新域取得。
-    pub(crate) fn bind_inode_domain(&self, candidate: &Arc<InodeDomain>) -> Result<(), FsError> {
+    /// 反向仅存 Weak；先按卷绑定锁到域索引的次序取得实际卷拥有，再开放并发表新绑定。
+    pub(crate) fn bind_inode_domain(
+        self: &Arc<Self>,
+        candidate: &Arc<InodeDomain>,
+    ) -> Result<(), FsError> {
         let retired = {
             let mut domain = self.inode_domain.lock();
             if let Some(previous) = domain.upgrade() {
@@ -294,6 +340,8 @@ impl Ext4Volume {
                 drop(previous);
                 return if same { Ok(()) } else { Err(FsError::Busy) };
             }
+            candidate.bind_volume(self)?;
+            self.writeback_domain().activate();
             core::mem::replace(&mut *domain, Arc::downgrade(candidate))
         };
         drop(retired);

@@ -18,8 +18,9 @@ use crate::fs::ext4::{
     InodeKind, InodeTime, PreparedDirectoryEdit, PreparedDirectoryMappings, PreparedInodeMapping,
     PreparedInodeRelease, UnpublishedInode,
 };
+use crate::fs::readahead::{self, ReadaheadState};
 use crate::fs::writeback;
-use crate::fs::{FsError, ReadBuffer, WriteBuffer};
+use crate::fs::{background, FsError, ReadBuffer, WriteBuffer};
 use crate::mm::folio::FolioContent;
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::sched;
@@ -54,6 +55,8 @@ struct InodeIndex {
     /// 活视图唯一共享的有限名字索引，失去最后拥有后可重新选择预算。
     dentry_cache: Weak<DentryCache>,
     slots: Vec<Option<InodeSlot>>,
+    /// 每个实际绑定卷保留至域关闭后的同步停止；容量与 canonical 槽预算相同。
+    volumes: Vec<Arc<Ext4Volume>>,
     cache_open: bool,
     evicted: usize,
     /// 同一索引锁内预留的 Work 发表责任，归零前不能宣布整个域已退场。
@@ -103,7 +106,7 @@ fn root_slot_position(index: &InodeIndex, inode: &InodeRef) -> usize {
 static EVICTION_QUEUE: Once<WorkQueue> = Once::new();
 /// 失败的删除义务由独立服务强持，链上节点不反向拥有服务或自身。
 static FAILED_EVICTIONS: SpinLock<Option<Arc<InodeDomain>>> = SpinLock::new(None);
-/// BSP 在原共享 pool 准备后、发布服务运行许可之前准备具体 inode 回收域。
+/// BSP 在原共享 pool 准备后、发布运行许可之前准备 inode 回收和卷回写服务。
 pub(crate) fn initialize_inode_eviction() -> Result<(), FsError> {
     assert!(
         EVICTION_QUEUE.get().is_none(),
@@ -116,21 +119,26 @@ pub(crate) fn initialize_inode_eviction() -> Result<(), FsError> {
     })
     .map_err(|_| FsError::NoMemory)?;
     EVICTION_QUEUE.call_once(|| queue);
-    Ok(())
+    background::initialize()
 }
 
 impl InodeDomain {
-    /// 缓存发表之前准备固定 canonical 槽和单个 Work，提交与最后 put 不再分配。
+    /// 缓存发表之前准备同预算的 canonical 槽、卷绑定和单个 Work，提交与最后 put 不再分配。
     fn try_new(capacity: usize) -> Result<Arc<Self>, FsError> {
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(capacity)
             .map_err(|_| FsError::NoMemory)?;
         slots.resize_with(capacity, || None);
+        let mut volumes = Vec::new();
+        volumes
+            .try_reserve_exact(capacity)
+            .map_err(|_| FsError::NoMemory)?;
         let domain = Arc::try_new(Self {
             index: SpinLock::new(InodeIndex {
                 dentry_cache: Weak::new(),
                 slots,
+                volumes,
                 cache_open: true,
                 evicted: 0,
                 dispatching: 0,
@@ -152,6 +160,43 @@ impl InodeDomain {
         .map_err(|_| FsError::NoMemory)?;
         domain.work.call_once(|| work);
         Ok(domain)
+    }
+
+    /// 调用者持卷绑定锁且已确认旧域退出；预算不足时不取得卷拥有或开放回写服务。
+    pub(crate) fn bind_volume(&self, volume: &Arc<Ext4Volume>) -> Result<(), FsError> {
+        let mut index = self.index.lock();
+        if !index.cache_open {
+            return Err(FsError::Busy);
+        }
+        if index.volumes.len() == index.slots.len() {
+            return Err(FsError::NoMemory);
+        }
+        index.volumes.push(volume.clone());
+        Ok(())
+    }
+
+    /// 回收 Work 在 Task 中停止已关闭域的无槽卷，活 inode 和失败槽继续保留各自卷绑定。
+    fn retire_volumes(&self) {
+        loop {
+            let volume = {
+                let mut index = self.index.lock();
+                if index.cache_open {
+                    return;
+                }
+                let Some(position) = index.volumes.iter().position(|volume| {
+                    !index
+                        .slots
+                        .iter()
+                        .flatten()
+                        .any(|slot| Arc::ptr_eq(&slot.inode.filesystem, volume))
+                }) else {
+                    return;
+                };
+                index.volumes.swap_remove(position)
+            };
+            // 原 Work 票保住域身份，卷拥有保留到同步停止结束；新域不能越过旧域的 Weak 绑定。
+            volume.writeback_domain().stop_sync();
+        }
     }
 
     /// 每个被 Work 接受的票另持一份真实域拥有，重复提交只归还本次未接受的票。
@@ -537,7 +582,7 @@ impl InodeCacheWatch {
         self.0.flush()
     }
 
-    /// cache owner 已退出后等待全部真实使用、发表责任和回收 Work；失败继续强保并返回原错误。
+    /// cache owner 已退出后等待真实使用、卷停止、发表责任和回收 Work；失败继续强保并返回原错误。
     pub(crate) fn wait_retired(&self) -> Result<(), FsError> {
         sched::assert_switchable();
         loop {
@@ -555,7 +600,9 @@ impl InodeCacheWatch {
                         return Err(error);
                     }
                 }
-                index.dispatching == 0 && index.slots.iter().all(Option::is_none)
+                index.dispatching == 0
+                    && index.volumes.is_empty()
+                    && index.slots.iter().all(Option::is_none)
             };
             if retired {
                 drop(registration);
@@ -1310,16 +1357,15 @@ impl InodeCache {
 }
 
 impl Drop for InodeCache {
-    /// cache owner 退出只交接原槽；真实同步、页清理及返盘块由预建 Work 在 Task 中完成。
+    /// cache owner 退出只交接原槽和卷绑定；空域的回写停止也由预建 Work 在 Task 中完成。
     fn drop(&mut self) {
         let requested = {
             let mut index = self.domain.index.lock();
             index.cache_open = false;
-            let mut requested = false;
+            let requested = !index.volumes.is_empty();
             for slot in index.slots.iter_mut().flatten() {
                 if matches!(slot.eviction, Eviction::Cached | Eviction::Requested) {
                     slot.eviction = Eviction::Requested;
-                    requested |= slot.users == 0 && slot.inode.mapping.is_cache_only();
                 }
             }
             if requested {
@@ -1490,9 +1536,12 @@ impl InodeRef {
         self.directory_read()?.dir_next(cursor)
     }
 
-    /// 在 invalidate 保护及页内容锁内先发布卷义务，再使原页 Dirty 可见；不分配。
+    /// 在 invalidate 与页内容协议内先发表 inode 义务并请求卷进度，再使原页 Dirty 可见。
     pub(crate) fn note_dirty(&self) {
         self.dirty_obligation.store(true, Ordering::Release);
+        self.filesystem
+            .writeback_domain()
+            .notify_dirty(&self.filesystem);
     }
 
     /// 数据回写已放开 WB 互斥，按 invalidate→WB 次序排除新写授权并重核原页义务。
@@ -1644,7 +1693,7 @@ impl InodeRef {
         // SAFETY: 同 inode 写序列化、invalidate 独占和 mapping WB 互斥均仍持有；
         // 新 size 已发表，首遍完整尾范围撤叶/CSD 已结束；普通读和新填充受 invalidate 排斥。
         // 旧唯一填充/WB 由原页等待，root 不跨数据等待；错误后也必须执行下一遍 even_cows。
-        let pages = unsafe { self.mapping.truncate_pages(new_size, g.block_size) };
+        let pages = unsafe { self.mapping.truncate_pages(self, new_size, g.block_size) };
         #[cfg(feature = "ktest")]
         self.truncate_phase(TruncatePhase::BeforeSecondUnmap);
         self.mapping.unmap_range(first..u64::MAX, true);
@@ -1731,7 +1780,7 @@ impl InodeRef {
         let _writeback = self.mapping.lock_writeback();
         // SAFETY: inode.write 与 invalidate 独占仍由末次使用者持有，首轮完整撤叶/CSD 已结束；
         // symlink target 从不进入 FileMapping，mapping 仅清理意外保留的旧页并等待真实 I/O 尾。
-        let pages = unsafe { self.mapping.truncate_pages(0, g.block_size) };
+        let pages = unsafe { self.mapping.truncate_pages(self, 0, g.block_size) };
         self.mapping.unmap_range(0..u64::MAX, true);
         if let Err(error) = pages {
             return Err(error);
@@ -1839,11 +1888,12 @@ impl InodeRef {
         drop(previous);
     }
 
-    /// 普通 Task 在 mmap/PTE 保护之外准备当前 EOF 内全部 FS 块，不增长文件长度。
-    /// 已发表的块与时间修改在后块失败时保留；未发表资源由原 PreparedMapping 显式取消。
+    /// 普通 Task 在 mmap/PTE 之外处理已有脏压力，再准备当前 EOF 内 FS 块，不增长文件。
+    /// 已发表块与时间在后块失败时保留；未发表资源仍由原 PreparedMapping 显式取消。
     pub(crate) fn prepare_mkwrite(&self, index: u64) -> Result<PreparedMkwrite, FsError> {
         let volume = self.filesystem();
         volume.require_write(volume.claim())?;
+        background::balance_dirty_pages(self);
         let _access = self.acquire_write()?;
         let state = self.wait_loaded()?;
         let _write = state.write.write();
@@ -2146,14 +2196,15 @@ impl InodeRef {
     }
     /// 内核按位置读取与用户接收端使用同一页交付循环。
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
-        self.read_into(offset, &mut ReadBuffer::kernel(dst))
+        self.read_into(offset, &mut ReadBuffer::kernel(dst), None)
     }
 
-    /// invalidate 共享侧保护本片选择、填充和消费；用户接收端 fault 在放锁后发生。
+    /// 每片在 invalidate 共享侧内选择和消费原页；预读准备与用户交付均在片保护外。
     pub(crate) fn read_into(
         &self,
         offset: u64,
         target: &mut ReadBuffer<'_>,
+        ra: Option<&SpinLock<ReadaheadState>>,
     ) -> Result<usize, FsError> {
         let initial = target.copied();
         let remaining = target.len() - initial;
@@ -2178,6 +2229,13 @@ impl InodeRef {
             let position = offset + copied as u64;
             let in_page = (position % PAGE_SIZE as u64) as usize;
             let mut count = (len - copied).min(staging.len()).min(PAGE_SIZE - in_page);
+            if copied == 0 || in_page == 0 {
+                if let Some(ra) = ra {
+                    if let Err(error) = readahead::prepare(self, ra, position, len - copied) {
+                        return if copied == 0 { Err(error) } else { Ok(copied) };
+                    }
+                }
+            }
             let result = {
                 let _invalidate = state.invalidate.read();
                 let current = *state.metadata.lock();
@@ -2194,6 +2252,11 @@ impl InodeRef {
             };
             let result = result.and_then(|()| target.push(&staging[..count]));
             copied = target.copied() - initial;
+            if copied != 0 {
+                if let Some(ra) = ra {
+                    readahead::note_read(ra, offset + copied as u64);
+                }
+            }
             if let Err(error) = result {
                 return if copied == 0 { Err(error) } else { Ok(copied) };
             }
@@ -2968,7 +3031,7 @@ fn release_retained(domain: &Arc<InodeDomain>) {
     drop(retired);
 }
 
-/// 每份被接受的 Work 票消费一份真实域拥有；旧 IO 全尾和后端释放均在原 pool Task 中执行。
+/// 消费真实域票并回收原 inode，随后在索引锁外同步停止已关闭域的全部无槽卷。
 fn evict_inodes(work: Pin<&Work>) {
     // SAFETY: queue 在 Work 接受前用 into_raw 移交一次真实域强引用；
     // callback 的这一票是唯一 from_raw 消费者，域和整数 context 指向的原分配全程存活。
@@ -3041,6 +3104,8 @@ fn evict_inodes(work: Pin<&Work>) {
     if !failed {
         release_retained(&domain);
     }
+    domain.retire_volumes();
+    domain.waiters.wake_all();
 }
 
 /// 正前缀已经被文件接受后保留它；零前缀保留具体的首次失败原因。

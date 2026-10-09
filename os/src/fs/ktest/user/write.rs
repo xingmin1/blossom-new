@@ -26,7 +26,7 @@ const SOURCE: usize = 0x4800_0000;
 const PROGRAM_WRITE: &[u8] = b"/test/bin/user-write";
 const SHARED_CONTROL: usize = 0x4900_0000;
 const SHARED_FILE_OFFSET: usize = 24;
-const SHARED_ALIAS: usize = 0x4a00_0000;
+pub(super) const SHARED_ALIAS: usize = 0x4a00_0000;
 
 /// 普通测试消费者的真实 Task 状态与同步结果观察，不承担 join 或文件拥有。
 
@@ -599,7 +599,7 @@ impl Fixture<DeviceInventory> for WriteOwner {
 }
 
 /// 每个期望字节来自独立输入，短读取或读到旧缓存均失败。
-fn bytes_at(
+pub(super) fn bytes_at(
     context: &mut TestContext<'_>,
     file: &FileRef,
     offset: u64,
@@ -657,7 +657,7 @@ fn vm<T>(context: &TestContext<'_>, result: Result<T, VmError>) -> Result<T, Tes
 }
 
 /// 每份别名有独立 Mm 和 VA，文件页偏移由本例实际准备的范围决定。
-fn shared_alias(
+pub(super) fn shared_alias(
     context: &TestContext<'_>,
     file: &FileRef,
     offset: u64,

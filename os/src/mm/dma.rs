@@ -414,6 +414,7 @@ impl MappedPages {
     }
 
     /// Bio 全尾收权后结束来源自己的初始化或 WB，保留每个原映射的接受范围。
+    /// 完整读入已覆盖本页时，父后继范围的错误不撤销该页的成功前缀；分段读保原错误。
     ///
     /// # Safety
     /// 本映射全部设备访问已经结束；独占读入者的 CPU 可变别名也须结束。
@@ -426,7 +427,16 @@ impl MappedPages {
                 publish_on_success,
             } => {
                 if *publish_on_success || result.error.is_some() {
-                    // SAFETY: 已真实收权；完整读覆盖 read 原范围，分段失败不授予内容访问。
+                    let result = if *publish_on_success && result.completed == read.len() {
+                        IoResult {
+                            completed: result.completed,
+                            error: None,
+                        }
+                    } else {
+                        result
+                    };
+                    // SAFETY: Bio 已真实收权，completed 是父连续成功前缀在本映射的交集；
+                    // 完整覆盖才授予整页访问，分段或不完整结果仍按原错误结束读入。
                     unsafe { read.complete(result) };
                 }
             }

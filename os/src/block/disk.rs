@@ -12,6 +12,8 @@ use virtio_drivers::transport::{DeviceStatus, InterruptStatus};
 use virtio_drivers::{DmaRegion, Error, Hal, MappedSegment};
 
 use crate::block::bio::BioInner;
+#[cfg(feature = "ktest")]
+use crate::block::SECTOR_BYTES;
 use crate::block::{AccessMode, Bio, BlkOperation, BlockError, FsClaim, QueueLimits, MAX_BATCH};
 use crate::cache::MetadataCache;
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity, VirtioInitError};
@@ -67,7 +69,7 @@ pub(super) struct QueueState {
     #[cfg(feature = "ktest")]
     ktest_folio_dma: Option<(usize, u64, usize, usize)>,
     #[cfg(feature = "ktest")]
-    ktest_completion_error: Option<(TestCompletionKind, BlockError)>,
+    ktest_completion_error: Option<(TestCompletionKind, BlockError, Option<usize>)>,
     #[cfg(feature = "ktest")]
     // 只匹配目标文件原页的 Data-WB，不改变真实 used ring 消费。
     ktest_hold_file_writeback_page: Option<usize>,
@@ -105,6 +107,8 @@ struct SlotResources {
     bytes: usize,
     used_len: u32,
     forced_error: Option<BlockError>,
+    #[cfg(feature = "ktest")]
+    ktest_read_prefix: Option<(usize, BlockError)>,
     configured: bool,
 }
 
@@ -327,6 +331,8 @@ impl Disk {
                     bytes: 0,
                     used_len: 0,
                     forced_error: None,
+                    #[cfg(feature = "ktest")]
+                    ktest_read_prefix: None,
                     configured: false,
                 }),
                 completion_work: None,
@@ -777,10 +783,14 @@ impl Disk {
                             unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
                         resources.used_len = used.len;
                         #[cfg(feature = "ktest")]
-                        if let Some((kind, error)) = q.ktest_completion_error {
+                        if let Some((kind, error, prefix)) = q.ktest_completion_error {
                             if kind.matches(resources) {
                                 q.ktest_completion_error = None;
-                                resources.forced_error = Some(error);
+                                if let Some(completed) = prefix {
+                                    resources.ktest_read_prefix = Some((completed, error));
+                                } else {
+                                    resources.forced_error = Some(error);
+                                }
                             }
                         }
                         #[cfg(feature = "ktest")]
@@ -902,6 +912,10 @@ impl Disk {
         resources.part_count = 0;
         resources.configured = false;
         resources.forced_error = None;
+        #[cfg(feature = "ktest")]
+        {
+            resources.ktest_read_prefix = None;
+        }
         // 从此处起不再访问本轮 slot 数据；其他 producer 在状态清空后可以马上重用。
         {
             let mut q = self.queue.lock();
@@ -962,30 +976,42 @@ impl Disk {
     /// 对下一次真实文件 WB used 注入一次上层完成错误，不改变硬件或准入。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_data(&self, error: BlockError) {
-        self.test_arm_completion_error(TestCompletionKind::Data, error);
+        self.test_arm_completion_error(TestCompletionKind::Data, error, None);
     }
 
     /// 对下一次真实文件原页读入的 used 注入一次上层完成错误。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_file_read(&self, error: BlockError) {
-        self.test_arm_completion_error(TestCompletionKind::FileRead, error);
+        self.test_arm_completion_error(TestCompletionKind::FileRead, error, None);
+    }
+
+    /// 真实文件读入成功 used 后仅交付指定扇区前缀，剩余部分保留一次软件完成错误。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_fail_next_file_read_after(&self, completed: usize, error: BlockError) {
+        assert!(0 < completed && completed % SECTOR_BYTES as usize == 0);
+        self.test_arm_completion_error(TestCompletionKind::FileRead, error, Some(completed));
     }
 
     /// 对下一次真实共同元数据 used 注入一次完成错误。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_metadata(&self, error: BlockError) {
-        self.test_arm_completion_error(TestCompletionKind::Metadata, error);
+        self.test_arm_completion_error(TestCompletionKind::Metadata, error, None);
     }
 
     /// 对下一次真实 FLUSH used 注入一次完成错误，未协商能力仍走原拒绝。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_flush(&self, error: BlockError) {
-        self.test_arm_completion_error(TestCompletionKind::Flush, error);
+        self.test_arm_completion_error(TestCompletionKind::Flush, error, None);
     }
 
     /// 测试控制只保存本 Disk 的一次性匹配，不伪造设备停止或 reset 确认。
     #[cfg(feature = "ktest")]
-    fn test_arm_completion_error(&self, kind: TestCompletionKind, error: BlockError) {
+    fn test_arm_completion_error(
+        &self,
+        kind: TestCompletionKind,
+        error: BlockError,
+        prefix: Option<usize>,
+    ) {
         assert!(matches!(
             error,
             BlockError::Io | BlockError::ShortIo | BlockError::NoMemory
@@ -999,7 +1025,7 @@ impl Disk {
             q.ktest_completion_error.is_none(),
             "completion error already armed"
         );
-        q.ktest_completion_error = Some((kind, error));
+        q.ktest_completion_error = Some((kind, error, prefix));
     }
 
     /// 观察一次性匹配是否仍未被真实 used 消费。
@@ -1306,6 +1332,10 @@ impl PreparingSlot<'_> {
         resources.bytes = bytes;
         resources.used_len = 0;
         resources.forced_error = None;
+        #[cfg(feature = "ktest")]
+        {
+            resources.ktest_read_prefix = None;
+        }
         resources.configured = true;
         Ok(())
     }
@@ -1493,6 +1523,14 @@ fn completion_result(slot: &SlotStorage, resources: &SlotResources) -> (usize, O
         BlkOperation::Read => {
             let expected = resources.bytes + 1;
             if used == expected {
+                #[cfg(feature = "ktest")]
+                if let Some((completed, error)) = resources.ktest_read_prefix {
+                    assert!(
+                        completed < resources.bytes,
+                        "controlled prefix has no failed tail"
+                    );
+                    return (completed, Some(error));
+                }
                 (resources.bytes, None)
             } else if used < expected {
                 (used.saturating_sub(1), Some(BlockError::ShortIo))
