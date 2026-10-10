@@ -55,7 +55,7 @@ impl FileOwner {
                 .vfs()
                 .resolve(self.path.context(), b"/pattern", ResolveMode::Follow),
         )?;
-        let volume = path.filesystem().clone();
+        let volume = checked(context, checked(context, path.inode())?.disk_volume())?.clone();
         let observer = self.path.owner.observer().clone();
         let block_size = volume.geometry().block_size;
         let hook: Arc<dyn Fn(u64, usize) + Send + Sync> = Arc::try_new(move |page, bytes| {
@@ -744,7 +744,11 @@ pub(crate) mod mounts {
         )?;
         checked(
             context,
-            vfs.mount(&covered, volume.clone(), AccessMode::ReadOnly),
+            vfs.mount(
+                &covered,
+                crate::fs::Filesystem::Ext4(volume.clone()),
+                AccessMode::ReadOnly,
+            ),
         )?;
         let fd = fixture.open(context, b"/mnt/extra/pattern", OpenOptions::default())?;
         let table = fixture.table();
@@ -1037,6 +1041,11 @@ pub(crate) mod vm_lifetime {
         fixture.prepare(context, 4)?;
         let fd = fixture.open(context, b"/pattern", OpenOptions::default())?;
         let file = checked(context, fixture.table().lookup(fd))?;
+        context.expect_eq(checked(context, file.stat())?.rdev, 0);
+        context.expect_eq(
+            file.ioctl(0, 0, crate::fs::FileIoContext::Kernel),
+            Err(FsError::NotTty),
+        );
         checked(context, file.seek(SeekFrom::Start(19)))?;
         let mut expected = [0; 8];
         assert_eq!(
@@ -1045,7 +1054,12 @@ pub(crate) mod vm_lifetime {
         );
         assert!(patterned(&expected, 0));
         let mut file_page_attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut file_page_attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode()
+                .unwrap()
+                .file_page(0, &mut file_page_attempt),
+        )?;
         let original = folio.phys_addr();
         let mm = vm_image()?;
         mm.map_file(
@@ -1148,12 +1162,9 @@ pub(crate) mod vm_lifetime {
         assert!(bytes.iter().all(|byte| *byte == 0));
         let directory = fixture.open(context, b"/", OpenOptions::default())?;
         let directory_file = checked(context, fixture.table().lookup(directory))?;
-        let mut directory_page_attempt = ReclaimAttempt::new();
         assert_eq!(
-            directory_file
-                .file_page(0, &mut directory_page_attempt)
-                .err(),
-            Some(FsError::IsDirectory)
+            directory_file.ioctl(0, 0, crate::fs::FileIoContext::Kernel),
+            Err(FsError::NotTty)
         );
         assert_eq!(
             mm.map_file(
@@ -1165,7 +1176,7 @@ pub(crate) mod vm_lifetime {
                 0,
                 false
             ),
-            Err(VmError::File(FsError::IsDirectory)),
+            Err(VmError::NotMappable),
         );
         drop(mm);
         drop(folio);
@@ -1225,7 +1236,10 @@ pub(crate) mod vm_racing {
         fixture.join_vm_user(0)?;
         assert_eq!(mm.read_u64(VM_TARGET), Ok(0));
         let mut attempt = ReclaimAttempt::new();
-        let old = checked(context, file.file_page(1, &mut attempt))?;
+        let old = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(1, &mut attempt),
+        )?;
         assert_ne!(mm.mapping(VM_TARGET).unwrap().physical, old.phys_addr());
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         checked(context, old.copy_to(0, &mut bytes).map_err(FsError::from))?;

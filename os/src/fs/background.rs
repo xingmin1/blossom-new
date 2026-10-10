@@ -960,11 +960,13 @@ pub(crate) fn global_snapshot() -> DirtySnapshot {
     }
 }
 
-/// 普通 writer 在释放 inode、cursor、invalidate 和内容 guard 后按本域实测完成有限等待。
+/// 磁盘 writer 在释放 inode、cursor、invalidate 和内容 guard 后按本域实测完成有限等待。
 /// 本接口不返回写入错误，已接受的正前缀不能被限速改成未写；原错误由 errseq 消费。
 pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
     sched::assert_switchable();
-    let volume = inode.filesystem();
+    let volume = inode
+        .disk_volume()
+        .expect("dirty balancing requires a disk inode");
     let domain = volume.writeback_domain();
     let (limit, background) = domain.limits();
     let pressure = domain.pressure();

@@ -364,7 +364,7 @@ fn run_disk_program(
     environment: &[&[u8]],
 ) -> Result<(), task::ProgramError> {
     let path = vfs.resolve(context, program, fs::ResolveMode::Follow)?;
-    let file = fs::open_path(path)?;
+    let file = fs::open_path(vfs, path)?;
     let arguments = task::exec::Arguments::from_kernel(program, &[program, argument], environment)?;
     let runtime =
         task::UserRuntime::try_new(Arc::clone(vfs), context.clone(), task::Credentials::ROOT)?;

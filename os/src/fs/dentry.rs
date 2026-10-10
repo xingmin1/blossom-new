@@ -125,8 +125,8 @@ impl DentryCache {
             dentry.inode()?;
             return Ok(dentry);
         }
-        // 静止正绑定仍强持 inode；inode 预算满时须先释放名字引用，才能由 iget 回收 inode。
-        if full || inodes.is_full() {
+        // 静止磁盘正绑定仍强持 inode；RAM 权威 inode 不占磁盘缓存预算。
+        if full || (!inode.is_memory() && inodes.is_full()) {
             self.prune_unused();
             // 回收期间同 key 可能已发表；预算满也必须先消费现有对象。
             let index = self.entries.lock();
@@ -467,6 +467,12 @@ impl DentryRef {
     /// 返回当前不可变原始名字的Arc快照，不为每次查询分配或复制字节。
     pub fn name(&self) -> Arc<Vec<u8>> {
         self.0.topology.lock().name.clone()
+    }
+
+    /// 同一拓扑锁内取得父和原始名字，路径导出不能拼接rename前后的两半状态。
+    pub(crate) fn topology_snapshot(&self) -> (Option<DentryRef>, Arc<Vec<u8>>) {
+        let topology = self.0.topology.lock();
+        (topology.parent.clone(), topology.name.clone())
     }
 
     /// 比较名字对象实例身份，硬链接的同 inode 不代表同 dentry。

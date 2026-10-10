@@ -46,7 +46,7 @@ fn prepare_file(
 ) -> Result<InodeRef, TestError> {
     fixture.prepare_namespace(context)?;
     let writer = fixture.open(context, PATHNAME, 2)?;
-    let inode = checked(context, writer.path().inode())?.clone();
+    let inode = checked(context, writer.path().unwrap().inode())?.clone();
     checked(context, writer.truncate(0))?;
     let mut bytes = [0u8; PAGE_SIZE];
     for page in 0..FULL_PAGES {
@@ -71,8 +71,14 @@ fn prepare_file(
     context.expect_eq(checked(context, writer.stat())?.size, FILE_BYTES);
     checked(context, writer.sync_range(0..u64::MAX, false))?;
     drop(writer);
-    finish_reads(inode.filesystem().disk())?;
-    context.expect_eq(inode.filesystem().disk().test_snapshot().inflight, 0);
+    finish_reads(checked(context, inode.disk_volume())?.disk())?;
+    context.expect_eq(
+        checked(context, inode.disk_volume())?
+            .disk()
+            .test_snapshot()
+            .inflight,
+        0,
+    );
     prune_clean(context, &inode)?;
     Ok(inode)
 }
@@ -131,7 +137,8 @@ fn read_page_at(context: &mut TestContext<'_>, file: &FileRef, page: u64) -> Tes
 /// 只查本盘最近真实接受波的序号，其他盘的旧观察不能满足本例停点。
 fn batch_sequence(inode: &InodeRef) -> u64 {
     inode
-        .filesystem()
+        .disk_volume()
+        .expect("disk readahead fixture has no volume")
         .claim()
         .ktest_read_batch_snapshot()
         .map_or(0, |snapshot| snapshot.sequence)
@@ -146,7 +153,8 @@ fn batch_evidence(
     ready: bool,
 ) -> TestResult {
     let snapshot = inode
-        .filesystem()
+        .disk_volume()
+        .map_err(|_| TestError("disk readahead fixture has no volume"))?
         .claim()
         .ktest_read_batch_snapshot()
         .ok_or(TestError("actual read batch was not captured"))?;
@@ -156,14 +164,14 @@ fn batch_evidence(
     context.expect_eq(0 < snapshot.bios && 0 < snapshot.multi_page_bios, true);
     let first = checked(
         context,
-        inode.map_block(start * (PAGE_SIZE / inode.filesystem().geometry().block_size) as u64),
+        inode.map_block(start * (PAGE_SIZE / inode.block_size() as usize) as u64),
     )?;
     let BlockMapping::Mapped { physical, .. } = first else {
         return Err(TestError("read batch first file block is not mapped"));
     };
     context.expect_eq(
         snapshot.first_sector,
-        physical * inode.filesystem().geometry().block_size as u64 / SECTOR_BYTES,
+        physical * inode.block_size() as u64 / SECTOR_BYTES,
     );
     for page in 0..pages {
         let index = start + page as u64;
@@ -186,7 +194,7 @@ fn batch_evidence(
     }
     context.diagnostic(format_args!(
         "W29 read-batch={:?} first-file-page={} original-pages-ready={} disk={:?} hardware-inflight-claimed=0",
-        snapshot, start, ready, inode.filesystem().disk().test_snapshot()
+        snapshot, start, ready, checked(context, inode.disk_volume())?.disk().test_snapshot()
     ));
     Ok(())
 }
@@ -216,7 +224,7 @@ pub(crate) mod reads {
         let random = fixture.open(context, PATHNAME, 0)?;
         context.expect_eq(Arc::ptr_eq(&first, &random), false);
         context.expect_eq(
-            checked(context, random.path().inode())?.ptr_eq(&inode),
+            checked(context, random.path().unwrap().inode())?.ptr_eq(&inode),
             true,
         );
         let table = checked(context, FileTable::try_new(2))?;
@@ -237,7 +245,13 @@ pub(crate) mod reads {
 
         // 暖页只供故障者验证 cursor 不形成等待环，首页及其整个预读窗仍为空。
         let mut fault_attempt = ReclaimAttempt::new();
-        let fault_page = checked(context, first.file_page(63, &mut fault_attempt))?;
+        let fault_page = checked(
+            context,
+            first
+                .mapping_inode()
+                .unwrap()
+                .file_page(63, &mut fault_attempt),
+        )?;
         let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("readahead fault MM owner OOM"))?;
         vm(
@@ -254,7 +268,7 @@ pub(crate) mod reads {
         )?;
         context.expect_eq(history(&first)?, empty);
         context.expect_eq(mm.mapping(FAULT_ADDRESS).is_none(), true);
-        let disk = inode.filesystem().disk().clone();
+        let disk = checked(context, inode.disk_volume())?.disk().clone();
         finish_reads(&disk)?;
         let before = disk.test_snapshot();
         let old_sequence = batch_sequence(&inode);
@@ -453,7 +467,13 @@ pub(crate) mod reads {
             2 * PAGE_SIZE as u64,
         );
         let mut canonical_attempt = ReclaimAttempt::new();
-        let canonical = checked(context, random.file_page(30, &mut canonical_attempt))?;
+        let canonical = checked(
+            context,
+            random
+                .mapping_inode()
+                .unwrap()
+                .file_page(30, &mut canonical_attempt),
+        )?;
         context.expect_eq(
             mm.mapping(FAULT_ADDRESS + PAGE_SIZE)
                 .map(|leaf| leaf.physical),
@@ -476,9 +496,21 @@ pub(crate) mod reads {
             53 * PAGE_SIZE as u64,
         );
         let mut first_attempt = ReclaimAttempt::new();
-        let same_first = checked(context, first.file_page(40, &mut first_attempt))?;
+        let same_first = checked(
+            context,
+            first
+                .mapping_inode()
+                .unwrap()
+                .file_page(40, &mut first_attempt),
+        )?;
         let mut random_attempt = ReclaimAttempt::new();
-        let same_random = checked(context, random.file_page(40, &mut random_attempt))?;
+        let same_random = checked(
+            context,
+            random
+                .mapping_inode()
+                .unwrap()
+                .file_page(40, &mut random_attempt),
+        )?;
         context.expect_eq(same_first.phys_addr(), same_random.phys_addr());
         finish_reads(&disk)?;
         context.diagnostic(format_args!(
@@ -497,7 +529,7 @@ pub(crate) mod reads {
     ) -> TestResult {
         let inode = prepare_file(context, fixture)?;
         let file = fixture.open(context, PATHNAME, 2)?;
-        let disk = inode.filesystem().disk().clone();
+        let disk = checked(context, inode.disk_volume())?.disk().clone();
         let mut bytes = [0xa7; 128];
         let offset = (FULL_PAGES * PAGE_SIZE - 19) as u64;
         context.expect_eq(
@@ -513,7 +545,9 @@ pub(crate) mod reads {
         let mut tail_attempt = ReclaimAttempt::new();
         let tail = checked(
             context,
-            file.file_page(FULL_PAGES as u64, &mut tail_attempt),
+            file.mapping_inode()
+                .unwrap()
+                .file_page(FULL_PAGES as u64, &mut tail_attempt),
         )?;
         let mut page = [0xa7; PAGE_SIZE];
         checked(context, tail.copy_to(0, &mut page).map_err(FsError::Io))?;
@@ -592,7 +626,7 @@ pub(crate) mod reads {
         context.expect_eq(
             checked(
                 context,
-                inode.map_block((4 * PAGE_SIZE / inode.filesystem().geometry().block_size) as u64),
+                inode.map_block((4 * PAGE_SIZE / inode.block_size() as usize) as u64),
             )?,
             BlockMapping::Eof,
         );
@@ -618,8 +652,8 @@ pub(crate) mod reads {
     ) -> TestResult {
         let inode = prepare_file(context, fixture)?;
         let file = fixture.open(context, PATHNAME, 0)?;
-        let disk = inode.filesystem().disk().clone();
-        let block_size = inode.filesystem().geometry().block_size;
+        let disk = checked(context, inode.disk_volume())?.disk().clone();
+        let block_size = inode.block_size() as usize;
         let block_count = 2 * PAGE_SIZE / block_size;
         let blocks_per_page = PAGE_SIZE / block_size;
         let mut pair = None;
@@ -670,8 +704,7 @@ pub(crate) mod reads {
                 context,
                 inode
                     .mapping()
-                    .prepare_file(&inode, first_page + index as u64, &mut attempt)
-                    .map_err(FsError::Io),
+                    .prepare_file(&inode, first_page + index as u64, &mut attempt),
             )?);
         }
         let invalidate = checked(context, inode.lock_invalidate())?;
@@ -714,7 +747,9 @@ pub(crate) mod reads {
         finish_reads(&disk)?;
         let before = disk.test_snapshot();
         disk.test_fail_next_file_read_after(PAGE_SIZE, BlockError::Io);
-        inode.filesystem().claim().submit_bio(bio);
+        checked(context, inode.disk_volume())?
+            .claim()
+            .submit_bio(bio);
         drop(invalidate);
         drop(prepared);
         let result = completion.wait();

@@ -7,6 +7,7 @@ use core::ops::Range;
 use crate::arch::{self, UserAccess};
 use crate::cache::FileRangeRegistration;
 use crate::fs::FileRef;
+use crate::fs::InodeRef;
 use crate::mm::anon::SharedAnon;
 use crate::mm::space::{PteDomain, VmError};
 use crate::mm::user_table::PagePermissions;
@@ -22,6 +23,7 @@ pub(crate) enum VmaBacking {
     },
     File {
         file: FileRef,
+        inode: InodeRef,
         offset: u64,
         private: bool,
     },
@@ -52,12 +54,13 @@ impl Vma {
         }
         let file_range = match &backing {
             VmaBacking::File {
-                file,
+                inode,
                 offset,
                 private,
+                ..
             } => Some(
                 FileRangeRegistration::try_new(
-                    file.path().inode().map_err(VmError::File)?.clone(),
+                    inode.clone(),
                     Arc::clone(domain.expect("file VMA requires its PTE domain")),
                     range.clone(),
                     *offset,
@@ -112,10 +115,12 @@ impl Vma {
             },
             VmaBacking::File {
                 file,
+                inode,
                 offset,
                 private,
             } => VmaBacking::File {
                 file: Arc::clone(file),
+                inode: inode.clone(),
                 offset: offset
                     .checked_add((range.start - self.range.start) as u64)
                     .ok_or(VmError::InvalidRange)?,
@@ -153,17 +158,20 @@ impl Vma {
             (
                 VmaBacking::File {
                     file,
+                    inode,
                     offset,
                     private,
                 },
                 VmaBacking::File {
                     file: next_file,
+                    inode: next_inode,
                     offset: next_offset,
                     private: next_private,
                 },
             ) => {
                 private == next_private
                     && Arc::ptr_eq(file, next_file)
+                    && inode.ptr_eq(next_inode)
                     && offset.checked_add(length) == Some(*next_offset)
             }
             _ => false,

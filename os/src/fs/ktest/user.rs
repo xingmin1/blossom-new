@@ -74,7 +74,7 @@ impl UserOwner {
                 .vfs()
                 .resolve(self.path.context(), pathname, ResolveMode::Follow),
         )?;
-        checked(context, crate::fs::open_path(path))
+        checked(context, crate::fs::open_path(self.path.vfs(), path))
     }
 
     /// 内核初次参数来自已拥有字节，与普通启动使用相同初始栈契约。
@@ -244,8 +244,10 @@ impl UserOwner {
         let disk = self.path.owner.disk()?.clone();
         let root = self.path.vfs().root();
         let old_device = root.filesystem().device();
-        let weak_volume = Arc::downgrade(root.filesystem());
-        let weak_metadata = Arc::downgrade(root.filesystem().metadata_cache());
+        let inode = checked(context, root.inode())?;
+        let volume = checked(context, inode.disk_volume())?;
+        let weak_volume = Arc::downgrade(volume);
+        let weak_metadata = Arc::downgrade(volume.metadata_cache());
         let weak_root = root.dentry().downgrade();
         let weak_vfs = Arc::downgrade(self.path.vfs());
         let weak_graph = Arc::downgrade(self.graph());
@@ -305,7 +307,12 @@ impl UserOwner {
         );
         self.prepare_mode(context, AccessMode::ReadOnly)?;
         let root = self.path.vfs().root();
-        context.expect_eq(root.filesystem().disk().identity(), disk.identity());
+        context.expect_eq(
+            checked(context, checked(context, root.inode())?.disk_volume())?
+                .disk()
+                .identity(),
+            disk.identity(),
+        );
         context.expect_eq(root.filesystem().mode(), AccessMode::ReadOnly);
         context.expect_eq(root.filesystem().device() != old_device, true);
         drop(root);
@@ -453,10 +460,7 @@ impl UserOwner {
         let mut attempt = ReclaimAttempt::new();
         let mut prepared = Some(checked(
             context,
-            inode
-                .mapping()
-                .prepare_file(&inode, 0, &mut attempt)
-                .map_err(FsError::Io),
+            inode.mapping().prepare_file(&inode, 0, &mut attempt),
         )?);
         let invalidate = checked(context, inode.lock_invalidate())?;
         let (folio, read) = checked(
@@ -1252,6 +1256,135 @@ pub(crate) mod programs {
         fixture.prepare(context)?;
         let event = fixture.run_named(context, b"/test/bin/user-io", b"raw", false)?;
         context.expect_eq(event.status, 0);
+        Ok(())
+    }
+
+    /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。
+    #[test]
+    #[ktest(tags("T04", "T30", "fs-device-mapping"))]
+    fn device_mapping_capability_precedes_mount_write(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let vfs = fixture.path.vfs();
+        let covered = checked(
+            context,
+            vfs.resolve(fixture.path.context(), b"/plain", ResolveMode::Follow),
+        )?;
+        let device = checked(context, crate::fs::devfs::try_new(0o755))?;
+        checked(
+            context,
+            vfs.mount(
+                &covered,
+                crate::fs::Filesystem::Memory(device),
+                AccessMode::ReadOnly,
+            ),
+        )?;
+        let event = fixture.run_named(context, b"/test/bin/user-device-map", b"raw", false)?;
+        context.expect_eq(event.status, 0);
+        Ok(())
+    }
+
+    /// 正常盘面设备节点经 unlink 或 rename 覆盖结束链接，末使用归还实际inode位而不解释设备号为块树。
+    #[test]
+    #[case("unlink_character", false)]
+    #[case("replace_block", true)]
+    #[ktest(tags("T01", "fs-device-retirement"))]
+    fn disk_device_last_reference_releases_inode(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        replace: bool,
+    ) -> TestResult {
+        fixture.prepare_mode(context, AccessMode::ReadWrite)?;
+        let vfs = fixture.path.vfs();
+        let fs_context = fixture.path.context();
+        let pathname = if replace {
+            b"/device-block".as_slice()
+        } else {
+            b"/device-char".as_slice()
+        };
+        let path = checked(
+            context,
+            vfs.resolve(fs_context, pathname, ResolveMode::Follow),
+        )?;
+        let inode = checked(context, path.inode())?.clone();
+        let number = inode.number();
+        let volume = checked(context, inode.disk_volume())?.clone();
+        let metadata = checked(context, inode.metadata_snapshot())?;
+        context.expect_eq(
+            metadata.kind,
+            if replace {
+                InodeKind::Block
+            } else {
+                InodeKind::Character
+            },
+        );
+        context.expect_eq(metadata.rdev, if replace { 0x801 } else { 0x103 });
+        context.expect_eq(metadata.blocks, 0);
+        context.expect_eq(
+            checked(context, write::inode_allocation_bit(&volume, number))?,
+            true,
+        );
+        if replace {
+            drop(checked(
+                context,
+                vfs.open_with(
+                    fs_context,
+                    fs_context.cwd(),
+                    b"/test/device-replacement",
+                    (0, 0),
+                    Some((0o644, 0)),
+                    true,
+                    false,
+                    |path, _| Ok(path),
+                ),
+            )?);
+            checked(
+                context,
+                vfs.rename_from(
+                    fs_context,
+                    fs_context.cwd(),
+                    b"/test/device-replacement",
+                    fs_context.cwd(),
+                    pathname,
+                    false,
+                    (0, 0),
+                ),
+            )?;
+            let replacement = checked(
+                context,
+                vfs.resolve(fs_context, pathname, ResolveMode::Follow),
+            )?;
+            context.expect_eq(
+                checked(
+                    context,
+                    checked(context, replacement.inode())?.metadata_snapshot(),
+                )?
+                .kind,
+                InodeKind::Regular,
+            );
+        } else {
+            checked(
+                context,
+                vfs.unlink_from(fs_context, fs_context.cwd(), pathname, (0, 0)),
+            )?;
+            context.expect_eq(
+                vfs.resolve(fs_context, pathname, ResolveMode::Follow).err(),
+                Some(FsError::NotFound),
+            );
+        }
+        context.expect_eq(checked(context, inode.metadata_snapshot())?.links, 0);
+        let watch = fixture.path.owner.cache().watch();
+        drop(inode);
+        drop(path);
+        vfs.prune_unused();
+        checked(context, watch.wait())?;
+        context.expect_eq(watch.contains(number), false);
+        context.expect_eq(
+            checked(context, write::inode_allocation_bit(&volume, number))?,
+            false,
+        );
         Ok(())
     }
 

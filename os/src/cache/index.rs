@@ -80,11 +80,31 @@ struct LruLinks {
     ticket: Option<NodeRawTicket>,
 }
 
+/// 文件页节点的后端身份；RAM 节点不进入磁盘 LRU 或写回队列。
+pub(crate) enum FileRole {
+    Disk(InodeWeak),
+    Memory(InodeWeak),
+}
+
+impl FileRole {
+    /// 返回节点是否拥有磁盘文件回收责任。
+    pub(crate) fn is_disk(&self) -> bool {
+        matches!(self, Self::Disk(_))
+    }
+
+    /// 借用节点的 canonical inode 弱身份。
+    pub(crate) fn owner(&self) -> &InodeWeak {
+        match self {
+            Self::Disk(owner) | Self::Memory(owner) => owner,
+        }
+    }
+}
+
 /// key、原 folio 和真实 file 弱身份在本控制生命周期内不可更换。
 pub(crate) struct Node {
     pub key: u64,
     pub folio: FolioRef,
-    pub file: Option<InodeWeak>,
+    pub role: Option<FileRole>,
     index: UnsafeCell<IndexLinks>,
     lru: UnsafeCell<LruLinks>,
 }
@@ -123,7 +143,7 @@ impl Node {
     pub(super) fn prepare(
         key: u64,
         folio: FolioRef,
-        file: Option<InodeWeak>,
+        role: Option<FileRole>,
         allocator: IndexAllocator,
     ) -> Result<NodeRef, BlockError> {
         let mut prepared =
@@ -133,7 +153,7 @@ impl Node {
             .write(Self {
                 key,
                 folio,
-                file,
+                role,
                 index: UnsafeCell::new(IndexLinks {
                     to_write: false,
                     height: 1,
@@ -510,7 +530,7 @@ impl Tree {
 
     /// 接入锁外准备的唯一叶，真实 file 节点同一 index→LRU 顺序登记原票。
     pub fn insert(&mut self, node: NodeRef) {
-        if node.file.is_some() {
+        if node.role.as_ref().is_some_and(FileRole::is_disk) {
             FILE_LRU
                 .lock()
                 .push(NodeRawTicket::new(Arc::clone(&node)), LruKind::Inactive);

@@ -22,7 +22,10 @@ WORK_DIR ?= build/run-$(ARCH)
 RESUME ?= 0
 LLVM_MC ?= llvm-mc
 USER_LD ?= rust-lld
-USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback)
+USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback device-map)
+MUSL_CROSS ?= $(ARCH)-linux-musl-
+USERLAND_BUILD ?= build/busybox-$(ARCH)
+USERLAND_ROOT ?= build/userland-$(ARCH)
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -112,6 +115,17 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	mkdir -p "$(dir $@)"
 	$(LLVM_MC) --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
 	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
+
+.PHONY: userland
+userland: $(USERLAND_BUILD)/.config
+	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
+	$(MUSL_CROSS)gcc -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie tests/user/libc-smoke.c -o "$(USERLAND_ROOT)/bin/libc-smoke"
+
+.DELETE_ON_ERROR: $(USERLAND_BUILD)/.config
+$(USERLAND_BUILD)/.config: userland/busybox.config
+	mkdir -p "$(USERLAND_BUILD)"
+	cp "$<" "$@"
+	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" oldconfig
 
 clean:
 	cd os && cargo clean

@@ -1,402 +1,302 @@
-use crate::{
-    mm::try_get_from_user, syscall::errno::EFAULT, task::signal::Signals, timer::TimeSpec,
-};
-use alloc::vec::Vec;
-use core::ptr::null_mut;
-
-use crate::{
-    mm::{copy_from_user_array, copy_to_user_array},
-    task::{current_task, sigprocmask, suspend_current_and_run_next, SigMaskHow},
+use alloc::{sync::Arc, vec::Vec};
+use core::{
+    ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not},
+    pin::Pin,
 };
 
-///  A scheduling  scheme  whereby  the  local  process  periodically  checks  until  the  pre-specified events (for example, read, write) have occurred.
-/// The PollFd struct in 32-bit style.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct PollFd {
-    /// File descriptor
-    fd: u32,
-    /// Requested events
-    events: PollEvent,
-    /// Returned events
-    revents: PollEvent,
-}
+use crate::{fs::FsError, sync::SpinLock};
 
-bitflags! {
-    /// Event types that can be polled for.
-    ///
-    /// These bits may be set in `events`(see `ppoll()`) to indicate the interesting event types;
-    ///
-    /// they will appear in `revents` to indicate the status of the file descriptor.
-    struct PollEvent:u16 {
-    /// There is data to read.
-    const POLLIN = 0x001;
-    /// There is urgent data to read.
-    const POLLPRI = 0x002;
-    /// Writing now will not block.
-    const POLLOUT = 0x004;
+/// 保存 poll/select 共同使用的目标 UAPI 位，并支持直接位运算。
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PollMask(pub u32);
 
-    // These values are defined in XPG4.2.
-    /// Normal data may be read.
-    const POLLRDNORM = 0x040;
-    /// Priority data may be read.
-    const POLLRDBAND = 0x080;
-    /// Writing now will not block.
-    const POLLWRNORM = 0x100;
-    /// Priority data may be written.
-    const POLLWRBAND = 0x200;
+impl PollMask {
+    /// 表示有数据可读。
+    pub const POLLIN: Self = Self(0x001);
+    /// 表示有带外数据可读。
+    pub const POLLPRI: Self = Self(0x002);
+    /// 表示写入不会阻塞。
+    pub const POLLOUT: Self = Self(0x004);
+    /// 表示文件对象发生错误。
+    pub const POLLERR: Self = Self(0x008);
+    /// 表示文件对象已挂断。
+    pub const POLLHUP: Self = Self(0x010);
+    /// 表示文件描述符无效。
+    pub const POLLNVAL: Self = Self(0x020);
+    /// 表示普通数据可读。
+    pub const POLLRDNORM: Self = Self(0x040);
+    /// 表示带优先级数据可读。
+    pub const POLLRDBAND: Self = Self(0x080);
+    /// 表示普通写入不会阻塞。
+    pub const POLLWRNORM: Self = Self(0x100);
+    /// 表示带优先级写入不会阻塞。
+    pub const POLLWRBAND: Self = Self(0x200);
+    /// 表示消息事件。
+    pub const POLLMSG: Self = Self(0x400);
+    /// 表示删除事件。
+    pub const POLLREMOVE: Self = Self(0x1000);
+    /// 表示对端已半关闭写侧。
+    pub const POLLRDHUP: Self = Self(0x2000);
 
+    /// 返回该掩码是否包含给定的全部位。
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 
-    /// Linux Extension.
-    const POLLMSG = 0x400;
-    /// Linux Extension.
-    const POLLREMOVE = 0x1000;
-    /// Linux Extension.
-    const POLLRDHUP = 0x2000;
-
-    /* Event types always implicitly polled for.
-    These bits need not be set in `events',
-    but they will appear in `revents' to indicate the status of the file descriptor.*/
-
-    /// Implicitly polled for only.
-    /// Error condition.
-    const POLLERR = 0x008;
-    /// Implicitly polled for only.
-    /// Hung up.
-    const POLLHUP = 0x010;
-    /// Implicitly polled for only.
-    /// Invalid polling request.
-    const POLLNVAL = 0x020;
+    /// 返回该掩码是否没有任何位。
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
-/// Wait for one of the events in `poll_fd_p` to happen, or the time limit to run out if any.
-/// Unlike the function family of `select()` which are basically AND'S,
-/// `poll()`'s act like OR's for polling the files.
-/// # Arguments
-/// * `poll_fd`: The USER pointer to the array of file descriptors to be polled
-/// * `nfds`: The number stored in the previous array.
-/// * `time_spec`: The time, see `timer::TimeSpec` for information. NOT SUPPORTED and will be ignored!
-/// * `sigmask`: The pointer to the sigmask in use during the poll.
-/// # Note
-/// * `POLLHUP`, `POLLNVAL` and `POLLERR` are ALWAYS polled for all given files,
-///   regardless of whether it is set in the array.
-/// # Unsupported Features
-/// * Timeout is not yet supported.
-/// * Other implementations are supported by specific files and may not be used by
-/// * Currently only user space structs are supported.
-/// # Return Conditions
-/// The call will block until either:
-/// * a file descriptor becomes ready;
-/// * the call is interrupted by a signal handler; or
-/// * the timeout expires.
-/// # Return Values and Side-effects
-/// * On success, a positive number is returned; this is the number of structures
-///   which have nonzero revents fields (in other words, those descriptors
-///   with events or errors reported).
-/// * A value of 0 indicates that the call timed out and no file descriptors were ready.
-/// * On error, -1 is returned, and errno is set appropriately.
-/// * The observed event is written back to the array, with others cleared.
-pub fn ppoll(
-    fds: *mut PollFd,
-    nfds: usize,
-    tmo_p: *const TimeSpec,
-    sigmask: *const Signals,
-) -> isize {
-    let task = current_task().unwrap();
-    let token = task.get_user_token();
-    let timeout: Option<TimeSpec> = match try_get_from_user(token, tmo_p) {
-        Ok(tmo) => match tmo {
-            Some(tmo) => Some(tmo + crate::timer::TimeSpec::now()),
-            None => None,
-        },
-        Err(errno) => return errno,
-    };
-    // push to the top of TrapContext page, make use of redundant space
-    let oldsig =
-        ((task.trap_cx_user_va() + crate::config::PAGE_SIZE) as *mut Signals).wrapping_sub(1);
-    if !sigmask.is_null() {
-        sigprocmask(SigMaskHow::SIG_SETMASK.bits(), sigmask, oldsig);
+impl BitOr for PollMask {
+    type Output = Self;
+
+    /// 合并两个 poll 位集合。
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
     }
-    drop(task);
+}
 
-    let mut poll_fd = Vec::<PollFd>::with_capacity(nfds);
-    let mut done: isize = 0;
-    if let Ok(_) = copy_from_user_array(token, fds, poll_fd.as_mut_ptr(), nfds) {
-        unsafe {
-            poll_fd.set_len(nfds);
+impl BitOrAssign for PollMask {
+    /// 将右侧 poll 位加入当前集合。
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for PollMask {
+    type Output = Self;
+
+    /// 保留两个 poll 位集合的交集。
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+impl BitAndAssign for PollMask {
+    /// 将当前集合限制为与右侧集合的交集。
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
+
+impl BitXor for PollMask {
+    type Output = Self;
+
+    /// 保留两个 poll 位集合中只出现一侧的位。
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Self(self.0 ^ rhs.0)
+    }
+}
+
+impl BitXorAssign for PollMask {
+    /// 将当前集合与右侧集合做异或。
+    fn bitxor_assign(&mut self, rhs: Self) {
+        self.0 ^= rhs.0;
+    }
+}
+
+impl Not for PollMask {
+    type Output = Self;
+
+    /// 反转 poll 位集合中的全部 UAPI 位。
+    fn not(self) -> Self::Output {
+        Self(!self.0)
+    }
+}
+
+/// 提供实际就绪状态和持续等待源，普通文件的默认 mask 不属于该能力。
+pub trait Pollable: Send + Sync {
+    /// 首轮登记全部源后观察状态，后续无 table 的调用只查询，不创建一次等待者。
+    fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError>;
+}
+
+/// 接收源就绪短通知的角色；实现不得在回调中等待或依赖源锁。
+pub trait PollNotify: Send + Sync {
+    /// 接收一次源状态变化通知。
+    fn notify(&self, mask: PollMask);
+}
+
+struct PollNode {
+    sink: Arc<dyn PollNotify>,
+    next: SpinLock<Option<Pin<Arc<PollNode>>>>,
+}
+
+struct PollWaitState {
+    chain: Option<Pin<Arc<PollNode>>>,
+}
+
+/// 由实际文件对象持有、串行管理持续 poll 登记链的源头。
+pub struct PollWaitHead {
+    state: SpinLock<PollWaitState>,
+}
+
+impl PollWaitHead {
+    /// 建立一个尚未登记任何消费者的持续源头。
+    pub const fn new() -> Self {
+        Self {
+            state: SpinLock::new(PollWaitState { chain: None }),
         }
-        for poll_fd in poll_fd.iter_mut() {
-            poll_fd.revents = PollEvent::empty();
+    }
+
+    /// 在源短锁内顺序通知全部登记者；该路径不分配、不查询对象状态也不取睡眠锁。
+    pub fn notify(&self, mask: PollMask) {
+        let state = self.state.lock();
+        let mut current = state.chain.as_ref().cloned();
+        while let Some(node) = current {
+            node.sink.notify(mask);
+            current = {
+                let next = node.next.lock();
+                next.as_ref().cloned()
+            };
         }
+    }
 
-        loop {
-            let task = current_task().unwrap();
-            let fd_table = task.files.lock();
-
-            for poll_fd in poll_fd.iter_mut() {
-                let fd = poll_fd.fd as usize;
-                match fd_table.get_ref(fd) {
-                    Ok(file_descriptor) => {
-                        let mut trigger = 0;
-                        if file_descriptor.file.hang_up() {
-                            poll_fd.revents |= PollEvent::POLLHUP;
-                            trigger = 1;
-                        }
-                        if poll_fd.events.contains(PollEvent::POLLIN)
-                            && file_descriptor.file.r_ready()
-                        {
-                            poll_fd.revents |= PollEvent::POLLIN;
-                            trigger = 1;
-                        }
-                        if poll_fd.events.contains(PollEvent::POLLOUT)
-                            && file_descriptor.file.w_ready()
-                        {
-                            poll_fd.revents |= PollEvent::POLLOUT;
-                            trigger = 1;
-                        }
-                        done += trigger;
-                    }
-                    Err(_) => continue,
-                }
-            }
-            if done > 0 {
-                break;
-            }
-            if let Some(timeout) = timeout {
-                if crate::timer::TimeSpec::now() >= timeout {
-                    break;
-                }
-            }
-            drop(fd_table);
-            drop(task);
-            suspend_current_and_run_next();
-        }
-
-        log::trace!("[ppoll] result: {:?}", poll_fd);
-        copy_to_user_array(token, &poll_fd[0], fds, nfds).unwrap();
-    } else {
-        log::error!(
-            "[ppoll] Error copy_from_user_array(_, fds: {:?}, poll_fd.as_mut_ptr():{:?}, _)",
-            fds,
-            poll_fd.as_mut_ptr()
+    /// 登记一个持续通知接收者并返回持有源头、节点和源链责任的句柄。
+    pub fn register(
+        self: &Arc<Self>,
+        sink: Arc<dyn PollNotify>,
+    ) -> Result<PollRegistration, FsError> {
+        let node = Pin::new(
+            Arc::try_new(PollNode {
+                sink,
+                next: SpinLock::new(None),
+            })
+            .map_err(|_| FsError::NoMemory)?,
         );
-        done = EFAULT;
-    }
-    if !sigmask.is_null() {
-        sigprocmask(
-            SigMaskHow::SIG_SETMASK.bits(),
-            oldsig,
-            null_mut::<Signals>(),
-        );
-    }
-    done
-}
-
-// This may be unsafe since the size of bits is undefined.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-/// Bitmap used by `pselect()` and `select` to indicate the event to wait for.
-pub struct FdSet {
-    bits: [u64; 16],
-}
-use crate::lang_items::Bytes;
-#[allow(unused)]
-impl FdSet {
-    /// Return an empty bitmap for further manipulation
-    pub fn empty() -> Self {
-        Self { bits: [0; 16] }
-    }
-    /// Divide `d` by 64 to decide the `u64` in `bits` to visit.
-    fn fd_elt(d: usize) -> usize {
-        d >> 6
-    }
-    /// Mod `d` by 64 for the position of `d` in the `fd_elt()` bitmap.
-    fn fd_mask(d: usize) -> u64 {
-        1 << (d & 0x3F)
-    }
-    /// Clear the current struct.
-    pub fn clr_all(&mut self) {
-        for i in 0..16 {
-            self.bits[i] = 0;
+        let mut state = self.state.lock();
+        {
+            let mut next = node.next.lock();
+            *next = state.chain.take();
         }
-    }
-    /// Collect all fds with their bits set.
-    pub fn get_fd_vec(&self) -> Vec<usize> {
-        let mut v = Vec::new();
-        for i in 0..1024 {
-            if self.is_set(i) {
-                v.push(i);
-            }
-        }
-        v
-    }
-    /// The total number of set bits.
-    pub fn set_num(&self) -> u32 {
-        let mut sum: u32 = 0;
-        for i in self.bits.iter() {
-            sum += i.count_ones();
-        }
-        sum
-    }
-    pub fn set(&mut self, d: usize) {
-        self.bits[Self::fd_elt(d)] |= Self::fd_mask(d);
-    }
-    /// Clear a certain bit `d` to stop waiting for the event of the correspond fd.
-    pub fn clr(&mut self, d: usize) {
-        self.bits[Self::fd_elt(d)] &= !Self::fd_mask(d);
-    }
-    /// Predicate for whether the bit is set for the `d`
-    pub fn is_set(&self, d: usize) -> bool {
-        (Self::fd_mask(d) & self.bits[Self::fd_elt(d)]) != 0
-    }
-}
-impl Bytes<FdSet> for FdSet {
-    fn as_bytes(&self) -> &[u8] {
-        let size = core::mem::size_of::<FdSet>();
-        unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, size) }
+        state.chain = Some(node.clone());
+        Ok(PollRegistration {
+            head: Arc::clone(self),
+            node,
+        })
     }
 
-    fn as_bytes_mut(&mut self) -> &mut [u8] {
-        let size = core::mem::size_of::<FdSet>();
-        unsafe { core::slice::from_raw_parts_mut(self as *mut _ as *mut u8, size) }
-    }
-}
-/// Poll each of the file discriptors
-/// until certain events.
-///
-/// # Arguments
-///
-/// * `nfds`: the highest-numbered file descriptor in any of the three sets
-///
-/// * `read_fds`: files to be watched to see if characters become available for reading
-///
-/// * `write_fds`: files to be watched to see if characters become available for writing
-///
-/// * `except_fds`: exceptional conditions
-///
-/// (For examples of some exceptional conditions, see the discussion of POLLPRI in [poll(2)].)
-/// * `timeout`: argument specifies the interval that pselect() should block waiting for a file descriptor to become ready
-///
-/// * `sigmask`: the sigmask used by the process during the poll, as in ppoll  
-///
-/// # Return Value
-///
-/// * On success, select() and pselect() return the number of file descriptors  contained in the three returned descriptor sets (that is, the total number of bits that are set in  readfds, writefds,  exceptfds)  which  may be zero if the timeout expires before anything interesting happens.  
-///
-/// * On error, -1  is returned,  the file descriptor sets are unmodified, and  timeout  becomes  undefined.
-///  
-/// * If both fields of the timeval structure are zero,
-///    then select() returns immediately.
-///    (This is useful for  polling.)
-///    If timeout is NULL (no timeout), select() can block indefinitely.
-pub fn pselect(
-    nfds: usize,
-    read_fds: &mut Option<FdSet>,
-    write_fds: &mut Option<FdSet>,
-    exception_fds: &mut Option<FdSet>,
-    timeout: &Option<TimeSpec>,
-    sigmask: *const Signals,
-) -> isize {
-    let timeout: Option<TimeSpec> = if let Some(ref timeout) = timeout {
-        Some(*timeout + crate::timer::TimeSpec::now())
-    } else {
-        None
-    };
-
-    // push to the top of TrapContext page, make use of redundant space
-    let oldsig = ((current_task().unwrap().trap_cx_user_va() + crate::config::PAGE_SIZE)
-        as *mut Signals)
-        .wrapping_sub(1);
-    if !sigmask.is_null() {
-        sigprocmask(SigMaskHow::SIG_SETMASK.bits(), sigmask, oldsig);
-    }
-
-    let mut done = 0;
-    loop {
-        let task = current_task().unwrap();
-        let fd_table = task.files.lock();
-
-        // check read
-        if let Some(ref read_fds) = read_fds {
-            for i in 0..nfds {
-                if !read_fds.is_set(i) {
-                    continue;
-                }
-                if let Ok(fd) = fd_table.get_ref(i) {
-                    if fd.r_ready() {
-                        done += 1;
+    /// 在源锁内同步摘除目标节点，并将被摘下的源链 ticket 留到锁外释放。
+    fn unlink(&self, target: &Pin<Arc<PollNode>>) {
+        let detached = {
+            let mut state = self.state.lock();
+            if state
+                .chain
+                .as_ref()
+                .is_some_and(|node| same_node(node, target))
+            {
+                let detached = state.chain.take();
+                let successor = detached.as_ref().and_then(|node| {
+                    let mut next = node.next.lock();
+                    next.take()
+                });
+                state.chain = successor;
+                detached
+            } else {
+                let mut current = state.chain.as_ref().cloned();
+                let mut detached = None;
+                while let Some(node) = current {
+                    let mut next = node.next.lock();
+                    if next
+                        .as_ref()
+                        .is_some_and(|candidate| same_node(candidate, target))
+                    {
+                        let removed = next.take();
+                        let successor = removed.as_ref().and_then(|candidate| {
+                            let mut following = candidate.next.lock();
+                            following.take()
+                        });
+                        *next = successor;
+                        detached = removed;
+                        break;
                     }
+                    current = next.as_ref().cloned();
                 }
+                detached
             }
-        }
-        // check write
-        if let Some(ref write_fds) = write_fds {
-            for i in 0..nfds {
-                if !write_fds.is_set(i) {
-                    continue;
-                }
-                if let Ok(fd) = fd_table.get_ref(i) {
-                    if fd.w_ready() {
-                        done += 1;
-                    }
-                }
-            }
-        }
-        // check exception
-        // do nothing
+        };
+        drop(detached);
+    }
+}
 
-        if done != 0 {
-            break;
-        }
-        if let Some(timeout) = timeout {
-            if crate::timer::TimeSpec::now() >= timeout {
-                break;
-            }
-        }
+/// 一个持续 poll 登记的同步注销句柄。
+pub struct PollRegistration {
+    head: Arc<PollWaitHead>,
+    node: Pin<Arc<PollNode>>,
+}
 
-        drop(fd_table);
-        drop(task);
-        suspend_current_and_run_next();
+impl PollRegistration {
+    /// 同步撤销登记；返回前源链不再访问该节点。
+    pub fn unregister(self) {
+        drop(self);
     }
-    let task = current_task().unwrap();
-    let fd_table = task.files.lock();
-    // count read
-    if let Some(read_fds) = read_fds.as_mut() {
-        for i in 0..nfds {
-            if !read_fds.is_set(i) {
-                continue;
-            }
-            if let Ok(fd) = fd_table.get_ref(i) {
-                if !fd.r_ready() {
-                    read_fds.clr(i);
-                }
-            }
+}
+
+impl Drop for PollRegistration {
+    /// 先在源锁内摘链，再在锁外释放源链 ticket 和节点拥有。
+    fn drop(&mut self) {
+        self.head.unlink(&self.node);
+    }
+}
+
+/// 比较两个稳定节点的实际地址，不从节点内容重建任何拥有引用。
+fn same_node(left: &Pin<Arc<PollNode>>, right: &Pin<Arc<PollNode>>) -> bool {
+    core::ptr::eq(Pin::as_ref(left).get_ref(), Pin::as_ref(right).get_ref())
+}
+
+/// 负责一次 provider 轮询的有限、可失败源登记集合。
+pub struct PollTable {
+    sink: Arc<dyn PollNotify>,
+    registrations: Vec<PollRegistration>,
+}
+
+impl PollTable {
+    /// 预留固定登记容量；容量不足时不会在后续首轮登记中隐式扩容。
+    pub fn new(sink: Arc<dyn PollNotify>, capacity: usize) -> Result<Self, FsError> {
+        let mut registrations = Vec::new();
+        registrations
+            .try_reserve_exact(capacity)
+            .map_err(|_| FsError::NoMemory)?;
+        Ok(Self {
+            sink,
+            registrations,
+        })
+    }
+
+    /// 首轮登记一个源头；同一源头在本表中只保留一个登记。
+    pub fn register(&mut self, head: &Arc<PollWaitHead>) -> Result<(), FsError> {
+        if self
+            .registrations
+            .iter()
+            .any(|registration| Arc::ptr_eq(&registration.head, head))
+        {
+            return Ok(());
+        }
+        if self.registrations.len() == self.registrations.capacity() {
+            return Err(FsError::NoMemory);
+        }
+        let registration = head.register(Arc::clone(&self.sink))?;
+        self.registrations.push(registration);
+        Ok(())
+    }
+
+    /// 返回本表中已经登记的不同源头数量。
+    pub fn len(&self) -> usize {
+        self.registrations.len()
+    }
+
+    /// 返回本表是否尚未登记任何源头。
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
+}
+
+impl Drop for PollTable {
+    /// 逆序销毁登记集合；每个登记先同步撤链，再释放节点、源头和 sink 引用。
+    fn drop(&mut self) {
+        while let Some(registration) = self.registrations.pop() {
+            drop(registration);
         }
     }
-    // count write
-    if let Some(write_fds) = write_fds.as_mut() {
-        for i in 0..nfds {
-            if !write_fds.is_set(i) {
-                continue;
-            }
-            if let Ok(fd) = fd_table.get_ref(i) {
-                if !fd.w_ready() {
-                    write_fds.clr(i);
-                }
-            }
-        }
-    }
-    // count exception
-    if let Some(exception_fds) = exception_fds {
-        *exception_fds = FdSet::empty();
-    }
-    if !sigmask.is_null() {
-        sigprocmask(
-            SigMaskHow::SIG_SETMASK.bits(),
-            oldsig,
-            null_mut::<Signals>(),
-        );
-    }
-    done as isize
 }

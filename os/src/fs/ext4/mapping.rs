@@ -4,8 +4,8 @@ use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
 use crate::fs::ext4::allocation::DetachedBlock;
 use crate::fs::ext4::codec::{self, EXTENTS};
-use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData, InodeKind, UnpublishedBlock};
-use crate::fs::FsError;
+use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData, UnpublishedBlock};
+use crate::fs::{FsError, InodeKind};
 use alloc::vec::Vec;
 use core::convert::{TryFrom, TryInto};
 
@@ -1205,7 +1205,12 @@ pub(crate) fn prepare_truncate(
         nodes: Vec::new(),
         indirect: Vec::new(),
     };
-    if inode.fast_symlink || inode.kind == InodeKind::Other {
+    if inode.fast_symlink
+        || matches!(
+            inode.kind,
+            InodeKind::Character | InodeKind::Block | InodeKind::Other
+        )
+    {
         if new_size != 0 {
             return Err(FsError::InvalidOperation);
         }

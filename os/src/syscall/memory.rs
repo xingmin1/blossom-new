@@ -50,8 +50,10 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
         if access == 1 || (!private && permissions.write && access == 0) {
             return Err(Errno::Permission);
         }
+        let inode = file.mapping_inode().ok_or(Errno::NoDevice)?.clone();
         if !private {
-            let writable = file.path().check_writable();
+            let path = file.path().ok_or(Errno::NoDevice)?;
+            let writable = path.check_writable();
             maximum.write = access == 2 && writable.is_ok();
             if permissions.write {
                 writable?;
@@ -59,6 +61,7 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         MmapSource::File {
             file,
+            inode,
             offset: offset as u64,
             private,
         }

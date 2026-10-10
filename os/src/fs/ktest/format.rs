@@ -468,7 +468,13 @@ pub(crate) mod identity {
         context.expect_eq(first.number(), second.number());
         context.expect_eq(first.ptr_eq(&second), false);
         context.expect_eq(core::ptr::eq(first.mapping(), second.mapping()), false);
-        context.expect_eq(Arc::ptr_eq(first.filesystem(), second.filesystem()), false);
+        context.expect_eq(
+            Arc::ptr_eq(
+                checked(context, first.disk_volume())?,
+                checked(context, second.disk_volume())?,
+            ),
+            false,
+        );
         Ok(())
     }
 }

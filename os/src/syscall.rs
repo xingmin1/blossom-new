@@ -147,6 +147,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         23 => file::dup(user, raw[0]),
         24 => file::dup3(user, raw),
         25 => file::fcntl(user, raw),
+        29 => file::ioctl(user, raw),
         34 => file::mkdirat(user, raw),
         35 => file::unlinkat(user, raw),
         36 => file::symlinkat(user, raw),

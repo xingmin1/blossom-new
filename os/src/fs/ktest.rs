@@ -1,4 +1,4 @@
-//! 真实 ext4 镜像、唯一 inode 与原文件页的具名消费回归。
+//! 真实挂载、canonical inode、原文件页与持续源的具名消费回归。
 
 use ::ktest::{self, Fixture, Resource, TestContext, TestError, TestResult};
 use alloc::sync::Arc;
@@ -8,11 +8,11 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::block::{self, AccessMode, BlockError, Disk, DiskRef};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
-use crate::fs::ext4::{Ext4Volume, InodeKind};
+use crate::fs::ext4::Ext4Volume;
 use crate::fs::inode::{InodeCache, InodeCacheWatch, InodeRef, InvalidateGuard};
 use crate::fs::{
-    DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, OpenOptions, Path,
-    ResolveMode, Vfs,
+    DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, InodeKind, OpenOptions,
+    Path, ResolveMode, Vfs,
 };
 use crate::mm::{FolioRead, FolioRef};
 use crate::sync::{Completion, SpinLock};
@@ -23,7 +23,10 @@ use crate::{cpu, drivers, mm, sched, time, timer};
 mod concurrency;
 mod file;
 mod format;
+mod mem_mapping;
 mod path;
+mod poll_source;
+mod pseudo;
 mod system;
 mod user;
 
@@ -31,9 +34,9 @@ const PATTERN_SIZE: u64 = 65573;
 const DIRECTORY_ENTRIES: usize = 12000;
 const DEEP_EXTENTS: u64 = 1500;
 
-/// 保留格式、inode、路径、文件与系统盘模块的实际宏锚点，不维护中央用例列表。
+/// 保留格式、inode、路径、文件、持续源与伪文件系统的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 25],
+    [&'static ::ktest::SuiteSlot; 28],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -65,6 +68,9 @@ pub(crate) fn anchors() -> (
             user::namespace_anchor(),
             user::readahead_anchor(),
             user::background_anchor(),
+            poll_source::source::__ktest_anchor(),
+            pseudo::anchors()[0],
+            mem_mapping::anchors()[0],
         ],
         path::anchors(),
         file::anchors(),
@@ -143,7 +149,7 @@ fn fill_file_page(
     _invalidate: &InvalidateGuard<'_>,
 ) -> Result<(), FsError> {
     match crate::fs::writeback::prepare_file_targets(inode, index, &(0..u64::MAX), None) {
-        Ok((size, targets)) => inode.filesystem().fill_page(index, size, &targets, read),
+        Ok((size, targets)) => inode.disk_volume()?.fill_page(index, size, &targets, read),
         Err(error) => Err(crate::fs::ext4::finish_error(read, error)),
     }
 }
@@ -448,7 +454,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             mut pressure,
         } => {
             let root = vfs.root();
-            let disk = root.filesystem().disk();
+            let disk = root.inode()?.disk_volume()?.disk();
             let submitted_before = disk.test_snapshot().submitted;
             let evidence = pressure.exhaust();
             let same = table.lookup(fd)?;
@@ -497,7 +503,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             name,
             mut pressure,
         } => {
-            let disk = parent.inode()?.filesystem().disk();
+            let disk = parent.inode()?.disk_volume()?.disk();
             let submitted_before = disk.test_snapshot().submitted;
             let len_before = vfs.dcache().len();
             let evidence = pressure.exhaust();

@@ -2,25 +2,27 @@
 
 pub(crate) mod background;
 mod dentry;
+pub(crate) mod devfs;
 pub(crate) mod ext4;
 mod file;
 mod file_table;
 mod inode;
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
+pub(crate) mod memfs;
 mod path;
+pub(crate) mod poll;
+pub(crate) mod procfs;
 pub(crate) mod readahead;
 pub(crate) mod system;
+mod types;
 pub(crate) mod writeback;
 
 pub use dentry::{DentryCache, DentryRef};
-pub(crate) use ext4::DirectoryCursor;
-pub use ext4::{
-    BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeData, InodeKind, InodeTime,
-};
+pub use ext4::{BlockMapping, Ext4Volume, Geometry, InodeData};
 pub use file::{
-    open_path, open_path_with_flags, stat_path, DirectoryFile, FileLike, FileRef, FileStat,
-    InodeFile, SeekFrom,
+    open_path, open_path_with_flags, stat_path, DirectoryFile, FileIoContext, FileLike, FileRef,
+    FileStat, InodeFile, SeekFrom,
 };
 pub use file::{ReadBuffer, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
@@ -28,7 +30,11 @@ pub(crate) use inode::{
     initialize_inode_eviction, DirectoryWriteGuard, InodeCacheWatch, InodeWeak, PreparedMkwrite,
 };
 pub use inode::{ExecAccess, InodeCache, InodeMetadata, InodeRef, WriteAccess};
+pub use memfs::{Filesystem, MemoryFs, MemoryFsKind};
 pub use path::{FsContext, LastComponent, LookupParent, Path, ResolveMode, Vfs};
+pub use poll::{PollMask, Pollable};
+pub(crate) use types::{DirectoryCursor, DirectoryPosition};
+pub use types::{DirectoryEntry, InodeKind, InodeTime};
 
 use crate::block::BlockError;
 
@@ -59,6 +65,8 @@ pub enum FsError {
     TooManyFiles,
     ReadOnly,
     IsDirectory,
+    IllegalSeek,
+    NotTty,
     BadAddress,
     Permission,
     LoadAborted,
@@ -83,6 +91,8 @@ impl FsError {
             | Self::ReadOnly
             | Self::IsDirectory
             | Self::BadAddress
+            | Self::IllegalSeek
+            | Self::NotTty
             | Self::Permission
             | Self::NotFound
             | Self::Exists

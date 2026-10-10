@@ -12,6 +12,7 @@ use crate::arch;
 use crate::block::{BlockError, IoResult};
 use crate::cache::MetadataCache;
 use crate::fs::background::{self, WritebackDomain};
+use crate::fs::memfs::MemoryPageCharge;
 use crate::fs::InodeRef;
 use crate::mm::page::{PageDesc, PageUseGuard};
 use crate::mm::{alloc_pages, pages, OwnedPages, PAGE_SIZE};
@@ -32,10 +33,11 @@ struct InitializedRange {
     len: u16,
 }
 
-/// 文件页只初始化一次任意合法范围；元数据页逐 sector 保留有效位和首次具体错误。
+/// 文件页只初始化一次任意合法范围；RAM 文件额度随内容槽持有到最后原页引用。
 enum FolioContents {
     File {
         initialized: Option<Result<InitializedRange, BlockError>>,
+        memory_charge: Option<MemoryPageCharge>,
     },
     Metadata {
         valid: u8,
@@ -131,7 +133,7 @@ impl FolioState {
     /// 只检查当前范围事实；调用者负责持内容锁或拒绝仍被锁定的状态。
     fn range_ready(shared: &FolioShared, offset: usize, len: usize) -> Result<(), BlockError> {
         match &shared.contents {
-            FolioContents::File { initialized } => {
+            FolioContents::File { initialized, .. } => {
                 let range = initialized.ok_or(BlockError::NotReady)??;
                 let start = usize::from(range.offset);
                 let end = start + usize::from(range.len);
@@ -242,7 +244,13 @@ impl FolioRef {
 
     /// 消耗真实 order0 拥有者作为文件页；高阶完整返回，不拆分或改变其阶数。
     pub fn from_pages(backing: OwnedPages) -> Result<Self, OwnedPages> {
-        Self::install(backing, FolioContents::File { initialized: None })
+        Self::install(
+            backing,
+            FolioContents::File {
+                initialized: None,
+                memory_charge: None,
+            },
+        )
     }
 
     /// 消耗独占 order0 页作为元数据页；此角色终身禁止交给用户可写映射。
@@ -256,12 +264,33 @@ impl FolioRef {
         )
     }
 
+    /// 将预留的 RAM 文件页额度移入原页内容槽；节点发表前必须完成此转移。
+    pub(crate) fn attach_memory_charge(&mut self, charge: MemoryPageCharge) {
+        let mut usage = self.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        let FolioContents::File { memory_charge, .. } = &mut shared.contents else {
+            panic!("memory charge attached to metadata folio");
+        };
+        assert!(
+            memory_charge.is_none(),
+            "folio already owns a memory charge"
+        );
+        *memory_charge = Some(charge);
+        background::account_file_page(false);
+    }
+
     /// 在未发表的空用途槽安装原拥有者和终身内容角色。
     fn install(backing: OwnedPages, contents: FolioContents) -> Result<Self, OwnedPages> {
         if backing.order() != 0 {
             return Err(backing);
         }
-        let file_role = matches!(&contents, FolioContents::File { .. });
+        let file_role = matches!(
+            &contents,
+            FolioContents::File {
+                memory_charge: None,
+                ..
+            }
+        );
         let descriptor = pages()
             .get(backing.phys_addr() / PAGE_SIZE)
             .expect("folio PFN has no descriptor");
@@ -324,6 +353,17 @@ impl FolioRef {
     pub fn ref_count(&self) -> usize {
         FolioState::shared(&self.descriptor.usage()).references
     }
+    /// 只识别由 MemoryPageCharge 标记的 RAM 文件原页，不凭文件打开对象猜后端。
+    pub(crate) fn is_memory(&self) -> bool {
+        let usage = self.descriptor.usage();
+        matches!(
+            &FolioState::shared(&usage).contents,
+            FolioContents::File {
+                memory_charge: Some(_),
+                ..
+            }
+        )
+    }
 
     /// 文件的一次填充结束后为真（包括失败）；元数据须整页全部 sector 已终结。
     /// 检查特定视图的可读性必须使用 range_ready，不能据此忽略失败或部分有效范围。
@@ -333,7 +373,7 @@ impl FolioRef {
             return false;
         }
         match &FolioState::shared(&usage).contents {
-            FolioContents::File { initialized } => initialized.is_some(),
+            FolioContents::File { initialized, .. } => initialized.is_some(),
             FolioContents::Metadata { valid, errors } => (0..SECTORS_PER_PAGE)
                 .all(|sector| valid & (1 << sector) != 0 || errors[sector].is_some()),
         }
@@ -348,7 +388,9 @@ impl FolioRef {
             let mut usage = self.descriptor.usage();
             let shared = FolioState::shared_mut(&mut usage);
             match &shared.contents {
-                FolioContents::File { initialized: None } => {}
+                FolioContents::File {
+                    initialized: None, ..
+                } => {}
                 FolioContents::File { .. } => return Err(BlockError::Busy),
                 FolioContents::Metadata { .. } => return Err(BlockError::InvalidRange),
             }
@@ -435,7 +477,7 @@ impl FolioRef {
         let usage = self.descriptor.usage();
         let shared = FolioState::shared(&usage);
         match &shared.contents {
-            FolioContents::File { initialized } => {
+            FolioContents::File { initialized, .. } => {
                 initialized.ok_or(BlockError::NotReady)?.map(|_| ())
             }
             FolioContents::Metadata { .. } => FolioState::range_ready(shared, 0, PAGE_SIZE),
@@ -571,7 +613,17 @@ impl FolioRef {
                     shared.writeback, 0,
                     "last folio reference retains writeback"
                 );
-                let file = matches!(&shared.contents, FolioContents::File { .. });
+                let file = matches!(
+                    &shared.contents,
+                    FolioContents::File {
+                        memory_charge: None,
+                        ..
+                    }
+                );
+                let charge = match &mut shared.contents {
+                    FolioContents::File { memory_charge, .. } => memory_charge.take(),
+                    FolioContents::Metadata { .. } => None,
+                };
                 assert_eq!(
                     usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED,
                     0,
@@ -579,7 +631,7 @@ impl FolioRef {
                 );
                 // SAFETY: 引用归零且无内容锁、Dirty、WB；读入和等待者均自持活引用，
                 // 全部固定投影已结束，take 只原地析构用途，页在退出用途锁后归还。
-                Some((unsafe { usage.take_folio() }, file))
+                Some((unsafe { usage.take_folio() }, file, charge))
             } else {
                 None
             }
@@ -587,8 +639,9 @@ impl FolioRef {
         if let Some(FolioOwner::Metadata(cache)) = &self.owner {
             cache.notify_metadata_available();
         }
-        if let Some((backing, file)) = discarded {
+        if let Some((backing, file, charge)) = discarded {
             drop(backing);
+            drop(charge);
             if file {
                 background::account_file_page(false);
             }
@@ -648,7 +701,8 @@ impl FolioRef {
             || !matches!(
                 &shared.contents,
                 FolioContents::File {
-                    initialized: Some(Ok(_))
+                    initialized: Some(Ok(_)),
+                    ..
                 }
             )
         {
@@ -720,21 +774,32 @@ impl FolioRef {
 
     /// 用途锁内只作原子转移，本卷账取真实外部 File owner，不取得调度锁。
     fn account_state(&self, old_dirty: u8, old_wb: u8, shared: &FolioShared) {
+        if matches!(
+            &shared.contents,
+            FolioContents::File {
+                memory_charge: Some(_),
+                ..
+            }
+        ) {
+            return;
+        }
         background::account_folio(old_dirty, shared.dirty, old_wb, shared.writeback);
         if let Some(FolioOwner::File(inode)) = &self.owner {
-            inode.filesystem().writeback_domain().account_folio(
-                old_dirty,
-                shared.dirty,
-                old_wb,
-                shared.writeback,
-            );
+            inode
+                .disk_volume()
+                .expect("disk folio accounting has no volume")
+                .writeback_domain()
+                .account_folio(old_dirty, shared.dirty, old_wb, shared.writeback);
         }
     }
 
     /// 用途锁外重报可见脏义务；只有可能减轻压力时唤醒 writer，新 Dirty 不制造空唤醒。
     fn notify_dirty_state(&self, relieved: bool) {
+        if self.is_memory() {
+            return;
+        }
         if let Some(FolioOwner::File(inode)) = &self.owner {
-            let volume = inode.filesystem();
+            let volume = inode.disk_volume().expect("disk dirty folio has no volume");
             let domain = volume.writeback_domain();
             if self.dirty_sectors() != 0 {
                 domain.notify_dirty(volume);
@@ -831,6 +896,9 @@ impl FolioContent<'_> {
     ) -> Result<(), BlockError> {
         if PAGE_SIZE < valid_bytes || !matches!(block_size, 1024 | 2048 | 4096) {
             return Err(BlockError::InvalidRange);
+        }
+        if self.folio.is_memory() {
+            return Ok(());
         }
         let mut usage = self.folio.descriptor.usage();
         let shared = FolioState::shared_mut(&mut usage);
@@ -999,7 +1067,7 @@ impl FolioContent<'_> {
         // 本 guard 独占内容锁，初始化 owner 无法同时存在；设备尾部与外部
         // 映射失效仍由 caller 证明，状态清除不能取消任何已接受的访问责任。
         match &mut shared.contents {
-            FolioContents::File { initialized } => *initialized = None,
+            FolioContents::File { initialized, .. } => *initialized = None,
             FolioContents::Metadata { valid, errors } => {
                 *valid = 0;
                 errors.fill(None);
@@ -1074,6 +1142,9 @@ impl FolioContent<'_> {
         len: usize,
     ) -> Result<Option<FolioWriteback>, BlockError> {
         validate_range(offset, len)?;
+        if self.folio.is_memory() {
+            return Err(BlockError::Unsupported);
+        }
         if offset % SECTOR_SIZE != 0 || len % SECTOR_SIZE != 0 {
             return Err(BlockError::Misaligned);
         }
@@ -1099,7 +1170,11 @@ impl FolioContent<'_> {
         }
         background::note_writeback_start();
         if let Some(FolioOwner::File(inode)) = &self.folio.owner {
-            inode.filesystem().writeback_domain().note_writeback_start();
+            inode
+                .disk_volume()
+                .expect("disk writeback folio has no volume")
+                .writeback_domain()
+                .note_writeback_start();
         }
         Ok(Some(FolioWriteback {
             folio,
@@ -1118,6 +1193,15 @@ impl FolioContent<'_> {
         let mut usage = self.folio.descriptor.usage();
         let shared = FolioState::shared_mut(&mut usage);
         FolioState::range_ready(shared, offset, len)?;
+        if matches!(
+            &shared.contents,
+            FolioContents::File {
+                memory_charge: Some(_),
+                ..
+            }
+        ) {
+            return Ok(());
+        }
         let mask = sector_mask(offset, len);
         if matches!(&shared.contents, FolioContents::Metadata { .. })
             && shared.writeback & mask != 0
@@ -1225,11 +1309,11 @@ impl FolioWriteback {
             if 0 < accepted {
                 background::note_completion(accepted, result.completed);
                 if let Some(FolioOwner::File(inode)) = &self.folio.owner {
-                    inode.filesystem().writeback_domain().note_completion(
-                        accepted,
-                        result.completed,
-                        error.map(Into::into),
-                    );
+                    inode
+                        .disk_volume()
+                        .expect("disk writeback completion has no volume")
+                        .writeback_domain()
+                        .note_completion(accepted, result.completed, error.map(Into::into));
                 } else if let Some(domain) = &self.writeback_domain {
                     domain.note_completion(accepted, result.completed, error.map(Into::into));
                 }
@@ -1368,6 +1452,7 @@ impl FolioRead {
             match &mut shared.contents {
                 FolioContents::File {
                     initialized: result,
+                    ..
                 } => {
                     assert!(result.is_none(), "folio result already published");
                     *result = Some(initialized);

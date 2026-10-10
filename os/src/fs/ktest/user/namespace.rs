@@ -9,7 +9,7 @@ use crate::block::{
 };
 use crate::cache::ktest::HeapPressure;
 use crate::cache::{BufferRef, MetadataCache, MetadataLoadHook};
-use crate::fs::ext4::{codec, BlockMapping, DirectoryEntry, Ext4Volume, InodeKind};
+use crate::fs::ext4::{codec, BlockMapping, Ext4Volume};
 use crate::fs::ktest::user::write::{
     allocation_counts, block_allocation_bit, inode_allocation_bit, WriteOwner,
 };
@@ -19,6 +19,7 @@ use crate::fs::{
     open_path, DentryRef, DescriptorFlags, FileLike, FileRef, FileTable, FsContext, FsError,
     InodeCache, InodeMetadata, InodeRef, OpenOptions, Path, ResolveMode, SeekFrom, Vfs,
 };
+use crate::fs::{DirectoryEntry, InodeKind};
 use crate::mm::dma::MappedPages;
 
 const INDEX: u32 = 0x1000;
@@ -246,6 +247,7 @@ fn name_for_split_leaf(
 /// 从真实 OFD readdir 找到所有新名字；短 callback 拒绝的末项必须按原位置重交付。
 fn verify_indexed_new_names(
     context: &mut TestContext<'_>,
+    vfs: &Vfs,
     path: &Path,
     expected: &[RawName],
     inode_number: u64,
@@ -253,7 +255,7 @@ fn verify_indexed_new_names(
     if expected.is_empty() {
         return Err(TestError("indexed directory name set is empty"));
     }
-    let file = checked(context, open_path(path.clone()))?;
+    let file = checked(context, open_path(vfs, path.clone()))?;
     let mut seen = Vec::new();
     seen.try_reserve_exact(expected.len())
         .map_err(|_| TestError("indexed name bitmap OOM"))?;
@@ -616,7 +618,7 @@ fn promote_legacy_directory(
     let directory_fd = checked(context, directory_table.reserve())?
         .publish(directory_file.clone(), DescriptorFlags::default());
     let duplicate_fd = checked(context, directory_table.dup(directory_fd))?;
-    let directory = directory_file.path().clone();
+    let directory = directory_file.path().unwrap().clone();
     let inode = checked(context, directory.inode())?.clone();
     context.expect_eq(
         checked(context, inode.metadata_snapshot())?.flags & INDEX,
@@ -820,11 +822,12 @@ fn set_root_hash_version(
 /// 核对目录字节名、拒绝交付位置与 OFD cookie 推进，读完后保留末尾位置。
 fn complete_directory_names(
     context: &mut TestContext<'_>,
+    vfs: &Vfs,
     path: &Path,
     names: &[Vec<u8>],
     inode_number: u64,
 ) -> TestResult {
-    let file = checked(context, open_path(path.clone()))?;
+    let file = checked(context, open_path(vfs, path.clone()))?;
     let mut seen = Vec::new();
     seen.try_reserve_exact(names.len())
         .map_err(|_| TestError("directory name bitmap OOM"))?;
@@ -1139,7 +1142,13 @@ fn cold_reopen_namespace(
     fixture.cold_volume = Some(volume.clone());
     let vfs = Arc::try_new(checked(
         context,
-        Vfs::try_new(volume.clone(), cache, 128, 4, AccessMode::ReadWrite),
+        Vfs::try_new(
+            crate::fs::Filesystem::Ext4(volume.clone()),
+            cache,
+            128,
+            4,
+            AccessMode::ReadWrite,
+        ),
     )?)
     .map_err(|_| TestError("cold namespace Vfs owner OOM"))?;
     let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
@@ -1696,7 +1705,7 @@ pub(crate) mod native {
                 .err(),
             Some(FsError::NotFound),
         );
-        verify_indexed_new_names(context, &indexed, &names, source_number)?;
+        verify_indexed_new_names(context, &view.vfs, &indexed, &names, source_number)?;
         let mut cold_path = Vec::new();
         cold_path
             .try_reserve_exact(9 + rename_target.bytes.len())
@@ -1736,12 +1745,14 @@ pub(crate) mod native {
         context.expect_eq(unsigned_version.root[28], 3);
         complete_directory_names(
             context,
+            &view.vfs,
             &collision_signed.path,
             &collision_signed.names,
             source_number,
         )?;
         complete_directory_names(
             context,
+            &view.vfs,
             &collision_unsigned.path,
             &collision_unsigned.names,
             source_number,
@@ -1801,7 +1812,13 @@ pub(crate) mod native {
         let cache = fixture.user.path.owner.cache().clone();
         let read_only_vfs = Arc::try_new(checked(
             context,
-            Vfs::try_new(view.volume.clone(), cache, 128, 4, AccessMode::ReadOnly),
+            Vfs::try_new(
+                crate::fs::Filesystem::Ext4(view.volume.clone()),
+                cache,
+                128,
+                4,
+                AccessMode::ReadOnly,
+            ),
         )?)
         .map_err(|_| TestError("read-only namespace view OOM"))?;
         let read_only_root = read_only_vfs.root();
@@ -1879,10 +1896,10 @@ pub(crate) mod native {
                 Some((0o666, view.context.umask())),
                 false,
                 false,
-                |path, _| open_path(path),
+                |path, _| open_path(&view.vfs, path),
             ),
         )?;
-        let new_pattern = new_file.path().clone();
+        let new_pattern = new_file.path().unwrap().clone();
         let new_pattern_inode = checked(context, new_pattern.inode())?.clone();
         fixture.inodes.push(new_pattern_inode.clone());
         let current_pattern = checked(
@@ -2021,8 +2038,11 @@ pub(crate) mod native {
         )?;
         checked(
             context,
-            view.vfs
-                .mount(&alias_covered, view.volume.clone(), AccessMode::ReadWrite),
+            view.vfs.mount(
+                &alias_covered,
+                crate::fs::Filesystem::Ext4(view.volume.clone()),
+                AccessMode::ReadWrite,
+            ),
         )?;
         let alias_root = checked(
             context,
@@ -2030,10 +2050,7 @@ pub(crate) mod native {
                 .resolve(&view.context, b"/w26-alias", ResolveMode::Follow),
         )?;
         context.expect_eq(alias_root.ptr_eq(&alias_covered), false);
-        context.expect_eq(
-            Arc::ptr_eq(alias_root.filesystem(), view.root.filesystem()),
-            true,
-        );
+        context.expect_eq(alias_root.filesystem().ptr_eq(view.root.filesystem()), true);
         context.expect_eq(
             view.vfs
                 .link_from(
@@ -2115,7 +2132,7 @@ pub(crate) mod native {
             ),
         )?;
         let source_parent_file = fixture.open(context, b"/w26-source-readonly", 0)?;
-        let source_parent = source_parent_file.path().clone();
+        let source_parent = source_parent_file.path().unwrap().clone();
         checked(
             context,
             view.vfs.mkdir_from(
@@ -2140,7 +2157,7 @@ pub(crate) mod native {
             ),
         )?;
         let target_parent_file = fixture.open(context, b"/w26-target-parent", 0)?;
-        let target_parent = target_parent_file.path().clone();
+        let target_parent = target_parent_file.path().unwrap().clone();
         context.expect_eq(
             view.vfs
                 .rename_from(
@@ -2423,7 +2440,7 @@ pub(crate) mod native {
     ) -> TestResult {
         fixture.prepare_namespace(context)?;
         let file = fixture.open(context, b"/pattern", 2)?;
-        let path = file.path().clone();
+        let path = file.path().unwrap().clone();
         let inode = checked(context, path.inode())?.clone();
         let volume = fixture.volume();
         let block_size = volume.geometry().block_size as u64;
@@ -2550,7 +2567,7 @@ pub(crate) mod native {
     ) -> TestResult {
         fixture.prepare_namespace(context)?;
         let file = fixture.open(context, b"/pattern", 0)?;
-        let inode = checked(context, file.path().inode())?.clone();
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
         let volume = fixture.volume();
         let block_size = volume.geometry().block_size as u64;
         for logical in 0..(mm::PAGE_SIZE as u64 / block_size) {

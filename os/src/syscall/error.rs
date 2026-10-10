@@ -26,13 +26,16 @@ pub(super) enum Errno {
     Busy = 16,
     Exists = 17,
     CrossDevice = 18,
+    NoDevice = 19,
     NotDirectory = 20,
     IsDirectory = 21,
     InvalidArgument = 22,
     TooManyFiles = 24,
+    NotTty = 25,
     TextBusy = 26,
     FileTooLarge = 27,
     NoSpace = 28,
+    IllegalSeek = 29,
     ReadOnly = 30,
     TooManyLinks = 31,
     NameTooLong = 36,
@@ -79,6 +82,8 @@ impl From<FsError> for Errno {
             FsError::TooManyFiles => Self::TooManyFiles,
             FsError::ReadOnly => Self::ReadOnly,
             FsError::IsDirectory => Self::IsDirectory,
+            FsError::IllegalSeek => Self::IllegalSeek,
+            FsError::NotTty => Self::NotTty,
             FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => {
                 Self::Io
             }
@@ -94,6 +99,7 @@ impl From<VmError> for Errno {
             VmError::InvalidRange => Self::InvalidArgument,
             VmError::Occupied => Self::Exists,
             VmError::Permission => Self::Permission,
+            VmError::NotMappable => Self::NoDevice,
             VmError::BeyondEof => Self::BadAddress,
             VmError::File(error) => error.into(),
         }

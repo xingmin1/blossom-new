@@ -4,8 +4,8 @@ use alloc::sync::Arc;
 use core::convert::TryFrom;
 
 use crate::fs::{
-    self, DescriptorFlags, DirectoryEntry, FileStat, FsContext, InodeKind, Path, ReadBuffer,
-    ResolveMode, SeekFrom, Vfs, WriteBuffer,
+    self, DescriptorFlags, DirectoryEntry, FileIoContext, FileStat, FsContext, InodeKind, Path,
+    ReadBuffer, ResolveMode, SeekFrom, Vfs, WriteBuffer,
 };
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyout, Errno, SysResult};
@@ -66,7 +66,16 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
             Some((raw[3] as u16, context.umask())),
             flags & EXCLUSIVE != 0,
             flags & NOFOLLOW != 0,
-            |path, created| prepare_open(path, flags, credentials, created),
+            |path, created| {
+                prepare_open(
+                    &vfs,
+                    path,
+                    flags,
+                    credentials,
+                    created,
+                    FileIoContext::User(user),
+                )
+            },
         )?
     } else {
         let mode = if flags & NOFOLLOW != 0 {
@@ -75,7 +84,14 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
             ResolveMode::Follow
         };
         let path = vfs.resolve_from(&context, &start, &pathname, mode, Some(credentials))?;
-        prepare_open(path, flags, credentials, false)?
+        prepare_open(
+            &vfs,
+            path,
+            flags,
+            credentials,
+            false,
+            FileIoContext::User(user),
+        )?
     };
     Ok(reservation.publish(
         file,
@@ -86,10 +102,12 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
 }
 /// 按最终 inode 决定 DAC 与 OFD；刚创建的空对象不重新核自身 mode，也不执行 O_TRUNC。
 fn prepare_open(
+    vfs: &Vfs,
     path: Path,
     flags: u32,
     credentials: (u32, u32),
     created: bool,
+    caller: FileIoContext<'_>,
 ) -> Result<fs::FileRef, fs::FsError> {
     let access = flags & 3;
     if access == 3 {
@@ -117,7 +135,7 @@ fn prepare_open(
         path.check_access(credentials.0, credentials.1, access)?;
     }
     let flags = flags & !(CREATE | EXCLUSIVE | if created { TRUNC } else { 0 });
-    fs::open_path_with_flags(path, flags)
+    fs::open_path_with_flags(vfs, path, flags, caller)
 }
 /// mkdirat 按本次 FsContext umask 建目录，路径逐组件从当前目录或真实 dirfd 开始。
 pub(super) fn mkdirat(user: &UserThread, raw: [usize; 6]) -> SysResult {
@@ -251,7 +269,7 @@ pub(super) fn truncate(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     path.check_access(runtime.credentials.uid, runtime.credentials.gid, 2)?;
     let access = inode.acquire_write()?;
-    access.truncate(inode.filesystem().claim(), length as u64)?;
+    access.truncate(length as u64)?;
     Ok(0)
 }
 
@@ -276,7 +294,7 @@ pub(super) fn read(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let mm = user.mm().expect("read has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
-    Ok(file.read_into(&mut target)? as isize)
+    Ok(file.read_into(&mut target, FileIoContext::User(user))? as isize)
 }
 
 /// 有符号负offset明确失败，按位置读不获取OFD位置锁，也不改dup共享游标。
@@ -291,7 +309,7 @@ pub(super) fn pread(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let mm = user.mm().expect("pread has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
-    Ok(file.read_at_into(raw[3] as u64, &mut target)? as isize)
+    Ok(file.read_at_into(raw[3] as u64, &mut target, FileIoContext::User(user))? as isize)
 }
 
 /// 用户输入绑定本次真实 Mm，文件只按已接受前缀更新共享位置。
@@ -303,7 +321,7 @@ pub(super) fn write(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let mm = user.mm().expect("write has no MM");
     let mut source = WriteBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
-    Ok(file.write_from(&mut source)? as isize)
+    Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)
 }
 
 /// 负偏移先拒绝，按位置写不改变 OFD 游标，追加状态由同一 inode 判断。
@@ -318,7 +336,14 @@ pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let mm = user.mm().expect("pwrite has no MM");
     let mut source = WriteBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
-    Ok(file.write_at_from(raw[3] as u64, &mut source)? as isize)
+    Ok(file.write_at_from(raw[3] as u64, &mut source, FileIoContext::User(user))? as isize)
+}
+
+/// 在表锁外向原 OFD 传递真实调用线程，设备自行解释命令与用户参数。
+pub(super) fn ioctl(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("ioctl has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    Ok(file.ioctl(raw[1] as u32, raw[2], FileIoContext::User(user))? as isize)
 }
 
 /// lookup 取得原强 OFD 后在表锁外同步全文件，独立打开与 dup 保持各自观察归属。
@@ -343,7 +368,7 @@ fn sync_file(user: &UserThread, raw: usize, data_only: bool) -> SysResult {
 pub(super) fn seek(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let delta = raw[1] as i64;
     let from = match raw[2] as u32 {
-        0 if 0 <= delta => SeekFrom::Start(delta as u64),
+        0 => SeekFrom::Start(raw[1] as u64),
         1 => SeekFrom::Current(delta),
         2 => SeekFrom::End(delta),
         _ => return Err(Errno::InvalidArgument),
@@ -567,7 +592,7 @@ fn resolve_start(
     if file.stat()?.kind != InodeKind::Directory {
         return Err(Errno::NotDirectory);
     }
-    Ok(file.path().clone())
+    Ok(file.path().ok_or(Errno::NotDirectory)?.clone())
 }
 
 /// 路径只从当前Mm读取一次原始NUL字节串，不要求UTF8。
@@ -612,6 +637,7 @@ fn encode_stat(stat: FileStat) -> Result<[u8; 128], Errno> {
     put_u32(&mut bytes, 20, stat.links);
     put_u32(&mut bytes, 24, stat.uid);
     put_u32(&mut bytes, 28, stat.gid);
+    put_u64(&mut bytes, 32, stat.rdev);
     put_u64(&mut bytes, 48, size as u64);
     put_u32(&mut bytes, 56, stat.block_size);
     put_u64(&mut bytes, 64, blocks as u64);
@@ -638,6 +664,8 @@ fn dirent_type(entry: &DirectoryEntry) -> u8 {
         Some(InodeKind::Regular) => 8,
         Some(InodeKind::Directory) => 4,
         Some(InodeKind::Symlink) => 10,
+        Some(InodeKind::Character) => 2,
+        Some(InodeKind::Block) => 6,
         _ => 0,
     }
 }

@@ -153,7 +153,7 @@ fn sync_inode_selection(
     storage: &mut WbStorage,
 ) -> Result<usize, FsError> {
     let _scope = ReclaimScope::noio();
-    if storage.stopped(inode.filesystem().writeback_domain()) {
+    if storage.stopped(inode.disk_volume()?.writeback_domain()) {
         return Err(FsError::Io(BlockError::QueueStopped));
     }
     let result = {
@@ -307,7 +307,8 @@ fn sync_inode_locked(
     } else {
         (mapping.mark_to_write_range(start, end), 0)
     };
-    let domain = inode.filesystem().writeback_domain();
+    let volume = inode.disk_volume()?;
+    let domain = volume.writeback_domain();
     let is_background = background.is_some();
     if is_background {
         domain.note_selection(selected_count, false);
@@ -358,7 +359,7 @@ fn sync_inode_locked(
             remember_error(&mut first_error, result);
             mapping.set_to_write(plan.index, false);
         }
-        let result = submit_ranges(inode.filesystem().claim(), storage, domain);
+        let result = submit_ranges(volume.claim(), storage, domain);
         unconfirmed |= result == Err(FsError::Io(BlockError::StopUnconfirmed));
         remember_error(&mut first_error, result);
         let Some(next) = next else {
@@ -381,7 +382,7 @@ pub(crate) fn prepare_file_targets(
     range: &Range<u64>,
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<(u64, [Option<u64>; SECTORS_PER_PAGE]), FsError> {
-    let volume = inode.filesystem();
+    let volume = inode.disk_volume()?;
     let size = volume.geometry().block_size;
     let page = index
         .checked_mul(PAGE_SIZE as u64)
@@ -416,21 +417,22 @@ fn prepare_file_page(
     storage: &mut WbStorage,
     background: bool,
 ) -> Result<(), FsError> {
-    let domain = inode.filesystem().writeback_domain();
+    let volume = inode.disk_volume()?;
+    let domain = volume.writeback_domain();
     if storage.stopped(domain) {
         return Err(FsError::Io(BlockError::QueueStopped));
     }
     let mut content = match plan.folio.try_lock_content() {
         Some(content) => content,
         None => {
-            submit_ranges(inode.filesystem().claim(), storage, domain)?;
+            submit_ranges(volume.claim(), storage, domain)?;
             plan.folio.lock_content()
         }
     };
     inode
         .mapping()
         .mkclean(plan.index, &plan.folio, &mut content);
-    let size = inode.filesystem().geometry().block_size;
+    let size = volume.geometry().block_size;
     let dirty = plan.folio.dirty_sectors();
     for offset in (0..PAGE_SIZE).step_by(size) {
         if dirty & range_mask(offset, size) == 0 {

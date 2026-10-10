@@ -2,9 +2,9 @@
 
 pub(crate) use crate::fs::ext4::crc::{crc16, crc32c};
 pub(crate) use crate::fs::ext4::directory::{verify_directory, DirectoryLayout};
-use crate::fs::ext4::{Geometry, InodeData, InodeKind, InodeTime};
+use crate::fs::ext4::{Geometry, InodeData};
 use crate::fs::inode::InodeMetadata;
-use crate::fs::FsError;
+use crate::fs::{FsError, InodeKind, InodeTime};
 
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
 pub(crate) const EA_INODE: u32 = 0x0020_0000;
@@ -570,7 +570,9 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         0x8000 => InodeKind::Regular,
         0x4000 => InodeKind::Directory,
         0xa000 => InodeKind::Symlink,
-        0x1000 | 0x2000 | 0x6000 | 0xc000 => InodeKind::Other,
+        0x2000 => InodeKind::Character,
+        0x6000 => InodeKind::Block,
+        0x1000 | 0xc000 => InodeKind::Other,
         _ => return Err(FsError::Corrupt),
     };
     let flags = le32(data, 32)?;
@@ -631,10 +633,12 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     }
     let mut block = [0u8; 60];
     block.copy_from_slice(bytes(data, 40, 60)?);
+    let rdev = decode_device(kind, &block);
     Ok(InodeData {
         number,
         kind,
         mode,
+        rdev,
         size,
         uid: u32::from(le16(data, 2)?) | u32::from(le16(data, 120)?) << 16,
         gid: u32::from(le16(data, 24)?) | u32::from(le16(data, 122)?) << 16,
@@ -651,6 +655,32 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         file_acl,
         extra_isize,
     })
+}
+
+/// 按 ext4 特殊 inode 的旧版或新版盘面编码还原内核设备号。
+fn decode_device(kind: InodeKind, block: &[u8; 60]) -> u64 {
+    if !matches!(kind, InodeKind::Character | InodeKind::Block) {
+        return 0;
+    }
+    let old = u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+    let (major, minor) = if old != 0 {
+        (u64::from((old >> 8) & 0xff), u64::from(old & 0xff))
+    } else {
+        let encoded = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        (
+            u64::from((encoded >> 8) & 0xfff),
+            u64::from((encoded & 0xff) | ((encoded >> 12) & 0xfff00)),
+        )
+    };
+    encode_device(major, minor)
+}
+
+/// 将 major/minor 组合成本内核与 Linux new_encode_dev 相同的设备号。
+fn encode_device(major: u64, minor: u64) -> u64 {
+    ((major & 0xffff_f000) << 32)
+        | ((major & 0x0000_0fff) << 8)
+        | ((minor & 0xffff_ff00) << 12)
+        | (minor & 0x0000_00ff)
 }
 
 /// 基础秒有符号扩展；只有 extra_isize 覆盖该字段时才消费 epoch 和纳秒。
@@ -679,6 +709,7 @@ pub(crate) fn validate_inode_metadata_update(
 ) -> Result<(), FsError> {
     let mut fixed = *next;
     fixed.mode = old.mode;
+    fixed.rdev = old.rdev;
     fixed.uid = old.uid;
     fixed.gid = old.gid;
     fixed.links = old.links;

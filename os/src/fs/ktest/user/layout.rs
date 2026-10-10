@@ -388,7 +388,7 @@ fn snapshot(
             context,
             "ELF cache folio read failed",
             page * PAGE_SIZE as u64,
-            file.file_page(page, &mut attempt),
+            file.mapping_inode().unwrap().file_page(page, &mut attempt),
         )?);
     }
     Ok((start, bytes, folios))

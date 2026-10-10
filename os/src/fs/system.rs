@@ -5,7 +5,8 @@ use alloc::sync::Arc;
 use crate::block::{AccessMode, DiskRef};
 use crate::fs::ext4::crc::crc32c;
 use crate::fs::{
-    Ext4Volume, FileLike, FileTable, FsContext, FsError, InodeCache, OpenOptions, ResolveMode, Vfs,
+    Ext4Volume, FileLike, FileTable, Filesystem, FsContext, FsError, InodeCache, OpenOptions,
+    ResolveMode, Vfs,
 };
 use crate::mm::PAGE_SIZE;
 
@@ -58,13 +59,13 @@ pub(crate) fn mount_disks(
     root_mode: AccessMode,
 ) -> Result<Vfs, FsError> {
     let volume = Ext4Volume::open(root, root_mode, 64)?;
-    let vfs = Vfs::try_new(volume, inodes, 128, 4, root_mode)?;
+    let vfs = Vfs::try_new(Filesystem::Ext4(volume), inodes, 128, 8, root_mode)?;
     if let Some(extra) = extra {
         let root = vfs.root();
         let context = FsContext::new(root.clone(), root)?;
         let covered = vfs.resolve(&context, b"/mnt/extra", ResolveMode::Follow)?;
         let volume = Ext4Volume::open(extra, AccessMode::ReadOnly, 64)?;
-        vfs.mount(&covered, volume, AccessMode::ReadOnly)?;
+        vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadOnly)?;
     }
     Ok(vfs)
 }

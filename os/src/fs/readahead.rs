@@ -185,7 +185,7 @@ fn submit_window(
     demand: u64,
     attempt: &mut ReclaimAttempt,
 ) -> Result<(), FsError> {
-    let volume = inode.filesystem();
+    let volume = inode.disk_volume()?;
     let mut ranges: Vec<(u64, FolioRead)> = Vec::new();
     if ranges
         .try_reserve_exact((window.end - window.start) as usize)
@@ -204,7 +204,7 @@ fn submit_window(
             Ok(prepared) => candidates[slot] = Some(prepared),
             Err(error) => {
                 if index == demand {
-                    demand_error = Some(error.into());
+                    demand_error = Some(error);
                 }
                 window.end = index;
                 break;

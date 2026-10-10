@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::fs::file::{O_DIRECTORY, O_NOFOLLOW};
 use crate::fs::{
-    open_path_with_flags, DirectoryEntry, FileRef, FileStat, FsContext, FsError, ResolveMode,
-    SeekFrom, Vfs, WriteBuffer,
+    open_path_with_flags, DirectoryEntry, FileIoContext, FileRef, FileStat, FsContext, FsError,
+    ResolveMode, SeekFrom, Vfs, WriteBuffer,
 };
 use crate::sync::SpinLock;
 
@@ -173,7 +173,7 @@ impl FileTable {
         let path = vfs.resolve(context, pathname, mode)?;
         let flags = if options.directory { O_DIRECTORY } else { 0 }
             | if options.no_follow { O_NOFOLLOW } else { 0 };
-        let file = open_path_with_flags(path, flags)?;
+        let file = open_path_with_flags(vfs, path, flags, FileIoContext::Kernel)?;
         Ok(reservation.publish(
             file,
             DescriptorFlags {
@@ -224,7 +224,7 @@ impl FileTable {
 
     /// 表短锁外持原 OFD 执行顺序写，关闭复用 fd 不改变本次文件身份。
     pub fn write_from(&self, fd: usize, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
-        self.lookup(fd)?.write_from(source)
+        self.lookup(fd)?.write_from(source, FileIoContext::Kernel)
     }
 
     /// 表短锁外按明确位置写入，实际追加和错误均由原 OFD 提供。
@@ -234,7 +234,8 @@ impl FileTable {
         offset: u64,
         source: &mut WriteBuffer<'_>,
     ) -> Result<usize, FsError> {
-        self.lookup(fd)?.write_at_from(offset, source)
+        self.lookup(fd)?
+            .write_at_from(offset, source, FileIoContext::Kernel)
     }
 
     /// 先移出打开槽并使编号立即可复用，解锁后才释放表拥有的文件引用。

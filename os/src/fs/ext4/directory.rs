@@ -5,9 +5,9 @@ use alloc::vec::Vec;
 use super::mapping::PreparedDirectoryMappings;
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, INDEX, METADATA_CSUM};
-use crate::fs::ext4::{BlockMapping, DirectoryEntry, Ext4Volume, Geometry, InodeKind};
+use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry};
 use crate::fs::inode::InodeMetadata;
-use crate::fs::FsError;
+use crate::fs::{DirectoryCursor, DirectoryEntry, DirectoryPosition, FsError, InodeKind};
 
 const DX_MAX_INDIRECT_LEVELS: usize = 2;
 const DX_EOF_COOKIE: u64 = 0x7fff_ffff_ffff_ffff;
@@ -152,38 +152,6 @@ pub(crate) enum DirectoryLayout {
     Leaf { end: usize },
     Root,
     Index,
-}
-
-/// 索引目录用真实 major/minor 哈希续读；线性目录仍使用盘上字节位置。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryCursor {
-    Byte(u64),
-    Indexed {
-        major: u32,
-        minor: u32,
-        collision: Option<DirectoryPosition>,
-    },
-}
-
-/// 精确定位已交付记录，区分 major/minor 完全相同的多个目录项。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryPosition {
-    /// inode mapping 中的目录逻辑块号。
-    pub(crate) logical: u64,
-    /// 目录块内最后一次交付的记录字节偏移。
-    pub(crate) offset: u32,
-}
-
-impl DirectoryCursor {
-    /// 返回给用户的稳定目录 cookie；碰撞位置只保存在 OFD 游标内。
-    pub(crate) fn cookie(&self) -> u64 {
-        match self {
-            Self::Byte(offset) => *offset,
-            Self::Indexed { major, minor, .. } => {
-                (u64::from(*major >> 1) << 32) | u64::from(*minor)
-            }
-        }
-    }
 }
 
 /// 按 HTree cookie 解释共享位置；布局切换也沿用原 cookie 数值而不重置到开头。
@@ -687,7 +655,9 @@ fn record(g: &Geometry, data: &[u8], offset: usize, end: usize) -> Result<Record
             0 => None,
             1 => Some(InodeKind::Regular),
             2 => Some(InodeKind::Directory),
-            3..=6 => Some(InodeKind::Other),
+            3 => Some(InodeKind::Character),
+            4 => Some(InodeKind::Block),
+            5 | 6 => Some(InodeKind::Other),
             7 => Some(InodeKind::Symlink),
             _ => return Err(FsError::Corrupt),
         }
@@ -1072,6 +1042,9 @@ pub(crate) fn next(
     cursor: &DirectoryCursor,
 ) -> Result<Option<DirectoryEntry>, FsError> {
     check_directory(volume, inode)?;
+    if matches!(cursor, DirectoryCursor::Memory(_)) {
+        return Err(FsError::InvalidOperation);
+    }
     if inode.flags & INDEX != 0 {
         let cursor = match cursor {
             DirectoryCursor::Byte(cookie) => indexed_cursor(*cookie)?,
@@ -1311,6 +1284,8 @@ fn directory_file_type(kind: InodeKind) -> u8 {
     match kind {
         InodeKind::Regular => 1,
         InodeKind::Directory => 2,
+        InodeKind::Character => 3,
+        InodeKind::Block => 4,
         InodeKind::Symlink => 7,
         InodeKind::Other => 0,
     }

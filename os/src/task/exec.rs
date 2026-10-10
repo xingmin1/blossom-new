@@ -7,7 +7,7 @@ use core::convert::TryInto;
 
 use crate::arch::{self, UserContext};
 use crate::block::BlockError;
-use crate::fs::{FileRef, FsError, InodeKind};
+use crate::fs::{FileIoContext, FileRef, FsError, InodeKind, ReadBuffer};
 use crate::mm::space::{Mm, VmError};
 use crate::mm::uaccess::CStringError;
 use crate::mm::user_table::{PagePermissions, PageTableError};
@@ -244,7 +244,10 @@ pub(crate) fn load(
     uid: u32,
     gid: u32,
 ) -> Result<LoadedImage, ExecError> {
-    let access = file.path().inode()?.deny_writes()?;
+    let access = file
+        .mapping_inode()
+        .ok_or(ExecError::Format)?
+        .deny_writes()?;
     let elf = Elf::read(&file)?;
     let mut mm = Mm::try_new()?;
     map_segments(&mut mm, &file, &elf.segments)?;
@@ -604,7 +607,11 @@ fn source_covered(
 fn read_exact(file: &FileRef, offset: u64, bytes: &mut [u8]) -> Result<(), ExecError> {
     let mut copied = 0;
     while copied < bytes.len() {
-        let read = file.read_at(offset + copied as u64, &mut bytes[copied..])?;
+        let read = file.read_at_into(
+            offset + copied as u64,
+            &mut ReadBuffer::kernel(&mut bytes[copied..]),
+            FileIoContext::Kernel,
+        )?;
         if read == 0 {
             return Err(ExecError::File(FsError::Io(BlockError::ShortIo)));
         }

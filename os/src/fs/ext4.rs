@@ -6,7 +6,7 @@ pub use allocation::{UnpublishedBlock, UnpublishedInode};
 pub(crate) mod codec;
 pub(crate) mod crc;
 mod directory;
-pub(crate) use directory::{DirectoryCursor, PreparedDirectoryEdit};
+pub(crate) use directory::PreparedDirectoryEdit;
 mod mapping;
 pub(crate) use mapping::PreparedDirectoryMappings;
 
@@ -23,7 +23,7 @@ use crate::block::{
 use crate::cache::{BufferRef, MetadataCache};
 use crate::fs::background::WritebackDomain;
 use crate::fs::inode::{InodeDomain, InodeMetadata, InodeRef};
-use crate::fs::{writeback, FsError};
+use crate::fs::{writeback, DirectoryCursor, DirectoryEntry, FsError, InodeKind, InodeTime};
 use crate::mm::{FolioRead, PAGE_SIZE};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
@@ -109,26 +109,13 @@ impl Geometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InodeKind {
-    Regular,
-    Directory,
-    Symlink,
-    Other,
-}
-
-/// inode 时间按盘面有符号秒与扩展纳秒保存，不在只读读取时修改时钟。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InodeTime {
-    pub seconds: i64,
-    pub nanoseconds: u32,
-}
-
 #[derive(Debug)]
 pub struct InodeData {
     pub number: u64,
     pub kind: InodeKind,
     pub mode: u16,
+    /// 字符或块节点的 Linux 设备号，普通 inode 为零。
+    pub rdev: u64,
     pub size: u64,
     pub uid: u32,
     pub gid: u32,
@@ -153,15 +140,6 @@ pub enum BlockMapping {
     Hole { len: u64 },
     Unwritten { physical: u64, len: u64 },
     Eof,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct DirectoryEntry {
-    pub number: u64,
-    pub name: Vec<u8>,
-    pub kind: Option<InodeKind>,
-    pub next_cookie: u64,
-    pub(crate) next_cursor: DirectoryCursor,
 }
 
 /// inode size、映射根或 links 提交所需的现有 inode 记录窗口。
@@ -392,7 +370,15 @@ impl Ext4Volume {
         let domain = self.inode_domain.lock().upgrade();
         domain
             .and_then(|domain| domain.dirty_inode_at(position))
-            .filter(|inode| core::ptr::eq(inode.filesystem().as_ref(), self))
+            .filter(|inode| {
+                core::ptr::eq(
+                    inode
+                        .disk_volume()
+                        .expect("disk dirty inode has no volume")
+                        .as_ref(),
+                    self,
+                )
+            })
     }
 
     /// 借用一次解码并验证的有效几何。
@@ -481,7 +467,12 @@ impl Ext4Volume {
                 codec::bytes(data, (byte % g.block_size as u64) as usize, g.inode_size)?,
             )
         })??;
-        if !inode.fast_symlink && inode.kind != InodeKind::Other {
+        if !inode.fast_symlink
+            && !matches!(
+                inode.kind,
+                InodeKind::Character | InodeKind::Block | InodeKind::Other
+            )
+        {
             mapping::validate_root(g, &inode)?;
         }
         Ok(inode)
@@ -499,7 +490,12 @@ impl Ext4Volume {
             context.check()?;
         }
         let inode = metadata.with_block(root);
-        if inode.fast_symlink || inode.kind == InodeKind::Other {
+        if inode.fast_symlink
+            || matches!(
+                inode.kind,
+                InodeKind::Character | InodeKind::Block | InodeKind::Other
+            )
+        {
             return Err(FsError::Unsupported);
         }
         let end = codec::ceil_div(inode.size, self.geometry.block_size as u64)?;
@@ -683,7 +679,10 @@ impl Ext4Volume {
             || old.file_acl != 0
             || next.file_acl != 0
             || old.flags & codec::EA_INODE != 0
-            || old.kind == InodeKind::Other
+            || matches!(
+                old.kind,
+                InodeKind::Character | InodeKind::Block | InodeKind::Other
+            )
         {
             return Err(FsError::InvalidOperation);
         }

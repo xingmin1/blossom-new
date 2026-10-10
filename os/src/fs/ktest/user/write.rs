@@ -3,11 +3,11 @@
 use crate::arch::UserAccess;
 use crate::block::{Bio, BioAllocator, BlkOperation, IoResult};
 use crate::cache::FileUnmapPhase;
-use crate::fs::ext4::{codec, BlockMapping, InodeData, InodeKind};
-use crate::fs::file::{open_path_with_flags, WriteBuffer};
+use crate::fs::ext4::{codec, BlockMapping, InodeData};
+use crate::fs::file::{open_path_with_flags, FileIoContext, WriteBuffer};
 use crate::fs::inode::{InodeCacheWatch, InodeRef, TruncatePhase};
 use crate::fs::ktest::user::*;
-use crate::fs::SeekFrom;
+use crate::fs::{InodeKind, SeekFrom};
 use crate::mm::dma::MappedPages;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{MmapAddress, MmapRequest, MmapSource};
@@ -119,11 +119,11 @@ impl WriteOwner {
             vfs.mkdir_from(&fs_context, &root, b"/test/ns-work", 0o777, (0, 0), 0),
         )?;
         let workspace = self.open(context, b"/test/ns-work", 0x10000)?;
-        let inode = checked(context, workspace.path().inode())?.clone();
+        let inode = checked(context, workspace.path().unwrap().inode())?.clone();
         // mkdir 不接受 SGID 模式位；父目录的继承属性通过受保护元数据更新设置。
         checked(
             context,
-            inode.update_metadata(inode.filesystem().claim(), |metadata| {
+            inode.update_metadata(checked(context, inode.disk_volume())?.claim(), |metadata| {
                 metadata.mode |= 0o2000;
                 metadata.gid = 1001;
             }),
@@ -180,7 +180,10 @@ impl WriteOwner {
             }
             self.inodes.push(inode);
         }
-        checked(context, open_path_with_flags(path, flags))
+        checked(
+            context,
+            open_path_with_flags(self.user.path.vfs(), path, flags, FileIoContext::Kernel),
+        )
     }
     /// 保留末组件本身的 canonical inode，symlink 不跟随到其目标。
     fn hold_nofollow(
@@ -207,7 +210,15 @@ impl WriteOwner {
 
     /// 从同一原根取得卷，根引用仅在正文和同步期间短暂保活。
     pub(super) fn volume(&self) -> Arc<Ext4Volume> {
-        self.user.path.vfs().root().filesystem().clone()
+        self.user
+            .path
+            .vfs()
+            .root()
+            .inode()
+            .unwrap()
+            .disk_volume()
+            .unwrap()
+            .clone()
     }
 
     /// 用户普通 syscall 自己断言返回值，内核仍消费 wait 状态与真实离栈 join。
@@ -373,7 +384,13 @@ impl WriteOwner {
         self.cold_cache = Some(cache.clone());
         let vfs = checked(
             context,
-            Vfs::try_new(volume, cache, 128, 4, AccessMode::ReadWrite),
+            Vfs::try_new(
+                crate::fs::Filesystem::Ext4(volume),
+                cache,
+                128,
+                4,
+                AccessMode::ReadWrite,
+            ),
         )?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
         let path = checked(
@@ -381,7 +398,10 @@ impl WriteOwner {
             vfs.resolve(&fs_context, b"/test/write-reserve", ResolveMode::Follow),
         )?;
         self.inodes.push(checked(context, path.inode())?.clone());
-        checked(context, open_path_with_flags(path, 2))
+        checked(
+            context,
+            open_path_with_flags(&vfs, path, 2, FileIoContext::Kernel),
+        )
     }
 
     /// 正式同步后的全部旧 FS 拥有先退出，真实完成 Work 尾和弱引用到期后才重建同设备的卷及缓存。
@@ -629,7 +649,10 @@ fn modified_between(
     later: u64,
 ) -> TestResult {
     let stat = checked(context, file.stat())?;
-    let record = checked(context, inode.filesystem().load_inode(inode.number(), None))?;
+    let record = checked(
+        context,
+        checked(context, inode.disk_volume())?.load_inode(inode.number(), None),
+    )?;
     for (modified, recorded, extra) in [
         (stat.mtime, record.mtime, 136),
         (stat.ctime, record.ctime, 132),
@@ -979,7 +1002,7 @@ fn indirect_tree(
 
 /// inode 本身的 CRC、实际根格式和全部外部节点共同决定数据/节点计数。
 fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestError> {
-    let volume = inode.filesystem();
+    let volume = checked(context, inode.disk_volume())?;
     let data = checked(context, volume.load_inode(inode.number(), None))?;
     let mut tree = Tree::default();
     tree.blocks
@@ -1167,7 +1190,7 @@ pub(crate) mod writes {
             .map_err(|_| TestError("slow consumer old MM owner OOM"))?;
         let (file, _) = fixture.cold_reopen(context, old_mm, file, inode, volume)?;
         let inode = fixture.inodes.last().unwrap().clone();
-        let disk = inode.filesystem().disk().clone();
+        let disk = checked(context, inode.disk_volume())?.disk().clone();
         context.expect_eq(checked(context, file.stat())?.size, (19 * PAGE_SIZE) as u64);
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
@@ -1201,7 +1224,12 @@ pub(crate) mod writes {
         let mut donors = [0usize; 16];
         let mut preparing = ReclaimAttempt::new();
         for (index, physical) in donors.iter_mut().enumerate() {
-            let folio = checked(context, file.file_page(index as u64, &mut preparing))?;
+            let folio = checked(
+                context,
+                file.mapping_inode()
+                    .unwrap()
+                    .file_page(index as u64, &mut preparing),
+            )?;
             context.expect_eq(folio.dirty_sectors(), 0);
             context.expect_eq(folio.writeback_sectors(), 0);
             *physical = folio.phys_addr();
@@ -1249,7 +1277,12 @@ pub(crate) mod writes {
             let mut attempt = ReclaimAttempt::new();
             let mut target = None;
             match consumer {
-                0 => target = Some(checked(context, file.file_page(16, &mut attempt))?),
+                0 => {
+                    target = Some(checked(
+                        context,
+                        file.mapping_inode().unwrap().file_page(16, &mut attempt),
+                    )?)
+                }
                 1 => vm(context, mm.fault(FILE, UserAccess::Read))?,
                 2 => vm(context, mm.fault(ANON, UserAccess::Read))?,
                 _ => unreachable!(),
@@ -1323,7 +1356,10 @@ pub(crate) mod writes {
             let io = disk.test_snapshot();
             if consumer == 0 {
                 context.expect_eq(
-                    file.file_page(17, &mut finite).err(),
+                    file.mapping_inode()
+                        .unwrap()
+                        .file_page(17, &mut finite)
+                        .err(),
                     Some(FsError::NoMemory),
                 );
             } else {
@@ -1390,8 +1426,14 @@ pub(crate) mod writes {
         checked(context, file.truncate((3 * PAGE_SIZE) as u64))?;
         checked(context, file.sync_range(0..u64::MAX, false))?;
         let mut preparing = ReclaimAttempt::new();
-        let dirty = checked(context, file.file_page(0, &mut preparing))?;
-        let clean = checked(context, file.file_page(1, &mut preparing))?;
+        let dirty = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut preparing),
+        )?;
+        let clean = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(1, &mut preparing),
+        )?;
         let original = dirty.phys_addr();
         let block = volume.geometry().block_size;
         let mut targets = [0u64; 4];
@@ -1427,7 +1469,11 @@ pub(crate) mod writes {
             };
             actor_entered.store(true, Ordering::Release);
             let mut attempt = ReclaimAttempt::new();
-            let error = actor_file.file_page(2, &mut attempt).err();
+            let error = actor_file
+                .mapping_inode()
+                .unwrap()
+                .file_page(2, &mut attempt)
+                .err();
             let stats = attempt.stats();
             drop(pressure);
             *actor_evidence.lock() = Some((allocation, stats, error));
@@ -1826,7 +1872,9 @@ pub(crate) mod writes {
             );
             folios[index] = Some(checked(
                 context,
-                file.file_page(offsets[index] / PAGE_SIZE as u64, &mut prepare_attempt),
+                file.mapping_inode()
+                    .unwrap()
+                    .file_page(offsets[index] / PAGE_SIZE as u64, &mut prepare_attempt),
             )?);
             for part in 0..PAGE_SIZE / block {
                 let BlockMapping::Mapped { physical, .. } = checked(
@@ -1988,7 +2036,9 @@ pub(crate) mod writes {
             context.expect_eq(
                 checked(
                     context,
-                    file.file_page(offsets[index] / PAGE_SIZE as u64, &mut verify_attempt),
+                    file.mapping_inode()
+                        .unwrap()
+                        .file_page(offsets[index] / PAGE_SIZE as u64, &mut verify_attempt),
                 )?
                 .phys_addr(),
                 folio.phys_addr(),
@@ -2069,10 +2119,26 @@ pub(crate) mod writes {
         checked(context, crate::fs::writeback::sync_inode(&io_inode))?;
         checked(context, crate::fs::writeback::sync_metadata(&volume))?;
         let mut file_attempt = ReclaimAttempt::new();
-        let clean = checked(context, file.file_page(0, &mut file_attempt))?;
-        let dirty = checked(context, file.file_page(1, &mut file_attempt))?;
+        let clean = checked(
+            context,
+            file.mapping_inode()
+                .unwrap()
+                .file_page(0, &mut file_attempt),
+        )?;
+        let dirty = checked(
+            context,
+            file.mapping_inode()
+                .unwrap()
+                .file_page(1, &mut file_attempt),
+        )?;
         let mut io_attempt = ReclaimAttempt::new();
-        let wb = checked(context, io_file.file_page(0, &mut io_attempt))?;
+        let wb = checked(
+            context,
+            io_file
+                .mapping_inode()
+                .unwrap()
+                .file_page(0, &mut io_attempt),
+        )?;
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -2214,7 +2280,7 @@ pub(crate) mod writes {
         fixture.user.release_pressure();
         let (error, stats, mode) = checked(context, no_memory)?;
         context.expect_eq(evidence, (true, true));
-        context.expect_eq(error, Some(BlockError::NoMemory));
+        context.expect_eq(error, Some(FsError::NoMemory));
         context.expect_eq(mode, ReclaimMode::NoFs);
         context.expect_eq(stats.scanned <= 64 && stats.isolated <= 16, true);
         context.expect_eq(stats.rmap_checks, 0);
@@ -2417,7 +2483,7 @@ pub(crate) mod writes {
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-reserve", 2)?;
         let inode = fixture.inodes.last().unwrap().clone();
-        let volume = inode.filesystem().clone();
+        let volume = checked(context, inode.disk_volume())?.clone();
         let allocation_hint = (inode.number() - 1) / volume.geometry().inodes_per_group;
         let block = volume.geometry().block_size as u64;
         let base = checked(context, file.stat())?
@@ -2451,7 +2517,9 @@ pub(crate) mod writes {
             context.expect_eq(checked(context, file.write_at(base, &[0xc4; 4096]))?, 4096);
             folios[0] = Some(checked(
                 context,
-                file.file_page(base / PAGE_SIZE as u64, &mut prepare_attempt),
+                file.mapping_inode()
+                    .unwrap()
+                    .file_page(base / PAGE_SIZE as u64, &mut prepare_attempt),
             )?);
             let mapping = checked(context, inode.map_block(base / block))?;
             context.diagnostic(format_args!("W10 first-page mapping={:?}", mapping));
@@ -2524,7 +2592,9 @@ pub(crate) mod writes {
                 );
                 *slot = Some(checked(
                     context,
-                    file.file_page(base / PAGE_SIZE as u64 + index as u64, &mut prepare_attempt),
+                    file.mapping_inode()
+                        .unwrap()
+                        .file_page(base / PAGE_SIZE as u64 + index as u64, &mut prepare_attempt),
                 )?);
                 if index == 1 {
                     let mapping =
@@ -2603,7 +2673,9 @@ pub(crate) mod writes {
                 folios[index].as_ref().unwrap().phys_addr(),
                 checked(
                     context,
-                    file.file_page(base / PAGE_SIZE as u64 + index as u64, &mut verify_attempt),
+                    file.mapping_inode()
+                        .unwrap()
+                        .file_page(base / PAGE_SIZE as u64 + index as u64, &mut verify_attempt),
                 )?
                 .phys_addr(),
             );
@@ -2762,7 +2834,9 @@ pub(crate) mod writes {
         let mut attempt = ReclaimAttempt::new();
         let folio = checked(
             context,
-            file.file_page(offset / PAGE_SIZE as u64, &mut attempt),
+            file.mapping_inode()
+                .unwrap()
+                .file_page(offset / PAGE_SIZE as u64, &mut attempt),
         )?;
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
@@ -2880,7 +2954,10 @@ pub(crate) mod writes {
         context.expect_eq(duplicated.sync_range(0..u64::MAX, false), Ok(()));
         context.expect_eq(second.sync_range(0..u64::MAX, false), error);
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, first.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            first.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
         context.diagnostic(format_args!("W11 real-used-controlled-EIO=1 two-independent-observers=1 dup-shared-cursor=1 seen-new-open-skips=1 unseen-new-open-reports=1 accepted-error-no-replay=1"));
         Ok(())
@@ -2899,7 +2976,10 @@ pub(crate) mod writes {
         context.expect_eq(file.write_at(0, &[0x45; 4096]), Ok(4096));
         let inode = fixture.inodes.last().unwrap().clone();
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let image = fixture.shared_image(context, b"b")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -2985,7 +3065,10 @@ pub(crate) mod writes {
             context.expect_eq(failed.flush_submitted - before.flush_submitted, 1);
         }
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
         disk.test_flush_completions();
         timer::sleep(time::Duration::from_millis(10));
@@ -3014,9 +3097,19 @@ pub(crate) mod writes {
         let inode = fixture.inodes.last().unwrap().clone();
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
         let mut prepare_attempt = ReclaimAttempt::new();
-        let first = checked(context, file.file_page(0, &mut prepare_attempt))?;
-        let second = checked(context, file.file_page(1, &mut prepare_attempt))?;
-        let block = inode.filesystem().geometry().block_size;
+        let first = checked(
+            context,
+            file.mapping_inode()
+                .unwrap()
+                .file_page(0, &mut prepare_attempt),
+        )?;
+        let second = checked(
+            context,
+            file.mapping_inode()
+                .unwrap()
+                .file_page(1, &mut prepare_attempt),
+        )?;
+        let block = inode.block_size() as usize;
         let disk = fixture.user.path.owner.disk()?.clone();
         if block < PAGE_SIZE {
             let (first_mask, neighbor_mask) = match block {
@@ -3043,7 +3136,13 @@ pub(crate) mod writes {
             );
             let mut range_attempt = ReclaimAttempt::new();
             context.expect_eq(
-                checked(context, file.file_page(0, &mut range_attempt))?.phys_addr(),
+                checked(
+                    context,
+                    file.mapping_inode()
+                        .unwrap()
+                        .file_page(0, &mut range_attempt),
+                )?
+                .phys_addr(),
                 original,
             );
             context.expect_eq(
@@ -3060,7 +3159,13 @@ pub(crate) mod writes {
             context.expect_eq((first.dirty_sectors(), first.writeback_sectors()), (0, 0));
             let mut neighbor_attempt = ReclaimAttempt::new();
             context.expect_eq(
-                checked(context, file.file_page(0, &mut neighbor_attempt))?.phys_addr(),
+                checked(
+                    context,
+                    file.mapping_inode()
+                        .unwrap()
+                        .file_page(0, &mut neighbor_attempt),
+                )?
+                .phys_addr(),
                 original,
             );
             context.expect_eq(
@@ -3166,7 +3271,10 @@ pub(crate) mod writes {
                 .lookup(user_fd),
         )?;
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let disk = fixture.user.path.owner.disk()?.clone();
         disk.test_suspend_completions();
         disk.test_fail_next_data(BlockError::Io);
@@ -3232,7 +3340,10 @@ pub(crate) mod writes {
             WriteBuffer::user(&address_space, SOURCE + 4079, 64),
         )?;
         let prefix_write = time::now().as_nanos();
-        context.expect_eq(checked(context, file.write_from(&mut source))?, 17);
+        context.expect_eq(
+            checked(context, file.write_from(&mut source, FileIoContext::Kernel))?,
+            17,
+        );
         modified_between(context, &file, &inode, prefix_write, time::now().as_nanos())?;
         context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 17);
         context.expect_eq(checked(context, file.stat())?.size, 5120);
@@ -3242,7 +3353,10 @@ pub(crate) mod writes {
             WriteBuffer::user(&address_space, SOURCE + 4096, 64),
         )?;
         let before_fault = checked(context, file.stat())?;
-        context.expect_eq(file.write_from(&mut source), Err(FsError::BadAddress));
+        context.expect_eq(
+            file.write_from(&mut source, FileIoContext::Kernel),
+            Err(FsError::BadAddress),
+        );
         context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 17);
         let after_fault = checked(context, file.stat())?;
         context.expect_eq(
@@ -3276,7 +3390,10 @@ pub(crate) mod writes {
         // 输入页未预触；write_from 内部 pull 必须允许同 inode 的真实 filefault。
         let mut source = checked(context, WriteBuffer::user(&mm, SOURCE + 4093, 1027))?;
         context.expect_eq(
-            checked(context, mapped.write_at_from(8192, &mut source))?,
+            checked(
+                context,
+                mapped.write_at_from(8192, &mut source, FileIoContext::Kernel),
+            )?,
             1027,
         );
         let mut expected = [0u8; 1027];
@@ -3834,7 +3951,15 @@ pub(crate) mod writes {
                 ResolveMode::Follow,
             ),
         )?;
-        let writer = checked(context, open_path_with_flags(path.clone(), 1))?;
+        let writer = checked(
+            context,
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            ),
+        )?;
         let args = Arguments::from_kernel(PROGRAM_WRITE, &[PROGRAM_WRITE, b"e"], &[])
             .map_err(|_| TestError("deny arguments OOM"))?;
         context.expect_eq(
@@ -3845,33 +3970,73 @@ pub(crate) mod writes {
         let image = exec::load(program.clone(), &args, 0, 0)
             .map_err(|_| TestError("deny real ELF load failed"))?;
         context.expect_eq(
-            open_path_with_flags(path.clone(), 1).err(),
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            )
+            .err(),
             Some(FsError::TextBusy),
         );
         context.expect_eq(
-            open_path_with_flags(path.clone(), 1 | 0x200).err(),
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1 | 0x200,
+                FileIoContext::Kernel,
+            )
+            .err(),
             Some(FsError::TextBusy),
         );
         let child = vm(context, image.mm.fork())?;
         let old_mm = image.mm.clone();
         drop(image);
         context.expect_eq(
-            open_path_with_flags(path.clone(), 1).err(),
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            )
+            .err(),
             Some(FsError::TextBusy),
         );
         drop(old_mm);
         context.expect_eq(
-            open_path_with_flags(path.clone(), 1).err(),
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            )
+            .err(),
             Some(FsError::TextBusy),
         );
         drop(child);
-        drop(checked(context, open_path_with_flags(path.clone(), 1))?);
+        drop(checked(
+            context,
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            ),
+        )?);
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
             mm.map_file(SOURCE, 4096, RO, RO, program.clone(), 0, true),
         )?;
-        drop(checked(context, open_path_with_flags(path.clone(), 1))?);
+        drop(checked(
+            context,
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            ),
+        )?);
         let bad = fixture.open(context, b"/test/write-map", 0)?;
         context.expect_eq(
             exec::load(bad.clone(), &args, 0, 0).err(),
@@ -3897,11 +4062,25 @@ pub(crate) mod writes {
         )
         .map_err(|_| TestError("unpublished executable prepare failed"))?;
         context.expect_eq(
-            open_path_with_flags(path.clone(), 1).err(),
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            )
+            .err(),
             Some(FsError::TextBusy),
         );
         drop(prepared);
-        drop(checked(context, open_path_with_flags(path.clone(), 1))?);
+        drop(checked(
+            context,
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            ),
+        )?);
         let image = exec::load(program.clone(), &args, 0, 0)
             .map_err(|_| TestError("OOM deny real load failed"))?;
         let runtime = checked(
@@ -3945,7 +4124,15 @@ pub(crate) mod writes {
                 crate::task::process::ProcessError::NoMemory,
             )),
         );
-        drop(checked(context, open_path_with_flags(path.clone(), 1))?);
+        drop(checked(
+            context,
+            open_path_with_flags(
+                fixture.user.path.vfs(),
+                path.clone(),
+                1,
+                FileIoContext::Kernel,
+            ),
+        )?);
         // loader 已取得 deny 后格式失败与真实 Mm 分配失败都必须归还原责任。
         let mut pages = PagePressure::prepare()?;
         let (evidence, load_error) = {
@@ -3959,7 +4146,10 @@ pub(crate) mod writes {
         };
         context.expect_eq(evidence, true);
         context.expect_eq(load_error, Some(ExecError::NoMemory));
-        drop(checked(context, open_path_with_flags(path, 1))?);
+        drop(checked(
+            context,
+            open_path_with_flags(fixture.user.path.vfs(), path, 1, FileIoContext::Kernel),
+        )?);
         fixture.run(context, b"e")
     }
 
@@ -4002,7 +4192,9 @@ pub(crate) mod writes {
         let mut attempt = ReclaimAttempt::new();
         let folio = checked(
             context,
-            file.file_page(page_offset / PAGE_SIZE as u64, &mut attempt),
+            file.mapping_inode()
+                .unwrap()
+                .file_page(page_offset / PAGE_SIZE as u64, &mut attempt),
         )?;
         context.expect_eq(mm.mapping(SOURCE).unwrap().physical, folio.phys_addr());
         context.expect_eq(
@@ -4075,7 +4267,10 @@ pub(crate) mod writes {
         context.expect_eq(mm.mapping(SOURCE).unwrap().permissions.write, true);
         let grants = mm.ktest_mkwrite_count();
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let cleaner = cpu::current().id;
         context.expect_eq(remote != cleaner, true);
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
@@ -4116,10 +4311,18 @@ pub(crate) mod writes {
         let replacement = fixture.open(context, b"/test/write-reserve", 2)?;
         context.expect_eq(checked(context, replacement.write(&[0x5a; 4096]))?, 4096);
         let mut replacement_attempt = ReclaimAttempt::new();
-        let replacement_folio =
-            checked(context, replacement.file_page(0, &mut replacement_attempt))?;
+        let replacement_folio = checked(
+            context,
+            replacement
+                .mapping_inode()
+                .unwrap()
+                .file_page(0, &mut replacement_attempt),
+        )?;
         let mut old_attempt = ReclaimAttempt::new();
-        let old_folio = checked(context, old.file_page(0, &mut old_attempt))?;
+        let old_folio = checked(
+            context,
+            old.mapping_inode().unwrap().file_page(0, &mut old_attempt),
+        )?;
         let image = fixture.shared_image(context, b"m")?;
         let mm = image.mm.clone();
         let ready =
@@ -4165,6 +4368,10 @@ pub(crate) mod writes {
                 maximum: RW,
                 source: MmapSource::File {
                     file: replacement.clone(),
+                    inode: replacement
+                        .mapping_inode()
+                        .expect("regular replacement has no mapping inode")
+                        .clone(),
                     offset: 0,
                     private: false,
                 },
@@ -4240,7 +4447,10 @@ pub(crate) mod writes {
         let file = fixture.open(context, b"/test/write-map", 2)?;
         let inode = fixture.inodes.last().unwrap().clone();
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let image = fixture.shared_image(context, b"c")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -4410,7 +4620,13 @@ pub(crate) mod writes {
         vm(context, mm.unmap(SOURCE, 4096))?;
         vm(context, child_mm.unmap(SHARED_ALIAS, 4096))?;
         let mut prepare_attempt = ReclaimAttempt::new();
-        drop(checked(context, other.file_page(0, &mut prepare_attempt))?);
+        drop(checked(
+            context,
+            other
+                .mapping_inode()
+                .unwrap()
+                .file_page(0, &mut prepare_attempt),
+        )?);
         new_inode.mapping().prune_unused();
         let mut pressure = PagePressure::prepare()?;
         context.expect_eq(old_inode.mapping().prune_unused(), 1);
@@ -4436,7 +4652,10 @@ pub(crate) mod writes {
         mm::drain_all_pages();
         drop(recycled);
         let mut reuse_attempt = ReclaimAttempt::new();
-        let reused = other.file_page(0, &mut reuse_attempt);
+        let reused = other
+            .mapping_inode()
+            .unwrap()
+            .file_page(0, &mut reuse_attempt);
         let reused = checked(context, reused)?;
         context.expect_eq(reused.phys_addr(), old_physical);
         vm(
@@ -4448,6 +4667,7 @@ pub(crate) mod writes {
                 maximum: RW,
                 source: MmapSource::File {
                     file: other.clone(),
+                    inode: new_inode.clone(),
                     offset: 0,
                     private: false,
                 },
@@ -4657,9 +4877,12 @@ pub(crate) mod writes {
                 let original = checked(context, inode.metadata_snapshot())?.mode;
                 checked(
                     context,
-                    inode.update_metadata(inode.filesystem().claim(), |metadata| {
-                        metadata.mode = (metadata.mode & !0o777) | 0o444;
-                    }),
+                    inode.update_metadata(
+                        checked(context, inode.disk_volume())?.claim(),
+                        |metadata| {
+                            metadata.mode = (metadata.mode & !0o777) | 0o444;
+                        },
+                    ),
                 )?;
                 let event = fixture.user.run_named_as(
                     context,
@@ -4673,9 +4896,12 @@ pub(crate) mod writes {
                 );
                 checked(
                     context,
-                    inode.update_metadata(inode.filesystem().claim(), |metadata| {
-                        metadata.mode = original;
-                    }),
+                    inode.update_metadata(
+                        checked(context, inode.disk_volume())?.claim(),
+                        |metadata| {
+                            metadata.mode = original;
+                        },
+                    ),
                 )?;
                 context.expect_eq(event?.status, 0);
                 bytes_at(context, &file, 0, b"123456789")?;
@@ -4707,7 +4933,10 @@ pub(crate) mod writes {
         checked(context, file.sync_range(0..u64::MAX, false))?;
         let inode = fixture.inodes.last().unwrap().clone();
         let mut attempt = ReclaimAttempt::new();
-        let original = checked(context, file.file_page(1, &mut attempt))?;
+        let original = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(1, &mut attempt),
+        )?;
         let image = fixture.shared_image(context, b"k")?;
         let mm = image.mm.clone();
         let file_offset = (PAGE_SIZE as u64).to_le_bytes();
@@ -4944,7 +5173,9 @@ pub(crate) mod writes {
             data_blocks[index] = physical;
             old_folios.push(checked(
                 context,
-                file.file_page(offset / PAGE_SIZE as u64, &mut prepare_attempt),
+                file.mapping_inode()
+                    .unwrap()
+                    .file_page(offset / PAGE_SIZE as u64, &mut prepare_attempt),
             )?);
         }
         let old = tree(context, &inode)?;
@@ -5091,7 +5322,12 @@ pub(crate) mod writes {
             )?;
         }
         let mut reuse_attempt = ReclaimAttempt::new();
-        let fresh = checked(context, file.file_page(0, &mut reuse_attempt))?;
+        let fresh = checked(
+            context,
+            file.mapping_inode()
+                .unwrap()
+                .file_page(0, &mut reuse_attempt),
+        )?;
         context.expect_eq(
             old_folios
                 .iter()
@@ -5125,7 +5361,7 @@ pub(crate) mod writes {
         inode: &InodeRef,
         folio: &crate::mm::FolioRef,
     ) -> Result<Vec<(u64, crate::mm::FolioWriteback)>, FsError> {
-        let volume = inode.filesystem();
+        let volume = inode.disk_volume()?;
         let block_size = volume.geometry().block_size;
         let folio = folio.clone().with_file_owner(inode.clone());
         folio.wait_writeback();
@@ -5174,7 +5410,11 @@ pub(crate) mod writes {
         let cache = fixture.cold_cache.as_ref().unwrap().clone();
         let linked_inode = fixture.inodes.last().unwrap().clone();
         context.expect_eq(
-            linked.path().unhashed_inode(linked_inode.clone()).err(),
+            linked
+                .path()
+                .unwrap()
+                .unhashed_inode(linked_inode.clone())
+                .err(),
             Some(FsError::InvalidOperation),
         );
         let before = allocation_counts(context, &volume)?;
@@ -5192,12 +5432,21 @@ pub(crate) mod writes {
         };
         fixture.inodes.push(inode.clone());
         fixture.eviction = Some(cache.watch());
-        let path = checked(context, linked.path().unhashed_inode(inode.clone()))?;
-        let file = checked(context, open_path_with_flags(path, 2))?;
+        let path = checked(
+            context,
+            linked.path().unwrap().unhashed_inode(inode.clone()),
+        )?;
+        let file = checked(
+            context,
+            open_path_with_flags(fixture.user.path.vfs(), path, 2, FileIoContext::Kernel),
+        )?;
         context.expect_eq(checked(context, file.stat())?.links, 0);
         context.expect_eq(file.write_at(0, &[0x91; PAGE_SIZE]), Ok(PAGE_SIZE));
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("unlinked live VMA MM owner OOM"))?;
         vm(
@@ -5418,9 +5667,15 @@ pub(crate) mod writes {
             context.expect_eq(allocated_counts, (before.0, before.1 - 1));
             let path = checked(
                 context,
-                linked.path().unhashed_inode(original.inode.clone()),
+                linked
+                    .path()
+                    .unwrap()
+                    .unhashed_inode(original.inode.clone()),
             )?;
-            let file = checked(context, open_path_with_flags(path, 2))?;
+            let file = checked(
+                context,
+                open_path_with_flags(fixture.user.path.vfs(), path, 2, FileIoContext::Kernel),
+            )?;
             context.expect_eq(checked(context, file.stat())?.links, 0);
             let paused = controls.clone();
             let hook: Arc<dyn Fn(&InodeRef, TruncatePhase) + Send + Sync> =
@@ -5643,13 +5898,19 @@ pub(crate) mod writes {
         checked(context, old.sync_range(0..u64::MAX, false))?;
         let old_inode = fixture.inodes.last().unwrap().clone();
         let mut old_attempt = ReclaimAttempt::new();
-        let old_folio = checked(context, old.file_page(0, &mut old_attempt))?;
+        let old_folio = checked(
+            context,
+            old.mapping_inode().unwrap().file_page(0, &mut old_attempt),
+        )?;
         let mut expected = [0; 32];
         let (new, new_folio) = if replacement == 0 {
             let file = fixture.open(context, b"/test/write-map", 0)?;
             context.expect_eq(file.read_at(0, &mut expected), Ok(expected.len()));
             let mut new_attempt = ReclaimAttempt::new();
-            let folio = checked(context, file.file_page(0, &mut new_attempt))?;
+            let folio = checked(
+                context,
+                file.mapping_inode().unwrap().file_page(0, &mut new_attempt),
+            )?;
             (Some(file), Some(folio))
         } else {
             (None, None)
@@ -5713,8 +5974,14 @@ pub(crate) mod writes {
                     replacing.unmap(SOURCE, PAGE_SIZE)
                 } else {
                     let source = if replacement == 0 {
+                        let file = file.expect("file replacement has no original OFD");
+                        let inode = file
+                            .mapping_inode()
+                            .expect("regular replacement has no mapping inode")
+                            .clone();
                         MmapSource::File {
-                            file: file.expect("file replacement has no original OFD"),
+                            file,
+                            inode,
                             offset: 0,
                             private: false,
                         }
@@ -5821,8 +6088,8 @@ pub(crate) mod writes {
         let race = fixture.open(context, b"/test/ns-work/ns-race", 2)?;
         let race_again = fixture.open(context, b"/test/ns-work/ns-race", 2)?;
         context.expect_eq(
-            checked(context, race.path().inode())?
-                .ptr_eq(checked(context, race_again.path().inode())?),
+            checked(context, race.path().unwrap().inode())?
+                .ptr_eq(checked(context, race_again.path().unwrap().inode())?),
             true,
         );
         let race_stat = checked(context, race.stat())?;
@@ -5962,7 +6229,10 @@ pub(crate) mod writes {
         let old_stat = checked(context, old.stat())?;
         context.expect_eq((old_stat.links, old_stat.size), (2, 4));
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, old.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            old.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         context.expect_eq(old.write_at(0, b"OLD!"), Ok(4));
         let old_tree = tree(context, &old_inode)?;
         context.expect_eq(old_tree.data, 1);
@@ -6007,7 +6277,7 @@ pub(crate) mod writes {
         let replacement_stat = checked(context, replacement.stat())?;
         context.expect_eq((replacement_stat.links, replacement_stat.size), (1, 4));
         context.expect_eq(
-            checked(context, replacement.path().inode())?.ptr_eq(&old_inode),
+            checked(context, replacement.path().unwrap().inode())?.ptr_eq(&old_inode),
             false,
         );
         context.expect_eq(checked(context, old.stat())?.links, 0);
@@ -6105,8 +6375,8 @@ pub(crate) mod writes {
         context.expect_eq((source_stat.links, source_stat.size), (1, 4));
         context.expect_eq((target_stat.links, target_stat.size), (1, 4));
         context.expect_eq(
-            checked(context, source.path().inode())?
-                .ptr_eq(checked(context, old_target.path().inode())?),
+            checked(context, source.path().unwrap().inode())?
+                .ptr_eq(checked(context, old_target.path().unwrap().inode())?),
             false,
         );
         WriteOwner::release(&mm, 1)?;
@@ -6114,13 +6384,13 @@ pub(crate) mod writes {
 
         let new_target = fixture.open(context, b"/test/ns-work/ns-target", 2)?;
         context.expect_eq(
-            checked(context, new_target.path().inode())?
-                .ptr_eq(checked(context, source.path().inode())?),
+            checked(context, new_target.path().unwrap().inode())?
+                .ptr_eq(checked(context, source.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(
-            checked(context, new_target.path().inode())?
-                .ptr_eq(checked(context, old_target.path().inode())?),
+            checked(context, new_target.path().unwrap().inode())?
+                .ptr_eq(checked(context, old_target.path().unwrap().inode())?),
             false,
         );
         context.expect_eq(checked(context, old_target.stat())?.links, 0);
@@ -6192,8 +6462,8 @@ pub(crate) mod writes {
         let alias_source = fixture.open(context, b"/test/ns-work/ns-alias-source", 2)?;
         let alias_target = fixture.open(context, b"/test/ns-work/ns-alias-target", 2)?;
         context.expect_eq(
-            checked(context, alias_source.path().inode())?
-                .ptr_eq(checked(context, alias_target.path().inode())?),
+            checked(context, alias_source.path().unwrap().inode())?
+                .ptr_eq(checked(context, alias_target.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(checked(context, alias_source.stat())?.links, 2);
@@ -6220,23 +6490,23 @@ pub(crate) mod writes {
         let d2_a = fixture.open(context, b"/test/ns-work/ns-d2/a", 0)?;
         let d2_b = fixture.open(context, b"/test/ns-work/ns-d2/b", 0)?;
         context.expect_eq(
-            checked(context, d1_a.path().inode())?
-                .ptr_eq(checked(context, cross_a.path().inode())?),
+            checked(context, d1_a.path().unwrap().inode())?
+                .ptr_eq(checked(context, cross_a.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(
-            checked(context, d2_a.path().inode())?
-                .ptr_eq(checked(context, cross_a.path().inode())?),
+            checked(context, d2_a.path().unwrap().inode())?
+                .ptr_eq(checked(context, cross_a.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(
-            checked(context, d1_b.path().inode())?
-                .ptr_eq(checked(context, cross_b.path().inode())?),
+            checked(context, d1_b.path().unwrap().inode())?
+                .ptr_eq(checked(context, cross_b.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(
-            checked(context, d2_b.path().inode())?
-                .ptr_eq(checked(context, cross_b.path().inode())?),
+            checked(context, d2_b.path().unwrap().inode())?
+                .ptr_eq(checked(context, cross_b.path().unwrap().inode())?),
             true,
         );
         drop((d1_a, d1_b, d2_a, d2_b));
@@ -6312,13 +6582,13 @@ pub(crate) mod writes {
         let d1_b = fixture.open(context, b"/test/ns-work/ns-d1/b", 0)?;
         let d2_a = fixture.open(context, b"/test/ns-work/ns-d2/a", 0)?;
         context.expect_eq(
-            checked(context, d1_b.path().inode())?
-                .ptr_eq(checked(context, cross_a.path().inode())?),
+            checked(context, d1_b.path().unwrap().inode())?
+                .ptr_eq(checked(context, cross_a.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(
-            checked(context, d2_a.path().inode())?
-                .ptr_eq(checked(context, cross_b.path().inode())?),
+            checked(context, d2_a.path().unwrap().inode())?
+                .ptr_eq(checked(context, cross_b.path().unwrap().inode())?),
             true,
         );
         bytes_at(context, &d1_b, 0, b"AAAA")?;
@@ -6336,8 +6606,8 @@ pub(crate) mod writes {
         }
         context.expect_eq(checked(context, alias_source.stat())?.links, 2);
         context.expect_eq(
-            checked(context, alias_source.path().inode())?
-                .ptr_eq(checked(context, alias_target.path().inode())?),
+            checked(context, alias_source.path().unwrap().inode())?
+                .ptr_eq(checked(context, alias_target.path().unwrap().inode())?),
             true,
         );
         context.expect_eq(

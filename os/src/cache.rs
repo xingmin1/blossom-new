@@ -20,7 +20,7 @@ use crate::mm::user_table::RetiredTables;
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
 use crate::sync::{SleepMutex, SleepMutexGuard, SleepRwLock, SpinLock, SpinLockGuard};
 use crate::task::{ReclaimMode, ReclaimScope};
-use index::{IndexAllocator, Node, NodeRef, RetiredNode, Tree};
+use index::{FileRole, IndexAllocator, Node, NodeRef, RetiredNode, Tree};
 
 /// 内容状态从节点自己的 folio 读取；ToWrite 只标记本轮选中的原节点。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +104,8 @@ fn writeback_errno(error: FsError) -> u32 {
         FsError::TooManyFiles => 24,
         FsError::ReadOnly | FsError::Io(BlockError::ReadOnly) => 30,
         FsError::IsDirectory => 21,
+        FsError::IllegalSeek => 29,
+        FsError::NotTty => 25,
         FsError::BadAddress => 14,
         FsError::Permission => 13,
         FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => 5,
@@ -177,7 +179,7 @@ impl FolioIndex {
         while let Some(node) = entries.lower_bound(cursor) {
             let key = node.key;
             let baseline = reserve.is_some_and(|source| source.metadata_has_baseline(&node.folio));
-            if node.folio.index_unused(baseline, false) {
+            if !node.folio.is_memory() && node.folio.index_unused(baseline, false) {
                 return Ok(entries.remove(key));
             }
             let Some(next) = key.checked_add(1) else {
@@ -271,7 +273,8 @@ impl FolioIndex {
                 let key = node.key;
                 let baseline =
                     reserve.is_some_and(|source| source.metadata_has_baseline(&node.folio));
-                let victim = if node.folio.index_unused(baseline, false) {
+                let victim = if !node.folio.is_memory() && node.folio.index_unused(baseline, false)
+                {
                     entries.remove(key)
                 } else {
                     None
@@ -1046,7 +1049,7 @@ impl FileMapping {
         owner: &InodeRef,
         index: u64,
         attempt: &mut ReclaimAttempt,
-    ) -> Result<PreparedFile, BlockError> {
+    ) -> Result<PreparedFile, FsError> {
         assert!(
             core::ptr::eq(owner.mapping(), self),
             "file mapping prepare owner changed"
@@ -1054,26 +1057,35 @@ impl FileMapping {
         let cached = {
             let entries = self.index.entries.lock();
             if entries.closed {
-                return Err(BlockError::QueueStopped);
+                return Err(FsError::LoadAborted);
             }
             entries.get(index).map(|node| node.folio.clone())
         };
         if let Some(folio) = cached {
             return Ok(PreparedFile::Cached(folio.with_file_owner(owner.clone())));
         }
-        attempt.prepare(|| {
-            let folio = FolioRef::allocate().ok_or(BlockError::NoMemory)?;
-            let read = folio
-                .begin_read(0, PAGE_SIZE)?
-                .with_file_owner(owner.clone());
-            let node = Node::prepare(
-                index,
-                folio,
-                Some(owner.downgrade_for_reclaim()),
-                IndexAllocator::Heap,
-            )?;
-            Ok(PreparedFile::New { node, read })
-        })
+        let mut charge = owner
+            .is_memory()
+            .then(|| owner.reserve_memory_page())
+            .transpose()?;
+        attempt
+            .prepare(|| {
+                let mut folio = FolioRef::allocate().ok_or(BlockError::NoMemory)?;
+                let read = folio
+                    .begin_read(0, PAGE_SIZE)?
+                    .with_file_owner(owner.clone());
+                let role = if owner.is_memory() {
+                    FileRole::Memory(owner.downgrade_for_reclaim())
+                } else {
+                    FileRole::Disk(owner.downgrade_for_reclaim())
+                };
+                let node = Node::prepare(index, folio.clone(), Some(role), IndexAllocator::Heap)?;
+                if let Some(charge) = charge.take() {
+                    folio.attach_memory_charge(charge);
+                }
+                Ok(PreparedFile::New { node, read })
+            })
+            .map_err(Into::into)
     }
 
     /// caller 重核 EOF 后二查 canonical；None 只表示旧命中已退休，私有输家仍由 caller 锁外结束。
@@ -1113,7 +1125,9 @@ impl FileMapping {
                 };
                 assert_eq!(node.key, index, "file candidate key changed");
                 assert!(
-                    node.file.as_ref().is_some_and(|key| key.matches(owner)),
+                    node.role
+                        .as_ref()
+                        .is_some_and(|role| role.owner().matches(owner)),
                     "file candidate owner changed"
                 );
                 let folio = node.folio.clone();
@@ -1267,7 +1281,7 @@ impl FileMapping {
                     if valid != 0 {
                         inode.note_dirty();
                         content
-                            .mark_prepared_dirty(valid, inode.filesystem().geometry().block_size)
+                            .mark_prepared_dirty(valid, inode.block_size() as usize)
                             .expect("reclaim prepared dirty range changed");
                     }
                 }
@@ -1480,7 +1494,7 @@ impl FileMapping {
                 let (observed, changed) =
                     data.domain.mkclean_range(&data, start, folio.phys_addr());
                 cleaned += changed;
-                if observed {
+                if observed && !data.inode.is_memory() {
                     let size = data
                         .inode
                         .metadata_snapshot()
@@ -1488,7 +1502,7 @@ impl FileMapping {
                         .size;
                     let valid = size.saturating_sub(start).min(PAGE_SIZE as u64) as usize;
                     if 0 < valid {
-                        let block_size = data.inode.filesystem().geometry().block_size;
+                        let block_size = data.inode.block_size() as usize;
                         data.inode.note_dirty();
                         content
                             .mark_prepared_dirty(valid, block_size)
@@ -1613,7 +1627,7 @@ fn reclaim_node(
     attempt: &mut ReclaimAttempt,
     writeback: &mut Option<Arc<Ext4Volume>>,
 ) {
-    let Some(inode) = node.file.as_ref().and_then(|key| key.upgrade()) else {
+    let Some(inode) = node.role.as_ref().and_then(|role| role.owner().upgrade()) else {
         let freed_file = index::putback(node);
         attempt.account(ReclaimStats {
             freed_file,
@@ -1679,9 +1693,12 @@ fn reclaim_node(
             })
         }
     };
-    if needs_writeback && writeback.is_none() && inode.filesystem().mode() == AccessMode::ReadWrite
-    {
-        *writeback = Some(Arc::clone(inode.filesystem()));
+    if needs_writeback && writeback.is_none() {
+        if let Ok(volume) = inode.disk_volume() {
+            if volume.mode() == AccessMode::ReadWrite {
+                *writeback = Some(Arc::clone(volume));
+            }
+        }
     }
     let mut freed_file = if let Some(retired) = retired {
         let freed = retired.release();

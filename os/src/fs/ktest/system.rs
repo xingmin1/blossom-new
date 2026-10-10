@@ -65,7 +65,9 @@ impl SystemOwner {
         let files = Arc::try_new(checked(context, FileTable::try_new(8))?)
             .map_err(|_| TestError("system file table owner OOM"))?;
         context.expect_eq(
-            vfs.root().filesystem().disk().identity(),
+            checked(context, checked(context, vfs.root().inode())?.disk_volume())?
+                .disk()
+                .identity(),
             self.owner.disks[selection.root].identity(),
         );
         context.expect_eq(vfs.root().filesystem().mode(), selection.root_mode);
@@ -580,7 +582,9 @@ pub(crate) mod dual {
                 .resolve(fixture.context(), EXTRA_FILES[0], ResolveMode::Follow),
         )?;
         context.expect_eq(
-            second.filesystem().disk().identity(),
+            checked(context, checked(context, second.inode())?.disk_volume())?
+                .disk()
+                .identity(),
             fixture.owner.disks[extra].identity(),
         );
         let first_inode = checked(context, first.inode())?;
@@ -594,10 +598,10 @@ pub(crate) mod dual {
         context.expect_eq(
             checked(
                 context,
-                fixture
-                    .vfs()
-                    .inodes()
-                    .iget(first.filesystem(), first_inode.number()),
+                fixture.vfs().inodes().iget(
+                    checked(context, first_inode.disk_volume())?,
+                    first_inode.number(),
+                ),
             )?
             .ptr_eq(first_inode),
             true,
@@ -605,10 +609,10 @@ pub(crate) mod dual {
         context.expect_eq(
             checked(
                 context,
-                fixture
-                    .vfs()
-                    .inodes()
-                    .iget(second.filesystem(), second_inode.number()),
+                fixture.vfs().inodes().iget(
+                    checked(context, second_inode.disk_volume())?,
+                    second_inode.number(),
+                ),
             )?
             .ptr_eq(second_inode),
             true,
@@ -627,7 +631,7 @@ pub(crate) mod dual {
             offset += first_len.max(second_len) as u64;
         }
         context.expect_eq(different, true);
-        context.diagnostic(format_args!("fs-system-dual identity-inode={} root-disk={:?} extra-disk={:?} swapped-host-source-comparison-required=1", first_inode.number(), first.filesystem().disk().identity(), second.filesystem().disk().identity()));
+        context.diagnostic(format_args!("fs-system-dual identity-inode={} root-disk={:?} extra-disk={:?} swapped-host-source-comparison-required=1", first_inode.number(), checked(context, first_inode.disk_volume())?.disk().identity(), checked(context, second_inode.disk_volume())?.disk().identity()));
         Ok(())
     }
 }

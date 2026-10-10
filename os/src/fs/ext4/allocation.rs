@@ -3,8 +3,8 @@
 use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, GroupState};
-use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeKind, InodeMetadata};
-use crate::fs::{FsError, InodeRef};
+use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeMetadata};
+use crate::fs::{FsError, InodeKind, InodeRef};
 use crate::time;
 use alloc::vec::Vec;
 
@@ -228,7 +228,9 @@ impl Ext4Volume {
             InodeKind::Regular => 0x8000,
             InodeKind::Directory => 0x4000,
             InodeKind::Symlink => 0xa000,
-            InodeKind::Other => return Err(FsError::InvalidOperation),
+            InodeKind::Character | InodeKind::Block | InodeKind::Other => {
+                return Err(FsError::InvalidOperation)
+            }
         };
         let parent_setgid = parent.mode & 0o2000 != 0;
         let mut mode = kind_mode

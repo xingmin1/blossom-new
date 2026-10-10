@@ -6,19 +6,28 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
 use crate::block::{AccessMode, BlockError};
-use crate::fs::ext4::DirectoryCursor;
+use crate::fs::memfs::MemorySpecial;
 #[cfg(feature = "ktest")]
 use crate::fs::readahead::ReadaheadSnapshot;
 use crate::fs::readahead::ReadaheadState;
 use crate::fs::{
-    background, writeback, DirectoryEntry, FsError, InodeKind, InodeTime, Path, WriteAccess,
+    background, writeback, DirectoryCursor, DirectoryEntry, FsError, InodeKind, InodeRef,
+    InodeTime, Path, Pollable, Vfs, WriteAccess,
 };
+use crate::fs::{devfs, procfs};
 use crate::mm::space::{Mm, VmError};
-use crate::mm::FolioRef;
 use crate::sync::{SleepMutex, SpinLock};
+use crate::task::UserThread;
 
 /// 共享一个打开实例及其位置；最后引用释放该实例持有的路径。
 pub type FileRef = Arc<dyn FileLike>;
+
+/// 显式保存本次调用者；内核缓冲与用户缓冲不能替代线程身份。
+#[derive(Clone, Copy)]
+pub enum FileIoContext<'a> {
+    Kernel,
+    User(&'a UserThread),
+}
 
 const O_ACCMODE: u32 = 0o3;
 const O_WRONLY: u32 = 0o1;
@@ -30,8 +39,9 @@ pub(crate) const O_SYNC: u32 = 0x101000;
 pub(crate) const O_DIRECTORY: u32 = 0o200000;
 pub(crate) const O_NOFOLLOW: u32 = 0o400000;
 const O_CLOEXEC: u32 = 0o2000000;
+pub(crate) const O_NOCTTY: u32 = 0o400;
 const MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
-const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | 0o100000 | O_DIRECTORY | O_NOFOLLOW | 0o400;
+const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | 0o100000 | O_DIRECTORY | O_NOFOLLOW | O_NOCTTY;
 
 /// 同一文件页循环的两个接收端，实际交付量独立于请求长度。
 pub struct ReadBuffer<'a> {
@@ -226,6 +236,8 @@ pub struct FileStat {
     /// 已分配空间按 512 字节计数。
     pub blocks: u64,
     pub device: u64,
+    /// 字符或块节点指向的设备号，普通节点为零。
+    pub rdev: u64,
     pub block_size: u32,
     pub atime: InodeTime,
     pub mtime: InodeTime,
@@ -236,19 +248,28 @@ pub struct FileStat {
 pub trait FileLike: Send + Sync {
     /// 内核顺序读取使用与用户读取相同的页交付和位置提交协议。
     fn read(&self, dst: &mut [u8]) -> Result<usize, FsError> {
-        self.read_into(&mut ReadBuffer::kernel(dst))
+        self.read_into(&mut ReadBuffer::kernel(dst), FileIoContext::Kernel)
     }
 
     /// 内核按位置读取使用同一页循环，不取得共享位置锁。
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
-        self.read_at_into(offset, &mut ReadBuffer::kernel(dst))
+        self.read_at_into(offset, &mut ReadBuffer::kernel(dst), FileIoContext::Kernel)
     }
 
     /// 从共享位置向具体接收端交付，只提交已交付的正前缀。
-    fn read_into(&self, target: &mut ReadBuffer<'_>) -> Result<usize, FsError>;
+    fn read_into(
+        &self,
+        target: &mut ReadBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError>;
 
     /// 按指定位置向接收端交付，不获取或修改共享位置。
-    fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError>;
+    fn read_at_into(
+        &self,
+        offset: u64,
+        target: &mut ReadBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError>;
 
     /// 只复制本打开实例的预读提示，目录没有文件读历史；不取得位置或页内容锁。
     #[cfg(feature = "ktest")]
@@ -256,8 +277,26 @@ pub trait FileLike: Send + Sync {
         None
     }
 
-    /// 借用保活挂载与 inode 的完整路径，dirfd 不暴露裸身份。
-    fn path(&self) -> &Path;
+    /// 只借用对象实际拥有的路径，无路径的流不能作为 dirfd 起点。
+    fn path(&self) -> Option<&Path>;
+
+    /// 只由普通可映射文件提供实际 inode，映射者自行保活该身份。
+    fn mapping_inode(&self) -> Option<&InodeRef>;
+
+    /// 借用实际持续事件 provider，普通文件与目录没有持久通知源。
+    fn pollable(&self) -> Option<&dyn Pollable> {
+        None
+    }
+
+    /// 没有设备控制能力的文件返回 ENOTTY，不把未知命令当作成功。
+    fn ioctl(
+        &self,
+        _command: u32,
+        _argument: usize,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        Err(FsError::NotTty)
+    }
 
     /// 读取此 OFD 的访问模式和状态，CLOEXEC 只在描述符槽保存。
     fn flags(&self) -> u32;
@@ -271,13 +310,6 @@ pub trait FileLike: Send + Sync {
     /// 同步半开字节范围及其必要元数据和设备缓存，并推进原 OFD 的错误观察游标。
     /// 调用者不得持描述符表、位置、inode 写锁或 mmap/PTE 保护；本操作可能等待真实 I/O。
     fn sync_range(&self, range: Range<u64>, data_only: bool) -> Result<(), FsError>;
-
-    /// 在普通任务中等待唯一 inode 的缓存页，不获取位置锁；EOF 与私有尾页由映射调用者处理。
-    fn file_page(
-        &self,
-        index: u64,
-        attempt: &mut crate::mm::reclaim::ReclaimAttempt,
-    ) -> Result<FolioRef, FsError>;
 
     /// 更新共享字节位置，负值或溢出不修改原位置。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError>;
@@ -296,19 +328,28 @@ pub trait FileLike: Send + Sync {
 
     /// 内核顺序写与用户写共用同一输入准备及文件提交协议。
     fn write(&self, src: &[u8]) -> Result<usize, FsError> {
-        self.write_from(&mut WriteBuffer::kernel(src))
+        self.write_from(&mut WriteBuffer::kernel(src), FileIoContext::Kernel)
     }
 
     /// 内核按位置写不取得共享位置锁，追加状态仍由 inode 仲裁。
     fn write_at(&self, offset: u64, src: &[u8]) -> Result<usize, FsError> {
-        self.write_at_from(offset, &mut WriteBuffer::kernel(src))
+        self.write_at_from(offset, &mut WriteBuffer::kernel(src), FileIoContext::Kernel)
     }
 
     /// 持共享位置直到实际写结束，只提交 inode 返回的起点和接受前缀。
-    fn write_from(&self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError>;
+    fn write_from(
+        &self,
+        source: &mut WriteBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError>;
 
     /// 按明确位置写入，不取得或修改共享位置。
-    fn write_at_from(&self, offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError>;
+    fn write_at_from(
+        &self,
+        offset: u64,
+        source: &mut WriteBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError>;
 }
 
 /// 普通文件的打开实例，路径保活挂载和唯一 inode 的文件页索引。
@@ -318,8 +359,8 @@ pub struct InodeFile {
     readahead: SpinLock<ReadaheadState>,
     flags: AtomicU32,
     write_access: Option<WriteAccess>,
-    /// 同一 OFD 的数据与共同元数据错误样本，短锁只覆盖检查与推进。
-    wb_errors: SpinLock<(u32, u32)>,
+    /// 只有磁盘 OFD 保存数据与共同元数据错误样本，短锁只覆盖检查与推进。
+    wb_errors: SpinLock<Option<(u32, u32)>>,
 }
 
 /// 目录的打开实例保存后端cookie和相同hash项的真实续读位置。
@@ -327,23 +368,25 @@ pub struct DirectoryFile {
     path: Path,
     cursor: SleepMutex<DirectoryCursor>,
     flags: AtomicU32,
-    wb_error: SpinLock<u32>,
+    wb_error: SpinLock<Option<u32>>,
 }
 
 /// 内核默认只读打开与用户带标志打开共用唯一构造。
-pub fn open_path(path: Path) -> Result<FileRef, FsError> {
-    open_path_with_flags(path, 0)
+pub fn open_path(vfs: &Vfs, path: Path) -> Result<FileRef, FsError> {
+    open_path_with_flags(vfs, path, 0, FileIoContext::Kernel)
 }
 
 /// 按已确定的真实对象建立完整 OFD；创建候选由 VFS 在名字发表前交入。
 /// O_TRUNC 在 OFD 存储准备后执行；只读截断的临时写拥有不转入打开实例。
-pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> {
+pub fn open_path_with_flags(
+    vfs: &Vfs,
+    path: Path,
+    flags: u32,
+    caller: FileIoContext<'_>,
+) -> Result<FileRef, FsError> {
     let access = flags & O_ACCMODE;
     if access == O_ACCMODE {
         return Err(FsError::InvalidOperation);
-    }
-    if access != 0 || flags & O_TRUNC != 0 {
-        path.check_writable()?;
     }
     let flags = flags & !O_CLOEXEC;
     if flags & !(OPEN_FLAGS | O_ACCMODE | O_TRUNC) != 0 {
@@ -360,17 +403,33 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
     if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
+    if let Some(special) = inode.memory_special() {
+        return match special {
+            MemorySpecial::Null | MemorySpecial::Zero => devfs::open(path, flags, caller, special),
+            MemorySpecial::Mounts | MemorySpecial::Meminfo | MemorySpecial::Uptime => {
+                procfs::open(path, flags, special, vfs)
+            }
+        };
+    }
     match kind {
         InodeKind::Regular => {
+            if access != 0 || flags & O_TRUNC != 0 {
+                path.check_writable()?;
+            }
             let mut write_access = if access != 0 || flags & O_TRUNC != 0 {
                 Some(inode.acquire_write()?)
             } else {
                 None
             };
-            let wb_errors = (
-                inode.mapping().sample_wb_error(),
-                inode.filesystem().metadata_cache().sample_wb_error(),
-            );
+            let wb_errors = if inode.is_memory() {
+                None
+            } else {
+                let volume = inode.disk_volume()?;
+                Some((
+                    inode.mapping().sample_wb_error(),
+                    volume.metadata_cache().sample_wb_error(),
+                ))
+            };
             let file = Arc::try_new(InodeFile {
                 path,
                 cursor: SleepMutex::new(0),
@@ -391,16 +450,21 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
                     .as_ref()
                     .or(write_access.as_ref())
                     .expect("truncating open has no write access");
-                access.truncate(file.path.inode()?.filesystem().claim(), 0)?;
+                access.truncate(0)?;
             }
             Ok(file)
         }
         InodeKind::Directory => {
             if access != 0 || flags & O_TRUNC != 0 {
+                path.check_writable()?;
                 return Err(FsError::IsDirectory);
             }
             let cursor = inode.directory_cursor(0)?;
-            let wb_error = inode.filesystem().metadata_cache().sample_wb_error();
+            let wb_error = if inode.is_memory() {
+                None
+            } else {
+                Some(inode.disk_volume()?.metadata_cache().sample_wb_error())
+            };
             Ok(Arc::try_new(DirectoryFile {
                 path,
                 cursor: SleepMutex::new(cursor),
@@ -410,41 +474,71 @@ pub fn open_path_with_flags(path: Path, flags: u32) -> Result<FileRef, FsError> 
             .map_err(|_| FsError::NoMemory)?)
         }
         InodeKind::Symlink => Err(FsError::TooManySymlinks),
-        InodeKind::Other => Err(FsError::Unsupported),
+        InodeKind::Character | InodeKind::Block | InodeKind::Other => Err(FsError::Unsupported),
     }
 }
 
 impl FileLike for InodeFile {
     /// 位置锁跨实际交付保持独占，用户故障的正前缀仍按真实长度推进。
-    fn read_into(&self, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+    fn read_into(
+        &self,
+        target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         require_read(self.flags())?;
         let mut cursor = self.cursor.lock();
-        let bytes = self
-            .path
-            .inode()?
-            .read_into(*cursor, target, Some(&self.readahead))?;
+        let inode = self.path.inode()?;
+        let readahead = if inode.is_memory() {
+            None
+        } else {
+            Some(&self.readahead)
+        };
+        let bytes = inode.read_into(*cursor, target, readahead)?;
         // inode 限制交付不超过 size-cursor，EOF 与零长返回零。
         *cursor += bytes as u64;
         Ok(bytes)
     }
 
     /// 按位置读取更新同一 OFD 的短预读提示，不参与共享位置的串行化。
-    fn read_at_into(&self, offset: u64, target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+    fn read_at_into(
+        &self,
+        offset: u64,
+        target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         require_read(self.flags())?;
-        self.path
-            .inode()?
-            .read_into(offset, target, Some(&self.readahead))
+        let inode = self.path.inode()?;
+        let readahead = if inode.is_memory() {
+            None
+        } else {
+            Some(&self.readahead)
+        };
+        inode.read_into(offset, target, readahead)
     }
 
-    /// 观察原 OFD 的提示快照，dup 读取同一状态，独立打开各自保存。
+    /// 只观察磁盘 OFD 的预读历史，RAM 文件没有磁盘预读提示。
     #[cfg(feature = "ktest")]
     fn ktest_readahead_snapshot(&self) -> Option<ReadaheadSnapshot> {
-        Some(self.readahead.lock().snapshot())
+        if self
+            .path
+            .inode()
+            .expect("regular OFD lost its inode")
+            .is_memory()
+        {
+            None
+        } else {
+            Some(self.readahead.lock().snapshot())
+        }
     }
 
     /// 由完整路径保活挂载，调用者可克隆此路径作为 dirfd 起点。
-    fn path(&self) -> &Path {
-        &self.path
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    /// 构造时已经取得正 inode；路径身份在此 OFD 寿命内不重新绑定。
+    fn mapping_inode(&self) -> Option<&InodeRef> {
+        Some(self.path.inode().expect("regular OFD lost its inode"))
     }
 
     /// OFD 状态由原子快照读取，不获取位置锁。
@@ -463,12 +557,11 @@ impl FileLike for InodeFile {
             return Err(FsError::InvalidOperation);
         }
         self.path.check_writable()?;
-        let inode = self.path.inode()?;
         let access = self
             .write_access
             .as_ref()
             .expect("writable OFD has no write access");
-        access.truncate(inode.filesystem().claim(), new_size)
+        access.truncate(new_size)
     }
 
     /// 在所有写入与位置保护之外同步实际范围，直接错误优先于后续阶段，样本仍全部推进。
@@ -477,7 +570,10 @@ impl FileLike for InodeFile {
             return Err(FsError::InvalidOperation);
         }
         let inode = self.path.inode()?;
-        let volume = inode.filesystem();
+        if inode.is_memory() {
+            return Ok(());
+        }
+        let volume = inode.disk_volume()?;
         // 只读卷没有可提交的写义务；只读 OFD 或挂载视图仍须同步 RW 卷上的共同内容。
         let writable = volume.mode() == AccessMode::ReadWrite;
         let data = if writable {
@@ -485,8 +581,8 @@ impl FileLike for InodeFile {
         } else {
             Ok(())
         };
-        // 共同元数据包含当前 inode 记录、块树及分配依赖；当前不存在新名字的父目录义务。
-        // fdatasync 可写出更多共同元数据，但不能绕过使数据可寻址的记录和设备 FLUSH。
+        // 共同元数据同步覆盖本卷当前选中的 inode、块树、分配和目录记录，可写出更多元数据。
+        // 文件同步不保证跨文件原子提交，fdatasync 仍须提交使数据可寻址的记录和设备 FLUSH。
         // 未确认设备停止时保持原在途拥有，禁止继续提交元数据或 FLUSH。
         let metadata = if writable && !matches!(data, Err(FsError::Io(BlockError::StopUnconfirmed)))
         {
@@ -495,22 +591,12 @@ impl FileLike for InodeFile {
             Ok(())
         };
         let mut samples = self.wb_errors.lock();
+        let samples = samples.as_mut().expect("disk OFD has no writeback samples");
         let data_error = inode.mapping().check_and_advance_wb_error(&mut samples.0);
-        let metadata_error = inode
-            .filesystem()
+        let metadata_error = volume
             .metadata_cache()
             .check_and_advance_wb_error(&mut samples.1);
         data.and(data_error).and(metadata).and(metadata_error)
-    }
-
-    /// 从完整路径保活的 inode 取得同源缓存页，不读取或修改打开实例的位置。
-    fn file_page(
-        &self,
-        index: u64,
-        attempt: &mut crate::mm::reclaim::ReclaimAttempt,
-    ) -> Result<FolioRef, FsError> {
-        require_read(self.flags())?;
-        self.path.inode()?.file_page(index, attempt)
     }
 
     /// 与顺序读取共用位置锁，允许定位到文件末尾之后。
@@ -537,7 +623,11 @@ impl FileLike for InodeFile {
     }
 
     /// 接受前缀先提交位置并放写保护，再完成同步和脏节流；失败不回滚已提交位置。
-    fn write_from(&self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+    fn write_from(
+        &self,
+        source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         let flags = self.flags();
         require_write(flags)?;
         self.path.check_writable()?;
@@ -548,12 +638,7 @@ impl FileLike for InodeFile {
             .write_access
             .as_ref()
             .expect("writable OFD has no write access");
-        let (start, bytes) = access.write_from(
-            inode.filesystem().claim(),
-            *cursor,
-            flags & O_APPEND != 0,
-            source,
-        )?;
+        let (start, bytes) = access.write_from(*cursor, flags & O_APPEND != 0, source)?;
         if 0 < bytes {
             *cursor = start
                 .checked_add(bytes as u64)
@@ -561,14 +646,19 @@ impl FileLike for InodeFile {
         }
         drop(cursor);
         sync_written(self, flags, start, bytes)?;
-        if 0 < bytes {
+        if 0 < bytes && !inode.is_memory() {
             background::balance_dirty_pages(&inode);
         }
         Ok(bytes)
     }
 
     /// pwrite 不取得共享位置，追加由 inode 仲裁，接受前缀在写保护外完成同步和脏节流。
-    fn write_at_from(&self, offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+    fn write_at_from(
+        &self,
+        offset: u64,
+        source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         let flags = self.flags();
         require_write(flags)?;
         self.path.check_writable()?;
@@ -578,14 +668,9 @@ impl FileLike for InodeFile {
             .write_access
             .as_ref()
             .expect("writable OFD has no write access");
-        let (start, bytes) = access.write_from(
-            inode.filesystem().claim(),
-            offset,
-            flags & O_APPEND != 0,
-            source,
-        )?;
+        let (start, bytes) = access.write_from(offset, flags & O_APPEND != 0, source)?;
         sync_written(self, flags, start, bytes)?;
-        if 0 < bytes {
+        if 0 < bytes && !inode.is_memory() {
             background::balance_dirty_pages(&inode);
         }
         Ok(bytes)
@@ -616,18 +701,32 @@ fn check_write_range(offset: u64, length: usize) -> Result<(), FsError> {
 
 impl FileLike for DirectoryFile {
     /// 目录字节由目录项操作消费，不能按普通文件读取。
-    fn read_into(&self, _target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+    fn read_into(
+        &self,
+        _target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         Err(FsError::IsDirectory)
     }
 
     /// 指定位置的普通字节读取同样拒绝目录。
-    fn read_at_into(&self, _offset: u64, _target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+    fn read_at_into(
+        &self,
+        _offset: u64,
+        _target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         Err(FsError::IsDirectory)
     }
 
     /// 目录实例保活完整路径，可作为相对路径起点。
-    fn path(&self) -> &Path {
-        &self.path
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    /// 目录只提供目录项流，不授予普通文件映射能力。
+    fn mapping_inode(&self) -> Option<&InodeRef> {
+        None
     }
 
     /// 读取此目录 OFD 状态，不获取枚举位置锁。
@@ -651,26 +750,21 @@ impl FileLike for DirectoryFile {
             return Err(FsError::InvalidOperation);
         }
         let inode = self.path.inode()?;
-        let volume = inode.filesystem();
+        if inode.is_memory() {
+            return Ok(());
+        }
+        let volume = inode.disk_volume()?;
         let result = if volume.mode() == AccessMode::ReadWrite {
             writeback::sync_metadata(volume)
         } else {
             Ok(())
         };
-        let error = inode
-            .filesystem()
-            .metadata_cache()
-            .check_and_advance_wb_error(&mut self.wb_error.lock());
+        let mut sample = self.wb_error.lock();
+        let sample = sample
+            .as_mut()
+            .expect("disk directory OFD has no writeback sample");
+        let error = volume.metadata_cache().check_and_advance_wb_error(sample);
         result.and(error)
-    }
-
-    /// 目录不能提供普通文件映射页，不建立缓存页或改变枚举位置。
-    fn file_page(
-        &self,
-        _index: u64,
-        _attempt: &mut crate::mm::reclaim::ReclaimAttempt,
-    ) -> Result<FolioRef, FsError> {
-        Err(FsError::IsDirectory)
     }
 
     /// 按真实后端cookie定位；显式seek从新位置重新枚举hash碰撞。
@@ -710,20 +804,29 @@ impl FileLike for DirectoryFile {
     }
 
     /// 目录不接受字节写入，访问模式检查与挂载能力检查保持各自错误。
-    fn write_from(&self, _source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+    fn write_from(
+        &self,
+        _source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
         require_write(self.flags())?;
         self.path.check_writable()?;
         Err(FsError::IsDirectory)
     }
 
     /// 按位置写同样拒绝目录，不获取枚举位置锁。
-    fn write_at_from(&self, _offset: u64, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
-        self.write_from(source)
+    fn write_at_from(
+        &self,
+        _offset: u64,
+        source: &mut WriteBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        self.write_from(source, caller)
     }
 }
 
 /// 写模式 OFD 不授予读取或文件映射能力，空请求同样核访问模式。
-fn require_read(flags: u32) -> Result<(), FsError> {
+pub(crate) fn require_read(flags: u32) -> Result<(), FsError> {
     if flags & O_ACCMODE == O_WRONLY {
         Err(FsError::BadFd)
     } else {
@@ -732,7 +835,7 @@ fn require_read(flags: u32) -> Result<(), FsError> {
 }
 
 /// 只读 OFD 不授予写能力，挂载检查不能替代打开时访问模式。
-fn require_write(flags: u32) -> Result<(), FsError> {
+pub(crate) fn require_write(flags: u32) -> Result<(), FsError> {
     if flags & O_ACCMODE == 0 {
         Err(FsError::BadFd)
     } else {
@@ -741,7 +844,7 @@ fn require_write(flags: u32) -> Result<(), FsError> {
 }
 
 /// 同一原子更新保留全部不可变打开位，只提交支持的可变状态位。
-fn set_status_flags(flags: &AtomicU32, raw: u32) -> Result<(), FsError> {
+pub(crate) fn set_status_flags(flags: &AtomicU32, raw: u32) -> Result<(), FsError> {
     if raw & !(OPEN_FLAGS | O_ACCMODE | O_CLOEXEC) != 0 {
         return Err(FsError::Unsupported);
     }
@@ -811,18 +914,26 @@ pub fn stat_path(path: &Path) -> Result<FileStat, FsError> {
     if data.kind == InodeKind::Other {
         return Err(FsError::Unsupported);
     }
-    let volume = inode.filesystem();
     Ok(FileStat {
         inode: inode.number(),
         kind: data.kind,
-        mode: data.mode,
+        mode: (data.mode & 0o7777)
+            | match data.kind {
+                InodeKind::Regular => 0o100000,
+                InodeKind::Directory => 0o040000,
+                InodeKind::Symlink => 0o120000,
+                InodeKind::Character => 0o020000,
+                InodeKind::Block => 0o060000,
+                InodeKind::Other => unreachable!(),
+            },
         size: data.size,
         uid: data.uid,
         gid: data.gid,
         links: data.links,
         blocks: data.blocks,
-        device: volume.device(),
-        block_size: volume.geometry().block_size as u32,
+        device: inode.device(),
+        rdev: inode.rdev(),
+        block_size: inode.block_size(),
         atime: data.atime,
         mtime: data.mtime,
         ctime: data.ctime,

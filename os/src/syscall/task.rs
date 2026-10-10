@@ -59,7 +59,8 @@ fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, User
         return Err(Errno::Permission);
     }
     path.check_access(credentials.uid, credentials.gid, 1)?;
-    let file = fs::open_path(path)?;
+    let vfs = runtime.fs.lock().vfs.clone();
+    let file = fs::open_path(&vfs, path)?;
     let arguments = Arguments::from_user(&mm, pathname, raw[1], raw[2]).map_err(exec_error)?;
     let image =
         exec::load(file, &arguments, credentials.uid, credentials.gid).map_err(exec_error)?;

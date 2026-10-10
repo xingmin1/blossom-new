@@ -2,6 +2,7 @@
 
 use crate::fs::dentry::DentryRef;
 use crate::fs::ktest::*;
+use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{FsContext, Path, ResolveMode, Vfs};
 
 pub(super) struct PathOwner {
@@ -26,7 +27,13 @@ impl PathOwner {
         )?;
         let vfs = Arc::try_new(checked(
             context,
-            Vfs::try_new(volume.clone(), self.owner.cache().clone(), 128, 4, mode),
+            Vfs::try_new(
+                Filesystem::Ext4(volume.clone()),
+                self.owner.cache().clone(),
+                128,
+                4,
+                mode,
+            ),
         )?)
         .map_err(|_| TestError("path view owner OOM"))?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
@@ -283,7 +290,7 @@ pub(crate) mod walk {
         let ro = checked(
             context,
             Vfs::try_new(
-                volume.clone(),
+                Filesystem::Ext4(volume.clone()),
                 fixture.owner.cache().clone(),
                 16,
                 1,
@@ -293,7 +300,7 @@ pub(crate) mod walk {
         let rw = checked(
             context,
             Vfs::try_new(
-                reopened,
+                Filesystem::Ext4(reopened),
                 fixture.owner.cache().clone(),
                 16,
                 1,
@@ -317,7 +324,13 @@ pub(crate) mod walk {
         context.expect_eq(ro_file.check_access(0, 0, 2), Err(FsError::ReadOnly));
         context.expect_eq(rw_file.check_access(0, 0, 2), Ok(()));
         context.expect_eq(
-            crate::fs::file::open_path_with_flags(ro_file.clone(), 1).err(),
+            crate::fs::file::open_path_with_flags(
+                &ro,
+                ro_file.clone(),
+                1,
+                crate::fs::FileIoContext::Kernel,
+            )
+            .err(),
             Some(FsError::ReadOnly),
         );
         read_pattern(context, &ro_file)?;
@@ -478,11 +491,20 @@ pub(crate) mod mounts {
         )?;
         checked(
             context,
-            vfs.mount(&covered, volume.clone(), AccessMode::ReadOnly),
+            vfs.mount(
+                &covered,
+                Filesystem::Ext4(volume.clone()),
+                AccessMode::ReadOnly,
+            ),
         )?;
         let mounted = fixture.resolve(context, b"/mnt/extra")?;
         context.expect_eq(mounted.ptr_eq(&covered), false);
-        context.expect_eq(Arc::ptr_eq(mounted.filesystem(), &volume), true);
+        context.expect_eq(
+            mounted
+                .filesystem()
+                .ptr_eq(&Filesystem::Ext4(volume.clone())),
+            true,
+        );
         context.expect_eq(checked(context, mounted.inode())?.number(), 2);
         context.expect_eq(
             checked(context, mounted.inode())?.ptr_eq(checked(context, vfs.root().inode())?),
@@ -503,7 +525,10 @@ pub(crate) mod mounts {
         );
         let file = fixture.resolve(context, b"/mnt/extra/pattern")?;
         let host = fixture.resolve(context, b"/pattern")?;
-        context.expect_eq(Arc::ptr_eq(file.filesystem(), &volume), true);
+        context.expect_eq(
+            file.filesystem().ptr_eq(&Filesystem::Ext4(volume.clone())),
+            true,
+        );
         context.expect_eq(
             checked(context, file.inode())?.ptr_eq(checked(context, host.inode())?),
             false,
@@ -511,7 +536,11 @@ pub(crate) mod mounts {
         read_pattern(context, &file)?;
         checked(
             context,
-            vfs.mount(&other, volume.clone(), AccessMode::ReadOnly),
+            vfs.mount(
+                &other,
+                Filesystem::Ext4(volume.clone()),
+                AccessMode::ReadOnly,
+            ),
         )?;
         let alias = fixture.resolve(context, b"/walk")?;
         context.expect_eq(alias.ptr_eq(&mounted), false);
@@ -523,7 +552,7 @@ pub(crate) mod mounts {
         context.expect_eq(
             vfs.mount(
                 &other,
-                fixture.volume.as_ref().expect("root volume alive").clone(),
+                Filesystem::Ext4(fixture.volume.as_ref().expect("root volume alive").clone()),
                 AccessMode::ReadOnly,
             )
             .err(),
@@ -554,13 +583,265 @@ pub(crate) mod mounts {
         vfs.prune_unused();
         checked(
             context,
-            vfs.mount(&covered, volume.clone(), AccessMode::ReadOnly),
+            vfs.mount(
+                &covered,
+                Filesystem::Ext4(volume.clone()),
+                AccessMode::ReadOnly,
+            ),
         )?;
         let reread = fixture.resolve(context, b"/mnt/extra/pattern")?;
         read_pattern(context, &reread)?;
         drop(reread);
         checked(context, vfs.unmount(&covered))?;
         read_pattern(context, &host)?;
+        Ok(())
+    }
+
+    /// 同一VFS挂入RAM目录，真实名字修改、清缓存、挂点转义与Busy卸载共用原路径协议。
+    #[test]
+    #[ktest(tags("T01", "T30", "fs-path-memory"))]
+    fn memory_names_and_actual_mount_snapshot(
+        context: &mut TestContext<'_>,
+        fixture: &mut PathOwner,
+    ) -> TestResult {
+        fixture.prepare_path(context, AccessMode::ReadOnly)?;
+        let vfs = fixture.vfs();
+        let fs_context = fixture.context();
+        let covered = fixture.resolve(context, b"/mnt/extra")?;
+        let memory = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o755))?;
+        checked(
+            context,
+            vfs.mount(
+                &covered,
+                Filesystem::Memory(memory.clone()),
+                AccessMode::ReadWrite,
+            ),
+        )?;
+        let ram_root = fixture.resolve(context, b"/mnt/extra")?;
+        context.expect_eq(
+            ram_root.filesystem().ptr_eq(&Filesystem::Memory(memory)),
+            true,
+        );
+        for pathname in [
+            b"/mnt/extra/a".as_slice(),
+            b"/mnt/extra/b",
+            b"/mnt/extra/a/raw \t\n\\#",
+        ] {
+            checked(
+                context,
+                vfs.mkdir_from(fs_context, fs_context.root(), pathname, 0o755, (0, 0), 0),
+            )?;
+        }
+        checked(
+            context,
+            vfs.mkdir_from(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/b/empty",
+                0o755,
+                (0, 0),
+                0,
+            ),
+        )?;
+        checked(
+            context,
+            vfs.rmdir_from(fs_context, fs_context.root(), b"/mnt/extra/b/empty", (0, 0)),
+        )?;
+        context.expect_eq(
+            vfs.resolve(fs_context, b"/mnt/extra/b/empty", ResolveMode::Follow)
+                .err(),
+            Some(FsError::NotFound),
+        );
+        context.expect_eq(
+            vfs.rmdir_from(fs_context, fs_context.root(), b"/mnt/extra/a", (0, 0))
+                .err(),
+            Some(FsError::NotEmpty),
+        );
+        let file = checked(
+            context,
+            vfs.open_with(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/a/file",
+                (0, 0),
+                Some((0o644, 0)),
+                true,
+                false,
+                |path, _| Ok(path),
+            ),
+        )?;
+        let inode = checked(context, file.inode())?.clone();
+        checked(
+            context,
+            vfs.link_from(
+                &file,
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/b/hard",
+                (0, 0),
+            ),
+        )?;
+        checked(
+            context,
+            vfs.symlink_from(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/link",
+                b"b/hard",
+                (0, 0),
+            ),
+        )?;
+        context.expect_eq(
+            checked(
+                context,
+                fixture.resolve(context, b"/mnt/extra/link")?.inode(),
+            )?
+            .ptr_eq(&inode),
+            true,
+        );
+        checked(
+            context,
+            vfs.rename_from(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/a",
+                fs_context.root(),
+                b"/mnt/extra/b/moved",
+                false,
+                (0, 0),
+            ),
+        )?;
+        let parent = fixture.resolve(context, b"/mnt/extra/b")?;
+        context.expect_eq(
+            fixture
+                .resolve(context, b"/mnt/extra/b/moved/..")?
+                .ptr_eq(&parent),
+            true,
+        );
+        context.expect_eq(
+            vfs.rename_from(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/b",
+                fs_context.root(),
+                b"/mnt/extra/b/moved/cycle",
+                false,
+                (0, 0),
+            )
+            .err(),
+            Some(FsError::InvalidOperation),
+        );
+        context.expect_eq(
+            vfs.link_from(
+                &fixture.resolve(context, b"/pattern")?,
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/cross",
+                (0, 0),
+            )
+            .err(),
+            Some(FsError::CrossDevice),
+        );
+        drop(file);
+        vfs.prune_unused();
+        let reopened = fixture.resolve(context, b"/mnt/extra/b/moved/file")?;
+        context.expect_eq(checked(context, reopened.inode())?.ptr_eq(&inode), true);
+        let nested = fixture.resolve(context, b"/mnt/extra/b/moved/raw \t\n\\#")?;
+        let procfs = checked(context, MemoryFs::try_new(MemoryFsKind::Procfs, 0o555))?;
+        checked(
+            context,
+            vfs.mount(&nested, Filesystem::Memory(procfs), AccessMode::ReadOnly),
+        )?;
+        let proc_root = fixture.resolve(context, b"/mnt/extra/b/moved/raw \t\n\\#")?;
+        context.expect_eq(proc_root.check_writable(), Err(FsError::ReadOnly));
+        context.expect_eq(vfs.unmount(&nested).err(), Some(FsError::Busy));
+        let text = checked(context, vfs.mounts_text())?;
+        let lines: Vec<&[u8]> = text
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        context.expect_eq(lines.len(), 3);
+        for line in &lines {
+            context.expect_eq(line.split(|&byte| byte == b' ').count(), 6);
+        }
+        for (line, device) in lines.iter().zip([
+            vfs.root().filesystem().device(),
+            ram_root.filesystem().device(),
+            proc_root.filesystem().device(),
+        ]) {
+            let source = line.split(|&byte| byte == b' ').next().unwrap();
+            let identity = source
+                .split(|&byte| byte == b':')
+                .nth(1)
+                .and_then(|digits| core::str::from_utf8(digits).ok())
+                .and_then(|digits| digits.parse::<u64>().ok());
+            context.expect_eq(identity, Some(device));
+        }
+        context.expect_eq(lines[0].ends_with(b" / ext4 ro 0 0"), true);
+        context.expect_eq(lines[1].ends_with(b" /mnt/extra tmpfs rw 0 0"), true);
+        context.expect_eq(
+            lines[2].ends_with(b" /mnt/extra/b/moved/raw\\040\\011\\012\\134\\043 proc ro 0 0"),
+            true,
+        );
+        drop(proc_root);
+        checked(context, vfs.unmount(&nested))?;
+        context.expect_eq(
+            checked(context, vfs.mounts_text())?
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count(),
+            2,
+        );
+        let devfs = checked(context, MemoryFs::try_new(MemoryFsKind::Devfs, 0o755))?;
+        checked(
+            context,
+            devfs.initialize_special(b"null", MemorySpecial::Null, 0o20600, 0x103),
+        )?;
+        checked(
+            context,
+            vfs.mount(&nested, Filesystem::Memory(devfs), AccessMode::ReadOnly),
+        )?;
+        let device = fixture.resolve(context, b"/mnt/extra/b/moved/raw \t\n\\#/null")?;
+        context.expect_eq(device.check_writable(), Err(FsError::ReadOnly));
+        context.expect_eq(device.check_access(0, 0, 2), Ok(()));
+        context.expect_eq(device.check_access(1, 1, 2), Err(FsError::Permission));
+        context.expect_eq(
+            vfs.unlink_from(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/b/moved/raw \t\n\\#/null",
+                (0, 0),
+            )
+            .err(),
+            Some(FsError::ReadOnly),
+        );
+        drop(device);
+        checked(context, vfs.unmount(&nested))?;
+        checked(
+            context,
+            vfs.unlink_from(
+                fs_context,
+                fs_context.root(),
+                b"/mnt/extra/b/moved/file",
+                (0, 0),
+            ),
+        )?;
+        context.expect_eq(checked(context, inode.metadata_snapshot())?.links, 1);
+        checked(
+            context,
+            vfs.unlink_from(fs_context, fs_context.root(), b"/mnt/extra/b/hard", (0, 0)),
+        )?;
+        context.expect_eq(checked(context, reopened.inode())?.ptr_eq(&inode), true);
+        context.expect_eq(checked(context, inode.metadata_snapshot())?.links, 0);
+        drop(reopened);
+        drop(nested);
+        drop(parent);
+        drop(ram_root);
+        checked(context, vfs.unmount(&covered))?;
+        context.expect_eq(
+            fixture.resolve(context, b"/mnt/extra")?.ptr_eq(&covered),
+            true,
+        );
         Ok(())
     }
 }

@@ -821,6 +821,7 @@ fn fault_signal(error: VmError) -> (u8, i32) {
             (9, 0)
         }
         VmError::BeyondEof => (7, 2),
+        VmError::NotMappable => panic!("user fault has no file mapping capability"),
         VmError::File(_) => (7, 3),
         VmError::Permission => (11, 2),
         VmError::InvalidRange | VmError::Occupied | VmError::Unmapped => (11, 1),

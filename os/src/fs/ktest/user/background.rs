@@ -506,7 +506,13 @@ pub(crate) mod waves {
         let watch = cache.watch();
         let vfs = checked(
             context,
-            Vfs::try_new(host.clone(), cache.clone(), 128, 4, AccessMode::ReadOnly),
+            Vfs::try_new(
+                crate::fs::Filesystem::Ext4(host.clone()),
+                cache.clone(),
+                128,
+                4,
+                AccessMode::ReadOnly,
+            ),
         )?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
         let covered = checked(
@@ -515,7 +521,11 @@ pub(crate) mod waves {
         )?;
         checked(
             context,
-            vfs.mount(&covered, volume.clone(), AccessMode::ReadWrite),
+            vfs.mount(
+                &covered,
+                crate::fs::Filesystem::Ext4(volume.clone()),
+                AccessMode::ReadWrite,
+            ),
         )?;
         let mounted = checked(
             context,
@@ -1110,7 +1120,7 @@ pub(crate) mod waves {
     ) -> TestResult {
         let file = fixture.prepare_file(context, if metadata { 1 } else { ROUND_PAGES })?;
         let volume = fixture.write.volume();
-        let inode = checked(context, file.path().inode())?.clone();
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
         let mut records = Vec::new();
         let mut record_keys = Vec::new();
         let mut pages = Vec::new();
@@ -1163,7 +1173,12 @@ pub(crate) mod waves {
             for index in 0..ROUND_PAGES {
                 pages.push((
                     index as u64,
-                    checked(context, file.file_page(index as u64, &mut attempt))?,
+                    checked(
+                        context,
+                        file.mapping_inode()
+                            .unwrap()
+                            .file_page(index as u64, &mut attempt),
+                    )?,
                 ));
             }
         }
@@ -1304,7 +1319,7 @@ pub(crate) mod waves {
     ) -> TestResult {
         let file = fixture.prepare_file(context, 1)?;
         let volume = fixture.write.volume();
-        let inode = checked(context, file.path().inode())?.clone();
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
         let before = volume.writeback_domain().snapshot();
         let old_mode = checked(context, inode.metadata_snapshot())?.mode;
         let control = fixture.observe_rounds(true)?;
@@ -1353,7 +1368,7 @@ pub(crate) mod waves {
                 Some((0o644, 0)),
                 true,
                 false,
-                |path, _| crate::fs::open_path(path),
+                |path, _| crate::fs::open_path(&vfs, path),
             ),
         )?;
         let result = (|| {
@@ -1491,11 +1506,14 @@ pub(crate) mod waves {
         fixture: &mut BackgroundOwner,
     ) -> TestResult {
         let file = fixture.prepare_file(context, ROUND_PAGES)?;
-        let inode = checked(context, file.path().inode())?.clone();
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
         let volume = fixture.write.volume();
         let disk = fixture.write.user.path.owner.disk()?.clone();
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let mapping = shared_alias(context, &file, 0)?;
         let control = fixture.observe_rounds(false)?;
         let before = disk.test_snapshot();
@@ -1585,12 +1603,18 @@ pub(crate) mod waves {
         fixture: &mut BackgroundOwner,
     ) -> TestResult {
         let file = fixture.prepare_file(context, ROUND_PAGES)?;
-        let inode = checked(context, file.path().inode())?.clone();
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
         let volume = fixture.write.volume();
         let disk = fixture.write.user.path.owner.disk()?.clone();
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
-        let outside = checked(context, file.file_page(64, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
+        let outside = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(64, &mut attempt),
+        )?;
         let mapping = shared_alias(context, &file, 0)?;
         let control = fixture.observe_rounds(false)?;
         context.expect_eq(file.write_at(95 * PAGE_SIZE as u64, &[0x45]), Ok(1));
@@ -1671,7 +1695,7 @@ pub(crate) mod waves {
         let file = fixture.prepare_file(context, PRESSURE_PAGES)?;
         let independent = fixture.write.open(context, b"/test/write-reserve", 2)?;
         let duplicate = file.clone();
-        let inode = checked(context, file.path().inode())?.clone();
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
         let volume = fixture.write.volume();
         let disk = fixture.write.user.path.owner.disk()?.clone();
         if !disk.limits().flush || global_snapshot().dirty_limit != 4096 {
@@ -1680,7 +1704,10 @@ pub(crate) mod waves {
             ));
         }
         let mut attempt = ReclaimAttempt::new();
-        let folio = checked(context, file.file_page(0, &mut attempt))?;
+        let folio = checked(
+            context,
+            file.mapping_inode().unwrap().file_page(0, &mut attempt),
+        )?;
         let control = fixture.observe_rounds(false)?;
         let creations_before = creation_snapshot()?;
         let metadata_before = metadata_stats();
@@ -1781,9 +1808,7 @@ pub(crate) mod waves {
             // 仅用原写能力探测 inode/invalidate 独占已释放；压力主体始终经过 FileLike 节流。
             let access = probe_inode.acquire_write()?;
             let mut input = WriteBuffer::kernel(&[PRESSURE_BYTE]);
-            if access.write_from(probe_volume.claim(), PAGE_SIZE as u64, false, &mut input)?
-                != (PAGE_SIZE as u64, 1)
-            {
+            if access.write_from(PAGE_SIZE as u64, false, &mut input)? != (PAGE_SIZE as u64, 1) {
                 return Err(FsError::InvalidOperation);
             }
             probe_volume

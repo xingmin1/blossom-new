@@ -24,6 +24,7 @@ use crate::sync::{IrqSaveGuard, ReadGuard, SleepRwLock, SpinLock, SpinLockGuard}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmError {
     NoMemory,
+    NotMappable,
     InvalidRange,
     Occupied,
     Unmapped,
@@ -59,6 +60,7 @@ pub(crate) enum MmapSource {
     SharedAnonymous,
     File {
         file: FileRef,
+        inode: InodeRef,
         offset: u64,
         private: bool,
     },
@@ -770,13 +772,15 @@ impl Mm {
         private: bool,
     ) -> Result<(), VmError> {
         let range = vma::checked_range(address, length)?;
-        check_file(&file, offset, length, private, permissions, maximum)?;
+        let inode = file.mapping_inode().ok_or(VmError::NotMappable)?.clone();
+        check_file(&file, &inode, offset, length, private, permissions, maximum)?;
         let vma = Vma::try_new(
             range,
             permissions,
             maximum,
             VmaBacking::File {
                 file,
+                inode,
                 offset,
                 private,
             },
@@ -823,6 +827,7 @@ impl Mm {
                         file,
                         offset,
                         private: false,
+                        ..
                     } if synchronous => {
                         let start = offset
                             .checked_add((cursor - vma.range.start) as u64)
@@ -856,12 +861,14 @@ impl Mm {
         let length = page_end(request.length)?;
         if let MmapSource::File {
             file,
+            inode,
             offset,
             private,
         } = &request.source
         {
             check_file(
                 file,
+                inode,
                 *offset,
                 length,
                 *private,
@@ -887,10 +894,12 @@ impl Mm {
             },
             MmapSource::File {
                 file,
+                inode,
                 offset,
                 private,
             } => VmaBacking::File {
                 file,
+                inode,
                 offset,
                 private,
             },
@@ -1798,19 +1807,20 @@ fn prepare_backing(
             ))
         }
         VmaBacking::File {
-            file,
+            inode,
             offset,
             private,
+            ..
         } => {
             let offset = offset
                 .checked_add((base - source.vma.range.start) as u64)
                 .ok_or(VmError::InvalidRange)?;
-            let size = file.stat().map_err(VmError::File)?.size;
+            let size = inode.metadata_snapshot().map_err(VmError::File)?.size;
             if size <= offset {
                 return Err(VmError::BeyondEof);
             }
             let valid = (size - offset).min(PAGE_SIZE as u64) as usize;
-            let folio = file
+            let folio = inode
                 .file_page(offset / PAGE_SIZE as u64, attempt)
                 .map_err(VmError::File)?;
             if (!*private || valid == PAGE_SIZE) && access != UserAccess::Write {
@@ -1836,6 +1846,7 @@ fn prepare_backing(
 /// 文件映射先核真实 OFD 读取能力；共享最大 W 还要求 RW OFD 与完整路径写能力。
 fn check_file(
     file: &FileRef,
+    inode: &InodeRef,
     offset: u64,
     length: usize,
     private: bool,
@@ -1852,9 +1863,12 @@ fn check_file(
         if file.flags() & 3 != 2 {
             return Err(VmError::Permission);
         }
-        file.path().check_writable().map_err(VmError::File)?;
+        file.path()
+            .ok_or(VmError::NotMappable)?
+            .check_writable()
+            .map_err(VmError::File)?;
     }
-    if file.stat().map_err(VmError::File)?.kind != InodeKind::Regular {
+    if inode.metadata_snapshot().map_err(VmError::File)?.kind != InodeKind::Regular {
         return Err(VmError::File(FsError::IsDirectory));
     }
     Ok(())
