@@ -19,14 +19,135 @@ const TRANSMIT_INTERRUPT: u8 = 2;
 #[cfg(feature = "ktest")]
 const THRE_INTERRUPT: u8 = 2;
 const TX_BUDGET: usize = 16;
+const MCR: usize = 4;
+// DLL/DLM 与 DATA/IER 共用偏移，访问前必须先置 LCR 的 DLAB，之后立即恢复。
+const DLL: usize = 0;
+const DLM: usize = 1;
+const DLAB: u8 = 0x80;
+const TRANSMITTER_EMPTY: u8 = 0x40;
+const DATA_TERMINAL_READY: u8 = 1;
+const REQUEST_TO_SEND: u8 = 2;
 
 // 整条应急消息最多读取这些次 LSR，不依赖时钟或其他 CPU 的进度。
 const EMERGENCY_POLL_BUDGET: usize = 10_000;
 
-static PORT: SpinLock<()> = SpinLock::new(());
+static PORT: SpinLock<RxState> = SpinLock::new(RxState::new());
 static TX_WAIT: WaitQueue = WaitQueue::new();
 static RECEIVED: AtomicUsize = AtomicUsize::new(0);
 static LAST_BYTE: AtomicU8 = AtomicU8::new(0);
+
+/// 中断已从 FIFO 取出的一个真实字节及其同步读取的 LSR。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RxSample {
+    /// 硬件 DATA 原始字节，不把 NUL 或 FF 当作空位。
+    pub byte: u8,
+    /// 读取 DATA 前同步取得的 LSR，携带该字节的线路错误位。
+    pub status: u8,
+}
+
+/// TTY 预先验证的串口寄存器目标；调用者保证分频可表示、行控已合法且 DLAB 为零。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SerialConfig {
+    /// 目标分频值，写入 DLL/DLM。
+    pub divisor: u16,
+    /// 目标 LCR，携带 5–8 位字长、停止位与校验位，不含 DLAB。
+    pub line_control: u8,
+    /// CREAD 是否要求打开接收中断。
+    pub receiver: bool,
+    /// 是否置 DTR 输出线。
+    pub dtr: bool,
+    /// 是否置 RTS 输出线。
+    pub rts: bool,
+}
+
+/// 真实串口寄存器回读与本平台固定 baudbase，不保存未被硬件接受的逻辑值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SerialSnapshot {
+    /// 回读 DLL/DLM 得到的实际分频。
+    pub divisor: u16,
+    /// 回读 LCR。
+    pub line_control: u8,
+    /// 回读 IER。
+    pub ier: u8,
+    /// 回读 MCR。
+    pub mcr: u8,
+    /// 回读 LSR。
+    pub lsr: u8,
+    /// 本平台固定 QEMU 串口 baudbase。
+    pub baud_base: u32,
+}
+
+/// 软件接收环容量；固定项数，不随终端模式或测试阶段改变。
+const RX_CAPACITY: usize = 1024;
+
+/// 端口锁内唯一的软件接收状态；生产者是 UART 中断，消费者是行规程工作。
+struct RxState {
+    samples: [RxSample; RX_CAPACITY],
+    head: usize,
+    tail: usize,
+    len: usize,
+    overrun: usize,
+    #[cfg(feature = "ktest")]
+    quota: Option<usize>,
+    #[cfg(feature = "ktest")]
+    test_control_owned: bool,
+}
+
+impl RxState {
+    /// 建立空接收环；测试配额初始为无且测试接收控制初始为未声明，不限制正常接收。
+    const fn new() -> Self {
+        Self {
+            samples: [RxSample { byte: 0, status: 0 }; RX_CAPACITY],
+            head: 0,
+            tail: 0,
+            len: 0,
+            overrun: 0,
+            #[cfg(feature = "ktest")]
+            quota: None,
+            #[cfg(feature = "ktest")]
+            test_control_owned: false,
+        }
+    }
+
+    /// 环未满时入队一个中断采样，环满时只计真实丢弃。
+    fn push(&mut self, sample: RxSample) {
+        if self.len < RX_CAPACITY {
+            self.samples[self.head] = sample;
+            self.head = (self.head + 1) % RX_CAPACITY;
+            self.len += 1;
+        } else {
+            self.overrun += 1;
+        }
+    }
+
+    /// 按生产顺序取出最多调用者缓冲区长度的采样，返回实际取出数。
+    fn pop(&mut self, out: &mut [RxSample]) -> usize {
+        let mut count = 0;
+        while count < out.len() && 0 < self.len {
+            out[count] = self.samples[self.tail];
+            self.tail = (self.tail + 1) % RX_CAPACITY;
+            self.len -= 1;
+            count += 1;
+        }
+        count
+    }
+
+    /// 消费一个测试配额；收齐本段最后一个字节时清配额并返回真。
+    #[cfg(feature = "ktest")]
+    fn consume_quota(&mut self) -> bool {
+        if let Some(remaining) = self.quota {
+            if 1 < remaining {
+                self.quota = Some(remaining - 1);
+                false
+            } else {
+                self.quota = None;
+                true
+            }
+        } else {
+            false
+        }
+    }
+}
 
 /// 取得当前平台固定 UART 的字节寄存器地址，Rust 执行入口始终保留其映射。
 fn register(offset: usize) -> *mut u8 {
@@ -219,27 +340,34 @@ pub(crate) fn emergency_write(arguments: fmt::Arguments<'_>) {
     let _ = emergency_writer().write_fmt(arguments);
 }
 
-/// 在端口短锁内最多提交十六个实际可接受字节，无等待、格式化或换行转换。
+/// 在端口短锁内最多提交十六个实际可接受字节，无等待、格式化或换行转换；接受字节后在锁外提示行规程复查实际发送队列。
 pub fn try_write(bytes: &[u8]) -> usize {
-    let _port = PORT.lock();
-    let mut accepted = 0;
-    for &byte in bytes.iter().take(TX_BUDGET) {
-        if read_register(LSR) & TRANSMIT_READY == 0 {
-            break;
+    let accepted = {
+        let _port = PORT.lock();
+        let mut accepted = 0;
+        for &byte in bytes.iter().take(TX_BUDGET) {
+            if read_register(LSR) & TRANSMIT_READY == 0 {
+                break;
+            }
+            write_register(DATA, byte);
+            accepted += 1;
         }
-        write_register(DATA, byte);
-        accepted += 1;
-    }
-    #[cfg(feature = "ktest")]
-    {
-        testing::COUNTERS
-            .accepted
-            .fetch_add(accepted, Ordering::Relaxed);
-        if accepted == 0 && !bytes.is_empty() {
+        #[cfg(feature = "ktest")]
+        {
             testing::COUNTERS
-                .zero_writes
-                .fetch_add(1, Ordering::Relaxed);
+                .accepted
+                .fetch_add(accepted, Ordering::Relaxed);
+            if accepted == 0 && !bytes.is_empty() {
+                testing::COUNTERS
+                    .zero_writes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
+        accepted
+    };
+    // klog 与行规程共享同一端口；THRE 中断可能已被另一方关闭，成功写入后必须提示复查实际队列。
+    if 0 < accepted {
+        crate::fs::tty::schedule_transmit();
     }
     accepted
 }
@@ -274,6 +402,123 @@ pub fn disable_interrupts() {
     write_register(IER, 0);
 }
 
+/// 返回本平台固定 QEMU 串口的实际 baudbase；RV 取 virt.c 传给 serial_mm_init 的 399193，LA 取同位置的 115200，不从 FDT 时钟除 16 推算。
+pub fn baud_base() -> u32 {
+    #[cfg(target_arch = "riscv64")]
+    {
+        399_193
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        115_200
+    }
+}
+
+/// 只读真实 LSR 的 TEMT 位；不用时钟延时代替硬件发送空标志。
+pub fn transmitter_empty() -> bool {
+    let _port = PORT.lock();
+    read_register(LSR) & TRANSMITTER_EMPTY != 0
+}
+
+/// 从软件接收环取出最多调用者缓冲区长度的真实采样，不触碰硬件 FIFO。
+pub fn read_received(samples: &mut [RxSample]) -> usize {
+    PORT.lock().pop(samples)
+}
+
+/// 在端口短锁内丢弃软件接收环全部未消费采样；仅清环指针与长度，不读硬件 FIFO，不改测试控制、配额、丢弃计数、接收统计与发送路径。
+pub fn discard_received() {
+    let mut port = PORT.lock();
+    port.head = 0;
+    port.tail = 0;
+    port.len = 0;
+}
+
+/// 返回软件接收环已满后真实丢弃的字节数。
+pub fn rx_overrun() -> usize {
+    PORT.lock().overrun
+}
+
+/// 在同一端口锁内回读真实分频、行控、中断使能、调制解调控制与线路状态，不改变设备配置。
+pub fn serial_snapshot() -> SerialSnapshot {
+    let _port = PORT.lock();
+    let line_control = read_register(LCR);
+    write_register(LCR, line_control | DLAB);
+    let low = read_register(DLL);
+    let high = read_register(DLM);
+    write_register(LCR, line_control);
+    SerialSnapshot {
+        divisor: u16::from(low) | (u16::from(high) << 8),
+        line_control: read_register(LCR),
+        ier: read_register(IER),
+        mcr: read_register(MCR),
+        lsr: read_register(LSR),
+        baud_base: baud_base(),
+    }
+}
+
+/// 在同一端口锁内应用预验证的串口目标并回读核验；分频写入期间保持目标帧格式位而只置 DLAB，只更新 DTR/RTS 而保留其它 MCR 位，按 CREAD 合并接收使能并保留原发送中断位。测试接收控制已声明时，仅当目标要求接收且本段配额未耗尽才打开接收中断，防止已收齐后重开接收吃掉 ACK。
+pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
+    assert_eq!(
+        config.line_control & DLAB,
+        0,
+        "UART line control must not set DLAB"
+    );
+    let _port = PORT.lock();
+    let saved_ier = read_register(IER);
+    let saved_mcr = read_register(MCR);
+    write_register(IER, 0);
+    // 分频写入期间保持目标帧格式位而只置 DLAB，不把硬件临时改为默认帧格式。
+    write_register(LCR, config.line_control | DLAB);
+    write_register(DLL, config.divisor as u8);
+    write_register(DLM, (config.divisor >> 8) as u8);
+    write_register(LCR, config.line_control);
+    let mut mcr = saved_mcr & !(DATA_TERMINAL_READY | REQUEST_TO_SEND);
+    if config.dtr {
+        mcr |= DATA_TERMINAL_READY;
+    }
+    if config.rts {
+        mcr |= REQUEST_TO_SEND;
+    }
+    write_register(MCR, mcr);
+    #[cfg(feature = "ktest")]
+    let effective_receiver = if _port.test_control_owned {
+        config.receiver && _port.quota.is_some()
+    } else {
+        config.receiver
+    };
+    #[cfg(not(feature = "ktest"))]
+    let effective_receiver = config.receiver;
+    let mut ier = saved_ier & TRANSMIT_INTERRUPT;
+    if effective_receiver {
+        ier |= RECEIVE_INTERRUPT;
+    }
+    write_register(IER, ier);
+    // 回读分频需要再次置 DLAB，之后立即恢复目标 LCR；全程不与 DATA/IER 访问交错。
+    write_register(LCR, config.line_control | DLAB);
+    let low = read_register(DLL);
+    let high = read_register(DLM);
+    write_register(LCR, config.line_control);
+    let snapshot = SerialSnapshot {
+        divisor: u16::from(low) | (u16::from(high) << 8),
+        line_control: read_register(LCR),
+        ier: read_register(IER),
+        mcr: read_register(MCR),
+        lsr: read_register(LSR),
+        baud_base: baud_base(),
+    };
+    assert_eq!(
+        snapshot.divisor, config.divisor,
+        "UART divisor was not accepted"
+    );
+    assert_eq!(
+        snapshot.line_control, config.line_control,
+        "UART line control was not accepted"
+    );
+    assert_eq!(snapshot.ier, ier, "UART interrupt enable was not accepted");
+    assert_eq!(snapshot.mcr, mcr, "UART modem control was not accepted");
+    snapshot
+}
+
 /// 先核对本端口真实 IIR，仅处理自身的有限 RX/TX，并在锁外通知等待者。
 ///
 /// # Safety
@@ -294,27 +539,39 @@ pub(crate) unsafe fn ktest_uart_handler_one(_context: *mut ()) -> bool {
     handle_uart::<1, true>()
 }
 
-/// 两个入口共享实际 IIR/RX/TX 流程；编译期参数使普通入口不承担测试分支或状态成本。
+/// 两个入口共享实际 IIR/RX/TX 流程；编译期参数使普通入口不承担测试分支或状态成本，真实接收同时入软件环并在锁外通知行规程。
 #[inline(always)]
 fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
-    let notify_tx = {
-        let _port = PORT.lock();
+    let (produced, notify_tx) = {
+        let mut port = PORT.lock();
         let first_interrupt = read_register(IIR) & 0x0f;
         if first_interrupt & 1 != 0 {
             return false;
         }
+        let mut produced = 0;
         if read_register(IER) & RECEIVE_INTERRUPT != 0 {
             for _ in 0..RX_BUDGET {
-                if read_register(LSR) & DATA_READY == 0 {
+                let status = read_register(LSR);
+                if status & DATA_READY == 0 {
                     break;
                 }
                 let byte = read_register(DATA);
+                port.push(RxSample { byte, status });
                 if STOP_RX {
                     // 必须紧跟 DATA 读取并留在 PORT 锁内；不得轮询或读取后续 ACK 字节。
                     write_register(IER, 0);
                 }
+                #[cfg(feature = "ktest")]
+                let quota_done = port.consume_quota();
                 LAST_BYTE.store(byte, Ordering::Relaxed);
                 RECEIVED.fetch_add(1, Ordering::Release);
+                produced += 1;
+                #[cfg(feature = "ktest")]
+                if quota_done {
+                    // 本段最后一个字节已收齐；同锁只关接收位，保留发送中断。
+                    write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
+                    break;
+                }
             }
         }
         let last_interrupt = read_register(IIR) & 0x0f;
@@ -332,13 +589,17 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
         }
         // IIR 读取确认真实 THRE；接收优先级较高时仍以真实 LSR 关闭已满足的 TX 请求。
         let _ = (first_interrupt, last_interrupt);
-        notify_tx
+        (produced, notify_tx)
     };
+    if 0 < produced {
+        crate::fs::tty::schedule_receive();
+    }
     if notify_tx {
         let woken = TX_WAIT.wake_all();
         #[cfg(feature = "ktest")]
         testing::COUNTERS.wakes.fetch_add(woken, Ordering::Relaxed);
         let _ = woken;
+        crate::fs::tty::schedule_transmit();
     }
     true
 }
@@ -483,5 +744,90 @@ pub mod testing {
             tx_interrupts: COUNTERS.tx_interrupts.load(Ordering::Relaxed),
             wakes: COUNTERS.wakes.load(Ordering::Relaxed),
         }
+    }
+
+    /// 在同一端口锁内声明本段测试接收控制并关闭真实接收中断，发送中断位原样保留；调用前不得已有控制且不得有残留配额，不发表配额。
+    /// 本段 begin 在任何关接收、清空、声明之前先调用；失败不清除控制，由用例中止处理。旧控制字节与旧 action 路径不使用此拥有位。
+    #[cfg(feature = "ktest")]
+    pub fn claim_receive_control() {
+        let mut port = super::PORT.lock();
+        assert!(
+            !port.test_control_owned,
+            "UART test receive control is already owned"
+        );
+        assert!(
+            port.quota.is_none(),
+            "previous UART test quota must be consumed before claiming control"
+        );
+        port.test_control_owned = true;
+        write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
+    }
+
+    /// 在同一端口锁内核对前段已收尾后发表本段剩余接收配额并打开真实接收中断；零长度不发表配额也不打开接收。
+    /// 调用前已声明本段测试接收控制、关闭接收中断、轮询消费本段 H，并清空前段行规程工作与软件环；本函数只置接收位，发送中断位原样保留。最后字节关接收后控制保持，直到 ACK 被轮询读走再释放。
+    #[cfg(feature = "ktest")]
+    pub fn arm_receive_bytes(length: usize) {
+        let mut port = super::PORT.lock();
+        assert!(
+            port.test_control_owned,
+            "UART test receive control must be claimed before arming"
+        );
+        let ier = read_register(IER);
+        assert_eq!(
+            ier & RECEIVE_INTERRUPT,
+            0,
+            "UART RX must be closed before arming a test segment"
+        );
+        assert_eq!(
+            port.len, 0,
+            "UART software ring must be empty before arming a test segment"
+        );
+        assert!(
+            port.quota.is_none(),
+            "previous UART test quota must be consumed before arming"
+        );
+        if 0 < length {
+            port.quota = Some(length);
+            write_register(IER, ier | RECEIVE_INTERRUPT);
+        } else {
+            port.quota = None;
+        }
+    }
+
+    /// 返回当前测试段剩余接收配额；无配额或已收齐时为 None。
+    #[cfg(feature = "ktest")]
+    pub fn receive_quota_remaining() -> Option<usize> {
+        super::PORT.lock().quota
+    }
+
+    /// 只观察软件接收环是否为空，供测试阶段边界核对，不取出任何采样。
+    #[cfg(feature = "ktest")]
+    pub fn receive_queue_empty() -> bool {
+        super::PORT.lock().len == 0
+    }
+
+    /// 在同一端口锁内核对本段已收尾后释放测试接收控制，并按真实当前 CREAD 恢复接收中断，发送中断位原样保留。
+    /// 调用前本段配额已耗尽、软件环已空且 ACK 已被轮询读走；调用者传入真实当前 CREAD。
+    #[cfg(feature = "ktest")]
+    pub fn release_receive_control(receiver: bool) {
+        let mut port = super::PORT.lock();
+        assert!(
+            port.test_control_owned,
+            "UART test receive control is not owned"
+        );
+        assert!(
+            port.quota.is_none(),
+            "UART test quota must be consumed before releasing control"
+        );
+        assert_eq!(
+            port.len, 0,
+            "UART software ring must be empty before releasing test control"
+        );
+        port.test_control_owned = false;
+        let mut ier = read_register(IER) & !RECEIVE_INTERRUPT;
+        if receiver {
+            ier |= RECEIVE_INTERRUPT;
+        }
+        write_register(IER, ier);
     }
 }

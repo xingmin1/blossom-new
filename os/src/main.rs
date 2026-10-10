@@ -122,6 +122,7 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     workqueue::initialize_services().expect("worker pool service task allocation failed");
     fs::initialize_inode_eviction().expect("inode eviction service allocation failed");
     klog::initialize_service().expect("log printer task allocation failed");
+    fs::tty::initialize_service().expect("TTY worker preparation failed");
     #[cfg(not(feature = "ktest"))]
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     #[cfg(feature = "ktest")]

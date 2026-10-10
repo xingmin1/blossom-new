@@ -171,6 +171,24 @@ class KTAP:
             require(kind == "io" and self.phase in ("setup", "body", "quiesce", "cleanup"),
                     "raw UART outside fixture phase")
             parts = (value or "").split()
+            if parts and parts[0] == "duplex":
+                require(len(parts) == 7 and parts[1].isdigit()
+                        and re.fullmatch(r"[0-9a-f]{8}", parts[2]) and parts[3].isdigit()
+                        and parts[4].isdigit() and re.fullmatch(r"[0-9a-f]{8}", parts[5])
+                        and parts[6].isdigit(), "invalid UART duplex declaration")
+                _, rx_length, rx_digest, rx_delay, tx_length, tx_digest, tx_delay = parts
+                rx_length, rx_delay, tx_length, tx_delay = map(
+                    int, (rx_length, rx_delay, tx_length, tx_delay))
+                require(rx_length + tx_length <= 64 * 1024 * 1024 and rx_delay <= 60000
+                        and tx_delay <= 60000 and (rx_length or tx_length)
+                        and (rx_length or rx_digest == "00000000")
+                        and (tx_length or tx_digest == "00000000")
+                        and (rx_length or rx_delay == 0)
+                        and (tx_length or tx_delay == 0),
+                        "UART duplex declaration exceeds bounds")
+                return dict(direction="duplex", rx_length=rx_length, rx_digest=rx_digest,
+                            rx_delay_ms=rx_delay, tx_length=tx_length, tx_digest=tx_digest,
+                            tx_delay_ms=tx_delay, case=cid)
             require(len(parts) == 4 and parts[0] in ("tx", "rx", "pause", "slow")
                     and parts[1].isdigit() and re.fullmatch(r"[0-9a-f]{8}", parts[2])
                     and parts[3].isdigit(), "invalid UART declaration")

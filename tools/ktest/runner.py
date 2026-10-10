@@ -45,6 +45,8 @@ class VM:
         self.buffer = bytearray()
         self.rx_offset = 0
         self.rx_used = False
+        self.tx_offset = 0
+        self.tx_used = False
         self.execution_uart = None
         self.debugger = None
         self.debug_log = None
@@ -164,13 +166,16 @@ class VM:
         """H 后独占原始段；RX 按本 VM 游标逐段核对长度与 CRC。"""
         require("uart" in names, "UART IO without declared resource")
         direction = declaration["direction"]
-        length = declaration["length"]
+        length = declaration["length"] if direction != "duplex" else 0
         chunk = 64 if direction == "slow" else 65536
         state = 0xFFFFFFFF
         payload = self.args.uart_payload
         expected_path = self.args.uart_expect
         expected = None
         try:
+            if direction == "duplex":
+                self._duplex_io(declaration, deadline)
+                return
             fixture = getattr(self, "execution_uart", None)
             if fixture is not None and fixture.kind == "backpressure":
                 require(getattr(self.args, "execution_uart", False),
@@ -239,6 +244,115 @@ class VM:
             if expected is not None:
                 expected.close()
 
+    def _duplex_io(self, declaration, deadline):
+        """同一原始socket交错收发payload，按每VM真实偏移逐段校验。"""
+        rx_length = declaration["rx_length"]
+        tx_length = declaration["tx_length"]
+        payload = self.args.uart_payload
+        expected_path = self.args.uart_expect
+        if rx_length:
+            require(payload is not None, "UART duplex receive requires --uart-payload")
+            state = 0xFFFFFFFF
+            with payload.open("rb") as source:
+                source.seek(self.rx_offset)
+                remaining = rx_length
+                while remaining:
+                    self.check(deadline)
+                    block = source.read(min(65536, remaining))
+                    require(block, "UART duplex input ended before declared phase length")
+                    state = crc32c_update(state, block)
+                    remaining -= len(block)
+            require(f"{state ^ 0xFFFFFFFF:08x}" == declaration["rx_digest"],
+                    "UART duplex input CRC mismatch")
+            self.rx_used = True
+        if tx_length:
+            require(expected_path is not None, "UART duplex transmit requires --uart-expect")
+            require(self.tx_offset + tx_length <= expected_path.stat().st_size,
+                    "UART duplex expectation ended before declared phase length")
+            self.tx_used = True
+
+        source = expected = output = None
+
+        try:
+            source = payload.open("rb") if rx_length else None
+            expected = expected_path.open("rb") if tx_length else None
+            if source is not None:
+                source.seek(self.rx_offset)
+            if expected is not None:
+                expected.seek(self.tx_offset)
+                output = (self.directory / f"uart-{declaration['case']}-{time.monotonic_ns()}.raw").open("xb")
+
+
+            self.send(b"H", deadline)
+            receive_at = time.monotonic() + declaration["rx_delay_ms"] / 1000
+            receive_after = time.monotonic()
+            pending = memoryview(b"")
+            rx_remaining = rx_length
+            tx_remaining = tx_length
+            rx_state = tx_state = 0xFFFFFFFF
+            while rx_remaining or tx_remaining:
+                self.check(deadline)
+                now = time.monotonic()
+                if rx_remaining and not pending and receive_at <= now:
+                    block = source.read(min(65536, rx_remaining))
+                    require(block, "UART duplex input ended during declared phase")
+                    pending = memoryview(block)
+
+                read_sockets = [self.serial] if tx_remaining and receive_after <= now else []
+                write_sockets = [self.serial] if pending else []
+                timeout = max(0, min(0.1, deadline - now))
+                if read_sockets and self.buffer:
+                    timeout = 0
+                if rx_remaining and not pending and now < receive_at:
+                    timeout = min(timeout, receive_at - now)
+                if tx_remaining and not read_sockets and now < receive_after:
+                    timeout = min(timeout, receive_after - now)
+                readable, writable, _ = select.select(read_sockets, write_sockets, [], timeout)
+                self.check(deadline)
+
+                if readable or (read_sockets and self.buffer):
+                    chunk = 64 if declaration["tx_delay_ms"] else 65536
+                    count = min(chunk, tx_remaining)
+                    if self.buffer:
+                        block = bytes(self.buffer[:count])
+                        del self.buffer[:len(block)]
+                    else:
+                        block = self.serial.recv(count)
+                        if not block:
+                            raise VMExited("UART closed during duplex payload")
+                        self.raw.write(block)
+                    output.write(block)
+                    tx_state = crc32c_update(tx_state, block)
+                    require(expected.read(len(block)) == block, "UART duplex payload mismatch")
+                    tx_remaining -= len(block)
+                    self.tx_offset += len(block)
+                    receive_after = time.monotonic() + declaration["tx_delay_ms"] / 1000
+
+                if writable:
+                    count = self.serial.send(pending)
+                    require(count > 0, "UART duplex input made no progress")
+                    sent = pending[:count]
+                    rx_state = crc32c_update(rx_state, sent)
+                    pending = pending[count:]
+                    rx_remaining -= count
+                    self.rx_offset += count
+
+            if rx_length:
+                require(f"{rx_state ^ 0xFFFFFFFF:08x}" == declaration["rx_digest"],
+                        "UART duplex transmitted input CRC mismatch")
+            if tx_length:
+                require(f"{tx_state ^ 0xFFFFFFFF:08x}" == declaration["tx_digest"],
+                        "UART duplex output CRC mismatch")
+        finally:
+            if source is not None:
+                source.close()
+            if expected is not None:
+                expected.close()
+            if output is not None:
+                output.close()
+
+        self.send(f"KTEST IO OK {declaration['case']}\n".encode("ascii"), deadline)
+
     def handshake(self, config, command, deadline):
         """唯一早期 READY 之后只发送一次 catalog 或 run 命令。"""
         self.connect(deadline)
@@ -254,6 +368,9 @@ class VM:
         if self.rx_used:
             require(self.args.uart_payload.stat().st_size == self.rx_offset,
                     "UART input has unconsumed bytes at VM exit")
+        if self.tx_used:
+            require(self.args.uart_expect.stat().st_size == self.tx_offset,
+                    "UART expected output has unconsumed bytes at VM exit")
         if self.debugger is not None:
             try:
                 self.debugger.wait(timeout=max(0, deadline - time.monotonic()))

@@ -94,6 +94,8 @@ pub enum MemoryFsKind {
 pub enum MemorySpecial {
     Null,
     Zero,
+    TtySerial,
+    Console,
     Mounts,
     Meminfo,
     Uptime,
@@ -231,9 +233,19 @@ impl MemoryFs {
         if self.kind == MemoryFsKind::Tmpfs || self.index.lock().namespace_published {
             return Err(FsError::InvalidOperation);
         }
-        let kind = match special {
-            MemorySpecial::Null | MemorySpecial::Zero => InodeKind::Character,
-            _ => InodeKind::Regular,
+        let kind = match (self.kind, special) {
+            (
+                MemoryFsKind::Devfs,
+                MemorySpecial::Null
+                | MemorySpecial::Zero
+                | MemorySpecial::TtySerial
+                | MemorySpecial::Console,
+            ) => InodeKind::Character,
+            (
+                MemoryFsKind::Procfs,
+                MemorySpecial::Mounts | MemorySpecial::Meminfo | MemorySpecial::Uptime,
+            ) => InodeKind::Regular,
+            _ => return Err(FsError::InvalidOperation),
         };
         let mode = (mode & 0x0fff)
             | if kind == InodeKind::Character {

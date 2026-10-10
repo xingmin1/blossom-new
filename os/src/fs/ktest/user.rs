@@ -19,6 +19,7 @@ mod namespace;
 mod pipe;
 mod preparation;
 mod readahead;
+mod tty;
 mod write;
 
 const PROGRAM: &[u8] = b"/test/bin/user-smoke";
@@ -45,6 +46,8 @@ struct UserOwner {
     reserved: Option<ReservedDescriptor>,
     observer: Option<JoinHandle>,
     lifecycle_child: Option<JoinObserver>,
+    /// 本例共享UART协议阶段的显式owner。
+    tty_io: crate::fs::ktest::tty::UartStage,
 }
 
 impl UserOwner {
@@ -61,6 +64,26 @@ impl UserOwner {
             TestError("user identity graph preparation failed")
         })?);
         Ok(())
+    }
+
+    /// 为真实用户串口用例在 ext4 中的空 `/dev` 目录挂载本例 devfs。
+    fn prepare_tty(&mut self, context: &TestContext<'_>) -> TestResult {
+        self.prepare(context)?;
+        let mountpoint = checked(
+            context,
+            self.path
+                .vfs()
+                .resolve(self.path.context(), b"/dev", ResolveMode::Follow),
+        )?;
+        let devfs = checked(context, crate::fs::devfs::try_new(0o755))?;
+        checked(
+            context,
+            self.path.vfs().mount(
+                &mountpoint,
+                crate::fs::memfs::Filesystem::Memory(devfs),
+                AccessMode::ReadOnly,
+            ),
+        )
     }
 
     /// 仅借本例已构造的身份图，不取得调度队列或运行资源拥有。
@@ -1149,6 +1172,7 @@ impl Fixture<DeviceInventory> for UserOwner {
             reserved: None,
             observer: None,
             lifecycle_child: None,
+            tty_io: crate::fs::ktest::tty::UartStage::new(),
         })
     }
 
@@ -1172,6 +1196,9 @@ impl Fixture<DeviceInventory> for UserOwner {
             self.reap_children(context, true)?;
             self.lifecycle_child_left_stack()?;
         }
+        if self.tty_io.active() {
+            return Err(TestError("TTY UART stage is still active at quiesce"));
+        }
         drop(self.graph.take());
         self.release_pressure();
         <PathOwner as Fixture<DeviceInventory>>::quiesce(&mut self.path, context)
@@ -1184,8 +1211,8 @@ impl Fixture<DeviceInventory> for UserOwner {
                 && self.graph.is_none()
                 && self.reserved.is_none()
                 && self.observer.is_none()
-                && self.lifecycle_child.is_none(),
-            "user fixture is not quiesced"
+                && self.lifecycle_child.is_none()
+                && !self.tty_io.active(),
         );
         let before = self.metadata_before;
         <PathOwner as Fixture<DeviceInventory>>::tear_down(self.path, context)?;
@@ -1420,6 +1447,85 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.events_abi(context, b"f")
+    }
+    /// 普通用户raw模式逐字节交付UART输入输出，跨write保留UTF-8与二进制值。
+    #[test]
+    #[ktest(tags("T19", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_raw_bytes_utf8_and_binary(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"r")
+    }
+
+    /// 真实canonical行规程执行编辑键、短读、EOF token和零长边界。
+    #[test]
+    #[ktest(tags("T20", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_canonical_edit_and_eof(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"c")
+    }
+
+    /// 用户read真实验证四种VMIN/VTIME组合的总期限与首字节后间隔期限。
+    #[test]
+    #[ktest(tags("T21", "user-tty"), resources("uart"), timeout_ms = 120000)]
+    fn tty_vmin_vtime_read_deadlines(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"v")
+    }
+
+    /// 用户read与poll分别验证MIN门槛和可读谓词，空立即read不伪造poll ready。
+    #[test]
+    #[ktest(tags("T22", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_poll_uses_independent_predicate(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"p")
+    }
+
+    /// host实际发字节时用户没有read，唯一UART Work仍消费IRQ并输出真实echo。
+    #[test]
+    #[ktest(tags("T23", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_irq_echo_without_reader(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"e")
+    }
+
+    /// 用户输出经ONLCR只转换一次，宿主真实背压并等到硬件TEMT。
+    #[test]
+    #[ktest(tags("T24", "user-tty"), resources("uart"), timeout_ms = 120000)]
+    fn tty_output_crlf_backpressure_and_drain(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"o")
+    }
+
+    /// 用户36字节termios结构与跨页故障、setter无半更新和W/F提交沿raw ioctl验证。
+    #[test]
+    #[ktest(tags("T25", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_termios_copy_fault_and_setter(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"t")
+    }
+
+    /// Ctrl-S期间用户write真实阻塞，后续RX Ctrl-Q经原Work恢复且续传字节有序。
+    #[test]
+    #[ktest(tags("T26", "user-tty"), resources("uart"), timeout_ms = 120000)]
+    fn tty_software_flow_control_resume(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"x")
     }
 
     /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。

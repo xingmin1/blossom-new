@@ -30,6 +30,7 @@ mod pipe;
 mod poll_source;
 mod pseudo;
 mod system;
+pub(crate) mod tty;
 mod user;
 
 const PATTERN_SIZE: u64 = 65573;
@@ -38,7 +39,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 保留格式、inode、路径、文件、持续源与伪文件系统的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 30],
+    [&'static ::ktest::SuiteSlot; 31],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -74,6 +75,7 @@ pub(crate) fn anchors() -> (
             pseudo::anchors()[0],
             mem_mapping::anchors()[0],
             pipe::anchor(),
+            tty::anchor(),
             epoll::anchor(),
         ],
         path::anchors(),

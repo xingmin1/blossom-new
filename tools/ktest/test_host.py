@@ -13,9 +13,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
@@ -84,6 +85,8 @@ def vm_fixture():
     vm = VM.__new__(VM)
     vm.rx_offset = 0
     vm.rx_used = False
+    vm.tx_offset = 0
+    vm.tx_used = False
     vm.debugger = None
     vm.gdb_command = None
     return vm
@@ -741,6 +744,129 @@ class ResourceAndUARTTests(unittest.TestCase):
                 finally:
                     host.close()
                     guest.close()
+
+    def test_duplex_payloads_use_independent_offsets_and_preserve_full_duplex_bytes(self):
+        """同一真实socket交错传入和读取payload，逐段校验各自全文偏移。"""
+        payload = b"\x00\xff\xe7\x95\x8c\nsecond-rx"
+        transmitted = b"echo\x00\xff\xe7\x95\x8c\nsecond-tx"
+        phases = ((payload[:3], transmitted[:6]), (payload[3:], transmitted[6:]))
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "input"
+            expected = base / "expected"
+            source.write_bytes(payload)
+            expected.write_bytes(transmitted)
+            host, guest = socket.socketpair()
+            guest.settimeout(2)
+            peer_errors = []
+
+            def peer():
+                try:
+                    for index, (rx, tx) in enumerate(phases):
+                        self.assertEqual(guest.recv(1), b"H")
+                        guest.sendall(tx)
+                        received = bytearray()
+                        while len(received) < len(rx):
+                            received.extend(guest.recv(len(rx) - len(received)))
+                        self.assertEqual(received, rx)
+                        ack = bytearray()
+                        while not ack.endswith(b"\n"):
+                            ack.extend(guest.recv(128))
+                        self.assertEqual(ack, f"KTEST IO OK {index}\n".encode())
+                except BaseException as error:
+                    peer_errors.append(error)
+
+            worker = threading.Thread(target=peer)
+            try:
+                vm = vm_fixture()
+                vm.args = options(uart_payload=source, uart_expect=expected)
+                vm.directory = base
+                vm.serial = host
+                host.setblocking(False)
+                vm.raw = io.BytesIO()
+                vm.buffer = bytearray()
+                vm.process = SimpleNamespace(poll=lambda: None)
+                worker.start()
+                for index, (rx, tx) in enumerate(phases):
+                    checksum = lambda data: f"{crc32c_update(0xFFFFFFFF, data) ^ 0xFFFFFFFF:08x}"
+                    declaration = dict(direction="duplex", rx_length=len(rx), rx_digest=checksum(rx),
+                                       rx_delay_ms=2, tx_length=len(tx), tx_digest=checksum(tx),
+                                       tx_delay_ms=1, case=index)
+                    vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(peer_errors, [])
+                self.assertEqual((vm.rx_offset, vm.tx_offset), (len(payload), len(transmitted)))
+                vm.verify_resources(time.monotonic() + 2)
+                self.assertEqual(source.read_bytes(), payload)
+                self.assertEqual(expected.read_bytes(), transmitted)
+                raw_parts = sorted(base.glob("uart-*.raw"))
+                self.assertEqual([path.read_bytes() for path in raw_parts], [part[1] for part in phases])
+            finally:
+                host.close()
+                guest.close()
+                worker.join(timeout=2)
+
+    def test_duplex_consumes_buffered_prefix_and_leaves_next_control_line(self):
+        """预读包含payload和后继控制行时只消费声明长度，不重复落盘或吞掉后继行。"""
+        transmitted = b"\x00\xffecho\n"
+        tail = b"next-control\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            expected = base / "expected"
+            expected.write_bytes(transmitted)
+            host, guest = socket.socketpair()
+            guest.settimeout(2)
+            try:
+                vm = vm_fixture()
+                vm.args = options(uart_expect=expected)
+                vm.directory = base
+                vm.serial = host
+                host.setblocking(False)
+                vm.raw = io.BytesIO(transmitted + tail)
+                vm.raw.seek(0, io.SEEK_END)
+                vm.buffer = bytearray(transmitted + tail)
+                vm.process = SimpleNamespace(poll=lambda: None)
+                declaration = dict(direction="duplex", rx_length=0, rx_digest="00000000",
+                                   rx_delay_ms=0, tx_length=len(transmitted),
+                                   tx_digest=f"{crc32c_update(0xFFFFFFFF, transmitted) ^ 0xFFFFFFFF:08x}",
+                                   tx_delay_ms=1, case=9)
+                vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                with guest.makefile("rb") as acknowledgements:
+                    self.assertEqual(acknowledgements.readline(), b"HKTEST IO OK 9\n")
+                self.assertEqual(vm.line(time.monotonic() + 2), "next-control")
+                self.assertEqual(next(base.glob("uart-*.raw")).read_bytes(), transmitted)
+                self.assertEqual(vm.tx_offset, len(transmitted))
+                self.assertEqual(vm.raw.getvalue(), transmitted + tail)
+            finally:
+                host.close()
+                guest.close()
+
+    def test_duplex_declaration_validates_both_lengths_crc_and_delays(self):
+        """双向协议分别校验RX/TX长度与CRC、每段延迟及非空传输方向。"""
+        invalid = ("duplex 0 00000000 0 0 00000000 0",
+                   "duplex 1 01234567 0 0 00000001 0",
+                   "duplex 0 00000001 0 1 00000000 0",
+                   "duplex 0 00000000 60001 1 00000000 0",
+                   "duplex 0 00000000 0 1 00000000 60001",
+                   "duplex 33554433 01234567 0 33554432 89abcdef 0",
+                   "duplex 1 00000000 0 1 00000000")
+        for declaration in invalid:
+            case = case_record(resources=["uart"])
+            parser = parser_for([case])
+            for line in case_lines(case)[:3]:
+                parser.feed(line)
+            with self.subTest(declaration=declaration), self.assertRaises(HostError):
+                parser.feed(f"  # KTEST io 0 {declaration}")
+
+        case = case_record(resources=["uart"])
+        parser = parser_for([case])
+        for line in case_lines(case)[:3]:
+            parser.feed(line)
+        self.assertEqual(parser.feed("  # KTEST io 0 duplex 1 01234567 10 2 89abcdef 20"),
+                         dict(direction="duplex", rx_length=1, rx_digest="01234567",
+                              rx_delay_ms=10, tx_length=2, tx_digest="89abcdef",
+                              tx_delay_ms=20, case=0))
 
     def test_raw_payload_cannot_be_ktap_or_panic_control(self):
         """真实 socket 的 payload 内含完整控制文本，仍只作为原始字节。"""

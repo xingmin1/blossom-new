@@ -17,6 +17,7 @@ pub(crate) mod poll;
 pub(crate) mod procfs;
 pub(crate) mod readahead;
 pub(crate) mod system;
+pub(crate) mod tty;
 mod types;
 pub(crate) mod writeback;
 
