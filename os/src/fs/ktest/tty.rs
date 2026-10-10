@@ -353,6 +353,159 @@ pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
 #[ktest::suite(fixture = TtyOwner, suite_resources = TtySuite, context = "Thread", tags("fs-tty"), timeout_ms = 45000)]
 pub(crate) mod cases {
     use super::*;
+
+    /// 四字段完整转换与 signed pid_t 边界直接消费正式 ABI codec。
+    #[test]
+    fn control_abi_codecs_preserve_all_fields(
+        _context: &mut TestContext<'_>,
+        _fixture: &mut TtyOwner,
+    ) -> TestResult {
+        use crate::fs::tty::termios::{decode_pid, encode_pid, Winsize, TOSTOP};
+        use crate::fs::FsError;
+        assert_eq!(decode_pid(encode_pid(0)), Ok(0));
+        assert_eq!(
+            decode_pid(encode_pid(i32::MAX as usize)),
+            Ok(i32::MAX as usize)
+        );
+        assert_eq!(
+            decode_pid((-1i32).to_le_bytes()),
+            Err(FsError::InvalidOperation)
+        );
+        assert_eq!(
+            decode_pid(i32::MIN.to_le_bytes()),
+            Err(FsError::InvalidOperation)
+        );
+        assert_eq!(Winsize::initial().to_bytes(), [24, 0, 80, 0, 0, 0, 0, 0]);
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+        let size = Winsize::from_bytes(bytes);
+        assert_eq!(
+            (size.rows, size.columns, size.xpixel, size.ypixel),
+            (0x201, 0x403, 0x605, 0x807)
+        );
+        assert_eq!(size.to_bytes(), bytes);
+        let mut config = Termios::default();
+        config.lflag |= TOSTOP;
+        assert_eq!(Termios::from_bytes(config.to_bytes()), Ok(config));
+        Ok(())
+    }
+
+    /// 信号效果保持 strip、literal-next、NOFLSH、BRKINT 与同批后继合法输入。
+    #[test]
+    fn input_signals_preserve_order_and_flush_boundary(
+        _context: &mut TestContext<'_>,
+        _fixture: &mut TtyOwner,
+    ) -> TestResult {
+        use crate::fs::tty::termios::{IGNBRK, NOFLSH, VLNEXT};
+        let mut state = NttyState::new();
+        state.termios.iflag = ISTRIP;
+        state.termios.lflag = ISIG;
+        for (byte, signal) in [(0x83, 2), (28, 3), (26, 20)] {
+            state.receive_sample(RxSample {
+                byte: b'o',
+                status: 1,
+            });
+            state.output.push(b'O');
+            state.xchar = Some(b'X');
+            let outcome = state.receive_sample(RxSample { byte, status: 1 });
+            assert_eq!(outcome.signal, Some(signal));
+            assert!(outcome.read_changed && outcome.write_changed);
+            assert!(state.input.is_empty() && state.output_empty());
+            state.receive_sample(RxSample {
+                byte: b'n',
+                status: 1,
+            });
+            let mut bytes = [0; 4];
+            assert_eq!(state.peek_raw(&mut bytes), 1);
+            assert_eq!(bytes[0], b'n');
+            state.flush_input();
+        }
+        state.termios.lflag = ICANON | ISIG | IEXTEN;
+        state.receive_sample(RxSample {
+            byte: state.termios.cc[VLNEXT],
+            status: 1,
+        });
+        assert_eq!(
+            state.receive_sample(RxSample { byte: 3, status: 1 }).signal,
+            None
+        );
+        assert_eq!(state.input.len(), 1);
+        state.termios.lflag = ISIG | NOFLSH;
+        assert_eq!(
+            state.receive_sample(RxSample { byte: 3, status: 1 }).signal,
+            Some(2)
+        );
+        assert_eq!(state.input.len(), 1);
+        state.termios.iflag = BRKINT;
+        assert_eq!(
+            state
+                .receive_sample(RxSample {
+                    byte: 0,
+                    status: 0x10
+                })
+                .signal,
+            Some(2)
+        );
+        assert_eq!(state.input.len(), 1);
+        state.termios.lflag = ISIG;
+        assert_eq!(
+            state
+                .receive_sample(RxSample {
+                    byte: 0,
+                    status: 0x10
+                })
+                .signal,
+            Some(2)
+        );
+        assert!(state.input.is_empty());
+        state.termios.iflag |= IGNBRK;
+        assert_eq!(
+            state
+                .receive_sample(RxSample {
+                    byte: 0,
+                    status: 0x10
+                })
+                .signal,
+            None
+        );
+        state.termios.iflag = 0;
+        state.termios.lflag = 0;
+        assert_eq!(
+            state.receive_sample(RxSample { byte: 3, status: 1 }).signal,
+            None
+        );
+        assert_eq!(state.input.len(), 1);
+        Ok(())
+    }
+
+    /// Kernel 裸指针与无用户身份的 tty 打开只返回正式边界错误。
+    #[test]
+    fn control_requests_reject_kernel_pointer_context(
+        context: &mut TestContext<'_>,
+        fixture: &mut TtyOwner,
+    ) -> TestResult {
+        use crate::fs::FsError;
+        fixture.open_tty(context, b"/ttyS0", 2)?;
+        for command in [0x540e, 0x5422, 0x540f, 0x5410, 0x5429, 0x5413, 0x5414] {
+            assert_eq!(
+                fixture
+                    .tty(0)
+                    .ioctl(command, usize::MAX, FileIoContext::Kernel)
+                    .err(),
+                Some(FsError::InvalidOperation)
+            );
+        }
+        let vfs = fixture.vfs.as_ref().expect("tty view missing");
+        let fs_context = fixture.context.as_ref().expect("tty context missing");
+        let path = checked(
+            context,
+            vfs.resolve(fs_context, b"/tty", crate::fs::ResolveMode::Follow),
+        )?;
+        assert_eq!(
+            crate::fs::open_path_with_flags(vfs, path, 2, FileIoContext::Kernel).err(),
+            Some(FsError::NoDeviceAddress)
+        );
+        Ok(())
+    }
     use crate::fs::SeekFrom;
     /// 默认 termios 的 36 字节编解码与 Linux 默认值一致。
     #[test]

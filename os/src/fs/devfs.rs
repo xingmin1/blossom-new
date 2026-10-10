@@ -30,6 +30,7 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     fs.initialize_special(b"zero", MemorySpecial::Zero, 0o666, 0x105)?;
     fs.initialize_special(b"ttyS0", MemorySpecial::TtySerial, 0o666, 0x440)?;
     fs.initialize_special(b"console", MemorySpecial::Console, 0o666, 0x501)?;
+    fs.initialize_special(b"tty", MemorySpecial::ControllingTty, 0o666, 0x500)?;
     Ok(fs)
 }
 

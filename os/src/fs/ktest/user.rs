@@ -13,6 +13,7 @@ use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
 mod background;
 mod events;
+mod jobs;
 mod layout;
 mod lifecycle;
 mod namespace;
@@ -1526,6 +1527,43 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.tty_abi(context, b"x")
+    }
+
+    /// 真实前后台组通过普通wait消费TTIN、TTOU、输入信号与孤儿HUP/CONT事件。
+    #[test]
+    #[ktest(
+        min_cpus = 2,
+        tags("T27", "user-tty", "user-jobs"),
+        resources("uart"),
+        timeout_ms = 120000
+    )]
+    fn jobs_front_background_signals(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.jobs_front_background_signals(context)
+    }
+
+    /// 三种打开身份、exec继承、leader挂断和同号新PGID沿真实OFD及用户生命周期验证。
+    #[test]
+    #[ktest(
+        min_cpus = 2,
+        tags("T28", "user-tty", "user-jobs"),
+        resources("uart"),
+        timeout_ms = 120000
+    )]
+    fn jobs_open_hangup_identity(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.jobs_open_hangup_identity(context)
+    }
+
+    /// 完整winsize变更只向当时前台组发送WINCH，实际sigtimedwait区分相同值与copy故障。
+    #[test]
+    #[ktest(min_cpus = 2, tags("T29", "user-tty", "user-jobs"), timeout_ms = 90000)]
+    fn jobs_winsize_changes(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.jobs_winsize_changes(context)
     }
 
     /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。

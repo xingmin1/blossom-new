@@ -1,5 +1,7 @@
 //! 目标 termios 编解码与纯配置转换；本文件不触硬件或短锁。
 
+use core::convert::TryFrom;
+
 use crate::console::SerialConfig;
 use crate::fs::FsError;
 
@@ -160,7 +162,7 @@ pub const ECHOK: u32 = 0x0020;
 pub const ECHONL: u32 = 0x0040;
 /// NOFLSH 本地位。
 pub const NOFLSH: u32 = 0x0080;
-/// TOSTOP 本地位，未选择。
+/// TOSTOP 后台输出检查位。
 pub const TOSTOP: u32 = 0x0100;
 /// ECHOCTL 本地位。
 pub const ECHOCTL: u32 = 0x0200;
@@ -207,8 +209,18 @@ pub const SUPPORTED_IFLAG: u32 = IGNBRK
 /// 本批支持的全部 oflag 位。
 pub const SUPPORTED_OFLAG: u32 = OPOST | ONLCR | OCRNL | ONOCR | ONLRET | TABDLY;
 /// 本批支持的全部 lflag 位。
-pub const SUPPORTED_LFLAG: u32 =
-    ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHONL | NOFLSH | ECHOCTL | ECHOKE | FLUSHO | IEXTEN;
+pub const SUPPORTED_LFLAG: u32 = ISIG
+    | ICANON
+    | ECHO
+    | ECHOE
+    | ECHOK
+    | ECHONL
+    | NOFLSH
+    | TOSTOP
+    | ECHOCTL
+    | ECHOKE
+    | FLUSHO
+    | IEXTEN;
 
 /// 标准 CBAUD 编码与名义波特率对照。
 const STANDARD_BAUDS: [(u32, u32); 16] = [
@@ -441,5 +453,67 @@ fn char_size(cflag: u32) -> u8 {
         CS6 => 6,
         CS7 => 7,
         _ => 8,
+    }
+}
+
+/// 两目标共同的 signed pid_t 字节数。
+pub const PID_BYTES: usize = 4;
+/// 两目标共同的窗口尺寸字节数。
+pub const WINSIZE_BYTES: usize = 8;
+
+/// 解码完整 pid_t，负进程组号码不能参与图查询。
+pub fn decode_pid(bytes: [u8; PID_BYTES]) -> Result<usize, FsError> {
+    let number = i32::from_le_bytes(bytes);
+    if number < 0 {
+        return Err(FsError::InvalidOperation);
+    }
+    Ok(number as usize)
+}
+
+/// 编码原号码域内的稳定 pid_t 数字。
+pub fn encode_pid(number: usize) -> [u8; PID_BYTES] {
+    i32::try_from(number)
+        .expect("terminal pid exceeds pid_t")
+        .to_le_bytes()
+}
+
+/// 窗口四字段共同提交，像素字段也属于变化判断。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Winsize {
+    pub rows: u16,
+    pub columns: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+impl Winsize {
+    /// 固定串口默认窗口，不宣称宿主尺寸探测。
+    pub const fn initial() -> Self {
+        Self {
+            rows: 24,
+            columns: 80,
+            xpixel: 0,
+            ypixel: 0,
+        }
+    }
+
+    /// 从完整八字节目标布局解码四个小端整数。
+    pub fn from_bytes(bytes: [u8; WINSIZE_BYTES]) -> Self {
+        Self {
+            rows: u16::from_le_bytes([bytes[0], bytes[1]]),
+            columns: u16::from_le_bytes([bytes[2], bytes[3]]),
+            xpixel: u16::from_le_bytes([bytes[4], bytes[5]]),
+            ypixel: u16::from_le_bytes([bytes[6], bytes[7]]),
+        }
+    }
+
+    /// 初始化完整八字节输出，不裸复制 Rust 结构体。
+    pub fn to_bytes(self) -> [u8; WINSIZE_BYTES] {
+        let mut bytes = [0; WINSIZE_BYTES];
+        bytes[0..2].copy_from_slice(&self.rows.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.columns.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.xpixel.to_le_bytes());
+        bytes[6..8].copy_from_slice(&self.ypixel.to_le_bytes());
+        bytes
     }
 }

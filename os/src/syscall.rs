@@ -115,7 +115,7 @@ pub(crate) fn resolve_restart(user: &UserThread, state: Restart, handler_flags: 
     }
 }
 
-/// 分派已支持的真实调用，未知编号保持ENOSYS；控制结果不落入普通写寄存器尾部。
+/// 分派真实调用；无进度I/O和ioctl中断交由用户返回裁决重启，未知编号保持ENOSYS。
 pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let raw = request.arguments;
     if matches!(request.number, 20..=22 | 72 | 73) {
@@ -145,8 +145,9 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if matches!(request.number, 129..=139 | 240) {
         return signal::dispatch(user, request);
     }
-    if matches!(request.number, 63..=66) {
+    if matches!(request.number, 29 | 63..=66) {
         let result = match request.number {
+            29 => file::ioctl(user, raw),
             63 => file::read(user, raw),
             64 => file::write(user, raw),
             65 => file::readv(user, raw),
@@ -164,7 +165,6 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         23 => file::dup(user, raw[0]),
         24 => file::dup3(user, raw),
         25 => file::fcntl(user, raw),
-        29 => file::ioctl(user, raw),
         34 => file::mkdirat(user, raw),
         35 => file::unlinkat(user, raw),
         36 => file::symlinkat(user, raw),

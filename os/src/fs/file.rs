@@ -536,7 +536,7 @@ pub fn open_path_with_flags(
     if let Some(special) = inode.memory_special() {
         return match special {
             MemorySpecial::Null | MemorySpecial::Zero => devfs::open(path, flags, caller, special),
-            MemorySpecial::TtySerial | MemorySpecial::Console => {
+            MemorySpecial::TtySerial | MemorySpecial::Console | MemorySpecial::ControllingTty => {
                 crate::fs::tty::open(path, flags, caller, special)
             }
             MemorySpecial::Mounts | MemorySpecial::Meminfo | MemorySpecial::Uptime => {

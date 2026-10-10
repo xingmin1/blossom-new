@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::pin::pin;
 use core::ptr;
 
+use crate::fs::{tty, FsError};
 use crate::sched;
 use crate::sync::SpinLock;
 use crate::task::signal::{
@@ -61,6 +62,14 @@ struct GroupRelations {
     pgid: Arc<Pid>,
     sid: Arc<Pid>,
     exit_signal: u8,
+    controlling_tty: Option<&'static tty::Endpoint>,
+}
+
+/// 控制端点只弱关联原图；会话和前台保稳定身份，不增加任何号码角色。
+pub(crate) struct TerminalControl {
+    pub(crate) graph: Weak<TaskGraph>,
+    pub(crate) session: Arc<Pid>,
+    pub(crate) foreground: Arc<Pid>,
 }
 
 impl ThreadGroup {
@@ -82,6 +91,11 @@ impl ThreadGroup {
     /// 返回根组自身建立或从父组继承的会话身份。
     pub(crate) fn sid(&self) -> usize {
         self.relations.lock().sid.number
+    }
+
+    /// 在关系锁内保留当前SID对象，号码复用不改变旧会话身份。
+    pub(crate) fn sid_object(&self) -> Arc<Pid> {
+        Arc::clone(&self.relations.lock().sid)
     }
 
     /// 借用组独有pending与控制拥有，不把共享动作轴等同于线程组。
@@ -197,6 +211,13 @@ struct ProcessEntry {
     completed: Option<Box<PreparedExecution>>,
     exit: Option<WaitEvent>,
     control_event: Option<ChildEvent>,
+    notification: Option<GroupNotification>,
+}
+
+/// 已提交递送的锁外通知责任，继续事件不能被后续普通信号覆盖。
+enum GroupNotification {
+    Signal,
+    Continued(ChildEvent),
 }
 
 impl ProcessEntry {
@@ -221,6 +242,7 @@ impl Drop for ProcessEntry {
 struct CollectedChild {
     event: WaitEvent,
     process: Option<ProcessEntry>,
+    notification_parent: Option<Arc<ThreadGroup>>,
     _released: [Option<Arc<Pid>>; 3],
 }
 
@@ -319,6 +341,7 @@ impl TaskGraph {
                 pgid,
                 sid,
                 exit_signal,
+                controlling_tty: None,
             }),
             uid,
             signals,
@@ -646,8 +669,10 @@ impl TaskGraph {
                 && (status & 0xff == 0 || (status & 0xff00 == 0 && (1..=64).contains(&signal))),
             "invalid Linux exit status"
         );
-        let (user, group, released, exit, stopped, parent) = {
+        let (user, group, released, exit, stopped, parent, hangup) = {
             let mut slots = self.slots.lock();
+            let old_pgid = identity.group.pgid_object();
+            let old_orphan = orphaned_process_group(&slots, &old_pgid);
             let ThreadEntry {
                 user,
                 group,
@@ -719,7 +744,16 @@ impl TaskGraph {
                 .and_then(|pid| slots[pid - 1].process.as_ref())
                 .map(|parent| parent.group.clone());
             let released = detach_role(&mut slots, &identity.tid_object(), TID);
-            if last {
+            let hangup = if last {
+                let relations = group.relations.lock();
+                let old_sid = relations.sid.clone();
+                let hangup = relations
+                    .controlling_tty
+                    .filter(|_| Arc::ptr_eq(&relations.sid, &group.pid))
+                    .map(|tty| (tty, old_sid.clone()));
+                drop(relations);
+                notify_new_orphan_locked(&mut slots, &old_pgid, old_orphan);
+                notify_unlinked_children_locked(&mut slots, identity.tgid(), &old_pgid, &old_sid);
                 for slot in slots.iter_mut() {
                     if let Some(child) = slot.process.as_mut() {
                         if child.parent == Some(identity.tgid()) {
@@ -727,15 +761,22 @@ impl TaskGraph {
                         }
                     }
                 }
-            }
-            (user, group, released, exit, stopped, parent)
+                hangup
+            } else {
+                None
+            };
+            (user, group, released, exit, stopped, parent, hangup)
         };
         drop(user);
         drop(released);
         if let Some(exit) = exit {
             // 先在锁外确认定时回调尾部，随后才允许用户wait回收组身份与时间拥有。
             group.time.stop();
-            let (parent, retired) = {
+            if let Some((_tty, session)) = hangup {
+                tty::hangup_session(self, &session);
+            }
+            self.flush_group_notifications();
+            let (parent, mut retired) = {
                 let mut slots = self.slots.lock();
                 let process = slots[identity.tgid() - 1]
                     .process
@@ -769,6 +810,9 @@ impl TaskGraph {
             }
             // 无退出信号或已自动回收仍须唤醒原wait，让其重查事件或返回ECHILD。
             self.waiters.wake_all();
+            if let Some(retired) = retired.as_mut() {
+                self.complete_retired_notification(retired);
+            }
             // 小完成观察只释放不join；scheduler继续持有本Task与栈至真实离栈。
             drop(retired);
         } else if let Some(event) = stopped {
@@ -776,6 +820,7 @@ impl TaskGraph {
             self.waiters.wake_all();
         }
         self.control_waiters.wake_all();
+        self.flush_group_notifications();
         drop(group);
     }
 
@@ -797,7 +842,7 @@ impl TaskGraph {
         pid: usize,
         nowait: bool,
     ) -> Result<Option<CollectedChild>, ProcessError> {
-        let collected = {
+        let mut collected = {
             let mut slots = self.slots.lock();
             let parent_number = match parent {
                 Some(parent) => Some(
@@ -819,6 +864,7 @@ impl TaskGraph {
                 return Ok(Some(CollectedChild {
                     event,
                     process: None,
+                    notification_parent: None,
                     _released: [None, None, None],
                 }));
             }
@@ -827,6 +873,7 @@ impl TaskGraph {
             }
             reap_child(&mut slots, index)
         };
+        self.complete_retired_notification(&mut collected);
         self.waiters.wake_all();
         Ok(Some(collected))
     }
@@ -1013,6 +1060,9 @@ impl TaskGraph {
             }
             selected
         };
+        if let Some(retired) = retired.as_mut() {
+            self.complete_retired_notification(retired);
+        }
         if retired.is_some() {
             self.waiters.wake_all();
         }
@@ -1072,6 +1122,307 @@ impl TaskGraph {
             .ok_or(ProcessError::NoProcess)
     }
 
+    /// 调用者必须仍是本图发表的活线程与活组，TTY入口不接受旧诊断身份。
+    fn terminal_caller(&self, slots: &[Slot], caller: &UserIdentity) -> Result<(), FsError> {
+        if !ptr::eq(self, caller.graph.as_ref()) {
+            return Err(FsError::NoProcess);
+        }
+        self.live_parent(slots, &caller.group)
+            .map_err(|_| FsError::NoProcess)?;
+        let thread = slots
+            .get(caller.tid() - 1)
+            .and_then(|slot| slot.thread.as_ref());
+        if !thread.is_some_and(|thread| {
+            Arc::ptr_eq(&thread.group, &caller.group)
+                && Arc::ptr_eq(&thread.signals, &caller.signals)
+        }) {
+            return Err(FsError::NoProcess);
+        }
+        Ok(())
+    }
+
+    /// 在copy之后的Graph事务取得控制终端；自动取得不满足条件时保持原关联。
+    pub(crate) fn acquire_tty(
+        &self,
+        caller: &UserIdentity,
+        tty: &'static tty::Endpoint,
+        automatic: bool,
+    ) -> Result<(), FsError> {
+        let slots = self.slots.lock();
+        self.terminal_caller(&slots, caller)?;
+        let mut relations = caller.group.relations.lock();
+        let mut control = tty.control().lock();
+        let same = relations
+            .controlling_tty
+            .is_some_and(|bound| ptr::eq(bound, tty))
+            && control.as_ref().is_some_and(|control| {
+                ptr::eq(control.graph.as_ptr(), self)
+                    && Arc::ptr_eq(&control.session, &relations.sid)
+            });
+        if Arc::ptr_eq(&caller.group.pid, &relations.sid) && same {
+            return Ok(());
+        }
+        if !Arc::ptr_eq(&caller.group.pid, &relations.sid)
+            || relations.controlling_tty.is_some()
+            || control.is_some()
+        {
+            return if automatic {
+                Ok(())
+            } else {
+                Err(FsError::NotPermitted)
+            };
+        }
+        *control = Some(TerminalControl {
+            graph: Arc::downgrade(&caller.graph),
+            session: relations.sid.clone(),
+            foreground: relations.pgid.clone(),
+        });
+        relations.controlling_tty = Some(tty);
+        Ok(())
+    }
+
+    /// 同Graph锁读取本组控制端点，无活身份或没有关联时不返回其它会话的端点。
+    pub(crate) fn controlling_tty(&self, caller: &UserIdentity) -> Option<&'static tty::Endpoint> {
+        let slots = self.slots.lock();
+        self.terminal_caller(&slots, caller).ok()?;
+        let tty = caller.group.relations.lock().controlling_tty;
+        tty
+    }
+
+    /// 只有本组自身ctty和端点原会话一致时才能取得稳定会话与前台对象。
+    pub(crate) fn terminal_ids(
+        &self,
+        caller: &UserIdentity,
+        tty: &'static tty::Endpoint,
+    ) -> Result<(Arc<Pid>, Arc<Pid>), FsError> {
+        let slots = self.slots.lock();
+        self.terminal_caller(&slots, caller)?;
+        let relations = caller.group.relations.lock();
+        if !relations
+            .controlling_tty
+            .is_some_and(|bound| ptr::eq(bound, tty))
+        {
+            return Err(FsError::NotTty);
+        }
+        let control = tty.control().lock();
+        let control = control
+            .as_ref()
+            .filter(|control| {
+                ptr::eq(control.graph.as_ptr(), self)
+                    && Arc::ptr_eq(&control.session, &relations.sid)
+            })
+            .ok_or(FsError::NotTty)?;
+        Ok((control.session.clone(), control.foreground.clone()))
+    }
+
+    /// 同事务按实际PGID角色或活PID角色确定目标会话，旧端点拥有在锁外释放。
+    pub(crate) fn set_terminal_foreground(
+        &self,
+        caller: &UserIdentity,
+        tty: &'static tty::Endpoint,
+        number: usize,
+    ) -> Result<(), FsError> {
+        if (i32::MAX as usize) < number {
+            return Err(FsError::InvalidOperation);
+        }
+        let retired = {
+            let slots = self.slots.lock();
+            self.terminal_caller(&slots, caller)?;
+            let session = {
+                let relations = caller.group.relations.lock();
+                if !relations
+                    .controlling_tty
+                    .is_some_and(|bound| ptr::eq(bound, tty))
+                {
+                    return Err(FsError::NotTty);
+                }
+                relations.sid.clone()
+            };
+            let slot = slots
+                .get(number.checked_sub(1).ok_or(FsError::NoProcess)?)
+                .ok_or(FsError::NoProcess)?;
+            let target = slot.pid.as_ref().ok_or(FsError::NoProcess)?;
+            let target_sid = session_of_pgrp(&slots, target).ok_or(FsError::NotPermitted)?;
+            if !Arc::ptr_eq(&target_sid, &session) {
+                return Err(FsError::NotPermitted);
+            }
+            let mut control = tty.control().lock();
+            let control = control
+                .as_mut()
+                .filter(|control| {
+                    ptr::eq(control.graph.as_ptr(), self) && Arc::ptr_eq(&control.session, &session)
+                })
+                .ok_or(FsError::NotTty)?;
+            core::mem::replace(&mut control.foreground, target.clone())
+        };
+        drop(retired);
+        Ok(())
+    }
+
+    /// 调用者持copy；Graph中清原会话全部关联并移出控制拥有，不调用TTY或通知。
+    pub(crate) fn release_tty_session(
+        &self,
+        tty: &'static tty::Endpoint,
+        session: &Arc<Pid>,
+    ) -> Option<TerminalControl> {
+        let slots = self.slots.lock();
+        if !has_role(&slots, session, SID) {
+            return None;
+        }
+        release_terminal_locked(&slots, self, tty, session)
+    }
+
+    /// 非会话首只清本组关联；会话首移出全会话控制责任，HUP/CONT由锁外调用者完成。
+    pub(crate) fn disassociate_tty(
+        &self,
+        caller: &UserIdentity,
+        tty: &'static tty::Endpoint,
+    ) -> Result<Option<TerminalControl>, FsError> {
+        let slots = self.slots.lock();
+        self.terminal_caller(&slots, caller)?;
+        let session = {
+            let mut relations = caller.group.relations.lock();
+            if !relations
+                .controlling_tty
+                .is_some_and(|bound| ptr::eq(bound, tty))
+            {
+                return Err(FsError::NotTty);
+            }
+            if !Arc::ptr_eq(&relations.sid, &caller.group.pid) {
+                relations.controlling_tty = None;
+                return Ok(None);
+            }
+            relations.sid.clone()
+        };
+        Ok(release_terminal_locked(&slots, self, tty, &session))
+    }
+
+    /// 一个Graph持有期按稳定PGID实际角色递送，提交后才完成成员和父等待通知。
+    pub(crate) fn send_process_group(
+        &self,
+        pgid: &Arc<Pid>,
+        signum: u8,
+    ) -> Result<(), SignalError> {
+        if signum == 0 || 64 < signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        let result = {
+            let mut slots = self.slots.lock();
+            deliver_process_group_locked(&mut slots, pgid, signum)
+        };
+        self.flush_group_notifications();
+        result
+    }
+
+    /// 自身控制终端的后台访问在同图中裁决，阻塞或忽略TTOU允许，TTIN与孤儿返回EIO。
+    pub(crate) fn check_terminal_access(
+        &self,
+        caller: &UserIdentity,
+        tty: &'static tty::Endpoint,
+        signum: u8,
+    ) -> Result<(), FsError> {
+        assert!(matches!(signum, 21 | 22), "invalid terminal access signal");
+        let result = {
+            let mut slots = self.slots.lock();
+            self.terminal_caller(&slots, caller)?;
+            let pgid = {
+                let relations = caller.group.relations.lock();
+                if !relations
+                    .controlling_tty
+                    .is_some_and(|bound| ptr::eq(bound, tty))
+                {
+                    return Ok(());
+                }
+                let control = tty.control().lock();
+                let control = control
+                    .as_ref()
+                    .filter(|control| {
+                        ptr::eq(control.graph.as_ptr(), self)
+                            && Arc::ptr_eq(&control.session, &relations.sid)
+                    })
+                    .ok_or(FsError::NotTty)?;
+                if Arc::ptr_eq(&control.foreground, &relations.pgid) {
+                    return Ok(());
+                }
+                relations.pgid.clone()
+            };
+            if caller.signals.blocked_or_ignored(signum) {
+                return if signum == 22 {
+                    Ok(())
+                } else {
+                    Err(FsError::DeviceIo)
+                };
+            }
+            if orphaned_process_group(&slots, &pgid) {
+                return Err(FsError::DeviceIo);
+            }
+            match deliver_process_group_locked(&mut slots, &pgid, signum) {
+                Ok(()) => Err(FsError::Interrupted),
+                Err(SignalError::NoProcess) => Err(FsError::NoProcess),
+                Err(error) => panic!("ordinary terminal signal failed: {:?}", error),
+            }
+        };
+        self.flush_group_notifications();
+        result
+    }
+
+    /// 逐槽移出已提交通知与原组拥有，合并普通提醒时仍保留继续事件责任。
+    fn flush_group_notifications(&self) {
+        let capacity = self.slots.lock().len();
+        for index in 0..capacity {
+            let pending = {
+                let mut slots = self.slots.lock();
+                let parent = slots[index]
+                    .process
+                    .as_ref()
+                    .and_then(|process| {
+                        if !matches!(process.notification, Some(GroupNotification::Continued(_))) {
+                            return None;
+                        }
+                        process.parent
+                    })
+                    .and_then(|number| slots[number - 1].process.as_ref())
+                    .map(|parent| parent.group.clone());
+                slots[index].process.as_mut().and_then(|process| {
+                    process
+                        .notification
+                        .take()
+                        .map(|notification| (process.group.clone(), notification, parent))
+                })
+            };
+            if let Some((group, notification, parent)) = pending {
+                self.complete_group_notification(&group, notification, parent.as_deref());
+            }
+        }
+    }
+
+    /// 通知已经提交的原组；父SIGCHLD与等待唤醒不持Graph、关系或信号短锁。
+    fn complete_group_notification(
+        &self,
+        group: &ThreadGroup,
+        notification: GroupNotification,
+        parent: Option<&ThreadGroup>,
+    ) {
+        group.signals.notify();
+        if let GroupNotification::Continued(event) = notification {
+            send_parent_event(parent, event);
+            self.waiters.wake_all();
+        }
+    }
+
+    /// wait或autoreap移出的进程继续承担原通知，最后拥有释放前完成已经提交的责任。
+    fn complete_retired_notification(&self, retired: &mut CollectedChild) {
+        if let Some(process) = retired.process.as_mut() {
+            if let Some(notification) = process.notification.take() {
+                self.complete_group_notification(
+                    &process.group,
+                    notification,
+                    retired.notification_parent.as_deref(),
+                );
+            }
+        }
+    }
+
     /// 只允许本组或同会话的直接子改变PGID；已exec子、会话首和跨会话加入被拒绝。
     pub(crate) fn set_pgid(
         &self,
@@ -1079,7 +1430,7 @@ impl TaskGraph {
         pid: usize,
         pgid: usize,
     ) -> Result<(), ProcessError> {
-        if pid > i32::MAX as usize || pgid > i32::MAX as usize {
+        if (i32::MAX as usize) < pid || (i32::MAX as usize) < pgid {
             return Err(ProcessError::InvalidArgument);
         }
         let released = {
@@ -1138,26 +1489,33 @@ impl TaskGraph {
                 }
                 target.clone()
             };
-            let mut relations = group.relations.lock();
-            if Arc::ptr_eq(&relations.pgid, &new_pgid) {
+            let old_pgid = group.pgid_object();
+            if Arc::ptr_eq(&old_pgid, &new_pgid) {
                 return Ok(());
             }
+            let old_orphan = orphaned_process_group(&slots, &old_pgid);
+            let new_orphan = orphaned_process_group(&slots, &new_pgid);
             attach_role(&mut slots, &new_pgid, PGID);
-            let old = core::mem::replace(&mut relations.pgid, new_pgid);
+            let old = core::mem::replace(&mut group.relations.lock().pgid, new_pgid.clone());
             let released = detach_role(&mut slots, &old, PGID);
+            notify_new_orphan_locked(&mut slots, &old_pgid, old_orphan);
+            notify_new_orphan_locked(&mut slots, &new_pgid, new_orphan);
             (old, released)
         };
         drop(released);
+        self.flush_group_notifications();
         Ok(())
     }
 
-    /// 当前组不是会话首且本TGID无外部PGID角色时建立新会话，不实现TTY扩展。
+    /// 建立新会话时只清本组ctty，并提交原组及实际直接子组失去连接后的孤儿通知。
     pub(crate) fn create_session(&self, caller: &UserIdentity) -> Result<usize, ProcessError> {
         let released = {
             let mut slots = self.slots.lock();
             self.live_parent(&slots, &caller.group)
                 .map_err(|_| ProcessError::NoProcess)?;
             let group = &caller.group;
+            let old_pgid = group.pgid_object();
+            let old_orphan = orphaned_process_group(&slots, &old_pgid);
             let mut relations = group.relations.lock();
             if Arc::ptr_eq(&relations.sid, &group.pid) || slots[caller.tgid() - 1].roles[PGID] != 0
             {
@@ -1167,11 +1525,16 @@ impl TaskGraph {
             attach_role(&mut slots, &group.pid, SID);
             let old_pgid = core::mem::replace(&mut relations.pgid, group.pid.clone());
             let old_sid = core::mem::replace(&mut relations.sid, group.pid.clone());
+            relations.controlling_tty = None;
+            drop(relations);
             let pgid = detach_role(&mut slots, &old_pgid, PGID);
             let sid = detach_role(&mut slots, &old_sid, SID);
+            notify_new_orphan_locked(&mut slots, &old_pgid, old_orphan);
+            notify_unlinked_children_locked(&mut slots, caller.tgid(), &old_pgid, &old_sid);
             (old_pgid, old_sid, pgid, sid)
         };
         drop(released);
+        self.flush_group_notifications();
         Ok(caller.tgid())
     }
 
@@ -1594,6 +1957,7 @@ impl PreparedIdentity {
                         let number = graph.live_parent(&slots, parent)?;
                         let inherited = parent.relations.lock();
                         let mut relations = self.identity.group.relations.lock();
+                        relations.controlling_tty = inherited.controlling_tty;
                         old_relations = Some((
                             core::mem::replace(&mut relations.pgid, inherited.pgid.clone()),
                             core::mem::replace(&mut relations.sid, inherited.sid.clone()),
@@ -1652,6 +2016,7 @@ impl PreparedIdentity {
                     completed: None,
                     exit: None,
                     control_event: None,
+                    notification: None,
                 });
             } else {
                 let process = slots[self.identity.tgid() - 1]
@@ -1778,6 +2143,11 @@ fn reap_child(slots: &mut [Slot], index: usize) -> CollectedChild {
     assert_eq!(retired.members, 0, "reaping a live group");
     assert!(slots[index].thread.is_none(), "reaping a live leader");
     let event = retired.exit.expect("reaping without exit event");
+    let notification_parent = retired
+        .parent
+        .filter(|_| matches!(retired.notification, Some(GroupNotification::Continued(_))))
+        .and_then(|number| slots[number - 1].process.as_ref())
+        .map(|parent| parent.group.clone());
     let released = {
         let relations = retired.group.relations.lock();
         [
@@ -1789,6 +2159,7 @@ fn reap_child(slots: &mut [Slot], index: usize) -> CollectedChild {
     CollectedChild {
         event,
         process: Some(retired),
+        notification_parent,
         _released: released,
     }
 }
@@ -1813,5 +2184,179 @@ fn child_signal_info(signum: u8, event: ChildEvent) -> SignalInfo {
             user_ticks: event.user_ns / (1_000_000_000 / USER_HZ),
             kernel_ticks: event.kernel_ns / (1_000_000_000 / USER_HZ),
         },
+    }
+}
+
+/// 实际角色与身份指针必须同时匹配，旧诊断Arc不使同号新身份成为目标。
+fn has_role(slots: &[Slot], pid: &Arc<Pid>, role: usize) -> bool {
+    slots.get(pid.number - 1).is_some_and(|slot| {
+        slot.roles[role] != 0
+            && slot
+                .pid
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, pid))
+    })
+}
+
+/// 先按PGID实际活组查会话；没有PGID成员才按同对象活PID角色查会话。
+fn session_of_pgrp(slots: &[Slot], pid: &Arc<Pid>) -> Option<Arc<Pid>> {
+    if has_role(slots, pid, PGID) {
+        for process in slots.iter().filter_map(|slot| slot.process.as_ref()) {
+            if 0 < process.members {
+                let relations = process.group.relations.lock();
+                if Arc::ptr_eq(&relations.pgid, pid) {
+                    return Some(relations.sid.clone());
+                }
+            }
+        }
+    }
+    if has_role(slots, pid, TID) {
+        return slots[pid.number - 1]
+            .thread
+            .as_ref()
+            .map(|thread| thread.group.sid_object());
+    }
+    None
+}
+
+/// 持Graph先验证端点原绑定，再逐组清关联；控制锁不跨关系锁扫描。
+fn release_terminal_locked(
+    slots: &[Slot],
+    graph: &TaskGraph,
+    tty: &'static tty::Endpoint,
+    session: &Arc<Pid>,
+) -> Option<TerminalControl> {
+    let matches = tty.control().lock().as_ref().is_some_and(|control| {
+        ptr::eq(control.graph.as_ptr(), graph) && Arc::ptr_eq(&control.session, session)
+    });
+    if !matches {
+        return None;
+    }
+    for process in slots.iter().filter_map(|slot| slot.process.as_ref()) {
+        let mut relations = process.group.relations.lock();
+        if Arc::ptr_eq(&relations.sid, session)
+            && relations
+                .controlling_tty
+                .is_some_and(|bound| ptr::eq(bound, tty))
+        {
+            relations.controlling_tty = None;
+        }
+    }
+    tty.control().lock().take()
+}
+
+/// 孤儿判断只看活组成员与实际用户父的不同PGID、相同SID连接。
+fn orphaned_process_group(slots: &[Slot], pgid: &Arc<Pid>) -> bool {
+    !slots
+        .iter()
+        .filter_map(|slot| slot.process.as_ref())
+        .any(|process| {
+            if process.members == 0 {
+                return false;
+            }
+            let relations = process.group.relations.lock();
+            if !Arc::ptr_eq(&relations.pgid, pgid) {
+                return false;
+            }
+            let parent = process
+                .parent
+                .and_then(|number| slots[number - 1].process.as_ref());
+            parent.is_some_and(|parent| {
+                if parent.members == 0 {
+                    return false;
+                }
+                let parent_relations = parent.group.relations.lock();
+                !Arc::ptr_eq(&parent_relations.pgid, pgid)
+                    && Arc::ptr_eq(&parent_relations.sid, &relations.sid)
+            })
+        })
+}
+
+/// 一个Graph持有期递送稳定PGID的全部活组，不分配或执行锁外通知。
+fn deliver_process_group_locked(
+    slots: &mut [Slot],
+    pgid: &Arc<Pid>,
+    signum: u8,
+) -> Result<(), SignalError> {
+    if !has_role(slots, pgid, PGID) {
+        return Err(SignalError::NoProcess);
+    }
+    let mut found = false;
+    for index in 0..slots.len() {
+        let Some(process) = slots[index].process.as_ref().filter(|process| {
+            0 < process.members && Arc::ptr_eq(&process.group.relations.lock().pgid, pgid)
+        }) else {
+            continue;
+        };
+        found = true;
+        let group = &process.group;
+        let continued = group.signals.deliver(
+            SignalInfo::kernel(signum),
+            None,
+            false,
+            slots
+                .iter()
+                .filter_map(|slot| slot.thread.as_ref())
+                .filter(|thread| Arc::ptr_eq(&thread.group, group))
+                .map(|thread| &thread.signals),
+        )?;
+        let event = continued.then(|| child_event(group, 6, 18));
+        let process = slots[index]
+            .process
+            .as_mut()
+            .expect("signalled process disappeared");
+        if let Some(event) = event {
+            process.control_event = Some(event);
+            process.notification = Some(GroupNotification::Continued(event));
+        } else if process.notification.is_none() {
+            process.notification = Some(GroupNotification::Signal);
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(SignalError::NoProcess)
+    }
+}
+
+/// 仅对本次false到true的孤儿变化和已确认停止作业提交HUP随后CONT。
+fn notify_new_orphan_locked(slots: &mut [Slot], pgid: &Arc<Pid>, was_orphan: bool) {
+    if was_orphan || !orphaned_process_group(slots, pgid) {
+        return;
+    }
+    let stopped = slots
+        .iter()
+        .filter_map(|slot| slot.process.as_ref())
+        .any(|process| {
+            0 < process.members
+                && Arc::ptr_eq(&process.group.relations.lock().pgid, pgid)
+                && process.group.signals.has_stopped_jobs()
+        });
+    if stopped {
+        deliver_process_group_locked(slots, pgid, 1).expect("orphan hangup delivery failed");
+        deliver_process_group_locked(slots, pgid, 18).expect("orphan continue delivery failed");
+    }
+}
+
+/// 旧父同SID且不同PGID就是变化前的非孤儿连接，只检查其实际直接子组。
+fn notify_unlinked_children_locked(
+    slots: &mut [Slot],
+    parent: usize,
+    old_pgid: &Arc<Pid>,
+    old_sid: &Arc<Pid>,
+) {
+    for index in 0..slots.len() {
+        let pgid = slots[index]
+            .process
+            .as_ref()
+            .filter(|child| child.parent == Some(parent) && 0 < child.members)
+            .and_then(|child| {
+                let relations = child.group.relations.lock();
+                (Arc::ptr_eq(&relations.sid, old_sid) && !Arc::ptr_eq(&relations.pgid, old_pgid))
+                    .then(|| relations.pgid.clone())
+            });
+        if let Some(pgid) = pgid {
+            notify_new_orphan_locked(slots, &pgid, false);
+        }
     }
 }

@@ -299,7 +299,7 @@ unsafe impl Sync for Work {}
 
 /// 固定当前两份票的有限等待边界，零表示入口没有该份票。
 #[derive(Clone, Copy)]
-pub(super) struct WorkBoundary {
+pub(crate) struct WorkBoundary {
     running: u64,
     queued: u64,
 }
@@ -602,8 +602,14 @@ impl Work {
         }
     }
 
-    /// 等待已固定票消失；取消并重用不会把后来的票加入此边界。
-    pub(super) fn flush_boundary(self: Pin<&Self>, boundary: WorkBoundary) -> bool {
+    /// 在业务锁内固定当前两份票，不等待回调；等待前须释放回调依赖的锁。
+    pub(crate) fn capture_boundary(self: Pin<&Self>) -> WorkBoundary {
+        let _lock = STATE_LOCK.lock();
+        self.capture_locked()
+    }
+
+    /// 等待同一 Work 已捕获的票消失；须保持对象存活并释放回调依赖的锁，不追随后来提交。
+    pub(crate) fn flush_boundary(self: Pin<&Self>, boundary: WorkBoundary) -> bool {
         pool::assert_wait_allowed(&self.domain, self.owned_raw);
         let affected = boundary.running != 0 || boundary.queued != 0;
         wait_until(&self.finished, || {
@@ -620,10 +626,7 @@ impl Work {
 
     /// 等待调用边界内存在的票，不追逐 callback 的未来 self-requeue。
     pub fn flush(self: Pin<&Self>) -> bool {
-        let boundary = {
-            let _lock = STATE_LOCK.lock();
-            self.capture_locked()
-        };
+        let boundary = self.capture_boundary();
         self.flush_boundary(boundary)
     }
 

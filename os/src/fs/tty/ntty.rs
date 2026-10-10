@@ -430,6 +430,25 @@ impl OutputQueue {
     }
 }
 
+/// 一次采样产生的真实就绪变化与待锁外递送的前台信号。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReceiveOutcome {
+    pub read_changed: bool,
+    pub write_changed: bool,
+    pub signal: Option<u8>,
+}
+
+impl ReceiveOutcome {
+    /// 将纯队列变化转换为没有信号的输入效果。
+    fn changes((read_changed, write_changed): (bool, bool)) -> Self {
+        Self {
+            read_changed,
+            write_changed,
+            signal: None,
+        }
+    }
+}
+
 /// 行规程短锁保护的全部状态。
 pub struct NttyState {
     /// 当前 termios 配置。
@@ -509,37 +528,45 @@ impl NttyState {
         self.termios.lflag & super::termios::FLUSHO != 0
     }
 
-    /// 处理一个中断采样，返回是否产生可读或可写变化。
-    pub fn receive_sample(&mut self, sample: RxSample) -> (bool, bool) {
+    /// 处理一个采样，只记录输入效果；实际组信号必须在全部业务锁外发送。
+    pub fn receive_sample(&mut self, sample: RxSample) -> ReceiveOutcome {
         let termios = self.termios;
         if sample.status & LSR_BREAK != 0 {
             return self.receive_break(termios);
         }
         if sample.status & (LSR_PARITY | LSR_FRAME) != 0 {
-            return self.receive_parity_error(termios, sample.byte);
+            return ReceiveOutcome::changes(self.receive_parity_error(termios, sample.byte));
         }
         if sample.status & LSR_OVERRUN != 0 {
             self.overrun += 1;
         }
         if sample.status & LSR_DATA_READY == 0 {
-            return (false, false);
+            return ReceiveOutcome::default();
         }
         self.receive_byte(termios, sample.byte)
     }
 
-    /// 处理真实中断条件，返回读写变化；PARMRK 三字节原子提交。
-    fn receive_break(&mut self, termios: Termios) -> (bool, bool) {
+    /// BRKINT 产生 INT；忽略与错误标记保持原输入顺序和完整容量边界。
+    fn receive_break(&mut self, termios: Termios) -> ReceiveOutcome {
         if termios.iflag & IGNBRK != 0 {
-            return (false, false);
+            return ReceiveOutcome::default();
         }
         if termios.iflag & BRKINT != 0 {
-            self.local_flush(termios);
-            return (true, true);
+            if termios.lflag & super::termios::NOFLSH == 0 {
+                self.local_flush();
+            }
+            return ReceiveOutcome {
+                read_changed: true,
+                write_changed: true,
+                signal: Some(2),
+            };
         }
-        if termios.iflag & PARMRK != 0 {
-            return self.store_marked_bytes(termios, &[0xff, 0, 0]);
-        }
-        self.queue_input_byte(termios, 0)
+        let changed = if termios.iflag & PARMRK != 0 {
+            self.store_marked_bytes(termios, &[0xff, 0, 0])
+        } else {
+            self.queue_input_byte(termios, 0)
+        };
+        ReceiveOutcome::changes(changed)
     }
 
     /// 处理真实校验或帧错误，返回读写变化；PARMRK 按 FF 00 c 原序提交。
@@ -601,25 +628,38 @@ impl NttyState {
         (true, true)
     }
 
-    /// 处理一个正常输入字节，返回读写变化；开启 FLUSHO 时立即退休待发输出。
-    fn receive_byte(&mut self, termios: Termios, mut byte: u8) -> (bool, bool) {
+    /// 按 strip、literal-next、流控和信号顺序解释输入，不触任务图。
+    fn receive_byte(&mut self, termios: Termios, mut byte: u8) -> ReceiveOutcome {
         if self.input.lnext {
             self.input.lnext = false;
             if termios.iflag & ISTRIP != 0 {
                 byte &= 0x7f;
             }
-            return self.store_data_byte(termios, byte);
+            return ReceiveOutcome::changes(self.store_data_byte(termios, byte));
         }
         if termios.iflag & ISTRIP != 0 {
             byte &= 0x7f;
         }
         if termios.iflag & IXON != 0 && self.receive_flow_control(termios, byte) {
-            return (false, true);
+            return ReceiveOutcome::changes((false, true));
         }
         if termios.lflag & ISIG != 0 && byte != DISABLED_CHAR {
-            if byte == termios.cc[VINTR] || byte == termios.cc[VQUIT] || byte == termios.cc[VSUSP] {
-                let changed = self.receive_signal(termios, byte);
-                return (changed, true);
+            let signal = if byte == termios.cc[VINTR] {
+                Some(2)
+            } else if byte == termios.cc[VQUIT] {
+                Some(3)
+            } else if byte == termios.cc[VSUSP] {
+                Some(20)
+            } else {
+                None
+            };
+            if signal.is_some() {
+                let read_changed = self.receive_signal(termios, byte);
+                return ReceiveOutcome {
+                    read_changed,
+                    write_changed: true,
+                    signal,
+                };
             }
         }
         if self.stopped
@@ -641,11 +681,11 @@ impl NttyState {
                     let _ = self.echo_char(termios, byte);
                 }
             }
-            return (false, true);
+            return ReceiveOutcome::changes((false, true));
         }
         if byte == CARRIAGE_RETURN {
             if termios.iflag & IGNCR != 0 {
-                return (false, false);
+                return ReceiveOutcome::default();
             }
             if termios.iflag & ICRNL != 0 {
                 byte = LINE_FEED;
@@ -653,16 +693,11 @@ impl NttyState {
         } else if byte == LINE_FEED && termios.iflag & INLCR != 0 {
             byte = CARRIAGE_RETURN;
         }
-        if termios.lflag & ICANON != 0 {
-            if self.receive_canonical(termios, byte) {
-                return (true, true);
-            }
-        } else {
-            return self.store_data_byte(termios, byte);
+        if termios.lflag & ICANON != 0 && self.receive_canonical(termios, byte) {
+            return ReceiveOutcome::changes((true, true));
         }
-        self.store_data_byte(termios, byte)
+        ReceiveOutcome::changes(self.store_data_byte(termios, byte))
     }
-
     /// 处理软件流控字符，返回是否消费。
     fn receive_flow_control(&mut self, termios: Termios, byte: u8) -> bool {
         if byte == termios.cc[VSTART] && byte != DISABLED_CHAR {
@@ -679,7 +714,7 @@ impl NttyState {
     /// 处理信号控制字符的本地解释与回显，不递送前台组。
     fn receive_signal(&mut self, termios: Termios, byte: u8) -> bool {
         if termios.lflag & super::termios::NOFLSH == 0 {
-            self.local_flush(termios);
+            self.local_flush();
         }
         if termios.iflag & IXON != 0 {
             self.stopped = false;
@@ -694,13 +729,10 @@ impl NttyState {
         true
     }
 
-    /// 执行信号或 BRKINT 的本地输入与回显清空，取消挂起重显。
-    fn local_flush(&mut self, termios: Termios) {
-        let _ = termios;
+    /// 信号 flush 只退休已解释输入和未发送输出，不丢接收 batch 后继采样。
+    fn local_flush(&mut self) {
         self.input.clear();
-        self.echo.clear();
-        self.output.clear();
-        self.pending_reprint = None;
+        self.flush_output();
     }
 
     /// 处理规范模式的编辑与记录字符，返回是否已消费；回显满回压输入。

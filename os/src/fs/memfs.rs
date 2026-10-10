@@ -96,6 +96,7 @@ pub enum MemorySpecial {
     Zero,
     TtySerial,
     Console,
+    ControllingTty,
     Mounts,
     Meminfo,
     Uptime,
@@ -239,7 +240,8 @@ impl MemoryFs {
                 MemorySpecial::Null
                 | MemorySpecial::Zero
                 | MemorySpecial::TtySerial
-                | MemorySpecial::Console,
+                | MemorySpecial::Console
+                | MemorySpecial::ControllingTty,
             ) => InodeKind::Character,
             (
                 MemoryFsKind::Procfs,

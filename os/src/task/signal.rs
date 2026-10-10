@@ -479,7 +479,7 @@ impl SignalGroup {
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<bool, SignalError> {
         let mut group = self.state.lock();
-        if group.members == 0 || group.exit.is_some() {
+        if group.members == 0 || (group.exit.is_some() && info.signum != 18) {
             return Ok(false);
         }
         let continued = info.signum == 18 && group.stop_reported;
@@ -508,6 +508,10 @@ impl SignalGroup {
                 blocked |= (private.mask | private.real_blocked.unwrap_or(0)) & bit != 0;
                 eligible |= (private.mask | private.real_blocked.unwrap_or(0)) & bit == 0;
             }
+        }
+        // 已经致命退出的停止成员仍须完成CONT恢复；不再为退出组增加pending。
+        if group.exit.is_some() {
+            return Ok(continued);
         }
         if info.signum == 9 {
             group.exit.get_or_insert(9);
@@ -598,6 +602,14 @@ impl SignalGroup {
         let _siglock = binding.actions.lock();
         let exit = self.state.lock().exit;
         exit
+    }
+
+    /// 只报告全体实际成员已经确认的停止，不把待处理停止信号算作停止作业。
+    pub(crate) fn has_stopped_jobs(&self) -> bool {
+        let binding = self.sighand.lock();
+        let _siglock = binding.actions.lock();
+        let stopped = self.state.lock().stop_reported;
+        stopped
     }
 
     /// 父停止/继续通知遵守SA_NOCLDSTOP，沿原锁外发送路径处理SIGCHLD。
@@ -725,6 +737,15 @@ impl ThreadSignals {
         let _siglock = binding.actions.lock();
         let mask = self.state.lock().mask;
         mask
+    }
+
+    /// 同一次canonical动作锁与private锁快照裁决终端信号的阻塞或忽略处置。
+    pub(crate) fn blocked_or_ignored(&self, signum: u8) -> bool {
+        let bit = signal_bit(signum).expect("invalid terminal signal");
+        let binding = self.group.sighand.lock();
+        let actions = binding.actions.lock();
+        let private = self.state.lock();
+        private.mask & bit != 0 || ignored(actions[signum as usize - 1], signum)
     }
 
     /// sigtimedwait暂时解除请求集阻断，保存真实旧mask以免忽略或默认致命丢失等待实例。
