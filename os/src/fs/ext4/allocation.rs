@@ -228,7 +228,7 @@ impl Ext4Volume {
             InodeKind::Regular => 0x8000,
             InodeKind::Directory => 0x4000,
             InodeKind::Symlink => 0xa000,
-            InodeKind::Character | InodeKind::Block | InodeKind::Other => {
+            InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other => {
                 return Err(FsError::InvalidOperation)
             }
         };

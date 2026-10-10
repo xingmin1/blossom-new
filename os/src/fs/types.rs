@@ -10,6 +10,7 @@ pub enum InodeKind {
     Symlink,
     Character,
     Block,
+    Fifo,
     Other,
 }
 

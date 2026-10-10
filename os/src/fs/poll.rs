@@ -4,7 +4,79 @@ use core::{
     pin::Pin,
 };
 
+use crate::wait::{WaitResult, Waiter, Waker};
 use crate::{fs::FsError, sync::SpinLock};
+
+/// 持续登记只保存通知事实，唯一一次等待仅在真正 park 的窗口存在。
+pub struct PollContext {
+    state: SpinLock<PollContextState>,
+}
+
+struct PollContextState {
+    triggered: bool,
+    waker: Option<Waker>,
+}
+
+impl PollContext {
+    /// 在确定需要等待后准备通知事实；快速 I/O 不需要建立本对象。
+    pub fn try_new() -> Result<Arc<Self>, FsError> {
+        Arc::try_new(Self {
+            state: SpinLock::new(PollContextState {
+                triggered: false,
+                waker: None,
+            }),
+        })
+        .map_err(|_| FsError::NoMemory)
+    }
+
+    /// 在下一轮业务扫描之前清除旧事实，不得在扫描之后调用。
+    pub fn clear_triggered(&self) {
+        self.state.lock().triggered = false;
+    }
+
+    /// 观察通知事实，不查询 provider，也不建立一次等待。
+    pub fn triggered(&self) -> bool {
+        self.state.lock().triggered
+    }
+
+    /// 在无业务锁、无用户复制的窗口安装唯一 Waiter，返回前撤 Waker 并结束等待。
+    pub fn park(&self, interruptible: bool) -> WaitResult {
+        let waiter = if interruptible {
+            Waiter::new_interruptible()
+        } else {
+            Waiter::new()
+        };
+        {
+            let mut state = self.state.lock();
+            assert!(state.waker.is_none(), "poll context already parked");
+            state.waker = Some(waiter.waker());
+            if state.triggered {
+                state.waker.as_ref().unwrap().notify();
+            }
+        }
+        let result = if interruptible {
+            waiter.park_signal()
+        } else {
+            waiter.park();
+            WaitResult::Woken
+        };
+        let waker = self.state.lock().waker.take();
+        drop(waker);
+        drop(waiter);
+        result
+    }
+}
+
+impl PollNotify for PollContext {
+    /// 源短锁内先保存事实，再唤醒当前窗口的等待者；没有 Waiter 时事实继续保留。
+    fn notify(&self, _mask: PollMask) {
+        let mut state = self.state.lock();
+        state.triggered = true;
+        if let Some(waker) = &state.waker {
+            waker.notify();
+        }
+    }
+}
 
 /// 保存 poll/select 共同使用的目标 UAPI 位，并支持直接位运算。
 #[repr(transparent)]

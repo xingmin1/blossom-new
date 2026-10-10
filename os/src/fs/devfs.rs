@@ -84,6 +84,11 @@ fn zeros(target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
 }
 
 impl FileLike for NullFile {
+    /// 空设备接受显式位置，位置值不改变EOF和丢弃写入语义。
+    fn positioned_io(&self) -> bool {
+        true
+    }
+
     /// 空设备即使接收端地址不可访问也只返回 EOF，不访问接收端。
     fn read_into(
         &self,
@@ -179,6 +184,11 @@ impl FileLike for NullFile {
 }
 
 impl FileLike for ZeroFile {
+    /// 零设备允许按位置调用，内容不随位置改变，访问权限仍按原打开模式检查。
+    fn positioned_io(&self) -> bool {
+        true
+    }
+
     /// 按接收端容量填零；用户故障保留本次已经交付的正前缀。
     fn read_into(
         &self,

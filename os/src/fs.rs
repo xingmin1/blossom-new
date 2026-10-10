@@ -11,6 +11,7 @@ mod inode;
 pub(crate) mod ktest;
 pub(crate) mod memfs;
 mod path;
+pub(crate) mod pipe;
 pub(crate) mod poll;
 pub(crate) mod procfs;
 pub(crate) mod readahead;
@@ -24,7 +25,7 @@ pub use file::{
     open_path, open_path_with_flags, stat_path, DirectoryFile, FileIoContext, FileLike, FileRef,
     FileStat, InodeFile, SeekFrom,
 };
-pub use file::{ReadBuffer, WriteBuffer};
+pub use file::{ReadBuffer, UserIoVector, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
 pub(crate) use inode::{
     initialize_inode_eviction, DirectoryWriteGuard, InodeCacheWatch, InodeWeak, PreparedMkwrite,
@@ -67,6 +68,9 @@ pub enum FsError {
     IsDirectory,
     IllegalSeek,
     NotTty,
+    WouldBlock,
+    BrokenPipe,
+    Interrupted,
     BadAddress,
     Permission,
     LoadAborted,
@@ -93,6 +97,9 @@ impl FsError {
             | Self::BadAddress
             | Self::IllegalSeek
             | Self::NotTty
+            | Self::WouldBlock
+            | Self::BrokenPipe
+            | Self::Interrupted
             | Self::Permission
             | Self::NotFound
             | Self::Exists

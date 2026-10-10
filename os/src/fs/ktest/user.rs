@@ -15,6 +15,7 @@ mod background;
 mod layout;
 mod lifecycle;
 mod namespace;
+mod pipe;
 mod preparation;
 mod readahead;
 mod write;
@@ -1257,6 +1258,103 @@ pub(crate) mod programs {
         let event = fixture.run_named(context, b"/test/bin/user-io", b"raw", false)?;
         context.expect_eq(event.status, 0);
         Ok(())
+    }
+
+    /// 两个真实用户进程共享管道OFD，读完最后writer的尾部后才见EOF。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
+    fn pipe_fork_dup_full_stream_tail_and_eof(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"d")
+    }
+
+    /// 两个writer把总长度4096的writev作为一笔请求提交，逐record核字节不交错。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
+    fn pipe_small_writev_records_across_writers(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"a")
+    }
+
+    /// NONBLOCK容量不足保EAGAIN，零长和跨页故障保已经真正消费的前缀。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
+    fn pipe_nonblocking_capacity_zero_and_fault_prefix(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"n")
+    }
+
+    /// 已解码iov只进入一次普通文件操作，长度边界与共享位置按实际字节推进。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-vector-user"))]
+    fn file_vector_import_and_shared_position(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"v")
+    }
+
+    /// 无reader的非零write由写者线程领取SIGPIPE，忽略、默认和阻塞mask保持各自语义。
+    #[test]
+    #[case("ignored", b"i" as &[u8])]
+    #[case("default_child", b"s" as &[u8])]
+    #[case("blocked_writer", b"b" as &[u8])]
+    #[ktest(tags("fs-pipe", "fs-pipe-user", "fs-pipe-signal"))]
+    fn pipe_last_reader_sigpipe_and_result(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        mode: &[u8],
+    ) -> TestResult {
+        fixture.pipe_abi(context, mode)
+    }
+
+    /// 已经真正Blocked的read由普通信号中断，SA_RESTART仅由原用户返回协议决定重放。
+    #[test]
+    #[case("interrupted", b"e" as &[u8])]
+    #[case("restart", b"r" as &[u8])]
+    #[ktest(tags("fs-pipe", "fs-pipe-user", "fs-pipe-signal"))]
+    fn pipe_blocked_read_signal_and_restart(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        mode: &[u8],
+    ) -> TestResult {
+        fixture.pipe_abi(context, mode)
+    }
+
+    /// pipe2输出错误与第二槽不足只取消本次未发表预留，已有描述符与容量不改变。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
+    fn pipe2_output_fault_and_second_slot_exhaustion(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"f")
+    }
+
+    /// 非root用户创建的匿名端点保留真实uid/gid，属性由正常fstat交付。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
+    fn pipe_creator_credentials_in_anonymous_stat(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"u")
+    }
+
+    /// 普通pread/pwrite先按OFD位置能力返回ESPIPE，错误端点和地址不改变优先级。
+    #[test]
+    #[ktest(tags("fs-pipe", "fs-pipe-user", "fs-pipe-positioned"))]
+    fn pipe_positioned_io_error_precedence(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.pipe_abi(context, b"p")
     }
 
     /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。

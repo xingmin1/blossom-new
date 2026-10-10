@@ -1,11 +1,14 @@
 //! 用户文件ABI沿正式表、OFD和逐组件VFS交付，不提前消费游标或借用户内存为Rust对象。
 
+use alloc::borrow::Cow;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 
+use crate::arch;
 use crate::fs::{
     self, DescriptorFlags, DirectoryEntry, FileIoContext, FileStat, FsContext, InodeKind, Path,
-    ReadBuffer, ResolveMode, SeekFrom, Vfs, WriteBuffer,
+    ReadBuffer, ResolveMode, SeekFrom, UserIoVector, Vfs, WriteBuffer,
 };
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyout, Errno, SysResult};
@@ -37,6 +40,138 @@ const OPENAT_SUPPORTED: u32 = 0o3
     | CLOEXEC;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
+const MAX_IOV_COUNT: usize = 1024;
+
+/// 只接受两个管道打开位；两个原预留槽在完整 copyout 成功后才分别发表。
+pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let flags = raw[1] as u32;
+    if flags & !(CLOEXEC | 0o4000) != 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("pipe2 has no runtime");
+    let reader_slot = runtime.files.reserve()?;
+    let writer_slot = runtime.files.reserve()?;
+    let (reader, writer) =
+        fs::pipe::try_new(flags, runtime.credentials.uid, runtime.credentials.gid)?;
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&(reader_slot.fd() as u32).to_le_bytes());
+    bytes[4..].copy_from_slice(&(writer_slot.fd() as u32).to_le_bytes());
+    let mm = user.mm().expect("pipe2 has no MM");
+    copyout(&mm, raw[0], &bytes)?;
+    let descriptor_flags = DescriptorFlags {
+        close_on_exec: flags & CLOEXEC != 0,
+    };
+    reader_slot.publish(reader, descriptor_flags);
+    writer_slot.publish(writer, descriptor_flags);
+    Ok(0)
+}
+
+/// 一次读取目标 16 字节 iovec 数组，小请求借原栈快照，大请求才分配有限拥有。
+fn import_vectors<'a>(
+    mm: &Mm,
+    address: usize,
+    count: usize,
+    fast: &'a mut [UserIoVector; 8],
+) -> Result<Cow<'a, [UserIoVector]>, Errno> {
+    // raw vlen 保留目标 unsigned long 宽度，所有负编码都超出有限上界。
+    if MAX_IOV_COUNT < count {
+        return Err(Errno::InvalidArgument);
+    }
+    if count == 0 {
+        return Ok(Cow::Borrowed(&fast[..0]));
+    }
+    let mut heap = Vec::new();
+    let vectors = if count <= fast.len() {
+        &mut fast[..count]
+    } else {
+        heap.try_reserve_exact(count).map_err(|_| Errno::NoMemory)?;
+        heap.resize(
+            count,
+            UserIoVector {
+                address: 0,
+                length: 0,
+            },
+        );
+        heap.as_mut_slice()
+    };
+    assert_eq!(core::mem::size_of::<UserIoVector>(), 16);
+    // SAFETY: repr(C) 两个64位usize与目标iovec布局相同，所有位模式均有效；
+    // vectors独占且已初始化count项，字节切片长度恰覆盖这些项，copyin不保留借用。
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(vectors.as_mut_ptr().cast::<u8>(), count * 16) };
+    let progress = mm.copyin(bytes, address);
+    if progress.error.is_some() || progress.copied != bytes.len() {
+        return Err(Errno::BadAddress);
+    }
+    if vectors.iter().any(|vector| (vector.length as isize) < 0) {
+        return Err(Errno::InvalidArgument);
+    }
+    let mut total = 0usize;
+    for vector in vectors.iter_mut() {
+        // 单段在裁剪后检查范围，多段检查原始范围；空段不解引用base。
+        let checked_length = if count == 1 {
+            vector.length.min(MAX_RW_COUNT)
+        } else {
+            vector.length
+        };
+        if checked_length != 0 {
+            let end = vector
+                .address
+                .checked_add(checked_length)
+                .ok_or(Errno::BadAddress)?;
+            if arch::USER_ADDRESS_END < end {
+                return Err(Errno::BadAddress);
+            }
+        }
+        vector.length = vector.length.min(MAX_RW_COUNT - total);
+        total += vector.length;
+    }
+    if count <= fast.len() {
+        Ok(Cow::Borrowed(&fast[..count]))
+    } else {
+        Ok(Cow::Owned(heap))
+    }
+}
+
+/// 沿原 fd 和 fmode 错误顺序进入一次 OFD 读取，向量故障保真实交付前缀。
+pub(super) fn readv(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("readv has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    if file.flags() & 3 == 1 {
+        return Err(Errno::BadFd);
+    }
+    let mm = user.mm().expect("readv has no MM");
+    let mut fast = [UserIoVector {
+        address: 0,
+        length: 0,
+    }; 8];
+    let vectors = import_vectors(&mm, raw[1], raw[2], &mut fast)?;
+    let mut target = ReadBuffer::user_vector(&mm, &vectors)?;
+    if target.len() == 0 {
+        return Ok(0);
+    }
+    Ok(file.read_into(&mut target, FileIoContext::User(user))? as isize)
+}
+
+/// 总向量是一笔写请求，只进入一次 OFD 和 inode 写事务，不逐段提交位置。
+pub(super) fn writev(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("writev has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    if file.flags() & 3 == 0 {
+        return Err(Errno::BadFd);
+    }
+    let mm = user.mm().expect("writev has no MM");
+    let mut fast = [UserIoVector {
+        address: 0,
+        length: 0,
+    }; 8];
+    let vectors = import_vectors(&mm, raw[1], raw[2], &mut fast)?;
+    let mut source = WriteBuffer::user_vector(&mm, &vectors)?;
+    if source.len() == 0 {
+        return Ok(0);
+    }
+    Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)
+}
 
 /// 先预留描述符，再让 VFS 决定最终名字；创建分支在名字发表前构造完整 OFD。
 pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
@@ -297,13 +432,16 @@ pub(super) fn read(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.read_into(&mut target, FileIoContext::User(user))? as isize)
 }
 
-/// 有符号负offset明确失败，按位置读不获取OFD位置锁，也不改dup共享游标。
+/// 负offset先拒绝，取得OFD后先核位置能力，再核读模式及用户地址，且不改共享游标。
 pub(super) fn pread(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if (raw[3] as i64) < 0 {
         return Err(Errno::InvalidArgument);
     }
     let runtime = user.runtime().expect("pread has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    if !file.positioned_io() {
+        return Err(Errno::IllegalSeek);
+    }
     if file.flags() & 3 == 1 {
         return Err(Errno::BadFd);
     }
@@ -324,13 +462,16 @@ pub(super) fn write(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)
 }
 
-/// 负偏移先拒绝，按位置写不改变 OFD 游标，追加状态由同一 inode 判断。
+/// 负偏移先拒绝，OFD位置能力先于写模式和用户地址，追加仍由同一inode仲裁。
 pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if (raw[3] as i64) < 0 {
         return Err(Errno::InvalidArgument);
     }
     let runtime = user.runtime().expect("pwrite has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    if !file.positioned_io() {
+        return Err(Errno::IllegalSeek);
+    }
     if file.flags() & 3 == 0 {
         return Err(Errno::BadFd);
     }
@@ -666,6 +807,7 @@ fn dirent_type(entry: &DirectoryEntry) -> u8 {
         Some(InodeKind::Symlink) => 10,
         Some(InodeKind::Character) => 2,
         Some(InodeKind::Block) => 6,
+        Some(InodeKind::Fifo) => 1,
         _ => 0,
     }
 }

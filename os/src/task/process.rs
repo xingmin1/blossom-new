@@ -1263,7 +1263,7 @@ impl TaskGraph {
                 value: 0,
             },
         };
-        self.deliver_thread(sender, tid, tgid, info, false)
+        self.deliver_thread(sender, tid, tgid, info, false, None)
     }
 
     /// queueinfo只寻具体进程，外部发送者不得伪造非负kernel code或SI_TKILL。
@@ -1303,7 +1303,7 @@ impl TaskGraph {
         if (0 <= info.code || info.code == -6) && sender.tid() != tid {
             return Err(SignalError::Permission);
         }
-        self.deliver_thread(sender, tid, Some(tgid), info, true)
+        self.deliver_thread(sender, tid, Some(tgid), info, true, None)
     }
 
     /// 内核控制者通过真实组身份发送普通信号，所有kick与uaccess仍在图和siglock之外。
@@ -1313,6 +1313,35 @@ impl TaskGraph {
         }
         let group = self.group_target(pid)?;
         self.deliver_group(&group, SignalInfo::kernel(signum), false)
+    }
+
+    /// 将当前执行者触发的异步信号递送到稳定private pending，保留原发送身份和锁外通知。
+    pub(crate) fn send_kernel_thread(
+        &self,
+        identity: &UserIdentity,
+        signum: u8,
+    ) -> Result<(), SignalError> {
+        if signum == 0 || 64 < signum {
+            return Err(SignalError::InvalidSignal);
+        }
+        let info = SignalInfo {
+            signum,
+            errno: 0,
+            code: 0,
+            payload: SignalPayload::Sender {
+                pid: identity.tgid(),
+                uid: identity.group.uid,
+                value: 0,
+            },
+        };
+        self.deliver_thread(
+            identity,
+            identity.tid(),
+            Some(identity.tgid()),
+            info,
+            false,
+            Some(&identity.signals),
+        )
     }
 
     /// 在关系锁中取得稳定组拥有，退出组仍可被kill0探测但发送不会重新建立成员。
@@ -1393,6 +1422,7 @@ impl TaskGraph {
         tgid: Option<usize>,
         info: SignalInfo,
         queued: bool,
+        expected_private: Option<&Arc<ThreadSignals>>,
     ) -> Result<(), SignalError> {
         let (group, signals, user, event) = {
             let mut slots = self.slots.lock();
@@ -1401,6 +1431,9 @@ impl TaskGraph {
                 .and_then(|slot| slot.thread.as_ref())
                 .ok_or(SignalError::NoProcess)?;
             if tgid.is_some_and(|tgid| thread.group.tgid() != tgid) {
+                return Err(SignalError::NoProcess);
+            }
+            if expected_private.is_some_and(|expected| !Arc::ptr_eq(expected, &thread.signals)) {
                 return Err(SignalError::NoProcess);
             }
             if !signal_permission(sender, &thread.group, info.signum) {

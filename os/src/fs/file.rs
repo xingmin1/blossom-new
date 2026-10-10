@@ -43,6 +43,63 @@ pub(crate) const O_NOCTTY: u32 = 0o400;
 const MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | 0o100000 | O_DIRECTORY | O_NOFOLLOW | O_NOCTTY;
 
+/// 已从目标 iovec ABI 解码的地址与长度；不借用用户字节。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserIoVector {
+    pub address: usize,
+    pub length: usize,
+}
+
+/// 同一请求的逐段游标，零长度段不产生用户访问。
+struct UserVector<'a> {
+    mm: &'a Mm,
+    vectors: &'a [UserIoVector],
+    index: usize,
+    offset: usize,
+    length: usize,
+}
+
+impl<'a> UserVector<'a> {
+    /// 验证内核快照的非零范围并计算无溢出的完整请求长度。
+    fn new(mm: &'a Mm, vectors: &'a [UserIoVector]) -> Result<Self, FsError> {
+        let mut length = 0usize;
+        for vector in vectors {
+            if vector.length != 0 {
+                let end = vector
+                    .address
+                    .checked_add(vector.length)
+                    .ok_or(FsError::BadAddress)?;
+                if arch::USER_ADDRESS_END < end {
+                    return Err(FsError::BadAddress);
+                }
+            }
+            length = length
+                .checked_add(vector.length)
+                .ok_or(FsError::InvalidOperation)?;
+        }
+        Ok(Self {
+            mm,
+            vectors,
+            index: 0,
+            offset: 0,
+            length,
+        })
+    }
+
+    /// 跳过已完成和空段，返回下一段剩余范围。
+    fn next(&mut self) -> Option<(usize, usize)> {
+        while let Some(vector) = self.vectors.get(self.index) {
+            if self.offset < vector.length {
+                return Some((vector.address + self.offset, vector.length - self.offset));
+            }
+            self.index += 1;
+            self.offset = 0;
+        }
+        None
+    }
+}
+
 /// 同一文件页循环的两个接收端，实际交付量独立于请求长度。
 pub struct ReadBuffer<'a> {
     target: ReadTarget<'a>,
@@ -57,6 +114,7 @@ enum ReadTarget<'a> {
         address: usize,
         length: usize,
     },
+    Vector(UserVector<'a>),
 }
 
 impl<'a> ReadBuffer<'a> {
@@ -86,11 +144,20 @@ impl<'a> ReadBuffer<'a> {
         })
     }
 
+    /// 借用已拥有的向量快照，同一 OFD 调用内逐段交付用户前缀。
+    pub fn user_vector(mm: &'a Mm, vectors: &'a [UserIoVector]) -> Result<Self, FsError> {
+        Ok(Self {
+            target: ReadTarget::Vector(UserVector::new(mm, vectors)?),
+            written: 0,
+        })
+    }
+
     /// 返回本次接收端的完整容量，不包含已交付进度。
     pub fn len(&self) -> usize {
         match &self.target {
             ReadTarget::Kernel(bytes) => bytes.len(),
             ReadTarget::User { length, .. } => *length,
+            ReadTarget::Vector(vector) => vector.length,
         }
     }
 
@@ -117,6 +184,22 @@ impl<'a> ReadBuffer<'a> {
                     Some(_) => Err(FsError::BadAddress),
                 }
             }
+            ReadTarget::Vector(vector) => {
+                let mut copied = 0;
+                while copied < count {
+                    let (address, remaining) =
+                        vector.next().expect("read vector ended before length");
+                    let end = count.min(copied + remaining);
+                    let progress = vector.mm.copyout(address, &bytes[copied..end]);
+                    vector.offset += progress.copied;
+                    copied += progress.copied;
+                    self.written += progress.copied;
+                    if progress.error.is_some() {
+                        return Err(FsError::BadAddress);
+                    }
+                }
+                Ok(copied)
+            }
         }
     }
 }
@@ -136,6 +219,7 @@ enum WriteSource<'a> {
         address: usize,
         length: usize,
     },
+    Vector(UserVector<'a>),
 }
 
 impl<'a> WriteBuffer<'a> {
@@ -167,11 +251,21 @@ impl<'a> WriteBuffer<'a> {
         })
     }
 
+    /// 借用向量快照，输入准备量与文件接受量继续分开记录。
+    pub fn user_vector(mm: &'a Mm, vectors: &'a [UserIoVector]) -> Result<Self, FsError> {
+        Ok(Self {
+            source: WriteSource::Vector(UserVector::new(mm, vectors)?),
+            prepared: 0,
+            error: None,
+        })
+    }
+
     /// 返回输入的完整长度，不把准备片段当成已接受的文件字节。
     pub fn len(&self) -> usize {
         match &self.source {
             WriteSource::Kernel(bytes) => bytes.len(),
             WriteSource::User { length, .. } => *length,
+            WriteSource::Vector(vector) => vector.length,
         }
     }
 
@@ -190,7 +284,7 @@ impl<'a> WriteBuffer<'a> {
         if count == 0 {
             return Ok(0);
         }
-        let copied = match &self.source {
+        let copied = match &mut self.source {
             WriteSource::Kernel(bytes) => {
                 dst[..count].copy_from_slice(&bytes[self.prepared..self.prepared + count]);
                 count
@@ -203,6 +297,26 @@ impl<'a> WriteBuffer<'a> {
                     _ => FsError::BadAddress,
                 });
                 progress.copied
+            }
+            WriteSource::Vector(vector) => {
+                let mut copied = 0;
+                while copied < count {
+                    let (address, remaining) =
+                        vector.next().expect("write vector ended before length");
+                    let end = count.min(copied + remaining);
+                    let progress = vector.mm.copyin(&mut dst[copied..end], address);
+                    vector.offset += progress.copied;
+                    copied += progress.copied;
+                    self.error = progress.error.map(|error| match error {
+                        VmError::NoMemory => FsError::NoMemory,
+                        VmError::File(error) => error,
+                        _ => FsError::BadAddress,
+                    });
+                    if self.error.is_some() {
+                        break;
+                    }
+                }
+                copied
             }
         };
         self.prepared += copied;
@@ -282,6 +396,11 @@ pub trait FileLike: Send + Sync {
 
     /// 只由普通可映射文件提供实际 inode，映射者自行保活该身份。
     fn mapping_inode(&self) -> Option<&InodeRef>;
+
+    /// 只有存在显式位置语义的对象允许pread/pwrite；流在访问模式和用户地址之前拒绝。
+    fn positioned_io(&self) -> bool {
+        false
+    }
 
     /// 借用实际持续事件 provider，普通文件与目录没有持久通知源。
     fn pollable(&self) -> Option<&dyn Pollable> {
@@ -474,11 +593,18 @@ pub fn open_path_with_flags(
             .map_err(|_| FsError::NoMemory)?)
         }
         InodeKind::Symlink => Err(FsError::TooManySymlinks),
-        InodeKind::Character | InodeKind::Block | InodeKind::Other => Err(FsError::Unsupported),
+        InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other => {
+            Err(FsError::Unsupported)
+        }
     }
 }
 
 impl FileLike for InodeFile {
+    /// 普通文件的显式字节位置由同一inode维护，不依赖共享游标或访问模式。
+    fn positioned_io(&self) -> bool {
+        true
+    }
+
     /// 位置锁跨实际交付保持独占，用户故障的正前缀仍按真实长度推进。
     fn read_into(
         &self,
@@ -700,6 +826,11 @@ fn check_write_range(offset: u64, length: usize) -> Result<(), FsError> {
 }
 
 impl FileLike for DirectoryFile {
+    /// 目录保留文件位置能力，普通字节访问仍由其操作返回目录错误。
+    fn positioned_io(&self) -> bool {
+        true
+    }
+
     /// 目录字节由目录项操作消费，不能按普通文件读取。
     fn read_into(
         &self,
@@ -924,6 +1055,7 @@ pub fn stat_path(path: &Path) -> Result<FileStat, FsError> {
                 InodeKind::Symlink => 0o120000,
                 InodeKind::Character => 0o020000,
                 InodeKind::Block => 0o060000,
+                InodeKind::Fifo => 0o010000,
                 InodeKind::Other => unreachable!(),
             },
         size: data.size,

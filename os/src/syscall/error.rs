@@ -38,6 +38,7 @@ pub(super) enum Errno {
     IllegalSeek = 29,
     ReadOnly = 30,
     TooManyLinks = 31,
+    BrokenPipe = 32,
     NameTooLong = 36,
     NoSyscall = 38,
     NotEmpty = 39,
@@ -84,6 +85,9 @@ impl From<FsError> for Errno {
             FsError::IsDirectory => Self::IsDirectory,
             FsError::IllegalSeek => Self::IllegalSeek,
             FsError::NotTty => Self::NotTty,
+            FsError::WouldBlock => Self::Again,
+            FsError::BrokenPipe => Self::BrokenPipe,
+            FsError::Interrupted => Self::Interrupted,
             FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => {
                 Self::Io
             }

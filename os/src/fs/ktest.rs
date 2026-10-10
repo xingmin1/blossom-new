@@ -25,6 +25,7 @@ mod file;
 mod format;
 mod mem_mapping;
 mod path;
+mod pipe;
 mod poll_source;
 mod pseudo;
 mod system;
@@ -36,7 +37,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 保留格式、inode、路径、文件、持续源与伪文件系统的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 28],
+    [&'static ::ktest::SuiteSlot; 29],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -71,6 +72,7 @@ pub(crate) fn anchors() -> (
             poll_source::source::__ktest_anchor(),
             pseudo::anchors()[0],
             mem_mapping::anchors()[0],
+            pipe::anchor(),
         ],
         path::anchors(),
         file::anchors(),

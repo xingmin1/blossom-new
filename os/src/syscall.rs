@@ -141,6 +141,19 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if matches!(request.number, 129..=139 | 240) {
         return signal::dispatch(user, request);
     }
+    if matches!(request.number, 63..=66) {
+        let result = match request.number {
+            63 => file::read(user, raw),
+            64 => file::write(user, raw),
+            65 => file::readv(user, raw),
+            66 => file::writev(user, raw),
+            _ => unreachable!(),
+        };
+        return match result {
+            Err(Errno::Interrupted) => Outcome::Restart(Restart::Syscall { request }),
+            other => Outcome::Return(other.unwrap_or_else(Errno::result)),
+        };
+    }
     let result: SysResult = match request.number {
         93 => return Outcome::Exit(((raw[0] & 255) << 8) as i32),
         94 => return Outcome::GroupExit(((raw[0] & 255) << 8) as i32),
@@ -157,10 +170,9 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         49 => file::chdir(user, raw[0]),
         56 => file::openat(user, raw),
         57 => file::close(user, raw[0]),
+        59 => file::pipe2(user, raw),
         61 => file::getdents(user, raw),
         62 => file::seek(user, raw),
-        63 => file::read(user, raw),
-        64 => file::write(user, raw),
         67 => file::pread(user, raw),
         68 => file::pwrite(user, raw),
         78 => file::readlink(user, raw),

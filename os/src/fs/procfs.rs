@@ -155,6 +155,11 @@ impl SnapshotFile {
 }
 
 impl FileLike for SnapshotFile {
+    /// 本次打开的稳定快照允许显式字节位置，不能授予只读实例写权限。
+    fn positioned_io(&self) -> bool {
+        true
+    }
+
     /// 顺序读取与复制描述符共享游标，实际交付后才推进位置。
     fn read_into(
         &self,

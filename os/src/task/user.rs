@@ -263,6 +263,18 @@ impl UserThread {
         process.identity.tid()
     }
 
+    /// 当前用户执行者生成线程定向异步信号，siginfo保留真实发送者，动作与mask沿原private协议处理。
+    pub fn send_kernel_signal(&self, signum: u8) {
+        self.assert_current();
+        let identity = self
+            .identity()
+            .expect("kernel signal has no current user identity");
+        identity
+            .graph()
+            .send_kernel_thread(&identity, signum)
+            .expect("current kernel signal delivery failed");
+    }
+
     /// 在关系和信号操作前取得身份快照，不跨图锁保存用户资源锁。
     pub(crate) fn identity(&self) -> Option<Arc<UserIdentity>> {
         self.process
