@@ -435,7 +435,7 @@ pub(crate) mod streams {
         poll.clear_triggered();
         checked(context, fixture.writer().write(b"fact"))?;
         context.expect_eq(poll.triggered(), true);
-        context.expect_eq(poll.park(false), crate::wait::WaitResult::Woken);
+        context.expect_eq(poll.park_until(false, None), crate::wait::WaitResult::Woken);
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 4);
         drop(table);
         poll.clear_triggered();

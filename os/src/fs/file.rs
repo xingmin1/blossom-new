@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
 use crate::block::{AccessMode, BlockError};
+use crate::fs::epoll::{EpollFile, WatchHead};
 use crate::fs::memfs::MemorySpecial;
 #[cfg(feature = "ktest")]
 use crate::fs::readahead::ReadaheadSnapshot;
@@ -404,6 +405,16 @@ pub trait FileLike: Send + Sync {
 
     /// 借用实际持续事件 provider，普通文件与目录没有持久通知源。
     fn pollable(&self) -> Option<&dyn Pollable> {
+        None
+    }
+
+    /// 只有事件对象提供实际epoll状态，raw入口不得从文件外观猜对象类型。
+    fn epoll(&self) -> Option<&EpollFile> {
+        None
+    }
+
+    /// 可持久监测的OFD保留反向watch，最后释放先同步撤登记再结束其源拥有。
+    fn watch_head(&self) -> Option<&Arc<WatchHead>> {
         None
     }
 

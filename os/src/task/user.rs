@@ -404,7 +404,7 @@ impl UserThread {
         self.restart.take()
     }
 
-    /// sigsuspend保存进入前mask，下一实际handler帧消费一次。
+    /// 临时等待保存进入前 mask，由普通返回恢复或下一实际 handler 帧消费一次。
     pub(crate) fn save_mask(&self, mask: u64) {
         self.assert_current();
         if self.saved_mask.get().is_none() {
@@ -412,7 +412,7 @@ impl UserThread {
         }
     }
 
-    /// 无handler重放sigsuspend前结束临时mask责任，参数重读失败也不遗留旧保存值。
+    /// 普通返回或无 handler 重放前结束临时 mask 责任，参数交付失败也不遗留保存值。
     pub(crate) fn restore_saved_mask(&self) {
         self.assert_current();
         if let Some(mask) = self.saved_mask.take() {
@@ -422,7 +422,7 @@ impl UserThread {
         }
     }
 
-    /// 实际handler保存sigsuspend的旧mask，否则保留选择时的mask快照。
+    /// 实际 handler 帧保存临时等待之前的 mask，否则保留选择时的快照。
     fn mask_to_restore(&self, selected: u64) -> u64 {
         self.saved_mask.take().unwrap_or(selected)
     }
@@ -640,7 +640,8 @@ pub(crate) fn prepare_bound_user(
 }
 
 /// 同一真实Task先向自身Mm尝试复制小端child_tid，部分写入或错误不取消创建。
-/// 随后循环执行用户现场，只有返回Rust并结束IRQ/现场借用后才允许等待或调度。
+/// 随后循环执行用户现场，只有返回 Rust 并结束 IRQ/现场借用后才允许等待或调度。
+/// 临时 mask 保留至真实信号选择；没有 handler 时恢复尚未领取的旧 mask。
 fn run_program(user: Arc<UserThread>) -> i32 {
     let identity = user.identity().expect("user entry has no identity");
     if let Some(address) = user.take_child_tid() {
@@ -700,6 +701,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 if let Some(state) = restart.take() {
                     crate::syscall::resolve_restart(&user, state, None);
                 }
+                user.restore_saved_mask();
             }
         }
         let trap = {

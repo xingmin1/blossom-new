@@ -12,6 +12,7 @@ use crate::task::{Credentials, JoinObserver, Placement, TaskId, UserRuntime};
 use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
 mod background;
+mod events;
 mod layout;
 mod lifecycle;
 mod namespace;
@@ -1355,6 +1356,70 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.pipe_abi(context, b"p")
+    }
+
+    /// 目标指令核对 poll 数组、select 集合跨度、重复 fd 计数及实际错误顺序。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T10", "T12"))]
+    fn poll_select_raw_abi_and_errors(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.events_abi(context, b"a")
+    }
+
+    /// 零 fd 的有限等待消耗原绝对期限，普通结果不被剩余时间写回错误覆盖。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T09"))]
+    fn zero_fd_deadlines(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.events_abi(context, b"t")
+    }
+
+    /// 三种等待各自进入真实 Blocked 后才让子进程写管道，通知通过生产源返回。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T11"))]
+    fn persistent_event_blocked_notifications(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.events_abi(context, b"b")
+    }
+
+    /// 真处理函数观察临时 mask，返回后旧 mask 恢复且等待不受 SA_RESTART 重启。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T09"))]
+    fn temporary_mask_handler_restore(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.events_abi(context, b"s")
+    }
+
+    /// raw 事件交付保留 data 高位，ADD、MOD 和 LT、ET、ONESHOT 消费同一真实管道。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T12", "T13", "T15"))]
+    fn epoll_ready_modes(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.events_abi(context, b"e")
+    }
+
+    /// dup 登记与复用后的新 OFD 分别保持身份，末端点关闭同步解除原登记。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T14", "T18"))]
+    fn epoll_dup_fd_reuse_final_close(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.events_abi(context, b"r")
+    }
+
+    /// 首项 EFAULT 与跨页正前缀分别保留未交付候选，下次正常输出继续交付。
+    #[test]
+    #[ktest(tags("fs-events", "fs-events-user", "T17"))]
+    fn epoll_output_fault_prefix(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.events_abi(context, b"f")
     }
 
     /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。

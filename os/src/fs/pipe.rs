@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use crate::fs::epoll::WatchHead;
 use crate::fs::file::{
     FileIoContext, FileLike, FileRef, FileStat, ReadBuffer, SeekFrom, WriteBuffer,
 };
@@ -152,6 +153,7 @@ struct PipeEnd {
     pipe: Arc<Pipe>,
     read: bool,
     flags: AtomicU32,
+    watches: Arc<WatchHead>,
 }
 
 /// 按创建者凭据准备两个实际OFD，CLOEXEC留给描述符槽；未发表失败归还原拥有。
@@ -177,16 +179,20 @@ pub fn try_new(flags: u32, uid: u32, gid: u32) -> Result<(FileRef, FileRef), FsE
         gid,
     })
     .map_err(|_| FsError::NoMemory)?;
+    let read_watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;
+    let write_watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;
     let reader: FileRef = Arc::try_new(PipeEnd {
         pipe: pipe.clone(),
         read: true,
         flags: AtomicU32::new(flags & O_NONBLOCK),
+        watches: read_watches,
     })
     .map_err(|_| FsError::NoMemory)?;
     let writer: FileRef = Arc::try_new(PipeEnd {
         pipe,
         read: false,
         flags: AtomicU32::new(1 | (flags & O_NONBLOCK)),
+        watches: write_watches,
     })
     .map_err(|_| FsError::NoMemory)?;
     Ok((reader, writer))
@@ -307,7 +313,7 @@ impl FileLike for PipeEnd {
                 }
             }
             if let Some((context, _)) = &waiting {
-                interrupted = context.park(matches!(caller, FileIoContext::User(_)))
+                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(self.prepare_wait()?);
@@ -335,6 +341,10 @@ impl FileLike for PipeEnd {
     /// 每个端点提供自己的实际持续源。
     fn pollable(&self) -> Option<&dyn Pollable> {
         Some(self)
+    }
+    /// 反向登记属于此打开端点，复制描述符共享同一份末释放责任。
+    fn watch_head(&self) -> Option<&Arc<WatchHead>> {
+        Some(&self.watches)
     }
     /// 访问模式属于该 OFD，CLOEXEC 不进入对象。
     fn flags(&self) -> u32 {
@@ -465,7 +475,7 @@ impl FileLike for PipeEnd {
                 }
             }
             if let Some((context, _)) = &waiting {
-                interrupted = context.park(matches!(caller, FileIoContext::User(_)))
+                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(match self.prepare_wait() {
@@ -487,8 +497,9 @@ impl FileLike for PipeEnd {
 }
 
 impl Drop for PipeEnd {
-    /// 只有实际 OFD 最后 put 才改变端点存在事实，并通知对端；dup/fork 仅共享 Arc。
+    /// 末OFD先同步撤全部持久watch，再发布端点关闭和通知对端；复制描述符不提前关闭。
     fn drop(&mut self) {
+        self.watches.release();
         if self.read {
             self.pipe.reader_open.store(false, Ordering::Release);
             self.pipe.write_head.notify(PollMask::POLLERR);

@@ -21,6 +21,7 @@ use crate::workqueue::{WorkQueue, WorkQueueConfig};
 use crate::{cpu, drivers, mm, sched, time, timer};
 
 mod concurrency;
+mod epoll;
 mod file;
 mod format;
 mod mem_mapping;
@@ -37,7 +38,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 保留格式、inode、路径、文件、持续源与伪文件系统的实际宏锚点，不维护中央用例列表。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 29],
+    [&'static ::ktest::SuiteSlot; 30],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -73,6 +74,7 @@ pub(crate) fn anchors() -> (
             pseudo::anchors()[0],
             mem_mapping::anchors()[0],
             pipe::anchor(),
+            epoll::anchor(),
         ],
         path::anchors(),
         file::anchors(),

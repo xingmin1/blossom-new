@@ -4,6 +4,8 @@ use core::{
     pin::Pin,
 };
 
+use crate::time::{self, MonotonicInstant};
+use crate::timer::{Timer, TimerKind};
 use crate::wait::{WaitResult, Waiter, Waker};
 use crate::{fs::FsError, sync::SpinLock};
 
@@ -39,18 +41,41 @@ impl PollContext {
         self.state.lock().triggered
     }
 
-    /// 在无业务锁、无用户复制的窗口安装唯一 Waiter，返回前撤 Waker 并结束等待。
-    pub fn park(&self, interruptible: bool) -> WaitResult {
+    /// 在无业务锁、无用户复制的窗口安装唯一 Waiter；期限和通知只唤醒本轮重查。
+    /// 无期限不建立定时器；返回先撤上下文 Waker、结束 Waiter，再确认实际 Timer 的回调尾部。
+    pub fn park_until(
+        &self,
+        interruptible: bool,
+        deadline: Option<MonotonicInstant>,
+    ) -> WaitResult {
         let waiter = if interruptible {
             Waiter::new_interruptible()
         } else {
             Waiter::new()
         };
+        let waker = core::pin::pin!(deadline.map(|_| waiter.waker()));
+        let timer = core::pin::pin!(waker.as_ref().as_pin_ref().map(|waker| {
+            Timer::new(
+                crate::cpu::current().id,
+                TimerKind::Precise,
+                poll_timeout,
+                waker.get_ref() as *const Waker as usize,
+            )
+        }));
+        if let Some(limit) = deadline {
+            let timer = timer
+                .as_ref()
+                .as_pin_ref()
+                .expect("poll deadline has no timer");
+            // SAFETY: Timer 和 Waker 均固定在本栈，回调只读取 Waker；每条返回路径
+            // 先撤上下文并结束活等待，再同步确认回调尾部，期间两份存储不移动或退栈。
+            unsafe { timer.arm_borrowed(limit) }.expect("fresh precise poll timer rejected");
+        }
         {
             let mut state = self.state.lock();
             assert!(state.waker.is_none(), "poll context already parked");
             state.waker = Some(waiter.waker());
-            if state.triggered {
+            if state.triggered || deadline.is_some_and(|limit| limit <= time::now()) {
                 state.waker.as_ref().unwrap().notify();
             }
         }
@@ -60,11 +85,22 @@ impl PollContext {
             waiter.park();
             WaitResult::Woken
         };
-        let waker = self.state.lock().waker.take();
-        drop(waker);
+        let installed = self.state.lock().waker.take();
+        drop(installed);
         drop(waiter);
+        if let Some(timer) = timer.as_ref().as_pin_ref() {
+            timer.cancel_sync();
+        }
         result
     }
+}
+
+/// 精确硬 IRQ 只通知固定栈 Waker，调用者同步停止节点后才结束上下文存储。
+fn poll_timeout(timer: Pin<&Timer>) {
+    // SAFETY: park_until 以固定栈 Waker 地址构造 context；同步 cancel_sync 确认
+    // 真实回调尾部以前保持该存储有效，回调不取得 provider 或用户访问锁。
+    let waker = unsafe { &*(timer.context() as *const Waker) };
+    waker.notify();
 }
 
 impl PollNotify for PollContext {

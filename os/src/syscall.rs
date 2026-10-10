@@ -4,6 +4,7 @@ mod error;
 mod file;
 mod futex;
 mod memory;
+mod poll;
 pub(crate) mod signal;
 mod task;
 pub(crate) mod time;
@@ -117,6 +118,9 @@ pub(crate) fn resolve_restart(user: &UserThread, state: Restart, handler_flags: 
 /// 分派已支持的真实调用，未知编号保持ENOSYS；控制结果不落入普通写寄存器尾部。
 pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let raw = request.arguments;
+    if matches!(request.number, 20..=22 | 72 | 73) {
+        return poll::dispatch(user, request);
+    }
     if request.number == 98 {
         return futex::dispatch(user, request);
     }

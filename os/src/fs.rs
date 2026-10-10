@@ -3,6 +3,7 @@
 pub(crate) mod background;
 mod dentry;
 pub(crate) mod devfs;
+pub(crate) mod epoll;
 pub(crate) mod ext4;
 mod file;
 mod file_table;
