@@ -746,66 +746,88 @@ class ResourceAndUARTTests(unittest.TestCase):
                     guest.close()
 
     def test_duplex_payloads_use_independent_offsets_and_preserve_full_duplex_bytes(self):
-        """同一真实socket交错传入和读取payload，逐段校验各自全文偏移。"""
+        """真实socket按正常及ACK合包次序交错收发，保留各阶段全文与独立偏移。"""
         payload = b"\x00\xff\xe7\x95\x8c\nsecond-rx"
         transmitted = b"echo\x00\xff\xe7\x95\x8c\nsecond-tx"
         phases = ((payload[:3], transmitted[:6]), (payload[3:], transmitted[6:]))
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            source = base / "input"
-            expected = base / "expected"
-            source.write_bytes(payload)
-            expected.write_bytes(transmitted)
-            host, guest = socket.socketpair()
-            guest.settimeout(2)
-            peer_errors = []
+        for mode in ("normal", "coalesced"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                source = base / "input"
+                expected = base / "expected"
+                source.write_bytes(payload)
+                expected.write_bytes(transmitted)
+                host, guest = socket.socketpair()
+                guest.settimeout(2)
+                peer_errors = []
+                next_handshake = threading.Event()
 
-            def peer():
+                def peer():
+                    """逐段核对真实payload和ACK，合包时等待后继握手已发送并留给下一阶段。"""
+                    try:
+                        for index, (rx, tx) in enumerate(phases):
+                            self.assertEqual(guest.recv(1), b"H")
+                            guest.sendall(tx)
+                            received = bytearray()
+                            while len(received) < len(rx):
+                                received.extend(guest.recv(len(rx) - len(received)))
+                            self.assertEqual(received, rx)
+                            expected_ack = f"KTEST IO OK {index}\n".encode()
+                            if mode == "coalesced" and index == 0:
+                                self.assertTrue(next_handshake.wait(2), "next handshake was not sent before ACK")
+                            ack = bytearray()
+                            while len(ack) < len(expected_ack):
+                                part = guest.recv(len(expected_ack) - len(ack))
+                                self.assertTrue(part, "peer stream closed before ACK")
+                                ack.extend(part)
+                            self.assertEqual(ack, expected_ack)
+                    except BaseException as error:
+                        peer_errors.append(error)
+
+                worker = threading.Thread(target=peer)
                 try:
-                    for index, (rx, tx) in enumerate(phases):
-                        self.assertEqual(guest.recv(1), b"H")
-                        guest.sendall(tx)
-                        received = bytearray()
-                        while len(received) < len(rx):
-                            received.extend(guest.recv(len(rx) - len(received)))
-                        self.assertEqual(received, rx)
-                        ack = bytearray()
-                        while not ack.endswith(b"\n"):
-                            ack.extend(guest.recv(128))
-                        self.assertEqual(ack, f"KTEST IO OK {index}\n".encode())
-                except BaseException as error:
-                    peer_errors.append(error)
+                    vm = vm_fixture()
+                    if mode == "coalesced":
+                        original_send = vm.send
+                        handshake_count = 0
 
-            worker = threading.Thread(target=peer)
-            try:
-                vm = vm_fixture()
-                vm.args = options(uart_payload=source, uart_expect=expected)
-                vm.directory = base
-                vm.serial = host
-                host.setblocking(False)
-                vm.raw = io.BytesIO()
-                vm.buffer = bytearray()
-                vm.process = SimpleNamespace(poll=lambda: None)
-                worker.start()
-                for index, (rx, tx) in enumerate(phases):
-                    checksum = lambda data: f"{crc32c_update(0xFFFFFFFF, data) ^ 0xFFFFFFFF:08x}"
-                    declaration = dict(direction="duplex", rx_length=len(rx), rx_digest=checksum(rx),
-                                       rx_delay_ms=2, tx_length=len(tx), tx_digest=checksum(tx),
-                                       tx_delay_ms=1, case=index)
-                    vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
-                worker.join(timeout=2)
-                self.assertFalse(worker.is_alive())
-                self.assertEqual(peer_errors, [])
-                self.assertEqual((vm.rx_offset, vm.tx_offset), (len(payload), len(transmitted)))
-                vm.verify_resources(time.monotonic() + 2)
-                self.assertEqual(source.read_bytes(), payload)
-                self.assertEqual(expected.read_bytes(), transmitted)
-                raw_parts = sorted(base.glob("uart-*.raw"))
-                self.assertEqual([path.read_bytes() for path in raw_parts], [part[1] for part in phases])
-            finally:
-                host.close()
-                guest.close()
-                worker.join(timeout=2)
+                        def observed_send(data, deadline):
+                            """原发送成功返回后记录握手次数，第二次真实H发送完成时通知peer。"""
+                            nonlocal handshake_count
+                            original_send(data, deadline)
+                            if data == b"H":
+                                handshake_count += 1
+                                if handshake_count == 2:
+                                    next_handshake.set()
+
+                        vm.send = observed_send
+                    vm.args = options(uart_payload=source, uart_expect=expected)
+                    vm.directory = base
+                    vm.serial = host
+                    host.setblocking(False)
+                    vm.raw = io.BytesIO()
+                    vm.buffer = bytearray()
+                    vm.process = SimpleNamespace(poll=lambda: None)
+                    worker.start()
+                    for index, (rx, tx) in enumerate(phases):
+                        checksum = lambda data: f"{crc32c_update(0xFFFFFFFF, data) ^ 0xFFFFFFFF:08x}"
+                        declaration = dict(direction="duplex", rx_length=len(rx), rx_digest=checksum(rx),
+                                           rx_delay_ms=2, tx_length=len(tx), tx_digest=checksum(tx),
+                                           tx_delay_ms=1, case=index)
+                        vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(peer_errors, [])
+                    self.assertEqual((vm.rx_offset, vm.tx_offset), (len(payload), len(transmitted)))
+                    vm.verify_resources(time.monotonic() + 2)
+                    self.assertEqual(source.read_bytes(), payload)
+                    self.assertEqual(expected.read_bytes(), transmitted)
+                    raw_parts = sorted(base.glob("uart-*.raw"))
+                    self.assertEqual([path.read_bytes() for path in raw_parts], [part[1] for part in phases])
+                finally:
+                    host.close()
+                    guest.close()
+                    worker.join(timeout=2)
 
     def test_duplex_consumes_buffered_prefix_and_leaves_next_control_line(self):
         """预读包含payload和后继控制行时只消费声明长度，不重复落盘或吞掉后继行。"""
