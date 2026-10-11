@@ -24,16 +24,14 @@ mod tcp;
 #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
 mod udp;
 
-use super::packet::*;
+use crate::iface::packet::*;
 
 use core::result::Result;
 use heapless::Vec;
 
 #[cfg(feature = "_proto-fragmentation")]
-use super::fragmentation::FragKey;
-#[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
-use super::fragmentation::PacketAssemblerSet;
-use super::fragmentation::{Fragmenter, FragmentsBuffer};
+use crate::iface::fragmentation::FragKey;
+use crate::iface::fragmentation::{Fragmenter, FragmentsBuffer, InterfaceBuffers};
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
@@ -125,6 +123,7 @@ pub struct InterfaceInner {
     pub caps: DeviceCapabilities,
     pub now: Instant,
     rand: Rand,
+    last_transmit_destination: Option<IpAddress>,
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: NeighborCache,
@@ -165,6 +164,118 @@ impl crate::socket::tcp::TcpContext for InterfaceInner {
     }
 }
 
+#[cfg(feature = "socket-udp")]
+impl crate::socket::udp::UdpContext for InterfaceInner {
+    /// UDP 广播判断沿同一接口地址配置。
+    fn is_broadcast(&self, address: &IpAddress) -> bool {
+        InterfaceInner::is_broadcast(self, address)
+    }
+
+    /// UDP 自动源选择沿接口原有双族算法。
+    fn get_source_address(&self, destination: &IpAddress) -> Option<IpAddress> {
+        InterfaceInner::get_source_address(self, destination)
+    }
+}
+
+/// 已解析传输输入的明确匹配结果；应答借用止于本轮接口处理。
+pub enum TransportResponse<'p> {
+    Matched(Option<Packet<'p>>),
+    Unmatched,
+}
+
+/// 静态传输分派；实现不得将 RX 或重组工作区的借用留到下一轮。
+pub trait TransportIngress<'s> {
+    #[cfg(feature = "socket-tcp")]
+    /// 消费已验证 TCP 表示，匹配但无立即应答仍返回 Matched。
+    fn tcp<'p>(
+        &mut self,
+        cx: &mut InterfaceInner,
+        meta: PacketMeta,
+        ip: &IpRepr,
+        repr: &TcpRepr<'p>,
+    ) -> TransportResponse<'p>;
+    #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
+    /// 返回目标是否匹配；目标接收缓冲满仍算匹配。
+    fn udp(
+        &mut self,
+        cx: &mut InterfaceInner,
+        meta: PacketMeta,
+        ip: &IpRepr,
+        repr: &UdpRepr,
+        payload: &[u8],
+    ) -> bool;
+    /// 为库原有 raw、ICMP、DHCP 消费者提供可选视图。
+    fn socket_set(&mut self) -> Option<&mut SocketSet<'s>>;
+    /// 本次输入已由同域核对的本机目的；不保存到接口地址表。
+    fn local_destination(&self) -> Option<IpAddress> {
+        None
+    }
+}
+
+impl<'s> TransportIngress<'s> for SocketSet<'s> {
+    #[cfg(feature = "socket-tcp")]
+    /// 原 SocketSet 的 TCP 消费者保留成熟 raw 状态机。
+    fn tcp<'p>(
+        &mut self,
+        cx: &mut InterfaceInner,
+        _meta: PacketMeta,
+        ip: &IpRepr,
+        repr: &TcpRepr<'p>,
+    ) -> TransportResponse<'p> {
+        for socket in self
+            .items_mut()
+            .filter_map(|item| crate::socket::tcp::Socket::downcast_mut(&mut item.socket))
+        {
+            if socket.accepts(ip, repr) {
+                return TransportResponse::Matched(
+                    socket
+                        .process(cx, ip, repr, repr.payload)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp))),
+                );
+            }
+        }
+        TransportResponse::Unmatched
+    }
+
+    #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
+    /// UDP 满时仅丢未接纳记录，DNS 仍沿原合法消费者分派。
+    fn udp(
+        &mut self,
+        cx: &mut InterfaceInner,
+        meta: PacketMeta,
+        ip: &IpRepr,
+        repr: &UdpRepr,
+        payload: &[u8],
+    ) -> bool {
+        #[cfg(feature = "socket-udp")]
+        for socket in self
+            .items_mut()
+            .filter_map(|item| crate::socket::udp::Socket::downcast_mut(&mut item.socket))
+        {
+            if socket.accepts(cx, ip, repr) {
+                socket.process(cx, meta, ip, repr, payload);
+                return true;
+            }
+        }
+        #[cfg(feature = "socket-dns")]
+        for socket in self
+            .items_mut()
+            .filter_map(|item| crate::socket::dns::Socket::downcast_mut(&mut item.socket))
+        {
+            if socket.accepts(ip, repr) {
+                socket.process(cx, ip, repr, payload);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 原 SocketSet 自身提供其它 feature 消费者视图。
+    fn socket_set(&mut self) -> Option<&mut SocketSet<'s>> {
+        Some(self)
+    }
+}
+
 /// Configuration structure used for creating a network interface.
 #[non_exhaustive]
 pub struct Config {
@@ -201,12 +312,13 @@ impl Config {
 }
 
 impl Interface {
-    /// Create a network interface using the previously provided configuration.
-    ///
-    /// # Panics
-    /// This function panics if the [`Config::hardware_address`] does not match
-    /// the medium of the device.
-    pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
+    /// 取得已准备工作区并构造小接口对象，介质必须匹配设备能力。
+    pub fn new(
+        config: Config,
+        device: &mut (impl Device + ?Sized),
+        now: Instant,
+        buffers: InterfaceBuffers,
+    ) -> Self {
         let caps = device.capabilities();
         assert_eq!(
             config.hardware_addr.medium(),
@@ -249,16 +361,8 @@ impl Interface {
         }
 
         Interface {
-            fragments: FragmentsBuffer {
-                #[cfg(feature = "proto-sixlowpan")]
-                decompress_buf: [0u8; sixlowpan::MAX_DECOMPRESSED_LEN],
-
-                #[cfg(feature = "_proto-fragmentation")]
-                assembler: PacketAssemblerSet::new(),
-                #[cfg(feature = "_proto-fragmentation")]
-                reassembly_timeout: Duration::from_secs(60),
-            },
-            fragmenter: Fragmenter::new(),
+            fragments: buffers.fragments,
+            fragmenter: buffers.fragmenter,
             inner: InterfaceInner {
                 now,
                 caps,
@@ -281,8 +385,135 @@ impl Interface {
                 #[cfg(feature = "proto-sixlowpan")]
                 sixlowpan_address_context: Vec::new(),
                 rand,
+                last_transmit_destination: None,
             },
         }
+    }
+
+    /// 读取最近一份实际接纳软件 frame 的 IP 目的；ARP 对应 None。
+    /// 调用者只在自己的 frame 槽从空变满后消费这份瞬时信息。
+    pub fn last_transmit_destination(&self) -> Option<IpAddress> {
+        self.inner.last_transmit_destination
+    }
+
+    /// 使用原编码和分片状态发送；token 必须实际保活一份 frame。
+    pub fn dispatch_ip<Tx: TxToken>(
+        &mut self,
+        timestamp: Instant,
+        tx_token: Tx,
+        meta: PacketMeta,
+        packet: Packet<'_>,
+    ) -> Result<(), DispatchError> {
+        self.inner.now = timestamp;
+        self.inner
+            .dispatch_ip(tx_token, meta, packet, &mut self.fragmenter)
+    }
+
+    /// 只推进当前报文的尾片，不扫描 SocketSet。
+    pub fn poll_fragmentation(&mut self, timestamp: Instant, device: &mut (impl Device + ?Sized)) {
+        self.inner.now = timestamp;
+        match self.inner.caps.medium {
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                #[cfg(feature = "proto-sixlowpan-fragmentation")]
+                self.sixlowpan_egress(device);
+            }
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
+            _ => {
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                self.ipv4_egress(device);
+            }
+        }
+    }
+
+    /// 清除真实到期重组；邻居有效期仍由原 lookup 判断。
+    pub fn poll_maintenance(&mut self, timestamp: Instant) {
+        self.inner.now = timestamp;
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.remove_expired(timestamp);
+    }
+
+    /// 返回仍占用重组槽的最早期限。
+    pub fn maintenance_deadline(&self) -> Option<Instant> {
+        #[cfg(feature = "_proto-fragmentation")]
+        {
+            self.fragments.assembler.deadline()
+        }
+        #[cfg(not(feature = "_proto-fragmentation"))]
+        {
+            None
+        }
+    }
+
+    /// 尚未交出全部尾片时保留唯一 fragmenter 的责任。
+    pub fn fragmentation_pending(&self) -> bool {
+        #[cfg(feature = "_proto-fragmentation")]
+        {
+            !self.fragmenter.is_empty() && !self.fragmenter.finished()
+        }
+        #[cfg(not(feature = "_proto-fragmentation"))]
+        {
+            false
+        }
+    }
+
+    /// 从真实地址配置判定本机，包括 IP loopback 接口的 127/8。
+    pub fn is_local(&self, address: IpAddress) -> bool {
+        self.inner.is_local(address)
+    }
+
+    /// 只读本接口地址和 Routes，选择实际可用源及 IP MTU。
+    pub fn resolve_route(
+        &self,
+        destination: IpAddress,
+        bound_source: IpAddress,
+    ) -> Result<(IpAddress, usize), DispatchError> {
+        if destination.is_unspecified() || destination.version() != bound_source.version() {
+            return Err(DispatchError::NoRoute);
+        }
+        if !self.is_local(destination)
+            && !destination.is_multicast()
+            && self.inner.route(&destination, self.inner.now).is_none()
+        {
+            return Err(DispatchError::NoRoute);
+        }
+        let source = if bound_source.is_unspecified() {
+            let selected = self
+                .inner
+                .get_source_address(&destination)
+                .ok_or(DispatchError::NoRoute)?;
+            if !self.is_local(selected) {
+                return Err(DispatchError::NoRoute);
+            }
+            selected
+        } else {
+            bound_source
+        };
+        if source.is_unspecified() || source.version() != destination.version() {
+            return Err(DispatchError::NoRoute);
+        }
+        Ok((source, self.inner.caps.ip_mtu()))
+    }
+
+    /// 针对真正待发目的返回原邻居限速状态的可重试时间。
+    pub fn egress_deadline(&self, destination: IpAddress, timestamp: Instant) -> Option<Instant> {
+        if destination.is_multicast()
+            || self.inner.is_broadcast(&destination)
+            || destination.is_unspecified()
+        {
+            return None;
+        }
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        {
+            #[cfg(feature = "medium-ip")]
+            if self.inner.caps.medium == Medium::Ip {
+                return None;
+            }
+            let routed = self.inner.route(&destination, timestamp)?;
+            return self.inner.neighbor_cache.retry_deadline(&routed, timestamp);
+        }
+        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+        None
     }
 
     /// Get the socket context.
@@ -510,18 +741,12 @@ impl Interface {
         self.socket_egress(device, sockets)
     }
 
-    /// Process one incoming packet queued in the device.
-    ///
-    /// Returns a value indicating:
-    /// - whether a packet was processed, in which case you have to call this method again in case there's more packets queued.
-    /// - whether the state of any socket might have changed.
-    ///
-    /// Since it processes at most one packet, this is guaranteed to always perform a bounded amount of work.
-    pub fn poll_ingress_single(
+    /// 同步处理至多一份输入；传输捕获必须在 RX 或重组借用结束前完成。
+    pub fn poll_ingress_single<'s>(
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut impl TransportIngress<'s>,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
@@ -531,19 +756,13 @@ impl Interface {
         self.socket_ingress(device, sockets)
     }
 
-    /// Return a _soft deadline_ for calling [poll] the next time.
-    /// The [Instant] returned is the time at which you should call [poll] next.
-    /// It is harmless (but wastes energy) to call it before the [Instant], and
-    /// potentially harmful (impacting quality of service) to call it after the
-    /// [Instant]
-    ///
-    /// [poll]: #method.poll
-    /// [Instant]: struct.Instant.html
+    /// 合并原 socket 期限和真实重组到期，未交出尾片沿原立即推进语义。
     pub fn poll_at(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Instant> {
         self.inner.now = timestamp;
+        let maintenance = self.maintenance_deadline();
 
         #[cfg(feature = "_proto-fragmentation")]
-        if !self.fragmenter.is_empty() {
+        if self.fragmentation_pending() {
             return Some(Instant::from_millis(0));
         }
 
@@ -562,6 +781,7 @@ impl Interface {
                     PollAt::Now => Some(Instant::from_millis(0)),
                 }
             })
+            .chain(maintenance)
             .min()
     }
 
@@ -581,10 +801,11 @@ impl Interface {
         }
     }
 
-    fn socket_ingress(
+    /// 接口同步处理保持原配对 TX token 的控制应答责任。
+    fn socket_ingress<'s>(
         &mut self,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut impl TransportIngress<'s>,
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
             return PollIngressSingleResult::None;
@@ -654,6 +875,7 @@ impl Interface {
         })
     }
 
+    /// 库原 SocketSet 发送逐对象分派，满分片工作区不误作邻居等待。
     fn socket_egress(
         &mut self,
         device: &mut (impl Device + ?Sized),
@@ -685,7 +907,10 @@ impl Interface {
 
                 inner
                     .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+                    .map_err(|err| match err {
+                        DispatchError::Exhausted => EgressError::Exhausted,
+                        _ => EgressError::Dispatch,
+                    })?;
 
                 result = PollResult::SocketStateChanged;
 
@@ -861,9 +1086,10 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "medium-ip")]
-    fn process_ip<'frame>(
+    /// 按原 IP 线格式校验分族，借用只在同步分派内有效。
+    fn process_ip<'frame, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         ip_payload: &'frame [u8],
         frag: &'frame mut FragmentsBuffer,
@@ -885,12 +1111,16 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "socket-raw")]
-    fn raw_socket_filter(
+    /// 有 SocketSet 视图时保留原 raw 消费者；不存在视图不影响控制算法。
+    fn raw_socket_filter<'s>(
         &mut self,
-        sockets: &mut SocketSet,
+        ingress: &mut impl TransportIngress<'s>,
         ip_repr: &IpRepr,
         ip_payload: &[u8],
     ) -> bool {
+        let Some(sockets) = ingress.socket_set() else {
+            return false;
+        };
         let mut handled_by_raw_socket = false;
 
         // Pass every IP packet to all raw sockets we have registered.
@@ -949,6 +1179,22 @@ impl InterfaceInner {
                 self.dispatch_ip(tx_token, PacketMeta::default(), packet, frag)
             }
         }
+    }
+
+    /// 本机查询使用真实地址；仅 IP 介质的配置授权 loopback 子网。
+    fn is_local(&self, address: IpAddress) -> bool {
+        if self.has_ip_addr(address) {
+            return true;
+        }
+        #[cfg(all(feature = "medium-ip", feature = "proto-ipv4"))]
+        if self.caps.medium == Medium::Ip {
+            if let IpAddress::Ipv4(address) = address {
+                return address.is_loopback() && self.ip_addrs.iter().any(|cidr| {
+                    matches!(cidr, IpCidr::Ipv4(cidr) if cidr.address().is_loopback() && cidr.contains_addr(&address))
+                });
+            }
+        }
+        false
     }
 
     pub fn in_same_network(&self, addr: &IpAddress) -> bool {
@@ -1134,6 +1380,7 @@ impl InterfaceInner {
         self.neighbor_cache.flush()
     }
 
+    /// 使用已有工作区编码报文；无法接纳完整报文时明确返回错误。
     fn dispatch_ip<Tx: TxToken>(
         &mut self,
         // NOTE(unused_mut): tx_token isn't always mutated, depending on
@@ -1145,6 +1392,15 @@ impl InterfaceInner {
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
+        let total_ip_len = ip_repr.buffer_len();
+        #[cfg(feature = "_proto-fragmentation")]
+        if !frag.is_empty() && !frag.finished() && self.caps.ip_mtu() < total_ip_len {
+            return Err(DispatchError::Exhausted);
+        }
+        #[cfg(feature = "_proto-fragmentation")]
+        if frag.finished() {
+            frag.reset();
+        }
 
         // Dispatch IEEE802.15.4:
 
@@ -1154,8 +1410,32 @@ impl InterfaceInner {
                 self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?;
             let addr = addr.ieee802154_or_panic();
 
-            self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
-            return Ok(());
+            return self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
+        }
+        match ip_repr {
+            #[cfg(feature = "proto-ipv4")]
+            IpRepr::Ipv4(_) => {
+                if 65535 < total_ip_len {
+                    return Err(DispatchError::PacketTooLarge);
+                }
+                if self.caps.ip_mtu() < total_ip_len {
+                    #[cfg(feature = "proto-ipv4-fragmentation")]
+                    if frag.buffer.len() < total_ip_len
+                        || self.caps.ip_mtu() < ip_repr.header_len() + 8
+                    {
+                        return Err(DispatchError::PacketTooLarge);
+                    }
+                    #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+                    return Err(DispatchError::PacketTooLarge);
+                }
+            }
+            #[cfg(feature = "proto-ipv6")]
+            IpRepr::Ipv6(_) => {
+                if self.caps.ip_mtu() < total_ip_len || 65535 < total_ip_len - ip_repr.header_len()
+                {
+                    return Err(DispatchError::PacketTooLarge);
+                }
+            }
         }
 
         // Dispatch IP/Ethernet:
@@ -1215,27 +1495,22 @@ impl InterfaceInner {
 
         let total_ip_len = ip_repr.buffer_len();
 
-        match &mut ip_repr {
+        let result = match &mut ip_repr {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                if total_ip_len > self.caps.ip_mtu() {
+                if self.caps.ip_mtu() < total_ip_len {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
                         net_debug!("start fragmentation");
 
-                        // Calculate how much we will send now (including the Ethernet header).
-                        let tx_len = self.caps.max_transmission_unit;
-
                         let ip_header_len = repr.buffer_len();
-                        let first_frag_ip_len = self.caps.ip_mtu();
-
-                        if frag.buffer.len() < total_ip_len {
-                            net_debug!(
-                                "Fragmentation buffer is too small, at least {} needed. Dropping",
-                                total_ip_len
-                            );
-                            return Ok(());
+                        let first_frag_ip_len =
+                            ip_header_len + ((self.caps.ip_mtu() - ip_header_len) / 8) * 8;
+                        let mut tx_len = first_frag_ip_len;
+                        #[cfg(feature = "medium-ethernet")]
+                        if matches!(self.caps.medium, Medium::Ethernet) {
+                            tx_len += EthernetFrame::<&[u8]>::header_len();
                         }
 
                         #[cfg(feature = "medium-ethernet")]
@@ -1249,17 +1524,14 @@ impl InterfaceInner {
 
                         // Save the IP header for other fragments.
                         frag.ipv4.repr = *repr;
+                        frag.meta = meta;
 
-                        // Save how much bytes we will send now.
-                        frag.sent_bytes = first_frag_ip_len;
-
-                        // Modify the IP header
-                        repr.payload_len = first_frag_ip_len - repr.buffer_len();
-
-                        // Emit the IP header to the buffer.
-                        emit_ip(&ip_repr, &mut frag.buffer);
+                        // 完整原始表示先写后备，首片头长度只在完整 payload 编码后修改。
+                        emit_ip(&packet.ip_repr(), &mut frag.buffer[..total_ip_len]);
+                        repr.payload_len = first_frag_ip_len - ip_header_len;
 
                         let mut ipv4_packet = Ipv4Packet::new_unchecked(&mut frag.buffer[..]);
+                        repr.emit(&mut ipv4_packet, &caps.checksum);
                         frag.ipv4.ident = ipv4_id;
                         ipv4_packet.set_ident(ipv4_id);
                         ipv4_packet.set_more_frags(true);
@@ -1271,6 +1543,7 @@ impl InterfaceInner {
                         }
 
                         // Transmit the first packet.
+                        tx_token.set_meta(meta);
                         tx_token.consume(tx_len, |mut tx_buffer| {
                             #[cfg(feature = "medium-ethernet")]
                             if matches!(self.caps.medium, Medium::Ethernet) {
@@ -1284,6 +1557,7 @@ impl InterfaceInner {
                             // Copy the IP header and the payload.
                             tx_buffer[..first_frag_ip_len]
                                 .copy_from_slice(&frag.buffer[..first_frag_ip_len]);
+                            frag.sent_bytes = first_frag_ip_len;
 
                             Ok(())
                         })
@@ -1291,8 +1565,7 @@ impl InterfaceInner {
 
                     #[cfg(not(feature = "proto-ipv4-fragmentation"))]
                     {
-                        net_debug!("Enable the `proto-ipv4-fragmentation` feature for fragmentation support.");
-                        Ok(())
+                        Err(DispatchError::PacketTooLarge)
                     }
                 } else {
                     tx_token.set_meta(meta);
@@ -1312,23 +1585,30 @@ impl InterfaceInner {
             }
             // We don't support IPv6 fragmentation yet.
             #[cfg(feature = "proto-ipv6")]
-            IpRepr::Ipv6(_) => tx_token.consume(total_len, |mut tx_buffer| {
-                #[cfg(feature = "medium-ethernet")]
-                if matches!(self.caps.medium, Medium::Ethernet) {
-                    emit_ethernet(&ip_repr, tx_buffer)?;
-                    tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                }
+            IpRepr::Ipv6(_) => {
+                tx_token.set_meta(meta);
+                tx_token.consume(total_len, |mut tx_buffer| {
+                    #[cfg(feature = "medium-ethernet")]
+                    if matches!(self.caps.medium, Medium::Ethernet) {
+                        emit_ethernet(&ip_repr, tx_buffer)?;
+                        tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+                    }
 
-                emit_ip(&ip_repr, tx_buffer);
-                Ok(())
-            }),
+                    emit_ip(&ip_repr, tx_buffer);
+                    Ok(())
+                })
+            }
+        };
+        if result.is_ok() {
+            self.last_transmit_destination = Some(packet.ip_repr().dst_addr());
         }
+        result
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-enum DispatchError {
+pub enum DispatchError {
     /// No route to dispatch this packet. Retrying won't help unless
     /// configuration is changed.
     NoRoute,
@@ -1336,4 +1616,8 @@ enum DispatchError {
     /// the neighbor for it yet. Discovery has been initiated, dispatch
     /// should be retried later.
     NeighborPending,
+    /// 完整合法包超出介质或预备工作区容量。
+    PacketTooLarge,
+    /// 原分片后备仍持有尚未全部交出的报文。
+    Exhausted,
 }

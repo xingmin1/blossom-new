@@ -2,7 +2,6 @@ use core::cmp::min;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
-use crate::iface::Context;
 use crate::phy::PacketMeta;
 use crate::socket::PollAt;
 #[cfg(feature = "async")]
@@ -10,25 +9,61 @@ use crate::socket::WakerRegistration;
 use crate::storage::Empty;
 use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr};
 
-/// Metadata for a sent or received UDP packet.
+/// UDP 单对象处理使用的本机广播判断与源地址选择。
+pub trait UdpContext {
+    /// 判断目的地址是否为当前介质的广播地址。
+    fn is_broadcast(&self, address: &IpAddress) -> bool;
+
+    /// 返回已选择的本机源地址；无可用源时返回 None。
+    fn get_source_address(&self, destination: &IpAddress) -> Option<IpAddress>;
+}
+
+/// 保存锁外已确定的源地址和当前介质广播地址，不拥有接口或路由状态。
+#[derive(Debug, Clone, Copy)]
+pub struct UdpContextState {
+    source: Option<IpAddress>,
+    broadcast: Option<IpAddress>,
+}
+
+impl UdpContextState {
+    /// 构造当前一次操作所需的小值环境。
+    pub const fn new(source: Option<IpAddress>, broadcast: Option<IpAddress>) -> Self {
+        Self { source, broadcast }
+    }
+}
+
+impl UdpContext for UdpContextState {
+    /// IPv4 全局广播和当前介质广播均使用同一广播判断。
+    fn is_broadcast(&self, address: &IpAddress) -> bool {
+        address.is_broadcast() || self.broadcast == Some(*address)
+    }
+
+    /// 仅返回与目的协议族一致的已选源地址。
+    fn get_source_address(&self, destination: &IpAddress) -> Option<IpAddress> {
+        self.source
+            .filter(|source| source.version() == destination.version())
+    }
+}
+
+/// 同一 UDP 消息的远端、本机地址与逐包设备 metadata。
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct UdpMetadata {
     pub endpoint: IpEndpoint,
-    /// The IP address to which an incoming datagram was sent, or to which an outgoing datagram
-    /// will be sent. Incoming datagrams always have this set. On outgoing datagrams, if it is not
-    /// set, and the socket is not bound to a single address anyway, a suitable address will be
-    /// determined using the algorithms of RFC 6724 (candidate source address selection) or some
-    /// heuristic (for IPv4).
+    /// RX 的目的 IP；TX 的真实源 IP。省略 TX 源时沿绑定地址和 Context 选择。
     pub local_address: Option<IpAddress>,
+    /// 本条 TX 的真实源端口，保持跨解绑或重新绑定的旧消息身份；RX 保持 None。
+    pub local_port: Option<u16>,
     pub meta: PacketMeta,
 }
 
 impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
+    /// 从远端构造默认 metadata；未指定的本机字段由实际处理路径决定。
     fn from(value: T) -> Self {
         Self {
             endpoint: value.into(),
             local_address: None,
+            local_port: None,
             meta: PacketMeta::default(),
         }
     }
@@ -119,6 +154,8 @@ pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
+    rx_budget: usize,
+    tx_budget: usize,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
     #[cfg(feature = "async")]
@@ -128,10 +165,12 @@ pub struct Socket<'a> {
 }
 
 impl<'a> Socket<'a> {
-    /// Create an UDP socket with the given buffers.
+    /// 使用同一对 PacketBuffer 构造 socket，默认预算为各自物理 payload 容量。
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
+            rx_budget: rx_buffer.payload_capacity(),
+            tx_budget: tx_buffer.payload_capacity(),
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -236,6 +275,16 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
+    /// 更新已由调用者持租约确认的 binding；port0 解除绑定，但不删除旧 RX/TX 消息。
+    pub fn set_endpoint(&mut self, endpoint: IpListenEndpoint) {
+        self.endpoint = endpoint;
+        #[cfg(feature = "async")]
+        {
+            self.rx_waker.wake();
+            self.tx_waker.wake();
+        }
+    }
+
     /// Close the socket.
     pub fn close(&mut self) {
         // Clear the bound endpoint of the socket.
@@ -258,10 +307,22 @@ impl<'a> Socket<'a> {
         self.endpoint.port != 0
     }
 
-    /// Check whether the transmit buffer is full.
+    /// 查询当前是否能接纳至少一个 payload 字节；零消息使用 can_send_size(0)。
     #[inline]
     pub fn can_send(&self) -> bool {
-        !self.tx_buffer.is_full()
+        self.can_send_size(1)
+    }
+
+    /// 同时核对预算、metadata 和原环连续空间；零消息仍占用一个 metadata。
+    pub fn can_send_size(&self, size: usize) -> bool {
+        self.tx_buffer
+            .enqueue_payload_cost(size)
+            .is_some_and(|cost| {
+                cost <= self
+                    .tx_budget
+                    .saturating_sub(self.tx_buffer.payload_bytes_count())
+                    && self.tx_buffer.payload_bytes_count() <= self.tx_budget
+            })
     }
 
     /// Check whether the receive buffer is not empty.
@@ -294,13 +355,35 @@ impl<'a> Socket<'a> {
         self.tx_buffer.payload_capacity()
     }
 
-    /// Enqueue a packet to be sent to a given remote endpoint, and return a pointer
-    /// to its payload.
-    ///
-    /// This function returns `Err(Error::Exhausted)` if the transmit buffer is full,
-    /// `Err(Error::Unaddressable)` if local or remote port, or remote address are unspecified,
-    /// and `Err(Error::Truncated)` if there is not enough transmit buffer capacity
-    /// to ever send this packet.
+    /// 返回接收接纳预算，物理容量仍由 payload_recv_capacity 查询。
+    pub fn recv_budget(&self) -> usize {
+        self.rx_budget
+    }
+
+    /// 返回发送接纳预算，包含同一 payload 环预留的 padding。
+    pub fn send_budget(&self) -> usize {
+        self.tx_budget
+    }
+
+    /// 在物理范围内修改后继接收预算，已有消息保持完整。
+    pub fn set_recv_budget(&mut self, budget: usize) {
+        assert!(1 <= budget && budget <= self.rx_buffer.payload_capacity());
+        self.rx_budget = budget;
+    }
+
+    /// 在物理范围内修改后继发送预算，不删除已接纳消息。
+    pub fn set_send_budget(&mut self, budget: usize) {
+        assert!(1 <= budget && budget <= self.tx_buffer.payload_capacity());
+        #[cfg(feature = "async")]
+        let could_send = self.can_send();
+        self.tx_budget = budget;
+        #[cfg(feature = "async")]
+        if !could_send && self.can_send() {
+            self.tx_waker.wake();
+        }
+    }
+
+    /// 向同一 TX 环接纳完整消息并借出 payload；地址无效或空间不足时不提交记录。
     pub fn send(
         &mut self,
         size: usize,
@@ -315,6 +398,9 @@ impl<'a> Socket<'a> {
         }
         if meta.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
+        }
+        if !self.can_send_size(size) {
+            return Err(SendError::BufferFull);
         }
 
         let payload_buf = self
@@ -331,11 +417,7 @@ impl<'a> Socket<'a> {
         Ok(payload_buf)
     }
 
-    /// Enqueue a packet to be send to a given remote endpoint and pass the buffer
-    /// to the provided closure. The closure then returns the size of the data written
-    /// into the buffer.
-    ///
-    /// Also see [send](#method.send).
+    /// 按 max_size 预留预算和连续空间，提交闭包实际写入的一条消息。
     pub fn send_with<F>(
         &mut self,
         max_size: usize,
@@ -355,6 +437,9 @@ impl<'a> Socket<'a> {
         if meta.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
         }
+        if !self.can_send_size(max_size) {
+            return Err(SendError::BufferFull);
+        }
 
         let size = self
             .tx_buffer
@@ -370,9 +455,7 @@ impl<'a> Socket<'a> {
         Ok(size)
     }
 
-    /// Enqueue a packet to be sent to a given remote endpoint, and fill it from a slice.
-    ///
-    /// See also [send](#method.send).
+    /// 将一条完整消息复制到原 TX 环；预算不足时不复制或提交前缀。
     pub fn send_slice(
         &mut self,
         data: &[u8],
@@ -475,7 +558,8 @@ impl<'a> Socket<'a> {
         self.rx_buffer.payload_bytes_count()
     }
 
-    pub fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
+    /// 在不取得接口状态的情况下判断端口、本机地址和广播匹配。
+    pub fn accepts<C: UdpContext>(&self, cx: &mut C, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
         if self.endpoint.port != repr.dst_port {
             return false;
         }
@@ -490,14 +574,15 @@ impl<'a> Socket<'a> {
         true
     }
 
-    pub fn process<P: crate::storage::SliceLike<Item = u8>>(
+    /// 把匹配的消息复制入唯一 RX 环；返回真实接纳事实，满时只丢弃本次输入。
+    pub fn process<C: UdpContext, P: crate::storage::SliceLike<Item = u8>>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut C,
         meta: PacketMeta,
         ip_repr: &IpRepr,
         repr: &UdpRepr,
         payload: P,
-    ) {
+    ) -> bool {
         debug_assert!(self.accepts(cx, ip_repr, repr));
 
         let size = payload.len();
@@ -517,25 +602,39 @@ impl<'a> Socket<'a> {
         let metadata = UdpMetadata {
             endpoint: remote_endpoint,
             local_address: Some(ip_repr.dst_addr()),
+            local_port: None,
             meta,
         };
 
-        match self.rx_buffer.enqueue(size, metadata) {
-            Ok(buf) => payload.copy_to_slice(buf),
-            Err(_) => net_trace!(
-                "udp:{}:{}: buffer full, dropped incoming packet",
-                self.endpoint,
-                remote_endpoint
-            ),
+        let fits = self
+            .rx_buffer
+            .enqueue_payload_cost(size)
+            .is_some_and(|cost| {
+                cost <= self
+                    .rx_budget
+                    .saturating_sub(self.rx_buffer.payload_bytes_count())
+                    && self.rx_buffer.payload_bytes_count() <= self.rx_budget
+            });
+        if fits {
+            if let Ok(buf) = self.rx_buffer.enqueue(size, metadata) {
+                payload.copy_to_slice(buf);
+                #[cfg(feature = "async")]
+                self.rx_waker.wake();
+                return true;
+            }
         }
-
-        #[cfg(feature = "async")]
-        self.rx_waker.wake();
+        net_trace!(
+            "udp:{}:{}: buffer full, dropped incoming packet",
+            self.endpoint,
+            remote_endpoint
+        );
+        false
     }
 
-    pub fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
+    /// 借出队首完整消息；emit 失败时保留同一 metadata 和 payload 供后续重试。
+    pub fn dispatch<C: UdpContext, F, E>(&mut self, cx: &mut C, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut Context, PacketMeta, (IpRepr, UdpRepr, &[u8])) -> Result<(), E>,
+        F: FnOnce(&mut C, PacketMeta, (IpRepr, UdpRepr, &[u8])) -> Result<(), E>,
     {
         let endpoint = self.endpoint;
         let hop_limit = self.hop_limit.unwrap_or(64);
@@ -568,7 +667,7 @@ impl<'a> Socket<'a> {
             );
 
             let repr = UdpRepr {
-                src_port: endpoint.port,
+                src_port: packet_meta.local_port.unwrap_or(endpoint.port),
                 dst_port: packet_meta.endpoint.port,
             };
             let ip_repr = IpRepr::new(
@@ -592,7 +691,8 @@ impl<'a> Socket<'a> {
         }
     }
 
-    pub fn poll_at(&self, _cx: &mut Context) -> PollAt {
+    /// 根据真实 TX 记录判断单对象是否有待发送责任。
+    pub fn poll_at<C: UdpContext>(&self, _cx: &mut C) -> PollAt {
         if self.tx_buffer.is_empty() {
             PollAt::Ingress
         } else {
@@ -605,10 +705,6 @@ impl<'a> Socket<'a> {
 mod test {
     use super::*;
     use crate::wire::{IpRepr, UdpRepr};
-
-    use crate::phy::Medium;
-    use crate::tests::setup;
-    use rstest::*;
 
     fn buffer(packets: usize) -> PacketBuffer<'static> {
         PacketBuffer::new(
@@ -624,6 +720,11 @@ mod test {
         tx_buffer: PacketBuffer<'static>,
     ) -> Socket<'static> {
         Socket::new(rx_buffer, tx_buffer)
+    }
+
+    /// 为原 UDP 行为测试提供已选源地址，不构造 Interface 或设备。
+    fn context() -> UdpContextState {
+        UdpContextState::new(Some(LOCAL_ADDR.into()), None)
     }
 
     const LOCAL_PORT: u16 = 53;
@@ -667,8 +768,8 @@ mod test {
         }
     }
 
+    /// 构造当前实际 RX 消息的完整远端和本机名称。
     fn remote_metadata_with_local() -> UdpMetadata {
-        // Would be great as a const once we have const `.into()`.
         UdpMetadata {
             local_address: Some(LOCAL_ADDR.into()),
             ..REMOTE_END.into()
@@ -774,16 +875,10 @@ mod test {
         );
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_send_dispatch(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证失败 dispatch 保留同一消息，成功后才释放发送槽。
+    #[test]
+    fn test_send_dispatch() {
+        let cx = &mut context();
         let mut socket = socket(buffer(0), buffer(1));
 
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
@@ -824,16 +919,10 @@ mod test {
         assert!(socket.can_send());
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_recv_process(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证实际收到的首条消息及满槽丢弃。
+    #[test]
+    fn test_recv_process() {
+        let cx = &mut context();
 
         let mut socket = socket(buffer(1), buffer(0));
 
@@ -868,16 +957,10 @@ mod test {
         assert!(!socket.can_recv());
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_peek_process(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证 PEEK 后同一消息仍能完整消费。
+    #[test]
+    fn test_peek_process() {
+        let cx = &mut context();
 
         let mut socket = socket(buffer(1), buffer(0));
 
@@ -903,16 +986,10 @@ mod test {
         assert_eq!(socket.peek(), Err(RecvError::Exhausted));
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_recv_truncated_slice(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证短接收报错并消费整条消息。
+    #[test]
+    fn test_recv_truncated_slice() {
+        let cx = &mut context();
 
         let mut socket = socket(buffer(1), buffer(0));
 
@@ -931,16 +1008,10 @@ mod test {
         assert_eq!(socket.recv_slice(&mut slice[..]), Err(RecvError::Truncated));
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_peek_truncated_slice(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证短 PEEK 不消费，后续短接收消费整条消息。
+    #[test]
+    fn test_peek_truncated_slice() {
+        let cx = &mut context();
 
         let mut socket = socket(buffer(1), buffer(0));
 
@@ -960,16 +1031,10 @@ mod test {
         assert_eq!(socket.peek_slice(&mut slice[..]), Err(RecvError::Exhausted));
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_set_hop_limit(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证原 hop limit 进入实际发送 repr。
+    #[test]
+    fn test_set_hop_limit() {
+        let cx = &mut context();
 
         let mut s = socket(buffer(0), buffer(1));
 
@@ -995,16 +1060,10 @@ mod test {
         );
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_doesnt_accept_wrong_port(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证仅匹配实际绑定端口。
+    #[test]
+    fn test_doesnt_accept_wrong_port() {
+        let cx = &mut context();
 
         let mut socket = socket(buffer(1), buffer(0));
 
@@ -1016,16 +1075,10 @@ mod test {
         assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &udp_repr));
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_doesnt_accept_wrong_ip(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+    /// 验证通配与具体本机地址的不同接纳条件。
+    #[test]
+    fn test_doesnt_accept_wrong_ip() {
+        let cx = &mut context();
 
         let mut port_bound_socket = socket(buffer(1), buffer(0));
         assert_eq!(port_bound_socket.bind(LOCAL_PORT), Ok(()));
@@ -1050,20 +1103,14 @@ mod test {
         assert_eq!(socket.send_slice(&too_large[..16 * 4], REMOTE_END), Ok(()));
     }
 
-    #[rstest]
-    #[case::ip(Medium::Ip)]
-    #[cfg(feature = "medium-ip")]
-    #[case::ethernet(Medium::Ethernet)]
-    #[cfg(feature = "medium-ethernet")]
-    #[case::ieee802154(Medium::Ieee802154)]
-    #[cfg(feature = "medium-ieee802154")]
-    fn test_process_empty_payload(#[case] medium: Medium) {
+    /// 验证零 payload 仍保存并消费一条 metadata。
+    #[test]
+    fn test_process_empty_payload() {
         let meta = Box::leak(Box::new([PacketMetadata::EMPTY]));
         let recv_buffer = PacketBuffer::new(&mut meta[..], vec![]);
         let mut socket = socket(recv_buffer, buffer(0));
 
-        let (mut iface, _, _) = setup(medium);
-        let cx = iface.context();
+        let cx = &mut context();
 
         assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
 
@@ -1071,8 +1118,365 @@ mod test {
             src_port: REMOTE_PORT,
             dst_port: LOCAL_PORT,
         };
-        socket.process(cx, PacketMeta::default(), &REMOTE_IP_REPR, &repr, &[]);
+        socket.process(cx, PacketMeta::default(), &REMOTE_IP_REPR, &repr, &[][..]);
         assert_eq!(socket.recv(), Ok((&[][..], remote_metadata_with_local())));
+    }
+
+    /// 验证零消息受 32 个 metadata 槽限制，入队事实和实际消费均包含零长度记录。
+    #[test]
+    fn test_zero_datagram_record_limit() {
+        let cx = &mut context();
+        let mut s = socket(buffer(32), buffer(32));
+        s.bind(LOCAL_PORT).unwrap();
+        for _ in 0..32 {
+            assert!(s.process(
+                cx,
+                PacketMeta::default(),
+                &REMOTE_IP_REPR,
+                &REMOTE_UDP_REPR,
+                &[][..]
+            ));
+            s.send_slice(&[], REMOTE_END).unwrap();
+        }
+        assert!(!s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            &[][..]
+        ));
+        assert_eq!(s.send_slice(&[], REMOTE_END), Err(SendError::BufferFull));
+        assert!(!s.can_send_size(0));
+        for _ in 0..32 {
+            assert_eq!(s.recv(), Ok((&[][..], remote_metadata_with_local())));
+            s.dispatch(cx, |_, _, (_, udp, bytes)| {
+                assert_eq!(udp, LOCAL_UDP_REPR);
+                assert!(bytes.is_empty());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+        assert_eq!(s.recv(), Err(RecvError::Exhausted));
+        s.dispatch(cx, |_, _, _| unreachable!())
+            .unwrap_or_else(|(): ()| unreachable!());
+        assert!(s.can_send_size(0));
+    }
+
+    /// 验证预算缩小不改旧消息，提高后真实恢复接纳；send_with 也遵守同一预算。
+    #[test]
+    fn test_payload_budgets_preserve_records() {
+        let cx = &mut context();
+        let mut s = socket(buffer(4), buffer(4));
+        s.bind(LOCAL_PORT).unwrap();
+        s.set_recv_budget(12);
+        s.set_send_budget(12);
+        for bytes in [&b"abcdef"[..], &b"123456"[..]] {
+            assert!(s.process(
+                cx,
+                PacketMeta::default(),
+                &REMOTE_IP_REPR,
+                &REMOTE_UDP_REPR,
+                bytes
+            ));
+            s.send_slice(bytes, REMOTE_END).unwrap();
+        }
+        assert!(!s.can_send());
+        assert_eq!(s.send(1, REMOTE_END), Err(SendError::BufferFull));
+        assert_eq!(
+            s.send_with(1, REMOTE_END, |_| unreachable!()),
+            Err(SendError::BufferFull)
+        );
+        assert!(!s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD
+        ));
+        s.set_recv_budget(4);
+        s.set_send_budget(4);
+        assert!(!s.can_send_size(0));
+        assert_eq!(s.peek().unwrap().0, PAYLOAD);
+        assert_eq!(s.recv().unwrap().0, PAYLOAD);
+        s.dispatch(cx, |_, _, (_, _, bytes)| {
+            assert_eq!(bytes, PAYLOAD);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(!s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            &[][..]
+        ));
+        assert_eq!(s.send_slice(&[], REMOTE_END), Err(SendError::BufferFull));
+        s.set_recv_budget(12);
+        s.set_send_budget(12);
+        assert!(s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD
+        ));
+        assert_eq!(
+            s.send_with(6, REMOTE_END, |bytes| {
+                bytes.copy_from_slice(PAYLOAD);
+                bytes.len()
+            }),
+            Ok(6)
+        );
+        for bytes in [&b"123456"[..], PAYLOAD] {
+            assert_eq!(s.recv().unwrap().0, bytes);
+            s.dispatch(cx, |_, _, (_, _, actual)| {
+                assert_eq!(actual, bytes);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+        assert_eq!(s.recv(), Err(RecvError::Exhausted));
+        assert!(s.can_send());
+    }
+
+    /// 验证绕回 padding 也占用预算，预算拒绝不改变队首消息。
+    #[test]
+    fn test_payload_budget_includes_padding() {
+        let cx = &mut context();
+        let mut s = socket(
+            PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0; 16]),
+            PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0; 16]),
+        );
+        s.bind(LOCAL_PORT).unwrap();
+        for bytes in [&b"abcdef"[..], &b"12345678"[..]] {
+            assert!(s.process(
+                cx,
+                PacketMeta::default(),
+                &REMOTE_IP_REPR,
+                &REMOTE_UDP_REPR,
+                bytes
+            ));
+            s.send_slice(bytes, REMOTE_END).unwrap();
+        }
+        assert_eq!(s.recv().unwrap().0, b"abcdef");
+        s.dispatch(cx, |_, _, (_, _, bytes)| {
+            assert_eq!(bytes, b"abcdef");
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        s.set_recv_budget(12);
+        s.set_send_budget(12);
+        assert!(!s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            &b"abcd"[..]
+        ));
+        assert!(!s.can_send_size(4));
+        assert_eq!(
+            s.send_slice(b"abcd", REMOTE_END),
+            Err(SendError::BufferFull)
+        );
+        s.set_recv_budget(14);
+        s.set_send_budget(14);
+        assert!(s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            &b"abcd"[..]
+        ));
+        s.send_slice(b"abcd", REMOTE_END).unwrap();
+        for bytes in [&b"12345678"[..], &b"abcd"[..]] {
+            assert_eq!(s.recv().unwrap().0, bytes);
+            s.dispatch(cx, |_, _, (_, _, actual)| {
+                assert_eq!(actual, bytes);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+    }
+
+    /// 验证字节预算恰满时仍可记录零消息，零消息不借用额外 payload 字节。
+    #[test]
+    fn test_zero_datagram_at_byte_limit() {
+        let cx = &mut context();
+        let mut s = socket(buffer(4), buffer(4));
+        s.bind(LOCAL_PORT).unwrap();
+        s.set_recv_budget(6);
+        s.set_send_budget(6);
+        assert!(s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD
+        ));
+        s.send_slice(PAYLOAD, REMOTE_END).unwrap();
+        assert!(!s.can_send());
+        assert!(s.can_send_size(0));
+        assert!(s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            &[][..]
+        ));
+        s.send_slice(&[], REMOTE_END).unwrap();
+        for bytes in [PAYLOAD, &[][..]] {
+            assert_eq!(s.recv().unwrap().0, bytes);
+            s.dispatch(cx, |_, _, (_, _, actual)| {
+                assert_eq!(actual, bytes);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+        assert_eq!(s.recv(), Err(RecvError::Exhausted));
+        assert!(s.can_send());
+    }
+
+    /// 验证一族实际发送和消费：默认源、显式源及零消息都保持各自 metadata。
+    fn check_datagram_sources(local: IpAddress, remote: IpAddress, explicit: IpAddress) {
+        let mut cx = UdpContextState::new(Some(local), None);
+        let mut sender = socket(buffer(0), buffer(4));
+        let mut receiver = socket(buffer(4), buffer(0));
+        sender.bind(LOCAL_PORT).unwrap();
+        receiver.bind((remote, REMOTE_PORT)).unwrap();
+        let destination = IpEndpoint::new(remote, REMOTE_PORT);
+        for (source, bytes, metadata) in [
+            (local, PAYLOAD, UdpMetadata::from(destination)),
+            (
+                explicit,
+                &b"123"[..],
+                UdpMetadata {
+                    local_address: Some(explicit),
+                    ..destination.into()
+                },
+            ),
+            (local, &[][..], UdpMetadata::from(destination)),
+        ] {
+            sender.send_slice(bytes, metadata).unwrap();
+            sender
+                .dispatch(&mut cx, |cx, meta, (ip, udp, payload)| {
+                    assert_eq!(ip.src_addr(), source);
+                    assert_eq!(ip.dst_addr(), remote);
+                    assert_eq!(udp.src_port, LOCAL_PORT);
+                    assert_eq!(udp.dst_port, REMOTE_PORT);
+                    assert_eq!(payload, bytes);
+                    assert!(receiver.accepts(cx, &ip, &udp));
+                    assert!(receiver.process(cx, meta, &ip, &udp, payload));
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            let (payload, received) = receiver.recv().unwrap();
+            assert_eq!(payload, bytes);
+            assert_eq!(
+                received,
+                UdpMetadata {
+                    endpoint: IpEndpoint::new(source, LOCAL_PORT),
+                    local_address: Some(remote),
+                    local_port: None,
+                    meta: metadata.meta,
+                }
+            );
+            assert_eq!(receiver.recv(), Err(RecvError::Exhausted));
+            sender
+                .dispatch(&mut cx, |_, _, _| unreachable!())
+                .unwrap_or_else(|(): ()| unreachable!());
+        }
+    }
+
+    /// 验证 IPv4 单报文和不同源地址的真实消费。
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn test_ipv4_datagram_sources() {
+        use crate::wire::Ipv4Address;
+        check_datagram_sources(
+            Ipv4Address::new(192, 168, 1, 1).into(),
+            Ipv4Address::new(192, 168, 1, 2).into(),
+            Ipv4Address::new(192, 168, 1, 3).into(),
+        );
+    }
+
+    /// 验证 IPv6 单报文和不同源地址的真实消费。
+    #[test]
+    #[cfg(feature = "proto-ipv6")]
+    fn test_ipv6_datagram_sources() {
+        use crate::wire::Ipv6Address;
+        check_datagram_sources(
+            Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).into(),
+            Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2).into(),
+            Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 3).into(),
+        );
+    }
+
+    /// 验证失败重试和解绑后重新绑定均保原 TX 源端口，旧 RX 也仍然可读。
+    #[test]
+    fn test_rebind_preserves_accepted_datagrams() {
+        let cx = &mut context();
+        let mut s = socket(buffer(4), buffer(4));
+        s.bind(LOCAL_END).unwrap();
+        assert!(s.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD
+        ));
+        let metadata = UdpMetadata {
+            local_address: Some(LOCAL_ADDR.into()),
+            local_port: Some(LOCAL_PORT),
+            ..REMOTE_END.into()
+        };
+        s.send_slice(PAYLOAD, metadata).unwrap();
+        s.send_slice(PAYLOAD, metadata).unwrap();
+        assert_eq!(
+            s.dispatch(cx, |_, _, (ip, udp, bytes)| {
+                assert_eq!(ip.src_addr(), LOCAL_END.addr);
+                assert_eq!(udp.src_port, LOCAL_PORT);
+                assert_eq!(bytes, PAYLOAD);
+                Err(())
+            }),
+            Err(())
+        );
+        s.set_endpoint(IpListenEndpoint::default());
+        assert!(!s.is_open());
+        s.dispatch(cx, |_, _, (ip, udp, bytes)| {
+            assert_eq!(ip.src_addr(), LOCAL_END.addr);
+            assert_eq!(udp.src_port, LOCAL_PORT);
+            assert_eq!(bytes, PAYLOAD);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        s.bind(IpEndpoint::new(OTHER_ADDR.into(), LOCAL_PORT + 1))
+            .unwrap();
+        s.send_slice(
+            b"new",
+            UdpMetadata {
+                local_address: Some(OTHER_ADDR.into()),
+                local_port: Some(LOCAL_PORT + 1),
+                ..REMOTE_END.into()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.recv(), Ok((PAYLOAD, remote_metadata_with_local())));
+        for (source, port, bytes) in [
+            (LOCAL_END.addr, LOCAL_PORT, PAYLOAD),
+            (OTHER_ADDR.into(), LOCAL_PORT + 1, &b"new"[..]),
+        ] {
+            s.dispatch(cx, |_, _, (ip, udp, payload)| {
+                assert_eq!(ip.src_addr(), source);
+                assert_eq!(udp.src_port, port);
+                assert_eq!(ip.dst_addr(), REMOTE_END.addr);
+                assert_eq!(udp.dst_port, REMOTE_PORT);
+                assert_eq!(payload, bytes);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+        s.dispatch(cx, |_, _, _| unreachable!())
+            .unwrap_or_else(|(): ()| unreachable!());
     }
 
     #[test]

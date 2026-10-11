@@ -76,6 +76,7 @@ impl From<u8> for MulticastScope {
 
 pub use core::net::Ipv6Addr as Address;
 
+/// 为核心库地址补充协议分类与网络字节序转换，不保存接口或路由状态。
 pub trait AddressExt {
     /// Construct an IPv6 address from a sequence of octets, in big-endian.
     ///
@@ -660,19 +661,25 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
     }
 }
 
+/// IPv6 首部和地址分类的共同消费者共享这些固定端点。
 #[cfg(test)]
 pub mod test {
     use super::*;
     use crate::wire::pretty_print::PrettyPrinter;
 
+    /// 首个链路本地端点用于源地址与目标地址的独立校验。
     #[allow(unused)]
     pub const MOCK_IP_ADDR_1: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    /// 同链路的第二个端点用于双向报文校验。
     #[allow(unused)]
     pub const MOCK_IP_ADDR_2: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    /// 第三个链路本地端点用于区分额外的报文来源。
     #[allow(unused)]
     pub const MOCK_IP_ADDR_3: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+    /// 第四个链路本地端点用于多端点报文校验。
     #[allow(unused)]
     pub const MOCK_IP_ADDR_4: Address = Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 4);
+    /// 未指定地址用于检验正常的选源和拒绝边界。
     #[allow(unused)]
     pub const MOCK_UNSPECIFIED: Address = Address::UNSPECIFIED;
 

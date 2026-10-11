@@ -98,6 +98,7 @@ mod igmp;
 pub mod ip;
 #[cfg(feature = "proto-ipv4")]
 pub mod ipv4;
+/// IPv6 地址、固定首部与报文表示供同一协议处理层使用。
 #[cfg(feature = "proto-ipv6")]
 pub mod ipv6;
 #[cfg(feature = "proto-ipv6")]

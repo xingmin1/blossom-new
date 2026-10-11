@@ -3,6 +3,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem;
+use smoltcp::wire::{IpAddress, Ipv6Address};
 
 use crate::fs::FsError;
 use crate::net::address::InetEndpoint;
@@ -35,6 +36,7 @@ pub struct BindLease {
     local: InetEndpoint,
     owner_id: u64,
     lease_id: u64,
+    dual_stack: bool,
     net: Weak<NetStack>,
     /// 准备中的 Arc 尚未发表，失败析构不能撤其它真实记录。
     published: bool,
@@ -54,6 +56,11 @@ impl BindLease {
     /// 每次预留使用独立不复用身份，旧发送的最后租约不能撤除后继绑定。
     pub fn id(&self) -> u64 {
         self.lease_id
+    }
+
+    /// 同一 IPv6 通配租约可额外覆盖 IPv4 接收面，不创建第二份端口拥有。
+    pub fn dual_stack(&self) -> bool {
+        self.dual_stack
     }
 }
 
@@ -75,15 +82,16 @@ struct Binding {
     owner_id: u64,
     lease_id: u64,
     reuse: bool,
+    dual_stack: bool,
 }
 
 struct TablesState {
     bindings: Vec<Binding>,
     tcp: Vec<Arc<TcpEndpoint>>,
     tuples: Vec<(u64, TcpTuple)>,
-    listeners: Vec<(u64, InetEndpoint)>,
+    listeners: Vec<(u64, InetEndpoint, bool)>,
     udp: Vec<Arc<UdpEndpoint>>,
-    udp_keys: Vec<(u64, InetEndpoint, Option<InetEndpoint>)>,
+    udp_keys: Vec<(u64, InetEndpoint, Option<InetEndpoint>, bool)>,
     unix: Vec<Arc<UnixPair>>,
     next_port: u16,
     closed: bool,
@@ -120,8 +128,12 @@ impl NetTables {
         protocol: TransportProtocol,
         requested: InetEndpoint,
         reuse: bool,
+        dual_stack: bool,
     ) -> Result<Arc<BindLease>, FsError> {
-        if !requested.is_unspecified() && !net.routes().is_local(requested.address) {
+        if dual_stack && requested.address != IpAddress::Ipv6(Ipv6Address::UNSPECIFIED) {
+            return Err(FsError::InvalidOperation);
+        }
+        if !requested.is_unspecified() && !net.is_local(requested.address) {
             return Err(FsError::AddressNotAvailable);
         }
         let mut lease = Arc::try_new(BindLease {
@@ -129,6 +141,7 @@ impl NetTables {
             local: requested,
             owner_id,
             lease_id: net.allocate_identity(),
+            dual_stack,
             net: Arc::downgrade(net),
             published: false,
         })
@@ -142,14 +155,14 @@ impl NetTables {
                 return Err(FsError::NoMemory);
             }
             let local = if requested.port == 0 {
-                choose_ephemeral(&mut state, protocol, requested)?
+                choose_ephemeral(&mut state, protocol, requested, dual_stack)?
             } else {
-                if binding_conflicts(&state.bindings, protocol, requested, reuse)
+                if binding_conflicts(&state.bindings, protocol, requested, reuse, dual_stack)
                     || (protocol == TransportProtocol::Tcp
                         && state
                             .listeners
                             .iter()
-                            .any(|entry| overlaps(entry.1, requested)))
+                            .any(|entry| overlaps(entry.1, entry.2, requested, dual_stack)))
                 {
                     return Err(FsError::AddressInUse);
                 }
@@ -164,6 +177,7 @@ impl NetTables {
                 owner_id,
                 lease_id: prepared.lease_id,
                 reuse,
+                dual_stack,
             });
             prepared.published = true;
         }
@@ -242,6 +256,14 @@ impl NetTables {
 
     /// 同锁核完整 tuple 唯一性后发表，重复 SYN 不能取得第二个连接键。
     pub fn publish_tcp_tuple(&self, id: u64, tuple: TcpTuple) -> Result<(), FsError> {
+        if tuple.local.address.version() != tuple.peer.address.version()
+            || tuple.local.is_unspecified()
+            || tuple.peer.is_unspecified()
+            || tuple.local.port == 0
+            || tuple.peer.port == 0
+        {
+            return Err(FsError::InvalidOperation);
+        }
         let mut state = self.state.lock();
         if state.closed || !state.tcp.iter().any(|entry| entry.id() == id) {
             return Err(FsError::BadFd);
@@ -273,17 +295,21 @@ impl NetTables {
         if binding.protocol != TransportProtocol::Tcp || binding.local != local {
             return Err(FsError::InvalidOperation);
         }
-        if state.listeners.iter().any(|entry| overlaps(entry.1, local))
+        let dual_stack = binding.dual_stack;
+        if state
+            .listeners
+            .iter()
+            .any(|entry| overlaps(entry.1, entry.2, local, dual_stack))
             || state.bindings.iter().any(|entry| {
                 entry.owner_id != id
                     && entry.protocol == TransportProtocol::Tcp
-                    && overlaps(entry.local, local)
+                    && overlaps(entry.local, entry.dual_stack, local, dual_stack)
                     && !(binding.reuse && entry.reuse)
             })
         {
             return Err(FsError::AddressInUse);
         }
-        publish_local(&mut state.listeners, id, local)
+        publish_local(&mut state.listeners, id, local, dual_stack)
     }
 
     /// UDP 键只复制端点当前地址和 peer；合法复用不再被精确地址检查否定。
@@ -300,12 +326,22 @@ impl NetTables {
         if local.port == 0 {
             return Err(FsError::InvalidOperation);
         }
+        let dual_stack = state
+            .bindings
+            .iter()
+            .find(|entry| {
+                entry.owner_id == id
+                    && entry.protocol == TransportProtocol::Udp
+                    && matches_local(entry.local, entry.dual_stack, local)
+            })
+            .ok_or(FsError::BadFd)?
+            .dual_stack;
         if let Some(index) = state.udp_keys.iter().position(|entry| entry.0 == id) {
             state.udp_keys.remove(index);
         } else if state.udp_keys.len() == TABLE_CAPACITY {
             return Err(FsError::NoMemory);
         }
-        state.udp_keys.push((id, local, peer));
+        state.udp_keys.push((id, local, peer, dual_stack));
         Ok(())
     }
 
@@ -334,7 +370,7 @@ impl NetTables {
         state.tcp.iter().find(|entry| entry.id() == id).cloned()
     }
 
-    /// connected peer 优先，其次具体本地地址，同评分取最近发表的真实节点。
+    /// 具体本地地址优先，其次 connected peer，同评分取最近发表的真实节点。
     pub fn lookup_udp(&self, local: InetEndpoint, peer: InetEndpoint) -> Option<Arc<UdpEndpoint>> {
         let state = self.state.lock();
         let id = state
@@ -342,13 +378,15 @@ impl NetTables {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                entry.1.port == local.port
-                    && (entry.1.is_unspecified() || entry.1.address == local.address)
+                matches_local(entry.1, entry.3, local)
                     && entry.2.map_or(true, |expected| expected == peer)
             })
             .max_by_key(|(index, entry)| {
                 (
-                    u8::from(entry.2.is_some()) * 2 + u8::from(!entry.1.is_unspecified()),
+                    (
+                        u8::from(!entry.1.is_unspecified()),
+                        u8::from(entry.2.is_some()),
+                    ),
                     *index,
                 )
             })
@@ -422,16 +460,27 @@ fn binding_conflicts(
     protocol: TransportProtocol,
     local: InetEndpoint,
     reuse: bool,
+    dual_stack: bool,
 ) -> bool {
     bindings.iter().any(|entry| {
-        entry.protocol == protocol && overlaps(entry.local, local) && !(reuse && entry.reuse)
+        entry.protocol == protocol
+            && overlaps(entry.local, entry.dual_stack, local, dual_stack)
+            && !(reuse && entry.reuse)
     })
 }
 
-/// 通配或相同具体地址在同一个端口上占据重叠本地地址。
-fn overlaps(left: InetEndpoint, right: InetEndpoint) -> bool {
-    left.port == right.port
-        && (left.is_unspecified() || right.is_unspecified() || left.address == right.address)
+/// 两接收面只有同族通配、相同具体值或双面通配的 IPv4 别名才重叠。
+fn overlaps(left: InetEndpoint, left_dual: bool, right: InetEndpoint, right_dual: bool) -> bool {
+    matches_local(left, left_dual, right) || matches_local(right, right_dual, left)
+}
+
+/// 绑定冲突、端口选择和接收查询共用同一纯地址覆盖规则。
+fn matches_local(binding: InetEndpoint, dual_stack: bool, local: InetEndpoint) -> bool {
+    binding.port == local.port
+        && (binding.address == local.address
+            || (binding.is_unspecified()
+                && (binding.address.version() == local.address.version()
+                    || (dual_stack && matches!(local.address, IpAddress::Ipv4(_))))))
 }
 
 /// 游标仅覆盖动态端口区间，自动端口不使用复用策略；选中和发表保持同一锁。
@@ -439,6 +488,7 @@ fn choose_ephemeral(
     state: &mut TablesState,
     protocol: TransportProtocol,
     requested: InetEndpoint,
+    dual_stack: bool,
 ) -> Result<InetEndpoint, FsError> {
     let start = state.next_port;
     loop {
@@ -451,7 +501,13 @@ fn choose_ephemeral(
         } else {
             state.next_port + 1
         };
-        if !binding_conflicts(&state.bindings, protocol, local, false) {
+        if !binding_conflicts(&state.bindings, protocol, local, false, dual_stack)
+            && !(protocol == TransportProtocol::Tcp
+                && state
+                    .listeners
+                    .iter()
+                    .any(|entry| overlaps(entry.1, entry.2, local, dual_stack)))
+        {
             return Ok(local);
         }
         if state.next_port == start {
@@ -462,9 +518,10 @@ fn choose_ephemeral(
 
 /// 本地键同一身份只发表一次，完整相同键冲突真实返回 AddressInUse。
 fn publish_local(
-    entries: &mut Vec<(u64, InetEndpoint)>,
+    entries: &mut Vec<(u64, InetEndpoint, bool)>,
     id: u64,
     local: InetEndpoint,
+    dual_stack: bool,
 ) -> Result<(), FsError> {
     if local.port == 0 {
         return Err(FsError::InvalidOperation);
@@ -478,19 +535,15 @@ fn publish_local(
     if entries.len() == TABLE_CAPACITY {
         return Err(FsError::NoMemory);
     }
-    entries.push((id, local));
+    entries.push((id, local, dual_stack));
     Ok(())
 }
 
 /// 地址精确键优先于同端口通配键，返回值不借用索引存储。
-fn lookup_local(entries: &[(u64, InetEndpoint)], local: InetEndpoint) -> Option<u64> {
+fn lookup_local(entries: &[(u64, InetEndpoint, bool)], local: InetEndpoint) -> Option<u64> {
     entries
         .iter()
-        .find(|entry| entry.1 == local)
-        .or_else(|| {
-            entries
-                .iter()
-                .find(|entry| entry.1.port == local.port && entry.1.is_unspecified())
-        })
+        .filter(|entry| matches_local(entry.1, entry.2, local))
+        .max_by_key(|entry| u8::from(!entry.1.is_unspecified()))
         .map(|entry| entry.0)
 }

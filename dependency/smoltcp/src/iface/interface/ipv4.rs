@@ -1,11 +1,7 @@
 use super::*;
 
 impl Interface {
-    /// Process fragments that still need to be sent for IPv4 packets.
-    ///
-    /// This function returns a boolean value indicating whether any packets were
-    /// processed or emitted, and thus, whether the readiness of any socket might
-    /// have changed.
+    /// 尾片只在实际取得 TX token 后推进，满时保留原完整后备。
     #[cfg(feature = "proto-ipv4-fragmentation")]
     pub(super) fn ipv4_egress(&mut self, device: &mut (impl Device + ?Sized)) {
         // Reset the buffer when we transmitted everything.
@@ -18,7 +14,7 @@ impl Interface {
         }
 
         let pkt = &self.fragmenter;
-        if pkt.packet_len > pkt.sent_bytes {
+        if pkt.sent_bytes < pkt.packet_len {
             if let Some(tx_token) = device.transmit(self.inner.now) {
                 self.inner
                     .dispatch_ipv4_frag(tx_token, &mut self.fragmenter);
@@ -82,9 +78,10 @@ impl InterfaceInner {
         })
     }
 
-    pub(super) fn process_ipv4<'a>(
+    /// 原 IPv4 校验和重组后同步分派，重组借用止于本轮捕获和控制应答。
+    pub(super) fn process_ipv4<'a, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
@@ -137,6 +134,10 @@ impl InterfaceInner {
 
         #[cfg(not(feature = "proto-ipv4-fragmentation"))]
         let ip_payload = ipv4_packet.payload();
+        let ipv4_repr = Ipv4Repr {
+            payload_len: ip_payload.len(),
+            ..ipv4_repr
+        };
 
         let ip_repr = IpRepr::Ipv4(ipv4_repr);
 
@@ -153,10 +154,11 @@ impl InterfaceInner {
                 && matches!(self.caps.medium, Medium::Ethernet)
             {
                 let udp_packet = check!(UdpPacket::new_checked(ip_payload));
-                if let Some(dhcp_socket) = sockets
-                    .items_mut()
-                    .find_map(|i| Dhcpv4Socket::downcast_mut(&mut i.socket))
-                {
+                if let Some(dhcp_socket) = sockets.socket_set().and_then(|sockets| {
+                    sockets
+                        .items_mut()
+                        .find_map(|i| Dhcpv4Socket::downcast_mut(&mut i.socket))
+                }) {
                     // First check for source and dest ports, then do `UdpRepr::parse` if they match.
                     // This way we avoid validating the UDP checksum twice for all non-DHCP UDP packets (one here, one in `process_udp`)
                     if udp_packet.src_port() == dhcp_socket.server_port
@@ -175,7 +177,8 @@ impl InterfaceInner {
             }
         }
 
-        if !self.has_ip_addr(ipv4_repr.dst_addr)
+        if !self.is_local(IpAddress::Ipv4(ipv4_repr.dst_addr))
+            && sockets.local_destination() != Some(IpAddress::Ipv4(ipv4_repr.dst_addr))
             && !self.has_multicast_group(ipv4_repr.dst_addr)
             && !self.is_broadcast_v4(ipv4_repr.dst_addr)
         {
@@ -227,7 +230,7 @@ impl InterfaceInner {
             }
 
             #[cfg(feature = "socket-tcp")]
-            IpProtocol::Tcp => self.process_tcp(sockets, ip_repr, ip_payload),
+            IpProtocol::Tcp => self.process_tcp(sockets, meta, ip_repr, ip_payload),
 
             _ if handled_by_raw_socket => None,
 
@@ -311,9 +314,10 @@ impl InterfaceInner {
         }
     }
 
-    pub(super) fn process_icmpv4<'frame>(
+    /// 无用户 ICMP socket 时仍执行原 echo 与控制处理。
+    pub(super) fn process_icmpv4<'frame, 's>(
         &mut self,
-        _sockets: &mut SocketSet,
+        _sockets: &mut impl TransportIngress<'s>,
         ip_repr: Ipv4Repr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -324,13 +328,15 @@ impl InterfaceInner {
         let mut handled_by_icmp_socket = false;
 
         #[cfg(all(feature = "socket-icmp", feature = "proto-ipv4"))]
-        for icmp_socket in _sockets
-            .items_mut()
-            .filter_map(|i| icmp::Socket::downcast_mut(&mut i.socket))
-        {
-            if icmp_socket.accepts_v4(self, &ip_repr, &icmp_repr) {
-                icmp_socket.process_v4(self, &ip_repr, &icmp_repr);
-                handled_by_icmp_socket = true;
+        if let Some(sockets) = _sockets.socket_set() {
+            for icmp_socket in sockets
+                .items_mut()
+                .filter_map(|i| icmp::Socket::downcast_mut(&mut i.socket))
+            {
+                if icmp_socket.accepts_v4(self, &ip_repr, &icmp_repr) {
+                    icmp_socket.process_v4(self, &ip_repr, &icmp_repr);
+                    handled_by_icmp_socket = true;
+                }
             }
         }
 
@@ -411,16 +417,23 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+    /// 发出一份尾片；仅在 token 的实际接纳闭包内推进字节责任。
+    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(
+        &mut self,
+        mut tx_token: Tx,
+        frag: &mut Fragmenter,
+    ) {
         let caps = self.caps.clone();
 
         let mtu_max = self.ip_mtu();
-        let ip_len = (frag.packet_len - frag.sent_bytes + frag.ipv4.repr.buffer_len()).min(mtu_max);
-        let payload_len = ip_len - frag.ipv4.repr.buffer_len();
+        let remaining = frag.packet_len - frag.sent_bytes;
+        let header_len = frag.ipv4.repr.buffer_len();
+        let max_payload = ((mtu_max - header_len) / 8) * 8;
+        let payload_len = remaining.min(max_payload);
+        let ip_len = payload_len + header_len;
 
         let more_frags = (frag.packet_len - frag.sent_bytes) != payload_len;
         frag.ipv4.repr.payload_len = payload_len;
-        frag.sent_bytes += payload_len;
 
         let mut tx_len = ip_len;
         #[cfg(feature = "medium-ethernet")]
@@ -445,6 +458,7 @@ impl InterfaceInner {
             }
         };
 
+        tx_token.set_meta(frag.meta);
         tx_token.consume(tx_len, |mut tx_buffer| {
             #[cfg(feature = "medium-ethernet")]
             if matches!(self.caps.medium, Medium::Ethernet) {
@@ -471,6 +485,8 @@ impl InterfaceInner {
 
             // Update the frag offset for the next fragment.
             frag.ipv4.frag_offset += payload_len as u16;
-        })
+            frag.sent_bytes += payload_len;
+        });
+        self.last_transmit_destination = Some(frag.ipv4.repr.dst_addr.into());
     }
 }

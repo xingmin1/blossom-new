@@ -5,7 +5,7 @@ mod boot_cases;
 mod context;
 mod diagnostic;
 mod execution_core;
-mod execution_services;
+pub(crate) mod execution_services;
 mod fatal_return;
 mod network;
 pub(crate) mod panic;

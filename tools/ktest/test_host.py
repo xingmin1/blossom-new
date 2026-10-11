@@ -6,6 +6,7 @@ import importlib.util
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import select as select_io
 import socket
@@ -27,6 +28,7 @@ from ktest.catalog import (Catalog, HostError, Invocation, batches, case_seed, i
                            run_command, select, stable_hash)
 from ktest.protocol import KTAP, ready
 from ktest.execution_uart import ExecutionUART
+from ktest.net_user import NetUserPeer
 from ktest.resources import (aliases, crc32c_update, prepare_disks,
                              resource_names, validate_resources)
 from ktest.runner import DeadlineExpired, VM, VMExited, execute_batch, finish_vm
@@ -1246,6 +1248,202 @@ class LifecycleAndReportTests(unittest.TestCase):
                                     invocations(rows, args), directory)
         self.assertEqual(factory.call_count, 1, "suite failure must not retry unstarted cases")
         return results
+
+    def test_network_peer_ack_orders_real_consumers_and_successor(self):
+        """真实跨例 P/Q 在 BEGIN 后产生；管道固定 begin 和 finish/drain 尚未完成的窗口。"""
+        rows = [case_record(index, tags=["network-nic-native"], resources=["net-user"])
+                for index in range(2)]
+        script = """
+import json,os,select,socket,sys,time
+uart=socket.socket(fileno=int(sys.argv[1]))
+ports_reader,gate_reader,feedback_writer=map(int,sys.argv[2:5])
+rows=json.loads(sys.argv[5])
+deadline=time.monotonic()+5
+
+def ready(readers):
+    '''所有协调和真实 socket 读取共用子进程的一次绝对期限。'''
+    remaining=deadline-time.monotonic()
+    assert 0 < remaining, "child absolute deadline expired"
+    readable,_,_=select.select(readers,[],[],remaining)
+    assert readable, "child absolute deadline expired"
+    return readable
+
+def line():
+    '''逐字节消费真实 UART，避免吞掉后继回执或运行命令。'''
+    value=b""
+    while not value.endswith(b"\\n"):
+        ready([uart])
+        part=uart.recv(1)
+        assert part, "UART EOF before acknowledgement"
+        value+=part
+        assert len(value)<=1024, "UART line exceeds test bound"
+    return value
+
+def acknowledgement(phase,cid):
+    '''只有完整真实回执才放行，窗口管道同时记录客体是否已经越过消费边界。'''
+    expected=f"KTEST PEER {phase} {cid}\\n".encode("ascii")
+    gate_seen=False
+    while True:
+        readable=ready([uart,gate_reader])
+        if uart in readable:
+            assert line()==expected, "wrong peer acknowledgement"
+            return gate_seen
+        marker=os.read(gate_reader,1)
+        assert marker, "window pipe closed"
+        matching=(phase=="BEGIN" and marker==b"B") or (phase=="END" and marker==b"F")
+        os.write(feedback_writer,b"b" if phase=="BEGIN" and matching else
+                 (b"f" if phase=="END" and matching else b"x"))
+        gate_seen=matching
+
+ready([ports_reader])
+port=int(os.read(ports_reader,32))
+udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+udp.bind(("127.0.0.1",0))
+uart.sendall(b"KTEST READY 1 arch=riscv64 cpus=2 mode=debug panic=unwind\\n")
+assert line().startswith(b"run "), "missing real run command"
+uart.sendall(b"KTAP version 1\\n1..1\\n  # Subtest: os::tests0\\n"
+             b"  1..2\\n  # KTEST suite-begin setup\\n")
+for position,row in enumerate(rows,1):
+    cid=row["case"]
+    uart.sendall(f"  # KTEST case-begin {cid}\\n".encode("ascii"))
+    begin_gate_seen=acknowledgement("BEGIN",cid)
+    uart.sendall(f"  # KTEST phase {cid} setup\\n  # KTEST phase {cid} body\\n".encode("ascii"))
+    assert udp.sendto(b"P",("127.0.0.1",port))==1
+    if not begin_gate_seen:
+        os.write(feedback_writer,b"p")
+    ready([udp])
+    data,address=udp.recvfrom(2)
+    assert data==b"Q" and address==("127.0.0.1",port), "real native peer response missing"
+    uart.sendall((f"  # KTEST phase {cid} cleanup\\n  # KTEST status {cid} Pass\\n"
+                  f"  ok {position} {row['name']}\\n").encode("utf-8"))
+    acknowledgement("END",cid)
+uart.sendall(b"ok 1 os::tests0\\n# KTEST complete\\n")
+udp.close()
+uart.close()
+os._exit(0)
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            host, guest = socket.socketpair()
+            ports_reader, ports_writer = os.pipe()
+            gate_reader, gate_writer = os.pipe()
+            feedback_reader, feedback_writer = os.pipe()
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(guest.fileno()), str(ports_reader),
+                 str(gate_reader), str(feedback_writer), json.dumps(rows)],
+                pass_fds=(guest.fileno(), ports_reader, gate_reader, feedback_writer))
+            guest.close()
+            os.close(ports_reader)
+            os.close(gate_reader)
+            os.close(feedback_writer)
+            windows = []
+            peers = []
+            raw = None
+
+            def window(marker, deadline):
+                """子进程在无回执的真实等待中应答管道，不通过 sleep 推测它已经停住。"""
+                os.write(gate_writer, marker)
+                readable, _, _ = select_io.select(
+                    [feedback_reader], [], [], max(0, deadline - time.monotonic()))
+                self.assertTrue(readable, "child did not reach the fixed consumer window")
+                feedback = os.read(feedback_reader, 1)
+                self.assertTrue(feedback, "child closed before the fixed consumer window")
+                return feedback
+
+            def construct_vm(args, kernel, current, names):
+                """仅代替 QEMU 启动，UART、进程、具体 peer 和正式 VM 消费方法保持真实。"""
+                nonlocal raw
+                self.assertIn("net-user", names)
+                peer = NetUserPeer(current)
+                peers.append(peer)
+                os.write(ports_writer, str(peer.ports[1]).encode("ascii"))
+                vm = vm_fixture()
+                vm.args = args
+                vm.directory = current
+                vm.serial = host
+                host.setblocking(False)
+                vm.buffer = bytearray()
+                raw = (current / "uart.log").open("xb", buffering=0)
+                vm.raw = raw
+                vm.process = process
+                vm.net_user = peer
+                original_begin = peer.begin
+                original_finish = peer.finish
+
+                def begin(case, deadline):
+                    """固定消费者未准备窗口；错误提前放行时先确认 P 已在真实端点排队。"""
+                    feedback = window(b"B", deadline)
+                    windows.append(("begin", case["case"], feedback))
+                    if feedback == b"p":
+                        readable, _, _ = select_io.select(
+                            [peer.udp], [], [], max(0, deadline - time.monotonic()))
+                        self.assertTrue(readable, "early producer did not reach the actual UDP socket")
+                    original_begin(case, deadline)
+
+                def finish(status, deadline):
+                    """固定原 finish/join/drain 前窗口，后继不得在其返回前进入 UART。"""
+                    feedback = window(b"F", deadline)
+                    windows.append(("finish", peer.active["row"]["case"], feedback))
+                    if feedback == b"x":
+                        readable, _, _ = select_io.select(
+                            [host], [], [], max(0, deadline - time.monotonic()))
+                        self.assertTrue(readable, "successor did not enter the actual UART socket")
+                    original_finish(status, deadline)
+
+                def connect(deadline):
+                    """UART 已由真实继承句柄建立，原 handshake 仍消费 READY 和发送命令。"""
+                    vm.check(deadline)
+
+                def close():
+                    """先终结并 wait 子进程，再关闭 peer 全尾及实际 UART 句柄。"""
+                    if process.poll() is None:
+                        process.terminate()
+                    process.wait(timeout=2)
+                    peer.close()
+                    host.close()
+                    raw.close()
+
+                peer.begin = begin
+                peer.finish = finish
+                vm.connect = connect
+                vm.close = close
+                return vm
+
+            try:
+                args = options(startup_timeout=2, setup_timeout=2, case_timeout=2, cleanup_timeout=2)
+                with patch("ktest.runner.VM", side_effect=construct_vm) as factory:
+                    results = execute_batch(args, Path("kernel"), catalog_of(rows),
+                                            invocations(rows, args), directory)
+                self.assertEqual(factory.call_count, 1)
+                self.assertEqual([row["status"] for row in results], ["Pass", "Pass"])
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(windows, [("begin", 0, b"b"), ("finish", 0, b"f"),
+                                           ("begin", 1, b"b"), ("finish", 1, b"f")])
+                report = json.loads((directory / "part-0" / "peer.json").read_text())
+                self.assertFalse(report["failures"])
+                self.assertEqual(len(report["cases"]), 2)
+                for row in report["cases"]:
+                    received = [event for event in row["events"] if event["kind"] == "udp-recv"]
+                    sent = [event for event in row["events"] if event["kind"] == "udp-send"]
+                    self.assertEqual([event["bytes_hex"] for event in received], ["50"])
+                    self.assertEqual([event["bytes_hex"] for event in sent], ["51"])
+                    self.assertEqual(received[0]["source"], sent[0]["destination"])
+                    self.assertTrue(row["complete"])
+                    self.assertFalse(row["errors"])
+                    self.assertIsNotNone(row["thread_exited_at"])
+                    self.assertIsNotNone(row["joined_at"])
+                self.assertIsNotNone(report["closed_at"])
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=2)
+                for peer in peers:
+                    peer.close()
+                host.close()
+                if raw is not None:
+                    raw.close()
+                for descriptor in (ports_writer, gate_writer, feedback_reader):
+                    os.close(descriptor)
 
     def test_suite_errors_keep_case_states_and_independent_json_junit_error(self):
         """suite 各阶段错误经真实 UART 落到独立报告，保全各例状态。"""

@@ -13,12 +13,13 @@ import tempfile
 import time
 import threading
 
-from storage import disk_arguments
+from storage import disk_arguments, network_arguments
 
 from . import ap_freeze, boot
 from .catalog import Catalog, HostError, require, run_command
 from .protocol import KTAP, ready
 from .execution_uart import ExecutionUART
+from .net_user import NetUserPeer
 from .resources import (crc32c_update, prepare_disks,
                         resource_names, validate_resources)
 
@@ -37,7 +38,7 @@ class VM:
     """每个实例有独立串口 socket、工作盘和进程组，不使用 stdio 后备。"""
 
     def __init__(self, args, kernel, directory, names):
-        """先制作独占盘，再让 QEMU 打开它们；输入文件永不交给 QEMU。"""
+        """独占盘和 live peer 在启动前准备，QEMU 真正 wait 后才释放。"""
         self.args = args
         self.directory = directory
         self.process = None
@@ -48,6 +49,7 @@ class VM:
         self.tx_offset = 0
         self.tx_used = False
         self.execution_uart = None
+        self.net_user = None
         self.debugger = None
         self.debug_log = None
         self.gdb_command = None
@@ -61,16 +63,20 @@ class VM:
             self.console = (directory / "qemu.log").open("xb", buffering=0)
             self.disk_directory = tempfile.TemporaryDirectory(prefix="disks-", dir=directory)
             disks = prepare_disks(names, args, Path(self.disk_directory.name))
+            if "net-user" in names:
+                self.net_user = NetUserPeer(directory)
             command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
                        "-kernel", str(kernel), "-m", args.memory, "-smp", str(args.cpus),
-                       "-display", "none", "-monitor", "none", "-no-reboot", "-nic", "none",
+                       "-display", "none", "-monitor", "none", "-no-reboot",
                        "-chardev", f"socket,id=ktest,path={self.endpoint},server=on,wait=on",
                        "-serial", "chardev:ktest"]
             if args.arch == "riscv64":
                 command += ["-bios", "default"]
                 if args.modern:
                     command += ["-global", "virtio-mmio.force-legacy=false"]
-            command += disk_arguments(disks, args, names)
+            command += network_arguments(args.arch, "user" if self.net_user is not None else "none")
+            ports = self.net_user.ports if self.net_user is not None else None
+            command += disk_arguments(disks, args, names, network_ports=ports)
             if "ap-freeze" in names and args.cpus >= 2:
                 endpoint = str(Path(self.socket_directory.name) / "gdb.sock")
                 command += ["-chardev", f"socket,id=ktest-gdb,path={endpoint},server=on,wait=off",
@@ -364,7 +370,7 @@ class VM:
                 return
 
     def verify_resources(self, deadline):
-        """真实退出后核对 RX 文件余量及本 VM 的实际冻结现场。"""
+        """真实退出后核对 UART、网络 peer 原字节及本 VM 的冻结现场。"""
         if self.rx_used:
             require(self.args.uart_payload.stat().st_size == self.rx_offset,
                     "UART input has unconsumed bytes at VM exit")
@@ -378,9 +384,12 @@ class VM:
                 raise DeadlineExpired("AP freeze debugger exceeded cleanup deadline") from error
             require(self.debugger.returncode == 0, "AP freeze GDB failed; inspect ap-freeze-gdb.log")
             ap_freeze.verify(self.directory)
+        peer = getattr(self, "net_user", None)
+        if peer is not None:
+            peer.verify(deadline)
 
     def close(self):
-        """先终结并 wait 各进程组，再关闭句柄及清理本实例独占工作盘。"""
+        """先真正 wait 进程，再取消并 join peer，最后关闭句柄及工作盘。"""
         for process in (self.debugger, self.process):
             if process is None:
                 continue
@@ -397,6 +406,9 @@ class VM:
             except ProcessLookupError:
                 pass
             process.wait()
+        peer = getattr(self, "net_user", None)
+        if peer is not None:
+            peer.close()
         if self.serial is not None:
             self.serial.close()
         if self.raw is not None:
@@ -502,7 +514,7 @@ def suite_error_row(suite, item, error, directory):
                 log=str(directory / "uart.log"))
 
 def execute_batch(args, kernel, catalog, items, directory):
-    """不完整 UART 不能证明未执行；只有真实 fatal 自退出可安全继续后缀。"""
+    """保持原 KTAP、fatal 和绝对期限，peer 消费边界完成后才回执放行本例或后继。"""
     output = []
     pending = list(items)
     attempt = 0
@@ -539,9 +551,15 @@ def execute_batch(args, kernel, catalog, items, directory):
                     item = pending[len(parser.results)]
                     vm.execution_uart.begin(item.case)
                     case_deadline = now + min(item.case["timeout_ms"] / 1000, args.case_timeout)
+                    peer = getattr(vm, "net_user", None)
+                    if peer is not None:
+                        peer.begin(item.case, case_deadline)
                     setup_deadline = now + args.setup_timeout
                     cleanup_deadline = None
                     deadline = case_deadline
+                    if peer is not None:
+                        vm.send(f"KTEST PEER BEGIN {item.case['case']}\n".encode("ascii"),
+                                min(case_deadline, setup_deadline))
                 elif event == "body":
                     setup_deadline = None
                     vm.execution_uart.body = True
@@ -553,6 +571,10 @@ def execute_batch(args, kernel, catalog, items, directory):
                     vm.raw_io(event, effective, names)
                 elif event == "status":
                     vm.execution_uart.finish(parser.status)
+                    peer = getattr(vm, "net_user", None)
+                    if peer is not None:
+                        peer.finish(parser.status, case_deadline)
+                        vm.send(f"KTEST PEER END {parser.active}\n".encode("ascii"), effective)
                 elif event == "result":
                     setup_deadline = case_deadline = None
                     if cleanup_deadline is None:
@@ -617,6 +639,10 @@ def execute_batch(args, kernel, catalog, items, directory):
             cid = item.case["case"]
             if cid in parser.results:
                 result = parser.results[cid]
+                peer = getattr(vm, "net_user", None)
+                peer_error = peer.failures.get(cid) if peer is not None else None
+                if result["status"] == "Pass" and peer_error:
+                    result = dict(result, status="Error", reason=peer_error)
                 output.append(result_row(item, result["status"], result["reason"], current,
                                          result.get("case_abort")))
             elif cid == parser.active:

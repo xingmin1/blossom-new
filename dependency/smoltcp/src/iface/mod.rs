@@ -19,8 +19,11 @@ pub mod packet;
 #[cfg(feature = "multicast")]
 pub use self::interface::multicast::MulticastError;
 pub use self::interface::{
-    Config, Interface, InterfaceInner as Context, PollIngressSingleResult, PollResult,
+    Config, DispatchError, Interface, InterfaceInner, InterfaceInner as Context,
+    PollIngressSingleResult, PollResult, TransportIngress, TransportResponse,
 };
 
 pub use self::route::{Route, RouteTableFull, Routes};
 pub use self::socket_set::{SocketHandle, SocketSet, SocketStorage};
+pub use crate::iface::fragmentation::{BufferError, InterfaceBuffers};
+pub use crate::iface::packet::{IpPayload, Packet};

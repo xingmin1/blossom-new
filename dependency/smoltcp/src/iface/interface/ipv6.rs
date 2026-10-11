@@ -184,9 +184,10 @@ impl InterfaceInner {
         })
     }
 
-    pub(super) fn process_ipv6<'frame>(
+    /// 保留 IPv6 校验、扩展头和邻居控制，传输输入同步分派。
+    pub(super) fn process_ipv6<'frame, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
@@ -209,6 +210,7 @@ impl InterfaceInner {
         };
 
         if !self.has_ip_addr(ipv6_repr.dst_addr)
+            && sockets.local_destination() != Some(IpAddress::Ipv6(ipv6_repr.dst_addr))
             && !self.has_multicast_group(ipv6_repr.dst_addr)
             && !ipv6_repr.dst_addr.is_loopback()
         {
@@ -318,11 +320,10 @@ impl InterfaceInner {
         ))
     }
 
-    /// Given the next header value forward the payload onto the correct process
-    /// function.
-    fn process_nxt_hdr<'frame>(
+    /// 原 next-header 分派保留控制处理及正常协议拒绝。
+    fn process_nxt_hdr<'frame, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         ipv6_repr: Ipv6Repr,
         nxt_hdr: IpProtocol,
@@ -342,7 +343,7 @@ impl InterfaceInner {
             ),
 
             #[cfg(feature = "socket-tcp")]
-            IpProtocol::Tcp => self.process_tcp(sockets, ipv6_repr.into(), ip_payload),
+            IpProtocol::Tcp => self.process_tcp(sockets, meta, ipv6_repr.into(), ip_payload),
 
             #[cfg(feature = "socket-raw")]
             _ if handled_by_raw_socket => None,
@@ -363,9 +364,10 @@ impl InterfaceInner {
         }
     }
 
-    pub(super) fn process_icmpv6<'frame>(
+    /// 无用户 ICMP socket 时仍处理 echo、NDISC 和必要控制报文。
+    pub(super) fn process_icmpv6<'frame, 's>(
         &mut self,
-        _sockets: &mut SocketSet,
+        _sockets: &mut impl TransportIngress<'s>,
         ip_repr: Ipv6Repr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -383,13 +385,15 @@ impl InterfaceInner {
         #[cfg(feature = "socket-icmp")]
         {
             use crate::socket::icmp::Socket as IcmpSocket;
-            for icmp_socket in _sockets
-                .items_mut()
-                .filter_map(|i| IcmpSocket::downcast_mut(&mut i.socket))
-            {
-                if icmp_socket.accepts_v6(self, &ip_repr, &icmp_repr) {
-                    icmp_socket.process_v6(self, &ip_repr, &icmp_repr);
-                    handled_by_icmp_socket = true;
+            if let Some(sockets) = _sockets.socket_set() {
+                for icmp_socket in sockets
+                    .items_mut()
+                    .filter_map(|i| IcmpSocket::downcast_mut(&mut i.socket))
+                {
+                    if icmp_socket.accepts_v6(self, &ip_repr, &icmp_repr) {
+                        icmp_socket.process_v6(self, &ip_repr, &icmp_repr);
+                        handled_by_icmp_socket = true;
+                    }
                 }
             }
         }

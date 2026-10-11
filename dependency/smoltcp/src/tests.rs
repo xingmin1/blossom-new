@@ -5,6 +5,7 @@ use crate::phy::{self, Device, DeviceCapabilities, Medium};
 use crate::time::Instant;
 use crate::wire::*;
 
+/// 为原库测试准备真实有限接口后备和 SocketSet。
 pub fn setup<'a>(medium: Medium) -> (Interface, SocketSet<'a>, TestingDevice) {
     let mut device = TestingDevice::new(medium);
 
@@ -21,7 +22,12 @@ pub fn setup<'a>(medium: Medium) -> (Interface, SocketSet<'a>, TestingDevice) {
         ])),
     });
 
-    let mut iface = Interface::new(config, &mut device, Instant::ZERO);
+    let buffers = InterfaceBuffers::try_new(
+        crate::config::FRAGMENTATION_BUFFER_SIZE,
+        crate::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::ZERO, buffers);
 
     #[cfg(feature = "proto-ipv4")]
     {

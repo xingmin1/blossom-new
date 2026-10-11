@@ -4,12 +4,15 @@ use core::convert::{TryFrom, TryInto};
 
 use crate::fs::{DescriptorFlags, FileIoContext, FileRef, ReadBuffer, UserIoVector, WriteBuffer};
 use crate::mm::space::Mm;
-use crate::net::address::{SocketAddress, AF_INET, AF_UNIX, INET_ADDRESS_LEN};
+use crate::net::address::{
+    AddressFamily, SocketAddress, AF_INET, AF_INET6, AF_UNIX, MAX_ADDRESS_LEN,
+};
 use crate::net::socket::SocketFile;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::file::{import_vectors, MAX_IOV_COUNT};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::UserThread;
+use smoltcp::socket::tcp::CongestionControl;
 
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
@@ -21,6 +24,11 @@ const SOCKET_FLAGS: u32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const TCP_NODELAY: i32 = 1;
+const TCP_MAXSEG: i32 = 2;
+const TCP_CONGESTION: i32 = 13;
+const IPPROTO_IPV6: i32 = 41;
+const IPV6_V6ONLY: i32 = 26;
+const CONGESTION_NAME_LEN: usize = 16;
 const MSG_TRUNC: u32 = 0x20;
 const IPPROTO_MAX: i32 = 263;
 const ADDRESS_STORAGE_LEN: usize = 128;
@@ -28,6 +36,7 @@ const SOL_SOCKET: i32 = 1;
 const SO_REUSEADDR: i32 = 2;
 const SO_TYPE: i32 = 3;
 const SO_ERROR: i32 = 4;
+const SO_KEEPALIVE: i32 = 9;
 const SO_SNDBUF: i32 = 7;
 const SO_RCVBUF: i32 = 8;
 const SO_ACCEPTCONN: i32 = 30;
@@ -92,9 +101,11 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !SOCKET_FLAGS != 0 {
         return Err(Errno::InvalidArgument);
     }
-    if family != i32::from(AF_INET) {
-        return Err(Errno::AddressFamilyNotSupported);
-    }
+    let family = match family {
+        value if value == i32::from(AF_INET) => AddressFamily::Ipv4,
+        value if value == i32::from(AF_INET6) => AddressFamily::Ipv6,
+        _ => return Err(Errno::AddressFamilyNotSupported),
+    };
     if SOCK_MAX <= kind {
         return Err(Errno::InvalidArgument);
     }
@@ -112,6 +123,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let file: FileRef = if kind == SOCK_STREAM {
         SocketFile::try_new_tcp(
             runtime.net,
+            family,
             flags,
             runtime.credentials.uid,
             runtime.credentials.gid,
@@ -119,6 +131,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
     } else {
         SocketFile::try_new_udp(
             runtime.net,
+            family,
             flags,
             runtime.credentials.uid,
             runtime.credentials.gid,
@@ -145,7 +158,7 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if protocol < 0 || IPPROTO_MAX <= protocol {
         return Err(Errno::InvalidArgument);
     }
-    if family == i32::from(AF_INET) {
+    if family == i32::from(AF_INET) || family == i32::from(AF_INET6) {
         match kind {
             SOCK_STREAM if protocol == 0 || protocol == IPPROTO_TCP => {}
             SOCK_DGRAM if protocol == 0 || protocol == IPPROTO_UDP => {}
@@ -185,7 +198,7 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(0)
 }
 
-/// 地址先复制为内核值，最短 family 可表示 UDP 解除 peer，IPv4 仍需完整地址。
+/// 地址先复制为内核值，两种 IP 族的完整结构与 scope 由共同解码边界检查。
 fn input_address(mm: &Mm, address: usize, raw_length: usize) -> Result<SocketAddress, Errno> {
     let length = raw_length as i32;
     if length < 2 || (ADDRESS_STORAGE_LEN as i32) < length {
@@ -451,7 +464,7 @@ fn output_name(
     capacity: usize,
     name: Option<SocketAddress>,
 ) -> Result<usize, Errno> {
-    let mut bytes = [0u8; INET_ADDRESS_LEN];
+    let mut bytes = [0u8; MAX_ADDRESS_LEN];
     let length = name.map_or(0, |name| name.encode(&mut bytes));
     let copied = capacity.min(length);
     if copied != 0 {
@@ -481,7 +494,39 @@ fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(count as isize)
 }
 
-/// 所选布尔选项读取目标 signed int；未知选项和缓冲设置不访问内容。
+/// 所选选项的协议和只读边界在 copyin 前检查，不把不支持的设置当作成功。
+fn check_option(socket: &SocketFile, level: i32, option: i32, setting: bool) -> Result<(), Errno> {
+    match (level, option) {
+        (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE) => Ok(()),
+        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) if !setting || socket.domain() != AF_UNIX => Ok(()),
+        (SOL_SOCKET, SO_TYPE | SO_ERROR | SO_ACCEPTCONN | SO_PROTOCOL | SO_DOMAIN) if !setting => {
+            Ok(())
+        }
+        (IPPROTO_TCP, TCP_NODELAY | TCP_CONGESTION) if socket.protocol() == IPPROTO_TCP => Ok(()),
+        (IPPROTO_TCP, TCP_MAXSEG) if !setting && socket.protocol() == IPPROTO_TCP => Ok(()),
+        (IPPROTO_IPV6, IPV6_V6ONLY) if socket.domain() == AF_INET6 => Ok(()),
+        _ => Err(Errno::ProtocolOptionNotSupported),
+    }
+}
+
+/// 有界字符串在首个 NUL 停止读取，后续不可读字节不改变已经结束的名称。
+fn input_congestion(
+    mm: &Mm,
+    address: usize,
+    length: usize,
+) -> Result<[u8; CONGESTION_NAME_LEN], Errno> {
+    let mut name = [0u8; CONGESTION_NAME_LEN];
+    for offset in 0..length.min(CONGESTION_NAME_LEN - 1) {
+        let source = address.checked_add(offset).ok_or(Errno::BadAddress)?;
+        copyin(mm, &mut name[offset..offset + 1], source)?;
+        if name[offset] == 0 {
+            break;
+        }
+    }
+    Ok(name)
+}
+
+/// 选项 copyin 全在端点锁外，缓冲提示和开关只以完整内核值修改原对象。
 fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let file = socket_file(user, raw[0])?;
     let socket = file.socket().expect("checked socket capability");
@@ -491,64 +536,95 @@ fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let level = raw[1] as i32;
     let option = raw[2] as i32;
-    match (level, option) {
-        (SOL_SOCKET, SO_REUSEADDR) => {}
-        (IPPROTO_TCP, TCP_NODELAY) if socket.protocol() == IPPROTO_TCP => {}
-        _ => return Err(Errno::ProtocolOptionNotSupported),
+    check_option(socket, level, option, true)?;
+    let mm = user.mm().expect("setsockopt has no MM");
+    if level == IPPROTO_TCP && option == TCP_CONGESTION {
+        if length == 0 {
+            return Err(Errno::InvalidArgument);
+        }
+        let name = input_congestion(&mm, raw[3], length as usize)?;
+        let end = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("bounded congestion name has no terminator");
+        socket.set_congestion_control(&name[..end])?;
+        return Ok(0);
     }
     if length < 4 {
         return Err(Errno::InvalidArgument);
     }
-    let mm = user.mm().expect("setsockopt has no MM");
     let mut bytes = [0u8; 4];
     copyin(&mm, &mut bytes, raw[3])?;
-    let enabled = i32::from_ne_bytes(bytes) != 0;
-    if level == SOL_SOCKET {
-        socket.set_reuse_address(enabled)?;
-    } else {
-        socket.set_nodelay(enabled)?;
+    let value = i32::from_ne_bytes(bytes);
+    match (level, option) {
+        (SOL_SOCKET, SO_REUSEADDR) => socket.set_reuse_address(value != 0)?,
+        (SOL_SOCKET, SO_KEEPALIVE) => socket.set_keepalive(value != 0)?,
+        (SOL_SOCKET, SO_SNDBUF) => socket.set_send_budget(value)?,
+        (SOL_SOCKET, SO_RCVBUF) => socket.set_receive_budget(value)?,
+        (IPPROTO_TCP, TCP_NODELAY) => socket.set_nodelay(value != 0)?,
+        (IPPROTO_IPV6, IPV6_V6ONLY) => socket.set_v6_only(value != 0)?,
+        _ => unreachable!("checked socket setter has no implementation"),
     }
     Ok(0)
 }
 
-/// 查询真实类型、监听状态和缓冲容量；pending error 在交付用户字节前一次消费。
+/// 名称来自 raw 实际控制器，固定名字槽只存本次查询的 ABI 字节。
+fn congestion_name(socket: &SocketFile) -> Result<[u8; CONGESTION_NAME_LEN], Errno> {
+    let name: &[u8] = match socket.congestion_control()? {
+        CongestionControl::Reno => b"reno",
+        CongestionControl::None => b"none",
+    };
+    let mut bytes = [0u8; CONGESTION_NAME_LEN];
+    bytes[..name.len()].copy_from_slice(name);
+    Ok(bytes)
+}
+
+/// 短输出只修改有效前缀，optlen 返回实际复制量；copyout 不回滚协议消费。
+fn output_option(mm: &Mm, raw: [usize; 6], capacity: usize, bytes: &[u8]) -> SysResult {
+    let copied = capacity.min(bytes.len());
+    if copied != 0 {
+        copyout(mm, raw[3], &bytes[..copied])?;
+    }
+    copyout(mm, raw[4], &(copied as u32).to_ne_bytes())?;
+    Ok(0)
+}
+
+/// 查询真实协议配置和预算，pending error 在交付用户字节前一次消费。
 fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let file = socket_file(user, raw[0])?;
     let socket = file.socket().expect("checked socket capability");
     let level = raw[1] as i32;
     let option = raw[2] as i32;
-    if level != SOL_SOCKET
-        && !(level == IPPROTO_TCP && option == TCP_NODELAY && socket.protocol() == IPPROTO_TCP)
-    {
-        return Err(Errno::ProtocolOptionNotSupported);
-    }
+    check_option(socket, level, option, false)?;
     let mm = user.mm().expect("getsockopt has no MM");
     let capacity = capacity(&mm, raw[4])?;
+    if level == IPPROTO_TCP && option == TCP_CONGESTION {
+        return output_option(&mm, raw, capacity, &congestion_name(socket)?);
+    }
     let value = match (level, option) {
         (IPPROTO_TCP, TCP_NODELAY) => i32::from(socket.nodelay()?),
+        (IPPROTO_TCP, TCP_MAXSEG) => {
+            i32::try_from(socket.effective_mss()?).map_err(|_| Errno::Overflow)?
+        }
+        (IPPROTO_IPV6, IPV6_V6ONLY) => i32::from(socket.v6_only()?),
         (SOL_SOCKET, SO_REUSEADDR) => i32::from(socket.reuse_address()),
+        (SOL_SOCKET, SO_KEEPALIVE) => i32::from(socket.keepalive()),
         (SOL_SOCKET, SO_TYPE) => socket.socket_type() as i32,
         (SOL_SOCKET, SO_ERROR) => socket
             .take_error()
             .map_or(0, |error| Errno::from(error) as i32),
         (SOL_SOCKET, SO_SNDBUF) => {
-            i32::try_from(socket.send_capacity()).map_err(|_| Errno::Overflow)?
+            i32::try_from(socket.send_budget()).map_err(|_| Errno::Overflow)?
         }
         (SOL_SOCKET, SO_RCVBUF) => {
-            i32::try_from(socket.receive_capacity()).map_err(|_| Errno::Overflow)?
+            i32::try_from(socket.receive_budget()).map_err(|_| Errno::Overflow)?
         }
         (SOL_SOCKET, SO_ACCEPTCONN) => i32::from(socket.is_listener()),
         (SOL_SOCKET, SO_PROTOCOL) => socket.protocol(),
         (SOL_SOCKET, SO_DOMAIN) => i32::from(socket.domain()),
-        _ => return Err(Errno::ProtocolOptionNotSupported),
+        _ => unreachable!("checked socket getter has no implementation"),
     };
-    let bytes = value.to_ne_bytes();
-    let copied = capacity.min(bytes.len());
-    if copied != 0 {
-        copyout(&mm, raw[3], &bytes[..copied])?;
-    }
-    copyout(&mm, raw[4], &(copied as u32).to_ne_bytes())?;
-    Ok(0)
+    output_option(&mm, raw, capacity, &value.to_ne_bytes())
 }
 
 /// 收发方向关闭直接作用于真实端点，不用关闭描述符冒充 shutdown。

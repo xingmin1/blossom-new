@@ -1,8 +1,6 @@
 use managed::ManagedSlice;
 
-use crate::storage::{Full, RingBuffer};
-
-use super::Empty;
+use crate::storage::{Empty, Full, RingBuffer};
 
 /// Size and header of a packet.
 #[derive(Debug, Clone, Copy)]
@@ -71,54 +69,48 @@ impl<'a, H> PacketBuffer<'a, H> {
         self.metadata_ring.is_full()
     }
 
+    /// 查询接纳完整消息所需的 payload 字节，包含绕回 padding；metadata 或连续空间不足时返回 None。
+    pub fn enqueue_payload_cost(&self, size: usize) -> Option<usize> {
+        let window = self.payload_ring.window();
+        let contiguous = if self.payload_ring.is_empty() {
+            self.payload_ring.capacity()
+        } else {
+            self.payload_ring.contiguous_window()
+        };
+        if window < size {
+            return None;
+        }
+        let padding = if contiguous < size { contiguous } else { 0 };
+        if window - padding < size {
+            return None;
+        }
+        let records = if padding == 0 { 1 } else { 2 };
+        if self.metadata_ring.window() < records {
+            return None;
+        }
+        Some(padding + size)
+    }
+
     // There is currently no enqueue_with() because of the complexity of managing padding
     // in case of failure.
 
-    /// Enqueue a single packet with the given header into the buffer, and
-    /// return a reference to its payload, or return `Err(Full)`
-    /// if the buffer is full.
+    /// 接纳一条完整消息并借出 payload；不足时保持 metadata 和 payload 两个环不变。
     pub fn enqueue(&mut self, size: usize, header: H) -> Result<&mut [u8], Full> {
-        if self.payload_ring.capacity() < size || self.metadata_ring.is_full() {
-            return Err(Full);
-        }
-
-        // Ring is currently empty.  Clear it (resetting `read_at`) to maximize
-        // for contiguous space.
+        let padding = self.enqueue_payload_cost(size).ok_or(Full)? - size;
         if self.payload_ring.is_empty() {
             self.payload_ring.clear();
         }
-
-        let window = self.payload_ring.window();
-        let contig_window = self.payload_ring.contiguous_window();
-
-        if window < size {
-            return Err(Full);
-        } else if contig_window < size {
-            if window - contig_window < size {
-                // The buffer length is larger than the current contiguous window
-                // and is larger than the contiguous window will be after adding
-                // the padding necessary to circle around to the beginning of the
-                // ring buffer.
-                return Err(Full);
-            } else {
-                // Add padding to the end of the ring buffer so that the
-                // contiguous window is at the beginning of the ring buffer.
-                *self.metadata_ring.enqueue_one()? = PacketMetadata::padding(contig_window);
-                // note(discard): function does not write to the result
-                // enqueued padding buffer location
-                let _buf_enqueued = self.payload_ring.enqueue_many(contig_window);
-            }
+        if 0 < padding {
+            *self.metadata_ring.enqueue_one()? = PacketMetadata::padding(padding);
+            let _ = self.payload_ring.enqueue_many(padding);
         }
-
         *self.metadata_ring.enqueue_one()? = PacketMetadata::packet(size, header);
-
         let payload_buf = self.payload_ring.enqueue_many(size);
-        debug_assert!(payload_buf.len() == size);
+        debug_assert_eq!(payload_buf.len(), size);
         Ok(payload_buf)
     }
 
-    /// Call `f` with a packet from the buffer large enough to fit `max_size` bytes. The packet
-    /// is shrunk to the size returned from `f` and enqueued into the buffer.
+    /// 预留 max_size 的连续空间，再提交闭包实际写入的一条消息；空环先复位以免保留无用 padding。
     pub fn enqueue_with_infallible<'b, F>(
         &'b mut self,
         max_size: usize,
@@ -128,38 +120,20 @@ impl<'a, H> PacketBuffer<'a, H> {
     where
         F: FnOnce(&'b mut [u8]) -> usize,
     {
-        if self.payload_ring.capacity() < max_size || self.metadata_ring.is_full() {
-            return Err(Full);
+        let padding = self.enqueue_payload_cost(max_size).ok_or(Full)? - max_size;
+        if self.payload_ring.is_empty() {
+            self.payload_ring.clear();
         }
-
-        let window = self.payload_ring.window();
-        let contig_window = self.payload_ring.contiguous_window();
-
-        if window < max_size {
-            return Err(Full);
-        } else if contig_window < max_size {
-            if window - contig_window < max_size {
-                // The buffer length is larger than the current contiguous window
-                // and is larger than the contiguous window will be after adding
-                // the padding necessary to circle around to the beginning of the
-                // ring buffer.
-                return Err(Full);
-            } else {
-                // Add padding to the end of the ring buffer so that the
-                // contiguous window is at the beginning of the ring buffer.
-                *self.metadata_ring.enqueue_one()? = PacketMetadata::padding(contig_window);
-                // note(discard): function does not write to the result
-                // enqueued padding buffer location
-                let _buf_enqueued = self.payload_ring.enqueue_many(contig_window);
-            }
+        if 0 < padding {
+            *self.metadata_ring.enqueue_one()? = PacketMetadata::padding(padding);
+            let _ = self.payload_ring.enqueue_many(padding);
         }
-
-        let (size, _) = self
-            .payload_ring
-            .enqueue_many_with(|data| (f(&mut data[..max_size]), ()));
-
+        let (size, _) = self.payload_ring.enqueue_many_with(|data| {
+            let size = f(&mut data[..max_size]);
+            assert!(size <= max_size);
+            (size, ())
+        });
         *self.metadata_ring.enqueue_one()? = PacketMetadata::packet(size, header);
-
         Ok(size)
     }
 
@@ -389,6 +363,45 @@ mod test {
         assert!(buffer.enqueue(4, ()).is_ok());
         assert!(buffer.dequeue().is_ok());
         assert!(buffer.enqueue(5, ()).is_ok());
+    }
+
+    /// 验证绕回需要两个 metadata，失败不得留下孤立 padding 或改变既有 payload。
+    #[test]
+    fn test_padding_requires_metadata_reservation() {
+        let mut buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 2], vec![0; 16]);
+        buffer.enqueue(6, ()).unwrap().copy_from_slice(b"abcdef");
+        buffer.enqueue(8, ()).unwrap().copy_from_slice(b"12345678");
+        assert_eq!(buffer.dequeue().unwrap().1, b"abcdef");
+        assert_eq!(buffer.enqueue_payload_cost(4), None);
+        assert_eq!(buffer.enqueue(4, ()), Err(Full));
+        assert_eq!(
+            buffer.enqueue_with_infallible(4, (), |_| unreachable!()),
+            Err(Full)
+        );
+        assert_eq!(buffer.dequeue().unwrap().1, b"12345678");
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.payload_bytes_count(), 0);
+    }
+
+    /// 验证空环 send_with 使用整块容量，实际缩短后仅保存一个完整记录。
+    #[test]
+    fn test_enqueue_with_reuses_empty_ring() {
+        let mut buffer = buffer();
+        buffer
+            .enqueue(12, ())
+            .unwrap()
+            .copy_from_slice(b"abcdefghijkl");
+        assert_eq!(buffer.dequeue().unwrap().1, b"abcdefghijkl");
+        assert_eq!(buffer.enqueue_payload_cost(16), Some(16));
+        assert_eq!(
+            buffer.enqueue_with_infallible(16, (), |bytes| {
+                bytes[..6].copy_from_slice(b"abcdef");
+                6
+            }),
+            Ok(6)
+        );
+        assert_eq!(buffer.dequeue().unwrap().1, b"abcdef");
+        assert!(buffer.is_empty());
     }
 
     #[test]

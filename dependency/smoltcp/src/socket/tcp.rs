@@ -14,8 +14,8 @@ use crate::socket::WakerRegistration;
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
-    TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, IpVersion, TcpControl, TcpRepr,
+    TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
 };
 
 mod congestion;
@@ -477,6 +477,10 @@ pub struct Socket<'a> {
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
     tx_buffer: SocketBuffer<'a>,
+    /// 接收接纳预算；既有数据和已通告信用仍由原物理后备保留。
+    rx_budget: usize,
+    /// 发送接纳预算，包含已接纳但尚未 ACK 的字节。
+    tx_budget: usize,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -500,8 +504,10 @@ pub struct Socket<'a> {
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
-    /// The last window length sent.
-    remote_last_win: u16,
+    /// 上次实际通告的窗口字节数；SYN 不缩放，其他报文已还原缩放。
+    remote_last_win: usize,
+    /// 上次实际广告的序号右边界；主动 SYN 在同步对端序号后锚定。
+    remote_last_win_edge: Option<TcpSeqNumber>,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -555,13 +561,14 @@ const DEFAULT_MSS: usize = 536;
 
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
-    /// Create a socket using the given buffers.
+    /// 使用给定物理后备建立连接，默认接纳预算等于各方向容量。
     pub fn new<T>(rx_buffer: T, tx_buffer: T) -> Socket<'a>
     where
         T: Into<SocketBuffer<'a>>,
     {
         let (rx_buffer, tx_buffer) = (rx_buffer.into(), tx_buffer.into());
         let rx_capacity = rx_buffer.capacity();
+        let tx_capacity = tx_buffer.capacity();
 
         // From RFC 1323:
         // [...] the above constraints imply that 2 * the max window size must be less
@@ -581,6 +588,8 @@ impl<'a> Socket<'a> {
             tx_buffer,
             rx_buffer,
             rx_fin_received: false,
+            rx_budget: rx_capacity,
+            tx_budget: tx_capacity,
             timeout: None,
             keep_alive: None,
             hop_limit: None,
@@ -591,6 +600,7 @@ impl<'a> Socket<'a> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
+            remote_last_win_edge: None,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
@@ -730,31 +740,45 @@ impl<'a> Socket<'a> {
         self.nagle
     }
 
-    /// Return the current window field value, including scaling according to RFC 1323.
-    ///
-    /// Used in internal calculations as well as packet generation.
-    #[inline]
-    fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+    /// 返回当前 ACK 之后仍须保留的上次通告信用，按 TCP 序号处理环绕。
+    fn remaining_recv_credit(&self) -> Option<usize> {
+        let right_edge = self.remote_last_win_edge?;
+        let next_ack = self.remote_seq_no + self.rx_buffer.len();
+        Some(if next_ack < right_edge {
+            right_edge - next_ack
+        } else {
+            0
+        })
     }
 
-    /// Return the last window field value, including scaling according to RFC 1323.
-    ///
-    /// Used in internal calculations as well as packet generation.
-    ///
-    /// Unlike `remote_last_win`, we take into account new packets received (but not acknowledged)
-    /// since the last window update and adjust the window length accordingly. This ensures a fair
-    /// comparison between the last window length and the new window length we're going to
-    /// advertise.
+    /// 用接纳预算和既有窗口信用计算广告，乱序数据也占用预算。
+    fn recv_window(&self) -> usize {
+        let assembled: usize = self
+            .assembler
+            .iter_data(0)
+            .map(|(left, right)| right - left)
+            .sum();
+        let available = self
+            .rx_budget
+            .saturating_sub(self.rx_buffer.len() + assembled);
+        available
+            .max(self.remaining_recv_credit().unwrap_or(0))
+            .min(self.rx_buffer.window())
+    }
+
+    /// 将预算与信用允许的字节窗口编码为普通报文的缩放窗口字段。
+    #[inline]
+    fn scaled_window(&self) -> u16 {
+        u16::try_from(self.recv_window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+    }
+
+    /// 将上次通告的剩余字节信用换算为当前普通报文的窗口单位。
     #[inline]
     fn last_scaled_window(&self) -> Option<u16> {
-        let last_ack = self.remote_last_ack?;
-        let next_ack = self.remote_seq_no + self.rx_buffer.len();
-
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
-
-        Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
+        Some(
+            u16::try_from(self.remaining_recv_credit()? >> self.remote_win_shift)
+                .unwrap_or(u16::MAX),
+        )
     }
 
     /// Set the timeout duration.
@@ -802,24 +826,14 @@ impl<'a> Socket<'a> {
         self.keep_alive
     }
 
-    /// Set the keep-alive interval.
-    ///
-    /// An idle socket with a keep-alive interval set will transmit a "keep-alive ACK" packet
-    /// every time it receives no communication during that interval. As a result, three things
-    /// may happen:
-    ///
-    ///   * The remote endpoint is fine and answers with an ACK packet.
-    ///   * The remote endpoint has rebooted and answers with an RST packet.
-    ///   * The remote endpoint has crashed and does not answer.
-    ///
-    /// The keep-alive functionality together with the timeout functionality allows to react
-    /// to these error conditions.
+    /// 设置原空闲探测间隔；关闭时撤销空闲探测期限，不修改重传和关闭计时。
     pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
         self.keep_alive = interval;
         if self.keep_alive.is_some() {
-            // If the connection is idle and we've just set the option, it would not take effect
-            // until the next packet, unless we wind up the timer explicitly.
+            // 原计时器在下一轮 dispatch 安排实际间隔，保留立即探测行为。
             self.timer.set_keep_alive();
+        } else {
+            self.timer.rewind_keep_alive(Instant::ZERO, None);
         }
     }
 
@@ -874,6 +888,7 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// 重置协议状态并保留调用方选择的选项和接纳预算。
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -892,6 +907,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.remote_last_win_edge = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1149,15 +1165,14 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Check whether the transmit half of the full-duplex connection is open
-    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    /// 查询发送方向是否打开且同一发送预算和物理 ring 仍允许接纳字节。
     #[inline]
     pub fn can_send(&self) -> bool {
         if !self.may_send() {
             return false;
         }
 
-        !self.tx_buffer.is_full()
+        0 < self.send_window()
     }
 
     /// Return the maximum number of bytes inside the recv buffer.
@@ -1172,6 +1187,61 @@ impl<'a> Socket<'a> {
         self.tx_buffer.capacity()
     }
 
+    /// 返回接收接纳预算；物理后备容量仍由 recv_capacity 查询。
+    pub fn recv_budget(&self) -> usize {
+        self.rx_budget
+    }
+
+    /// 返回发送接纳预算，包括未 ACK 字节使用的额度。
+    pub fn send_budget(&self) -> usize {
+        self.tx_budget
+    }
+
+    /// 在物理后备范围内调节接收预算，不丢弃数据或收回已通告信用。
+    pub fn set_recv_budget(&mut self, budget: usize) {
+        assert!(1 <= budget && budget <= self.rx_buffer.capacity());
+        self.rx_budget = budget;
+    }
+
+    /// 在物理后备范围内调节发送预算，既有未 ACK 字节和序号保持不变。
+    pub fn set_send_budget(&mut self, budget: usize) {
+        assert!(1 <= budget && budget <= self.tx_buffer.capacity());
+        #[cfg(feature = "async")]
+        let could_send = self.can_send();
+        self.tx_budget = budget;
+        #[cfg(feature = "async")]
+        if !could_send && self.can_send() {
+            self.tx_waker.wake();
+        }
+    }
+
+    /// 返回同一发送队列还能接纳的字节量，未 ACK 字节不会因调小预算消失。
+    fn send_window(&self) -> usize {
+        self.tx_budget
+            .saturating_sub(self.tx_buffer.len())
+            .min(self.tx_buffer.window())
+    }
+
+    /// 按给定 IP 族和路径 MTU 计算原 TCP 基本首部之后的本地 MSS。
+    fn local_mss<C: TcpContext>(cx: &C, version: IpVersion) -> usize {
+        let ip_header_len = match version {
+            #[cfg(feature = "proto-ipv4")]
+            IpVersion::Ipv4 => crate::wire::IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
+            IpVersion::Ipv6 => crate::wire::IPV6_HEADER_LEN,
+        };
+        cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN
+    }
+
+    /// 查询实际分段共用的 MSS；已连接时采用四元组的族，未协商时保留默认对端限制。
+    pub fn effective_mss<C: TcpContext>(&self, cx: &C, version: IpVersion) -> usize {
+        let version = self
+            .tuple
+            .map(|tuple| tuple.local.addr.version())
+            .unwrap_or(version);
+        Self::local_mss(cx, version).min(self.remote_mss)
+    }
+
     /// Check whether the receive half of the full-duplex connection buffer is open
     /// (see [may_recv](#method.may_recv)), and the receive buffer is not empty.
     #[inline]
@@ -1183,17 +1253,19 @@ impl<'a> Socket<'a> {
         !self.rx_buffer.is_empty()
     }
 
+    /// 在发送方向打开时借出同一队列及剩余额度，并保留原空闲时间记账。
     fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&'b mut SocketBuffer<'a>, usize) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
         }
 
         let old_length = self.tx_buffer.len();
-        let (size, result) = f(&mut self.tx_buffer);
-        if size > 0 {
+        let limit = self.send_window();
+        let (size, result) = f(&mut self.tx_buffer, limit);
+        if 0 < size {
             // The connection might have been idle for a long time, and so remote_last_ts
             // would be far in the past. Unless we clear it here, we'll abort the connection
             // down over in dispatch() by erroneously detecting it as timed out.
@@ -1211,27 +1283,27 @@ impl<'a> Socket<'a> {
         Ok(result)
     }
 
-    /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
-    /// and enqueue the amount of elements returned by `f`.
-    ///
-    /// This function returns `Err(Error::Illegal)` if the transmit half of
-    /// the connection is not open; see [may_send](#method.may_send).
+    /// 借出发送预算和物理连续片段共同允许的切片，并提交回调返回的接受量。
+    /// 回调接受量超过本次切片长度会触发断言；发送方向关闭时返回状态错误。
     pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
+        self.send_impl(|tx_buffer, limit| {
+            tx_buffer.enqueue_many_with(|bytes| {
+                let size = limit.min(bytes.len());
+                let (accepted, result) = f(&mut bytes[..size]);
+                assert!(accepted <= size);
+                (accepted, result)
+            })
+        })
     }
 
-    /// Enqueue a sequence of octets to be sent, and fill it from a slice.
-    ///
-    /// This function returns the amount of octets actually enqueued, which is limited
-    /// by the amount of free space in the transmit buffer; down to zero.
-    ///
-    /// See also [send](#method.send).
+    /// 将预算和物理空闲共同允许的前缀写入原发送 ring，满预算时返回零。
+    /// 跨 ring 尾部仍可接纳两个连续片段；发送方向关闭时返回状态错误。
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
-        self.send_impl(|tx_buffer| {
-            let size = tx_buffer.enqueue_slice(data);
+        self.send_impl(|tx_buffer, limit| {
+            let size = tx_buffer.enqueue_slice(&data[..limit.min(data.len())]);
             (size, size)
         })
     }
@@ -1397,6 +1469,7 @@ impl<'a> Socket<'a> {
         (ip_reply_repr, reply_repr)
     }
 
+    /// 先按上次实际广告右边界计算本次窗口，再提交立即应答的广告记录。
     fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
         reply_repr.timestamp = repr
@@ -1409,13 +1482,14 @@ impl<'a> Socket<'a> {
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
-        self.remote_last_win = reply_repr.window_len;
+        self.remote_last_ack = reply_repr.ack_number;
+        self.remote_last_win = (reply_repr.window_len as usize) << self.remote_win_shift;
+        self.remote_last_win_edge = reply_repr.ack_number.map(|ack| ack + self.remote_last_win);
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1855,6 +1929,8 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
+                // 主动 SYN 的窗口以对端首个数据序号锚定；原 ACK 差量仍触发握手应答。
+                self.remote_last_win_edge = Some(self.remote_seq_no + self.remote_last_win);
                 self.remote_has_sack = repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
@@ -2156,18 +2232,7 @@ impl<'a> Socket<'a> {
 
     /// 根据连接窗口、拥塞状态和当前 MTU 判断是否存在可发送序号。
     fn seq_to_transmit<C: TcpContext>(&self, cx: &mut C) -> bool {
-        let ip_header_len = match self.tuple.unwrap().local.addr {
-            #[cfg(feature = "proto-ipv4")]
-            IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
-            #[cfg(feature = "proto-ipv6")]
-            IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
-        };
-
-        // Max segment size we're able to send due to MTU limitations.
-        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
-
-        // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.remote_mss);
+        let effective_mss = self.effective_mss(cx, self.tuple.unwrap().local.addr.version());
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2194,7 +2259,7 @@ impl<'a> Socket<'a> {
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
         // Can we send at least 1 full segment?
-        let can_send_full = max_send >= effective_mss;
+        let can_send_full = effective_mss <= max_send;
 
         // Do we have to send a FIN?
         let want_fin = match self.state {
@@ -2256,22 +2321,13 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Return whether we should send ACK immediately due to significant window updates.
-    ///
-    /// ACKs with significant window updates should be sent immediately to let the sender know that
-    /// more data can be sent. According to the Linux kernel implementation, "significant" means
-    /// doubling the receive window. The Linux kernel implementation can be found at
-    /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
+    /// 已完成握手后按原倍增阈值更新普通窗口；握手期间仅由 SYN 和原 RTO 通告窗口。
     fn window_to_update(&self) -> bool {
         match self.state {
-            State::SynSent
-            | State::SynReceived
-            | State::Established
-            | State::FinWait1
-            | State::FinWait2 => {
+            State::Established | State::FinWait1 | State::FinWait2 => {
                 let new_win = self.scaled_window();
                 if let Some(last_win) = self.last_scaled_window() {
-                    new_win > 0 && new_win / 2 >= last_win
+                    0 < new_win && last_win <= new_win / 2
                 } else {
                     false
                 }
@@ -2409,7 +2465,7 @@ impl<'a> Socket<'a> {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
                 // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+                repr.window_len = u16::try_from(self.recv_window()).unwrap_or(u16::MAX);
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
@@ -2449,9 +2505,7 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let size = win_limit
-                    .min(self.remote_mss)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                let size = win_limit.min(self.effective_mss(cx, tuple.local.addr.version()));
 
                 let offset = self.remote_last_seq - self.local_seq_no;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
@@ -2513,7 +2567,7 @@ impl<'a> Socket<'a> {
 
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
-            let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+            let max_segment_size = Self::local_mss(cx, tuple.local.addr.version());
             repr.max_seg_size = Some(max_segment_size as u16);
         }
 
@@ -2543,6 +2597,15 @@ impl<'a> Socket<'a> {
         }
         self.ack_delay_timer = AckDelayTimer::Idle;
 
+        self.remote_last_ack = repr.ack_number;
+        let shift = if repr.control == TcpControl::Syn {
+            0
+        } else {
+            self.remote_win_shift
+        };
+        self.remote_last_win = (repr.window_len as usize) << shift;
+        self.remote_last_win_edge = repr.ack_number.map(|ack| ack + self.remote_last_win);
+
         // Leave the rest of the state intact if sending a keep-alive packet, since those
         // carry a fake segment.
         if is_keep_alive {
@@ -2551,8 +2614,6 @@ impl<'a> Socket<'a> {
 
         // We've sent a packet successfully, so we can update the internal state now.
         self.remote_last_seq = repr.seq_number + repr.segment_len();
-        self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -2886,7 +2947,6 @@ mod test {
             assert_eq!(s1.remote_seq_no, s2.remote_seq_no, "remote_seq_no");
             assert_eq!(s1.remote_last_seq, s2.remote_last_seq, "remote_last_seq");
             assert_eq!(s1.remote_last_ack, s2.remote_last_ack, "remote_last_ack");
-            assert_eq!(s1.remote_last_win, s2.remote_last_win, "remote_last_win");
             assert_eq!(s1.remote_win_len, s2.remote_win_len, "remote_win_len");
             assert_eq!(s1.timer, s2.timer, "timer");
         }};
@@ -2936,13 +2996,15 @@ mod test {
         socket_syn_sent_with_buffer_sizes(64, 64)
     }
 
+    /// 准备既有 Established fixture，普通 ACK 的窗口和右边界使用真实字节单位。
     fn socket_established_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
         let mut s = socket_syn_received_with_buffer_sizes(tx_len, rx_len);
         s.state = State::Established;
         s.local_seq_no = LOCAL_SEQ + 1;
         s.remote_last_seq = LOCAL_SEQ + 1;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
-        s.remote_last_win = s.scaled_window();
+        s.remote_last_win = (s.scaled_window() as usize) << s.remote_win_shift;
+        s.remote_last_win_edge = s.remote_last_ack.map(|ack| ack + s.remote_last_win);
         s
     }
 
@@ -2976,7 +3038,6 @@ mod test {
         s.cx.set_now(Instant::from_millis(10));
         let previous_seq = s.remote_last_seq;
         let previous_ack = s.remote_last_ack;
-        let previous_window = s.remote_last_win;
         let result = s.socket.dispatch(&mut s.cx, |_, (_, tcp)| {
             assert_eq!(tcp.seq_number, previous_seq);
             assert_eq!(tcp.payload, b"abcdef");
@@ -2986,7 +3047,6 @@ mod test {
         assert_eq!(s.remote_last_ts, Some(Instant::from_millis(10)));
         assert_eq!(s.remote_last_seq, previous_seq);
         assert_eq!(s.remote_last_ack, previous_ack);
-        assert_eq!(s.remote_last_win, previous_window);
         assert_eq!(s.tx_buffer.len(), 6);
         let result = s.socket.dispatch(&mut s.cx, |_, (_, tcp)| {
             assert_eq!(tcp.seq_number, previous_seq);
@@ -2996,6 +3056,740 @@ mod test {
         assert_eq!(result, Ok(()));
         assert_eq!(s.remote_last_seq, previous_seq + 6);
         assert_eq!(s.tx_buffer.len(), 6);
+    }
+
+    /// 主动 SYN 的已广告信用以首个数据序号锚定，握手 ACK 和失败 emit 不伪造信用。
+    #[test]
+    fn test_recv_budget_active_syn_credit_and_failed_handshake_emit() {
+        for (seq, fail_handshake_emit) in [(REMOTE_SEQ, false), (TcpSeqNumber(-9), true)] {
+            let mut s = socket_with_buffer_sizes(64, 128);
+            s.set_recv_budget(64);
+            s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: None,
+                    window_len: 64,
+                    window_scale: Some(0),
+                    max_seg_size: Some(BASE_MSS),
+                    sack_permitted: true,
+                    ..RECV_TEMPL
+                }]
+            );
+            s.set_recv_budget(4);
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: seq,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    max_seg_size: Some(4000),
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state(), State::Established);
+            if fail_handshake_emit {
+                s.set_recv_budget(128);
+                let result = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
+                    assert_eq!(repr.control, TcpControl::None);
+                    assert_eq!(repr.ack_number, Some(seq + 1));
+                    assert_eq!(repr.window_len, 128);
+                    Err::<(), ()>(())
+                });
+                assert_eq!(result, Err(()));
+                s.set_recv_budget(4);
+            }
+            assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(seq + 1),
+                    window_len: 64,
+                    ..RECV_TEMPL
+                }]
+            );
+            let pattern: Vec<u8> = (0..64).collect();
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: seq + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &pattern,
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(seq + 65),
+                    window_len: 0,
+                    ..RECV_TEMPL
+                }]
+            );
+            let mut received = [0; 64];
+            assert_eq!(s.recv_slice(&mut received), Ok(64));
+            assert_eq!(received.as_slice(), pattern.as_slice());
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(seq + 65),
+                    window_len: 4,
+                    ..RECV_TEMPL
+                }]
+            );
+            assert_eq!(s.state(), State::Established);
+            assert_eq!(s.recv_capacity(), 128);
+        }
+    }
+
+    /// 握手后真实缩放广告的右边界在预算缩小、乱序和补缺时保持，并最终收敛。
+    #[test]
+    fn test_recv_budget_preserves_scaled_ack_credit() {
+        let mut s = connected_with_recv_budget(131072, 64, REMOTE_SEQ, Some(2));
+        let base = REMOTE_SEQ + 1;
+        let pattern: Vec<u8> = (0..132).collect();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: base,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &pattern[..4],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(base + 4),
+                window_len: 15,
+                ..RECV_TEMPL
+            })
+        );
+        s.set_recv_budget(132);
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(base + 4),
+                window_len: 32,
+                ..RECV_TEMPL
+            })
+        );
+        s.set_recv_budget(4);
+        let repr = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: base + 12,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &pattern[12..20],
+                ..SEND_TEMPL
+            },
+        )
+        .unwrap();
+        assert_eq!(repr.ack_number, Some(base + 4));
+        assert_eq!(repr.window_len, 32);
+        let repr = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: base + 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &pattern[4..12],
+                ..SEND_TEMPL
+            },
+        )
+        .unwrap();
+        assert_eq!(repr.ack_number, Some(base + 20));
+        assert_eq!(repr.window_len, 28);
+        assert_eq!(
+            repr.ack_number.unwrap() + ((repr.window_len as usize) << 2),
+            base + 132
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: base + 20,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &pattern[20..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(base + 132),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        let mut received = [0; 132];
+        assert_eq!(s.recv_slice(&mut received), Ok(132));
+        assert_eq!(received.as_slice(), pattern.as_slice());
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(base + 132),
+                window_len: 1,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    /// 通过真实握手与逐段 ACK 核对路径 MTU、对端 MSS 和 Reno 的同一发送决策。
+    #[cfg(feature = "socket-tcp-reno")]
+    fn check_effective_mss_segments(local: IpAddress, remote: IpAddress, base_mss: usize) {
+        for peer_mss in [1200, 4000] {
+            let mut s = socket_with_buffer_sizes(8192, 128);
+            s.set_congestion_control(CongestionControl::Reno);
+            s.set_nagle_enabled(false);
+            s.listen(LISTEN_END).unwrap();
+            let ip = IpRepr::new(remote, local, IpProtocol::Tcp, TCP_HEADER_LEN, 64);
+            let syn = TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                max_seg_size: Some(peer_mss),
+                window_len: 8192,
+                ..SEND_TEMPL
+            };
+            assert!(s.socket.accepts(&ip, &syn));
+            assert!(s
+                .socket
+                .process(&mut s.cx, &ip, &syn, syn.payload)
+                .is_none());
+            let mut syn_sent = false;
+            s.socket
+                .dispatch(&mut s.cx, |_, (ip, repr)| {
+                    assert_eq!(ip.src_addr(), local);
+                    assert_eq!(ip.dst_addr(), remote);
+                    assert_eq!(repr.control, TcpControl::Syn);
+                    assert_eq!(repr.max_seg_size, Some(base_mss as u16));
+                    syn_sent = true;
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+            assert!(syn_sent);
+            let ack = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 8192,
+                ..SEND_TEMPL
+            };
+            assert!(s
+                .socket
+                .process(&mut s.cx, &ip, &ack, ack.payload)
+                .is_none());
+            assert_eq!(s.state(), State::Established);
+            assert_eq!(s.congestion_control(), CongestionControl::Reno);
+            let data: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+            assert_eq!(s.send_slice(&data), Ok(data.len()));
+            let mut offset = 0;
+            while offset < data.len() {
+                let mtu = if offset == 0 { 1500 } else { 1280 };
+                s.cx.set_ip_mtu(mtu);
+                let expected = (if mtu == 1500 {
+                    base_mss
+                } else {
+                    base_mss - 220
+                })
+                .min(peer_mss as usize);
+                assert_eq!(s.socket.effective_mss(&s.cx, local.version()), expected);
+                #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6"))]
+                {
+                    let other = match local.version() {
+                        IpVersion::Ipv4 => IpVersion::Ipv6,
+                        IpVersion::Ipv6 => IpVersion::Ipv4,
+                    };
+                    assert_eq!(s.socket.effective_mss(&s.cx, other), expected);
+                }
+                let count = expected.min(data.len() - offset);
+                let mut emitted = false;
+                s.socket
+                    .dispatch(&mut s.cx, |_, (ip, repr)| {
+                        assert_eq!(ip.src_addr(), local);
+                        assert_eq!(ip.dst_addr(), remote);
+                        assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                        assert_eq!(repr.payload, &data[offset..offset + count]);
+                        emitted = true;
+                        Ok::<(), ()>(())
+                    })
+                    .unwrap();
+                assert!(emitted);
+                let old_congestion_window = s.congestion_controller.inner().window();
+                offset += count;
+                let ack = TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1 + offset),
+                    window_len: 8192,
+                    ..SEND_TEMPL
+                };
+                assert!(s
+                    .socket
+                    .process(&mut s.cx, &ip, &ack, ack.payload)
+                    .is_none());
+                assert!(old_congestion_window < s.congestion_controller.inner().window());
+                assert_eq!(s.send_queue(), data.len() - offset);
+            }
+            assert!(s.can_send());
+        }
+    }
+
+    /// IPv4 实际分段同时消费 peer MSS、路径 MTU 和原 Reno ACK 更新。
+    #[cfg(all(feature = "proto-ipv4", feature = "socket-tcp-reno"))]
+    #[test]
+    fn test_effective_mss_ipv4_segments_and_reno() {
+        check_effective_mss_segments(
+            IpAddress::v4(192, 168, 1, 1),
+            IpAddress::v4(192, 168, 1, 2),
+            1460,
+        );
+    }
+
+    /// IPv6 基本首部长度参与同一 MSS 决策，实际段和 Reno 状态由真实 ACK 消费。
+    #[cfg(all(feature = "proto-ipv6", feature = "socket-tcp-reno"))]
+    #[test]
+    fn test_effective_mss_ipv6_segments_and_reno() {
+        check_effective_mss_segments(
+            IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 0, 2),
+            1440,
+        );
+    }
+
+    /// 未通告的新额度计算扣除 assembler 的真实数据范围，补缺后完整交付。
+    #[test]
+    fn test_recv_budget_counts_out_of_order_data() {
+        let mut s = connected_with_recv_budget(64, 8, REMOTE_SEQ, None);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abcdefgh",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 9),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        let mut received = [0; 8];
+        assert_eq!(s.recv_slice(&mut received), Ok(8));
+        assert_eq!(&received, b"abcdefgh");
+        s.set_recv_budget(16);
+        let repr = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 13,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"mnop",
+                ..SEND_TEMPL
+            },
+        )
+        .unwrap();
+        assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 9));
+        assert_eq!(repr.window_len, 12);
+        let repr = send(
+            &mut s,
+            Instant::ZERO,
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 9,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"ijkl",
+                ..SEND_TEMPL
+            },
+        )
+        .unwrap();
+        assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 17));
+        assert_eq!(repr.window_len, 8);
+        assert_eq!(s.recv_slice(&mut received), Ok(8));
+        assert_eq!(&received, b"ijklmnop");
+        recv(&mut s, Instant::ZERO, |result| {
+            assert_eq!(result.unwrap().window_len, 16);
+        });
+    }
+
+    /// SYN 信用不乘协商缩放，普通窗口按缩放编码且保留舍入前合法在途尾字节。
+    #[test]
+    fn test_recv_budget_syn_credit_and_scaled_tail() {
+        let mut s = connected_with_recv_budget(131072, 131072, REMOTE_SEQ, Some(2));
+        s.set_recv_budget(4);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"a",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 2),
+                window_len: 16383,
+                ..RECV_TEMPL
+            })
+        );
+        let tail = vec![b'z'; 65534];
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 2,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &tail,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 65536),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        let mut received = vec![0; 65535];
+        assert_eq!(s.recv_slice(&mut received), Ok(65535));
+        assert_eq!(received[0], b'a');
+        assert_eq!(&received[1..], tail.as_slice());
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 65536),
+                window_len: 1,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    /// emit 失败不创建新接收信用，重试用同一旧右边界而不随新 ACK 伪增窗口。
+    #[test]
+    fn test_recv_budget_failed_emit_does_not_grant_credit() {
+        let mut s = connected_with_recv_budget(64, 8, REMOTE_SEQ, None);
+        s.set_recv_budget(64);
+        let result = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
+            assert_eq!(repr.window_len, 64);
+            Err::<(), ()>(())
+        });
+        assert_eq!(result, Err(()));
+        s.set_recv_budget(1);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abcd",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 5),
+                window_len: 4,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    /// 原 Nagle 策略实际阻止第二个短段，关闭后同一队列恢复发送。
+    #[test]
+    fn test_nagle_toggle_consumes_real_segments() {
+        let mut s = connected_with_recv_budget(64, 64, REMOTE_SEQ, None);
+        assert!(s.nagle_enabled());
+        assert_eq!(s.send_slice(b"a"), Ok(1));
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"a",
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.send_slice(b"b"), Ok(1));
+        recv_nothing!(s);
+        s.set_nagle_enabled(false);
+        assert!(!s.nagle_enabled());
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 2,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"b",
+                ..RECV_TEMPL
+            })
+        );
+        s.set_nagle_enabled(true);
+        assert_eq!(s.send_slice(b"c"), Ok(1));
+        recv_nothing!(s);
+    }
+
+    /// 受控时间观察 7200 秒真实探测；关闭后撤销期限且健康连接不超时死亡。
+    #[test]
+    fn test_keep_alive_7200_seconds_then_disabled() {
+        let mut s = connected_with_recv_budget(64, 64, REMOTE_SEQ, None);
+        assert_eq!(s.keep_alive(), None);
+        assert_eq!(s.timeout(), None);
+        s.set_keep_alive(Some(Duration::from_secs(7200)));
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"\x00",
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_secs(7200))
+        );
+        recv_nothing(&mut s, Instant::from_secs(7199));
+        recv(&mut s, Instant::from_secs(7200), |result| {
+            let repr = result.unwrap();
+            assert_eq!(repr.seq_number, LOCAL_SEQ);
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1));
+            assert_eq!(repr.payload, b"\x00");
+        });
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_secs(14400))
+        );
+        s.set_keep_alive(None);
+        assert_eq!(s.keep_alive(), None);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        recv_nothing(&mut s, Instant::from_secs(14400));
+        recv_nothing(&mut s, Instant::from_secs(28800));
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.timeout(), None);
+    }
+
+    /// 通过 SYN、SYN-ACK 和 ACK 建立预算测试连接，选项在 listen 的 reset 后仍保留。
+    fn connected_with_recv_budget(
+        capacity: usize,
+        budget: usize,
+        remote_seq: TcpSeqNumber,
+        scale: Option<u8>,
+    ) -> TestSocket {
+        let mut s = socket_with_buffer_sizes(64, capacity);
+        assert_eq!(s.recv_budget(), capacity);
+        assert_eq!(s.send_budget(), 64);
+        s.set_recv_budget(budget);
+        s.listen(LISTEN_END).unwrap();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: remote_seq,
+                ack_number: None,
+                window_scale: scale,
+                max_seg_size: Some(4000),
+                ..SEND_TEMPL
+            }
+        );
+        recv(&mut s, Instant::ZERO, |result| {
+            let repr = result.unwrap();
+            assert_eq!(repr.control, TcpControl::Syn);
+            assert_eq!(repr.ack_number, Some(remote_seq + 1));
+            assert_eq!(repr.window_len as usize, budget.min(u16::MAX as usize));
+        });
+        send!(
+            s,
+            TcpRepr {
+                seq_number: remote_seq + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.recv_capacity(), capacity);
+        assert_eq!(s.recv_budget(), budget);
+        s
+    }
+
+    /// 两个发送入口共用预算；调小保留未 ACK 图样，ACK 和调大恢复真实接纳。
+    #[test]
+    fn test_send_budget_preserves_unacked_and_recovers() {
+        let mut s = connected_with_recv_budget(64, 64, REMOTE_SEQ, None);
+        s.set_send_budget(6);
+        assert_eq!(s.send_capacity(), 64);
+        assert_eq!(s.send_slice(b"abc"), Ok(3));
+        assert_eq!(
+            s.send(|bytes| {
+                assert_eq!(bytes.len(), 3);
+                bytes.copy_from_slice(b"def");
+                (3, 3)
+            }),
+            Ok(3)
+        );
+        assert!(!s.can_send());
+        assert_eq!(s.send_slice(b"x"), Ok(0));
+        assert_eq!(
+            s.send(|bytes| {
+                assert!(bytes.is_empty());
+                (0, 0)
+            }),
+            Ok(0)
+        );
+        s.set_send_budget(2);
+        assert_eq!(s.send_queue(), 6);
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"abcdef",
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 4),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_queue(), 3);
+        assert_eq!(s.send_slice(b"x"), Ok(0));
+        assert_eq!(s.tx_buffer.get_allocated(0, 3), b"def");
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 7),
+                ..SEND_TEMPL
+            }
+        );
+        assert!(s.can_send());
+        assert_eq!(s.send_slice(b"gh"), Ok(2));
+        assert!(!s.can_send());
+        s.set_send_budget(5);
+        assert!(s.can_send());
+        assert_eq!(s.send_slice(b"ijk!"), Ok(3));
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 7,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"ghijk",
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.send_queue(), 5);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 12),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_queue(), 0);
+        s.reset();
+        assert_eq!(s.send_budget(), 5);
+        assert_eq!(s.recv_budget(), 64);
+    }
+
+    /// 回调不能把超出预算片段的量提交到物理发送 ring。
+    #[test]
+    #[should_panic]
+    fn test_send_callback_cannot_exceed_budget() {
+        let mut s = connected_with_recv_budget(64, 64, REMOTE_SEQ, None);
+        s.set_send_budget(3);
+        let _ = s.send(|bytes| {
+            assert_eq!(bytes.len(), 3);
+            (4, ())
+        });
+    }
+
+    /// 缩小后按旧窗口接收乱序和补缺，并在序号环绕处保留同一右边界信用。
+    #[test]
+    fn test_recv_budget_preserves_old_credit_and_wrap() {
+        for seq in [REMOTE_SEQ, TcpSeqNumber(-9)] {
+            let mut s = connected_with_recv_budget(64, 64, seq, None);
+            let base = seq + 1;
+            let pattern: Vec<u8> = (0..64).collect();
+            s.set_recv_budget(4);
+            let repr = send(
+                &mut s,
+                Instant::ZERO,
+                &TcpRepr {
+                    seq_number: base + 8,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &pattern[8..16],
+                    ..SEND_TEMPL
+                },
+            )
+            .unwrap();
+            assert_eq!(repr.ack_number, Some(base));
+            assert_eq!(repr.window_len, 64);
+            let repr = send(
+                &mut s,
+                Instant::ZERO,
+                &TcpRepr {
+                    seq_number: base,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &pattern[..8],
+                    ..SEND_TEMPL
+                },
+            )
+            .unwrap();
+            assert_eq!(repr.ack_number, Some(base + 16));
+            assert_eq!(repr.window_len, 48);
+            assert_eq!(
+                repr.ack_number.unwrap() + repr.window_len as usize,
+                base + 64
+            );
+            assert!(send(
+                &mut s,
+                Instant::ZERO,
+                &TcpRepr {
+                    seq_number: base + 16,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &pattern[16..],
+                    ..SEND_TEMPL
+                }
+            )
+            .is_none());
+            recv(&mut s, Instant::ZERO, |result| {
+                let repr = result.unwrap();
+                assert_eq!(repr.ack_number, Some(base + 64));
+                assert_eq!(repr.window_len, 0);
+            });
+            let mut received = [0; 64];
+            assert_eq!(s.recv_slice(&mut received), Ok(64));
+            assert_eq!(received.as_slice(), pattern.as_slice());
+            recv(&mut s, Instant::ZERO, |result| {
+                assert_eq!(result.unwrap().window_len, 4);
+            });
+            s.set_recv_budget(16);
+            assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+            recv(&mut s, Instant::ZERO, |result| {
+                assert_eq!(result.unwrap().window_len, 16);
+            });
+        }
     }
 
     fn socket_fin_wait_1() -> TestSocket {
@@ -3167,6 +3961,7 @@ mod test {
         );
     }
 
+    /// 监听握手保未缩放窗口与实际 scale 协商，未到 RTO 不额外重发 SYN。
     #[test]
     fn test_listen_syn_win_scale_buffers() {
         for (buffer_size, shift_amt) in &[
@@ -3186,7 +3981,6 @@ mod test {
             let mut s = socket_with_buffer_sizes(64, *buffer_size);
             s.state = State::Listen;
             s.listen_endpoint = LISTEN_END;
-            assert_eq!(s.remote_win_shift, *shift_amt);
             send!(
                 s,
                 TcpRepr {
@@ -3197,7 +3991,6 @@ mod test {
                     ..SEND_TEMPL
                 }
             );
-            assert_eq!(s.remote_win_shift, *shift_amt);
             recv!(
                 s,
                 [TcpRepr {
@@ -3380,6 +4173,7 @@ mod test {
         assert_eq!(s.state, State::SynReceived);
     }
 
+    /// SYN-RECEIVED 接收 FIN 和数据后保留原半关闭、ACK 和窗口行为。
     #[test]
     fn test_syn_received_fin() {
         let mut s = socket_syn_received();
@@ -3416,7 +4210,6 @@ mod test {
 
         let mut s2 = socket_close_wait();
         s2.remote_last_ack = Some(REMOTE_SEQ + 1 + 6 + 1);
-        s2.remote_last_win = 58;
         sanity!(s, s2);
     }
 
@@ -4221,6 +5014,7 @@ mod test {
         );
     }
 
+    /// 用真实接收和 ACK 准备 RFC 2018 的窗口与选择确认场景。
     fn setup_rfc2018_cases() -> (TestSocket, Vec<u8>) {
         // This is a utility function used by the tests for RFC 2018 cases. It configures a socket
         // in a particular way suitable for those cases.
@@ -4263,10 +5057,10 @@ mod test {
             })
             .unwrap();
         }
-        assert_eq!(s.remote_last_win, 3500);
         (s, segment)
     }
 
+    /// 核对 RFC 2018 乱序场景的 ACK 与 SACK 范围，不将未实际广告的窗口作为信用。
     #[test]
     fn test_established_rfc2018_cases() {
         // This test case verifies the exact scenarios described on pages 8-9 of RFC 2018. Please
@@ -4294,41 +5088,50 @@ mod test {
         //   8500         5000     5500       9000
         //
         for offset in (500..3500).step_by(500) {
-            send!(
-                s,
-                TcpRepr {
+            let repr = send(
+                &mut s,
+                Instant::ZERO,
+                &TcpRepr {
                     seq_number: REMOTE_SEQ + 1 + offset + 5000,
                     ack_number: Some(LOCAL_SEQ + 1),
                     payload: &segment,
                     ..SEND_TEMPL
                 },
-                Some(TcpRepr {
-                    seq_number: LOCAL_SEQ + 1,
-                    ack_number: Some(REMOTE_SEQ + 1 + 5000),
-                    window_len: 4000,
-                    sack_ranges: [
-                        Some((
-                            REMOTE_SEQ.0 as u32 + 1 + 5500,
-                            REMOTE_SEQ.0 as u32 + 1 + 5500 + offset as u32
-                        )),
-                        None,
-                        None
-                    ],
-                    ..RECV_TEMPL
-                })
+            )
+            .expect("out-of-order data must produce SACK");
+            assert_eq!(repr.src_port, LOCAL_PORT);
+            assert_eq!(repr.dst_port, REMOTE_PORT);
+            assert_eq!(repr.control, TcpControl::None);
+            assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1 + 5000));
+            assert_eq!(
+                repr.sack_ranges,
+                [
+                    Some((
+                        REMOTE_SEQ.0 as u32 + 1 + 5500,
+                        REMOTE_SEQ.0 as u32 + 1 + 5500 + offset as u32,
+                    )),
+                    None,
+                    None,
+                ]
             );
+            assert!(repr.payload.is_empty());
         }
     }
 
+    /// 核对普通 ACK 在大物理窗口下的原缩放结果。
     #[test]
     fn test_established_sliding_window_recv() {
         let mut s = socket_established();
         // Update our scaling parameters for a TCP with a scaled buffer.
         assert_eq!(s.rx_buffer.len(), 0);
         s.rx_buffer = SocketBuffer::new(vec![0; 262143]);
+        s.set_recv_budget(262143);
         s.assembler = Assembler::new();
         s.remote_win_scale = Some(0);
-        s.remote_last_win = 65535;
+        // fixture 表示普通 ACK 字段 65535、缩放 2 后的真实广告字节数。
+        s.remote_last_win = 65535 << 2;
+        s.remote_last_win_edge = s.remote_last_ack.map(|ack| ack + s.remote_last_win);
         s.remote_win_shift = 2;
 
         // Create a TCP segment that will mostly fill an IP frame.
@@ -6455,10 +7258,12 @@ mod test {
     // Tests for window management.
     // =========================================================================================//
 
+    /// 用握手协商的对端 MSS 限制真实发送报文。
     #[test]
     fn test_maximum_segment_size() {
         let mut s = socket_listen();
         s.tx_buffer = SocketBuffer::new(vec![0; 32767]);
+        s.set_send_budget(32767);
         send!(
             s,
             TcpRepr {
@@ -6843,6 +7648,7 @@ mod test {
         );
     }
 
+    /// 核对读取、乱序补缺和普通 ACK 的真实窗口广告。
     #[test]
     fn test_announce_window_after_read() {
         let mut s = socket_established();
@@ -6866,8 +7672,6 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        // Test that `dispatch` updates `remote_last_win`
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
         s.recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
         recv!(
@@ -6879,8 +7683,6 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
-        // Provoke immediate ACK to test that `process` updates `remote_last_win`
         send!(
             s,
             TcpRepr {
@@ -6911,7 +7713,6 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
         s.recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
     }

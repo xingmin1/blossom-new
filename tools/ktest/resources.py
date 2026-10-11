@@ -1,4 +1,4 @@
-"""具体 UART 与磁盘资源；原镜像只读输入，每台 VM 使用独占副本。"""
+"""具体 UART、磁盘与 net-user 资源；每台 VM 独占工作盘和真实网络 peer。"""
 
 import hashlib
 from pathlib import Path
@@ -6,7 +6,7 @@ import shutil
 import stat
 from .catalog import require
 
-RESOURCES = {"uart", "scratch", "root", "extra", "ap-freeze", "virtio-access-platform"}
+RESOURCES = {"uart", "scratch", "root", "extra", "ap-freeze", "virtio-access-platform", "net-user"}
 
 
 def aliases(path, target):

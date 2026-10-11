@@ -58,6 +58,7 @@ fn client(kind: Client) {
 
 static CLIENT_DONE: AtomicBool = AtomicBool::new(false);
 
+/// 预备有限接口后备后运行原传输基准。
 fn main() {
     #[cfg(feature = "log")]
     utils::setup_logging("info");
@@ -95,7 +96,12 @@ fn main() {
     };
     config.random_seed = rand::random();
 
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::now(), buffers);
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs
             .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))

@@ -10,6 +10,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 
+/// 原服务端使用显式预备的有限接口工作区。
 fn main() {
     utils::setup_logging("");
 
@@ -34,7 +35,12 @@ fn main() {
 
     config.random_seed = rand::random();
 
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::now(), buffers);
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs
             .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))

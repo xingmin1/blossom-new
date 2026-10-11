@@ -132,7 +132,12 @@ fn exercise_tcp_headers(data: &[u8]) {
     };
 
     let config = Config::new(EthernetAddress([0x02, 0, 0, 0, 0, 1]).into());
-    let mut iface = Interface::new(config, &mut device, clock.elapsed());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, clock.elapsed(), buffers);
     iface.update_ip_addrs(|addrs| {
         addrs
             .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))

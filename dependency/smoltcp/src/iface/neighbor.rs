@@ -167,6 +167,15 @@ impl Cache {
         }
     }
 
+    /// 原邻居限速窗口决定真实待发目的的重试期限。
+    pub fn retry_deadline(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Option<Instant> {
+        match self.lookup(protocol_addr, timestamp) {
+            Answer::Found(_) => None,
+            Answer::RateLimited => Some(self.silent_until),
+            Answer::NotFound => Some(timestamp),
+        }
+    }
+
     pub fn limit_rate(&mut self, timestamp: Instant) {
         self.silent_until = timestamp + Self::SILENT_TIME;
     }

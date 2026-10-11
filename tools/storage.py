@@ -1,9 +1,29 @@
-"""普通运行和测试共用的 QEMU 块设备槽位与明确启动参数。"""
+"""普通运行和测试共用的 QEMU 块设备、网络槽位与明确启动参数。"""
 
 
 
-def disk_arguments(disks, args, names, init=None):
-    """按实际槽位附盘并传根挂载模式；显式 init 保留空值，只拒绝启动 token 分隔符。"""
+def network_arguments(arch, net="none", forward=""):
+    """仅按明确网络模式配置固定 NIC 槽位，hostfwd 由调用者原样指定。"""
+    if net == "none":
+        if forward:
+            raise ValueError("host forwarding requires user networking")
+        return ["-nic", "none"]
+    if net != "user":
+        raise ValueError(f"unsupported network mode: {net}")
+    backend = "user,id=net0"
+    if forward:
+        backend += f",hostfwd={forward}"
+    if arch == "riscv64":
+        device = "virtio-net-device,netdev=net0,bus=virtio-mmio-bus.3"
+    elif arch == "loongarch64":
+        device = "virtio-net-pci,netdev=net0,addr=0x11,disable-legacy=on"
+    else:
+        raise ValueError(f"unsupported network architecture: {arch}")
+    return ["-netdev", backend, "-device", device + ",mac=52:54:00:12:34:56"]
+
+
+def disk_arguments(disks, args, names, init=None, network_ports=None):
+    """保留原盘槽位及唯一 append；网络端口只在原启动 token 尾部追加。"""
     if init is not None and any(character in " \t\n\r\v\f\0" for character in init):
         raise ValueError("init must not contain ASCII whitespace or NUL")
     command = []
@@ -34,5 +54,10 @@ def disk_arguments(disks, args, names, init=None):
         bootargs.append(f"extra={args.extra_root}")
     if init is not None:
         bootargs.append(f"init={init}")
+    if network_ports is not None:
+        tcp, udp = network_ports
+        if not (1 <= tcp <= 65535 and 1 <= udp <= 65535):
+            raise ValueError("network peer ports must be in 1..65535")
+        bootargs += [f"ktest-net-tcp={tcp}", f"ktest-net-udp={udp}"]
     command += ["-append", " ".join(bootargs)]
     return command

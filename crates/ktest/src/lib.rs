@@ -28,6 +28,7 @@ pub enum Resource {
     Extra,
     ApFreeze,
     VirtioAccessPlatform,
+    NetUser,
 }
 impl Resource {
     /// 返回宿主资源合同中的固定名字。
@@ -39,6 +40,7 @@ impl Resource {
             Self::Extra => "extra",
             Self::ApFreeze => "ap-freeze",
             Self::VirtioAccessPlatform => "virtio-access-platform",
+            Self::NetUser => "net-user",
         }
     }
 }

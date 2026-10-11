@@ -8,14 +8,16 @@ use crate::fs::epoll::WatchHead;
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable, Pollable};
 use crate::fs::{DirectoryEntry, FileStat, FsError, InodeKind, InodeRef, InodeTime, Path};
 use crate::fs::{FileIoContext, FileLike, ReadBuffer, SeekFrom, WriteBuffer};
-use crate::net::address::{InetEndpoint, SocketAddress};
+use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress};
+use crate::net::packet::zeroed_bytes;
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::UnixEndpoint;
 use crate::net::{IoProgress, MessageResult, NetStackRef};
 use crate::wait::WaitResult;
+use smoltcp::socket::tcp::CongestionControl;
 
-pub const TCP_BUFFER_LEN: usize = 16 * 1024;
+pub const TCP_BUFFER_LEN: usize = 128 * 1024;
 const O_RDWR: u32 = 2;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
@@ -25,7 +27,9 @@ const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
 const MSG_NOSIGNAL: u32 = 0x4000;
 const STREAM_PREFIX_LEN: usize = 4096;
-const DATAGRAM_PREFIX_LEN: usize = 1472;
+const MAX_DATAGRAM_LEN: usize = 65507;
+const BUFFER_HINT_MAX: u32 = 65536;
+const BUFFER_BUDGET_MIN: usize = 1024;
 
 /// 一个打开实例只选择一种真实协议端点，不引入另一层 socket 表。
 #[derive(Clone)]
@@ -66,6 +70,8 @@ pub struct SocketFile {
     watches: Arc<WatchHead>,
     /// 阻塞 connect 尚未领取完成时保留该事实，信号重启仍消费原握手结果。
     connect_unclaimed: AtomicBool,
+    /// 非 TCP 的通用开关只属于 OFD，不产生协议探测。
+    generic_keepalive: AtomicBool,
     opened: bool,
 }
 
@@ -73,6 +79,7 @@ impl SocketFile {
     /// 从同一网络域准备默认有界 TCP 核心与新的打开实例，CLOEXEC 留给描述符槽。
     pub fn try_new_tcp(
         net: NetStackRef,
+        family: AddressFamily,
         flags: u32,
         uid: u32,
         gid: u32,
@@ -80,13 +87,14 @@ impl SocketFile {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
-        let endpoint = net.try_new_tcp(TCP_BUFFER_LEN, TCP_BUFFER_LEN)?;
+        let endpoint = net.try_new_tcp(family, TCP_BUFFER_LEN, TCP_BUFFER_LEN)?;
         Self::allocate(net, Endpoint::Tcp(endpoint), flags, uid, gid)
     }
 
     /// 从本域准备 UDP 打开实例，零长消息仍由真实报文端点提交。
     pub fn try_new_udp(
         net: NetStackRef,
+        family: AddressFamily,
         flags: u32,
         uid: u32,
         gid: u32,
@@ -94,7 +102,7 @@ impl SocketFile {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
-        let endpoint = net.try_new_udp()?;
+        let endpoint = net.try_new_udp(family)?;
         Self::allocate(net, Endpoint::Udp(endpoint), flags, uid, gid)
     }
 
@@ -160,6 +168,7 @@ impl SocketFile {
             flags: AtomicU32::new(O_RDWR | (flags & O_NONBLOCK)),
             watches,
             connect_unclaimed: AtomicBool::new(false),
+            generic_keepalive: AtomicBool::new(false),
             opened: false,
         });
         match result {
@@ -196,7 +205,35 @@ impl SocketFile {
     pub fn domain(&self) -> u16 {
         match &self.endpoint {
             Endpoint::Unix(_) => 1,
-            Endpoint::Tcp(_) | Endpoint::Udp(_) => 2,
+            Endpoint::Tcp(endpoint) => endpoint.family().number(),
+            Endpoint::Udp(endpoint) => endpoint.family().number(),
+        }
+    }
+
+    /// IP 族始终来自稳定端点，匿名 UNIX 不具有 IP 族。
+    pub fn family(&self) -> Result<AddressFamily, FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => Ok(endpoint.family()),
+            Endpoint::Udp(endpoint) => Ok(endpoint.family()),
+            Endpoint::Unix(_) => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 查询同一端点的双面绑定策略。
+    pub fn v6_only(&self) -> Result<bool, FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => Ok(endpoint.v6_only()),
+            Endpoint::Udp(endpoint) => Ok(endpoint.v6_only()),
+            Endpoint::Unix(_) => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 操作锁中的实际绑定事实决定策略能否修改。
+    pub fn set_v6_only(&self, enabled: bool) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.set_v6_only(enabled),
+            Endpoint::Udp(endpoint) => endpoint.set_v6_only(enabled),
+            Endpoint::Unix(_) => Err(FsError::Unsupported),
         }
     }
 
@@ -235,17 +272,26 @@ impl SocketFile {
         Ok(())
     }
 
-    /// 按实际地址域绑定本端点，匿名 UNIX 不提供路径绑定。
+    /// 地址族、mapped 与 scope 在进入真实绑定前集中正规化。
     pub fn bind(&self, local: SocketAddress) -> Result<(), FsError> {
-        match (&self.endpoint, local) {
-            (Endpoint::Tcp(endpoint), SocketAddress::Inet(local)) => {
-                endpoint.bind(local).map(|_| ())
-            }
-            (Endpoint::Udp(endpoint), SocketAddress::Inet(local)) => {
-                endpoint.bind(local).map(|_| ())
-            }
-            (Endpoint::Unix(_), _) => Err(FsError::Unsupported),
-            _ => Err(FsError::AddressFamilyNotSupported),
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint
+                .bind(local.normalize(
+                    endpoint.family(),
+                    endpoint.v6_only(),
+                    AddressOperation::Bind,
+                    false,
+                )?)
+                .map(|_| ()),
+            Endpoint::Udp(endpoint) => endpoint
+                .bind(local.normalize(
+                    endpoint.family(),
+                    endpoint.v6_only(),
+                    AddressOperation::Bind,
+                    true,
+                )?)
+                .map(|_| ()),
+            Endpoint::Unix(_) => Err(FsError::Unsupported),
         }
     }
 
@@ -257,18 +303,29 @@ impl SocketFile {
     /// UDP 更新默认 peer 或断开，TCP 阻塞重启只领取既有握手的实际结果。
     /// 中断或等待资源准备失败保留未领取事实，成功或连接失败才清除。
     pub fn connect(&self, peer: SocketAddress, caller: FileIoContext<'_>) -> Result<(), FsError> {
-        let endpoint = match (&self.endpoint, peer) {
-            (Endpoint::Udp(endpoint), SocketAddress::Inet(peer)) => {
-                return endpoint.connect(Some(peer))
+        let endpoint = match &self.endpoint {
+            Endpoint::Udp(endpoint) => {
+                let peer = if peer == SocketAddress::Unspecified {
+                    None
+                } else {
+                    Some(peer.normalize(
+                        endpoint.family(),
+                        endpoint.v6_only(),
+                        AddressOperation::Connect,
+                        true,
+                    )?)
+                };
+                return endpoint.connect(peer);
             }
-            (Endpoint::Udp(endpoint), SocketAddress::Unspecified) => return endpoint.connect(None),
-            (Endpoint::Tcp(endpoint), SocketAddress::Inet(_)) => endpoint,
-            (Endpoint::Unix(_), _) => return Err(FsError::Unsupported),
-            _ => return Err(FsError::AddressFamilyNotSupported),
+            Endpoint::Tcp(endpoint) => endpoint,
+            Endpoint::Unix(_) => return Err(FsError::Unsupported),
         };
-        let SocketAddress::Inet(peer) = peer else {
-            unreachable!("TCP connection requires an Inet address");
-        };
+        let peer = peer.normalize(
+            endpoint.family(),
+            endpoint.v6_only(),
+            AddressOperation::Connect,
+            false,
+        )?;
         let nonblock = self.flags() & O_NONBLOCK != 0;
         match endpoint.connect(peer) {
             Ok(()) if nonblock => return Err(FsError::InProgress),
@@ -430,11 +487,16 @@ impl SocketFile {
         }
         match &self.endpoint {
             Endpoint::Udp(endpoint) => {
-                let destination = match destination {
-                    Some(SocketAddress::Inet(peer)) => Some(peer),
-                    None => None,
-                    _ => return Err(FsError::AddressFamilyNotSupported),
-                };
+                let destination = destination
+                    .map(|peer| {
+                        peer.normalize(
+                            endpoint.family(),
+                            endpoint.v6_only(),
+                            AddressOperation::Send,
+                            true,
+                        )
+                    })
+                    .transpose()?;
                 return self.send_datagram(endpoint, source, destination, flags, caller);
             }
             Endpoint::Unix(_) if destination.is_some() => return Err(FsError::AlreadyConnected),
@@ -485,7 +547,7 @@ impl SocketFile {
         }
     }
 
-    /// 一次完整 copyin 后保留原包和 Lease，容量等待不重新取用户输入或改变目的。
+    /// 一次完整堆 copyin 后保留同份消息，等待期间只重试真实 raw 接纳。
     fn send_datagram(
         &self,
         endpoint: &Arc<UdpEndpoint>,
@@ -495,30 +557,26 @@ impl SocketFile {
         caller: FileIoContext<'_>,
     ) -> Result<usize, FsError> {
         let length = source.len() - source.copied();
-        if DATAGRAM_PREFIX_LEN < length {
+        if MAX_DATAGRAM_LEN < length {
             return Err(FsError::MessageTooLarge);
         }
-        let mut prefix = [0u8; DATAGRAM_PREFIX_LEN];
-        let prepared = source.pull(&mut prefix[..length])?;
+        let mut payload = zeroed_bytes(length)?;
+        let prepared = source.pull(&mut payload)?;
         if prepared < length {
             // WriteBuffer 保留首个 copyin 错误；UDP 不提交已经取得的部分输入。
             source.pull(&mut [])?;
             unreachable!("incomplete datagram copy has no stored error");
         }
-        let (mut packet, _lease) = endpoint.prepare_send(&prefix[..length], destination)?;
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            endpoint.check_send()?;
-            if self.net.egress_ready(endpoint.id())? {
-                match self.net.try_emit(packet) {
-                    Ok(()) => return Ok(length),
-                    Err((FsError::WouldBlock, returned)) => packet = returned,
-                    Err((error, _packet)) => return Err(error),
-                }
+            match endpoint.send(&payload, destination)? {
+                IoProgress::Ready(count) => return Ok(count),
+                IoProgress::Blocked => {}
+                IoProgress::Eof => unreachable!("datagram send returned receive EOF"),
             }
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
@@ -547,8 +605,12 @@ impl SocketFile {
     /// 查询实际绑定或路由选源，匿名 UNIX 返回无路径名称。
     pub fn local_address(&self) -> Result<SocketAddress, FsError> {
         match &self.endpoint {
-            Endpoint::Tcp(endpoint) => endpoint.local_address().map(SocketAddress::Inet),
-            Endpoint::Udp(endpoint) => endpoint.local_address().map(SocketAddress::Inet),
+            Endpoint::Tcp(endpoint) => endpoint
+                .local_address()
+                .map(|local| SocketAddress::from_endpoint(local, endpoint.family())),
+            Endpoint::Udp(endpoint) => endpoint
+                .local_address()
+                .map(|local| SocketAddress::from_endpoint(local, endpoint.family())),
             Endpoint::Unix(endpoint) => endpoint.local_address(),
         }
     }
@@ -556,8 +618,12 @@ impl SocketFile {
     /// 返回真实连接的 peer 或匿名名称，未连接错误由协议对象保留。
     pub fn peer_address(&self) -> Result<SocketAddress, FsError> {
         match &self.endpoint {
-            Endpoint::Tcp(endpoint) => endpoint.peer_address().map(SocketAddress::Inet),
-            Endpoint::Udp(endpoint) => endpoint.peer_address().map(SocketAddress::Inet),
+            Endpoint::Tcp(endpoint) => endpoint
+                .peer_address()
+                .map(|peer| SocketAddress::from_endpoint(peer, endpoint.family())),
+            Endpoint::Udp(endpoint) => endpoint
+                .peer_address()
+                .map(|peer| SocketAddress::from_endpoint(peer, endpoint.family())),
             Endpoint::Unix(endpoint) => endpoint.peer_address(),
         }
     }
@@ -579,21 +645,95 @@ impl SocketFile {
         }
     }
 
-    /// 返回实际协议接收存储的字节容量，不套用 skb 记账翻倍规则。
-    pub fn receive_capacity(&self) -> usize {
+    /// IP 返回原 raw 的有效接收预算，UNIX 返回共同 FIFO 的真实容量。
+    pub fn receive_budget(&self) -> usize {
         match &self.endpoint {
-            Endpoint::Tcp(endpoint) => endpoint.receive_capacity(),
-            Endpoint::Udp(endpoint) => endpoint.receive_capacity(),
+            Endpoint::Tcp(endpoint) => endpoint.receive_budget(),
+            Endpoint::Udp(endpoint) => endpoint.receive_budget(),
             Endpoint::Unix(endpoint) => endpoint.receive_capacity(),
         }
     }
 
-    /// 返回实际发送存储容量，UDP 读取本域共享 egress 的完整 IP 字节容量。
-    pub fn send_capacity(&self) -> usize {
+    /// IP 返回原 raw 的有效发送预算，UNIX 不展示超过后备的配置。
+    pub fn send_budget(&self) -> usize {
         match &self.endpoint {
-            Endpoint::Tcp(endpoint) => endpoint.send_capacity(),
-            Endpoint::Udp(endpoint) => endpoint.send_capacity(),
+            Endpoint::Tcp(endpoint) => endpoint.send_budget(),
+            Endpoint::Udp(endpoint) => endpoint.send_budget(),
             Endpoint::Unix(endpoint) => endpoint.send_capacity(),
+        }
+    }
+
+    /// signed int 按 unsigned 提示限幅倍增，实际预算不超过原物理后备。
+    fn buffer_budget(hint: i32, capacity: usize) -> usize {
+        ((hint as u32).min(BUFFER_HINT_MAX) as usize * 2)
+            .max(BUFFER_BUDGET_MIN)
+            .min(capacity)
+    }
+
+    /// 设置同一接收队列的预算，不重新分配或丢弃已接纳数据。
+    pub fn set_receive_budget(&self, hint: i32) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => {
+                endpoint.set_receive_budget(Self::buffer_budget(hint, endpoint.receive_capacity()))
+            }
+            Endpoint::Udp(endpoint) => {
+                endpoint.set_receive_budget(Self::buffer_budget(hint, endpoint.receive_capacity()))
+            }
+            Endpoint::Unix(_) => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 设置同一发送队列的预算，恢复通知由真实端点在锁外处理。
+    pub fn set_send_budget(&self, hint: i32) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => {
+                endpoint.set_send_budget(Self::buffer_budget(hint, endpoint.send_capacity()))
+            }
+            Endpoint::Udp(endpoint) => {
+                endpoint.set_send_budget(Self::buffer_budget(hint, endpoint.send_capacity()))
+            }
+            Endpoint::Unix(_) => Err(FsError::Unsupported),
+        }
+    }
+
+    /// TCP 查询实际探测定时器开关，其他协议只查询同 OFD 的通用布尔值。
+    pub fn keepalive(&self) -> bool {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.keepalive(),
+            Endpoint::Udp(_) | Endpoint::Unix(_) => self.generic_keepalive.load(Ordering::Acquire),
+        }
+    }
+
+    /// TCP 修改真实 7200 秒探测，UDP 和 UNIX 不创建探测工作。
+    pub fn set_keepalive(&self, enabled: bool) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.set_keepalive(enabled),
+            Endpoint::Udp(_) | Endpoint::Unix(_) => {
+                self.generic_keepalive.store(enabled, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    /// MSS 查询沿 raw 当前 tuple 与路径决策，不在打开对象重复计算。
+    pub fn effective_mss(&self) -> Result<usize, FsError> {
+        Ok(self.tcp_endpoint()?.effective_mss())
+    }
+
+    /// 返回真实 raw 拥塞控制器，打开对象不保存另一份算法名称。
+    pub fn congestion_control(&self) -> Result<CongestionControl, FsError> {
+        Ok(self.tcp_endpoint()?.congestion_control())
+    }
+
+    /// 所选算法仅为已启用的 Reno，其他名称保留真实查找失败。
+    pub fn set_congestion_control(&self, name: &[u8]) -> Result<(), FsError> {
+        let controller = self.congestion_control()?;
+        if name != b"reno" {
+            return Err(FsError::NotFound);
+        }
+        match controller {
+            CongestionControl::Reno => Ok(()),
+            CongestionControl::None => Err(FsError::Unsupported),
         }
     }
 

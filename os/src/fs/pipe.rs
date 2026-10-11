@@ -30,17 +30,20 @@ struct Slot {
     length: usize,
 }
 
-struct Ring {
-    slots: [Option<Slot>; SLOTS],
+/// 按需拥有原页的固定槽 FIFO，管道和匿名 socket 方向各自决定锁与关闭协议。
+pub(crate) struct PipeBuffer<const N: usize> {
+    slots: [Option<Slot>; N],
     head: usize,
     tail: usize,
     used: usize,
     bytes: usize,
 }
 
-impl Ring {
-    /// 空环不预分配数据页；每个占用槽独占一个原页。
-    fn new() -> Self {
+impl<const N: usize> PipeBuffer<N> {
+    /// 空 FIFO 不预分配数据页，槽数必须为正且每槽恰好拥有一个原页。
+    pub(crate) fn new() -> Self {
+        assert!(0 < N);
+        assert_eq!(mm::PAGE_SIZE, PIPE_BUF);
         Self {
             slots: core::array::from_fn(|_| None),
             head: 0,
@@ -50,20 +53,47 @@ impl Ring {
         }
     }
 
+    /// 查询已经提交且尚未消费的字节量。
+    pub(crate) fn len(&self) -> usize {
+        self.bytes
+    }
+
+    /// 查询是否还有可交付数据，不把空槽当成已提交字节。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    /// 返回全部物理槽均为空时的固定字节容量。
+    pub(crate) fn capacity(&self) -> usize {
+        N * PIPE_BUF
+    }
+
     /// 只计算末页的可合并后缀，读过的前端空隙不能重新成为物理槽。
     fn merge_space(&self) -> usize {
         if self.used == 0 {
             return 0;
         }
-        let slot = self.slots[(self.head + SLOTS - 1) % SLOTS]
-            .as_ref()
-            .unwrap();
+        let slot = self.slots[(self.head + N - 1) % N].as_ref().unwrap();
         PIPE_BUF - slot.offset - slot.length
     }
 
     /// 容量由空闲物理槽及末页后缀组成，不由逻辑剩余字节推断。
-    fn space(&self) -> usize {
-        (SLOTS - self.used) * PIPE_BUF + self.merge_space()
+    pub(crate) fn space(&self) -> usize {
+        self.empty_slot_capacity() + self.merge_space()
+    }
+
+    /// 只报告空物理槽的容量，管道 poll 不因满槽末页仍可合并而写就绪。
+    pub(crate) fn empty_slot_capacity(&self) -> usize {
+        self.capacity() - self.used * PIPE_BUF
+    }
+
+    /// 立即归还全部占用页并恢复空 FIFO 的索引和容量。
+    pub(crate) fn clear(&mut self) {
+        self.slots.iter_mut().for_each(|slot| drop(slot.take()));
+        self.head = 0;
+        self.tail = 0;
+        self.used = 0;
+        self.bytes = 0;
     }
 
     /// 仅消费实际交付量，最后一个字节交付后结束该槽页拥有。
@@ -75,29 +105,30 @@ impl Ring {
         self.bytes -= count;
         if slot.length == 0 {
             drop(self.slots[self.tail].take());
-            self.tail = (self.tail + 1) % SLOTS;
+            self.tail = (self.tail + 1) % N;
             self.used -= 1;
         }
     }
 
-    /// 在睡眠锁内复制输入到末页或新槽；失败不影响此前已发表的数据页。
-    fn append(&mut self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+    /// 在调用者的睡眠锁内复制输入到末页或新槽；调用前必须有真实空间。
+    /// 一次只提交一个页后缀，失败不影响此前已发表的数据页。
+    pub(crate) fn append(&mut self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
         if self.merge_space() == 0 {
-            assert!(self.used < SLOTS);
+            assert!(self.used < N);
             let pages = mm::alloc_pages(0, true).ok_or(FsError::NoMemory)?;
             self.slots[self.head] = Some(Slot {
                 pages,
                 offset: 0,
                 length: 0,
             });
-            self.head = (self.head + 1) % SLOTS;
+            self.head = (self.head + 1) % N;
             self.used += 1;
         }
-        let index = (self.head + SLOTS - 1) % SLOTS;
+        let index = (self.head + N - 1) % N;
         let slot = self.slots[index].as_mut().unwrap();
         let offset = slot.offset + slot.length;
-        // SAFETY: 本槽独占一个已清零的原页，睡眠锁排除读写和归还；后缀完全位于页内，
-        // pull 只借本次调用的独占片段，结束后才更新长度或释放空槽。
+        // SAFETY: 本槽独占一个已清零的原页，调用者的睡眠锁排除读写和归还；
+        // 后缀完全位于页内，pull 不保存独占借用，结束后才更新长度或释放空槽。
         let dst = unsafe {
             core::slice::from_raw_parts_mut(
                 slot.pages.as_mut_ptr().cast::<u8>().add(offset),
@@ -116,10 +147,58 @@ impl Ring {
         }
         result
     }
+
+    /// 在调用者的睡眠锁内逐槽交付，非 PEEK 只消费实际 copyout 差量。
+    /// 故障保留本次合法正前缀；PEEK 的局部游标不改变槽、页及 FIFO 索引。
+    pub(crate) fn receive(
+        &mut self,
+        target: &mut ReadBuffer<'_>,
+        peek: bool,
+    ) -> Result<usize, FsError> {
+        let start = target.copied();
+        let available = self.len();
+        let mut index = self.tail;
+        let mut offset = 0;
+        while target.copied() - start < available && target.copied() < target.len() {
+            let slot = self.slots[index].as_mut().unwrap();
+            let length = slot.length;
+            let count = (length - offset).min(target.len() - target.copied());
+            // SAFETY: 槽独占的原页仍然存活，片段仅覆盖已提交的初始化字节；
+            // 调用者的睡眠锁排除并发写入及归页，push 不保存本页借用。
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    slot.pages
+                        .as_mut_ptr()
+                        .cast::<u8>()
+                        .add(slot.offset + offset),
+                    count,
+                )
+            };
+            let before = target.copied();
+            let result = target.push(bytes);
+            let delivered = target.copied() - before;
+            if peek {
+                offset += delivered;
+                if offset == length {
+                    index = (index + 1) % N;
+                    offset = 0;
+                }
+            } else {
+                self.consume(delivered);
+                index = self.tail;
+            }
+            if let Err(error) = result {
+                let copied = target.copied() - start;
+                return if copied == 0 { Err(error) } else { Ok(copied) };
+            }
+            assert!(0 < delivered, "FIFO copyout made no progress");
+        }
+        Ok(target.copied() - start)
+    }
 }
 
 struct Pipe {
-    ring: SleepMutex<Ring>,
+    ring: SleepMutex<PipeBuffer<SLOTS>>,
     /// 一次原子观察同时保存数据量和物理空槽容量，末页合并后缀不授予poll写就绪。
     observation: AtomicU64,
     reader_open: AtomicBool,
@@ -133,9 +212,9 @@ struct Pipe {
 
 impl Pipe {
     /// 状态提交后发布查询快照并通知真正的读写源；通知不取得 ring 锁。
-    fn publish(&self, ring: &Ring, read_changed: bool, write_changed: bool) {
+    fn publish(&self, ring: &PipeBuffer<SLOTS>, read_changed: bool, write_changed: bool) {
         self.observation.store(
-            (ring.bytes as u64) | (((SLOTS - ring.used) * PIPE_BUF) as u64) << SPACE_SHIFT,
+            (ring.len() as u64) | (ring.empty_slot_capacity() as u64) << SPACE_SHIFT,
             Ordering::Release,
         );
         if read_changed {
@@ -161,14 +240,13 @@ pub fn try_new(flags: u32, uid: u32, gid: u32) -> Result<(FileRef, FileRef), FsE
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return Err(FsError::InvalidOperation);
     }
-    assert_eq!(mm::PAGE_SIZE, PIPE_BUF);
     let read_head = Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?;
     let write_head = Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?;
     let inode = NEXT_INODE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("pipe inode identity exhausted");
     let pipe = Arc::try_new(Pipe {
-        ring: SleepMutex::new(Ring::new()),
+        ring: SleepMutex::new(PipeBuffer::new()),
         observation: AtomicU64::new((PIPE_CAPACITY as u64) << SPACE_SHIFT),
         reader_open: AtomicBool::new(true),
         writer_open: AtomicBool::new(true),
@@ -279,27 +357,11 @@ impl FileLike for PipeEnd {
             }
             {
                 let mut ring = self.pipe.ring.lock();
-                while 0 < ring.bytes && target.copied() < target.len() {
-                    let tail = ring.tail;
-                    let slot = ring.slots[tail].as_mut().unwrap();
-                    let count = slot.length.min(target.len() - target.copied());
-                    // SAFETY: 槽页仍由 ring 独占且长度仅包含已提交的初始化字节；睡眠锁
-                    // 排除并发改变及归还，push 不把本页借用保存到调用之外。
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            slot.pages.as_mut_ptr().cast::<u8>().add(slot.offset),
-                            count,
-                        )
-                    };
-                    let before = target.copied();
-                    let result = target.push(bytes);
-                    let delivered = target.copied() - before;
-                    ring.consume(delivered);
-                    self.pipe.publish(&ring, false, 0 < delivered);
-                    if let Err(error) = result {
-                        return Self::progress(target.copied() - start, error);
-                    }
-                    assert!(0 < delivered, "pipe copyout made no progress");
+                let before = target.copied();
+                let result = ring.receive(target, false);
+                self.pipe.publish(&ring, false, before < target.copied());
+                if let Err(error) = result {
+                    return Self::progress(target.copied() - start, error);
                 }
                 let copied = target.copied() - start;
                 if 0 < copied || !self.pipe.writer_open.load(Ordering::Acquire) {

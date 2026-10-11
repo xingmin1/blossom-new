@@ -24,6 +24,12 @@ _Static_assert(sizeof(struct sockaddr_in) == 16, "sockaddr_in ABI");
 _Static_assert(offsetof(struct sockaddr_in, sin_family) == 0, "sockaddr family ABI");
 _Static_assert(offsetof(struct sockaddr_in, sin_port) == 2, "sockaddr port ABI");
 _Static_assert(offsetof(struct sockaddr_in, sin_addr) == 4, "sockaddr address ABI");
+_Static_assert(sizeof(struct sockaddr_in6) == 28, "sockaddr_in6 ABI");
+_Static_assert(offsetof(struct sockaddr_in6, sin6_family) == 0, "IPv6 family ABI");
+_Static_assert(offsetof(struct sockaddr_in6, sin6_port) == 2, "IPv6 port ABI");
+_Static_assert(offsetof(struct sockaddr_in6, sin6_flowinfo) == 4, "IPv6 flowinfo ABI");
+_Static_assert(offsetof(struct sockaddr_in6, sin6_addr) == 8, "IPv6 address ABI");
+_Static_assert(offsetof(struct sockaddr_in6, sin6_scope_id) == 24, "IPv6 scope ABI");
 _Static_assert(sizeof(socklen_t) == 4, "socklen ABI");
 _Static_assert(sizeof(struct epoll_event) == 16, "natural epoll ABI");
 _Static_assert(offsetof(struct epoll_event, events) == 0, "epoll events ABI");
@@ -219,7 +225,7 @@ static void identity(const char *program)
         int value = -1;
         socklen_t length = sizeof value;
         CHECK(getsockopt(fd, SOL_SOCKET, options[i], &value, &length) == 0 && length == sizeof value);
-        const int expected[] = {SOCK_STREAM, AF_INET, IPPROTO_TCP, 0, 16384, 16384};
+        const int expected[] = {SOCK_STREAM, AF_INET, IPPROTO_TCP, 0, 131072, 131072};
         CHECK(value == expected[i]);
     }
     ERROR(lseek(fd, 0, SEEK_SET), ESPIPE);
@@ -907,13 +913,14 @@ static void udp_message(void)
     CHECK(recvfrom(receiver, output, 3, MSG_TRUNC, (struct sockaddr *)&source, &length) == 9);
     CHECK(memcmp(output, "tru", 3) == 0 && length == sizeof source && source.sin_port == sender.sin_port);
     datagram_expect(receiver, "following", &sender);
-    unsigned char large[1473];
+    unsigned char large[2049], received[2049];
     for (size_t i = 0; i < sizeof large; ++i) large[i] = (unsigned char)(i * 29u + 7u);
-    ERROR(send(fd, large, sizeof large, 0), EMSGSIZE);
-    CHECK(send(fd, large, sizeof large - 1, 0) == sizeof large - 1);
-    unsigned char received[1472];
-    CHECK(recv(receiver, received, sizeof received, 0) == sizeof received);
+    CHECK(send(fd, large, sizeof large, 0) == sizeof large);
+    length = sizeof source;
+    CHECK(recvfrom(receiver, received, sizeof received, 0, (struct sockaddr *)&source, &length) == sizeof received);
     CHECK(memcmp(received, large, sizeof received) == 0);
+    CHECK(length == sizeof source && source.sin_family == AF_INET);
+    CHECK(source.sin_port == sender.sin_port && source.sin_addr.s_addr == sender.sin_addr.s_addr);
     install_handler(SIGPIPE, 0);
     CHECK(shutdown(fd, SHUT_WR) == 0);
     ERROR(send(fd, NULL, 0, 0), EPIPE);
@@ -1217,6 +1224,929 @@ static void socket_options(void)
     CHECK(close(fd) == 0 && close(child) == 0 && close(first) == 0);
 }
 
+/// 基础 IPv6 地址只使用真实 sockaddr_in6 的 ::1，flowinfo 与 scope 保零。
+static struct sockaddr_in6 ipv6_address(void)
+{
+    struct sockaddr_in6 value = { .sin6_family = AF_INET6,
+        .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    return value;
+}
+
+/// 名称与消息来源必须为完整 ::1 端点；零端口不能冒充已经绑定的名称。
+static void ipv6_name(const struct sockaddr_in6 *actual, socklen_t length, uint16_t port)
+{
+    const struct in6_addr loopback = IN6ADDR_LOOPBACK_INIT;
+    CHECK(length == 28 && actual->sin6_family == AF_INET6);
+    CHECK(memcmp(&actual->sin6_addr, &loopback, sizeof loopback) == 0);
+    CHECK(actual->sin6_flowinfo == 0 && actual->sin6_scope_id == 0);
+    CHECK(actual->sin6_port != 0);
+    if (port != 0) CHECK(actual->sin6_port == port);
+}
+
+/// 域、类型、协议及 socket 属性均查询正式 OFD，不从本地创建参数推定。
+static void ipv6_identity(int fd, int type)
+{
+    CHECK(option(fd, SOL_SOCKET, SO_DOMAIN) == 10);
+    CHECK(option(fd, SOL_SOCKET, SO_TYPE) == type);
+    CHECK(option(fd, SOL_SOCKET, SO_PROTOCOL) == (type == SOCK_STREAM ? 6 : 17));
+    struct stat stat;
+    CHECK(fstat(fd, &stat) == 0 && S_ISSOCK(stat.st_mode));
+}
+
+/// 正式名称查询还核四字节容量的真实前缀，未容纳区域必须保留原 guard。
+static struct sockaddr_in6 ipv6_query(int fd, int peer, uint16_t port)
+{
+    struct sockaddr_in6 actual = {0};
+    socklen_t length = sizeof actual;
+    CHECK((peer ? getpeername(fd, (struct sockaddr *)&actual, &length)
+        : getsockname(fd, (struct sockaddr *)&actual, &length)) == 0);
+    ipv6_name(&actual, length, port);
+    unsigned char short_name[36];
+    memset(short_name, 0xa5, sizeof short_name);
+    length = 4;
+    CHECK((peer ? getpeername(fd, (struct sockaddr *)short_name, &length)
+        : getsockname(fd, (struct sockaddr *)short_name, &length)) == 0);
+    CHECK(length == 28 && memcmp(short_name, &actual, 4) == 0);
+    for (size_t i = 4; i < sizeof short_name; ++i) CHECK(short_name[i] == 0xa5);
+    return actual;
+}
+
+/// port0 绑定经正式 ABI 分配端口，短输入和异族输入失败后仍能正常绑定。
+static int ipv6_bound(int type, struct sockaddr_in6 *local)
+{
+    int fd = socket(AF_INET6, type, 0);
+    CHECK(0 <= fd);
+    ipv6_identity(fd, type);
+    *local = ipv6_address();
+    ERROR(bind(fd, (struct sockaddr *)local, 27), EINVAL);
+    struct sockaddr_in foreign = address(0);
+    ERROR(bind(fd, (struct sockaddr *)&foreign, sizeof foreign), EAFNOSUPPORT);
+    CHECK(bind(fd, (struct sockaddr *)local, sizeof *local) == 0);
+    *local = ipv6_query(fd, 0, 0);
+    return fd;
+}
+
+/// PEEK 的真实短前缀与后继完整读取共用相同图样，随后必须观察数据后的 EOF。
+static void ipv6_stream_expect(int fd, const unsigned char *expected, size_t size)
+{
+    unsigned char peeked[31], output[16397];
+    CHECK(size <= sizeof output);
+    CHECK(wait_ready(fd, POLLIN) & POLLIN);
+    ssize_t count = recv(fd, peeked, sizeof peeked, MSG_PEEK);
+    CHECK(0 < count && (size_t)count <= sizeof peeked && (size_t)count <= size);
+    CHECK(memcmp(peeked, expected, (size_t)count) == 0);
+    read_all(fd, output, size);
+    CHECK(memcmp(output, expected, size) == 0);
+    CHECK(read(fd, output, 1) == 0);
+}
+
+/// 真实 fork/connect/accept 建立新 IPv6 OFD，半关闭后仍能交付反向全文并正常 reap。
+static void ipv6_tcp(void)
+{
+    struct sockaddr_in6 local;
+    int listening = ipv6_bound(SOCK_STREAM, &local);
+    CHECK(fcntl(listening, F_SETFL, O_NONBLOCK) == 0);
+    CHECK(listen(listening, 8) == 0);
+    unsigned char request[16397], response[8197];
+    for (size_t i = 0; i < sizeof request; ++i) request[i] = pattern(i);
+    for (size_t i = 0; i < sizeof response; ++i) response[i] = pattern(i) ^ 0xa5;
+    pid_t child = fork_child();
+    if (child == 0) {
+        CHECK(close(listening) == 0);
+        int client = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        CHECK(0 <= client);
+        ipv6_identity(client, SOCK_STREAM);
+        ERROR(connect(client, (struct sockaddr *)&local, 27), EINVAL);
+        CHECK(connect(client, (struct sockaddr *)&local, sizeof local) == 0);
+        struct sockaddr_in6 own = ipv6_query(client, 0, 0);
+        ipv6_query(client, 1, local.sin6_port);
+        write_all(client, &own.sin6_port, sizeof own.sin6_port);
+        write_all(client, request, sizeof request);
+        CHECK(shutdown(client, SHUT_WR) == 0);
+        ipv6_stream_expect(client, response, sizeof response);
+        CHECK(close(client) == 0);
+        _exit(0);
+    }
+    CHECK(wait_ready(listening, POLLIN) & POLLIN);
+    struct sockaddr_in6 accepted = {0};
+    socklen_t length = sizeof accepted;
+    int server = accept4(listening, (struct sockaddr *)&accepted, &length, SOCK_CLOEXEC);
+    CHECK(0 <= server);
+    ipv6_name(&accepted, length, 0);
+    ipv6_identity(server, SOCK_STREAM);
+    ipv6_query(server, 0, local.sin6_port);
+    ipv6_query(server, 1, accepted.sin6_port);
+    struct stat listener_stat, server_stat, alias_stat;
+    CHECK(fstat(listening, &listener_stat) == 0 && fstat(server, &server_stat) == 0);
+    CHECK(server_stat.st_ino != listener_stat.st_ino);
+    CHECK((fcntl(server, F_GETFL) & O_NONBLOCK) == 0);
+    CHECK((fcntl(listening, F_GETFL) & O_NONBLOCK) != 0);
+    int alias = dup(server);
+    CHECK(0 <= alias && alias != server);
+    CHECK(fstat(alias, &alias_stat) == 0 && alias_stat.st_ino == server_stat.st_ino);
+    CHECK(alias_stat.st_dev == server_stat.st_dev);
+    CHECK(fcntl(server, F_GETFD) == FD_CLOEXEC && fcntl(alias, F_GETFD) == 0);
+    CHECK(fcntl(alias, F_SETFL, O_NONBLOCK) == 0);
+    CHECK((fcntl(server, F_GETFL) & O_NONBLOCK) != 0);
+    CHECK(fcntl(server, F_SETFL, 0) == 0);
+    CHECK((fcntl(alias, F_GETFL) & O_NONBLOCK) == 0);
+    uint16_t client_port;
+    read_all(alias, &client_port, sizeof client_port);
+    CHECK(client_port == accepted.sin6_port);
+    ipv6_stream_expect(alias, request, sizeof request);
+    write_all(alias, response, sizeof response);
+    CHECK(shutdown(alias, SHUT_WR) == 0);
+    CHECK(close(alias) == 0 && close(server) == 0 && close(listening) == 0);
+    reap(child, 0);
+    printf("network-smoke ipv6-tcp request=%zu response=%zu names=28 peek=1 fin=1 reaped=0\n",
+        sizeof request, sizeof response);
+}
+
+/// UDP 就绪由原 ppoll 观察，每次只领取一条并核全文及同一记录的 IPv6 来源。
+static void ipv6_datagram_expect(int fd, const void *expected, size_t size,
+    const struct sockaddr_in6 *sender)
+{
+    unsigned char output[2049];
+    struct sockaddr_in6 source = {0};
+    socklen_t length = sizeof source;
+    CHECK(size <= sizeof output);
+    CHECK(wait_ready(fd, POLLIN) & POLLIN);
+    CHECK(recvfrom(fd, output, sizeof output, 0, (struct sockaddr *)&source, &length) == (ssize_t)size);
+    CHECK(memcmp(output, expected, size) == 0);
+    ipv6_name(&source, length, sender->sin6_port);
+}
+
+/// 两目的、默认 peer、零消息、PEEK/TRUNC、大 lo 消息与 LP64 向量均经真实 IPv6 消息入口。
+static void ipv6_udp(void)
+{
+    struct sockaddr_in6 a, b, local;
+    int first = ipv6_bound(SOCK_DGRAM, &a), second = ipv6_bound(SOCK_DGRAM, &b);
+    int fd = ipv6_bound(SOCK_DGRAM, &local);
+    CHECK(a.sin6_port != b.sin6_port && local.sin6_port != a.sin6_port && local.sin6_port != b.sin6_port);
+    ERROR(send(fd, "x", 1, 0), EDESTADDRREQ);
+    CHECK(sendto(fd, "one", 3, 0, (struct sockaddr *)&a, sizeof a) == 3);
+    ipv6_datagram_expect(first, "one", 3, &local);
+    CHECK(sendto(fd, "two", 3, 0, (struct sockaddr *)&b, sizeof b) == 3);
+    ipv6_datagram_expect(second, "two", 3, &local);
+    CHECK(connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
+    CHECK(sendto(fd, "override", 8, 0, (struct sockaddr *)&b, sizeof b) == 8);
+    ipv6_datagram_expect(second, "override", 8, &local);
+    ipv6_query(fd, 1, a.sin6_port);
+    CHECK(send(fd, "default", 7, 0) == 7);
+    ipv6_datagram_expect(first, "default", 7, &local);
+
+    unsigned char output[2049];
+    struct sockaddr_in6 source = {0};
+    socklen_t length = sizeof source;
+    CHECK(send(fd, NULL, 0, 0) == 0);
+    CHECK(wait_ready(first, POLLIN) & POLLIN);
+    CHECK(recvfrom(first, output, sizeof output, MSG_PEEK, (struct sockaddr *)&source, &length) == 0);
+    ipv6_name(&source, length, local.sin6_port);
+    ipv6_datagram_expect(first, "", 0, &local);
+    ERROR(recv(first, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    CHECK(send(fd, "short-tail", 10, 0) == 10);
+    CHECK(send(fd, "next", 4, 0) == 4);
+    CHECK(wait_ready(first, POLLIN) & POLLIN);
+    length = sizeof source;
+    CHECK(recvfrom(first, output, 3, 0, (struct sockaddr *)&source, &length) == 3);
+    CHECK(memcmp(output, "sho", 3) == 0);
+    ipv6_name(&source, length, local.sin6_port);
+    ipv6_datagram_expect(first, "next", 4, &local);
+    CHECK(send(fd, "peek-full", 9, 0) == 9);
+    CHECK(wait_ready(first, POLLIN) & POLLIN);
+    length = sizeof source;
+    CHECK(recvfrom(first, output, 4, MSG_PEEK, (struct sockaddr *)&source, &length) == 4);
+    CHECK(memcmp(output, "peek", 4) == 0);
+    ipv6_name(&source, length, local.sin6_port);
+    length = sizeof source;
+    CHECK(recvfrom(first, output, 4, MSG_PEEK | MSG_TRUNC, (struct sockaddr *)&source, &length) == 9);
+    CHECK(memcmp(output, "peek", 4) == 0);
+    ipv6_name(&source, length, local.sin6_port);
+    ipv6_datagram_expect(first, "peek-full", 9, &local);
+    CHECK(send(fd, "truncated", 9, 0) == 9);
+    CHECK(send(fd, "following", 9, 0) == 9);
+    CHECK(wait_ready(first, POLLIN) & POLLIN);
+    length = sizeof source;
+    CHECK(recvfrom(first, output, 3, MSG_TRUNC, (struct sockaddr *)&source, &length) == 9);
+    CHECK(memcmp(output, "tru", 3) == 0);
+    ipv6_name(&source, length, local.sin6_port);
+    ipv6_datagram_expect(first, "following", 9, &local);
+
+    unsigned char large[2049];
+    for (size_t i = 0; i < sizeof large; ++i) large[i] = pattern(i);
+    CHECK(send(fd, large, sizeof large, 0) == sizeof large);
+    ipv6_datagram_expect(first, large, sizeof large, &local);
+    ERROR(recv(first, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+
+    struct iovec input[] = {{(void *)"vector-", 7}, {(void *)"datagram", 8}};
+    struct msghdr message = {.msg_name = &b, .msg_namelen = sizeof b,
+        .msg_iov = input, .msg_iovlen = 2};
+    CHECK(sendmsg(fd, &message, 0) == 15);
+    unsigned char prefix[3], tail[12];
+    struct iovec target[] = {{prefix, sizeof prefix}, {tail, sizeof tail}};
+    struct msghdr header = {.msg_name = &source, .msg_namelen = sizeof source,
+        .msg_iov = target, .msg_iovlen = 2};
+    CHECK(wait_ready(second, POLLIN) & POLLIN);
+    CHECK(recvmsg(second, &header, 0) == 15);
+    CHECK(memcmp(prefix, "vec", sizeof prefix) == 0 && memcmp(tail, "tor-datagram", sizeof tail) == 0);
+    CHECK(header.msg_flags == 0 && header.msg_controllen == 0);
+    ipv6_name(&source, header.msg_namelen, local.sin6_port);
+    ipv6_query(fd, 1, a.sin6_port);
+    CHECK(send(fd, "after vector", 12, 0) == 12);
+    ipv6_datagram_expect(first, "after vector", 12, &local);
+
+    struct sockaddr disconnect = {.sa_family = AF_UNSPEC};
+    CHECK(connect(fd, &disconnect, sizeof disconnect.sa_family) == 0);
+    length = sizeof source;
+    ERROR(getpeername(fd, (struct sockaddr *)&source, &length), ENOTCONN);
+    ERROR(send(fd, "x", 1, 0), EDESTADDRREQ);
+    CHECK(sendto(second, "recent", 6, 0, (struct sockaddr *)&local, sizeof local) == 6);
+    ipv6_datagram_expect(fd, "recent", 6, &b);
+    ERROR(send(fd, "x", 1, 0), EDESTADDRREQ);
+    CHECK(close(fd) == 0 && close(first) == 0 && close(second) == 0);
+    printf("network-smoke ipv6-udp destinations=2 names=28 zero=1 peek=1 trunc=1 large=2049 vector=15 disconnected=1\n");
+}
+
+/// int 设置沿正式 ABI 提交，查询断言由各行为单独消费。
+static void set_option(int fd, int level, int name, int value)
+{
+    CHECK(setsockopt(fd, level, name, &value, sizeof value) == 0);
+}
+
+/// 通配地址保留 ::，port0 的实际分配名称仍按 AF_INET6 返回。
+static int wildcard6(int type, int only, uint16_t port, struct sockaddr_in6 *local)
+{
+    int fd = socket(AF_INET6, type, 0);
+    CHECK(0 <= fd);
+    CHECK(option(fd, IPPROTO_IPV6, IPV6_V6ONLY) == 0);
+    if (only) set_option(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1);
+    CHECK(option(fd, IPPROTO_IPV6, IPV6_V6ONLY) == only);
+    *local = (struct sockaddr_in6){.sin6_family = AF_INET6, .sin6_port = port};
+    CHECK(bind(fd, (struct sockaddr *)local, sizeof *local) == 0);
+    socklen_t length = sizeof *local;
+    CHECK(getsockname(fd, (struct sockaddr *)local, &length) == 0);
+    const struct in6_addr any = IN6ADDR_ANY_INIT;
+    CHECK(length == 28 && local->sin6_family == AF_INET6 && local->sin6_port != 0);
+    CHECK(memcmp(&local->sin6_addr, &any, sizeof any) == 0);
+    CHECK(local->sin6_flowinfo == 0 && local->sin6_scope_id == 0);
+    return fd;
+}
+
+/// 映射端点在用户边界保 AF_INET6 身份，IPv4 字节只放在最后四字节。
+static struct sockaddr_in6 mapped_address(uint16_t port)
+{
+    struct sockaddr_in6 value = {.sin6_family = AF_INET6, .sin6_port = port};
+    const unsigned char bytes[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1};
+    memcpy(&value.sin6_addr, bytes, sizeof bytes);
+    return value;
+}
+
+/// 名称与来源的映射输出必须含完整 28 字节及真实端口。
+static void mapped_name(const struct sockaddr_in6 *actual, socklen_t length, uint16_t port)
+{
+    struct sockaddr_in6 expected = mapped_address(port);
+    CHECK(length == 28 && actual->sin6_family == AF_INET6);
+    CHECK(actual->sin6_port == port && port != 0);
+    CHECK(actual->sin6_flowinfo == 0 && actual->sin6_scope_id == 0);
+    CHECK(memcmp(&actual->sin6_addr, &expected.sin6_addr, sizeof expected.sin6_addr) == 0);
+}
+
+/// 已连接映射 OFD 的 local/peer 均由正式名称 syscall 取得。
+static void mapped_query(int fd, int peer, uint16_t port)
+{
+    struct sockaddr_in6 actual;
+    socklen_t length = sizeof actual;
+    CHECK((peer ? getpeername(fd, (struct sockaddr *)&actual, &length)
+        : getsockname(fd, (struct sockaddr *)&actual, &length)) == 0);
+    mapped_name(&actual, length, port);
+}
+
+/// 短双向流在各自 FIN 后领取 EOF，关闭双方前不遗留未读字节。
+static void short_exchange(int client, int server)
+{
+    unsigned char output[32];
+    write_all(client, "mapped\0request\xff", 15);
+    CHECK(shutdown(client, SHUT_WR) == 0);
+    read_all(server, output, 15);
+    CHECK(memcmp(output, "mapped\0request\xff", 15) == 0);
+    CHECK(read(server, output, 1) == 0);
+    write_all(server, "native\0response\xfe", 16);
+    CHECK(shutdown(server, SHUT_WR) == 0);
+    read_all(client, output, 16);
+    CHECK(memcmp(output, "native\0response\xfe", 16) == 0);
+    CHECK(read(client, output, 1) == 0);
+    CHECK(close(client) == 0 && close(server) == 0);
+}
+
+/// 双面通配 listener 及 dup 共用身份，原生隔离与显式 mapped 都用真实 TCP 连接。
+static void mapped_tcp(void)
+{
+    struct sockaddr_in6 local;
+    int listening = wildcard6(SOCK_STREAM, 0, 0, &local);
+    CHECK(listen(listening, 4) == 0);
+    int alias = dup(listening);
+    CHECK(0 <= alias);
+    struct stat original, duplicate, accepted;
+    CHECK(fstat(listening, &original) == 0 && fstat(alias, &duplicate) == 0);
+    CHECK(original.st_ino == duplicate.st_ino && original.st_dev == duplicate.st_dev);
+    int v4 = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= v4);
+    struct sockaddr_in destination = address(ntohs(local.sin6_port));
+    ERROR(bind(v4, (struct sockaddr *)&destination, sizeof destination), EADDRINUSE);
+    CHECK(close(v4) == 0);
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= client && connect(client, (struct sockaddr *)&destination, sizeof destination) == 0);
+    struct sockaddr_in own;
+    socklen_t length = sizeof own;
+    CHECK(getsockname(client, (struct sockaddr *)&own, &length) == 0);
+    CHECK(length == 16 && own.sin_family == AF_INET && own.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    struct sockaddr_in6 peer;
+    length = sizeof peer;
+    int server = accept(alias, (struct sockaddr *)&peer, &length);
+    CHECK(0 <= server);
+    mapped_name(&peer, length, own.sin_port);
+    ipv6_identity(server, SOCK_STREAM);
+    mapped_query(server, 0, local.sin6_port);
+    mapped_query(server, 1, own.sin_port);
+    CHECK(fstat(server, &accepted) == 0 && accepted.st_ino != original.st_ino);
+    int enabled = 1;
+    ERROR(setsockopt(listening, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof enabled), EINVAL);
+    ERROR(setsockopt(server, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof enabled), EINVAL);
+    short_exchange(client, server);
+    CHECK(option(alias, SOL_SOCKET, SO_ACCEPTCONN) == 1 && option(alias, SOL_SOCKET, SO_DOMAIN) == AF_INET6);
+    CHECK(close(alias) == 0 && close(listening) == 0);
+
+    listening = wildcard6(SOCK_STREAM, 1, 0, &local);
+    CHECK(listen(listening, 4) == 0 && fcntl(listening, F_SETFL, O_NONBLOCK) == 0);
+    int v4_listener = listener(ntohs(local.sin6_port), 0);
+    destination = address(ntohs(local.sin6_port));
+    client = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= client && connect(client, (struct sockaddr *)&destination, sizeof destination) == 0);
+    server = accept(v4_listener, NULL, NULL);
+    CHECK(0 <= server && option(server, SOL_SOCKET, SO_DOMAIN) == AF_INET);
+    ERROR(accept(listening, NULL, NULL), EAGAIN);
+    short_exchange(client, server);
+    struct sockaddr_in6 native = ipv6_address();
+    native.sin6_port = local.sin6_port;
+    client = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(0 <= client && connect(client, (struct sockaddr *)&native, sizeof native) == 0);
+    CHECK(wait_ready(listening, POLLIN) & POLLIN);
+    length = sizeof peer;
+    server = accept(listening, (struct sockaddr *)&peer, &length);
+    CHECK(0 <= server);
+    ipv6_name(&peer, length, 0);
+    ipv6_identity(server, SOCK_STREAM);
+    CHECK(option(server, IPPROTO_IPV6, IPV6_V6ONLY) == 1);
+    short_exchange(client, server);
+    CHECK(close(listening) == 0);
+
+    struct sockaddr_in6 mapped = mapped_address(destination.sin_port);
+    client = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(0 <= client && connect(client, (struct sockaddr *)&mapped, sizeof mapped) == 0);
+    ipv6_identity(client, SOCK_STREAM);
+    mapped_query(client, 1, destination.sin_port);
+    length = sizeof peer;
+    CHECK(getsockname(client, (struct sockaddr *)&peer, &length) == 0);
+    mapped_name(&peer, length, peer.sin6_port);
+    ERROR(setsockopt(client, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof enabled), EINVAL);
+    server = accept(v4_listener, NULL, NULL);
+    CHECK(0 <= server);
+    short_exchange(client, server);
+    CHECK(close(v4_listener) == 0);
+
+    client = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(0 <= client);
+    set_option(client, IPPROTO_IPV6, IPV6_V6ONLY, 1);
+    ERROR(bind(client, (struct sockaddr *)&mapped, sizeof mapped), EINVAL);
+    ERROR(connect(client, (struct sockaddr *)&mapped, sizeof mapped), ENETUNREACH);
+    CHECK(close(client) == 0);
+    client = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= client);
+    ERROR(bind(client, (struct sockaddr *)&native, sizeof native), EAFNOSUPPORT);
+    ERROR(connect(client, (struct sockaddr *)&native, sizeof native), EAFNOSUPPORT);
+    CHECK(option(client, SOL_SOCKET, SO_DOMAIN) == AF_INET && close(client) == 0);
+}
+
+/// UDP 双面通配按同条记录返回 mapped source，V6ONLY 后原生与 IPv4 各自领取。
+static void mapped_udp(void)
+{
+    struct sockaddr_in6 local, source;
+    int receiver = wildcard6(SOCK_DGRAM, 0, 0, &local);
+    struct sockaddr_in sender, destination = address(ntohs(local.sin6_port));
+    int fd = datagram(&sender);
+    CHECK(sendto(fd, "udp-mapped", 10, 0, (struct sockaddr *)&destination, sizeof destination) == 10);
+    unsigned char output[32];
+    socklen_t length = sizeof source;
+    CHECK(recvfrom(receiver, output, sizeof output, 0, (struct sockaddr *)&source, &length) == 10);
+    CHECK(memcmp(output, "udp-mapped", 10) == 0);
+    mapped_name(&source, length, sender.sin_port);
+    ipv6_identity(receiver, SOCK_DGRAM);
+    CHECK(sendto(receiver, "mapped-reply", 12, 0, (struct sockaddr *)&source, sizeof source) == 12);
+    datagram_expect(fd, "mapped-reply", &destination);
+    CHECK(close(receiver) == 0);
+
+    receiver = wildcard6(SOCK_DGRAM, 1, 0, &local);
+    destination = address(ntohs(local.sin6_port));
+    int v4 = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(0 <= v4 && bind(v4, (struct sockaddr *)&destination, sizeof destination) == 0);
+    CHECK(sendto(fd, "v4-only", 7, 0, (struct sockaddr *)&destination, sizeof destination) == 7);
+    datagram_expect(v4, "v4-only", &sender);
+    ERROR(recv(receiver, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    struct sockaddr_in6 native_sender;
+    int native = ipv6_bound(SOCK_DGRAM, &native_sender);
+    struct sockaddr_in6 native_destination = ipv6_address();
+    native_destination.sin6_port = local.sin6_port;
+    CHECK(sendto(native, "v6-only", 7, 0, (struct sockaddr *)&native_destination, sizeof native_destination) == 7);
+    ipv6_datagram_expect(receiver, "v6-only", 7, &native_sender);
+    ERROR(recv(v4, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    CHECK(close(native) == 0 && close(v4) == 0 && close(fd) == 0 && close(receiver) == 0);
+}
+
+/// 同一用户网络域消费有限 mapped/V6ONLY 行为，不复制两族 flags 矩阵。
+static void ipv6_mapped(void)
+{
+    mapped_tcp();
+    mapped_udp();
+    printf("network-smoke ipv6-mapped dual-listener=1 names=28 v6only=1 udp-source=1\n");
+}
+
+/// 大消息的拥有存储位于 BSS，函数栈只保存 ABI 名称及少量前缀。
+static unsigned char datagram_input[65508], datagram_output[65508];
+
+/// 同条 datagram 的 source 按发送者实际族和端口比较，不比较 sockaddr padding。
+static void message_source(const struct sockaddr_storage *source, socklen_t length,
+    const struct sockaddr_storage *sender, socklen_t sender_length)
+{
+    CHECK(length == sender_length && source->ss_family == sender->ss_family);
+    if (sender->ss_family == AF_INET) {
+        const struct sockaddr_in *actual = (const struct sockaddr_in *)source;
+        const struct sockaddr_in *expected = (const struct sockaddr_in *)sender;
+        CHECK(actual->sin_port == expected->sin_port);
+        CHECK(actual->sin_addr.s_addr == expected->sin_addr.s_addr);
+    } else {
+        const struct sockaddr_in6 *actual = (const struct sockaddr_in6 *)source;
+        const struct sockaddr_in6 *expected = (const struct sockaddr_in6 *)sender;
+        ipv6_name(actual, length, expected->sin6_port);
+    }
+}
+
+/// 每族两种具名尺寸各发一次，PEEK/TRUNC 后仍一次领取全文，越界不产生后继消息。
+static void large_loopback_family(int family)
+{
+    struct sockaddr_storage sender = {0}, destination = {0}, source;
+    socklen_t length;
+    int fd, receiver;
+    size_t maximum;
+    if (family == AF_INET) {
+        struct sockaddr_in own, target;
+        fd = datagram(&own);
+        receiver = datagram(&target);
+        memcpy(&sender, &own, sizeof own);
+        memcpy(&destination, &target, sizeof target);
+        length = sizeof own;
+        maximum = 65507;
+    } else {
+        struct sockaddr_in6 own, target;
+        fd = ipv6_bound(SOCK_DGRAM, &own);
+        receiver = ipv6_bound(SOCK_DGRAM, &target);
+        memcpy(&sender, &own, sizeof own);
+        memcpy(&destination, &target, sizeof target);
+        length = sizeof own;
+        maximum = 65487;
+    }
+    const size_t sizes[] = {8193, maximum};
+    for (size_t message = 0; message < sizeof sizes / sizeof sizes[0]; ++message) {
+        size_t size = sizes[message];
+        for (size_t i = 0; i < size; ++i)
+            datagram_input[i] = pattern(i + message * 113 + (size_t)family * 257);
+        CHECK(sendto(fd, datagram_input, size, 0, (struct sockaddr *)&destination, length) == (ssize_t)size);
+        if (message == 0) {
+            unsigned char prefix[31];
+            socklen_t source_length = sizeof source;
+            CHECK(recvfrom(receiver, prefix, sizeof prefix, MSG_PEEK | MSG_TRUNC,
+                (struct sockaddr *)&source, &source_length) == (ssize_t)size);
+            CHECK(memcmp(prefix, datagram_input, sizeof prefix) == 0);
+            message_source(&source, source_length, &sender, length);
+        }
+        socklen_t source_length = sizeof source;
+        CHECK(recvfrom(receiver, datagram_output, sizeof datagram_output, 0,
+            (struct sockaddr *)&source, &source_length) == (ssize_t)size);
+        CHECK(memcmp(datagram_output, datagram_input, size) == 0);
+        message_source(&source, source_length, &sender, length);
+        ERROR(recv(receiver, datagram_output, sizeof datagram_output, MSG_DONTWAIT), EAGAIN);
+        printf("network-smoke large-loopback family=%d size=%zu single-message=1 source=%u\n",
+            family, size, source_length);
+    }
+    ERROR(sendto(fd, datagram_input, maximum + 1, 0, (struct sockaddr *)&destination, length), EMSGSIZE);
+    ERROR(recv(receiver, datagram_output, sizeof datagram_output, MSG_DONTWAIT), EAGAIN);
+    CHECK(close(fd) == 0 && close(receiver) == 0);
+}
+
+/// 大 lo 的协议上界只在一个 mode 验收，不把本地消息等同 NIC 分片。
+static void large_loopback(void)
+{
+    large_loopback_family(AF_INET);
+    large_loopback_family(AF_INET6);
+}
+
+/// Reno 读取固定 16 字节名字槽，截短只改交付前缀，setter 消费有界名称。
+static void congestion_option(int fd)
+{
+    const char reno[16] = "reno";
+    const socklen_t capacities[] = {0, 4, 16, 24};
+    for (size_t i = 0; i < sizeof capacities / sizeof capacities[0]; ++i) {
+        unsigned char output[24];
+        memset(output, 0xa5, sizeof output);
+        socklen_t length = capacities[i], copied = length < 16 ? length : 16;
+        CHECK(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, output, &length) == 0);
+        CHECK(length == copied && memcmp(output, reno, copied) == 0);
+        for (size_t byte = copied; byte < sizeof output; ++byte) CHECK(output[byte] == 0xa5);
+    }
+    CHECK(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "reno", 4) == 0);
+    CHECK(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "reno\0ignored", 12) == 0);
+    ERROR(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "cubic", 5), ENOENT);
+    ERROR(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "", 0), EINVAL);
+    ERROR(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, (void *)1, 4), EFAULT);
+    unsigned char *mapping = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mapping != MAP_FAILED && munmap(mapping + 4096, 4096) == 0);
+    // 名称到首 NUL 或最多十五字节；optlen 不能让读取跨进未映射页。
+    memcpy(mapping + 4091, "reno", 5);
+    CHECK(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, mapping + 4091, 32) == 0);
+    memset(mapping + 4081, 'x', 15);
+    ERROR(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, mapping + 4081, 16), ENOENT);
+    CHECK(munmap(mapping, 4096) == 0);
+    socklen_t length = 16;
+    ERROR(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, (void *)1, &length), EFAULT);
+    length = 0;
+    CHECK(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, (void *)1, &length) == 0 && length == 0);
+    unsigned char output[16];
+    length = sizeof output;
+    CHECK(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, output, &length) == 0);
+    CHECK(length == 16 && memcmp(output, reno, 16) == 0);
+}
+
+/// NODELAY 与 KEEPALIVE 的非零/零开关消费正式查询，短 int 输出保剩余 guard。
+static void protocol_switches(int fd)
+{
+    CHECK(option(fd, IPPROTO_TCP, TCP_NODELAY) == 0);
+    CHECK(option(fd, SOL_SOCKET, SO_KEEPALIVE) == 0);
+    set_option(fd, IPPROTO_TCP, TCP_NODELAY, -7);
+    set_option(fd, SOL_SOCKET, SO_KEEPALIVE, -7);
+    CHECK(option(fd, IPPROTO_TCP, TCP_NODELAY) == 1);
+    CHECK(option(fd, SOL_SOCKET, SO_KEEPALIVE) == 1);
+    unsigned char output[8];
+    memset(output, 0xa5, sizeof output);
+    const int enabled = 1;
+    socklen_t length = 2;
+    CHECK(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, output, &length) == 0 && length == 2);
+    CHECK(memcmp(output, &enabled, 2) == 0);
+    for (size_t i = 2; i < sizeof output; ++i) CHECK(output[i] == 0xa5);
+    ERROR(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, 3), EINVAL);
+    ERROR(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)1, sizeof enabled), EFAULT);
+    ERROR(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, output, (socklen_t *)1), EFAULT);
+    ERROR(setsockopt(fd, IPPROTO_TCP, 0x7fff, &enabled, sizeof enabled), ENOPROTOOPT);
+    length = sizeof enabled;
+    ERROR(getsockopt(fd, IPPROTO_TCP, 0x7fff, output, &length), ENOPROTOOPT);
+    set_option(fd, IPPROTO_TCP, TCP_NODELAY, 0);
+    set_option(fd, SOL_SOCKET, SO_KEEPALIVE, 0);
+    CHECK(option(fd, IPPROTO_TCP, TCP_NODELAY) == 0);
+    CHECK(option(fd, SOL_SOCKET, SO_KEEPALIVE) == 0);
+}
+
+/// listener 设置在握手前交给 child，两族 MSS 都查询已协商的 lo 连接。
+static void protocol_family(int family)
+{
+    struct sockaddr_storage destination = {0};
+    socklen_t length;
+    int listening;
+    if (family == AF_INET) {
+        listening = listener(0, 0);
+        struct sockaddr_in local;
+        length = sizeof local;
+        CHECK(getsockname(listening, (struct sockaddr *)&local, &length) == 0);
+        memcpy(&destination, &local, sizeof local);
+    } else {
+        struct sockaddr_in6 local;
+        listening = ipv6_bound(SOCK_STREAM, &local);
+        CHECK(listen(listening, 4) == 0);
+        length = sizeof local;
+        memcpy(&destination, &local, sizeof local);
+    }
+    CHECK(option(listening, SOL_SOCKET, SO_SNDBUF) == 131072);
+    CHECK(option(listening, SOL_SOCKET, SO_RCVBUF) == 131072);
+    protocol_switches(listening);
+    set_option(listening, IPPROTO_TCP, TCP_NODELAY, 1);
+    set_option(listening, SOL_SOCKET, SO_KEEPALIVE, 1);
+    int client = socket(family, SOCK_STREAM, 0);
+    CHECK(0 <= client);
+    protocol_switches(client);
+    CHECK(connect(client, (struct sockaddr *)&destination, length) == 0);
+    int server = accept(listening, NULL, NULL);
+    CHECK(0 <= server);
+    CHECK(option(server, IPPROTO_TCP, TCP_NODELAY) == 1);
+    CHECK(option(server, SOL_SOCKET, SO_KEEPALIVE) == 1);
+    set_option(server, IPPROTO_TCP, TCP_NODELAY, 0);
+    set_option(server, SOL_SOCKET, SO_KEEPALIVE, 0);
+    CHECK(option(server, IPPROTO_TCP, TCP_NODELAY) == 0 && option(server, SOL_SOCKET, SO_KEEPALIVE) == 0);
+    CHECK(option(listening, IPPROTO_TCP, TCP_NODELAY) == 1 && option(listening, SOL_SOCKET, SO_KEEPALIVE) == 1);
+    congestion_option(client);
+    congestion_option(server);
+    int mss = option(client, IPPROTO_TCP, TCP_MAXSEG);
+    CHECK(mss == option(server, IPPROTO_TCP, TCP_MAXSEG));
+    CHECK(mss == (family == AF_INET ? 65495 : 65475));
+    ERROR(setsockopt(client, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof mss), ENOPROTOOPT);
+    short_exchange(client, server);
+    CHECK(close(listening) == 0);
+    printf("network-smoke protocol-options family=%d mss=%d reno-slot=16 keepalive-switch=1 nodelay-switch=1 inherited=1\n",
+        family, mss);
+}
+
+/// 通用 KEEPALIVE 布尔属性不赋予 UDP/UNIX TCP 协议选项。
+static void non_tcp_options(int fd)
+{
+    CHECK(option(fd, SOL_SOCKET, SO_KEEPALIVE) == 0);
+    set_option(fd, SOL_SOCKET, SO_KEEPALIVE, -1);
+    CHECK(option(fd, SOL_SOCKET, SO_KEEPALIVE) == 1);
+    set_option(fd, SOL_SOCKET, SO_KEEPALIVE, 0);
+    CHECK(option(fd, SOL_SOCKET, SO_KEEPALIVE) == 0);
+    const int names[] = {TCP_NODELAY, TCP_MAXSEG, TCP_CONGESTION};
+    int value = 1;
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        socklen_t length = sizeof value;
+        ERROR(getsockopt(fd, IPPROTO_TCP, names[i], &value, &length), ENOPROTOOPT);
+        ERROR(setsockopt(fd, IPPROTO_TCP, names[i], &value, sizeof value), ENOPROTOOPT);
+    }
+}
+
+/// 开关、MSS 及 Reno 通过普通选项 ABI 消费；7200 秒 probe 留给库的可控 Instant。
+static void protocol_options(void)
+{
+    protocol_family(AF_INET);
+    protocol_family(AF_INET6);
+    int udp = socket(AF_INET, SOCK_DGRAM, 0), fds[2];
+    CHECK(0 <= udp && socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(option(udp, SOL_SOCKET, SO_SNDBUF) == 131072);
+    CHECK(option(udp, SOL_SOCKET, SO_RCVBUF) == 131072);
+    non_tcp_options(udp);
+    non_tcp_options(fds[0]);
+    CHECK(close(udp) == 0 && close(fds[0]) == 0 && close(fds[1]) == 0);
+}
+
+/// 小预算在同一 OFD 及其别名生效，hint 只通过正式 setsockopt 换算。
+static void buffer_hint(int fd, int name, int hint, int expected)
+{
+    set_option(fd, SOL_SOCKET, name, hint);
+    CHECK(option(fd, SOL_SOCKET, name) == expected);
+}
+
+/// 普通 pipe 控制 peer 暂停读取；真实 EAGAIN 前缀在缩小、提高和 FIN 后仍完整交付。
+static void tcp_buffer_budget(void)
+{
+    int listening = listener(0, 0);
+    buffer_hint(listening, SO_RCVBUF, 1024, 2048);
+    buffer_hint(listening, SO_SNDBUF, 1024, 2048);
+    struct sockaddr_in destination;
+    socklen_t length = sizeof destination;
+    CHECK(getsockname(listening, (struct sockaddr *)&destination, &length) == 0);
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= client);
+    buffer_hint(client, SO_SNDBUF, 1024, 2048);
+    buffer_hint(client, SO_RCVBUF, 1024, 2048);
+    CHECK(connect(client, (struct sockaddr *)&destination, sizeof destination) == 0);
+    int server = accept(listening, NULL, NULL), alias = dup(client);
+    CHECK(0 <= server && 0 <= alias);
+    CHECK(option(server, SOL_SOCKET, SO_RCVBUF) == 2048);
+    CHECK(option(server, SOL_SOCKET, SO_SNDBUF) == 2048);
+    CHECK(close(listening) == 0);
+    int control[2], notice[2];
+    CHECK(pipe(control) == 0 && pipe(notice) == 0);
+    pid_t child = fork_child();
+    if (child == 0) {
+        CHECK(close(client) == 0 && close(alias) == 0);
+        CHECK(close(control[1]) == 0 && close(notice[0]) == 0);
+        size_t initially_accepted, total;
+        read_all(control[0], &initially_accepted, sizeof initially_accepted);
+        CHECK(0 < initially_accepted);
+        unsigned char output[733], byte;
+        CHECK(recv(server, &byte, 1, MSG_PEEK) == 1 && byte == pattern(0));
+        buffer_hint(server, SO_RCVBUF, 1, 1024);
+        write_all(notice[1], "R", 1);
+        read_all(control[0], &total, sizeof total);
+        CHECK(initially_accepted < total);
+        buffer_hint(server, SO_RCVBUF, 4096, 8192);
+        write_all(notice[1], "G", 1);
+        size_t done = 0;
+        while (done < total) {
+            size_t requested = total - done;
+            if (sizeof output < requested) requested = sizeof output;
+            ssize_t count = read(server, output, requested);
+            CHECK(0 < count && (size_t)count <= requested);
+            for (size_t i = 0; i < (size_t)count; ++i) CHECK(output[i] == pattern(done + i));
+            done += (size_t)count;
+        }
+        CHECK(read(server, &byte, 1) == 0);
+        write_all(server, "budget-restored", 15);
+        CHECK(shutdown(server, SHUT_WR) == 0);
+        CHECK(close(server) == 0 && close(control[0]) == 0 && close(notice[1]) == 0);
+        _exit(0);
+    }
+    CHECK(close(server) == 0 && close(control[0]) == 0 && close(notice[1]) == 0);
+    CHECK(fcntl(client, F_SETFL, O_NONBLOCK) == 0);
+    unsigned char input[4096], output[32], byte;
+    size_t accepted = 0;
+    for (;;) {
+        CHECK(accepted < 262144);
+        for (size_t i = 0; i < sizeof input; ++i) input[i] = pattern(accepted + i);
+        ssize_t count = send(client, input, sizeof input, MSG_NOSIGNAL);
+        if (count == -1) {
+            CHECK(errno == EAGAIN);
+            break;
+        }
+        CHECK(0 < count && (size_t)count <= sizeof input);
+        accepted += (size_t)count;
+    }
+    CHECK(0 < accepted);
+    buffer_hint(alias, SO_SNDBUF, 1, 1024);
+    CHECK(option(client, SOL_SOCKET, SO_SNDBUF) == 1024);
+    write_all(control[1], &accepted, sizeof accepted);
+    read_all(notice[0], &byte, 1);
+    CHECK(byte == 'R');
+    buffer_hint(alias, SO_SNDBUF, 4096, 8192);
+    CHECK(option(client, SOL_SOCKET, SO_SNDBUF) == 8192);
+    for (size_t i = 0; i < sizeof input; ++i) input[i] = pattern(accepted + i);
+    ssize_t resumed = send(client, input, sizeof input, MSG_NOSIGNAL);
+    CHECK(0 < resumed && (size_t)resumed <= sizeof input);
+    size_t done = accepted + (size_t)resumed, total = done + 16397;
+    write_all(control[1], &total, sizeof total);
+    read_all(notice[0], &byte, 1);
+    CHECK(byte == 'G' && fcntl(alias, F_SETFL, 0) == 0);
+    while (done < total) {
+        size_t count = total - done;
+        if (sizeof input < count) count = sizeof input;
+        for (size_t i = 0; i < count; ++i) input[i] = pattern(done + i);
+        write_all(client, input, count);
+        done += count;
+    }
+    CHECK(shutdown(alias, SHUT_WR) == 0);
+    read_all(client, output, 15);
+    CHECK(memcmp(output, "budget-restored", 15) == 0 && read(client, &byte, 1) == 0);
+    CHECK(read(notice[0], &byte, 1) == 0);
+    reap(child, 0);
+    CHECK(close(control[1]) == 0 && close(notice[0]) == 0);
+    CHECK(close(alias) == 0 && close(client) == 0);
+    printf("network-smoke buffer-budget tcp-initial=%zu resumed=%zd total=%zu shrink-preserved=1 fin=1 reaped=0\n",
+        accepted, resumed, total);
+}
+
+/// 一次 recvfrom 领取预算调整前已排队的完整消息，并核同条记录的 IPv4 来源。
+static void budget_datagram_expect(int fd, size_t size, const struct sockaddr_in *sender)
+{
+    struct sockaddr_in source;
+    socklen_t length = sizeof source;
+    CHECK(recvfrom(fd, datagram_output, sizeof datagram_output, 0,
+        (struct sockaddr *)&source, &length) == (ssize_t)size);
+    CHECK(memcmp(datagram_output, datagram_input, size) == 0);
+    CHECK(length == 16 && source.sin_family == AF_INET);
+    CHECK(source.sin_port == sender->sin_port && source.sin_addr.s_addr == sender->sin_addr.s_addr);
+}
+
+/// UDP 单消息按真实预算接纳，提高允许大消息，缩小不撤销已经就绪的记录。
+static void udp_buffer_budget(void)
+{
+    struct sockaddr_in sender, destination;
+    int fd = datagram(&sender), receiver = datagram(&destination), alias = dup(receiver);
+    CHECK(0 <= alias);
+    buffer_hint(fd, SO_SNDBUF, 1024, 2048);
+    buffer_hint(fd, SO_RCVBUF, 1024, 2048);
+    buffer_hint(receiver, SO_SNDBUF, 1024, 2048);
+    buffer_hint(receiver, SO_RCVBUF, 1024, 2048);
+    for (size_t i = 0; i < 8193; ++i) datagram_input[i] = pattern(i + 31);
+    ERROR(sendto(fd, datagram_input, 2049, 0, (struct sockaddr *)&destination, sizeof destination), EMSGSIZE);
+    ERROR(recv(receiver, datagram_output, sizeof datagram_output, MSG_DONTWAIT), EAGAIN);
+    CHECK(sendto(fd, datagram_input, 1537, 0, (struct sockaddr *)&destination, sizeof destination) == 1537);
+    CHECK(wait_ready(receiver, POLLIN) & POLLIN);
+    buffer_hint(alias, SO_RCVBUF, 1, 1024);
+    CHECK(option(receiver, SOL_SOCKET, SO_RCVBUF) == 1024);
+    budget_datagram_expect(receiver, 1537, &sender);
+
+    buffer_hint(fd, SO_SNDBUF, 8192, 16384);
+    buffer_hint(alias, SO_RCVBUF, 8192, 16384);
+    CHECK(option(receiver, SOL_SOCKET, SO_RCVBUF) == 16384);
+    for (size_t i = 0; i < 8193; ++i) datagram_input[i] = pattern(i + 97);
+    CHECK(sendto(fd, datagram_input, 8193, 0, (struct sockaddr *)&destination, sizeof destination) == 8193);
+    CHECK(wait_ready(receiver, POLLIN) & POLLIN);
+    buffer_hint(alias, SO_RCVBUF, 1, 1024);
+    buffer_hint(fd, SO_SNDBUF, 1024, 2048);
+    budget_datagram_expect(receiver, 8193, &sender);
+    ERROR(sendto(fd, datagram_input, 8193, 0, (struct sockaddr *)&destination, sizeof destination), EMSGSIZE);
+    ERROR(recv(receiver, datagram_output, sizeof datagram_output, MSG_DONTWAIT), EAGAIN);
+    for (size_t i = 0; i < 1023; ++i) datagram_input[i] = pattern(i + 193);
+    CHECK(sendto(fd, datagram_input, 1023, 0, (struct sockaddr *)&destination, sizeof destination) == 1023);
+    CHECK(wait_ready(receiver, POLLIN) & POLLIN);
+    budget_datagram_expect(receiver, 1023, &sender);
+    ERROR(recv(receiver, datagram_output, sizeof datagram_output, MSG_DONTWAIT), EAGAIN);
+    buffer_hint(fd, SO_SNDBUF, 100000, 131072);
+    buffer_hint(alias, SO_RCVBUF, 100000, 131072);
+    CHECK(option(receiver, SOL_SOCKET, SO_RCVBUF) == 131072);
+    CHECK(close(alias) == 0 && close(receiver) == 0 && close(fd) == 0);
+    printf("network-smoke buffer-budget udp-small=1537 udp-grown=8193 shrink-preserved=1 next-large=EMSGSIZE source=16\n");
+}
+
+/// TCP 流满后的接受恢复与 UDP 单消息接纳分别消费同一正式预算接口。
+static void buffer_budget(void)
+{
+    tcp_buffer_budget();
+    udp_buffer_budget();
+}
+
+/// 服务端口只接受完整十进制数字，范围之外的 argv 不能成为截断后的目的端口。
+static unsigned service_port(const char *text)
+{
+    CHECK(*text != '\0');
+    unsigned value = 0;
+    for (const unsigned char *digit = (const unsigned char *)text; *digit; ++digit) {
+        CHECK('0' <= *digit && *digit <= '9');
+        value = value * 10 + (*digit - '0');
+        CHECK(value <= 65535);
+    }
+    CHECK(0 < value);
+    return value;
+}
+
+/// 两个 NIC 模式只访问明确的宿主网关地址，端口来自本次普通 argv。
+static struct sockaddr_in nic_peer(unsigned port)
+{
+    struct sockaddr_in peer = address(port);
+    peer.sin_addr.s_addr = htonl(0x0a000202);
+    return peer;
+}
+
+/// 单连接真实提交和接收短前缀后继续核验双向全文，写半关闭必须交付宿主 EOF。
+static void nic_tcp(unsigned port)
+{
+    static unsigned char input[98317], output[65539];
+    for (size_t i = 0; i < sizeof input; ++i)
+        input[i] = (unsigned char)((i * 37 + (i >> 8) + 19) & 255);
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    CHECK(0 <= fd);
+    struct sockaddr_in peer = nic_peer(port);
+    CHECK(connect(fd, (struct sockaddr *)&peer, sizeof peer) == 0);
+    struct sockaddr_in actual;
+    socklen_t length = sizeof actual;
+    CHECK(getsockname(fd, (struct sockaddr *)&actual, &length) == 0);
+    CHECK(length == sizeof actual && actual.sin_family == AF_INET);
+    CHECK(actual.sin_addr.s_addr == htonl(0x0a00020f) && actual.sin_port != 0);
+    length = sizeof actual;
+    CHECK(getpeername(fd, (struct sockaddr *)&actual, &length) == 0);
+    CHECK(length == sizeof actual && actual.sin_family == AF_INET);
+    CHECK(actual.sin_addr.s_addr == peer.sin_addr.s_addr && actual.sin_port == peer.sin_port);
+    ssize_t accepted = write(fd, input, sizeof input);
+    CHECK(0 < accepted && (size_t)accepted < sizeof input);
+    write_all(fd, input + accepted, sizeof input - (size_t)accepted);
+    CHECK(shutdown(fd, SHUT_WR) == 0);
+    ssize_t received = read(fd, output, sizeof output);
+    CHECK(0 < received && (size_t)received < sizeof output);
+    read_all(fd, output + received, sizeof output - (size_t)received);
+    for (size_t i = 0; i < sizeof output; ++i)
+        CHECK(output[i] == (unsigned char)((i * 53 + (i >> 7) + 91) & 255));
+    unsigned char byte;
+    CHECK(read(fd, &byte, 1) == 0);
+    CHECK(close(fd) == 0);
+    printf("network-smoke nic-tcp sent=%zu received=%zu first-write=%zd first-read=%zd peer-port=%u\n",
+        sizeof input, sizeof output, accepted, received, port);
+}
+
+/// 同一 UDP socket 领取四条完整应答，大 IPv4 消息经 NIC 分片，协议越界仍拒绝。
+static void nic_udp(unsigned port)
+{
+    static unsigned char input[65508], output[8193];
+    for (size_t i = 0; i < sizeof input; ++i)
+        input[i] = (unsigned char)((i * 29 + (i >> 4) + 45) & 255);
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    CHECK(0 <= fd);
+    struct sockaddr_in peer = nic_peer(port);
+    const size_t sizes[] = {17, 0, 1472, 8193};
+    for (size_t message = 0; message < sizeof sizes / sizeof sizes[0]; ++message) {
+        size_t size = sizes[message];
+        ssize_t sent = sendto(fd, input, size, 0, (struct sockaddr *)&peer, sizeof peer);
+        CHECK(sent == (ssize_t)size);
+        CHECK(wait_ready(fd, POLLIN) & POLLIN);
+        struct sockaddr_in source;
+        socklen_t length = sizeof source;
+        ssize_t received = recvfrom(fd, output, sizeof output, 0,
+            (struct sockaddr *)&source, &length);
+        CHECK(received == (ssize_t)size);
+        CHECK(length == sizeof source && source.sin_family == AF_INET);
+        CHECK(source.sin_addr.s_addr == peer.sin_addr.s_addr && source.sin_port == peer.sin_port);
+        for (size_t i = 0; i < size; ++i) CHECK(output[i] == (unsigned char)(input[i] ^ 0xa5));
+        printf("network-smoke nic-udp message=%zu sent=%zd received=%zd source-port=%u\n",
+            message, sent, received, ntohs(source.sin_port));
+    }
+    ERROR(sendto(fd, input, sizeof input, 0, (struct sockaddr *)&peer, sizeof peer), EMSGSIZE);
+    CHECK(close(fd) == 0);
+}
+
 /// 普通 argv 描述符完整解析，非法字符串不能默认为标准流。
 static int descriptor(const char *text)
 {
@@ -1232,6 +2162,14 @@ int main(int argc, char **argv)
 {
     CHECK(2 <= argc && argv[argc] == NULL && argv[0][0] == '/');
     if (strcmp(argv[1], "exec-identity") == 0) return exec_identity(argc, argv);
+    if (strcmp(argv[1], "nic-tcp") == 0 || strcmp(argv[1], "nic-udp") == 0) {
+        CHECK(argc == 4);
+        unsigned tcp_port = service_port(argv[2]), udp_port = service_port(argv[3]);
+        if (strcmp(argv[1], "nic-tcp") == 0) nic_tcp(tcp_port);
+        else nic_udp(udp_port);
+        printf("network-smoke mode=%s passed\n", argv[1]);
+        return 0;
+    }
     if (argc == 4) { ready_fd = descriptor(argv[2]); go_fd = descriptor(argv[3]); }
     else CHECK(argc == 2);
     if (strcmp(argv[1], "identity") == 0) identity(argv[0]);
@@ -1248,6 +2186,12 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "unix-pair") == 0) unix_pair();
     else if (strcmp(argv[1], "message-vector") == 0) message_vector();
     else if (strcmp(argv[1], "socket-options") == 0) socket_options();
+    else if (strcmp(argv[1], "ipv6-tcp") == 0) ipv6_tcp();
+    else if (strcmp(argv[1], "ipv6-udp") == 0) ipv6_udp();
+    else if (strcmp(argv[1], "ipv6-mapped") == 0) { CHECK(argc == 2); ipv6_mapped(); }
+    else if (strcmp(argv[1], "buffer-budget") == 0) { CHECK(argc == 2); buffer_budget(); }
+    else if (strcmp(argv[1], "protocol-options") == 0) { CHECK(argc == 2); protocol_options(); }
+    else if (strcmp(argv[1], "large-loopback") == 0) { CHECK(argc == 2); large_loopback(); }
     else fail("unknown mode", __LINE__);
     if (strcmp(argv[1], "udp-address") == 0 || strcmp(argv[1], "udp-message") == 0
         || strcmp(argv[1], "unix-pair") == 0 || strcmp(argv[1], "message-vector") == 0

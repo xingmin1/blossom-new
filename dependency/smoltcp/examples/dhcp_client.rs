@@ -13,6 +13,7 @@ use smoltcp::{
     time::Duration,
 };
 
+/// 预备有限接口工作区后运行原 DHCP 消费者。
 fn main() {
     #[cfg(feature = "log")]
     utils::setup_logging("");
@@ -36,7 +37,12 @@ fn main() {
         Medium::Ieee802154 => todo!(),
     };
     config.random_seed = rand::random();
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::now(), buffers);
 
     // Create sockets
     let mut dhcp_socket = dhcpv4::Socket::new();

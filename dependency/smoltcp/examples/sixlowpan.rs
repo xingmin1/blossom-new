@@ -53,6 +53,7 @@ use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, Ieee802154Address, Ieee802154Pan, IpAddress, IpCidr};
 
+/// 原 6LoWPAN 示例显式准备接口重组和分片后备。
 fn main() {
     utils::setup_logging("");
 
@@ -79,7 +80,12 @@ fn main() {
     config.random_seed = rand::random();
     config.pan_id = Some(Ieee802154Pan(0xbeef));
 
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::now(), buffers);
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs
             .push(IpCidr::new(

@@ -1,588 +1,906 @@
-//! UDP 内核端点持有完整报文记录，索引与接收容量均属于同一网络域。
+//! UDP 每个端点独立拥有原协议队列、操作权和后台工作；输入短锁只移动完整拥有。
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use smoltcp::iface::IpPayload;
+use smoltcp::phy::PacketMeta;
+use smoltcp::socket::udp::{self, UdpContextState, UdpMetadata};
+use smoltcp::wire::{IpAddress, IpListenEndpoint};
+use spin::Once;
 
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer};
-use crate::net::address::{InetEndpoint, SocketAddress};
-use crate::net::packet::OwnedPacket;
+use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress};
+use crate::net::packet::{zeroed_bytes, OwnedPacket};
 use crate::net::table::{BindLease, TransportProtocol};
-use crate::net::{
-    EndpointSlot, MessageResult, NetStack, NetStackRef, LOOPBACK_CAPACITY, LOOPBACK_MTU,
-};
-use crate::sync::{SleepMutex, SpinLock};
+use crate::net::{EndpointSlot, IoProgress, MessageResult, NetStack, NetStackRef, PROTOCOL_BUDGET};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
+use crate::workqueue::Work;
 
-const INBOX_RECORDS: usize = 32;
-const MAX_PAYLOAD: usize = LOOPBACK_MTU - 28;
-const INBOX_BYTES: usize = INBOX_RECORDS * MAX_PAYLOAD;
+const PACKET_RECORDS: usize = 32;
+const PAYLOAD_CAPACITY: usize = 131072;
 const MSG_TRUNC: u32 = 0x20;
 
-struct Inbox {
+/// 后台输入在普通操作持有协议对象时保留；预留槽位内的移动不分配。
+struct Input {
+    closed: bool,
+    owner_waiting: bool,
     packets: VecDeque<OwnedPacket>,
-    payload_bytes: usize,
+}
+
+/// 原 raw 队列唯一保存消息；发送旁表只延长每条记录对应的绑定租约。
+struct State {
+    socket: udp::Socket<'static>,
+    leases: VecDeque<Arc<BindLease>>,
     binding: Option<Arc<BindLease>>,
     peer: Option<InetEndpoint>,
     route_local: Option<InetEndpoint>,
     explicit_bind: bool,
     reuse: bool,
+    v6_only: bool,
     read_closed: bool,
     write_closed: bool,
     closed: bool,
+    error: Option<FsError>,
 }
 
-/// 一个记录同时拥有数据、源地址和原始长度；弱域引用不延长服务寿命。
+impl State {
+    /// 从原队列和方向关闭事实计算就绪，不驱动 dispatch 或领取输入。
+    fn mask(&self) -> PollMask {
+        if self.closed {
+            return PollMask::POLLERR | PollMask::POLLHUP;
+        }
+        let mut mask = PollMask::default();
+        if self.socket.can_recv() || self.read_closed {
+            mask |= PollMask::POLLIN | PollMask::POLLRDNORM;
+        }
+        if self.socket.can_send() || self.write_closed {
+            mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
+        }
+        if self.read_closed {
+            mask |= PollMask::POLLRDHUP;
+        }
+        if self.read_closed && self.write_closed {
+            mask |= PollMask::POLLHUP;
+        }
+        if self.error.is_some() {
+            mask |= PollMask::POLLERR;
+        }
+        mask
+    }
+
+    /// 完整消息的零长度也须经过真实关闭检查，写关闭不能伪成功。
+    fn check_send(&self) -> Result<(), FsError> {
+        if self.closed {
+            return Err(FsError::NotConnected);
+        }
+        if self.write_closed {
+            return Err(FsError::BrokenPipe);
+        }
+        Ok(())
+    }
+}
+
+/// 表、退休容器和根停止者保活稳定节点，节点只弱持网络域。
 pub struct UdpEndpoint {
     id: u64,
+    family: AddressFamily,
     stack: Weak<NetStack>,
-    inbox: SpinLock<Inbox>,
-    bind_serial: SleepMutex<()>,
-    receive_serial: SleepMutex<()>,
+    state: SleepMutex<State>,
+    input: SpinLock<Input>,
     source: Arc<PollWaitHead>,
+    work: Once<Pin<Arc<Work>>>,
+    stopped: AtomicBool,
     _slot: EndpointSlot,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OperationMode {
+    Modify,
+    Observe,
+}
+
+/// 普通操作释放原对象后才通知；观察也必须交接已受阻的 Work。
+struct OperationGuard<'a> {
+    endpoint: &'a UdpEndpoint,
+    state: Option<SleepMutexGuard<'a, State>>,
+    mode: OperationMode,
+    initial_mask: PollMask,
+    initial_send_budget: usize,
+    initial_read_closed: bool,
+    initial_write_closed: bool,
+    initial_closed: bool,
+}
+
+impl Deref for OperationGuard<'_> {
+    type Target = State;
+
+    /// 借用同一操作拥有保护内的协议对象。
+    fn deref(&self) -> &State {
+        self.state.as_deref().unwrap()
+    }
+}
+
+impl DerefMut for OperationGuard<'_> {
+    /// 修改只发生于端点自己的 SleepMutex 拥有期。
+    fn deref_mut(&mut self) -> &mut State {
+        self.state.as_deref_mut().unwrap()
+    }
+}
+
+impl Drop for OperationGuard<'_> {
+    /// 先释放操作锁，再交接短锁中登记的真实拥有责任和新增方向通知。
+    fn drop(&mut self) {
+        let notification = if self.mode == OperationMode::Modify {
+            let state = self.state.as_deref().unwrap();
+            let mut mask = state.mask() & !self.initial_mask;
+            if !self.initial_read_closed && state.read_closed {
+                mask |= PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLRDHUP;
+            }
+            if !self.initial_write_closed && state.write_closed {
+                mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
+            }
+            if !self.initial_closed && state.closed {
+                mask |= PollMask::POLLERR | PollMask::POLLHUP;
+            }
+            if self.initial_send_budget < state.socket.send_budget() && state.socket.can_send() {
+                mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
+            }
+            mask
+        } else {
+            PollMask::default()
+        };
+        drop(self.state.take());
+        let owner_waiting = {
+            let mut input = self.endpoint.input.lock();
+            core::mem::take(&mut input.owner_waiting)
+        };
+        if !notification.is_empty() {
+            self.endpoint.source.notify(notification);
+        }
+        if self.mode == OperationMode::Modify || owner_waiting {
+            self.endpoint.schedule();
+        }
+    }
+}
+
 impl UdpEndpoint {
-    /// 域先取得真实节点额度，再在发表之前准备全部记录槽位。
+    /// 域先取得节点额度，发表前 fallible 准备两向原队列和全部有限旁表。
     pub(crate) fn try_new(
         net: &NetStackRef,
         id: u64,
         slot: EndpointSlot,
+        family: AddressFamily,
     ) -> Result<Arc<Self>, FsError> {
+        let socket = udp::Socket::new(Self::packet_buffer()?, Self::packet_buffer()?);
         let mut packets = VecDeque::new();
         packets
-            .try_reserve_exact(INBOX_RECORDS)
+            .try_reserve_exact(PACKET_RECORDS)
             .map_err(|_| FsError::NoMemory)?;
-        Arc::try_new(Self {
+        let mut leases = VecDeque::new();
+        leases
+            .try_reserve_exact(PACKET_RECORDS)
+            .map_err(|_| FsError::NoMemory)?;
+        let endpoint = Arc::try_new(Self {
             id,
+            family,
             stack: Arc::downgrade(net),
-            inbox: SpinLock::new(Inbox {
-                packets,
-                payload_bytes: 0,
+            state: SleepMutex::new(State {
+                socket,
+                leases,
                 binding: None,
                 peer: None,
                 route_local: None,
                 explicit_bind: false,
                 reuse: false,
+                v6_only: false,
                 read_closed: false,
                 write_closed: false,
                 closed: false,
+                error: None,
             }),
-            bind_serial: SleepMutex::new(()),
-            receive_serial: SleepMutex::new(()),
+            input: SpinLock::new(Input {
+                closed: false,
+                owner_waiting: false,
+                packets,
+            }),
             source: Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
+            work: Once::new(),
+            stopped: AtomicBool::new(false),
             _slot: slot,
         })
-        .map_err(|_| FsError::NoMemory)
+        .map_err(|_| FsError::NoMemory)?;
+        // UDP 不消耗 TCP 的协议 CPU 轮转序号；同一 Work 由原执行域调度。
+        let work = Work::try_new(
+            net.work_queue(),
+            0,
+            run_udp,
+            Arc::as_ptr(&endpoint) as usize,
+        )
+        .map_err(|_| FsError::NoMemory)?;
+        endpoint.work.call_once(|| work);
+        Ok(endpoint)
     }
 
-    /// 返回域内不复用的端点编号，关闭后外部引用仍保有这个身份。
+    /// metadata 和 payload 都在堆上预备，128KiB 后备不落任务栈。
+    fn packet_buffer() -> Result<udp::PacketBuffer<'static>, FsError> {
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve_exact(PACKET_RECORDS)
+            .map_err(|_| FsError::NoMemory)?;
+        metadata.resize(PACKET_RECORDS, udp::PacketMetadata::EMPTY);
+        Ok(udp::PacketBuffer::new(
+            metadata,
+            zeroed_bytes(PAYLOAD_CAPACITY)?,
+        ))
+    }
+
+    /// 普通操作共享同一释放协议，观察不得主动安排新的协议进度。
+    fn operation(&self, mode: OperationMode) -> OperationGuard<'_> {
+        let state = self.state.lock();
+        let initial_mask = state.mask();
+        let initial_send_budget = state.socket.send_budget();
+        let initial_read_closed = state.read_closed;
+        let initial_write_closed = state.write_closed;
+        let initial_closed = state.closed;
+        OperationGuard {
+            endpoint: self,
+            state: Some(state),
+            mode,
+            initial_mask,
+            initial_send_budget,
+            initial_read_closed,
+            initial_write_closed,
+            initial_closed,
+        }
+    }
+
+    /// 返回域内不复用的身份，关闭后外部拥有仍保留该身份。
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// 查询本端发送关门事实，已准备或等待容量的消息不得绕过后来的写关闭。
-    pub fn check_send(&self) -> Result<(), FsError> {
-        let inbox = self.inbox.lock();
-        if inbox.closed {
+    /// OFD 地址族由构造固定，不从某条报文的协议族推测。
+    pub fn family(&self) -> AddressFamily {
+        self.family
+    }
+
+    /// 与 raw 和真实 binding 在同一操作状态观察 V6ONLY。
+    pub fn v6_only(&self) -> bool {
+        self.operation(OperationMode::Observe).v6_only
+    }
+
+    /// 仅未绑定的 IPv6 端点可修改 V6ONLY，旧在途记录不改变该边界。
+    pub fn set_v6_only(&self, value: bool) -> Result<(), FsError> {
+        let mut state = self.operation(OperationMode::Modify);
+        if self.family != AddressFamily::Ipv6 || state.binding.is_some() {
+            return Err(FsError::InvalidOperation);
+        }
+        if state.closed {
             return Err(FsError::NotConnected);
         }
-        if inbox.write_closed {
-            return Err(FsError::BrokenPipe);
-        }
+        state.v6_only = value;
         Ok(())
     }
 
-    /// 普通任务串行绑定并取得根准入，显式通配地址保持原值直到实际连接选定路由源。
+    /// 查询本端发送关门，不取得根或接口短锁。
+    pub fn check_send(&self) -> Result<(), FsError> {
+        self.operation(OperationMode::Observe).check_send()
+    }
+
+    /// 已正规化的核心地址仍须符合端点族、V6ONLY 和实际操作的错误边界。
+    fn check_family(
+        &self,
+        state: &State,
+        address: IpAddress,
+        operation: AddressOperation,
+    ) -> Result<(), FsError> {
+        match (self.family, address) {
+            (AddressFamily::Ipv4, IpAddress::Ipv6(_)) => Err(FsError::AddressFamilyNotSupported),
+            (AddressFamily::Ipv6, IpAddress::Ipv4(_)) if state.v6_only => Err(match operation {
+                AddressOperation::Bind => FsError::InvalidOperation,
+                AddressOperation::Connect => FsError::AddressFamilyNotSupported,
+                AddressOperation::Send => FsError::NetworkUnreachable,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// 双面只属于 IPv6 :: 通配且 V6ONLY 关闭的同一租约。
+    fn dual_stack(&self, state: &State, local: InetEndpoint) -> bool {
+        self.family == AddressFamily::Ipv6
+            && !state.v6_only
+            && matches!(local.address, IpAddress::Ipv6(address) if address.is_unspecified())
+    }
+
+    /// 同一操作权内取得显式绑定；真实源校验在表锁外的根接口查询完成。
     pub fn bind(self: &Arc<Self>, requested: InetEndpoint) -> Result<InetEndpoint, FsError> {
-        let _serial = self.bind_serial.lock();
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
+        if state.binding.is_some() {
+            return Err(FsError::InvalidOperation);
+        }
+        self.check_family(&state, requested.address, AddressOperation::Bind)?;
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
-        let reuse = {
-            let inbox = self.inbox.lock();
-            if inbox.closed {
-                return Err(FsError::NotConnected);
-            }
-            if inbox.binding.is_some() {
-                return Err(FsError::InvalidOperation);
-            }
-            inbox.reuse
-        };
         let lease = net.tables().reserve_binding(
             &net,
             self.id,
             TransportProtocol::Udp,
             requested,
-            reuse,
+            state.reuse,
+            self.dual_stack(&state, requested),
         )?;
         let local = lease.local();
-        {
-            let mut inbox = self.inbox.lock();
-            if inbox.closed {
-                return Err(FsError::NotConnected);
-            }
-            net.tables().publish_udp(self.id, local, None)?;
-            inbox.binding = Some(Arc::clone(&lease));
-            inbox.explicit_bind = true;
+        net.tables().publish_udp(self.id, local, None)?;
+        state.socket.set_endpoint(local.raw_listen());
+        if matches!(local.address, IpAddress::Ipv6(address) if !address.is_unspecified()) {
+            state.v6_only = true;
         }
+        state.binding = Some(lease);
+        state.explicit_bind = true;
         Ok(local)
     }
 
-    /// 默认目的与本次发送目的独立；断开自动绑定时只撤索引并放下端点自己的 Lease。
+    /// 自动绑定只保存一份真正通配租约，发送 metadata 单独保存选定源。
+    fn automatic_binding(
+        &self,
+        net: &NetStackRef,
+        state: &State,
+    ) -> Result<Arc<BindLease>, FsError> {
+        net.tables().reserve_binding(
+            net,
+            self.id,
+            TransportProtocol::Udp,
+            InetEndpoint {
+                address: self.family.unspecified(),
+                port: 0,
+            },
+            state.reuse,
+            self.family == AddressFamily::Ipv6 && !state.v6_only,
+        )
+    }
+
+    /// 默认 peer 和每次目的独立；自动断开只撤当前租约，不清原消息队列。
     pub fn connect(self: &Arc<Self>, peer: Option<InetEndpoint>) -> Result<(), FsError> {
-        let _serial = self.bind_serial.lock();
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
         let Some(peer) = peer else {
-            let released = {
-                let mut inbox = self.inbox.lock();
-                if inbox.closed {
-                    return Err(FsError::NotConnected);
-                }
-                if inbox.explicit_bind {
-                    let local = inbox
-                        .binding
-                        .as_ref()
-                        .expect("explicit UDP binding")
-                        .local();
-                    net.tables().publish_udp(self.id, local, None)?;
-                    inbox.peer = None;
-                    inbox.route_local = None;
-                    None
-                } else {
-                    net.tables().unpublish_udp(self.id);
-                    inbox.peer = None;
-                    inbox.route_local = None;
-                    inbox.binding.take()
-                }
-            };
-            // 准备中的发送另持 Lease；端口要到最后一份真实拥有结束才归还。
-            drop(released);
+            if state.explicit_bind {
+                let local = state
+                    .binding
+                    .as_ref()
+                    .expect("explicit UDP binding")
+                    .local();
+                net.tables().publish_udp(self.id, local, None)?;
+                state.socket.set_endpoint(local.raw_listen());
+            } else {
+                net.tables().unpublish_udp(self.id);
+                state.socket.set_endpoint(IpListenEndpoint::default());
+                // 已接纳 TX 的旁表和 Root owned 包各持旧 lease，最后 put 只撤己 lease_id。
+                state.binding.take();
+            }
+            state.peer = None;
+            state.route_local = None;
             return Ok(());
         };
         if peer.port == 0 {
             return Err(FsError::InvalidOperation);
         }
-        let (binding, reuse) = {
-            let inbox = self.inbox.lock();
-            if inbox.closed {
-                return Err(FsError::NotConnected);
-            }
-            (inbox.binding.clone(), inbox.reuse)
-        };
-        let bound_source = binding
+        self.check_family(&state, peer.address, AddressOperation::Connect)?;
+        let bound = state
+            .binding
             .as_ref()
-            .map_or([0; 4], |lease| lease.local().address);
-        let route = net.routes().resolve(peer.address, bound_source)?;
-        let lease = match binding {
-            Some(lease) => lease,
-            None => net.tables().reserve_binding(
-                &net,
-                self.id,
-                TransportProtocol::Udp,
-                InetEndpoint {
-                    address: [0; 4],
-                    port: 0,
-                },
-                reuse,
-            )?,
+            .map_or(self.family.unspecified(), |lease| lease.local().address);
+        let route = net.resolve_route(peer.address, bound)?;
+        let lease = match state.binding.as_ref() {
+            Some(lease) => Arc::clone(lease),
+            None => self.automatic_binding(&net, &state)?,
         };
         let local = InetEndpoint {
             address: route.source,
             port: lease.local().port,
         };
-        {
-            let mut inbox = self.inbox.lock();
-            if inbox.closed {
-                return Err(FsError::NotConnected);
-            }
-            net.tables().publish_udp(self.id, local, Some(peer))?;
-            inbox.binding = Some(Arc::clone(&lease));
-            inbox.route_local = Some(local);
-            inbox.peer = Some(peer);
-        }
+        net.tables().publish_udp(self.id, local, Some(peer))?;
+        state.socket.set_endpoint(local.raw_listen());
+        state.binding = Some(lease);
+        state.route_local = Some(local);
+        state.peer = Some(peer);
         Ok(())
     }
 
-    /// 准备完整消息及它的端口拥有，阻塞发送保留同一包和 Lease，不重新选择目的。
-    pub fn prepare_send(
+    /// 完整已复制消息只在原 TX record 接纳后报告成功；暂满不拆消息或提交旁表。
+    pub fn send(
         self: &Arc<Self>,
         payload: &[u8],
         destination: Option<InetEndpoint>,
-    ) -> Result<(OwnedPacket, Arc<BindLease>), FsError> {
-        let _serial = self.bind_serial.lock();
-        let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
-        let _admission = net.admission()?;
-        let (destination, binding, reuse) = {
-            let inbox = self.inbox.lock();
-            if inbox.closed {
-                return Err(FsError::NotConnected);
-            }
-            if inbox.write_closed {
-                return Err(FsError::BrokenPipe);
-            }
-            let destination = destination
-                .or(inbox.peer)
-                .ok_or(FsError::DestinationRequired)?;
-            (destination, inbox.binding.clone(), inbox.reuse)
-        };
+    ) -> Result<IoProgress, FsError> {
+        let mut state = self.operation(OperationMode::Modify);
+        state.check_send()?;
+        let destination = destination
+            .or(state.peer)
+            .ok_or(FsError::DestinationRequired)?;
         if destination.port == 0 {
             return Err(FsError::InvalidOperation);
         }
-        let bound_source = binding
-            .as_ref()
-            .map_or([0; 4], |lease| lease.local().address);
-        let route = net.routes().resolve(destination.address, bound_source)?;
-        if route.mtu.saturating_sub(28) < payload.len() {
+        self.check_family(&state, destination.address, AddressOperation::Send)?;
+        let protocol_limit = match destination.address {
+            IpAddress::Ipv4(_) => 65507,
+            IpAddress::Ipv6(_) => 65487,
+        };
+        if protocol_limit < payload.len() || state.socket.send_budget() < payload.len() {
             return Err(FsError::MessageTooLarge);
         }
-        let lease = match binding {
-            Some(lease) => lease,
+        let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
+        let _admission = net.admission()?;
+        let bound = state
+            .binding
+            .as_ref()
+            .map_or(self.family.unspecified(), |lease| lease.local().address);
+        let route = net.resolve_route(destination.address, bound)?;
+        if matches!(destination.address, IpAddress::Ipv6(_))
+            && route.mtu.saturating_sub(48) < payload.len()
+        {
+            return Err(FsError::MessageTooLarge);
+        }
+        if !state.socket.can_send_size(payload.len()) {
+            return Ok(IoProgress::Blocked);
+        }
+        let lease = match state.binding.as_ref() {
+            Some(lease) => Arc::clone(lease),
             None => {
-                let lease = net.tables().reserve_binding(
-                    &net,
-                    self.id,
-                    TransportProtocol::Udp,
-                    InetEndpoint {
-                        address: [0; 4],
-                        port: 0,
-                    },
-                    reuse,
-                )?;
-                {
-                    let mut inbox = self.inbox.lock();
-                    if inbox.closed {
-                        return Err(FsError::NotConnected);
-                    }
-                    if inbox.write_closed {
-                        return Err(FsError::BrokenPipe);
-                    }
-                    net.tables()
-                        .publish_udp(self.id, lease.local(), inbox.peer)?;
-                    inbox.binding = Some(Arc::clone(&lease));
-                }
+                let lease = self.automatic_binding(&net, &state)?;
+                net.tables()
+                    .publish_udp(self.id, lease.local(), state.peer)?;
+                state.socket.set_endpoint(lease.local().raw_listen());
+                state.binding = Some(Arc::clone(&lease));
                 lease
             }
         };
-        let local = InetEndpoint {
-            address: route.source,
-            port: lease.local().port,
+        let metadata = UdpMetadata {
+            endpoint: destination.raw(),
+            local_address: Some(route.source),
+            local_port: Some(lease.local().port),
+            meta: PacketMeta::default(),
         };
-        let packet = OwnedPacket::try_from_udp(local, destination, payload, route.mtu)?;
-        self.check_send()?;
-        Ok((packet, lease))
-    }
-
-    /// 只观察真正绑定的值，通配地址保持全零，不安排后台执行。
-    pub fn local(&self) -> Option<InetEndpoint> {
-        self.inbox
-            .lock()
-            .binding
-            .as_ref()
-            .map(|lease| lease.local())
-    }
-
-    /// 新报文只取接收短锁；旧索引查找到的包仍须按当前默认 peer 过滤。
-    pub fn enqueue(&self, packet: OwnedPacket) -> Result<(), FsError> {
-        let payload_len = packet.udp_payload()?.len();
-        let (peer, _) = packet.udp_endpoints()?;
-        if MAX_PAYLOAD < payload_len {
-            return Err(FsError::MessageTooLarge);
+        // 准入只保护绑定发表和关门；完整 payload 复制不得占用全域操作权。
+        drop(_admission);
+        match state.socket.send_slice(payload, metadata) {
+            Ok(()) => {
+                assert!(state.leases.len() < PACKET_RECORDS);
+                state.leases.push_back(lease);
+                Ok(IoProgress::Ready(payload.len()))
+            }
+            Err(udp::SendError::BufferFull) => Ok(IoProgress::Blocked),
+            Err(udp::SendError::Unaddressable) => Err(FsError::AddressNotAvailable),
         }
+    }
+
+    /// 输入仅发表有界 owned backlog，满时丢未接纳消息，不向 sender 提供可靠回压。
+    pub fn enqueue(&self, packet: OwnedPacket) -> Result<(), FsError> {
+        packet.udp_payload()?;
         {
-            let mut inbox = self.inbox.lock();
-            if inbox.closed || inbox.read_closed {
+            let mut input = self.input.lock();
+            if input.closed {
                 return Err(FsError::NotConnected);
             }
-            if inbox.peer.is_some_and(|expected| expected != peer) {
-                return Ok(());
-            }
-            if INBOX_RECORDS <= inbox.packets.len()
-                || INBOX_BYTES - inbox.payload_bytes < payload_len
-            {
+            if PACKET_RECORDS <= input.packets.len() {
                 return Err(FsError::WouldBlock);
             }
-            inbox.payload_bytes += payload_len;
-            inbox.packets.push_back(packet);
+            input.packets.push_back(packet);
         }
-        self.source.notify(PollMask::POLLIN | PollMask::POLLRDNORM);
+        self.schedule();
         Ok(())
     }
 
-    /// 接收序列化覆盖窥视、复制与消费，短锁外的 fault 不会把报文改成成功前缀。
+    /// peek 与 recv 在同一操作权下直接借原 record；用户复制不持表或接口短锁。
     pub fn receive(
         &self,
         target: &mut ReadBuffer<'_>,
         peek: bool,
     ) -> Result<Option<MessageResult>, FsError> {
-        let _serial = self.receive_serial.lock();
-        if peek {
-            let mut prefix = [0u8; MAX_PAYLOAD];
-            let snapshot = {
-                let inbox = self.inbox.lock();
-                let Some(packet) = inbox.packets.front() else {
-                    return Self::empty_receive(&inbox);
-                };
-                let payload = packet.udp_payload()?;
-                let original_len = payload.len();
-                let count = original_len.min(target.len() - target.copied());
-                prefix[..count].copy_from_slice(&payload[..count]);
-                (count, original_len, packet.udp_endpoints()?.0)
-            };
-            let (count, original_len, source) = snapshot;
-            return Self::copy_datagram(target, &prefix[..count], original_len, source).map(Some);
-        }
-        let packet = {
-            let mut inbox = self.inbox.lock();
-            let Some(packet) = Self::pop_datagram(&mut inbox) else {
-                return Self::empty_receive(&inbox);
-            };
-            packet
-        };
-        let payload = packet.udp_payload()?;
-        Self::copy_datagram(target, payload, payload.len(), packet.udp_endpoints()?.0).map(Some)
-    }
-
-    /// 空消息保有真实 source，读关闭后的空 EOF 没有 source，未关闭空队列才是等待。
-    fn empty_receive(inbox: &Inbox) -> Result<Option<MessageResult>, FsError> {
-        if inbox.closed {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
             return Err(FsError::NotConnected);
         }
-        Ok(inbox.read_closed.then_some(MessageResult {
-            copied: 0,
-            original_len: 0,
-            source: None,
-            flags: 0,
-        }))
+        if !state.socket.can_recv() {
+            return Ok(state.read_closed.then_some(MessageResult {
+                copied: 0,
+                original_len: 0,
+                source: None,
+                flags: 0,
+            }));
+        }
+        if peek {
+            let (payload, metadata) = state.socket.peek().expect("UDP readable record");
+            self.copy_datagram(target, payload, InetEndpoint::from_raw(metadata.endpoint))
+                .map(Some)
+        } else {
+            // 原 recv 先消费整条，短复制和部分 fault 都不会把剩余尾部留给后继接收者。
+            let (payload, metadata) = state.socket.recv().expect("UDP readable record");
+            self.copy_datagram(target, payload, InetEndpoint::from_raw(metadata.endpoint))
+                .map(Some)
+        }
     }
 
-    /// 整条复制的错误直接传播，即使目标已得到正前缀也不得报告 UDP 成功。
+    /// UDP 的部分 fault 直接传播；成功的短复制保原长和同条 source。
     fn copy_datagram(
+        &self,
         target: &mut ReadBuffer<'_>,
         payload: &[u8],
-        original_len: usize,
         source: InetEndpoint,
     ) -> Result<MessageResult, FsError> {
+        let original_len = payload.len();
         let copied = target.push(payload)?;
         Ok(MessageResult {
             copied,
             original_len,
-            source: Some(SocketAddress::Inet(source)),
+            source: Some(SocketAddress::from_endpoint(source, self.family)),
             flags: if copied < original_len { MSG_TRUNC } else { 0 },
         })
     }
 
-    /// 只在接收短锁内移动完整记录并归还预算，不通知新的读事件。
-    fn pop_datagram(inbox: &mut Inbox) -> Option<OwnedPacket> {
-        let packet = inbox.packets.pop_front()?;
-        inbox.payload_bytes -= packet
-            .udp_payload()
-            .expect("UDP inbox protocol invariant")
-            .len();
-        Some(packet)
+    /// 观察真正租约地址，自动断开后不从旧在途包补回当前绑定。
+    pub fn local(&self) -> Option<InetEndpoint> {
+        self.operation(OperationMode::Observe)
+            .binding
+            .as_ref()
+            .map(|lease| lease.local())
     }
 
-    /// 原内核消费者领取同一拥有记录，不能在另一接收者窥视期间弹出队头。
-    pub fn take_datagram(&self) -> Option<OwnedPacket> {
-        let _serial = self.receive_serial.lock();
-        Self::pop_datagram(&mut self.inbox.lock())
-    }
-
-    /// 同一短锁更新已有绑定复用策略；未绑定只记录将来实际预留采用的值。
+    /// 显式或自动绑定的复用策略只修改当前 lease_id。
     pub fn set_reuse_address(&self, reuse: bool) -> Result<(), FsError> {
-        let _serial = self.bind_serial.lock();
-        let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
-        let _admission = net.admission()?;
-        let mut inbox = self.inbox.lock();
-        if inbox.closed {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
             return Err(FsError::NotConnected);
         }
-        if let Some(lease) = inbox.binding.as_ref() {
+        let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
+        let _admission = net.admission()?;
+        if let Some(lease) = state.binding.as_ref() {
             net.tables().set_reuse(lease.id(), reuse)?;
         }
-        inbox.reuse = reuse;
+        state.reuse = reuse;
         Ok(())
     }
 
-    /// 查询本端点的真实复用策略，不改变绑定或协议索引。
+    /// 观察当前真实复用策略，不修改租约或协议索引。
     pub fn reuse_address(&self) -> bool {
-        self.inbox.lock().reuse
+        self.operation(OperationMode::Observe).reuse
     }
 
-    /// 按弱域的控制块身份判断归属，不因临时升级延长根停止责任。
+    /// 弱域身份判断不延长网络服务寿命。
     pub fn belongs_to(&self, net: &NetStackRef) -> bool {
         Weak::ptr_eq(&self.stack, &Arc::downgrade(net))
     }
 
-    /// 连接名称采用真实路由源，未连接名称保持显式或自动通配绑定的原地址。
+    /// connected 名称使用实际路由源，其余保持当前租约的真实通配值。
     pub fn local_address(&self) -> Result<InetEndpoint, FsError> {
-        let inbox = self.inbox.lock();
-        if inbox.closed {
+        let state = self.operation(OperationMode::Observe);
+        if state.closed {
             return Err(FsError::NotConnected);
         }
-        Ok(inbox
+        Ok(state
             .route_local
-            .or_else(|| inbox.binding.as_ref().map(|lease| lease.local()))
+            .or_else(|| state.binding.as_ref().map(|lease| lease.local()))
             .unwrap_or(InetEndpoint {
-                address: [0; 4],
+                address: self.family.unspecified(),
                 port: 0,
             }))
     }
 
-    /// 只查询默认目的；sendto 的独立目的从不成为此名称。
+    /// 单次 sendto 的目的从不替换 connected 默认 peer 名称。
     pub fn peer_address(&self) -> Result<InetEndpoint, FsError> {
-        let inbox = self.inbox.lock();
-        if inbox.closed {
+        let state = self.operation(OperationMode::Observe);
+        if state.closed {
             return Err(FsError::NotConnected);
         }
-        inbox.peer.ok_or(FsError::NotConnected)
+        state.peer.ok_or(FsError::NotConnected)
     }
 
-    /// 返回原 inbox 实际 payload 预算，零长包仍独立占用记录槽。
+    /// 返回原 RX PacketBuffer 的当前有效预算。
+    pub fn receive_budget(&self) -> usize {
+        self.operation(OperationMode::Observe).socket.recv_budget()
+    }
+
+    /// 返回原 TX PacketBuffer 的当前有效预算。
+    pub fn send_budget(&self) -> usize {
+        self.operation(OperationMode::Observe).socket.send_budget()
+    }
+
+    /// 同一原队列缩小预算保留旧记录，提高后由 guard 安排后继 backlog。
+    pub fn set_receive_budget(&self, budget: usize) -> Result<(), FsError> {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
+        if budget == 0 || state.socket.payload_recv_capacity() < budget {
+            return Err(FsError::InvalidOperation);
+        }
+        state.socket.set_recv_budget(budget);
+        Ok(())
+    }
+
+    /// TX 预算控制原空间，不重建或删除旧消息；提高预算的 OUT 通知在锁外发生。
+    pub fn set_send_budget(&self, budget: usize) -> Result<(), FsError> {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
+        if budget == 0 || state.socket.payload_send_capacity() < budget {
+            return Err(FsError::InvalidOperation);
+        }
+        state.socket.set_send_budget(budget);
+        Ok(())
+    }
+
+    /// 物理 RX 容量与可调预算分开，均来自同一原对象。
     pub fn receive_capacity(&self) -> usize {
-        INBOX_BYTES
+        self.operation(OperationMode::Observe)
+            .socket
+            .payload_recv_capacity()
     }
 
-    /// 返回本域共享软件 egress 的完整 IP 字节容量，不虚构端点独占发送环。
+    /// 物理 TX 容量不再从 Root 共享软件队列伪造。
     pub fn send_capacity(&self) -> usize {
-        LOOPBACK_CAPACITY * LOOPBACK_MTU
+        self.operation(OperationMode::Observe)
+            .socket
+            .payload_send_capacity()
     }
 
-    /// 当前 UDP 没有记录 ICMP 错误的生产路径，查询不合成错误或消费通知。
+    /// 一次消费真正后台 dispatch 错误，不合成 ICMP 或重复回显。
     pub fn take_error(&self) -> Option<FsError> {
-        None
+        self.operation(OperationMode::Modify).error.take()
     }
 
-    /// 未连接也提交真实方向关闭再报错，已有报文仍先于读 EOF 交付。
+    /// 未连接也先提交方向关闭；已有原 RX record 先于读 EOF。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
         if 2 < how {
             return Err(FsError::InvalidOperation);
         }
-        let (connected, notification) = {
-            let mut inbox = self.inbox.lock();
-            if inbox.closed {
-                return Err(FsError::NotConnected);
-            }
-            let mut notification = PollMask::default();
-            if (how == 0 || how == 2) && !inbox.read_closed {
-                inbox.read_closed = true;
-                notification |= PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLRDHUP;
-            }
-            if (how == 1 || how == 2) && !inbox.write_closed {
-                inbox.write_closed = true;
-                notification |= PollMask::POLLOUT | PollMask::POLLWRNORM;
-            }
-            if !notification.is_empty() && inbox.read_closed && inbox.write_closed {
-                notification |= PollMask::POLLHUP;
-            }
-            (inbox.peer.is_some(), notification)
-        };
-        if !notification.is_empty() {
-            self.source.notify(notification);
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
         }
-        if connected {
+        if how == 0 || how == 2 {
+            state.read_closed = true;
+        }
+        if how == 1 || how == 2 {
+            state.write_closed = true;
+        }
+        if state.peer.is_some() {
             Ok(())
         } else {
             Err(FsError::NotConnected)
         }
     }
 
-    /// 登记唯一源后查询真实接收事实与同锁登记的共享 egress 容量，不驱动协议。
+    /// 登记持续源后只 Observe 原 raw 事实，不 pump、查路由或登记 Root 容量等待。
     pub fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError> {
         if let Some(table) = table {
             table.register(&self.source)?;
         }
-        let (mut mask, can_send) = {
-            let inbox = self.inbox.lock();
-            if inbox.closed {
-                return Ok(PollMask::POLLERR | PollMask::POLLHUP);
-            }
-            let mut mask = PollMask::default();
-            if !inbox.packets.is_empty() || inbox.read_closed {
-                mask |= PollMask::POLLIN | PollMask::POLLRDNORM;
-            }
-            if inbox.read_closed {
-                mask |= PollMask::POLLRDHUP;
-            }
-            if inbox.write_closed {
-                mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
-            }
-            if inbox.read_closed && inbox.write_closed {
-                mask |= PollMask::POLLHUP;
-            }
-            (mask, !inbox.write_closed)
-        };
-        if can_send {
-            let Some(net) = self.stack.upgrade() else {
-                return Ok(mask | PollMask::POLLERR | PollMask::POLLHUP);
-            };
-            // 与关闭共用 Inbox 短锁，撤等待 id 后不能再发表这个端点的容量等待。
-            let inbox = self.inbox.lock();
-            if inbox.closed {
-                return Ok(mask | PollMask::POLLERR | PollMask::POLLHUP);
-            }
-            if inbox.write_closed {
-                return Ok(mask | PollMask::POLLOUT | PollMask::POLLWRNORM);
-            }
-            match net.egress_ready(self.id) {
-                Ok(true) => mask |= PollMask::POLLOUT | PollMask::POLLWRNORM,
-                Ok(false) => {}
-                Err(FsError::NotConnected) => mask |= PollMask::POLLERR | PollMask::POLLHUP,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(mask)
+        Ok(self.operation(OperationMode::Observe).mask())
     }
 
-    /// 容量恢复只重查本端发送事实和实际 egress，已满时由同一入口重新登记。
+    /// Root 容量恢复只安排原 Work，释放 TX record 后才通知发送者。
     pub fn notify_egress(&self) {
+        self.schedule();
+    }
+
+    /// 原 Work 合并 pending 票，根停止或本端点全尾后拒绝新增工作。
+    fn schedule(&self) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let Some(net) = self.stack.upgrade() else {
             return;
         };
-        let can_send = {
-            let inbox = self.inbox.lock();
-            !inbox.closed && !inbox.write_closed && matches!(net.egress_ready(self.id), Ok(true))
+        if !net.is_stopping() {
+            let _ = self
+                .work
+                .get()
+                .expect("UDP work is not prepared")
+                .as_ref()
+                .queue();
+        }
+    }
+
+    /// 后台先登记拥有责任；末 OFD 关门后仍提交已接纳 TX，暂满不自旋。
+    fn run(&self) {
+        let Some(net) = self.stack.upgrade() else {
+            return;
         };
-        if can_send {
-            self.source.notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
+        if net.is_stopping() || self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        self.input.lock().owner_waiting = true;
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        self.input.lock().owner_waiting = false;
+        let mut notification = PollMask::default();
+        if !state.closed {
+            self.process_input(&mut state, &mut notification);
+        }
+        let result = self.dispatch(&net, &mut state, &mut notification);
+        if let Err(error) = result {
+            if error != FsError::WouldBlock {
+                state.error.get_or_insert(error);
+                notification |= PollMask::POLLERR;
+            }
+        }
+        let pending_tx = !state.leases.is_empty();
+        let closed = state.closed;
+        let ended = closed && !pending_tx;
+        let binding = if ended {
+            // raw TX 已全部进入 Root；其后 packet/frame/DMA 持各自真实拥有。
+            state.socket.close();
+            state.binding.take()
+        } else {
+            None
+        };
+        drop(state);
+        if !notification.is_empty() {
+            self.source.notify(notification);
+        }
+        if ended {
+            let packets = {
+                let mut input = self.input.lock();
+                input.closed = true;
+                core::mem::take(&mut input.packets)
+            };
+            net.cancel_egress_wait(self.id);
+            net.tables().unpublish_udp(self.id);
+            drop((binding, packets));
+            net.retire_udp(self.id);
+            return;
+        }
+        let pending_input = !closed && !self.input.lock().packets.is_empty();
+        if pending_input || (result.is_ok() && pending_tx) {
+            self.schedule();
+        }
+        if result == Err(FsError::WouldBlock) && net.egress_ready(self.id) == Ok(true) {
+            self.schedule();
         }
     }
 
-    /// 结束接收与本身份容量等待，再锁外撤表拥有；外部引用继续覆盖端点额度。
+    /// 原 RX record 的真实接纳才通知 IN；当前 peer、族和关闭事实再次过滤旧查找。
+    fn process_input(&self, state: &mut State, notification: &mut PollMask) {
+        let mut remaining = PROTOCOL_BUDGET;
+        while 0 < remaining {
+            let packet = self.input.lock().packets.pop_front();
+            let Some(packet) = packet else {
+                break;
+            };
+            remaining -= 1;
+            if state.read_closed || state.binding.is_none() {
+                continue;
+            }
+            let (peer, _) = packet.udp_endpoints().expect("UDP backlog protocol");
+            if state.peer.is_some_and(|expected| expected != peer)
+                || self
+                    .check_family(state, peer.address, AddressOperation::Send)
+                    .is_err()
+            {
+                continue;
+            }
+            let raw = packet.as_packet();
+            let ip = raw.ip_repr();
+            let IpPayload::Udp(repr, payload) = raw.payload() else {
+                unreachable!("UDP backlog protocol");
+            };
+            let mut context = UdpContextState::new(None, None);
+            if state.socket.accepts(&mut context, &ip, repr)
+                && state
+                    .socket
+                    .process(&mut context, PacketMeta::default(), &ip, repr, *payload)
+            {
+                *notification |= PollMask::POLLIN | PollMask::POLLRDNORM;
+            }
+        }
+    }
+
+    /// 首 TX record 与首 lease 同时提交，Root 未接纳时两者都留在原队列。
+    fn dispatch(
+        &self,
+        net: &NetStackRef,
+        state: &mut State,
+        notification: &mut PollMask,
+    ) -> Result<(), FsError> {
+        let mut remaining = PROTOCOL_BUDGET;
+        while 0 < remaining {
+            let Some(lease) = state.leases.front().cloned() else {
+                return Ok(());
+            };
+            remaining -= 1;
+            if !net.egress_ready(self.id)? {
+                return Err(FsError::WouldBlock);
+            }
+            let mut context = UdpContextState::new(None, None);
+            let mut emitted = false;
+            state
+                .socket
+                .dispatch(&mut context, |_, _, (ip, udp, payload)| {
+                    let mut storage = Vec::new();
+                    storage
+                        .try_reserve_exact(payload.len())
+                        .map_err(|_| FsError::NoMemory)?;
+                    let packet =
+                        OwnedPacket::capture_udp(&ip, &udp, payload, storage).with_binding(lease);
+                    net.try_emit(packet).map_err(|(error, _packet)| error)?;
+                    emitted = true;
+                    Ok::<(), FsError>(())
+                })?;
+            assert!(emitted, "UDP lease has no corresponding TX record");
+            state.leases.pop_front();
+            *notification |= PollMask::POLLOUT | PollMask::POLLWRNORM;
+        }
+        Ok(())
+    }
+
+    /// 末 OFD 只提交关闭并安排异步退休，不在本端点 Work 上 join 自己。
     pub fn close(&self) {
-        self.stop_sync();
-        if let Some(net) = self.stack.upgrade() {
-            let endpoint = net.tables().take_udp(self.id);
-            drop(endpoint);
-        }
+        let mut state = self.operation(OperationMode::Modify);
+        state.closed = true;
+        state.read_closed = true;
+        state.write_closed = true;
+        state.peer = None;
+        state.route_local = None;
+        self.input.lock().closed = true;
     }
 
-    /// 根停止与末 OFD 同接收序列化，移出的报文和 Lease 全部在短锁外释放。
+    /// reaper 或根停止局部拥有覆盖 Work 全尾，关门后再清原队列及 lease。
     pub(crate) fn stop_sync(&self) {
-        let _serial = self.receive_serial.lock();
-        let (packets, lease, changed) = {
-            let mut inbox = self.inbox.lock();
-            let changed = !inbox.closed;
-            inbox.closed = true;
-            inbox.read_closed = true;
-            inbox.write_closed = true;
-            inbox.peer = None;
-            inbox.route_local = None;
-            inbox.payload_bytes = 0;
-            (
-                core::mem::take(&mut inbox.packets),
-                inbox.binding.take(),
-                changed,
-            )
+        assert!(
+            !self.stopped.swap(true, Ordering::AcqRel),
+            "UDP endpoint stopped twice"
+        );
+        self.input.lock().closed = true;
+        self.work
+            .get()
+            .expect("UDP work is not prepared")
+            .as_ref()
+            .close_sync();
+        let binding = {
+            let mut state = self.state.lock();
+            state.closed = true;
+            state.read_closed = true;
+            state.write_closed = true;
+            state.peer = None;
+            state.route_local = None;
+            state.socket.close();
+            state.leases.clear();
+            state.binding.take()
+        };
+        let packets = {
+            let mut input = self.input.lock();
+            input.owner_waiting = false;
+            core::mem::take(&mut input.packets)
         };
         if let Some(net) = self.stack.upgrade() {
             net.cancel_egress_wait(self.id);
             net.tables().unpublish_udp(self.id);
         }
-        if changed {
-            self.source.notify(PollMask::POLLERR | PollMask::POLLHUP);
-        }
-        drop(packets);
-        drop(lease);
+        drop((binding, packets));
+        self.source
+            .notify(PollMask::POLLIN | PollMask::POLLOUT | PollMask::POLLERR | PollMask::POLLHUP);
     }
+}
+
+/// 表或退休容器的真实拥有覆盖回调到返回的全部节点访问。
+fn run_udp(work: Pin<&Work>) {
+    // SAFETY: context 来自稳定 Arc，发表后表、退休容器或根停止的局部 Arc 持续保活；
+    // 最后拥有释放前先同步关闭本 Work，回调不延长裸指针的寿命。
+    let endpoint = unsafe { &*(work.context() as *const UdpEndpoint) };
+    endpoint.run();
 }

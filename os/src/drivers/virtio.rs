@@ -1,4 +1,4 @@
-//! 选定块设备的真实传输、ring/PDU 页和停止责任。
+//! 共用的选定设备传输与具体块设备的 ring/PDU 页和停止责任。
 
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest_prepare;
@@ -44,6 +44,9 @@ pub enum VirtioInitError {
         status: DeviceStatus,
     },
     Protocol(Error),
+    StopUnconfirmed {
+        status: DeviceStatus,
+    },
 }
 
 impl From<ProbeError> for VirtioInitError {
@@ -66,7 +69,7 @@ impl From<VirtioPciError> for VirtioInitError {
 }
 impl VirtioInitError {
     /// 页分配失败在 transport 仍存活时保留真实状态，不以重新 reset 后的值代替。
-    fn dma_prepare(error: DmaError, status: DeviceStatus) -> Self {
+    pub(crate) fn dma_prepare(error: DmaError, status: DeviceStatus) -> Self {
         if error == DmaError::NoMemory {
             Self::NoMemory { status }
         } else {
@@ -74,7 +77,7 @@ impl VirtioInitError {
         }
     }
     /// shadow 分配失败同样保留未发表时的设备状态。
-    fn queue_prepare(error: Error, status: DeviceStatus) -> Self {
+    pub(crate) fn queue_prepare(error: Error, status: DeviceStatus) -> Self {
         if error == Error::NoMemory {
             Self::NoMemory { status }
         } else {
@@ -106,6 +109,72 @@ pub enum VirtioIdentity {
     },
 }
 
+/// 在普通 Task 中构造同一次库存的 MMIO 传输，不协商特性或发表队列。
+///
+/// 调用者须独占该真实硬件，完整 registers 窗口须永久强序映射，version、vendor_id
+/// 与 interrupt 须来自该设备的真实库存；设备和映射必须覆盖所有传输、通知及 IRQ
+/// 消费者的访问期，直到它们全部退出且设备已确认 reset。构造失败不选择其它设备。
+pub(crate) unsafe fn prepare_mmio_transport(
+    registers: Region,
+    version: u32,
+    vendor_id: u32,
+    interrupt: IrqNumber,
+) -> Result<(SomeTransport<'static>, VirtioIdentity, IrqNumber), VirtioInitError> {
+    drop(task::current_task());
+    let base = mmio_region_address(registers)?;
+    let size = registers
+        .end
+        .checked_sub(registers.start)
+        .ok_or(ProbeError::Resource("invalid MMIO extent"))?;
+    let header = NonNull::new(base as *mut VirtIOHeader)
+        .ok_or(ProbeError::Resource("null MMIO register address"))?;
+    // SAFETY: 调用者承担真实硬件独占和完整永久强序映射；checked 地址与长度来自
+    // 同一窗口，库构造进一步核对对齐、窗口范围与身份，所有消费者寿命仍由调用者保证。
+    let transport = unsafe { MmioTransport::new(header, size) }?;
+    if u32::from(transport.version()) != version || transport.vendor_id() != vendor_id {
+        return Err(ProbeError::Resource("MMIO inventory identity changed").into());
+    }
+    Ok((
+        transport.into(),
+        VirtioIdentity::Mmio {
+            physical: registers.start,
+            version,
+            vendor_id,
+        },
+        interrupt,
+    ))
+}
+
+/// 在普通 Task 中构造同一 PCI 库存的选定传输，不重扫 capability、BAR 或 INTx。
+///
+/// 调用者须独占此真实功能，device 须来自 inventory，库存 BAR 的完整 CPU 物理
+/// 窗口须永久强序映射；设备和映射必须覆盖所有传输、通知及 IRQ 消费者的访问期，
+/// 直到它们全部退出且设备已确认 reset。构造不协商特性或发表队列。
+pub(crate) unsafe fn prepare_pci_transport(
+    inventory: &PciInventory,
+    device: &PciDevice,
+) -> Result<(SomeTransport<'static>, VirtioIdentity, IrqNumber), VirtioInitError> {
+    drop(task::current_task());
+    let selected = selected_construct(inventory, device)?;
+    let interrupt = device.interrupt.ok_or(ProbeError::Resource(
+        "VirtIO PCI device has no INTx resource",
+    ))?;
+    // SAFETY: selected 的身份、capability 与完整 BAR 内范围由同库存验证；调用者
+    // 承担实际功能独占、永久强序映射和全部消费者访问期内的设备保活义务。
+    let transport = unsafe { PciTransport::new(selected) }?;
+    Ok((
+        transport.into(),
+        VirtioIdentity::Pci {
+            bus: device.bus,
+            device: device.device,
+            function: device.function,
+            vendor_id: device.vendor_id,
+            device_id: device.device_id,
+        },
+        interrupt,
+    ))
+}
+
 /// 原页拥有者和库 driver 共存；未确认停止时禁止析构任何控制区。
 pub struct VirtioDevice {
     driver: ManuallyDrop<VirtIOBlk<KernelHal, SomeTransport<'static>>>,
@@ -131,64 +200,34 @@ pub(crate) struct TestPrepareSnapshot {
 impl VirtioDevice {
     /// 在普通 Task 中准备已发现 MMIO 块设备，不发表队列或 DRIVER_OK。
     ///
-    /// # Safety
-    /// 调用者须为该硬件的唯一 owner；candidate 的完整物理窗口必须已永久强序映射，
-    /// 设备身份来自同一次真实发现，且不能与另一个 transport 同时使用该设备。
+    /// 调用者须独占 candidate 的真实硬件，完整物理窗口须永久强序映射，身份来自
+    /// 同一次发现；设备和映射须覆盖全部传输、通知及 IRQ 访问，直到尾部结束并确认 reset。
     pub unsafe fn prepare_mmio(candidate: &MmioBlockCandidate) -> Result<Self, VirtioInitError> {
-        drop(task::current_task());
-        let base = mmio_region_address(candidate.registers)?;
-        let size = candidate
-            .registers
-            .end
-            .checked_sub(candidate.registers.start)
-            .ok_or(ProbeError::Resource("invalid MMIO extent"))?;
-        let header = NonNull::new(base as *mut VirtIOHeader)
-            .ok_or(ProbeError::Resource("null MMIO register address"))?;
-        // SAFETY: 调用者保证实际唯一设备与完整永久映射；构造再检查长度、对齐和身份。
-        let transport = unsafe { MmioTransport::new(header, size) }?;
-        if u32::from(transport.version()) != candidate.version
-            || transport.vendor_id() != candidate.vendor_id
-        {
-            return Err(ProbeError::Resource("MMIO inventory identity changed").into());
-        }
-        Self::prepare(
-            transport.into(),
-            VirtioIdentity::Mmio {
-                physical: candidate.registers.start,
-                version: candidate.version,
-                vendor_id: candidate.vendor_id,
-            },
-            candidate.interrupt,
-        )
+        // SAFETY: 调用者保证同库存设备独占、完整永久强序映射及全部消费者寿命；
+        // 候选字段直接传递，不构造第二份硬件 owner。
+        let (transport, identity, interrupt) = unsafe {
+            prepare_mmio_transport(
+                candidate.registers,
+                candidate.version,
+                candidate.vendor_id,
+                candidate.interrupt,
+            )
+        }?;
+        Self::prepare(transport, identity, interrupt)
     }
 
     /// 只消费库存已选 BDF、cap 元数据与 BAR，不重新扫描或创建配置 owner。
     ///
-    /// # Safety
-    /// 调用者须为此硬件的唯一 owner，库存 BAR 的完整 CPU 物理窗口必须已永久强序映射；
-    /// 设备及映射须存活至所有通知/IRQ 尾部结束和确认 reset。
+    /// 调用者须独占此真实硬件，device 来自 inventory，库存 BAR 的完整 CPU 物理
+    /// 窗口须永久强序映射；设备及映射须覆盖全部通知、IRQ 尾部和确认 reset。
     pub unsafe fn prepare_pci(
         inventory: &PciInventory,
         device: &PciDevice,
     ) -> Result<Self, VirtioInitError> {
-        drop(task::current_task());
-        let selected = selected_construct(inventory, device)?;
-        let interrupt = device.interrupt.ok_or(ProbeError::Resource(
-            "VirtIO PCI device has no INTx resource",
-        ))?;
-        // SAFETY: 已选数据来自本库存唯一功能；调用者承担完整映射、设备寿命及独占义务。
-        let transport = unsafe { PciTransport::new(selected) }?;
-        Self::prepare(
-            transport.into(),
-            VirtioIdentity::Pci {
-                bus: device.bus,
-                device: device.device,
-                function: device.function,
-                vendor_id: device.vendor_id,
-                device_id: device.device_id,
-            },
-            interrupt,
-        )
+        // SAFETY: 调用者承担同库存唯一功能、完整永久映射及全部消费者寿命；
+        // 共用构造只产生该功能的传输，块类型、协商和控制页仍由本 owner 准备。
+        let (transport, identity, interrupt) = unsafe { prepare_pci_transport(inventory, device) }?;
+        Self::prepare(transport, identity, interrupt)
     }
 
     /// reset 确认后锁外预备所有 fallible 资源，尚未发表时错误自动归还原页。

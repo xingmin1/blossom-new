@@ -10,34 +10,375 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
+use ::core::convert::TryFrom;
+use ::core::mem::ManuallyDrop;
 use ::core::pin::Pin;
 use ::core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use smoltcp::iface::{
+    BufferError, Config, DispatchError, Interface, InterfaceBuffers, InterfaceInner,
+    TransportIngress, TransportResponse,
+};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken};
+use smoltcp::time::Instant;
 #[cfg(feature = "ktest")]
 use smoltcp::wire::TcpControl;
-use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpProtocol, IpRepr, Ipv4Address, Ipv4Cidr,
+    Ipv6Address, Ipv6Cidr, TcpRepr, UdpRepr,
+};
 use spin::Once;
 
 use crate::cpu;
+use crate::drivers::virtio::VirtioInitError;
+use crate::drivers::virtio_net::VirtioNet;
+use crate::drivers::DeviceInventory;
 use crate::fs::FsError;
-use crate::net::address::SocketAddress;
+use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
 use crate::net::core::TcpCore;
-use crate::net::packet::OwnedPacket;
-use crate::net::route::RouteTable;
-use crate::net::table::{NetTables, TcpTuple};
+use crate::net::packet::{return_capture_storage, zeroed_bytes, CaptureStorage, OwnedPacket};
+use crate::net::route::{EthernetConfig, InterfaceId, Route};
+use crate::net::table::{BindLease, NetTables, TcpTuple};
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::{UnixEndpoint, UnixPair};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::time;
+use crate::timer::{Timer, TimerKind};
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
 
 pub const LOOPBACK_CAPACITY: usize = 32;
-pub const LOOPBACK_MTU: usize = 1500;
+pub const LOOPBACK_MTU: usize = 65535;
 pub(crate) const ENDPOINT_CAPACITY: usize = 128;
 pub(crate) const PROTOCOL_BUDGET: usize = 16;
+const ETHERNET_FRAME_CAPACITY: usize = 1514;
+const INTERFACE_WORKSPACE_CAPACITY: usize = 65536;
+
+/// 控制和数据共享一份预备帧，领取期间占用事实禁止接口再取得 TxToken。
+struct FrameSlot {
+    bytes: Vec<u8>,
+    len: usize,
+    in_flight: bool,
+    destination: Option<IpAddress>,
+}
+
+impl FrameSlot {
+    /// 在接口发表前准备完整帧存储，后续处理只写已经取得的容量。
+    fn try_new(capacity: usize) -> Result<Self, FsError> {
+        Ok(Self {
+            bytes: zeroed_bytes(capacity)?,
+            len: 0,
+            in_flight: false,
+            destination: None,
+        })
+    }
+
+    /// 空槽才提供实际可消费的发送存储。
+    fn available(&self) -> bool {
+        self.len == 0 && !self.in_flight
+    }
+}
+
+/// 软件介质只借当前 RX 前缀，配对 TX 的预备帧负责控制回应的拥有。
+struct FrameDevice<'a> {
+    frame: &'a mut FrameSlot,
+    input: Option<&'a [u8]>,
+    medium: Medium,
+}
+
+struct FrameRx<'a>(&'a [u8]);
+struct FrameTx<'a>(&'a mut FrameSlot);
+
+impl RxToken for FrameRx<'_> {
+    /// 输入仅在同步库解析期间可借用，不能跨到端点 Work。
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(self.0)
+    }
+}
+
+impl TxToken for FrameTx<'_> {
+    /// TxToken 已独占空槽，编码完成即正式接纳软件帧，不依赖 NIC 后继容量。
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        assert!(
+            self.0.available() && len <= self.0.bytes.len(),
+            "invalid interface TX reservation"
+        );
+        let result = f(&mut self.0.bytes[..len]);
+        self.0.len = len;
+        result
+    }
+}
+
+impl Device for FrameDevice<'_> {
+    type RxToken<'a>
+        = FrameRx<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = FrameTx<'a>
+    where
+        Self: 'a;
+
+    /// 只有配对控制输出可真正接纳时才允许库开始解析一帧。
+    fn receive(&mut self, _: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if !self.frame.available() {
+            return None;
+        }
+        Some((FrameRx(self.input.take()?), FrameTx(self.frame)))
+    }
+
+    /// 满槽不交 token，fragmenter 因而保留尚未发送的原尾部。
+    fn transmit(&mut self, _: Instant) -> Option<Self::TxToken<'_>> {
+        self.frame.available().then_some(FrameTx(self.frame))
+    }
+
+    /// 介质 MTU 含真实 Ethernet 头，VirtIO 头仍归原 driver。
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = self.medium;
+        caps.max_transmission_unit = match self.medium {
+            Medium::Ip => LOOPBACK_MTU,
+            Medium::Ethernet => ETHERNET_FRAME_CAPACITY,
+        };
+        caps.max_burst_size = Some(1);
+        caps
+    }
+}
+
+/// 每接口只持库状态和预备帧；lo 输入后备允许完整 IP 回流同时保活控制应答。
+struct InterfaceState {
+    iface: Interface,
+    frame: FrameSlot,
+    loopback_rx: Vec<u8>,
+    medium: Medium,
+    binding: Option<Arc<BindLease>>,
+    capture: CaptureStorage,
+}
+
+impl InterfaceState {
+    /// 先 fallible 准备所有大存储，再构造库的小接口对象。
+    fn try_new(medium: Medium, hardware: HardwareAddress, seed: u64) -> Result<Self, FsError> {
+        let capacity = if medium == Medium::Ip {
+            LOOPBACK_MTU
+        } else {
+            ETHERNET_FRAME_CAPACITY
+        };
+        let mut frame = FrameSlot::try_new(capacity)?;
+        let buffers =
+            InterfaceBuffers::try_new(INTERFACE_WORKSPACE_CAPACITY, INTERFACE_WORKSPACE_CAPACITY)
+                .map_err(|error| match error {
+                BufferError::NoMemory => FsError::NoMemory,
+                BufferError::InvalidCapacity => FsError::InvalidOperation,
+            })?;
+        let loopback_rx = if medium == Medium::Ip {
+            zeroed_bytes(LOOPBACK_MTU)?
+        } else {
+            Vec::new()
+        };
+        let capture = Arc::try_new(SpinLock::new(prepare_ingress_storage()?))
+            .map_err(|_| FsError::NoMemory)?;
+        let mut config = Config::new(hardware);
+        config.random_seed = seed;
+        let mut device = FrameDevice {
+            frame: &mut frame,
+            input: None,
+            medium,
+        };
+        let mut iface = Interface::new(config, &mut device, interface_now(), buffers);
+        if medium == Medium::Ip {
+            iface.update_ip_addrs(|addresses| {
+                addresses
+                    .push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::LOCALHOST, 8)))
+                    .expect("loopback IPv4 capacity exhausted");
+                addresses
+                    .push(IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128)))
+                    .expect("loopback IPv6 capacity exhausted");
+            });
+        }
+        Ok(Self {
+            iface,
+            frame,
+            loopback_rx,
+            medium,
+            binding: None,
+            capture,
+        })
+    }
+
+    /// 控制应答与原分片尾必须先取得空槽，不能覆盖已有帧或工作区。
+    fn dispatch_ready(&self) -> bool {
+        self.frame.available() && !self.iface.fragmentation_pending()
+    }
+}
+
+/// 输入仅捕获一个端点与 owned repr，协议处理和通知由解接口锁后的调用者承担。
+enum IngressEvent {
+    Tcp(Arc<TcpEndpoint>, OwnedPacket),
+    Udp(Arc<UdpEndpoint>, OwnedPacket),
+}
+
+struct IngressCollector<'a> {
+    tables: &'a NetTables,
+    storage: Option<Vec<u8>>,
+    capture: CaptureStorage,
+    event: Option<IngressEvent>,
+    local_destination: Option<IpAddress>,
+}
+
+impl<'a> IngressCollector<'a> {
+    /// 消费接口锁外已取得的后备，库回调只初始化实际 payload。
+    fn new(tables: &'a NetTables, capture: CaptureStorage, storage: Vec<u8>) -> Self {
+        Self {
+            tables,
+            storage: Some(storage),
+            capture,
+            event: None,
+            local_destination: None,
+        }
+    }
+
+    /// 未借给 owned 输入的后备归回同一小 holder，不访问 Root 或协议对象。
+    fn return_storage(&mut self) {
+        if let Some(storage) = self.storage.take() {
+            return_capture_storage(&self.capture, storage);
+        }
+    }
+
+    /// TCP 入站错误保持；UDP backlog 满只丢未接纳消息，不向发送者提供可靠回压。
+    fn deliver(self) -> Result<(), FsError> {
+        match self.event {
+            Some(IngressEvent::Tcp(endpoint, packet)) => endpoint.enqueue(packet),
+            Some(IngressEvent::Udp(endpoint, packet)) => match endpoint.enqueue(packet) {
+                Err(FsError::WouldBlock) => Ok(()),
+                result => result,
+            },
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'s> TransportIngress<'s> for IngressCollector<'_> {
+    /// 本次目的仅由 Root 在接口锁外核定，库接纳快照不改变地址配置。
+    fn local_destination(&self) -> Option<IpAddress> {
+        self.local_destination
+    }
+
+    /// 表锁只取得稳定 Arc；没有匹配仍由库生成成熟的正常拒绝回应。
+    fn tcp<'p>(
+        &mut self,
+        _: &mut InterfaceInner,
+        _: PacketMeta,
+        ip: &IpRepr,
+        repr: &TcpRepr<'p>,
+    ) -> TransportResponse<'p> {
+        let peer = InetEndpoint {
+            address: ip.src_addr(),
+            port: repr.src_port,
+        };
+        let local = InetEndpoint {
+            address: ip.dst_addr(),
+            port: repr.dst_port,
+        };
+        let endpoint = self
+            .tables
+            .lookup_tcp(TcpTuple { local, peer })
+            .or_else(|| self.tables.lookup_listener(local));
+        match endpoint {
+            Some(endpoint) => {
+                assert!(
+                    self.event.is_none(),
+                    "multiple transports in one ingress frame"
+                );
+                let storage = if repr.payload.is_empty() {
+                    Vec::new()
+                } else {
+                    self.storage
+                        .take()
+                        .expect("ingress capture storage missing")
+                };
+                let packet = OwnedPacket::capture_tcp(ip, repr, storage);
+                let packet = if repr.payload.is_empty() {
+                    packet
+                } else {
+                    packet.with_capture_storage(self.capture.clone())
+                };
+                self.event = Some(IngressEvent::Tcp(endpoint, packet));
+                TransportResponse::Matched(None)
+            }
+            None => TransportResponse::Unmatched,
+        }
+    }
+
+    /// UDP 匹配事实不取 raw 锁；RX budget 满的后继丢弃由端点 Work 处理。
+    fn udp(
+        &mut self,
+        _: &mut InterfaceInner,
+        _: PacketMeta,
+        ip: &IpRepr,
+        repr: &UdpRepr,
+        payload: &[u8],
+    ) -> bool {
+        let peer = InetEndpoint {
+            address: ip.src_addr(),
+            port: repr.src_port,
+        };
+        let local = InetEndpoint {
+            address: ip.dst_addr(),
+            port: repr.dst_port,
+        };
+        let Some(endpoint) = self.tables.lookup_udp(local, peer) else {
+            return false;
+        };
+        assert!(
+            self.event.is_none(),
+            "multiple transports in one ingress frame"
+        );
+        let storage = if payload.is_empty() {
+            Vec::new()
+        } else {
+            self.storage
+                .take()
+                .expect("ingress capture storage missing")
+        };
+        let packet = OwnedPacket::capture_udp(ip, repr, payload, storage);
+        let packet = if payload.is_empty() {
+            packet
+        } else {
+            packet.with_capture_storage(self.capture.clone())
+        };
+        self.event = Some(IngressEvent::Udp(endpoint, packet));
+        true
+    }
+
+    /// 内核不拥有用户 SocketSet，普通 IP 控制处理仍由库自身执行。
+    fn socket_set(&mut self) -> Option<&mut smoltcp::iface::SocketSet<'s>> {
+        None
+    }
+}
+
+/// 两类端点共享同一已预留退休容量，最后 slot 归还仍由真实对象析构负责。
+enum RetiredEndpoint {
+    Tcp(Arc<TcpEndpoint>),
+    Udp(Arc<UdpEndpoint>),
+}
+
+impl RetiredEndpoint {
+    /// 回收者在所有根短锁外等待端点实际后台尾部。
+    fn stop_sync(self) {
+        match self {
+            Self::Tcp(endpoint) => endpoint.stop_sync(),
+            Self::Udp(endpoint) => endpoint.stop_sync(),
+        }
+    }
+}
 
 /// Runtime、打开对象和系统拥有者持同一域，不按进程复制网络状态。
 pub type NetStackRef = Arc<NetStack>;
@@ -61,7 +402,7 @@ pub struct MessageResult {
 
 /// 只能由可睡普通任务持有，最后一次析构等待本域全部回调尾部。
 pub struct NetStackOwner {
-    net: NetStackRef,
+    net: ManuallyDrop<NetStackRef>,
 }
 
 impl NetStackOwner {
@@ -74,7 +415,9 @@ impl NetStackOwner {
 impl Drop for NetStackOwner {
     /// 服务拥有者在普通任务作用域结束时关闭一次准入并等待全部后台尾部。
     fn drop(&mut self) {
-        self.net.stop_sync();
+        self.net.stop_sync().expect("network device stop failed");
+        // SAFETY: Root 全部回调和 NIC DMA/IRQ 已真正停止，本 owner 唯一承担这份 Arc 的释放。
+        unsafe { ManuallyDrop::drop(&mut self.net) };
     }
 }
 
@@ -96,10 +439,16 @@ impl Drop for EndpointSlot {
 /// 队列容量和等待登记使用同一短锁，关闭也在这把锁内拒绝新的包。
 struct Egress {
     open: bool,
-    packets: VecDeque<OwnedPacket>,
+    packets: VecDeque<QueuedPacket>,
     waiting: Vec<u64>,
     #[cfg(feature = "ktest")]
     packet_control: Option<TestPacketControl>,
+}
+
+/// 领取期间保留队列槽，NIC 拒绝容量时不会被并发生产者抢占软件额度。
+struct QueuedPacket {
+    packet: Option<OwnedPacket>,
+    route: Route,
 }
 
 /// 只记录所选实际普通段的丢失及同 seq 再到达，时间来自生产 monotonic 域。
@@ -136,13 +485,17 @@ enum TestPacketControl {
 /// 控制发表与停止串行，逐连接协议处理不持这把控制互斥。
 pub struct NetStack {
     tables: NetTables,
-    routes: RouteTable,
+    loopback: SleepMutex<Option<InterfaceState>>,
     admission: SleepMutex<()>,
     egress: SpinLock<Egress>,
-    retired: SpinLock<Vec<Arc<TcpEndpoint>>>,
+    retired: SpinLock<Vec<RetiredEndpoint>>,
     queue: Once<WorkQueue>,
     ingress: Once<Pin<Arc<Work>>>,
     reaper: Once<Pin<Arc<Work>>>,
+    nic: Once<Arc<VirtioNet>>,
+    ethernet: Once<SleepMutex<Option<InterfaceState>>>,
+    interface_timer: Once<Pin<Arc<Timer>>>,
+    timer_control: SpinLock<()>,
     stopping: AtomicBool,
     stopped: AtomicBool,
     endpoints: AtomicUsize,
@@ -152,8 +505,36 @@ pub struct NetStack {
 }
 
 impl NetStack {
-    /// 在普通任务中准备全部队列和稳定回调上下文，失败关闭未接受票的执行域。
+    /// 明确构造只有 lo 的服务，仍使用完整共同协议、表与执行域。
     pub fn try_new_lo() -> Result<NetStackOwner, FsError> {
+        Self::try_new_base()
+    }
+
+    /// 在普通任务完整准备根、库接口和 NIC，真实 start 成功才交付服务拥有者。
+    ///
+    /// 调用者须独占所选库存设备，并保证实际完整强序设备映射和库存覆盖全部消费者寿命。
+    pub unsafe fn try_new_nic(inventory: &DeviceInventory) -> Result<NetStackOwner, FsError> {
+        let owner = Self::try_new_base()?;
+        let net = owner.stack();
+        // SAFETY: 唯一设备及永久完整映射义务由本 unsafe 构造的调用者承担，Root 从发表前保活 NIC。
+        let nic = unsafe { VirtioNet::prepare(net, inventory, 0) }.map_err(network_device_error)?;
+        net.nic.call_once(|| nic);
+        let ethernet = InterfaceState::try_new(
+            Medium::Ethernet,
+            HardwareAddress::Ethernet(EthernetAddress(net.nic.get().unwrap().info().mac)),
+            net.seed,
+        )?;
+        net.ethernet.call_once(|| SleepMutex::new(Some(ethernet)));
+        net.nic
+            .get()
+            .unwrap()
+            .start()
+            .map_err(network_device_error)?;
+        Ok(owner)
+    }
+
+    /// 两种介质只在共同协议、索引、队列和稳定 Work 全部准备成功后取得停止责任。
+    fn try_new_base() -> Result<NetStackOwner, FsError> {
         let mut packets = VecDeque::new();
         packets
             .try_reserve_exact(LOOPBACK_CAPACITY)
@@ -168,7 +549,11 @@ impl NetStack {
             .map_err(|_| FsError::NoMemory)?;
         let net = Arc::try_new(Self {
             tables: NetTables::try_new()?,
-            routes: RouteTable::new_loopback(),
+            loopback: SleepMutex::new(Some(InterfaceState::try_new(
+                Medium::Ip,
+                HardwareAddress::Ip,
+                time::now().as_nanos(),
+            )?)),
             admission: SleepMutex::new(()),
             egress: SpinLock::new(Egress {
                 open: true,
@@ -181,6 +566,10 @@ impl NetStack {
             queue: Once::new(),
             ingress: Once::new(),
             reaper: Once::new(),
+            nic: Once::new(),
+            ethernet: Once::new(),
+            interface_timer: Once::new(),
+            timer_control: SpinLock::new(()),
             stopping: AtomicBool::new(false),
             stopped: AtomicBool::new(true),
             endpoints: AtomicUsize::new(0),
@@ -201,18 +590,23 @@ impl NetStack {
             return Err(error);
         }
         net.stopped.store(false, Ordering::Release);
-        Ok(NetStackOwner { net })
+        Ok(NetStackOwner {
+            net: ManuallyDrop::new(net),
+        })
     }
 
-    /// 此时唯一构造引用保活上下文，两个 Work 完全准备后才可被外部安排。
+    /// 根拥有者覆盖两个 Work 和接口期限，全部准备后才允许外部安排。
     fn prepare_workers(self: &NetStackRef) -> Result<(), FsError> {
         let context = Arc::as_ptr(self) as usize;
         let ingress = Work::try_new(self.work_queue(), 0, run_ingress, context)
             .map_err(|_| FsError::NoMemory)?;
         let reaper = Work::try_new(self.work_queue(), 0, run_retired, context)
             .map_err(|_| FsError::NoMemory)?;
+        let timer = Timer::try_new(0, TimerKind::Precise, interface_expired, context)
+            .map_err(|_| FsError::NoMemory)?;
         self.ingress.call_once(|| ingress);
         self.reaper.call_once(|| reaper);
+        self.interface_timer.call_once(|| timer);
         Ok(())
     }
 
@@ -230,9 +624,148 @@ impl NetStack {
         &self.tables
     }
 
-    /// 返回本域实际路由配置，不从目的地址伪造接口。
-    pub(crate) fn routes(&self) -> &RouteTable {
-        &self.routes
+    /// 本机地址只查询当前库接口，不持有第二份地址表。
+    pub fn is_local(&self, address: IpAddress) -> bool {
+        if self
+            .loopback
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.iface.is_local(address))
+        {
+            return true;
+        }
+        self.ethernet.get().is_some_and(|ethernet| {
+            ethernet
+                .lock()
+                .as_ref()
+                .is_some_and(|state| state.iface.is_local(address))
+        })
+    }
+
+    /// 本域本机目的统一走 lo，其它目的由实际 eth 地址和 Routes 选源。
+    pub fn resolve_route(
+        &self,
+        destination: IpAddress,
+        bound_source: IpAddress,
+    ) -> Result<Route, FsError> {
+        if self.is_stopping() {
+            return Err(FsError::NotConnected);
+        }
+        if !bound_source.is_unspecified() && !self.is_local(bound_source) {
+            return Err(FsError::AddressNotAvailable);
+        }
+        let bound_source = if bound_source.is_unspecified() {
+            match destination {
+                IpAddress::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                IpAddress::Ipv6(_) => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+            }
+        } else {
+            bound_source
+        };
+        let loopback = self.loopback.lock();
+        let state = loopback.as_ref().ok_or(FsError::NotConnected)?;
+        if state.iface.is_local(destination) {
+            let (source, mtu) = state
+                .iface
+                .resolve_route(destination, bound_source)
+                .map_err(dispatch_error)?;
+            return Ok(Route {
+                interface: InterfaceId::Loopback,
+                source,
+                mtu,
+            });
+        }
+        drop(loopback);
+        let ethernet = self
+            .ethernet
+            .get()
+            .ok_or(FsError::NetworkUnreachable)?
+            .lock();
+        let state = ethernet.as_ref().ok_or(FsError::NotConnected)?;
+        let local_destination = state.iface.is_local(destination);
+        if !local_destination
+            && !bound_source.is_unspecified()
+            && !state.iface.is_local(bound_source)
+        {
+            return Err(FsError::NetworkUnreachable);
+        }
+        let (source, mtu) = state
+            .iface
+            .resolve_route(destination, bound_source)
+            .map_err(dispatch_error)?;
+        if local_destination {
+            Ok(Route {
+                interface: InterfaceId::Loopback,
+                source,
+                mtu: LOOPBACK_MTU,
+            })
+        } else {
+            Ok(Route {
+                interface: InterfaceId::Ethernet,
+                source,
+                mtu,
+            })
+        }
+    }
+
+    /// 借用根实际拥有的 NIC，身份、队列及 IRQ 查询由同一设备值提供。
+    pub(crate) fn nic(&self) -> Option<&Arc<VirtioNet>> {
+        self.nic.get()
+    }
+
+    /// 返回当前 eth0 完整配置副本，不主动推进设备或协议。
+    pub fn ethernet_config(&self) -> Option<EthernetConfig> {
+        let ethernet = self.ethernet.get()?.lock();
+        let iface = &ethernet.as_ref()?.iface;
+        let address = iface.ip_addrs().iter().find_map(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => Some(*cidr),
+            _ => None,
+        })?;
+        let gateway = iface.routes().iter().find_map(|route| match route.cidr {
+            IpCidr::Ipv4(cidr) if cidr.prefix_len() == 0 => match route.via_router {
+                IpAddress::Ipv4(address) => Some(address.octets()),
+                _ => None,
+            },
+            _ => None,
+        });
+        Some(EthernetConfig {
+            address: address.address().octets(),
+            prefix_len: address.prefix_len(),
+            gateway,
+        })
+    }
+
+    /// 配置只更新库内 IPv4 地址和默认路由，已有 IPv6 地址保持。
+    pub fn configure_ethernet(&self, config: EthernetConfig) -> Result<(), FsError> {
+        {
+            let _admission = self.admission()?;
+            config.validate()?;
+            let mut ethernet = self
+                .ethernet
+                .get()
+                .ok_or(FsError::NetworkUnreachable)?
+                .lock();
+            let state = ethernet.as_mut().ok_or(FsError::NotConnected)?;
+            state.iface.routes_mut().remove_default_ipv4_route();
+            if let Some(gateway) = config.gateway {
+                state
+                    .iface
+                    .routes_mut()
+                    .add_default_ipv4_route(Ipv4Address::from(gateway))
+                    .map_err(|_| FsError::NoMemory)?;
+            }
+            state.iface.update_ip_addrs(|addresses| {
+                addresses.retain(|cidr| !matches!(cidr, IpCidr::Ipv4(_)));
+                addresses
+                    .push(IpCidr::Ipv4(Ipv4Cidr::new(
+                        Ipv4Address::from(config.address),
+                        config.prefix_len,
+                    )))
+                    .expect("Ethernet address capacity exhausted");
+            });
+        }
+        self.kick_egress();
+        Ok(())
     }
 
     /// 所有连接和域 Work 共用这份执行域及原 per-CPU pools。
@@ -275,14 +808,14 @@ impl NetStack {
     /// 从真实容量和本域身份准备核心，节点所有资源齐备后才发表表拥有。
     pub fn try_new_tcp(
         self: &NetStackRef,
+        family: AddressFamily,
         rx_len: usize,
         tx_len: usize,
     ) -> Result<Arc<TcpEndpoint>, FsError> {
         let _admission = self.admission()?;
         let slot = self.claim_endpoint_slot()?;
         let id = self.allocate_identity();
-        let core = self.new_core(id, rx_len, tx_len)?;
-        let endpoint = TcpEndpoint::try_new(self, id, core, slot)?;
+        let endpoint = TcpEndpoint::try_new(self, id, slot, family, rx_len, tx_len)?;
         self.tables.insert_tcp(endpoint.clone())?;
         Ok(endpoint)
     }
@@ -299,11 +832,14 @@ impl NetStack {
     }
 
     /// UDP 与 TCP 取得同一节点额度，但各自拥有独立端口索引。
-    pub fn try_new_udp(self: &NetStackRef) -> Result<Arc<UdpEndpoint>, FsError> {
+    pub fn try_new_udp(
+        self: &NetStackRef,
+        family: AddressFamily,
+    ) -> Result<Arc<UdpEndpoint>, FsError> {
         let _admission = self.admission()?;
         let slot = self.claim_endpoint_slot()?;
         let id = self.allocate_identity();
-        let endpoint = UdpEndpoint::try_new(self, id, slot)?;
+        let endpoint = UdpEndpoint::try_new(self, id, slot, family)?;
         self.tables.insert_udp(endpoint.clone())?;
         Ok(endpoint)
     }
@@ -318,11 +854,6 @@ impl NetStack {
         Ok(endpoints)
     }
 
-    /// 返回当前唯一 lo 的真实地址和掩码。
-    pub fn loopback_cidr(&self) -> Ipv4Cidr {
-        Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8)
-    }
-
     /// 软件报文和连接使用同一真实 IP MTU。
     pub fn loopback_mtu(&self) -> usize {
         LOOPBACK_MTU
@@ -330,14 +861,23 @@ impl NetStack {
 
     /// 校验路由后只移动 owned 包，未接受时将完整拥有交回发送者。
     pub fn try_emit(&self, packet: OwnedPacket) -> Result<(), (FsError, OwnedPacket)> {
+        if self.is_stopping() {
+            return Err((FsError::NotConnected, packet));
+        }
         if LOOPBACK_MTU < packet.len() {
             return Err((FsError::MessageTooLarge, packet));
         }
-        let bytes = packet.bytes();
-        let source = [bytes[12], bytes[13], bytes[14], bytes[15]];
-        if let Err(error) = self.routes.resolve(packet.destination(), source) {
-            return Err((error, packet));
-        }
+        let route = match self.resolve_route(packet.destination(), packet.source()) {
+            Ok(route) => route,
+            Err(error) => {
+                let error = if self.is_stopping() {
+                    FsError::NotConnected
+                } else {
+                    error
+                };
+                return Err((error, packet));
+            }
+        };
         {
             let mut egress = self.egress.lock();
             if !egress.open {
@@ -346,19 +886,29 @@ impl NetStack {
             if egress.packets.len() == LOOPBACK_CAPACITY {
                 return Err((FsError::WouldBlock, packet));
             }
-            egress.packets.push_back(packet);
+            egress.packets.push_back(QueuedPacket {
+                packet: Some(packet),
+                route,
+            });
         }
-        let _ = self
-            .ingress
-            .get()
-            .expect("network ingress is not prepared")
-            .as_ref()
-            .queue();
+        self.kick_egress();
         Ok(())
     }
 
+    /// 真实 TX 完成、邻居输入或库期限只安排根 Work，不主动轮询连接。
+    pub(crate) fn kick_egress(&self) {
+        if !self.is_stopping() {
+            let _ = self
+                .ingress
+                .get()
+                .expect("network ingress is not prepared")
+                .as_ref()
+                .queue();
+        }
+    }
+
     /// 普通 owned 发送失败释放未接受包，保留实际路由或容量错误。
-    pub fn send_ipv4(&self, packet: OwnedPacket) -> Result<(), FsError> {
+    pub fn send_ip(&self, packet: OwnedPacket) -> Result<(), FsError> {
         self.try_emit(packet).map_err(|(error, _packet)| error)
     }
 
@@ -397,16 +947,34 @@ impl NetStack {
 
     /// 从表移动同一 Arc 到预留退休队列，当前 callback 不等待自己的 Work。
     pub(crate) fn retire_tcp(&self, id: u64) {
-        {
-            let mut retired = self.retired.lock();
-            if self.is_stopping() {
-                return;
-            }
-            if let Some(endpoint) = self.tables.take_tcp(id) {
-                assert!(retired.len() < ENDPOINT_CAPACITY);
-                retired.push(endpoint);
-            }
+        let mut retired = self.retired.lock();
+        if self.is_stopping() {
+            return;
         }
+        if let Some(endpoint) = self.tables.take_tcp(id) {
+            assert!(retired.len() < ENDPOINT_CAPACITY);
+            retired.push(RetiredEndpoint::Tcp(endpoint));
+        }
+        drop(retired);
+        self.schedule_reaper(id);
+    }
+
+    /// UDP 回调只移交真实拥有，另一个根 Work 才同步结束该端点全尾。
+    pub(crate) fn retire_udp(&self, id: u64) {
+        let mut retired = self.retired.lock();
+        if self.is_stopping() {
+            return;
+        }
+        if let Some(endpoint) = self.tables.take_udp(id) {
+            assert!(retired.len() < ENDPOINT_CAPACITY);
+            retired.push(RetiredEndpoint::Udp(endpoint));
+        }
+        drop(retired);
+        self.schedule_reaper(id);
+    }
+
+    /// 退休和末关闭使用同一容量等待撤销及已有回收票。
+    fn schedule_reaper(&self, id: u64) {
         self.cancel_egress_wait(id);
         let _ = self
             .reaper
@@ -414,11 +982,6 @@ impl NetStack {
             .expect("network reaper is not prepared")
             .as_ref()
             .queue();
-    }
-
-    /// 仅返回当前已经接受的软件包数量，不以查询推动协议。
-    pub fn loopback_pending(&self) -> usize {
-        self.egress.lock().packets.len()
     }
 
     /// 测试只观察真实容量等待登记，查询不安排或修改连接进度。
@@ -479,7 +1042,15 @@ impl NetStack {
                 }
                 _ => return Err(FsError::InvalidOperation),
             };
-            egress.packets.push_back(packet);
+            let route = Route {
+                interface: InterfaceId::Loopback,
+                source: packet.source(),
+                mtu: LOOPBACK_MTU,
+            };
+            egress.packets.push_back(QueuedPacket {
+                packet: Some(packet),
+                route,
+            });
         }
         let _ = self.ingress.get().unwrap().as_ref().queue();
         Ok(())
@@ -564,7 +1135,7 @@ impl NetStack {
         Ok(())
     }
 
-    /// 报文解析在短锁外，锁内只移动原 SYN 或记录所选 data、空 ACK 的真实到达事实。
+    /// typed repr 借用止于短锁前，锁内只移动原包或记录实际交付事实。
     #[cfg(feature = "ktest")]
     fn controlled_loopback_packet(&self, packet: OwnedPacket) -> Option<OwnedPacket> {
         if packet.protocol() != IpProtocol::Tcp {
@@ -641,75 +1212,499 @@ impl NetStack {
         Some(packet)
     }
 
-    /// 有界领取后释放队列锁，再通知原等待者并处理同一个 IPv4 路径。
-    fn receive_loopback(&self) {
-        for _ in 0..PROTOCOL_BUDGET {
-            let mut waiting = [0u64; ENDPOINT_CAPACITY];
-            let (packet, count) = {
-                let mut egress = self.egress.lock();
-                if !egress.open {
-                    return;
-                }
-                let packet = egress.packets.pop_front();
-                let count = if packet.is_some() {
-                    egress.waiting.len()
-                } else {
-                    0
-                };
-                waiting[..count].copy_from_slice(&egress.waiting[..count]);
-                if packet.is_some() {
-                    egress.waiting.clear();
-                }
-                (packet, count)
-            };
-            for id in &waiting[..count] {
-                self.notify_egress(*id);
-            }
-            let Some(packet) = packet else {
-                return;
-            };
-            #[cfg(feature = "ktest")]
-            let Some(packet) = self.controlled_loopback_packet(packet) else {
-                continue;
-            };
-            if let Err(error) = self.deliver_ipv4(packet) {
-                crate::klog!(
-                    crate::klog::Level::Debug,
-                    "loopback delivery failed: {:?}",
-                    error
-                );
-            }
-        }
-        if self.loopback_pending() != 0 && !self.is_stopping() {
-            let _ = self.ingress.get().unwrap().as_ref().queue();
+    /// 原队列领取槽与容量通知同锁；设备或协议处理、最后 packet put 全在短锁外。
+    fn finish_egress(&self, index: usize) {
+        let mut waiting = [0u64; ENDPOINT_CAPACITY];
+        let (entry, count) = {
+            let mut egress = self.egress.lock();
+            let entry = egress
+                .packets
+                .remove(index)
+                .expect("network egress slot missing");
+            let count = egress.waiting.len();
+            waiting[..count].copy_from_slice(&egress.waiting);
+            egress.waiting.clear();
+            (entry, count)
+        };
+        drop(entry);
+        for id in &waiting[..count] {
+            self.notify_egress(*id);
         }
     }
 
-    /// 表只查找并克隆真正拥有；协议、报文编码和队列接收均在表锁外。
-    fn deliver_ipv4(&self, packet: OwnedPacket) -> Result<(), FsError> {
-        match packet.protocol() {
-            IpProtocol::Tcp => {
-                let (peer, local) = packet.tcp_endpoints()?;
-                let endpoint = self
-                    .tables
-                    .lookup_tcp(TcpTuple { local, peer })
-                    .or_else(|| self.tables.lookup_listener(local));
-                if let Some(endpoint) = endpoint {
-                    return endpoint.enqueue(packet);
-                }
-                if let Some(reset) = packet.try_tcp_reset(LOOPBACK_MTU)? {
-                    self.send_ipv4(reset)?;
-                }
-            }
-            IpProtocol::Udp => {
-                let (peer, local) = packet.udp_endpoints()?;
-                if let Some(endpoint) = self.tables.lookup_udp(local, peer) {
-                    return endpoint.enqueue(packet);
-                }
-            }
-            _ => {}
+    /// 一个接口同时只 dispatch 一条队列责任，最后帧交出后才归还原32项额度。
+    fn finish_interface_egress(&self, id: InterfaceId) {
+        let index = self
+            .egress
+            .lock()
+            .packets
+            .iter()
+            .position(|entry| entry.route.interface == id && entry.packet.is_none());
+        if let Some(index) = index {
+            self.finish_egress(index);
         }
-        Ok(())
+    }
+
+    /// 取得实际接口保护，控制调用不能在持表锁时进入此入口。
+    fn interface(&self, id: InterfaceId) -> Option<&SleepMutex<Option<InterfaceState>>> {
+        match id {
+            InterfaceId::Loopback => Some(&self.loopback),
+            InterfaceId::Ethernet => self.ethernet.get(),
+        }
+    }
+
+    /// 输入借同一 holder 后备，前一 loan 尚未归还时只在接口锁外准备新 Vec。
+    fn take_ingress_storage(&self, id: InterfaceId) -> Result<(CaptureStorage, Vec<u8>), FsError> {
+        let capture = {
+            let interface = self.interface(id).ok_or(FsError::NotConnected)?.lock();
+            let state = interface.as_ref().ok_or(FsError::NotConnected)?;
+            if self.is_stopping() {
+                return Err(FsError::NotConnected);
+            }
+            if id == InterfaceId::Ethernet && !state.dispatch_ready() {
+                return Err(FsError::WouldBlock);
+            }
+            state.capture.clone()
+        };
+        let storage = ::core::mem::take(&mut *capture.lock());
+        let storage = if storage.capacity() == 0 {
+            prepare_ingress_storage()?
+        } else {
+            assert!(
+                LOOPBACK_MTU <= storage.capacity(),
+                "ingress capture capacity lost"
+            );
+            storage
+        };
+        Ok((capture, storage))
+    }
+
+    /// 只选择已有空帧和空 fragmenter 的原槽，不移动等待中的队列项。
+    fn select_egress(
+        &self,
+        blocked: [bool; 2],
+        stalled: &[Option<IpAddress>],
+    ) -> Option<(usize, InterfaceId)> {
+        let ready = [
+            !blocked[0]
+                && self
+                    .loopback
+                    .lock()
+                    .as_ref()
+                    .is_some_and(InterfaceState::dispatch_ready),
+            !blocked[1]
+                && self.ethernet.get().is_some_and(|ethernet| {
+                    ethernet
+                        .lock()
+                        .as_ref()
+                        .is_some_and(InterfaceState::dispatch_ready)
+                }),
+        ];
+        let egress = self.egress.lock();
+        if !egress.open {
+            return None;
+        }
+        egress
+            .packets
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                let available = match entry.route.interface {
+                    InterfaceId::Loopback => ready[0],
+                    InterfaceId::Ethernet => ready[1],
+                };
+                let destination = Some(entry.packet.as_ref()?.destination());
+                (available && !stalled.contains(&destination))
+                    .then_some((index, entry.route.interface))
+            })
+    }
+
+    /// 完整 IP 输出交换到预备 RX 存储，再经同一库解析和控制链回到端点。
+    fn receive_loopback_frame(&self) -> Result<bool, FsError> {
+        let destination = {
+            let loopback = self.loopback.lock();
+            let Some(state) = loopback.as_ref() else {
+                return Ok(false);
+            };
+            if state.frame.len == 0 {
+                return Ok(false);
+            }
+            state
+                .frame
+                .destination
+                .expect("loopback output has no typed IP destination")
+        };
+        let (capture, storage) = self.take_ingress_storage(InterfaceId::Loopback)?;
+        let mut collector = IngressCollector::new(&self.tables, capture, storage);
+        collector.local_destination = self.is_local(destination).then_some(destination);
+        let (received, binding) = {
+            let mut loopback = self.loopback.lock();
+            match loopback.as_mut() {
+                Some(state) if !self.is_stopping() && 0 < state.frame.len => {
+                    let len = state.frame.len;
+                    ::core::mem::swap(&mut state.frame.bytes, &mut state.loopback_rx);
+                    state.frame.len = 0;
+                    state.frame.destination = None;
+                    let mut device = FrameDevice {
+                        frame: &mut state.frame,
+                        input: Some(&state.loopback_rx[..len]),
+                        medium: state.medium,
+                    };
+                    state
+                        .iface
+                        .poll_ingress_single(interface_now(), &mut device, &mut collector);
+                    if 0 < state.frame.len {
+                        state.frame.destination = state.iface.last_transmit_destination();
+                    }
+                    (true, state.binding.take())
+                }
+                _ => (false, None),
+            }
+        };
+        collector.return_storage();
+        if !received {
+            return Ok(false);
+        }
+        drop(binding);
+        self.finish_interface_egress(InterfaceId::Loopback);
+        collector.deliver()?;
+        Ok(true)
+    }
+
+    /// NIC 满时归还同一预备帧且保持占用，控制输入不能覆盖此责任。
+    fn transmit_ethernet_frame(&self) -> Result<Option<bool>, VirtioInitError> {
+        let Some(ethernet) = self.ethernet.get() else {
+            return Ok(None);
+        };
+        let (bytes, len) = {
+            let mut ethernet = ethernet.lock();
+            let Some(state) = ethernet.as_mut() else {
+                return Ok(None);
+            };
+            if state.frame.len == 0 || state.frame.in_flight || self.is_stopping() {
+                return Ok(None);
+            }
+            state.frame.in_flight = true;
+            (::core::mem::take(&mut state.frame.bytes), state.frame.len)
+        };
+        let accepted = self
+            .nic
+            .get()
+            .expect("Ethernet interface without NIC")
+            .try_transmit(len, |frame| frame.copy_from_slice(&bytes[..len]));
+        let (binding, finished) = {
+            let mut ethernet = ethernet.lock();
+            let state = ethernet
+                .as_mut()
+                .expect("Ethernet workspace released before NIC tail");
+            state.frame.bytes = bytes;
+            state.frame.in_flight = false;
+            if matches!(accepted, Ok(true)) {
+                state.frame.len = 0;
+                state.frame.destination = None;
+                if !state.iface.fragmentation_pending() {
+                    (state.binding.take(), true)
+                } else {
+                    (None, false)
+                }
+            } else {
+                (None, false)
+            }
+        };
+        drop(binding);
+        if finished {
+            self.finish_interface_egress(InterfaceId::Ethernet);
+        }
+        accepted.map(Some)
+    }
+
+    /// 只推进库已有余片，TxToken 空槽事实是唯一正常发送提交条件。
+    fn advance_fragmentation(&self, id: InterfaceId) -> bool {
+        let Some(interface) = self.interface(id) else {
+            return false;
+        };
+        let mut interface = interface.lock();
+        let Some(state) = interface.as_mut() else {
+            return false;
+        };
+        if self.is_stopping() || !state.frame.available() || !state.iface.fragmentation_pending() {
+            return false;
+        }
+        let mut device = FrameDevice {
+            frame: &mut state.frame,
+            input: None,
+            medium: state.medium,
+        };
+        state.iface.poll_fragmentation(interface_now(), &mut device);
+        if 0 < state.frame.len {
+            state.frame.destination = state.iface.last_transmit_destination();
+        }
+        0 < state.frame.len
+    }
+
+    /// 根 Work 按预算处理软件帧和 owned 包；NIC 满或邻居等待不产生忙重排。
+    fn receive_egress(&self) {
+        if self.is_stopping() {
+            return;
+        }
+        self.maintain_interfaces();
+        let mut blocked = [false; 2];
+        let mut stalled = [None; LOOPBACK_CAPACITY];
+        let mut tx_full = false;
+        let mut consumed = 0;
+        while consumed < PROTOCOL_BUDGET && !self.is_stopping() {
+            match self.receive_loopback_frame() {
+                Ok(true) => {
+                    consumed += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    crate::klog!(
+                        crate::klog::Level::Debug,
+                        "Loopback input failed: {:?}",
+                        error
+                    );
+                    blocked[0] = true;
+                }
+            }
+            if !tx_full {
+                match self
+                    .transmit_ethernet_frame()
+                    .expect("Ethernet transmission failed")
+                {
+                    Some(true) => {
+                        consumed += 1;
+                        continue;
+                    }
+                    Some(false) => {
+                        tx_full = true;
+                        blocked[1] = true;
+                    }
+                    None => {}
+                }
+            }
+            if !tx_full && self.advance_fragmentation(InterfaceId::Ethernet) {
+                consumed += 1;
+                continue;
+            }
+            let Some((index, id)) = self.select_egress(blocked, &stalled) else {
+                break;
+            };
+            let packet = self.egress.lock().packets[index]
+                .packet
+                .take()
+                .expect("network egress packet already claimed");
+            #[cfg(feature = "ktest")]
+            let packet = if id == InterfaceId::Loopback {
+                match self.controlled_loopback_packet(packet) {
+                    Some(packet) => packet,
+                    None => {
+                        self.finish_egress(index);
+                        consumed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                packet
+            };
+            let result = {
+                let mut interface = self
+                    .interface(id)
+                    .expect("queued interface disappeared")
+                    .lock();
+                match interface.as_mut() {
+                    Some(state) if state.dispatch_ready() => {
+                        let result = state.iface.dispatch_ip(
+                            interface_now(),
+                            FrameTx(&mut state.frame),
+                            PacketMeta::default(),
+                            packet.as_packet(),
+                        );
+                        if 0 < state.frame.len {
+                            state.frame.destination = state.iface.last_transmit_destination();
+                        }
+                        if result.is_ok() {
+                            assert!(
+                                state.binding.is_none(),
+                                "interface retained previous packet lease"
+                            );
+                            state.binding = packet.binding().cloned();
+                        }
+                        result
+                    }
+                    _ => Err(DispatchError::Exhausted),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    drop(packet);
+                }
+                Err(DispatchError::NeighborPending) => {
+                    *stalled
+                        .iter_mut()
+                        .find(|destination| destination.is_none())
+                        .expect("network stalled destination capacity exhausted") =
+                        Some(packet.destination());
+                    self.egress.lock().packets[index].packet = Some(packet);
+                }
+                Err(DispatchError::Exhausted) => {
+                    self.egress.lock().packets[index].packet = Some(packet);
+                    blocked[if id == InterfaceId::Loopback { 0 } else { 1 }] = true;
+                }
+                Err(error) => {
+                    self.finish_egress(index);
+                    drop(packet);
+                    crate::klog!(crate::klog::Level::Debug, "IP dispatch failed: {:?}", error);
+                }
+            }
+            consumed += 1;
+        }
+        self.arm_interface_timer();
+        if consumed == PROTOCOL_BUDGET && self.actionable_egress(blocked, tx_full, &stalled) {
+            self.kick_egress();
+        }
+    }
+
+    /// 预算尾只重排能继续消费的事实，真实 TX 满只等 completion。
+    fn actionable_egress(
+        &self,
+        blocked: [bool; 2],
+        tx_full: bool,
+        stalled: &[Option<IpAddress>],
+    ) -> bool {
+        if !blocked[0]
+            && self
+                .loopback
+                .lock()
+                .as_ref()
+                .is_some_and(|state| 0 < state.frame.len)
+        {
+            return true;
+        }
+        if !tx_full
+            && self.ethernet.get().is_some_and(|ethernet| {
+                ethernet
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|state| 0 < state.frame.len || state.iface.fragmentation_pending())
+            })
+        {
+            return true;
+        }
+        self.select_egress(blocked, stalled).is_some()
+    }
+
+    /// 即使没有下一包也执行成熟库的到期重组回收。
+    fn maintain_interfaces(&self) {
+        let now = interface_now();
+        if let Some(state) = self.loopback.lock().as_mut() {
+            state.iface.poll_maintenance(now);
+        }
+        if let Some(ethernet) = self.ethernet.get() {
+            if let Some(state) = ethernet.lock().as_mut() {
+                state.iface.poll_maintenance(now);
+            }
+        }
+    }
+
+    /// 最早重组到期和真实待发目的的邻居期限共享一份根 Timer。
+    fn arm_interface_timer(&self) {
+        let mut destinations = [None; LOOPBACK_CAPACITY];
+        {
+            let egress = self.egress.lock();
+            for (index, entry) in egress.packets.iter().enumerate() {
+                destinations[index] = entry
+                    .packet
+                    .as_ref()
+                    .map(|packet| (entry.route.interface, packet.destination()));
+            }
+        }
+        let now = interface_now();
+        let mut deadline = None;
+        for id in [InterfaceId::Loopback, InterfaceId::Ethernet] {
+            let Some(interface) = self.interface(id) else {
+                continue;
+            };
+            let interface = interface.lock();
+            let Some(state) = interface.as_ref() else {
+                continue;
+            };
+            deadline = earlier_deadline(deadline, state.iface.maintenance_deadline());
+            for (interface, destination) in destinations.iter().flatten() {
+                if *interface == id {
+                    deadline =
+                        earlier_deadline(deadline, state.iface.egress_deadline(*destination, now));
+                }
+            }
+        }
+        let _control = self.timer_control.lock();
+        if self.is_stopping() {
+            return;
+        }
+        let timer = self
+            .interface_timer
+            .get()
+            .expect("interface timer is not prepared")
+            .as_ref();
+        match deadline {
+            Some(deadline) => {
+                let micros =
+                    u64::try_from(deadline.total_micros()).expect("negative interface deadline");
+                let nanos = micros
+                    .checked_mul(1000)
+                    .expect("interface deadline overflow");
+                timer
+                    .arm(time::MonotonicInstant::from_nanos(nanos))
+                    .expect("interface timer arm failed");
+            }
+            None => {
+                timer.cancel_pending();
+            }
+        }
+    }
+
+    /// RX 只借收权 DMA 前缀；库完成捕获后解接口锁再 enqueue 和安排 Work。
+    pub(crate) fn receive_ethernet(&self, frame: &[u8]) -> Result<(), FsError> {
+        if self.is_stopping() {
+            return Err(FsError::NotConnected);
+        }
+        let (capture, storage) = self.take_ingress_storage(InterfaceId::Ethernet)?;
+        let mut collector = IngressCollector::new(&self.tables, capture, storage);
+        let result = {
+            let mut ethernet = self
+                .ethernet
+                .get()
+                .expect("Ethernet interface disappeared")
+                .lock();
+            match ethernet.as_mut() {
+                Some(state) if !self.is_stopping() => {
+                    if state.dispatch_ready() {
+                        let mut device = FrameDevice {
+                            frame: &mut state.frame,
+                            input: Some(frame),
+                            medium: state.medium,
+                        };
+                        state.iface.poll_ingress_single(
+                            interface_now(),
+                            &mut device,
+                            &mut collector,
+                        );
+                        if 0 < state.frame.len {
+                            state.frame.destination = state.iface.last_transmit_destination();
+                        }
+                        Ok(())
+                    } else {
+                        Err(FsError::WouldBlock)
+                    }
+                }
+                _ => Err(FsError::NotConnected),
+            }
+        };
+        collector.return_storage();
+        result?;
+        self.kick_egress();
+        collector.deliver()
     }
 
     /// 具体退休拥有在短锁外覆盖 Timer 和 Work 的完整尾部。
@@ -730,8 +1725,8 @@ impl NetStack {
         }
     }
 
-    /// 唯一拥有者先停生产源，再按域、节点、执行域次序等待真实尾部。
-    fn stop_sync(&self) {
+    /// 先关生产与全部协议回调，随后确认 NIC 停止；错误保留原根和 IRQ 上下文。
+    fn stop_sync(&self) -> Result<(), VirtioInitError> {
         {
             let _admission = self.admission.lock();
             let mut egress = self.egress.lock();
@@ -741,19 +1736,38 @@ impl NetStack {
             );
             egress.open = false;
         }
+        // Timer 的重提边界与关门串行；等待 callback 全尾时不持这把短锁。
+        {
+            let _control = self.timer_control.lock();
+        }
+        if let Some(timer) = self.interface_timer.get() {
+            timer.as_ref().close_sync();
+        }
         self.ingress.get().unwrap().as_ref().close_sync();
         self.reaper.get().unwrap().as_ref().close_sync();
         let (tcp, udp, unix) = self.tables.take_all();
         let retired = ::core::mem::take(&mut *self.retired.lock());
-        for endpoint in tcp.into_iter().chain(retired) {
+        for endpoint in tcp {
             endpoint.stop_sync();
         }
         for endpoint in udp {
             endpoint.stop_sync();
         }
+        for endpoint in retired {
+            endpoint.stop_sync();
+        }
         for pair in unix {
             pair.stop_sync();
         }
+        if let Some(nic) = self.nic.get() {
+            nic.stop_sync()?;
+        }
+        let loopback = self.loopback.lock().take();
+        let ethernet = self
+            .ethernet
+            .get()
+            .and_then(|ethernet| ethernet.lock().take());
+        drop((loopback, ethernet));
         #[cfg(feature = "ktest")]
         {
             let control = self.egress.lock().packet_control.take();
@@ -767,6 +1781,7 @@ impl NetStack {
         drop(packets);
         self.work_queue().close_sync();
         self.stopped.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -784,7 +1799,7 @@ impl Drop for NetStack {
 fn run_ingress(work: Pin<&Work>) {
     // SAFETY: context 来自稳定 Arc payload；唯一服务拥有者等待本 Work 全尾后才释放域。
     let net = unsafe { &*(work.context() as *const NetStack) };
-    net.receive_loopback();
+    net.receive_egress();
 }
 
 /// 退休 Work 不同步关闭自身，只等待从具体退休队列移出的连接。
@@ -792,4 +1807,52 @@ fn run_retired(work: Pin<&Work>) {
     // SAFETY: context 来自稳定 Arc payload；根拥有者在本 Work 同步全尾结束前保活域。
     let net = unsafe { &*(work.context() as *const NetStack) };
     net.reap_retired();
+}
+
+/// Timer context 的存活由原 Root owner 覆盖至同步尾部，只移交原 Work。
+fn interface_expired(timer: Pin<&Timer>) {
+    // SAFETY: context 来自稳定根 Arc，Root owner 在 Timer close_sync 全尾前保留同一强拥有。
+    let net = unsafe { &*(timer.context() as *const NetStack) };
+    net.kick_egress();
+}
+
+/// 预留空 capture 后备；初始化和消费后补存都只能在接口处理锁外调用。
+fn prepare_ingress_storage() -> Result<Vec<u8>, FsError> {
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(LOOPBACK_MTU)
+        .map_err(|_| FsError::NoMemory)?;
+    Ok(storage)
+}
+
+/// 库微秒与生产 monotonic 纳秒共享基准，不另建协议时钟。
+fn interface_now() -> Instant {
+    Instant::from_micros(
+        i64::try_from(time::now().as_nanos() / 1000).expect("interface clock exhausted"),
+    )
+}
+
+/// 合并真实可选期限，不把没有责任的接口转换成立即重排。
+fn earlier_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+/// 原文件错误直接表达实际路由、容量和合法报文边界。
+fn dispatch_error(error: DispatchError) -> FsError {
+    match error {
+        DispatchError::NoRoute => FsError::NetworkUnreachable,
+        DispatchError::NeighborPending | DispatchError::Exhausted => FsError::WouldBlock,
+        DispatchError::PacketTooLarge => FsError::MessageTooLarge,
+    }
+}
+
+/// 文件层保实际内存不足，其余设备初始化失败统一交原设备 I/O 错误，不回退 lo。
+fn network_device_error(error: VirtioInitError) -> FsError {
+    match error {
+        VirtioInitError::NoMemory { .. } => FsError::NoMemory,
+        _ => FsError::DeviceIo,
+    }
 }

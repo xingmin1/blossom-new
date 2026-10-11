@@ -6,6 +6,8 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use smoltcp::socket::tcp::State;
+use smoltcp::socket::udp as raw_udp;
+use smoltcp::wire::{IpAddress, IpProtocol, IpRepr, Ipv4Address, Ipv6Address, UdpRepr};
 
 use crate::fs::epoll::{EpollEvent, EpollFile, EPOLLET, EPOLL_CTL_ADD};
 use crate::fs::{
@@ -14,7 +16,7 @@ use crate::fs::{
 use crate::ktest::execution_services::{baseline, Baseline, SuiteBaseline};
 use crate::mm::space::Mm;
 use crate::mm::user_table::PagePermissions;
-use crate::net::address::{InetEndpoint, SocketAddress};
+use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
 use crate::net::socket::SocketFile;
@@ -28,11 +30,11 @@ use crate::sync::{SleepMutex, SpinLock};
 use crate::{cpu, time, timer};
 
 const CLIENT: InetEndpoint = InetEndpoint {
-    address: [127, 0, 0, 1],
+    address: IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
     port: 35701,
 };
 const SERVER: InetEndpoint = InetEndpoint {
-    address: [127, 0, 0, 1],
+    address: IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
     port: 44702,
 };
 const ADDRESS: usize = 0x4600_0000;
@@ -108,7 +110,7 @@ impl NetworkOwner {
         self.wire.lock().pop_front()
     }
 
-    /// 两端编码真实包，领取后以实际输入构造重新核线性字节，再锁外选目的端处理。
+    /// 本例 wire 移动库 repr 与 payload 的真实拥有，锁外选择目的端处理。
     fn pump(&self, context: &TestContext<'_>) -> TestResult {
         let now = time::now();
         for endpoint in [&self.client, &self.server] {
@@ -118,7 +120,6 @@ impl NetworkOwner {
             )?;
         }
         while let Some(packet) = self.take_packet() {
-            let packet = operation(context, OwnedPacket::try_from_ipv4(packet.bytes()))?;
             let (_, destination) = operation(context, packet.tcp_endpoints())?;
             let endpoint = if destination == SERVER {
                 &self.server
@@ -172,6 +173,21 @@ fn pattern(position: usize) -> u8 {
     (position as u8)
         .wrapping_mul(37)
         .wrapping_add((position / 251) as u8)
+}
+
+/// 原 PacketBuffer 在基线后 fallible 准备 metadata 与字节后备，测试不另建 payload 队列。
+fn udp_buffer(records: usize, bytes: usize) -> Result<raw_udp::PacketBuffer<'static>, TestError> {
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(records)
+        .map_err(|_| TestError("UDP metadata allocation failed"))?;
+    metadata.resize(records, raw_udp::PacketMetadata::EMPTY);
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(bytes)
+        .map_err(|_| TestError("UDP payload allocation failed"))?;
+    payload.resize(bytes, 0);
+    Ok(raw_udp::PacketBuffer::new(metadata, payload))
 }
 
 /// 保留两个具名套件的真实宏锚点，不增加入口或中央分派器。
@@ -476,7 +492,7 @@ fn listener(
     net: &NetStackRef,
     port: u16,
 ) -> Result<Arc<TcpEndpoint>, TestError> {
-    let endpoint = operation(context, net.try_new_tcp(256, 256))?;
+    let endpoint = operation(context, net.try_new_tcp(AddressFamily::Ipv4, 256, 256))?;
     operation(context, endpoint.bind(InetEndpoint { port, ..SERVER }))?;
     operation(context, endpoint.listen(4))?;
     Ok(endpoint)
@@ -517,6 +533,51 @@ fn accepted(
 pub(crate) mod stack {
     use super::*;
 
+    /// IPv6 通配 port0 的同一租约覆盖 IPv4，V6ONLY port0 则允许同端口的 IPv4 绑定。
+    #[test]
+    fn udp_dual_stack_port_zero_reserves_both_protocol_faces(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let dual = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv6))?;
+        let local = operation(
+            context,
+            dual.bind(InetEndpoint {
+                address: AddressFamily::Ipv6.unspecified(),
+                port: 0,
+            }),
+        )?;
+        context.expect_eq(local.address, AddressFamily::Ipv6.unspecified());
+        context.expect_eq(49152 <= local.port, true);
+        let ipv4 = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+        context.expect_eq(
+            ipv4.bind(InetEndpoint {
+                address: SERVER.address,
+                port: local.port,
+            }),
+            Err(FsError::AddressInUse),
+        );
+        let native = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv6))?;
+        operation(context, native.set_v6_only(true))?;
+        let native_local = operation(
+            context,
+            native.bind(InetEndpoint {
+                address: AddressFamily::Ipv6.unspecified(),
+                port: 0,
+            }),
+        )?;
+        let ipv4_local = InetEndpoint {
+            address: SERVER.address,
+            port: native_local.port,
+        };
+        context.expect_eq(operation(context, ipv4.bind(ipv4_local))?, ipv4_local);
+        dual.close();
+        native.close();
+        ipv4.close();
+        drop((dual, native, ipv4));
+        socket_retired(&fixture.net)
+    }
+
     /// 同域跨 Task 使用原通配绑定冲突；TCP 与 UDP 的端口拥有彼此独立。
     #[test]
     fn cross_task_bind_wildcard_and_protocol_spaces(
@@ -524,16 +585,19 @@ pub(crate) mod stack {
         fixture: &mut StackOwner,
     ) -> TestResult {
         let wildcard = InetEndpoint {
-            address: [0; 4],
+            address: AddressFamily::Ipv4.unspecified(),
             port: 45120,
         };
-        let first = operation(context, fixture.net.try_new_tcp(128, 128))?;
+        let first = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 128, 128),
+        )?;
         context.expect_eq(operation(context, first.bind(wildcard))?, wildcard);
         operation(context, first.listen(4))?;
         let net = Arc::clone(&fixture.net);
         let child =
             crate::ktest::spawn_result_on((cpu::current().id + 1) % cpu::count(), move |_| {
-                let tcp = child_operation(net.try_new_tcp(128, 128))?;
+                let tcp = child_operation(net.try_new_tcp(AddressFamily::Ipv4, 128, 128))?;
                 if tcp.bind(InetEndpoint {
                     address: SERVER.address,
                     port: wildcard.port,
@@ -541,7 +605,7 @@ pub(crate) mod stack {
                 {
                     return Err(TestError("cross Task wildcard bind conflict missing"));
                 }
-                let udp = child_operation(net.try_new_udp())?;
+                let udp = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
                 if child_operation(udp.bind(wildcard))? != wildcard || udp.local() != Some(wildcard)
                 {
                     return Err(TestError("UDP wildcard or protocol space changed"));
@@ -549,7 +613,7 @@ pub(crate) mod stack {
                 Ok(0)
             })?;
         context.expect_eq(child.join()?, 0);
-        context.expect_eq(first.lock().listen_endpoint(), wildcard);
+        context.expect_eq(first.lock().listen_endpoint(AddressFamily::Ipv4), wildcard);
         Ok(())
     }
 
@@ -593,23 +657,23 @@ pub(crate) mod stack {
                     timer::sleep(time::Duration::from_millis(1));
                 }
                 for _ in 0..16 {
-                    let tcp = child_operation(net.try_new_tcp(128, 128))?;
+                    let tcp = child_operation(net.try_new_tcp(AddressFamily::Ipv4, 128, 128))?;
                     let local = child_operation(tcp.bind(InetEndpoint {
-                        address: [0; 4],
+                        address: AddressFamily::Ipv4.unspecified(),
                         port: 0,
                     }))?;
-                    if local.address != [0; 4] || local.port < 49152 {
+                    if local.address != AddressFamily::Ipv4.unspecified() || local.port < 49152 {
                         return Err(TestError(
                             "automatic TCP bind changed wildcard or port range",
                         ));
                     }
                     ports.lock().push((true, local.port));
-                    let udp = child_operation(net.try_new_udp())?;
+                    let udp = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
                     let local = child_operation(udp.bind(InetEndpoint {
-                        address: [0; 4],
+                        address: AddressFamily::Ipv4.unspecified(),
                         port: 0,
                     }))?;
-                    if local.address != [0; 4] || local.port < 49152 {
+                    if local.address != AddressFamily::Ipv4.unspecified() || local.port < 49152 {
                         return Err(TestError("automatic bind changed wildcard or port range"));
                     }
                     ports.lock().push((false, local.port));
@@ -642,7 +706,10 @@ pub(crate) mod stack {
         fixture: &mut StackOwner,
     ) -> TestResult {
         let listener = listener(context, &fixture.net, SERVER.port)?;
-        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        let client = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 256, 256),
+        )?;
         operation(context, client.connect(SERVER))?;
         let server = accepted(context, &listener, &client)?;
         let input: [u8; 1025] = ::core::array::from_fn(pattern);
@@ -732,8 +799,14 @@ pub(crate) mod stack {
     ) -> TestResult {
         let listener_a = listener(context, &fixture.net, 45210)?;
         let listener_b = listener(context, &fixture.net, 45211)?;
-        let client_a = operation(context, fixture.net.try_new_tcp(256, 256))?;
-        let client_b = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        let client_a = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 256, 256),
+        )?;
+        let client_b = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 256, 256),
+        )?;
         if client_a.work_cpu() == client_b.work_cpu() {
             return Err(TestError("independent clients share protocol CPU"));
         }
@@ -827,15 +900,15 @@ pub(crate) mod stack {
         context: &mut TestContext<'_>,
         fixture: &mut StackOwner,
     ) -> TestResult {
-        let udp = operation(context, fixture.net.try_new_udp())?;
+        let udp = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         let destination = operation(
             context,
             udp.bind(InetEndpoint {
-                address: [0; 4],
+                address: AddressFamily::Ipv4.unspecified(),
                 port: 45310,
             }),
         )?;
-        context.expect_eq(destination.address, [0; 4]);
+        context.expect_eq(destination.address, AddressFamily::Ipv4.unspecified());
         for payload in [&b"real UDP record"[..], &b""[..]] {
             let packet = operation(
                 context,
@@ -849,88 +922,170 @@ pub(crate) mod stack {
                     LOOPBACK_MTU,
                 ),
             )?;
-            operation(context, fixture.net.send_ipv4(packet))?;
-            let mut record = None;
+            operation(context, fixture.net.send_ip(packet))?;
             observe(
                 || {
-                    record = udp.take_datagram();
-                    record.is_some()
+                    udp.poll(None)
+                        .is_ok_and(|mask| mask.contains(PollMask::POLLIN))
                 },
                 "UDP ingress record missing",
             )?;
-            let record = record.ok_or(TestError("UDP observed record disappeared"))?;
-            context.expect_eq(operation(context, record.udp_endpoints())?.0, CLIENT);
-            context.expect_eq(operation(context, record.udp_payload())?, payload);
-            context.expect_eq(
-                operation(context, record.udp_payload())?.len(),
-                payload.len(),
-            );
+            let mut bytes = [0u8; 32];
+            let record = operation(
+                context,
+                udp.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            )?
+            .ok_or(TestError("UDP observed record disappeared"))?;
+            context.expect_eq(record.source, Some(SocketAddress::Inet(CLIENT)));
+            context.expect_eq(record.copied, payload.len());
+            context.expect_eq(record.original_len, payload.len());
+            context.expect_eq(&bytes[..record.copied], payload);
         }
-        context.expect_eq(udp.take_datagram().is_none(), true);
-        udp.close();
+        let mut bytes = [0u8; 1];
         context.expect_eq(
-            fixture
-                .net
-                .tables()
-                .lookup_udp(
-                    InetEndpoint {
-                        port: destination.port,
-                        ..SERVER
-                    },
-                    CLIENT,
-                )
-                .is_none(),
-            true,
+            operation(
+                context,
+                udp.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            )?,
+            None,
         );
+        udp.close();
+        observe(
+            || {
+                fixture
+                    .net
+                    .tables()
+                    .lookup_udp(
+                        InetEndpoint {
+                            port: destination.port,
+                            ..SERVER
+                        },
+                        CLIENT,
+                    )
+                    .is_none()
+            },
+            "closed UDP did not release actual receive index",
+        )?;
         Ok(())
     }
 
-    /// 同一个 inbox 的 32 个完整 MTU 记录占满真实字节预算，领取后恢复；空记录同样满。
+    /// 原 raw 接纳事实确定字节及 metadata 满；缩小保旧记录，调大恢复，不推测网络交付。
     #[test]
     fn udp_inbox_record_and_payload_capacity_recovers(
         context: &mut TestContext<'_>,
-        fixture: &mut StackOwner,
+        _: &mut StackOwner,
     ) -> TestResult {
-        let udp = operation(context, fixture.net.try_new_udp())?;
-        let destination = operation(
-            context,
-            udp.bind(InetEndpoint {
-                port: 45311,
-                ..SERVER
-            }),
-        )?;
-        let payload: [u8; LOOPBACK_MTU - 28] = ::core::array::from_fn(pattern);
-        for input in [&payload[..], &b""[..]] {
+        for (address, source) in [
+            (
+                SERVER.address,
+                IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 2)),
+            ),
+            (
+                IpAddress::Ipv6(Ipv6Address::LOCALHOST),
+                IpAddress::Ipv6(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 2)),
+            ),
+        ] {
+            let mut raw = raw_udp::Socket::new(udp_buffer(32, 128)?, udp_buffer(32, 128)?);
+            raw.bind((address, SERVER.port))
+                .map_err(|_| TestError("raw UDP bind failed"))?;
+            let mut cx = raw_udp::UdpContextState::new(Some(address), None);
+            let repr = UdpRepr {
+                src_port: CLIENT.port,
+                dst_port: SERVER.port,
+            };
+            let zero_ip = IpRepr::new(source, address, IpProtocol::Udp, 8, 64);
             for _ in 0..32 {
-                let packet = operation(
-                    context,
-                    OwnedPacket::try_from_udp(CLIENT, destination, input, LOOPBACK_MTU),
-                )?;
-                operation(context, udp.enqueue(packet))?;
+                context.expect_eq(
+                    raw.process(&mut cx, Default::default(), &zero_ip, &repr, &b""[..]),
+                    true,
+                );
             }
-            let packet = operation(
-                context,
-                OwnedPacket::try_from_udp(CLIENT, destination, input, LOOPBACK_MTU),
-            )?;
-            context.expect_eq(udp.enqueue(packet), Err(FsError::WouldBlock));
-            let record = udp
-                .take_datagram()
-                .ok_or(TestError("full UDP inbox lost record"))?;
-            context.expect_eq(operation(context, record.udp_payload())?, input);
-            context.expect_eq(operation(context, record.udp_endpoints())?.0, CLIENT);
-            drop(record);
-            let packet = operation(
-                context,
-                OwnedPacket::try_from_udp(CLIENT, destination, input, LOOPBACK_MTU),
-            )?;
-            operation(context, udp.enqueue(packet))?;
+            context.expect_eq(
+                raw.process(&mut cx, Default::default(), &zero_ip, &repr, &b""[..]),
+                false,
+            );
             for _ in 0..32 {
-                let record = udp
-                    .take_datagram()
-                    .ok_or(TestError("UDP inbox recovery lost record"))?;
-                context.expect_eq(operation(context, record.udp_payload())?, input);
+                let (payload, metadata) = raw
+                    .recv()
+                    .map_err(|_| TestError("raw UDP zero record lost"))?;
+                context.expect_eq(payload, &b""[..]);
+                context.expect_eq(metadata.endpoint.addr, source);
+                context.expect_eq(metadata.endpoint.port, CLIENT.port);
+                context.expect_eq(metadata.local_address, Some(address));
             }
-            context.expect_eq(udp.take_datagram().is_none(), true);
+            context.expect_eq(raw.can_recv(), false);
+            raw.set_recv_budget(64);
+            let first: [u8; 32] = ::core::array::from_fn(pattern);
+            let second: [u8; 32] = ::core::array::from_fn(|index| pattern(index + 32));
+            let ip = IpRepr::new(source, address, IpProtocol::Udp, 40, 64);
+            for input in [&first[..], &second[..]] {
+                context.expect_eq(
+                    raw.process(&mut cx, Default::default(), &ip, &repr, input),
+                    true,
+                );
+            }
+            context.expect_eq(
+                raw.process(&mut cx, Default::default(), &ip, &repr, &first[..]),
+                false,
+            );
+            raw.set_recv_budget(16);
+            for input in [&first[..], &second[..]] {
+                let (payload, metadata) = raw
+                    .recv()
+                    .map_err(|_| TestError("lowered UDP budget lost old record"))?;
+                context.expect_eq(payload, input);
+                context.expect_eq(metadata.local_address, Some(address));
+            }
+            context.expect_eq(
+                raw.process(&mut cx, Default::default(), &ip, &repr, &first[..]),
+                false,
+            );
+            raw.set_recv_budget(64);
+            context.expect_eq(
+                raw.process(&mut cx, Default::default(), &ip, &repr, &second[..]),
+                true,
+            );
+            context.expect_eq(
+                raw.recv()
+                    .map_err(|_| TestError("raised UDP budget did not recover"))?
+                    .0,
+                &second[..],
+            );
+            raw.set_send_budget(32);
+            let metadata = raw_udp::UdpMetadata {
+                endpoint: (source, CLIENT.port).into(),
+                local_address: Some(address),
+                meta: Default::default(),
+                local_port: Some(SERVER.port),
+            };
+            raw.send_slice(&first, metadata)
+                .map_err(|_| TestError("raw UDP TX acceptance failed"))?;
+            context.expect_eq(raw.can_send(), false);
+            context.expect_eq(
+                raw.send_slice(b"x", metadata),
+                Err(raw_udp::SendError::BufferFull),
+            );
+            raw.set_send_budget(16);
+            let rejected = raw.dispatch(&mut cx, |_, _, (_, _, payload)| {
+                context.expect_eq(payload, &first[..]);
+                Err::<(), _>(FsError::WouldBlock)
+            });
+            context.expect_eq(rejected, Err(FsError::WouldBlock));
+            raw.set_send_budget(64);
+            let dispatched = raw.dispatch(&mut cx, |_, _, (ip, _, payload)| {
+                context.expect_eq(ip.src_addr(), address);
+                context.expect_eq(payload, &first[..]);
+                Ok(())
+            });
+            operation(context, dispatched)?;
+            context.expect_eq(raw.can_send(), true);
+            raw.send_slice(&second, metadata)
+                .map_err(|_| TestError("raised UDP TX budget did not recover"))?;
+            let dispatched = raw.dispatch(&mut cx, |_, _, (_, _, payload)| {
+                context.expect_eq(payload, &second[..]);
+                Ok(())
+            });
+            operation(context, dispatched)?;
         }
         Ok(())
     }
@@ -942,7 +1097,10 @@ pub(crate) mod stack {
         fixture: &mut StackOwner,
     ) -> TestResult {
         let listener = listener(context, &fixture.net, 45410)?;
-        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        let client = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 256, 256),
+        )?;
         operation(
             context,
             client.connect(InetEndpoint {
@@ -972,9 +1130,12 @@ pub(crate) mod stack {
             .try_reserve_exact(128)
             .map_err(|_| TestError("endpoint capacity observation allocation failed"))?;
         for _ in 0..128 {
-            nodes.push(operation(context, fixture.net.try_new_udp())?);
+            nodes.push(operation(
+                context,
+                fixture.net.try_new_udp(AddressFamily::Ipv4),
+            )?);
         }
-        match fixture.net.try_new_udp() {
+        match fixture.net.try_new_udp(AddressFamily::Ipv4) {
             Err(FsError::NoMemory) => {}
             _ => return Err(TestError("live endpoint slot capacity not enforced")),
         }
@@ -982,7 +1143,8 @@ pub(crate) mod stack {
             endpoint.close();
         }
         drop(nodes);
-        let recovered = operation(context, fixture.net.try_new_udp())?;
+        socket_retired(&fixture.net)?;
+        let recovered = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         recovered.close();
         Ok(())
     }
@@ -995,7 +1157,10 @@ pub(crate) mod stack {
         fixture: &mut StackOwner,
     ) -> TestResult {
         let listener = listener(context, &fixture.net, 45420)?;
-        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        let client = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 256, 256),
+        )?;
         context.expect_eq(client.work_cpu(), 1);
         let destination = InetEndpoint {
             port: 45421,
@@ -1025,98 +1190,90 @@ pub(crate) mod stack {
                 LOOPBACK_MTU,
             ),
         )?;
-        let full = Arc::try_new(AtomicBool::new(false))
-            .map_err(|_| TestError("egress full observation allocation failed"))?;
-        let full_by_child = Arc::clone(&full);
+        let entered = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("egress gate observation allocation failed"))?;
+        let gate_entered = Arc::clone(&entered);
         let release = Arc::clone(&fixture.release);
         let net = Arc::clone(&fixture.net);
         let controlled_client = Arc::clone(&client);
         let controller = crate::ktest::spawn_result_on(1, move |_| {
             let client = controlled_client;
-            let queued_net = Arc::clone(&net);
             let gate_release = Arc::clone(&release);
             let child = crate::ktest::spawn_result_on(0, move |token| {
-                let mut unaccepted = None;
+                // CPU0 只阻止 ingress 执行；包、路由与队列操作留在普通可睡控制任务。
+                let irq = crate::sync::IrqSaveGuard::new();
+                gate_entered.store(true, Ordering::Release);
+                let end = time::now()
+                    .checked_add(time::Duration::from_secs(5))
+                    .unwrap();
                 let mut error = None;
-                let mut packets = packets.into_iter();
-                {
-                    // 所有报文和控制拥有已在普通上下文准备；停点内只短锁移包和原子观察。
-                    let irq = crate::sync::IrqSaveGuard::new();
-                    for packet in packets.by_ref() {
-                        if let Err((_, packet)) = queued_net.try_emit(packet) {
-                            unaccepted = Some(packet);
-                            error = Some("prepared egress queue did not accept 32 records");
-                            break;
-                        }
+                while !gate_release.load(Ordering::Acquire) && !token.stop_requested() {
+                    if end <= time::now() {
+                        error = Some("egress IRQ gate release deadline");
+                        break;
                     }
-                    if error.is_none() {
-                        let pointer = extra.bytes().as_ptr();
-                        let length = extra.len();
-                        match queued_net.try_emit(extra) {
-                            Err((FsError::WouldBlock, packet))
-                                if packet.bytes().as_ptr() == pointer && packet.len() == length =>
-                            {
-                                unaccepted = Some(packet);
-                                full_by_child.store(true, Ordering::Release);
-                            }
-                            Err((_, packet)) => {
-                                unaccepted = Some(packet);
-                                error = Some(
-                                    "full egress did not preserve unaccepted packet ownership",
-                                );
-                            }
-                            Ok(()) => error = Some("egress queue exceeded actual packet capacity"),
-                        }
-                    }
-                    let end = time::now()
-                        .checked_add(time::Duration::from_secs(5))
-                        .unwrap();
-                    while error.is_none()
-                        && !gate_release.load(Ordering::Acquire)
-                        && !token.stop_requested()
-                    {
-                        if end <= time::now() {
-                            error = Some("egress IRQ gate release deadline");
-                            break;
-                        }
-                        ::core::hint::spin_loop();
-                    }
-                    drop(irq);
+                    ::core::hint::spin_loop();
                 }
-                drop(packets);
-                drop(unaccepted);
+                drop(irq);
                 error.map_or(Ok(0), |message| Err(TestError(message)))
             })?;
-            observe(
-                || full.load(Ordering::Acquire) || child.try_join().is_some(),
-                "egress queue did not reach actual full capacity",
-            )?;
-            if !full.load(Ordering::Acquire) {
-                return Err(TestError(
-                    "egress capacity control failed before full observation",
-                ));
-            }
-            child_operation(client.connect(InetEndpoint {
-                port: 45420,
-                ..SERVER
-            }))?;
-            observe(
-                || net.egress_waiting(client.id()),
-                "full SYN emitter did not register actual egress wait",
-            )?;
-            if client.state() != State::SynSent {
-                return Err(TestError(
-                    "full egress submitted SYN before capacity recovered",
-                ));
-            }
-            timer::sleep(time::Duration::from_millis(20));
-            if !net.egress_waiting(client.id()) {
-                return Err(TestError(
-                    "egress wait disappeared while ingress CPU was stopped",
-                ));
-            }
+            // 验证失败也先解除停点并 join；未接纳包始终在 CPU1 普通任务结束拥有。
+            let result = (|| -> TestResult {
+                observe(
+                    || entered.load(Ordering::Acquire) || child.try_join().is_some(),
+                    "egress ingress CPU did not enter actual IRQ gate",
+                )?;
+                if !entered.load(Ordering::Acquire) {
+                    return Err(TestError("egress gate failed before entry observation"));
+                }
+                for packet in packets {
+                    net.try_emit(packet).map_err(|_| {
+                        TestError("prepared egress queue did not accept 32 records")
+                    })?;
+                }
+                let length = extra.len();
+                let unaccepted = match net.try_emit(extra) {
+                    Err((FsError::WouldBlock, packet))
+                        if packet.len() == length
+                            && packet.udp_payload() == Ok(&b"unaccepted owned packet"[..]) =>
+                    {
+                        packet
+                    }
+                    Err(_) => {
+                        return Err(TestError(
+                            "full egress did not preserve unaccepted packet ownership",
+                        ));
+                    }
+                    Ok(()) => {
+                        return Err(TestError("egress queue exceeded actual packet capacity"))
+                    }
+                };
+                child_operation(client.connect(InetEndpoint {
+                    port: 45420,
+                    ..SERVER
+                }))?;
+                observe(
+                    || net.egress_waiting(client.id()),
+                    "full SYN emitter did not register actual egress wait",
+                )?;
+                if client.state() != State::SynSent {
+                    return Err(TestError(
+                        "full egress submitted SYN before capacity recovered",
+                    ));
+                }
+                timer::sleep(time::Duration::from_millis(20));
+                if !net.egress_waiting(client.id()) {
+                    return Err(TestError(
+                        "egress wait disappeared while ingress CPU was stopped",
+                    ));
+                }
+                drop(unaccepted);
+                Ok(())
+            })();
             release.store(true, Ordering::Release);
-            if child.join()? != 0 {
+            let joined = child.join();
+            result?;
+            if joined? != 0 {
                 return Err(TestError("egress IRQ gate child failed"));
             }
             Ok(0)
@@ -1154,7 +1311,10 @@ pub(crate) mod stack {
         fixture: &mut StackOwner,
     ) -> TestResult {
         let listener = listener(context, &fixture.net, 45430)?;
-        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        let client = operation(
+            context,
+            fixture.net.try_new_tcp(AddressFamily::Ipv4, 256, 256),
+        )?;
         operation(
             context,
             client.connect(InetEndpoint {
@@ -1163,7 +1323,7 @@ pub(crate) mod stack {
             }),
         )?;
         let server = accepted(context, &listener, &client)?;
-        let udp = operation(context, fixture.net.try_new_udp())?;
+        let udp = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         let local = operation(
             context,
             udp.bind(InetEndpoint {
@@ -1189,9 +1349,13 @@ pub(crate) mod stack {
         context.expect_eq(client.state(), State::Closed);
         context.expect_eq(server.state(), State::Closed);
         context.expect_eq(listener.state(), State::Closed);
-        context.expect_eq(udp.take_datagram().is_none(), true);
+        let mut bytes = [0u8; 1];
+        context.expect_eq(
+            udp.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            Err(FsError::NotConnected),
+        );
         context.expect_eq(udp.local(), None);
-        match fixture.net.try_new_udp() {
+        match fixture.net.try_new_udp(AddressFamily::Ipv4) {
             Err(FsError::NotConnected) => {}
             _ => return Err(TestError("stopped network accepted new endpoint ownership")),
         }
@@ -1215,7 +1379,10 @@ fn socket_listener(
     net: &NetStackRef,
     port: u16,
 ) -> Result<Arc<SocketFile>, TestError> {
-    let file = operation(context, SocketFile::try_new_tcp(net.clone(), 0, 0, 0))?;
+    let file = operation(
+        context,
+        SocketFile::try_new_tcp(net.clone(), AddressFamily::Ipv4, 0, 0, 0),
+    )?;
     operation(
         context,
         file.bind(SocketAddress::Inet(InetEndpoint { port, ..SERVER })),
@@ -1280,6 +1447,192 @@ fn socket_epoll_collect(file: &EpollFile, output: &mut [EpollEvent]) -> Result<u
 pub(crate) mod socket_native {
     use super::*;
 
+    /// 四页槽满后读一字节不归槽，跨槽 PEEK 部分 fault 保留全文；整页释放才写就绪。
+    #[test]
+    fn unix_shared_fifo_slots_and_cross_page_peek_fault(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let [sender, receiver] = operation(context, fixture.net.try_new_unix_pair())?;
+        let mut fifo = crate::fs::pipe::PipeBuffer::<4>::new();
+        let page: [u8; 4096] = ::core::array::from_fn(pattern);
+        for _ in 0..4 {
+            context.expect_eq(
+                operation(context, sender.send(&page))?,
+                IoProgress::Ready(page.len()),
+            );
+            context.expect_eq(
+                operation(context, fifo.append(&mut WriteBuffer::kernel(&page)))?,
+                page.len(),
+            );
+        }
+        let mut bytes = [0u8; 4096];
+        for count in [1, 4088] {
+            context.expect_eq(
+                operation(
+                    context,
+                    receiver.receive(&mut ReadBuffer::kernel(&mut bytes[..count]), false),
+                )?,
+                IoProgress::Ready(count),
+            );
+            context.expect_eq(
+                operation(
+                    context,
+                    fifo.receive(&mut ReadBuffer::kernel(&mut bytes[..count]), false),
+                )?,
+                count,
+            );
+            context.expect_eq(
+                operation(context, sender.poll(None))?.contains(PollMask::POLLOUT),
+                false,
+            );
+            context.expect_eq(fifo.empty_slot_capacity(), 0);
+        }
+        let memory = Mm::try_new().map_err(|_| TestError("UNIX MM allocation failed"))?;
+        memory
+            .map_anonymous(ADDRESS, 4096, RW, RW)
+            .map_err(|_| TestError("UNIX fault page mapping failed"))?;
+        for unix in [true, false] {
+            let mut target = operation(context, ReadBuffer::user(&memory, ADDRESS + 4096 - 9, 32))?;
+            if unix {
+                context.expect_eq(
+                    operation(context, receiver.receive(&mut target, true))?,
+                    IoProgress::Ready(9),
+                );
+            } else {
+                context.expect_eq(operation(context, fifo.receive(&mut target, true))?, 9);
+            }
+            context.expect_eq(target.copied(), 9);
+            let mut peeked = [0u8; 9];
+            context.expect_eq(memory.copyin(&mut peeked, ADDRESS + 4096 - 9).copied, 9);
+            context.expect_eq(&peeked[..7], &page[4089..]);
+            context.expect_eq(&peeked[7..], &page[..2]);
+        }
+        context.expect_eq(
+            operation(context, sender.poll(None))?.contains(PollMask::POLLOUT),
+            false,
+        );
+        context.expect_eq(
+            operation(
+                context,
+                receiver.receive(&mut ReadBuffer::kernel(&mut bytes[..7]), false),
+            )?,
+            IoProgress::Ready(7),
+        );
+        context.expect_eq(&bytes[..7], &page[4089..]);
+        context.expect_eq(
+            operation(
+                context,
+                fifo.receive(&mut ReadBuffer::kernel(&mut bytes[..7]), false),
+            )?,
+            7,
+        );
+        context.expect_eq(&bytes[..7], &page[4089..]);
+        context.expect_eq(
+            operation(context, sender.poll(None))?.contains(PollMask::POLLOUT),
+            true,
+        );
+        context.expect_eq(fifo.empty_slot_capacity(), page.len());
+        for _ in 0..3 {
+            context.expect_eq(
+                operation(
+                    context,
+                    receiver.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+                )?,
+                IoProgress::Ready(page.len()),
+            );
+            context.expect_eq(bytes, page);
+            context.expect_eq(
+                operation(
+                    context,
+                    fifo.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+                )?,
+                page.len(),
+            );
+            context.expect_eq(bytes, page);
+        }
+        sender.close();
+        receiver.close();
+        drop((sender, receiver, fifo, memory));
+        socket_retired(&fixture.net)
+    }
+
+    /// 正常原页压力使新槽零进度 ENOMEM，旧页保图样，放压后同方向再次发送。
+    #[test]
+    fn unix_shared_fifo_real_page_oom_recovers(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let [sender, receiver] = operation(context, fixture.net.try_new_unix_pair())?;
+        let mut fifo = crate::fs::pipe::PipeBuffer::<4>::new();
+        let page = [0x79; 4096];
+        context.expect_eq(
+            operation(context, sender.send(&page))?,
+            IoProgress::Ready(page.len()),
+        );
+        context.expect_eq(
+            operation(context, fifo.append(&mut WriteBuffer::kernel(&page)))?,
+            page.len(),
+        );
+        let mut pressure = Vec::new();
+        pressure
+            .try_reserve_exact(crate::mm::stats().present_pages)
+            .map_err(|_| TestError("UNIX page pressure slots OOM"))?;
+        crate::mm::shrink_all();
+        crate::mm::drain_all_pages();
+        for order in [10, 0] {
+            while let Some(page) = crate::mm::alloc_pages(order, false) {
+                pressure.push(page);
+            }
+        }
+        crate::mm::drain_all_pages();
+        context.expect_eq(crate::mm::alloc_pages(0, false).is_none(), true);
+        context.expect_eq(sender.send(b"new page"), Err(FsError::NoMemory));
+        let mut source = WriteBuffer::kernel(b"new page");
+        context.expect_eq(fifo.append(&mut source), Err(FsError::NoMemory));
+        context.expect_eq(source.copied(), 0);
+        let mut bytes = [0u8; 4096];
+        context.expect_eq(
+            receiver.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            Ok(IoProgress::Ready(page.len())),
+        );
+        context.expect_eq(bytes, page);
+        context.expect_eq(
+            fifo.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            Ok(page.len()),
+        );
+        context.expect_eq(bytes, page);
+        drop(pressure);
+        context.expect_eq(
+            operation(context, sender.send(b"after OOM"))?,
+            IoProgress::Ready(9),
+        );
+        context.expect_eq(
+            operation(
+                context,
+                receiver.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            )?,
+            IoProgress::Ready(9),
+        );
+        context.expect_eq(&bytes[..9], b"after OOM");
+        context.expect_eq(
+            operation(context, fifo.append(&mut WriteBuffer::kernel(b"after OOM")))?,
+            9,
+        );
+        context.expect_eq(
+            operation(
+                context,
+                fifo.receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            )?,
+            9,
+        );
+        context.expect_eq(&bytes[..9], b"after OOM");
+        sender.close();
+        receiver.close();
+        drop((sender, receiver, fifo));
+        socket_retired(&fixture.net)
+    }
+
     /// 已领取 child 正常退休不得重发旧 ready 的 ET；后继握手仍须产生新事件并正常归还全部端点。
     #[test]
     fn accepted_child_retirement_does_not_rearm_listener_edge(
@@ -1300,7 +1653,7 @@ pub(crate) mod socket_native {
         );
         let client_a = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(
             context,
@@ -1352,7 +1705,7 @@ pub(crate) mod socket_native {
         }
         let client_b = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(
             context,
@@ -1425,7 +1778,7 @@ pub(crate) mod socket_native {
 
         let client_c = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(
             context,
@@ -1563,7 +1916,7 @@ pub(crate) mod socket_native {
         operation(context, listener.set_status_flags(0o4000))?;
         let client = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(context, client.bind(SocketAddress::Inet(peer)))?;
         operation(
@@ -1667,11 +2020,11 @@ pub(crate) mod socket_native {
         let listener_b = socket_listener(context, &fixture.net, 45611)?;
         let client_a = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         let client_b = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         let cpu_a = client_a.tcp_endpoint().unwrap().work_cpu();
         let cpu_b = client_b.tcp_endpoint().unwrap().work_cpu();
@@ -1768,7 +2121,7 @@ pub(crate) mod socket_native {
         let listener = socket_listener(context, &fixture.net, 45620)?;
         let client = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(
             context,
@@ -1791,7 +2144,7 @@ pub(crate) mod socket_native {
         let healthy_listener = socket_listener(context, &fixture.net, 45622)?;
         let healthy_client = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(
             context,
@@ -1878,7 +2231,7 @@ pub(crate) mod socket_native {
         let listener = socket_listener(context, &fixture.net, 45630)?;
         let client = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 1000, 2000),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 1000, 2000),
         )?;
         operation(
             context,
@@ -1931,7 +2284,7 @@ pub(crate) mod socket_native {
     ) -> TestResult {
         let listener = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         let endpoint = operation(context, listener.tcp_endpoint())?;
         context.expect_eq(endpoint.lock().nagle_enabled(), true);
@@ -1941,6 +2294,9 @@ pub(crate) mod socket_native {
         context.expect_eq(endpoint.lock().nagle_enabled(), true);
         operation(context, listener.set_nodelay(true))?;
         operation(context, listener.set_reuse_address(true))?;
+        operation(context, endpoint.set_receive_budget(1024))?;
+        operation(context, endpoint.set_send_budget(2048))?;
+        operation(context, endpoint.set_keepalive(true))?;
         operation(
             context,
             listener.bind(SocketAddress::Inet(InetEndpoint {
@@ -1951,7 +2307,7 @@ pub(crate) mod socket_native {
         operation(context, listener.listen(4))?;
         let client = operation(
             context,
-            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
         )?;
         operation(
             context,
@@ -1964,6 +2320,22 @@ pub(crate) mod socket_native {
             ),
         )?;
         let child = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let child_endpoint = operation(context, child.tcp_endpoint())?;
+        context.expect_eq(child_endpoint.receive_budget(), 1024);
+        context.expect_eq(child_endpoint.send_budget(), 2048);
+        context.expect_eq(
+            child_endpoint.receive_capacity(),
+            endpoint.receive_capacity(),
+        );
+        context.expect_eq(child_endpoint.send_capacity(), endpoint.send_capacity());
+        context.expect_eq(child_endpoint.keepalive(), true);
+        context.expect_eq(
+            child_endpoint.congestion_control(),
+            smoltcp::socket::tcp::CongestionControl::Reno,
+        );
+        operation(context, child_endpoint.set_keepalive(false))?;
+        context.expect_eq(child_endpoint.keepalive(), false);
+        context.expect_eq(endpoint.keepalive(), true);
         context.expect_eq(
             operation(context, child.tcp_endpoint())?
                 .lock()
@@ -2096,14 +2468,17 @@ pub(crate) mod socket_native {
             .try_reserve_exact(127)
             .map_err(|_| TestError("UNIX slot observation allocation failed"))?;
         for _ in 0..127 {
-            occupied.push(operation(context, fixture.net.try_new_udp())?);
+            occupied.push(operation(
+                context,
+                fixture.net.try_new_udp(AddressFamily::Ipv4),
+            )?);
         }
         match fixture.net.try_new_unix_pair() {
             Err(FsError::NoMemory) => {}
             _ => return Err(TestError("UNIX pair exceeded two actual endpoint slots")),
         }
         context.expect_eq(fixture.net.ktest_live_endpoints(), 127);
-        let last = operation(context, fixture.net.try_new_udp())?;
+        let last = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         context.expect_eq(fixture.net.ktest_live_endpoints(), 128);
         last.close();
         for endpoint in &occupied {
@@ -2123,84 +2498,206 @@ pub(crate) mod socket_native {
         Ok(())
     }
 
-    /// AF_UNSPEC 后旧准备 Lease 保端口，旧末 put 不得撤同端点的后继绑定或阻止真实新包交付。
+    /// AF_UNSPEC 保已接纳消息的旧租约，旧消息交付后归端口且后继绑定仍保持唯一。
     #[test]
+    #[ktest(min_cpus = 2)]
     fn udp_prepared_lease_survives_disconnect_without_unbinding_successor(
         context: &mut TestContext<'_>,
         fixture: &mut StackOwner,
     ) -> TestResult {
-        let receiver = operation(context, fixture.net.try_new_udp())?;
-        let destination = operation(
-            context,
-            receiver.bind(InetEndpoint {
+        let net = Arc::clone(&fixture.net);
+        let release = Arc::clone(&fixture.release);
+        let controller = crate::ktest::spawn_result_on(1, move |_| {
+            let receiver = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            let destination = child_operation(receiver.bind(InetEndpoint {
                 port: 45670,
                 ..SERVER
-            }),
-        )?;
-        let sender = operation(context, fixture.net.try_new_udp())?;
-        operation(context, sender.connect(Some(destination)))?;
-        let (old_packet, old_lease) =
-            operation(context, sender.prepare_send(b"old prepared message", None))?;
-        let old_local = old_lease.local();
-        context.expect_eq(
-            operation(context, old_packet.udp_endpoints())?.0.port,
-            old_local.port,
-        );
-        operation(context, sender.connect(None))?;
-        context.expect_eq(sender.peer_address(), Err(FsError::NotConnected));
-        context.expect_eq(
-            operation(context, sender.local_address())?,
-            InetEndpoint {
-                address: [0; 4],
-                port: 0,
-            },
-        );
-        let contender = operation(context, fixture.net.try_new_udp())?;
-        context.expect_eq(contender.bind(old_local), Err(FsError::AddressInUse));
-        let input = b"successor prepared datagram";
-        let (new_packet, new_lease) =
-            operation(context, sender.prepare_send(input, Some(destination)))?;
-        let new_local = new_lease.local();
-        context.expect_eq(new_local.port != old_local.port, true);
-        context.expect_eq(sender.peer_address(), Err(FsError::NotConnected));
-        let expected_source = InetEndpoint {
-            address: SERVER.address,
-            port: new_local.port,
-        };
-        context.expect_eq(
-            operation(context, new_packet.udp_endpoints())?,
-            (expected_source, destination),
-        );
-        drop((old_packet, old_lease));
-        context.expect_eq(operation(context, contender.bind(old_local))?, old_local);
-        let third = operation(context, fixture.net.try_new_udp())?;
-        context.expect_eq(third.bind(new_local), Err(FsError::AddressInUse));
-        operation(context, fixture.net.send_ipv4(new_packet))?;
-        let mut delivered = None;
-        observe(
-            || {
-                delivered = receiver.take_datagram();
-                delivered.is_some()
-            },
-            "successor UDP packet did not reach actual receiver",
-        )?;
-        let delivered = delivered.ok_or(TestError("successor UDP record disappeared"))?;
-        context.expect_eq(
-            operation(context, delivered.udp_endpoints())?,
-            (expected_source, destination),
-        );
-        context.expect_eq(operation(context, delivered.udp_payload())?, &input[..]);
-        context.expect_eq(receiver.take_datagram().is_none(), true);
-        context.diagnostic(format_args!(
-            "network-socket udp-old-port={} udp-new-port={} successor-payload-bytes={} default-peer-none=1",
-            old_local.port, new_local.port, input.len()
-        ));
-        sender.close();
-        receiver.close();
-        contender.close();
-        third.close();
-        drop((delivered, new_lease, sender, receiver, contender, third));
-        socket_retired(&fixture.net)?;
+            }))?;
+            let sender = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            child_operation(sender.connect(Some(destination)))?;
+            let entered = Arc::try_new(AtomicBool::new(false))
+                .map_err(|_| TestError("UDP gate observation OOM"))?;
+            let held = Arc::clone(&entered);
+            let gate_release = Arc::clone(&release);
+            let gate = crate::ktest::spawn_result_on(0, move |token| {
+                let irq = crate::sync::IrqSaveGuard::new();
+                held.store(true, Ordering::Release);
+                let end = time::now()
+                    .checked_add(time::Duration::from_secs(5))
+                    .unwrap();
+                while !gate_release.load(Ordering::Acquire) && !token.stop_requested() {
+                    if end <= time::now() {
+                        return Err(TestError("UDP lease IRQ gate release deadline"));
+                    }
+                    ::core::hint::spin_loop();
+                }
+                drop(irq);
+                Ok(0)
+            })?;
+            observe(
+                || entered.load(Ordering::Acquire),
+                "UDP Work CPU did not enter actual IRQ gate",
+            )?;
+            let old = child_operation(sender.local_address())?;
+            let old_input = b"old prepared message";
+            child_operation(sender.set_send_budget(old_input.len()))?;
+            if child_operation(sender.send(old_input, None))? != IoProgress::Ready(old_input.len())
+            {
+                return Err(TestError("UDP old record not accepted"));
+            }
+            if child_operation(sender.poll(None))?.contains(PollMask::POLLOUT) {
+                return Err(TestError(
+                    "UDP accepted bytes did not exhaust real TX budget",
+                ));
+            }
+            child_operation(sender.set_send_budget(64))?;
+            if !child_operation(sender.poll(None))?.contains(PollMask::POLLOUT) {
+                return Err(TestError("UDP raised TX budget did not restore OUT"));
+            }
+            child_operation(sender.connect(None))?;
+            if child_operation(sender.local_address())?
+                != (InetEndpoint {
+                    address: AddressFamily::Ipv4.unspecified(),
+                    port: 0,
+                })
+            {
+                return Err(TestError(
+                    "UDP automatic disconnect retained current binding",
+                ));
+            }
+            let contender = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            if contender.bind(old) != Err(FsError::AddressInUse) {
+                return Err(TestError(
+                    "accepted old UDP record lost binding before dispatch",
+                ));
+            }
+            let input = b"successor prepared datagram";
+            if child_operation(sender.send(input, Some(destination)))?
+                != IoProgress::Ready(input.len())
+            {
+                return Err(TestError("UDP successor record not accepted"));
+            }
+            let new = child_operation(sender.local_address())?;
+            if old.port == new.port || sender.peer_address() != Err(FsError::NotConnected) {
+                return Err(TestError(
+                    "UDP successor changed disconnect or reused live old port",
+                ));
+            }
+            let third = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            if third.bind(new) != Err(FsError::AddressInUse) {
+                return Err(TestError("UDP successor binding not retained"));
+            }
+            release.store(true, Ordering::Release);
+            if gate.join()? != 0 {
+                return Err(TestError("UDP lease IRQ gate child failed"));
+            }
+            for (expected, source) in [(&old_input[..], old), (&input[..], new)] {
+                observe(
+                    || {
+                        receiver
+                            .poll(None)
+                            .is_ok_and(|mask| mask.contains(PollMask::POLLIN))
+                    },
+                    "accepted UDP record not received",
+                )?;
+                let mut bytes = [0u8; 64];
+                let record =
+                    child_operation(receiver.receive(&mut ReadBuffer::kernel(&mut bytes), false))?
+                        .ok_or(TestError("accepted UDP record disappeared"))?;
+                let expected_source = SocketAddress::Inet(InetEndpoint {
+                    address: SERVER.address,
+                    port: source.port,
+                });
+                if record.source != Some(expected_source)
+                    || record.original_len != expected.len()
+                    || &bytes[..record.copied] != expected
+                {
+                    return Err(TestError("UDP old or successor source and bytes differ"));
+                }
+            }
+            let mut bound = false;
+            let mut failure = None;
+            observe(
+                || {
+                    match contender.bind(old) {
+                        Ok(local) => bound = local == old,
+                        Err(FsError::AddressInUse) => {}
+                        Err(error) => failure = Some(error),
+                    }
+                    bound || failure.is_some()
+                },
+                "old UDP lease did not retire after actual delivery",
+            )?;
+            if let Some(error) = failure {
+                child_operation::<()>(Err(error))?;
+            }
+            if third.bind(new) != Err(FsError::AddressInUse) {
+                return Err(TestError("old UDP lease final put unbound successor"));
+            }
+            release.store(false, Ordering::Release);
+            entered.store(false, Ordering::Release);
+            let held = Arc::clone(&entered);
+            let gate_release = Arc::clone(&release);
+            let gate = crate::ktest::spawn_result_on(0, move |token| {
+                let irq = crate::sync::IrqSaveGuard::new();
+                held.store(true, Ordering::Release);
+                let end = time::now()
+                    .checked_add(time::Duration::from_secs(5))
+                    .unwrap();
+                while !gate_release.load(Ordering::Acquire) && !token.stop_requested() {
+                    if end <= time::now() {
+                        return Err(TestError("UDP close IRQ gate release deadline"));
+                    }
+                    ::core::hint::spin_loop();
+                }
+                drop(irq);
+                Ok(0)
+            })?;
+            observe(
+                || entered.load(Ordering::Acquire),
+                "UDP close Work CPU did not enter actual IRQ gate",
+            )?;
+            let tail = b"accepted before close";
+            if child_operation(sender.send(tail, Some(destination)))?
+                != IoProgress::Ready(tail.len())
+            {
+                return Err(TestError("UDP pre-close record not accepted"));
+            }
+            sender.close();
+            release.store(true, Ordering::Release);
+            if gate.join()? != 0 {
+                return Err(TestError("UDP close IRQ gate child failed"));
+            }
+            observe(
+                || {
+                    receiver
+                        .poll(None)
+                        .is_ok_and(|mask| mask.contains(PollMask::POLLIN))
+                },
+                "UDP close discarded accepted raw TX record",
+            )?;
+            let mut bytes = [0u8; 64];
+            let record =
+                child_operation(receiver.receive(&mut ReadBuffer::kernel(&mut bytes), false))?
+                    .ok_or(TestError("UDP close delivery disappeared"))?;
+            if record.source
+                != Some(SocketAddress::Inet(InetEndpoint {
+                    address: SERVER.address,
+                    port: new.port,
+                }))
+                || record.original_len != tail.len()
+                || &bytes[..record.copied] != tail
+            {
+                return Err(TestError("UDP close delivery source or full bytes differ"));
+            }
+            receiver.close();
+            contender.close();
+            third.close();
+            drop((sender, receiver, contender, third));
+            socket_retired(&net)?;
+            Ok(0)
+        })?;
+        context.expect_eq(controller.join()?, 0);
         context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
         context.expect_eq(fixture.net.is_stopping(), false);
         Ok(())

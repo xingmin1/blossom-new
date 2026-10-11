@@ -67,11 +67,12 @@ impl Options {
                                     | "extra"
                                     | "ap-freeze"
                                     | "virtio-access-platform"
+                                    | "net-user"
                             )
                         {
                             return Err(syn::Error::new(
                                 value.span(),
-                                "resource must be uart, scratch, root, extra, ap-freeze or virtio-access-platform",
+                                "resource must be uart, scratch, root, extra, ap-freeze, virtio-access-platform or net-user",
                             ));
                         }
                         if key == "tags" {
@@ -528,6 +529,7 @@ fn defaults(base: &Options, case: Option<&Options>) -> Tokens {
         "extra" => quote!(ktest::Resource::Extra),
         "ap-freeze" => quote!(ktest::Resource::ApFreeze),
         "virtio-access-platform" => quote!(ktest::Resource::VirtioAccessPlatform),
+        "net-user" => quote!(ktest::Resource::NetUser),
         _ => unreachable!(),
     });
     quote!(ktest::Defaults { context: #context, isolation: #isolation, tags: &[#(#tags),*], min_cpus: #min_cpus, timeout_ms: #timeout, resources: &[#(#resources),*] })

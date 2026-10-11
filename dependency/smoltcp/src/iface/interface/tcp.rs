@@ -1,12 +1,11 @@
 use super::*;
 
-use crate::socket::tcp::Socket;
-
 impl InterfaceInner {
     /// 在接口解析边界校验报文，再交给匹配连接或构造拒绝应答。
-    pub fn process_tcp<'frame>(
+    pub fn process_tcp<'frame, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
+        meta: PacketMeta,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -19,15 +18,9 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
-        {
-            if tcp_socket.accepts(&ip_repr, &tcp_repr) {
-                return tcp_socket
-                    .process(self, &ip_repr, &tcp_repr, tcp_repr.payload)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
-            }
+        match sockets.tcp(self, meta, &ip_repr, &tcp_repr) {
+            TransportResponse::Matched(reply) => return reply,
+            TransportResponse::Unmatched => {}
         }
 
         if tcp_repr.control == TcpControl::Rst
@@ -39,7 +32,7 @@ impl InterfaceInner {
             None
         } else {
             // The packet wasn't handled by a socket, send a TCP RST packet.
-            let (ip, tcp) = tcp::Socket::rst_reply(&ip_repr, &tcp_repr);
+            let (ip, tcp) = crate::socket::tcp::Socket::rst_reply(&ip_repr, &tcp_repr);
             Some(Packet::new(ip, IpPayload::Tcp(tcp)))
         }
     }

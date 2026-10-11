@@ -764,26 +764,11 @@ fn test_handle_igmp(#[case] medium: Medium) {
 #[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ip"))]
 #[case(Medium::Ethernet)]
 #[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ethernet"))]
+/// 每条报文沿真实设备交出全部余片，再核对 frame 长度和完整 UDP 内容。
 fn test_packet_len(#[case] medium: Medium) {
     use crate::config::FRAGMENTATION_BUFFER_SIZE;
 
-    let (mut iface, _, _) = setup(medium);
-
-    struct TestTxToken {
-        max_transmission_unit: usize,
-    }
-
-    impl TxToken for TestTxToken {
-        fn consume<R, F>(self, len: usize, f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            net_debug!("TxToken get len: {}", len);
-            assert!(len <= self.max_transmission_unit);
-            let mut junk = [0; 1536];
-            f(&mut junk[..len])
-        }
-    }
+    let (mut iface, _, mut device) = setup(medium);
 
     iface.inner.neighbor_cache.fill(
         IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
@@ -821,17 +806,53 @@ fn test_packet_len(#[case] medium: Medium) {
         let ip_payload = IpPayload::Udp(udp_repr, &udp_packet_payload);
         let ip_packet = Packet::new_ipv4(ip_repr, ip_payload);
 
+        let token = device.transmit(Instant::ZERO).unwrap();
         assert_eq!(
-            iface.inner.dispatch_ip(
-                TestTxToken {
-                    max_transmission_unit: iface.inner.caps.max_transmission_unit
-                },
-                PacketMeta::default(),
-                ip_packet,
-                &mut iface.fragmenter,
-            ),
+            iface.dispatch_ip(Instant::ZERO, token, PacketMeta::default(), ip_packet),
             Ok(())
         );
+        while iface.fragmentation_pending() {
+            iface.poll_fragmentation(Instant::ZERO, &mut device);
+        }
+
+        let mut assembled = vec![0; ip_packet_payload_len];
+        let mut copied = 0;
+        for frame in recv_all(&mut device, Instant::ZERO) {
+            assert!(frame.len() <= iface.inner.caps.max_transmission_unit);
+            let header_len = match medium {
+                #[cfg(feature = "medium-ip")]
+                Medium::Ip => 0,
+                #[cfg(feature = "medium-ethernet")]
+                Medium::Ethernet => {
+                    let ethernet = EthernetFrame::new_checked(&frame[..]).unwrap();
+                    assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv4);
+                    EthernetFrame::<&[u8]>::header_len()
+                }
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => unreachable!(),
+            };
+            let fragment = Ipv4Packet::new_checked(&frame[header_len..]).unwrap();
+            let parsed = Ipv4Repr::parse(&fragment, &ChecksumCapabilities::default()).unwrap();
+            assert_eq!(parsed.src_addr, ip_repr.src_addr);
+            assert_eq!(parsed.dst_addr, ip_repr.dst_addr);
+            assert_eq!(parsed.next_header, IpProtocol::Udp);
+            assert_eq!(fragment.frag_offset() as usize, copied);
+            let payload = fragment.payload();
+            assert!(copied + payload.len() <= assembled.len());
+            assembled[copied..copied + payload.len()].copy_from_slice(payload);
+            copied += payload.len();
+        }
+        assert_eq!(copied, ip_packet_payload_len);
+        let udp_packet = UdpPacket::new_checked(&assembled[..]).unwrap();
+        let parsed = UdpRepr::parse(
+            &udp_packet,
+            &ip_repr.src_addr.into(),
+            &ip_repr.dst_addr.into(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(parsed, udp_repr);
+        assert_eq!(udp_packet.payload(), &udp_packet_payload[..]);
     }
 }
 
@@ -921,6 +942,7 @@ fn test_raw_socket_no_reply(#[case] medium: Medium) {
     feature = "socket-udp",
     feature = "medium-ethernet"
 ))]
+/// raw 与 UDP 同时消费时，UDP 保持实际来源和完整消息。
 fn test_raw_socket_with_udp_socket(#[case] medium: Medium) {
     use crate::socket::udp;
     use crate::wire::{IpEndpoint, IpVersion, UdpPacket, UdpRepr};

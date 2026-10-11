@@ -1,15 +1,10 @@
 use super::*;
 
-#[cfg(feature = "socket-dns")]
-use crate::socket::dns::Socket as DnsSocket;
-
-#[cfg(feature = "socket-udp")]
-use crate::socket::udp::Socket as UdpSocket;
-
 impl InterfaceInner {
-    pub(super) fn process_udp<'frame>(
+    /// 校验 UDP 后静态分派；未匹配仍生成库原有端口拒绝应答。
+    pub(super) fn process_udp<'frame, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         handled_by_raw_socket: bool,
         ip_repr: IpRepr,
@@ -24,26 +19,8 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        #[cfg(feature = "socket-udp")]
-        for udp_socket in sockets
-            .items_mut()
-            .filter_map(|i| UdpSocket::downcast_mut(&mut i.socket))
-        {
-            if udp_socket.accepts(self, &ip_repr, &udp_repr) {
-                udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
-                return None;
-            }
-        }
-
-        #[cfg(feature = "socket-dns")]
-        for dns_socket in sockets
-            .items_mut()
-            .filter_map(|i| DnsSocket::downcast_mut(&mut i.socket))
-        {
-            if dns_socket.accepts(&ip_repr, &udp_repr) {
-                dns_socket.process(self, &ip_repr, &udp_repr, udp_packet.payload());
-                return None;
-            }
+        if sockets.udp(self, meta, &ip_repr, &udp_repr, udp_packet.payload()) {
+            return None;
         }
 
         // The packet wasn't handled by a socket, send an ICMP port unreachable packet.

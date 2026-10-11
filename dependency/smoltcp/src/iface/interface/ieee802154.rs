@@ -9,9 +9,10 @@ impl InterfaceInner {
         no
     }
 
-    pub(super) fn process_ieee802154<'output, 'payload: 'output>(
+    /// 保留原 IEEE802.15.4 校验并同步交给传输消费者。
+    pub(super) fn process_ieee802154<'output, 'payload: 'output, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         sixlowpan_payload: &'payload [u8],
         _fragments: &'output mut FragmentsBuffer,
@@ -46,6 +47,7 @@ impl InterfaceInner {
         }
     }
 
+    /// 原 IEEE802.15.4 编码将后备或介质容量错误返回调用者。
     pub(super) fn dispatch_ieee802154<Tx: TxToken>(
         &mut self,
         ll_dst_a: Ieee802154Address,
@@ -53,7 +55,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
-    ) {
+    ) -> Result<(), DispatchError> {
         let ll_src_a = self.hardware_addr.ieee802154_or_panic();
 
         // Create the IEEE802.15.4 header.
@@ -71,7 +73,7 @@ impl InterfaceInner {
             src_addr: Some(ll_src_a),
         };
 
-        self.dispatch_sixlowpan(tx_token, meta, packet, ieee_repr, frag);
+        self.dispatch_sixlowpan(tx_token, meta, packet, ieee_repr, frag)
     }
 
     #[cfg(feature = "proto-sixlowpan-fragmentation")]

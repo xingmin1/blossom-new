@@ -16,6 +16,63 @@ type Buffer = alloc::vec::Vec<u8>;
 #[cfg(not(feature = "alloc"))]
 type Buffer = [u8; REASSEMBLY_BUFFER_SIZE];
 
+/// 接口工作区准备失败；处理报文时不再扩展这些后备。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BufferError {
+    NoMemory,
+    InvalidCapacity,
+}
+
+/// 在普通任务中一次准备发送分片和接收重组的实际后备。
+pub struct InterfaceBuffers {
+    pub(crate) fragments: FragmentsBuffer,
+    pub(crate) fragmenter: Fragmenter,
+}
+
+impl InterfaceBuffers {
+    /// 预备有限工作区；alloc 模式仅将 Vec 元数据留在调用栈上。
+    pub fn try_new(
+        fragmentation_capacity: usize,
+        reassembly_capacity: usize,
+    ) -> Result<Self, BufferError> {
+        if fragmentation_capacity == 0 || reassembly_capacity == 0 {
+            return Err(BufferError::InvalidCapacity);
+        }
+        #[cfg(not(feature = "alloc"))]
+        if fragmentation_capacity != FRAGMENTATION_BUFFER_SIZE
+            || reassembly_capacity != REASSEMBLY_BUFFER_SIZE
+        {
+            return Err(BufferError::InvalidCapacity);
+        }
+        Ok(Self {
+            fragments: FragmentsBuffer {
+                #[cfg(feature = "proto-sixlowpan")]
+                decompress_buf: [0; MAX_DECOMPRESSED_LEN],
+                #[cfg(feature = "_proto-fragmentation")]
+                assembler: PacketAssemblerSet::try_new(reassembly_capacity)?,
+                #[cfg(feature = "_proto-fragmentation")]
+                reassembly_timeout: Duration::from_secs(60),
+            },
+            fragmenter: Fragmenter::try_new(fragmentation_capacity)?,
+        })
+    }
+}
+
+#[cfg(feature = "alloc")]
+/// 只在构造期申请并初始化后备，容量错误与真实分配失败分开返回。
+fn prepare_buffer(capacity: usize) -> Result<alloc::vec::Vec<u8>, BufferError> {
+    if capacity == 0 {
+        return Err(BufferError::InvalidCapacity);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| BufferError::NoMemory)?;
+    buffer.resize(capacity, 0);
+    Ok(buffer)
+}
+
 /// Problem when assembling: something was out of bounds.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -60,8 +117,8 @@ pub struct PacketAssembler<K> {
 }
 
 impl<K> PacketAssembler<K> {
-    /// Create a new empty buffer for fragments.
-    pub const fn new() -> Self {
+    /// 构造空元数据；实际槽位使用 try_new 准备后备。
+    const fn empty() -> Self {
         Self {
             key: None,
 
@@ -76,6 +133,21 @@ impl<K> PacketAssembler<K> {
         }
     }
 
+    /// 在接口构造期准备槽位，报文处理只访问已初始化的长度。
+    pub fn try_new(capacity: usize) -> Result<Self, BufferError> {
+        let mut assembler = Self::empty();
+        #[cfg(feature = "alloc")]
+        {
+            assembler.buffer = prepare_buffer(capacity)?;
+        }
+        #[cfg(not(feature = "alloc"))]
+        if capacity != REASSEMBLY_BUFFER_SIZE {
+            return Err(BufferError::InvalidCapacity);
+        }
+        Ok(assembler)
+    }
+
+    /// 清除重组状态并保留已准备的 payload 后备。
     pub fn reset(&mut self) {
         self.key = None;
         self.assembler.clear();
@@ -83,7 +155,7 @@ impl<K> PacketAssembler<K> {
         self.expires_at = Instant::ZERO;
     }
 
-    /// Set the total size of the packet assembler.
+    /// 设置已知总长；超出预备容量时返回错误，不在处理期分配。
     pub fn set_total_size(&mut self, size: usize) -> Result<(), AssemblerError> {
         if let Some(old_size) = self.total_size {
             if old_size != size {
@@ -91,14 +163,8 @@ impl<K> PacketAssembler<K> {
             }
         }
 
-        #[cfg(not(feature = "alloc"))]
         if self.buffer.len() < size {
             return Err(AssemblerError);
-        }
-
-        #[cfg(feature = "alloc")]
-        if self.buffer.len() < size {
-            self.buffer.resize(size, 0);
         }
 
         self.total_size = Some(size);
@@ -110,6 +176,7 @@ impl<K> PacketAssembler<K> {
         self.expires_at
     }
 
+    /// 原地写入后将实际长度登记到原 assembler；段表满明确拒绝。
     pub fn add_with(
         &mut self,
         offset: usize,
@@ -128,27 +195,18 @@ impl<K> PacketAssembler<K> {
             offset
         );
 
-        self.assembler.add(offset, len);
+        self.assembler
+            .add(offset, len)
+            .map_err(|_| AssemblerError)?;
         Ok(())
     }
 
-    /// Add a fragment into the packet that is being reassembled.
-    ///
-    /// # Errors
-    ///
-    /// - Returns [`Error::PacketAssemblerBufferTooSmall`] when trying to add data into the buffer at a non-existing
-    ///   place.
+    /// 将片段写入预备工作区；偏移溢出和超容量均拒绝。
     pub fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
-        #[cfg(not(feature = "alloc"))]
-        if self.buffer.len() < offset + data.len() {
+        let end = offset.checked_add(data.len()).ok_or(AssemblerError)?;
+        if self.buffer.len() < end {
             return Err(AssemblerError);
         }
-
-        #[cfg(feature = "alloc")]
-        if self.buffer.len() < offset + data.len() {
-            self.buffer.resize(offset + data.len(), 0);
-        }
-
         let len = data.len();
         self.buffer[offset..][..len].copy_from_slice(data);
 
@@ -158,7 +216,9 @@ impl<K> PacketAssembler<K> {
             offset
         );
 
-        self.assembler.add(offset, data.len());
+        self.assembler
+            .add(offset, data.len())
+            .map_err(|_| AssemblerError)?;
         Ok(())
     }
 
@@ -193,13 +253,17 @@ pub struct PacketAssemblerSet<K: Eq + Copy> {
 }
 
 impl<K: Eq + Copy> PacketAssemblerSet<K> {
-    const NEW_PA: PacketAssembler<K> = PacketAssembler::new();
+    const NEW_PA: PacketAssembler<K> = PacketAssembler::empty();
 
-    /// Create a new set of packet assemblers.
-    pub fn new() -> Self {
-        Self {
+    /// 在接口构造期逐槽准备有限重组后备，失败时归还已取得槽位。
+    pub fn try_new(capacity: usize) -> Result<Self, BufferError> {
+        let mut set = Self {
             assemblers: [Self::NEW_PA; REASSEMBLY_BUFFER_COUNT],
+        };
+        for slot in &mut set.assemblers {
+            *slot = PacketAssembler::try_new(capacity)?;
         }
+        Ok(set)
     }
 
     /// Get a [`PacketAssembler`] for a specific key.
@@ -228,13 +292,22 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
         Ok(slot)
     }
 
-    /// Remove all [`PacketAssembler`]s that are expired.
+    /// 在真实最早到期时清除占用，保留各槽的后备。
     pub fn remove_expired(&mut self, timestamp: Instant) {
         for frag in &mut self.assemblers {
-            if !frag.is_free() && frag.expires_at < timestamp {
+            if !frag.is_free() && frag.expires_at <= timestamp {
                 frag.reset();
             }
         }
+    }
+
+    /// 只报告仍持有重组责任的槽位的最早期限。
+    pub fn deadline(&self) -> Option<Instant> {
+        self.assemblers
+            .iter()
+            .filter(|slot| !slot.is_free())
+            .map(|slot| slot.expires_at)
+            .min()
     }
 }
 
@@ -268,19 +341,27 @@ pub struct Fragmenter {}
 
 #[cfg(not(feature = "_proto-fragmentation"))]
 impl Fragmenter {
-    pub fn new() -> Self {
-        Self {}
+    /// 未启用分片时不创建 payload 工作区。
+    pub fn try_new(_capacity: usize) -> Result<Self, BufferError> {
+        Ok(Self {})
     }
 }
 
 #[cfg(feature = "_proto-fragmentation")]
 pub struct Fragmenter {
-    /// The buffer that holds the unfragmented 6LoWPAN packet.
+    /// 完整未分片包的预备后备。
+    #[cfg(feature = "alloc")]
+    pub buffer: alloc::vec::Vec<u8>,
+    #[cfg(not(feature = "alloc"))]
     pub buffer: [u8; FRAGMENTATION_BUFFER_SIZE],
     /// The size of the packet without the IEEE802.15.4 header and the fragmentation headers.
     pub packet_len: usize,
     /// The amount of bytes that already have been transmitted.
     pub sent_bytes: usize,
+    /// 同一完整消息的设备 metadata，尾片沿原值发送。
+    pub meta: crate::phy::PacketMeta,
+    /// 压缩尾片仍保留其对应的真实 IP 目的。
+    pub destination: Option<IpAddress>,
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
     pub ipv4: Ipv4Fragmenter,
@@ -320,11 +401,21 @@ pub struct SixlowpanFragmenter {
 
 #[cfg(feature = "_proto-fragmentation")]
 impl Fragmenter {
-    pub fn new() -> Self {
-        Self {
+    /// 在接口构造期准备发送后备；传输时只改元数据和已有字节。
+    pub fn try_new(capacity: usize) -> Result<Self, BufferError> {
+        #[cfg(not(feature = "alloc"))]
+        if capacity != FRAGMENTATION_BUFFER_SIZE {
+            return Err(BufferError::InvalidCapacity);
+        }
+        Ok(Self {
+            #[cfg(feature = "alloc")]
+            buffer: prepare_buffer(capacity)?,
+            #[cfg(not(feature = "alloc"))]
             buffer: [0u8; FRAGMENTATION_BUFFER_SIZE],
             packet_len: 0,
             sent_bytes: 0,
+            meta: crate::phy::PacketMeta::default(),
+            destination: None,
 
             #[cfg(feature = "proto-ipv4-fragmentation")]
             ipv4: Ipv4Fragmenter {
@@ -350,7 +441,7 @@ impl Fragmenter {
                 ll_dst_addr: Ieee802154Address::Absent,
                 ll_src_addr: Ieee802154Address::Absent,
             },
-        }
+        })
     }
 
     /// Return `true` when everything is transmitted.
@@ -365,10 +456,12 @@ impl Fragmenter {
         self.packet_len == 0
     }
 
-    // Reset the buffer.
+    /// 清除发送责任并保留完整 payload 后备。
     pub fn reset(&mut self) {
         self.packet_len = 0;
         self.sent_bytes = 0;
+        self.meta = crate::phy::PacketMeta::default();
+        self.destination = None;
 
         #[cfg(feature = "proto-ipv4-fragmentation")]
         {
@@ -406,21 +499,23 @@ mod tests {
     }
 
     #[test]
+    /// 原重叠片段只在预备后备中覆盖相应字节。
     fn packet_assembler_overlap() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
 
         p_assembler.set_total_size(5).unwrap();
 
         let data = b"Rust";
-        p_assembler.add(&data[..], 0);
-        p_assembler.add(&data[..], 1);
+        p_assembler.add(&data[..], 0).unwrap();
+        p_assembler.add(&data[..], 1).unwrap();
 
         assert_eq!(p_assembler.assemble(), Some(&b"RRust"[..]))
     }
 
     #[test]
+    /// 预备后备中的原顺序重组仍交出完整 payload。
     fn packet_assembler_assemble() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
 
         let data = b"Hello World!";
 
@@ -435,8 +530,9 @@ mod tests {
     }
 
     #[test]
+    /// 预备后备中的乱序重组保留原洞表算法。
     fn packet_assembler_out_of_order_assemble() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
 
         let data = b"Hello World!";
 
@@ -451,17 +547,19 @@ mod tests {
     }
 
     #[test]
+    /// 预备后的槽位可为真实 key 取得重组责任。
     fn packet_assembler_set() {
         let key = Key { id: 1 };
 
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
 
         assert!(set.get(&key, Instant::ZERO).is_ok());
     }
 
     #[test]
+    /// 原固定槽位全部占用后明确拒绝新 key。
     fn packet_assembler_set_full() {
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
         for i in 0..REASSEMBLY_BUFFER_COUNT {
             set.get(&Key { id: i }, Instant::ZERO).unwrap();
         }
@@ -469,8 +567,9 @@ mod tests {
     }
 
     #[test]
+    /// 完成重组后同一预备槽位立即可供后继 key 使用。
     fn packet_assembler_set_assembling_many() {
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
 
         let key = Key { id: 0 };
         let assr = set.get(&key, Instant::ZERO).unwrap();
@@ -502,5 +601,32 @@ mod tests {
         let assr = set.get(&key, Instant::ZERO).unwrap();
         assr.add(&[0x01], 1).unwrap();
         assert_eq!(assr.assemble(), Some(&[0x00, 0x01][..]));
+    }
+
+    #[test]
+    /// 超容量和偏移溢出不扩后备，reset 后原槽仍可重用。
+    fn packet_assembler_capacity_and_expiry() {
+        let mut assembler = PacketAssembler::<Key>::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
+        assert_eq!(
+            assembler.set_total_size(REASSEMBLY_BUFFER_SIZE + 1),
+            Err(AssemblerError)
+        );
+        assert_eq!(assembler.add(&[1], usize::MAX), Err(AssemblerError));
+        assembler.set_total_size(2).unwrap();
+        assembler.add(&[7, 9], 0).unwrap();
+        assert_eq!(assembler.assemble(), Some(&[7, 9][..]));
+        let mut set = PacketAssemblerSet::try_new(REASSEMBLY_BUFFER_SIZE).unwrap();
+        let deadline = Instant::from_millis(42);
+        set.get(&Key { id: 1 }, deadline)
+            .unwrap()
+            .add(&[5], 0)
+            .unwrap();
+        assert_eq!(set.deadline(), Some(deadline));
+        set.remove_expired(deadline);
+        assert_eq!(set.deadline(), None);
+        set.get(&Key { id: 2 }, deadline)
+            .unwrap()
+            .set_total_size(1)
+            .unwrap();
     }
 }

@@ -124,6 +124,7 @@ fn client(kind: Client) {
 
 static CLIENT_DONE: AtomicBool = AtomicBool::new(false);
 
+/// 原 6LoWPAN 基准显式准备接口重组和分片后备。
 fn main() {
     #[cfg(feature = "log")]
     utils::setup_logging("info");
@@ -159,7 +160,12 @@ fn main() {
     config.random_seed = rand::random();
     config.pan_id = Some(Ieee802154Pan(0xbeef));
 
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::now(), buffers);
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs
             .push(IpCidr::new(

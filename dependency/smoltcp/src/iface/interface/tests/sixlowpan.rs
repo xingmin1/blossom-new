@@ -80,6 +80,7 @@ fn icmp_echo_request(#[case] medium: Medium) {
 
 #[test]
 #[cfg(feature = "proto-sixlowpan-fragmentation")]
+/// 原 6LoWPAN echo 的分片发送明确消费库返回结果。
 fn test_echo_request_sixlowpan_128_bytes() {
     use crate::phy::Checksum;
 
@@ -223,13 +224,16 @@ fn test_echo_request_sixlowpan_128_bytes() {
     );
 
     let tx_token = device.transmit(Instant::now()).unwrap();
-    iface.inner.dispatch_ieee802154(
-        Ieee802154Address::default(),
-        tx_token,
-        PacketMeta::default(),
-        result.unwrap(),
-        &mut iface.fragmenter,
-    );
+    iface
+        .inner
+        .dispatch_ieee802154(
+            Ieee802154Address::default(),
+            tx_token,
+            PacketMeta::default(),
+            result.unwrap(),
+            &mut iface.fragmenter,
+        )
+        .unwrap();
 
     assert_eq!(
         device.tx_queue.pop_front().unwrap(),
@@ -263,6 +267,7 @@ fn test_echo_request_sixlowpan_128_bytes() {
 
 #[test]
 #[cfg(feature = "proto-sixlowpan-fragmentation")]
+/// 原分片重组交 UDP 单条记录并保实际来源。
 fn test_sixlowpan_udp_with_fragmentation() {
     use crate::phy::Checksum;
     use crate::socket::udp;
@@ -372,28 +377,31 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
     );
 
     let tx_token = device.transmit(Instant::now()).unwrap();
-    iface.inner.dispatch_ieee802154(
-        Ieee802154Address::default(),
-        tx_token,
-        PacketMeta::default(),
-        Packet::new_ipv6(
-            Ipv6Repr {
-                src_addr: Ipv6Address::UNSPECIFIED,
-                dst_addr: Ipv6Address::UNSPECIFIED,
-                next_header: IpProtocol::Udp,
-                payload_len: udp_data.len(),
-                hop_limit: 64,
-            },
-            IpPayload::Udp(
-                UdpRepr {
-                    src_port: 1234,
-                    dst_port: 1234,
+    iface
+        .inner
+        .dispatch_ieee802154(
+            Ieee802154Address::default(),
+            tx_token,
+            PacketMeta::default(),
+            Packet::new_ipv6(
+                Ipv6Repr {
+                    src_addr: Ipv6Address::UNSPECIFIED,
+                    dst_addr: Ipv6Address::UNSPECIFIED,
+                    next_header: IpProtocol::Udp,
+                    payload_len: udp_data.len(),
+                    hop_limit: 64,
                 },
-                udp_data,
+                IpPayload::Udp(
+                    UdpRepr {
+                        src_port: 1234,
+                        dst_port: 1234,
+                    },
+                    udp_data,
+                ),
             ),
-        ),
-        &mut iface.fragmenter,
-    );
+            &mut iface.fragmenter,
+        )
+        .unwrap();
 
     iface.poll(Instant::now(), &mut device, &mut sockets);
 

@@ -70,12 +70,9 @@ impl<'p> Packet<'p> {
         }
     }
 
-    pub fn emit_payload(
-        &self,
-        _ip_repr: &IpRepr,
-        payload: &mut [u8],
-        caps: &DeviceCapabilities,
-    ) {
+    /// 将已选协议表示编码到实际 TX 后备，设备能力只参与校验和处理。
+    /// TCP 窗口必须保持 raw 在成功发送时提交的信用，编码层不得按 burst 再裁剪。
+    pub fn emit_payload(&self, _ip_repr: &IpRepr, payload: &mut [u8], caps: &DeviceCapabilities) {
         match self.payload() {
             #[cfg(feature = "proto-ipv4")]
             IpPayload::Icmpv4(icmpv4_repr) => {
@@ -141,25 +138,7 @@ impl<'p> Packet<'p> {
                 &caps.checksum,
             ),
             #[cfg(feature = "socket-tcp")]
-            IpPayload::Tcp(mut tcp_repr) => {
-                // This is a terrible hack to make TCP performance more acceptable on systems
-                // where the TCP buffers are significantly larger than network buffers,
-                // e.g. a 64 kB TCP receive buffer (and so, when empty, a 64k window)
-                // together with four 1500 B Ethernet receive buffers. If left untreated,
-                // this would result in our peer pushing our window and sever packet loss.
-                //
-                // I'm really not happy about this "solution" but I don't know what else to do.
-                if let Some(max_burst_size) = caps.max_burst_size {
-                    let mut max_segment_size = caps.max_transmission_unit;
-                    max_segment_size -= _ip_repr.header_len();
-                    max_segment_size -= tcp_repr.header_len();
-
-                    let max_window_size = max_burst_size * max_segment_size;
-                    if tcp_repr.window_len as usize > max_window_size {
-                        tcp_repr.window_len = max_window_size as u16;
-                    }
-                }
-
+            IpPayload::Tcp(tcp_repr) => {
                 tcp_repr.emit(
                     &mut TcpPacket::new_unchecked(payload),
                     &_ip_repr.src_addr(),

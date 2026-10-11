@@ -1,51 +1,52 @@
-//! 路由只从真实本机配置选择源地址，不修改通配绑定。
+//! 路由只携带库接口当次选择的小值，地址、Routes 与邻居状态留在原 Interface。
+
+use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Cidr};
 
 use crate::fs::FsError;
-use crate::net::LOOPBACK_MTU;
 
-/// 当前路径选定的源地址和完整 IPv4 MTU。
+/// 同一协议域的两种实际交付介质。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceId {
+    Loopback,
+    Ethernet,
+}
+
+/// 控制入口的一次 IPv4 配置值，提交后由库接口保存真实配置。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EthernetConfig {
+    pub address: [u8; 4],
+    pub prefix_len: u8,
+    pub gateway: Option<[u8; 4]>,
+}
+
+impl EthernetConfig {
+    /// 在写入库接口前核静态配置边界，不创建第二个路由或地址集合。
+    pub fn validate(self) -> Result<(), FsError> {
+        if 32 < self.prefix_len || !unicast(self.address) {
+            return Err(FsError::InvalidOperation);
+        }
+        if let Some(gateway) = self.gateway {
+            if !unicast(gateway)
+                || gateway == self.address
+                || !Ipv4Cidr::new(Ipv4Address::from(self.address), self.prefix_len)
+                    .contains_addr(&Ipv4Address::from(gateway))
+            {
+                return Err(FsError::InvalidOperation);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 一次库路由选择的源和 MTU，下一跳及邻居解析继续由同一库接口负责。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Route {
-    pub source: [u8; 4],
+    pub interface: InterfaceId,
+    pub source: IpAddress,
     pub mtu: usize,
 }
 
-/// 唯一本地接口持实际地址与前缀，不含尚未存在的外部接口。
-pub struct RouteTable {
-    loopback: Route,
-}
-
-impl RouteTable {
-    /// 建立 lo 的 127.0.0.1/8 与 1500 字节 MTU，不产生异步工作。
-    pub fn new_loopback() -> Self {
-        Self {
-            loopback: Route {
-                source: [127, 0, 0, 1],
-                mtu: LOOPBACK_MTU,
-            },
-        }
-    }
-
-    /// lo 的整个 127/8 前缀均按本机目的地址处理。
-    pub fn is_local(&self, address: [u8; 4]) -> bool {
-        address[0] == self.loopback.source[0]
-    }
-
-    /// 先核具体绑定源，再找目的路径；通配仅在返回值中选择实际 lo 源。
-    pub fn resolve(&self, destination: [u8; 4], bound_source: [u8; 4]) -> Result<Route, FsError> {
-        if bound_source != [0; 4] && !self.is_local(bound_source) {
-            return Err(FsError::AddressNotAvailable);
-        }
-        if !self.is_local(destination) {
-            return Err(FsError::NetworkUnreachable);
-        }
-        Ok(Route {
-            source: if bound_source == [0; 4] {
-                self.loopback.source
-            } else {
-                bound_source
-            },
-            mtu: self.loopback.mtu,
-        })
-    }
+/// 当前静态 eth0 控制入口只接受非回环 IPv4 单播值。
+fn unicast(address: [u8; 4]) -> bool {
+    address[0] != 0 && address[0] != 127 && address[0] < 224
 }

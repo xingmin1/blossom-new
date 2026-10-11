@@ -82,6 +82,11 @@ impl Routes {
         f(&mut self.storage);
     }
 
+    /// 只读真实路由项，供控制查询读取默认网关而不复制配置。
+    pub fn iter(&self) -> impl Iterator<Item = &Route> {
+        self.storage.iter()
+    }
+
     /// Add a default ipv4 gateway (ie. "ip route add 0.0.0.0/0 via `gateway`").
     ///
     /// On success, returns the previous default route, if any.

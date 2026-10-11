@@ -14,6 +14,7 @@ use smoltcp::wire::{
 const MDNS_PORT: u16 = 5353;
 const MDNS_GROUP: Ipv4Address = Ipv4Address::new(224, 0, 0, 251);
 
+/// 原 multicast 示例使用显式预备的接口工作区。
 fn main() {
     utils::setup_logging("warn");
 
@@ -37,7 +38,12 @@ fn main() {
     };
     config.random_seed = rand::random();
 
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let buffers = smoltcp::iface::InterfaceBuffers::try_new(
+        smoltcp::config::FRAGMENTATION_BUFFER_SIZE,
+        smoltcp::config::REASSEMBLY_BUFFER_SIZE,
+    )
+    .unwrap();
+    let mut iface = Interface::new(config, &mut device, Instant::now(), buffers);
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs
             .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))

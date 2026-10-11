@@ -2,20 +2,27 @@
 
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use smoltcp::storage::RingBuffer;
 
+use crate::fs::pipe::{PipeBuffer, PIPE_BUF};
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
-use crate::fs::{FsError, ReadBuffer};
+use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::SocketAddress;
-use crate::net::packet::zeroed_bytes;
 use crate::net::{EndpointSlot, IoProgress, NetStack, NetStackRef};
 use crate::sync::{SleepMutex, SpinLock};
 
-const STREAM_CAPACITY: usize = 16 * 1024;
-const SENDER_CLOSED: usize = 1 << 16;
-const RECEIVER_CLOSED: usize = 1 << 17;
-const BYTES_MASK: usize = SENDER_CLOSED - 1;
+const STREAM_CAPACITY: usize = 4 * PIPE_BUF;
+const SPACE_SHIFT: u32 = 15;
+const BYTES_MASK: usize = (1 << SPACE_SHIFT) - 1;
+const SPACE_MASK: usize = BYTES_MASK << SPACE_SHIFT;
+const SENDER_CLOSED: usize = 1 << (2 * SPACE_SHIFT);
+const RECEIVER_CLOSED: usize = 1 << (2 * SPACE_SHIFT + 1);
 const CLOSED_MASK: usize = SENDER_CLOSED | RECEIVER_CLOSED;
+const _: () = {
+    assert!(STREAM_CAPACITY <= BYTES_MASK);
+    assert!(SPACE_MASK & BYTES_MASK == 0);
+    assert!(CLOSED_MASK & (BYTES_MASK | SPACE_MASK) == 0);
+    assert!(2 * SPACE_SHIFT + 1 < usize::BITS);
+};
 
 /// 每个方向只串行该方向的生产、交付及关闭，用户故障不占反向锁。
 struct Direction {
@@ -24,27 +31,28 @@ struct Direction {
 }
 
 struct DirectionState {
-    ring: RingBuffer<'static, u8>,
+    ring: PipeBuffer<4>,
     sender_closed: bool,
     receiver_closed: bool,
 }
 
 impl Direction {
-    /// 准备真实固定容量环，尚未发表时的错误由拥有值完整回收。
-    fn try_new() -> Result<Self, FsError> {
-        Ok(Self {
+    /// 准备空的四槽原页 FIFO，数据页只在发送真实提交时按需申请。
+    fn new() -> Self {
+        Self {
             state: SleepMutex::new(DirectionState {
-                ring: RingBuffer::new(zeroed_bytes(STREAM_CAPACITY)?),
+                ring: PipeBuffer::new(),
                 sender_closed: false,
                 receiver_closed: false,
             }),
-            snapshot: AtomicUsize::new(0),
-        })
+            snapshot: AtomicUsize::new(STREAM_CAPACITY << SPACE_SHIFT),
+        }
     }
 
-    /// 持方向保护发布只读快照，poll 不等待正在交付用户字节的方向。
+    /// 持方向保护同时发布字节、真实空间及关闭位，poll 不等正在交付的方向。
     fn publish(&self, state: &DirectionState) {
         let snapshot = state.ring.len()
+            | (state.ring.space() << SPACE_SHIFT)
             | if state.sender_closed {
                 SENDER_CLOSED
             } else {
@@ -81,7 +89,7 @@ pub struct UnixEndpoint {
 }
 
 impl UnixPair {
-    /// 完整准备两个环、持续源及节点；根只能在全部成功后取得 pair 拥有。
+    /// 完整准备两个方向 FIFO、持续源及节点；根只在全部成功后取得 pair 拥有。
     pub fn try_new(
         net: &NetStackRef,
         ids: [u64; 2],
@@ -90,7 +98,7 @@ impl UnixPair {
         let pair = Arc::try_new(Self {
             id: ids[0],
             net: Arc::downgrade(net),
-            directions: [Direction::try_new()?, Direction::try_new()?],
+            directions: [Direction::new(), Direction::new()],
             sources: [
                 Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
                 Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
@@ -125,7 +133,7 @@ impl UnixPair {
         self.id
     }
 
-    /// 从真实环提交的快照查询就绪，不获取睡眠锁或产生通知。
+    /// 从真实 FIFO 的字节、物理空间和关闭快照查询就绪，不获取睡眠锁或通知。
     fn mask(&self, side: usize) -> PollMask {
         let incoming = self.directions[1 - side].snapshot.load(Ordering::Acquire);
         let outgoing = self.directions[side].snapshot.load(Ordering::Acquire);
@@ -139,7 +147,7 @@ impl UnixPair {
             mask |= PollMask::POLLRDHUP;
         }
         // 关闭后的发送会立即报错，仍须允许等待发送的任务重新查询。
-        if outgoing & BYTES_MASK < STREAM_CAPACITY || write_closed {
+        if 0 < (outgoing & SPACE_MASK) >> SPACE_SHIFT || write_closed {
             mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
         }
         if read_closed && write_closed {
@@ -231,7 +239,7 @@ impl UnixEndpoint {
         Weak::ptr_eq(&self.pair.net, &Arc::downgrade(net))
     }
 
-    /// 接收只占 incoming 方向；结束环借用后 copyout，按实际差量消费前缀。
+    /// 接收只占 incoming 方向，共同 FIFO 按实际差量消费；PEEK 不产生容量通知。
     pub fn receive(&self, target: &mut ReadBuffer<'_>, peek: bool) -> Result<IoProgress, FsError> {
         let direction = &self.pair.directions[1 - self.side];
         let mut state = direction.state.lock();
@@ -249,29 +257,22 @@ impl UnixEndpoint {
                 IoProgress::Blocked
             });
         }
+        let space = state.ring.space();
         let before = target.copied();
-        let mut prefix = [0u8; 4096];
-        let capacity = (target.len() - before).min(prefix.len());
-        let length = state.ring.read_allocated(0, &mut prefix[..capacity]);
-        let result = target.push(&prefix[..length]);
+        let result = state.ring.receive(target, peek);
         let copied = target.copied() - before;
         if !peek && 0 < copied {
-            state.ring.dequeue_allocated(copied);
             direction.publish(&state);
         }
-        let writable = !state.sender_closed && !state.receiver_closed;
+        let writable = !state.sender_closed && !state.receiver_closed && space < state.ring.space();
         drop(state);
-        if !peek && 0 < copied && writable {
+        if !peek && writable {
             self.pair.sources[1 - self.side].notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
         }
-        if 0 < copied {
-            Ok(IoProgress::Ready(copied))
-        } else {
-            result.map(|_| IoProgress::Ready(0))
-        }
+        result.map(IoProgress::Ready)
     }
 
-    /// 只提交调用者已准备的内核前缀；空输入也先检查真实错误和发送关闭事实。
+    /// 已准备的内核前缀逐页提交，接受量只取 append 结果；空输入仍先检查发送关闭。
     pub fn send(&self, source: &[u8]) -> Result<IoProgress, FsError> {
         let direction = &self.pair.directions[self.side];
         let mut state = direction.state.lock();
@@ -285,7 +286,22 @@ impl UnixEndpoint {
         if source.is_empty() {
             return Ok(IoProgress::Ready(0));
         }
-        let accepted = state.ring.enqueue_slice(source);
+        let mut source = WriteBuffer::kernel(source);
+        let mut accepted = 0;
+        while source.copied() < source.len() && 0 < state.ring.space() {
+            match state.ring.append(&mut source) {
+                Ok(count) => {
+                    assert!(0 < count, "UNIX copyin made no progress");
+                    accepted += count;
+                }
+                Err(error) => {
+                    if accepted == 0 {
+                        return Err(error);
+                    }
+                    break;
+                }
+            }
+        }
         if accepted == 0 {
             return Ok(IoProgress::Blocked);
         }

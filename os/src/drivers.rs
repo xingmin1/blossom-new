@@ -13,6 +13,7 @@ use crate::{
 
 pub mod pci;
 pub mod virtio;
+pub mod virtio_net;
 
 use crate::drivers::pci::PciInventory;
 
@@ -49,18 +50,32 @@ pub struct MmioBlockCandidate {
     pub interrupt: IrqNumber,
 }
 
-/// 分开保存 MMIO block 候选与所有 PCI 功能，不预先创建磁盘实例。
+/// 实际 DeviceID=1 的 MMIO network 候选，独立于磁盘编号与选择。
+#[derive(Debug)]
+pub struct MmioNetCandidate {
+    pub registers: Region,
+    pub version: u32,
+    pub vendor_id: u32,
+    pub interrupt: IrqNumber,
+}
+
+/// 分开保存 MMIO 块、网络候选与所有 PCI 功能，不预先创建设备实例。
 pub struct DeviceInventory {
     pub mmio_blocks: Vec<MmioBlockCandidate>,
+    pub mmio_networks: Vec<MmioNetCandidate>,
     pub pci: PciInventory,
 }
 
-/// 普通 init Task 一次读取启用资源；无首盘返回，不设置 queue 或 DRIVER_OK。
+/// 普通 init Task 一次读取块、网络及 PCI 启用资源，不设置 queue 或 DRIVER_OK。
 pub fn discover() -> Result<DeviceInventory, ProbeError> {
     drop(task::current_task());
     let info = boot::info();
     let mut mmio_blocks = Vec::new();
     mmio_blocks
+        .try_reserve_exact(info.virtio_mmio_count)
+        .map_err(|_| ProbeError::NoMemory)?;
+    let mut mmio_networks = Vec::new();
+    mmio_networks
         .try_reserve_exact(info.virtio_mmio_count)
         .map_err(|_| ProbeError::NoMemory)?;
     for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
@@ -90,11 +105,23 @@ pub fn discover() -> Result<DeviceInventory, ProbeError> {
                 vendor_id,
                 interrupt: irq::map_source(resource.interrupt_source)?,
             });
+        } else if device_id == 1 {
+            mmio_networks.push(MmioNetCandidate {
+                registers: resource.registers,
+                version,
+                vendor_id,
+                interrupt: irq::map_source(resource.interrupt_source)?,
+            });
         }
     }
     mmio_blocks.sort_unstable_by_key(|candidate| candidate.registers.start);
+    mmio_networks.sort_unstable_by_key(|candidate| candidate.registers.start);
     let pci = PciInventory::discover(info)?;
-    Ok(DeviceInventory { mmio_blocks, pci })
+    Ok(DeviceInventory {
+        mmio_blocks,
+        mmio_networks,
+        pci,
+    })
 }
 
 /// checked CPU PA→强序 VA 换算；可访问映射由 AP 前架构初始化负责。

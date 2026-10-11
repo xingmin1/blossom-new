@@ -1,4 +1,4 @@
-//! 普通静态 TCP 程序复用原用户身份图、文件表和整组网络域。
+//! 普通静态网络程序复用原用户身份图、文件表和整组网络域。
 
 use super::*;
 use crate::fs::FileRef;
@@ -23,6 +23,14 @@ pub(super) enum NetworkMode {
     UnixPair,
     MessageVector,
     SocketOptions,
+    Ipv6Tcp,
+    Ipv6Udp,
+    Ipv6Mapped,
+    BufferBudget,
+    ProtocolOptions,
+    LargeLoopback,
+    NicTcp,
+    NicUdp,
 }
 
 impl NetworkMode {
@@ -43,6 +51,14 @@ impl NetworkMode {
             Self::UnixPair => b"unix-pair",
             Self::MessageVector => b"message-vector",
             Self::SocketOptions => b"socket-options",
+            Self::Ipv6Tcp => b"ipv6-tcp",
+            Self::Ipv6Udp => b"ipv6-udp",
+            Self::Ipv6Mapped => b"ipv6-mapped",
+            Self::BufferBudget => b"buffer-budget",
+            Self::ProtocolOptions => b"protocol-options",
+            Self::LargeLoopback => b"large-loopback",
+            Self::NicTcp => b"nic-tcp",
+            Self::NicUdp => b"nic-udp",
         }
     }
 
@@ -137,14 +153,27 @@ impl UserOwner {
         } else {
             None
         };
-        let mut argv: [&[u8]; 4] = [PROGRAM, mode.argument(), &[], &[]];
-        let (ready_text, ready_start) = decimal_fd(channels.as_ref().map_or(0, |x| x.2));
-        let (go_text, go_start) = decimal_fd(channels.as_ref().map_or(0, |x| x.3));
-        argv[2] = &ready_text[ready_start..];
-        argv[3] = &go_text[go_start..];
+        let nic = matches!(mode, NetworkMode::NicTcp | NetworkMode::NicUdp);
+        let (first, second) = if nic {
+            let (tcp, udp) = nic_ports()?.ok_or(TestError("network NIC ports are missing"))?;
+            (usize::from(tcp), usize::from(udp))
+        } else {
+            (
+                channels.as_ref().map_or(0, |x| x.2),
+                channels.as_ref().map_or(0, |x| x.3),
+            )
+        };
+        let (first_text, first_start) = decimal_fd(first);
+        let (second_text, second_start) = decimal_fd(second);
+        let argv: [&[u8]; 4] = [
+            PROGRAM,
+            mode.argument(),
+            &first_text[first_start..],
+            &second_text[second_start..],
+        ];
         let arguments = Arguments::from_kernel(
             PROGRAM,
-            &argv[..if channels.is_some() { 4 } else { 2 }],
+            &argv[..if nic || channels.is_some() { 4 } else { 2 }],
             &[],
         )
         .map_err(|_| TestError("network user arguments failed"))?;
@@ -395,7 +424,57 @@ fn coordinate(
     }
 }
 
-/// 描述符参数只在准备期编码一次，固定栈数组不创建额外字符串拥有。
+/// 两个明确的启动端口必须成对且各出现一次；没有 token 时保留原 lo 域。
+pub(super) fn nic_ports() -> Result<Option<(u16, u16)>, TestError> {
+    let mut tcp = None;
+    let mut udp = None;
+    for token in crate::boot::info()
+        .bootargs()
+        .split(|byte| byte.is_ascii_whitespace())
+    {
+        let (slot, value) = if let Some(value) = token.strip_prefix(b"ktest-net-tcp=") {
+            (&mut tcp, value)
+        } else if let Some(value) = token.strip_prefix(b"ktest-net-udp=") {
+            (&mut udp, value)
+        } else if token == b"ktest-net-tcp" || token == b"ktest-net-udp" {
+            return Err(TestError("network NIC port token has no value"));
+        } else {
+            continue;
+        };
+        if slot.is_some() {
+            return Err(TestError("network NIC port token is duplicated"));
+        }
+        *slot = Some(service_port(value)?);
+    }
+    match (tcp, udp) {
+        (Some(tcp), Some(udp)) => Ok(Some((tcp, udp))),
+        (None, None) => Ok(None),
+        _ => Err(TestError("network NIC ports must be supplied together")),
+    }
+}
+
+/// 服务端口只接受十进制数字的 1..65535，空值、符号和溢出均是设置错误。
+fn service_port(bytes: &[u8]) -> Result<u16, TestError> {
+    let mut port = 0u16;
+    if bytes.is_empty() {
+        return Err(TestError("network NIC port is empty"));
+    }
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return Err(TestError("network NIC port is not decimal"));
+        }
+        port = port
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u16::from(byte - b'0')))
+            .ok_or(TestError("network NIC port exceeds 65535"))?;
+    }
+    if port == 0 {
+        return Err(TestError("network NIC port is zero"));
+    }
+    Ok(port)
+}
+
+/// 描述符或服务端口只在准备期编码一次，固定栈数组不创建额外字符串拥有。
 fn decimal_fd(mut value: usize) -> ([u8; 20], usize) {
     let mut bytes = [0u8; 20];
     let mut start = bytes.len();

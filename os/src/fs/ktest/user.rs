@@ -7,6 +7,7 @@ use crate::fs::ktest::user::network::NetworkMode;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
+use crate::net::route::EthernetConfig;
 use crate::net::{NetStack, NetStackOwner, NetStackRef};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
@@ -53,10 +54,26 @@ struct UserSuite {
 }
 
 impl Fixture for UserSuite {
-    /// 整组只发现一次设备并准备一次网络域，失败仍交原 suite 设置错误路径处理。
+    /// 整组只发现一次设备；成对服务端口选择真实 NIC，没有 token 时明确构造 lo。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+        let ports = network::nic_ports()?;
         let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
-        let net_owner = checked(context, NetStack::try_new_lo())?;
+        let net_owner = if ports.is_some() {
+            // SAFETY: 框架串行分派 suite，前组已同步停止 NIC；本组是所选设备唯一构造者。
+            // 库存来自一次真实 discover，永久强序映射有效，库存保留到网络 owner 完整停止之后。
+            let owner = checked(context, unsafe { NetStack::try_new_nic(&inventory) })?;
+            checked(
+                context,
+                owner.stack().configure_ethernet(EthernetConfig {
+                    address: [10, 0, 2, 15],
+                    prefix_len: 24,
+                    gateway: Some([10, 0, 2, 2]),
+                }),
+            )?;
+            owner
+        } else {
+            checked(context, NetStack::try_new_lo())?
+        };
         let net = Arc::clone(net_owner.stack());
         Ok(Self {
             net_owner: Some(net_owner),
@@ -1390,6 +1407,26 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
 pub(crate) mod programs {
     use super::*;
 
+    /// 普通 TCP 经实际 NIC 与宿主核验双向全文、短前缀、半关闭和真实地址。
+    #[test]
+    #[ktest(
+        tags("network-user", "network-nic", "network-nic-tcp"),
+        resources("net-user")
+    )]
+    fn network_nic_tcp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::NicTcp)
+    }
+
+    /// 同一普通 UDP socket 经实际 NIC 消费三条完整响应并拒绝超 MTU 消息。
+    #[test]
+    #[ktest(
+        tags("network-user", "network-nic", "network-nic-udp"),
+        resources("net-user")
+    )]
+    fn network_nic_udp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::NicUdp)
+    }
+
     /// 普通用户身份创建 socket，并核验共享 OFD 与独立描述符 flags。
     #[test]
     #[ktest(tags("network-user", "network-tcp"))]
@@ -1492,6 +1529,54 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.network_mode(context, NetworkMode::SocketOptions)
+    }
+
+    /// 普通 IPv6 TCP 握手、名称容量、双向全文与半关闭沿真实用户 fork 和 reap。
+    #[test]
+    #[ktest(tags("network-user", "network-ipv6", "network-tcp"))]
+    fn network_ipv6_tcp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Ipv6Tcp)
+    }
+
+    /// 两个 ::1 UDP 目的与默认 peer、大 lo 消息和 LP64 向量由普通 syscall 核验。
+    #[test]
+    #[ktest(tags("network-user", "network-ipv6", "network-udp"))]
+    fn network_ipv6_udp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Ipv6Udp)
+    }
+
+    /// 双面监听共用同一 OFD，映射名称、端口冲突及 V6ONLY 隔离由普通连接核验。
+    #[test]
+    #[ktest(tags("network-user", "network-ipv6"))]
+    fn network_ipv6_mapped(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Ipv6Mapped)
+    }
+
+    /// TCP 发送满后恢复，UDP 单消息按预算接纳，缩小不丢两者已接受的数据。
+    #[test]
+    #[ktest(tags("network-user", "network-buffer"))]
+    fn network_buffer_budget(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::BufferBudget)
+    }
+
+    /// 双族真实连接查询 MSS、Reno 及开关，非 TCP 请求和选项容量保正式 ABI 错误。
+    #[test]
+    #[ktest(tags("network-user", "network-options"))]
+    fn network_protocol_options(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::ProtocolOptions)
+    }
+
+    /// 大 lo UDP 保单条消息、全文及来源，分别核两族协议上界与下一字节拒绝。
+    #[test]
+    #[ktest(tags("network-user", "network-large"))]
+    fn network_large_loopback(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::LargeLoopback)
     }
 
     /// 真实 ELF 的边缘、BSS、参数和缓存私有性由 loader 与实际用户指令共同验证。

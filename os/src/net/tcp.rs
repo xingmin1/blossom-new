@@ -6,13 +6,13 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
-use smoltcp::socket::tcp::State;
-use smoltcp::wire::TcpControl;
+use smoltcp::socket::tcp::{CongestionControl, State};
+use smoltcp::wire::{IpAddress, TcpControl};
 use spin::Once;
 
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
-use crate::net::address::InetEndpoint;
+use crate::net::address::{AddressFamily, InetEndpoint};
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
 use crate::net::table::{BindLease, TcpTuple, TransportProtocol};
@@ -44,6 +44,7 @@ struct Metadata {
     read_closed: bool,
     write_closed: bool,
     reuse: bool,
+    v6_only: bool,
 }
 
 /// 半连接与可接受连接共享实际 backlog 上限，只有成熟 Established 才进入 ready。
@@ -56,6 +57,7 @@ struct Children {
 /// 表强持稳定节点，节点弱指网络域和 listener；普通 Work 固定轮转 CPU。
 pub struct TcpEndpoint {
     id: u64,
+    family: AddressFamily,
     stack: Weak<NetStack>,
     core: SleepMutex<TcpCore>,
     input: SpinLock<Input>,
@@ -150,19 +152,23 @@ impl Drop for TcpOperationGuard<'_> {
 }
 
 impl TcpEndpoint {
-    /// 根取得额度和核心后准备异步节点，Work 与 Timer 使用独立轮转的同一 CPU。
+    /// 在原域环境准备唯一核心和异步节点，Work 与 Timer 固定在独立轮转的同一 CPU。
     pub(crate) fn try_new(
         net: &NetStackRef,
         id: u64,
-        core: TcpCore,
         slot: EndpointSlot,
+        family: AddressFamily,
+        rx_len: usize,
+        tx_len: usize,
     ) -> Result<Arc<Self>, FsError> {
+        let core = net.new_core(id, rx_len, tx_len)?;
         let mut packets = VecDeque::new();
         packets
             .try_reserve_exact(LOOPBACK_CAPACITY)
             .map_err(|_| FsError::NoMemory)?;
         let endpoint = Arc::try_new(Self {
             id,
+            family,
             stack: Arc::downgrade(net),
             core: SleepMutex::new(core),
             input: SpinLock::new(Input {
@@ -180,6 +186,7 @@ impl TcpEndpoint {
                 read_closed: false,
                 write_closed: false,
                 reuse: false,
+                v6_only: false,
             }),
             children: SpinLock::new(Children {
                 limit: 0,
@@ -395,7 +402,7 @@ impl TcpEndpoint {
                     .map(|lease| lease.local())
             })
             .unwrap_or(InetEndpoint {
-                address: [0; 4],
+                address: self.family.unspecified(),
                 port: 0,
             }))
     }
@@ -466,17 +473,110 @@ impl TcpEndpoint {
         self.observe().send_capacity()
     }
 
+    /// 端点族由创建时确定，mapped child 不从实际报文族改写 OFD 身份。
+    pub fn family(&self) -> AddressFamily {
+        self.family
+    }
+
+    /// 与绑定及 raw 配置共用本连接的操作拥有，观察不驱动协议。
+    pub fn v6_only(&self) -> bool {
+        let _core = self.observe();
+        self.metadata.lock().v6_only
+    }
+
+    /// 只允许未绑定的 IPv6 端点修改双族策略。
+    pub fn set_v6_only(&self, enabled: bool) -> Result<(), FsError> {
+        let _core = self.lock();
+        if self.family != AddressFamily::Ipv6 {
+            return Err(FsError::Unsupported);
+        }
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        let mut metadata = self.metadata.lock();
+        if metadata.lease.is_some() || metadata.engaged {
+            return Err(FsError::InvalidOperation);
+        }
+        metadata.v6_only = enabled;
+        Ok(())
+    }
+
+    /// 查询原核心的探测配置，不保存第二份 KEEPALIVE 开关。
+    pub fn keepalive(&self) -> bool {
+        self.observe().keepalive()
+    }
+
+    /// 释放修改保护后沿原 Work 和方向通知安排探测配置变化。
+    pub fn set_keepalive(&self, enabled: bool) -> Result<(), FsError> {
+        let mut core = self.lock();
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        core.set_keepalive(enabled);
+        Ok(())
+    }
+
+    /// 返回真实接收接纳预算，独立于 child 所需的物理后备容量。
+    pub fn receive_budget(&self) -> usize {
+        self.observe().receive_budget()
+    }
+
+    /// 返回 raw 未 ACK 字节共同占用的发送接纳预算。
+    pub fn send_budget(&self) -> usize {
+        self.observe().send_budget()
+    }
+
+    /// 在同一 raw 对象上调节窗口预算，原数据和旧信用保持拥有。
+    pub fn set_receive_budget(&self, budget: usize) -> Result<(), FsError> {
+        let mut core = self.lock();
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        core.set_receive_budget(budget)
+    }
+
+    /// 在同一 raw 对象上调节发送预算，真实恢复的 OUT 在核心解锁后通知。
+    pub fn set_send_budget(&self, budget: usize) -> Result<(), FsError> {
+        let mut core = self.lock();
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        core.set_send_budget(budget)
+    }
+
+    /// 使用原分段决策查询 MSS，已连接 tuple 由 raw 选择实际协议族。
+    pub fn effective_mss(&self) -> usize {
+        self.observe().effective_mss(self.family)
+    }
+
+    /// 返回该端点实际启用的原拥塞控制器。
+    pub fn congestion_control(&self) -> CongestionControl {
+        self.observe().congestion_control()
+    }
+
+    /// ABI 已完成 mapped 正规化，端点仅核对核心小值与本端点策略。
+    fn check_address(&self, address: IpAddress, connecting: bool) -> Result<(), FsError> {
+        match (self.family, address) {
+            (AddressFamily::Ipv4, IpAddress::Ipv6(_)) => Err(FsError::AddressFamilyNotSupported),
+            (AddressFamily::Ipv6, IpAddress::Ipv4(_)) if self.metadata.lock().v6_only => {
+                Err(if connecting {
+                    FsError::NetworkUnreachable
+                } else {
+                    FsError::InvalidOperation
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// 取得仍存在的网络域，停止后的操作不得再发表新索引。
     fn net(&self) -> Result<NetStackRef, FsError> {
         self.stack.upgrade().ok_or(FsError::NotConnected)
     }
 
-    /// 源地址校验与真正端口预留在控制发表阶段完成，通配值保持原样。
+    /// 同一操作拥有核对族及绑定策略，成功具体 IPv6 绑定同时固定 V6ONLY。
     pub fn bind(self: &Arc<Self>, local: InetEndpoint) -> Result<InetEndpoint, FsError> {
         let core = self.lock();
         if core.state() != State::Closed || self.metadata.lock().engaged {
             return Err(FsError::InvalidOperation);
         }
+        self.check_address(local.address, false)?;
         let net = self.net()?;
         let _admission = net.admission()?;
         if self.metadata.lock().lease.is_some() {
@@ -488,9 +588,14 @@ impl TcpEndpoint {
             TransportProtocol::Tcp,
             local,
             self.reuse_address(),
+            local.address == AddressFamily::Ipv6.unspecified() && !self.metadata.lock().v6_only,
         )?;
         let local = lease.local();
-        self.metadata.lock().lease = Some(lease);
+        let mut metadata = self.metadata.lock();
+        if matches!(local.address, IpAddress::Ipv6(_)) && !local.is_unspecified() {
+            metadata.v6_only = true;
+        }
+        metadata.lease = Some(lease);
         Ok(local)
     }
 
@@ -545,7 +650,7 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 首次发表实际 tuple；进行中和曾连接成功的重复调用不重新启动握手。
+    /// 首次发表实际双族 tuple；路由选源及 MTU 更新发生在同一核心握手之前。
     pub fn connect(self: &Arc<Self>, peer: InetEndpoint) -> Result<(), FsError> {
         let mut core = self.lock();
         let metadata = self.metadata.lock();
@@ -559,14 +664,16 @@ impl TcpEndpoint {
             return Err(metadata.error.unwrap_or(FsError::NotConnected));
         }
         drop(metadata);
+        self.check_address(peer.address, true)?;
         let net = self.net()?;
         let admission = net.admission()?;
         let lease = self.binding_or_ephemeral(&net)?;
-        let route = net.routes().resolve(peer.address, lease.local().address)?;
+        let route = net.resolve_route(peer.address, lease.local().address)?;
         let local = InetEndpoint {
             address: route.source,
             port: lease.local().port,
         };
+        core.set_ip_mtu(route.mtu);
         core.connect(local, peer, time::now())?;
         if let Err(error) = net
             .tables()
@@ -586,7 +693,7 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 调用者持本核心及控制准入，首次自动绑定预留真正的临时端口。
+    /// 调用者持本核心及控制准入，首次自动绑定保留本端点族的通配地址及双面责任。
     fn binding_or_ephemeral(&self, net: &NetStackRef) -> Result<Arc<BindLease>, FsError> {
         if let Some(lease) = self.metadata.lock().lease.as_ref().cloned() {
             return Ok(lease);
@@ -596,10 +703,11 @@ impl TcpEndpoint {
             self.id,
             TransportProtocol::Tcp,
             InetEndpoint {
-                address: [0; 4],
+                address: self.family.unspecified(),
                 port: 0,
             },
             self.reuse_address(),
+            self.family == AddressFamily::Ipv6 && !self.metadata.lock().v6_only,
         )?;
         self.metadata.lock().lease = Some(lease.clone());
         Ok(lease)
@@ -802,7 +910,7 @@ impl TcpEndpoint {
         }
         while 0 < remaining {
             remaining -= 1;
-            core.dispatch(time::now(), |packet| net.send_ipv4(packet))?;
+            core.dispatch(time::now(), |packet| net.send_ip(packet))?;
             if core.deadline(time::now()) != ProtocolDeadline::Now {
                 break;
             }
@@ -825,7 +933,7 @@ impl TcpEndpoint {
         }
     }
 
-    /// listener 核心提供配置，fallible child 准备不持域控制锁；只在发表时核 tuple。
+    /// listener 操作拥有提供当前配置；同物理后备的 child 在发表前继承策略并选实际 MTU。
     fn receive_syn(
         &self,
         net: &NetStackRef,
@@ -837,6 +945,7 @@ impl TcpEndpoint {
             return Ok(());
         }
         let (peer, local) = packet.tcp_endpoints()?;
+        self.check_address(local.address, false)?;
         let tuple = TcpTuple { local, peer };
         if let Some(child) = net.tables().lookup_tcp(tuple) {
             return child.enqueue(packet);
@@ -856,10 +965,24 @@ impl TcpEndpoint {
             .expect("listener has no binding");
         let slot = net.claim_endpoint_slot()?;
         let id = net.allocate_identity();
-        let mut child_core = net.new_core(id, core.receive_capacity(), core.send_capacity())?;
-        child_core.set_nagle_enabled(core.nagle_enabled());
-        child_core.listen(local)?;
-        let child = Self::try_new(net, id, child_core, slot)?;
+        let child = Self::try_new(
+            net,
+            id,
+            slot,
+            self.family,
+            core.receive_capacity(),
+            core.send_capacity(),
+        )?;
+        let route = net.resolve_route(peer.address, local.address)?;
+        {
+            let mut child_core = child.core.lock();
+            child_core.set_ip_mtu(route.mtu);
+            child_core.set_receive_budget(core.receive_budget())?;
+            child_core.set_send_budget(core.send_budget())?;
+            child_core.set_nagle_enabled(core.nagle_enabled());
+            child_core.set_keepalive(core.keepalive());
+            child_core.listen(local)?;
+        }
         let listener = net
             .tables()
             .tcp_by_id(self.id)
@@ -870,6 +993,7 @@ impl TcpEndpoint {
             metadata.parent = Arc::downgrade(&listener);
             metadata.engaged = true;
             metadata.reuse = self.reuse_address();
+            metadata.v6_only = self.metadata.lock().v6_only;
         }
         let admission = net.admission()?;
         if let Some(existing) = net.tables().lookup_tcp(tuple) {

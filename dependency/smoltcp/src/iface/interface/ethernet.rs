@@ -1,9 +1,10 @@
 use super::*;
 
 impl InterfaceInner {
-    pub(super) fn process_ethernet<'frame>(
+    /// 保留原 Ethernet 校验和 L2 控制，传输输入同步交静态消费者。
+    pub(super) fn process_ethernet<'frame, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: crate::phy::PacketMeta,
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
@@ -45,6 +46,7 @@ impl InterfaceInner {
         }
     }
 
+    /// 发出原 L2 控制 frame，真实接纳后清除 IP 目的快照。
     pub(super) fn dispatch_ethernet<Tx, F>(
         &mut self,
         tx_token: Tx,
@@ -56,7 +58,7 @@ impl InterfaceInner {
         F: FnOnce(EthernetFrame<&mut [u8]>),
     {
         let tx_len = EthernetFrame::<&[u8]>::buffer_len(buffer_len);
-        tx_token.consume(tx_len, |tx_buffer| {
+        let result = tx_token.consume(tx_len, |tx_buffer| {
             debug_assert!(tx_buffer.as_ref().len() == tx_len);
             let mut frame = EthernetFrame::new_unchecked(tx_buffer);
 
@@ -66,6 +68,10 @@ impl InterfaceInner {
             f(frame);
 
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.last_transmit_destination = None;
+        }
+        result
     }
 }

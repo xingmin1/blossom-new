@@ -5,8 +5,8 @@ use super::{
     report,
 };
 use ::ktest::{
-    CaseDesc, CaseOutcome, CaseRunner, Context, Failure, Phase, Status, SuiteDesc, TestContext,
-    TestError, TestResult,
+    CaseDesc, CaseOutcome, CaseRunner, Context, Failure, Phase, Resource, Status, SuiteDesc,
+    TestContext, TestError, TestResult,
 };
 use core::convert::TryInto;
 use core::fmt::Write;
@@ -39,6 +39,7 @@ pub(crate) fn early() -> RunCommand {
     core::hint::black_box(crate::fs::ktest::anchors());
     core::hint::black_box(super::network::anchors());
     core::hint::black_box(crate::ktest::network::socket_native::__ktest_anchor());
+    core::hint::black_box(crate::drivers::virtio_net::ktest::native::__ktest_anchor());
     let registry = Registry::load().unwrap_or_else(|e| super::context::fatal(e.0));
     let arch = if cfg!(target_arch = "riscv64") {
         "riscv64"
@@ -181,12 +182,54 @@ fn number(text: &str) -> Result<u64, TestError> {
     Ok(value)
 }
 
+/// 仅按 suite 与全部选中 case 的资源并集决定本 VM 的 peer 握手，不受标签或静态 Skip 影响。
+fn needs_peer(command: &RunCommand, suite: &SuiteDesc) -> bool {
+    suite.defaults.resources.contains(&Resource::NetUser)
+        || command.cases[..command.count].iter().any(|&id| {
+            suite.cases[id as usize]
+                .attributes
+                .resources
+                .contains(&Resource::NetUser)
+        })
+}
+
+/// 关闭 RX 的控制者只消费一条有界完整回执，阶段、十进制 ID 和换行必须与当前边界一致。
+fn peer_acknowledgement(id: u32, prefix: &[u8]) -> TestResult {
+    let mut line = [0u8; 64];
+    let mut length = 0;
+    loop {
+        if length == line.len() {
+            return Err(TestError("peer acknowledgement exceeds UART line bound"));
+        }
+        let byte = super::control_read_byte();
+        line[length] = byte;
+        length += 1;
+        if byte == b'\n' {
+            break;
+        }
+    }
+    let digits = line[..length - 1]
+        .strip_prefix(prefix)
+        .ok_or(TestError("peer acknowledgement phase mismatch"))?;
+    let text = core::str::from_utf8(digits)
+        .map_err(|_| TestError("peer acknowledgement is not ASCII decimal"))?;
+    let received: u32 = number(text)
+        .map_err(|_| TestError("peer acknowledgement ID is malformed"))?
+        .try_into()
+        .map_err(|_| TestError("peer acknowledgement ID overflows"))?;
+    if received != id {
+        return Err(TestError("peer acknowledgement case ID mismatch"));
+    }
+    Ok(())
+}
+
 struct Runner {
     command: RunCommand,
     suite: &'static SuiteDesc,
     position: usize,
     begun: bool,
     passed: bool,
+    peer: bool,
 }
 impl Runner {
     /// 静态不适用不构造 fixture；资源取得错误由具体生产 fixture 真实返回。
@@ -197,15 +240,32 @@ impl Runner {
         }
         None
     }
-    /// setup之前只开始当前项目，保持 Host 选择顺序不变。
+    /// 发布边界前独占控制 RX 并同步旧 IRQ/Work，精确回执后才恢复原 RX 状态；失败终止 VM。
+    fn peer_boundary(&self, id: u32, prefix: &[u8], publish: impl FnOnce()) {
+        if !self.peer {
+            publish();
+            return;
+        }
+        let receiver = crate::console::testing::claim_receive_control();
+        crate::console::testing::synchronize_receive_irq()
+            .unwrap_or_else(|error| super::context::fatal(error.0));
+        crate::fs::tty::flush_work();
+        if !crate::console::testing::receive_queue_empty() {
+            super::context::fatal("UART RX ring is not empty before peer boundary");
+        }
+        publish();
+        peer_acknowledgement(id, prefix).unwrap_or_else(|error| super::context::fatal(error.0));
+        crate::console::testing::release_receive_control(receiver);
+    }
+    /// setup 前发布当前项；需要 peer 的批次先取得真实 BEGIN 回执，才允许 case 准备和生产。
     fn begin(&mut self, id: u32) {
         if !self.begun {
-            report::begin(id);
+            self.peer_boundary(id, b"KTEST PEER BEGIN ", || report::begin(id));
             report::phase(id, Phase::Setup);
             self.begun = true;
         }
     }
-    /// 静态 CPU 不适用不调用 suite 或 case 设备 setup。
+    /// 静态 CPU 不适用不调用设备 setup，仍按本 VM 资源并集完成 BEGIN/END 后才推进下一项。
     fn static_prefix(&mut self) {
         while self.position < self.command.count {
             let id = self.command.cases[self.position];
@@ -221,13 +281,16 @@ impl Runner {
                 cleanup: None,
                 expectations: 0,
             };
-            report::result(id, self.position + 1, case, &outcome, Some(reason));
+            self.peer_boundary(id, b"KTEST PEER END ", || {
+                report::result(id, self.position + 1, case, &outcome, Some(reason));
+            });
             self.position += 1;
             self.begun = false;
         }
     }
 }
 impl CaseRunner for Runner {
+    /// typed dispatch 完成真实清理后保留原终态发布，宿主 END 回执先于位置推进和后继开始。
     fn run(
         &mut self,
         cases: &'static [CaseDesc],
@@ -255,7 +318,9 @@ impl CaseRunner for Runner {
                             cleanup: None,
                             expectations: 0,
                         };
-                        report::result(id, self.position + 1, case, &outcome, None);
+                        self.peer_boundary(id, b"KTEST PEER END ", || {
+                            report::result(id, self.position + 1, case, &outcome, None);
+                        });
                         self.position += 1;
                         self.begun = false;
                         self.passed = false;
@@ -278,14 +343,16 @@ impl CaseRunner for Runner {
             );
             let outcome = dispatch(&mut context, id as usize);
             self.passed &= matches!(outcome.status, Status::Pass | Status::Skip);
-            services.finish(self.position + 1, &outcome);
+            self.peer_boundary(id, b"KTEST PEER END ", || {
+                services.finish(self.position + 1, &outcome);
+            });
             self.begun = false;
             self.position += 1;
         }
         Ok(())
     }
 }
-/// 调用正式 API 生成的 typed suite入口，不维护第二套 fixture 生命周期。
+/// 调用正式 typed suite 入口，握手只用于含 net-user 的 Thread 批次，不改原终止路径。
 fn execute(command: RunCommand) -> ! {
     let suite = command
         .registry
@@ -299,7 +366,15 @@ fn execute(command: RunCommand) -> ! {
         position: 0,
         begun: false,
         passed: true,
+        peer: needs_peer(&command, suite),
     };
+    if runner.peer && suite.defaults.context != Context::Thread {
+        report::suite_error(
+            suite.name,
+            "setup",
+            Failure::Returned(TestError("net-user peer boundary requires Thread context")),
+        );
+    }
     let runnable = command.cases[..command.count]
         .iter()
         .find(|&&id| runner.applicability(&suite.cases[id as usize]).is_none())

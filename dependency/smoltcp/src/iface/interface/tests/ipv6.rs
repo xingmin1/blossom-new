@@ -1256,11 +1256,13 @@ fn get_source_address_empty_interface() {
     );
 }
 
+#[cfg(feature = "multicast")]
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
+/// 显式启用 multicast 时核对原 IPv6 入组、报告与退组行为。
 fn test_join_ipv6_multicast_group(#[case] medium: Medium) {
     fn recv_icmpv6(
         device: &mut crate::tests::TestingDevice,

@@ -3,10 +3,11 @@
 use ::core::convert::TryFrom;
 use smoltcp::socket::tcp::TcpContext;
 use smoltcp::socket::{tcp, PollAt};
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
+use smoltcp::wire::IpVersion;
 
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
-use crate::net::address::InetEndpoint;
+use crate::net::address::{AddressFamily, InetEndpoint};
 use crate::net::packet::{zeroed_bytes, OwnedPacket};
 use crate::net::IoProgress;
 use crate::time::MonotonicInstant;
@@ -41,7 +42,8 @@ impl TcpCore {
         }
         let rx = tcp::SocketBuffer::new(zeroed_bytes(rx_len)?);
         let tx = tcp::SocketBuffer::new(zeroed_bytes(tx_len)?);
-        let socket = tcp::Socket::new(rx, tx);
+        let mut socket = tcp::Socket::new(rx, tx);
+        socket.set_congestion_control(tcp::CongestionControl::Reno);
         Ok(Self {
             socket,
             context: tcp::TcpContextState::new(Instant::ZERO, ip_mtu, seed),
@@ -74,7 +76,7 @@ impl TcpCore {
             })
     }
 
-    /// 在连接保护内消费完整 IPv4/TCP 输入；立即回应在结束 repr 借用前编码为 owned 包。
+    /// 在连接保护内消费 owned TCP repr；立即回应结束当前借用前取得独立 payload 拥有。
     pub fn process(
         &mut self,
         packet: &OwnedPacket,
@@ -215,18 +217,11 @@ impl TcpCore {
         self.socket.remote_endpoint().map(InetEndpoint::from_raw)
     }
 
-    /// 监听通配地址保持零地址，不把通配静默改成 loopback。
-    pub fn listen_endpoint(&self) -> InetEndpoint {
+    /// raw 通配监听不保存地址族，由端点的不可变族恢复对应未指定地址。
+    pub fn listen_endpoint(&self, family: AddressFamily) -> InetEndpoint {
         let endpoint = self.socket.listen_endpoint();
-        let address = endpoint
-            .addr
-            .map(|address| {
-                let smoltcp::wire::IpAddress::Ipv4(address) = address;
-                address.octets()
-            })
-            .unwrap_or([0; 4]);
         InetEndpoint {
-            address,
+            address: endpoint.addr.unwrap_or(family.unspecified()),
             port: endpoint.port,
         }
     }
@@ -239,6 +234,68 @@ impl TcpCore {
     /// 返回 raw 发送 ring 的实际容量，不另存一份可能失配的配置。
     pub fn send_capacity(&self) -> usize {
         self.socket.send_capacity()
+    }
+
+    /// 接纳预算与物理后备独立，旧接收数据和通告信用仍由 raw 保存。
+    pub fn receive_budget(&self) -> usize {
+        self.socket.recv_budget()
+    }
+
+    /// 未 ACK 字节占用同一 raw 发送预算。
+    pub fn send_budget(&self) -> usize {
+        self.socket.send_budget()
+    }
+
+    /// 预算必须处于真实接收后备内，不重建 ring 或裁剪旧数据。
+    pub fn set_receive_budget(&mut self, budget: usize) -> Result<(), FsError> {
+        if budget == 0 || self.receive_capacity() < budget {
+            return Err(FsError::InvalidOperation);
+        }
+        self.socket.set_recv_budget(budget);
+        Ok(())
+    }
+
+    /// 预算必须处于真实发送后备内，未 ACK 内容保持原拥有。
+    pub fn set_send_budget(&mut self, budget: usize) -> Result<(), FsError> {
+        if budget == 0 || self.send_capacity() < budget {
+            return Err(FsError::InvalidOperation);
+        }
+        self.socket.set_send_budget(budget);
+        Ok(())
+    }
+
+    /// 读取原空闲探测间隔是否启用，不缓存第二份 socket 开关。
+    pub fn keepalive(&self) -> bool {
+        self.socket.keep_alive().is_some()
+    }
+
+    /// 原 TCP 探测使用 7200 秒，关闭直接撤销原探测期限。
+    pub fn set_keepalive(&mut self, enabled: bool) {
+        self.socket
+            .set_keep_alive(enabled.then_some(Duration::from_secs(7200)));
+    }
+
+    /// 路由已选择实际源和介质后更新唯一发送环境。
+    pub fn set_ip_mtu(&mut self, mtu: usize) {
+        assert!(
+            68 <= mtu && mtu <= u16::MAX as usize,
+            "invalid TCP route MTU"
+        );
+        self.context.set_ip_mtu(mtu);
+    }
+
+    /// 未连接使用 OFD 族，已连接实际 tuple 的协议族由 raw 优先选择。
+    pub fn effective_mss(&self, family: AddressFamily) -> usize {
+        let version = match family {
+            AddressFamily::Ipv4 => IpVersion::Ipv4,
+            AddressFamily::Ipv6 => IpVersion::Ipv6,
+        };
+        self.socket.effective_mss(&self.context, version)
+    }
+
+    /// 返回真正处理发送拥塞窗口的原控制器。
+    pub fn congestion_control(&self) -> tcp::CongestionControl {
+        self.socket.congestion_control()
     }
 
     /// 查询 raw 的实际 Nagle 策略，不从发送队列或状态推算 TCP_NODELAY。

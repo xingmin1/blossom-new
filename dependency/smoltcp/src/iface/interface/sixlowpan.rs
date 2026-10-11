@@ -49,9 +49,10 @@ impl InterfaceInner {
         tag
     }
 
-    pub(super) fn process_sixlowpan<'output, 'payload: 'output>(
+    /// 原解压和重组后同步分派，工作区借用不跨调用保存。
+    pub(super) fn process_sixlowpan<'output, 'payload: 'output, 's>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut impl TransportIngress<'s>,
         meta: PacketMeta,
         ieee802154_repr: &Ieee802154Repr,
         payload: &'payload [u8],
@@ -293,6 +294,7 @@ impl InterfaceInner {
         Ok(decompressed_len)
     }
 
+    /// 使用原压缩与分片算法，完整报文无法接纳时返回容量错误。
     pub(super) fn dispatch_sixlowpan<Tx: TxToken>(
         &mut self,
         mut tx_token: Tx,
@@ -300,12 +302,13 @@ impl InterfaceInner {
         packet: Packet,
         ieee_repr: Ieee802154Repr,
         frag: &mut Fragmenter,
-    ) {
+    ) -> core::result::Result<(), DispatchError> {
         let packet = match packet {
             #[cfg(feature = "proto-ipv4")]
             Packet::Ipv4(_) => unreachable!(),
             Packet::Ipv6(packet) => packet,
         };
+        let destination = IpAddress::Ipv6(packet.header.dst_addr);
 
         // First we calculate the size we are going to need. If the size is bigger than the MTU,
         // then we use fragmentation.
@@ -315,9 +318,14 @@ impl InterfaceInner {
         let ieee_len = ieee_repr.buffer_len();
 
         // TODO(thvdveld): use the MTU of the device.
-        if total_size + ieee_len > 125 {
+        if 125 < total_size + ieee_len {
             #[cfg(feature = "proto-sixlowpan-fragmentation")]
             {
+                if !frag.is_empty() && !frag.finished() {
+                    return Err(DispatchError::Exhausted);
+                }
+                frag.destination = Some(destination);
+                frag.meta = meta;
                 // The packet does not fit in one Ieee802154 frame, so we need fragmentation.
                 // We do this by emitting everything in the `frag.buffer` from the interface.
                 // After emitting everything into that buffer, we send the first fragment heere.
@@ -329,12 +337,7 @@ impl InterfaceInner {
 
                 let pkt = frag;
                 if pkt.buffer.len() < total_size {
-                    net_debug!(
-                        "dispatch_ieee802154: dropping, \
-                        fragmentation buffer is too small, at least {} needed",
-                        total_size
-                    );
-                    return;
+                    return Err(DispatchError::PacketTooLarge);
                 }
 
                 let payload_length = packet.header.payload_len;
@@ -381,8 +384,6 @@ impl InterfaceInner {
                     (125 - ieee_len - frag1.buffer_len() + header_diff) / 8 * 8 - header_diff;
 
                 pkt.sixlowpan.fragn_size = (125 - ieee_len - fragn.buffer_len()) / 8 * 8;
-                pkt.sent_bytes = frag1_size;
-                pkt.sixlowpan.datagram_offset = frag1_size + header_diff;
 
                 tx_token.set_meta(meta);
                 tx_token.consume(ieee_len + frag1.buffer_len() + frag1_size, |mut tx_buf| {
@@ -398,15 +399,14 @@ impl InterfaceInner {
 
                     // Add the buffer part.
                     tx_buf[..frag1_size].copy_from_slice(&pkt.buffer[..frag1_size]);
+                    pkt.sent_bytes = frag1_size;
+                    pkt.sixlowpan.datagram_offset = frag1_size + header_diff;
                 });
             }
 
             #[cfg(not(feature = "proto-sixlowpan-fragmentation"))]
             {
-                net_debug!(
-                    "Enable the `proto-sixlowpan-fragmentation` feature for fragmentation support."
-                );
-                return;
+                return Err(DispatchError::PacketTooLarge);
             }
         } else {
             tx_token.set_meta(meta);
@@ -420,6 +420,8 @@ impl InterfaceInner {
                 Self::ipv6_to_sixlowpan(&self.checksum_caps(), packet, &ieee_repr, tx_buf);
             });
         }
+        self.last_transmit_destination = Some(destination);
+        Ok(())
     }
 
     fn ipv6_to_sixlowpan(
@@ -654,9 +656,10 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
+    /// 原尾片实际接纳后推进责任并记录该 frame 的真实 IP 目的。
     pub(super) fn dispatch_sixlowpan_frag<Tx: TxToken>(
         &mut self,
-        tx_token: Tx,
+        mut tx_token: Tx,
         ieee_repr: Ieee802154Repr,
         frag: &mut Fragmenter,
     ) {
@@ -670,6 +673,7 @@ impl InterfaceInner {
         let ieee_len = ieee_repr.buffer_len();
         let frag_size = (frag.packet_len - frag.sent_bytes).min(frag.sixlowpan.fragn_size);
 
+        tx_token.set_meta(frag.meta);
         tx_token.consume(
             ieee_repr.buffer_len() + fragn.buffer_len() + frag_size,
             |mut tx_buf| {
@@ -689,6 +693,7 @@ impl InterfaceInner {
                 frag.sixlowpan.datagram_offset += frag_size;
             },
         );
+        self.last_transmit_destination = frag.destination;
     }
 }
 

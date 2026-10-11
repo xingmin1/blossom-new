@@ -251,6 +251,18 @@ impl<H: Hal> VirtQueue<H> {
         Ok(count)
     }
 
+    /// 只读设备实际完成索引；不消费 shadow、改变额度或写通知标志。
+    pub fn pending_used(&self) -> Result<usize> {
+        let pending = self
+            .read_u16(self.layout.used_offset + 2)
+            .wrapping_sub(self.last_used_idx);
+        if self.layout.depth < pending || self.inflight < pending {
+            return Err(Error::DeviceNeedsReset);
+        }
+        H::dma_read_barrier();
+        Ok(usize::from(pending))
+    }
+
     /// 取出真实 used head 并仅依赖可信 shadow 回收链；错误不归还任何资源。
     pub fn pop_used(&mut self) -> Result<Option<UsedElement>> {
         let used_idx = self.read_u16(self.layout.used_offset + 2);

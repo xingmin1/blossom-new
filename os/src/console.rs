@@ -756,10 +756,10 @@ pub mod testing {
         }
     }
 
-    /// 在同一端口锁内声明本段测试接收控制并关闭真实接收中断，发送中断位原样保留；调用前不得已有控制且不得有残留配额，不发表配额。
-    /// 本段 begin 在任何关接收、清空、声明之前先调用；失败不清除控制，由用例中止处理。旧控制字节与旧 action 路径不使用此拥有位。
+    /// 在同一端口锁内保存并返回原 RX 中断位，声明本段测试接收控制并关闭 RX，发送位原样保留。
+    /// 调用前不得已有控制或残留配额；失败不清除控制，由用例中止处理，不发表新的配额。
     #[cfg(feature = "ktest")]
-    pub fn claim_receive_control() {
+    pub fn claim_receive_control() -> bool {
         let mut port = super::PORT.lock();
         assert!(
             !port.test_control_owned,
@@ -769,8 +769,10 @@ pub mod testing {
             port.quota.is_none(),
             "previous UART test quota must be consumed before claiming control"
         );
+        let ier = read_register(IER);
         port.test_control_owned = true;
-        write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
+        write_register(IER, ier & !RECEIVE_INTERRUPT);
+        ier & RECEIVE_INTERRUPT != 0
     }
 
     /// 在 PORT 锁内核对测试控制已独占、接收 producer 已关且配额为空，不改变状态。
@@ -863,8 +865,8 @@ pub mod testing {
         super::PORT.lock().len == 0
     }
 
-    /// 在同一端口锁内核对本段已收尾后释放测试接收控制，并按真实当前 CREAD 恢复接收中断，发送中断位原样保留。
-    /// 调用前本段配额已耗尽、软件环已空且 ACK 已被轮询读走；调用者传入真实当前 CREAD。
+    /// 在同一端口锁内核对本段已收尾后释放测试接收控制，按调用者保存的真实接收状态恢复 RX，发送位原样保留。
+    /// 调用前配额已耗尽、软件环已空且 ACK 已被轮询读走；TTY 传当前 CREAD，通用控制握手传 claim 保存的原 RX 位。
     #[cfg(feature = "ktest")]
     pub fn release_receive_control(receiver: bool) {
         let mut port = super::PORT.lock();
