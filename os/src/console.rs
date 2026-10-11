@@ -91,10 +91,12 @@ struct RxState {
     quota: Option<usize>,
     #[cfg(feature = "ktest")]
     test_control_owned: bool,
+    #[cfg(feature = "ktest")]
+    tty_attached: bool,
 }
 
 impl RxState {
-    /// 建立空接收环；测试配额初始为无且测试接收控制初始为未声明，不限制正常接收。
+    /// 建立空接收环；测试配额、控制声明与 TTY 接收附着初始均为空，普通构建始终接收至 TTY。
     const fn new() -> Self {
         Self {
             samples: [RxSample { byte: 0, status: 0 }; RX_CAPACITY],
@@ -106,6 +108,8 @@ impl RxState {
             quota: None,
             #[cfg(feature = "ktest")]
             test_control_owned: false,
+            #[cfg(feature = "ktest")]
+            tty_attached: false,
         }
     }
 
@@ -539,7 +543,7 @@ pub(crate) unsafe fn ktest_uart_handler_one(_context: *mut ()) -> bool {
     handle_uart::<1, true>()
 }
 
-/// 两个入口共享实际 IIR/RX/TX 流程；编译期参数使普通入口不承担测试分支或状态成本，真实接收同时入软件环并在锁外通知行规程。
+/// 两个入口共享实际 IIR/RX/TX 流程；普通构建始终将真实采样送入行规程，测试构建只在 TTY 接收附着时入软件环并在锁外通知，原计数、配额和发送流程保持独立。
 #[inline(always)]
 fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     let (produced, notify_tx) = {
@@ -549,6 +553,10 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
             return false;
         }
         let mut produced = 0;
+        #[cfg(feature = "ktest")]
+        let tty_attached = port.tty_attached;
+        #[cfg(not(feature = "ktest"))]
+        let tty_attached = true;
         if read_register(IER) & RECEIVE_INTERRUPT != 0 {
             for _ in 0..RX_BUDGET {
                 let status = read_register(LSR);
@@ -556,7 +564,10 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                     break;
                 }
                 let byte = read_register(DATA);
-                port.push(RxSample { byte, status });
+                if tty_attached {
+                    port.push(RxSample { byte, status });
+                    produced += 1;
+                }
                 if STOP_RX {
                     // 必须紧跟 DATA 读取并留在 PORT 锁内；不得轮询或读取后续 ACK 字节。
                     write_register(IER, 0);
@@ -565,7 +576,6 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                 let quota_done = port.consume_quota();
                 LAST_BYTE.store(byte, Ordering::Relaxed);
                 RECEIVED.fetch_add(1, Ordering::Release);
-                produced += 1;
                 #[cfg(feature = "ktest")]
                 if quota_done {
                     // 本段最后一个字节已收齐；同锁只关接收位，保留发送中断。
@@ -666,8 +676,8 @@ pub mod testing {
 
     /// 取走唯一 default UART action 的真实 token，不改变设备 IER 或 action 准入。
     ///
-    /// 仅 Thread 控制者调用；成功后调用者拥有停止设备、同步注销和归还新 token 的责任。
-    /// 空槽返回错误，不凭空创建 token；不得从同线 handler 或持有 PORT 时调用。
+    /// 仅 Thread 控制者调用；同 token 暂停时须 disable_sync 后归还，替换 action 时须
+    /// unregister_sync 后登记并归还新 token。空槽返回错误；不得持有 PORT 或回调退出所需锁。
     #[cfg(feature = "ktest")]
     pub fn take_uart_registration() -> Result<crate::irq::IrqRegistration, ::ktest::TestError> {
         UART_REGISTRATION.lock().take().ok_or(::ktest::TestError(
@@ -675,13 +685,13 @@ pub mod testing {
         ))
     }
 
-    /// 首次登记或归还新 default UART token，并开放该真实 action 的准入。
+    /// 首次登记、同步暂停后归还同一 token，或替换 action 后归还新 default token，并开放其准入。
     ///
-    /// 传入 token 必须属于当前 UART 的永久 uart_handler/null context；归还前已停止测试
-    /// action 并同步注销，UART IER 仍关闭，成功后再开启接收。允许首次登记的 BSP 或
-    /// 后续 Thread 控制者调用，不得从同线 handler 或持有其退出所需的 PORT/其他锁调用。
-    /// 双拥有时保留原槽责任，拒绝的传入 token 在槽锁外同步注销；不可启用的 token
-    /// 同样在锁外同步注销后返回错误。因此任何返回路径都不会遗失活 action 责任。
+    /// 传入 token 必须属于当前 UART 的永久 uart_handler/null context。同 token 归还前已
+    /// disable_sync；替换前已停止并同步注销旧/测试 action。UART RX IER 保持关闭，发送位
+    /// 可以保留；本函数不改 IER。允许首次登记的 BSP 或后续 Thread 控制者调用，不得从
+    /// 同线 handler 或持有其退出所需的 PORT/其他锁调用。双拥有时保留原槽责任，拒绝的
+    /// token 与不可启用的 token 均在槽锁外同步注销后返回错误，不遗失活 action 责任。
     #[cfg(feature = "ktest")]
     pub fn restore_uart_registration(
         registration: crate::irq::IrqRegistration,
@@ -761,6 +771,53 @@ pub mod testing {
         );
         port.test_control_owned = true;
         write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
+    }
+
+    /// 在 PORT 锁内核对测试控制已独占、接收 producer 已关且配额为空，不改变状态。
+    fn check_receive_control(port: &RxState) -> ::ktest::TestResult {
+        if !port.test_control_owned {
+            return Err(::ktest::TestError("UART test receive control is not owned"));
+        }
+        if read_register(IER) & RECEIVE_INTERRUPT != 0 {
+            return Err(::ktest::TestError(
+                "UART RX must be closed before synchronization",
+            ));
+        }
+        if port.quota.is_some() {
+            return Err(::ktest::TestError(
+                "UART receive quota must be consumed before synchronization",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 在独占测试控制且 RX 关闭、配额为空时同步唯一 default action 的完整回调尾部。
+    /// 仅可服务 IRQ 的 Thread 控制者调用，不得持回调退出所需锁；锁外暂停并恢复同一
+    /// 未注销 token，设备 IER 与计数不变。失败保留接收控制，由调用者按真实错误结束拥有。
+    pub fn synchronize_receive_irq() -> ::ktest::TestResult {
+        crate::sched::assert_switchable();
+        {
+            let port = PORT.lock();
+            check_receive_control(&port)?;
+        }
+        let registration = take_uart_registration()?;
+        registration.disable_sync();
+        restore_uart_registration(registration)
+    }
+
+    /// 同步原 IRQ 尾部后在 PORT 锁内提交测试接收去向；调用前须已 claim 且 RX 关闭、配额为空。
+    /// 附着要求旧软件环为空；撤附着保留已接受采样供原 Work 完成，发送与设备配置不变。
+    pub fn set_tty_receive(attached: bool) -> ::ktest::TestResult {
+        synchronize_receive_irq()?;
+        let mut port = PORT.lock();
+        check_receive_control(&port)?;
+        if attached && port.len != 0 {
+            return Err(::ktest::TestError(
+                "UART software ring must be empty before TTY receive attachment",
+            ));
+        }
+        port.tty_attached = attached;
+        Ok(())
     }
 
     /// 在同一端口锁内核对前段已收尾后发表本段剩余接收配额并打开真实接收中断；零长度不发表配额也不打开接收。

@@ -2,6 +2,7 @@
 
 use crate::fs::ext4::codec;
 use crate::fs::ktest::path::PathOwner;
+use crate::fs::ktest::tty::SerialTtyOwner;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
@@ -39,6 +40,34 @@ struct RunningProgram {
 struct ReservedDescriptor {
     release: Arc<Completion>,
     join: JoinHandle,
+}
+
+/// 用户程序整组共享唯一设备库存与串口 TTY 接收附着，case 仍独立拥有路径和用户任务。
+struct UserProgramSuite {
+    inventory: DeviceInventory,
+    serial: SerialTtyOwner,
+}
+
+impl Fixture for UserProgramSuite {
+    /// 原库存只发现一次，随后在首个 case 准备前附着真实 TTY 接收。
+    fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+        let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
+        let serial = SerialTtyOwner::attach()?;
+        crate::workqueue::testing::wait_services_blocked();
+        Ok(Self { inventory, serial })
+    }
+
+    /// 全部 case 的任务、OFD 与 raw 阶段结束后先恢复 Raw，再结束原库存的异步责任。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.serial.stop()?;
+        <DeviceInventory as Fixture>::quiesce(&mut self.inventory, context)
+    }
+
+    /// 串口已停止后消费原库存，不重新发现设备或销毁常驻 TTY 服务。
+    fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.serial.stop()?;
+        <DeviceInventory as Fixture>::tear_down(self.inventory, context)
+    }
 }
 
 struct UserOwner {
@@ -1277,6 +1306,23 @@ impl Fixture<DeviceInventory> for UserOwner {
     }
 }
 
+impl Fixture<UserProgramSuite> for UserOwner {
+    /// 用户程序借组合中同一库存，继续由原设备夹具保存每例清理责任。
+    fn set_up(context: &mut TestContext<'_>, suite: &UserProgramSuite) -> Result<Self, TestError> {
+        <Self as Fixture<DeviceInventory>>::set_up(context, &suite.inventory)
+    }
+
+    /// 用户图、文件和 raw 阶段仍按原 case 顺序停止，接收附着保留至最后一例结束。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        <Self as Fixture<DeviceInventory>>::quiesce(self, context)
+    }
+
+    /// 消费原每例拥有并保留完整 MM 与任务元数据断言。
+    fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
+        <Self as Fixture<DeviceInventory>>::tear_down(self, context)
+    }
+}
+
 /// 父入口只保留原生 suite 宏的真实锚点。
 pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
     programs::__ktest_anchor()
@@ -1302,7 +1348,7 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
     background::anchor()
 }
 
-#[ktest::suite(fixture = UserOwner, suite_resources = DeviceInventory, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
+#[ktest::suite(fixture = UserOwner, suite_resources = UserProgramSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
 

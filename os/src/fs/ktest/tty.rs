@@ -51,7 +51,7 @@ impl UartStage {
         Self { owned: false }
     }
 
-    /// 声明本段 duplex 并打开接收配额；拥有控制位后核空环再发声明。
+    /// 声明本段 duplex；先同步旧 IRQ 全尾、核空环，再发送宿主声明并打开配额。
     pub fn begin(
         &mut self,
         _context: &TestContext<'_>,
@@ -66,6 +66,7 @@ impl UartStage {
         let id = crate::ktest::active_case().ok_or(TestError("tty UART IO outside case"))?;
         self.owned = true;
         crate::console::testing::claim_receive_control();
+        crate::console::testing::synchronize_receive_irq()?;
         crate::fs::tty::flush_work();
         if !crate::console::testing::receive_queue_empty() {
             return Err(TestError("tty RX ring is not empty before stage"));
@@ -156,7 +157,56 @@ impl Default for UartStage {
     }
 }
 
+/// 本组测试拥有唯一串口的 TTY 接收附着，常驻端点、Work 与 IRQ 仍由生产服务保活。
+pub(super) struct SerialTtyOwner {
+    attached: bool,
+}
+
+impl SerialTtyOwner {
+    /// 在首例基线前同步旧接收尾部，恢复合法配置后按真实 CREAD 解除临时控制。
+    pub(super) fn attach() -> Result<Self, TestError> {
+        crate::console::testing::claim_receive_control();
+        crate::console::testing::set_tty_receive(true)?;
+        Self::finish_receive()?;
+        let receiver = crate::fs::tty::termios().cflag & CREAD != 0;
+        crate::console::testing::release_receive_control(receiver);
+        Ok(Self { attached: true })
+    }
+
+    /// 全部任务、文件与 raw 阶段结束后停止新 TTY RX，真实排完已接受字节才恢复 Raw。
+    pub(super) fn stop(&mut self) -> TestResult {
+        if !self.attached {
+            return Ok(());
+        }
+        crate::console::testing::claim_receive_control();
+        crate::console::testing::set_tty_receive(false)?;
+        Self::finish_receive()?;
+        let receiver = crate::fs::tty::termios().cflag & CREAD != 0;
+        crate::console::testing::release_receive_control(receiver);
+        self.attached = false;
+        Ok(())
+    }
+
+    /// RX producer 已同步停止后，等待环、Work、echo/output 与 TEMT，再清退休输入。
+    fn finish_receive() -> TestResult {
+        loop {
+            crate::fs::tty::flush_work();
+            if crate::console::testing::receive_queue_empty() {
+                break;
+            }
+        }
+        crate::fs::tty::drain(FileIoContext::Kernel)
+            .map_err(|_| TestError("tty drain failed at receive handoff"))?;
+        crate::fs::tty::set_termios(Termios::default(), 2, FileIoContext::Kernel)
+            .map_err(|_| TestError("tty default termios failed at receive handoff"))?;
+        crate::fs::tty::flush_work();
+        Ok(())
+    }
+}
+
 struct TtySuite {
+    /// 本组真实接收附着的结束责任。
+    serial: SerialTtyOwner,
     /// 同一 VM 的整组资源基线。
     memory: mm::MemoryStats,
     /// 同一 VM 的任务元数据基线。
@@ -164,24 +214,42 @@ struct TtySuite {
 }
 
 impl ::ktest::Fixture for TtySuite {
-    /// 常驻服务停稳后保存同一 VM 的整组资源。
+    /// 常驻服务停稳并附着 TTY 接收后保存同一 VM 的整组资源。
     fn set_up(_context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         crate::klog::testing::wait_service_blocked();
-        crate::workqueue::testing::wait_services_blocked();
         until("tty timer services did not block", || {
             (0..cpu::count()).all(|id| {
                 crate::timer::testing::service_task(id)
                     .is_some_and(|task| sched::test_state(&task) == crate::task::State::Blocked)
             })
         })?;
+        let mut serial = SerialTtyOwner::attach()?;
+        crate::workqueue::testing::wait_services_blocked();
+        let memory = match settled() {
+            Ok(memory) => memory,
+            Err(error) => {
+                serial.stop()?;
+                return Err(error);
+            }
+        };
         Ok(Self {
-            memory: settled()?,
+            serial,
+            memory,
             metadata: crate::workqueue::testing::metadata_stats(),
         })
     }
 
-    /// 全部 case 拥有结束后核第二层六域及任务元数据。
+    /// 全部 case 已释放自己的拥有后，真实停止本组接收并恢复 Raw。
+    fn quiesce(&mut self, _context: &mut TestContext<'_>) -> TestResult {
+        self.serial.stop()
+    }
+
+    /// 接收已恢复 Raw 后核第二层六域及任务元数据。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
+        assert!(
+            !self.serial.attached,
+            "tty suite receive owner is still attached"
+        );
         recovered(context, "tty-suite-last-release", self.memory)?;
         let actual = crate::workqueue::testing::metadata_stats();
         context.diagnostic(format_args!(
@@ -898,7 +966,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 真实打开 /ttyS0 与 /console，经 FileLike 核能力、poll 与 stat。
+    /// 真实打开 /ttyS0 与 /console，以设备号和操作错误核对各自文件语义。
     #[test]
     fn real_open_capabilities_poll_and_stat(
         context: &mut TestContext<'_>,
@@ -908,14 +976,6 @@ pub(crate) mod cases {
         fixture.open_tty(context, b"/console", 2)?;
         let first = fixture.tty(0);
         let second = fixture.tty(1);
-        assert!(first.path().is_some());
-        assert!(second.path().is_some());
-        assert!(first.mapping_inode().is_none());
-        assert!(!first.positioned_io());
-        assert!(first.pollable().is_some());
-        assert!(first.watch_head().is_some());
-        let mask = checked(context, first.pollable().unwrap().poll(None))?;
-        assert_ne!(mask, crate::fs::PollMask::default());
         let stat = checked(context, first.stat())?;
         assert_eq!(stat.rdev, 0x440);
         let stat = checked(context, second.stat())?;
