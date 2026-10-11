@@ -77,7 +77,12 @@ pub enum FsError {
     AddressInUse,
     AddressNotAvailable,
     NetworkUnreachable,
+    ConnectionReset,
+    AlreadyConnected,
     NotConnected,
+    ConnectionRefused,
+    AlreadyInProgress,
+    InProgress,
     MessageTooLarge,
     NotSocket,
     WouldBlock,
@@ -91,7 +96,7 @@ pub enum FsError {
 
 impl FsError {
     /// 将页填充的实际格式或 I/O 错误写入共享 folio，等待者读取同一原因。
-    /// 根选择、名字查找、文件能力和 inode 加载取消不属于页填充结果。
+    /// 根选择、名字查找、文件能力、socket 连接结果和 inode 加载取消不属于页填充结果。
     pub(crate) fn folio_error(self) -> BlockError {
         match self {
             Self::NoMemory => BlockError::NoMemory,
@@ -116,7 +121,12 @@ impl FsError {
             | Self::AddressInUse
             | Self::AddressNotAvailable
             | Self::NetworkUnreachable
+            | Self::ConnectionReset
+            | Self::AlreadyConnected
             | Self::NotConnected
+            | Self::ConnectionRefused
+            | Self::AlreadyInProgress
+            | Self::InProgress
             | Self::MessageTooLarge
             | Self::NotSocket
             | Self::WouldBlock

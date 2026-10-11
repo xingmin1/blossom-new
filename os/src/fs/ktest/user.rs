@@ -3,6 +3,7 @@
 use crate::fs::ext4::codec;
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::tty::SerialTtyOwner;
+use crate::fs::ktest::user::network::NetworkMode;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
@@ -20,6 +21,7 @@ mod layout;
 mod libc;
 mod lifecycle;
 mod namespace;
+mod network;
 mod pipe;
 mod preparation;
 mod readahead;
@@ -1387,6 +1389,69 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
 #[ktest::suite(fixture = UserOwner, suite_resources = UserProgramSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
+
+    /// 普通用户身份创建 socket，并核验共享 OFD 与独立描述符 flags。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_identity(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Identity)
+    }
+
+    /// 同一监听 OFD 的别名连续接受已完成握手的连接，每次得到新 OFD。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_listener(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Listener)
+    }
+
+    /// 真实 SYN 等待与拒绝分别产生非阻塞连接结果，SO_ERROR 按一次消费核验。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_connect(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Connect)
+    }
+
+    /// 普通流读取核验完整字节、PEEK、短前缀与数据后的 FIN 和 EOF。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_stream(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Stream)
+    }
+
+    /// 发送空间用尽后观察真实用户阻塞，再由接收及后台 ACK 恢复进度。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_backpressure(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Backpressure)
+    }
+
+    /// 真实半关闭保留接收方向，并区分 SIGPIPE 与 MSG_NOSIGNAL。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_half_close(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::HalfClose)
+    }
+
+    /// 地址容量、用户复制错误与 fd 满分别核验真实 accept 的领取和发表。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_address(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Address)
+    }
+
+    /// 信号打断真实 read 和 connect 等待，并沿原重启与 poll 绝对期限消费结果。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_signal(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Signal)
+    }
+
+    /// 同一 socket 身份在原 epoll 中核验触发方式、修改、删除和 fd 复用。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_epoll(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Epoll)
+    }
 
     /// 真实 ELF 的边缘、BSS、参数和缓存私有性由 loader 与实际用户指令共同验证。
     #[test]

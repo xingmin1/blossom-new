@@ -7,13 +7,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use smoltcp::socket::tcp::State;
 
-use crate::fs::{FsError, ReadBuffer, WriteBuffer};
+use crate::fs::epoll::{EpollEvent, EpollFile, EPOLLET, EPOLL_CTL_ADD};
+use crate::fs::{
+    FileIoContext, FileLike, FileRef, FsError, PollMask, Pollable, ReadBuffer, WriteBuffer,
+};
 use crate::ktest::execution_services::{baseline, Baseline, SuiteBaseline};
 use crate::mm::space::Mm;
 use crate::mm::user_table::PagePermissions;
 use crate::net::address::InetEndpoint;
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
+use crate::net::socket::SocketFile;
+use crate::net::table::TcpTuple;
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::{
@@ -1205,6 +1210,670 @@ pub(crate) mod stack {
             }
             _ => return Err(TestError("stopped network accepted new egress ownership")),
         }
+        Ok(())
+    }
+}
+
+/// 正式 SocketFile listener 使用同一域与用户文件数据面，不构造第二 raw wire。
+fn socket_listener(
+    context: &TestContext<'_>,
+    net: &NetStackRef,
+    port: u16,
+) -> Result<Arc<SocketFile>, TestError> {
+    let file = operation(context, SocketFile::try_new_tcp(net.clone(), 0, 0, 0))?;
+    operation(context, file.bind(InetEndpoint { port, ..SERVER }))?;
+    operation(context, file.listen(4))?;
+    Ok(file)
+}
+
+/// 文件流按合法短读推进，零长度只在调用者明确验 EOF 时消费。
+fn socket_read_exact(file: &SocketFile, output: &mut [u8]) -> TestResult {
+    let mut done = 0;
+    while done < output.len() {
+        let count = child_operation(file.read(&mut output[done..]))?;
+        if count == 0 {
+            return Err(TestError("native socket ended before full byte delivery"));
+        }
+        done += count;
+    }
+    Ok(())
+}
+
+/// 文件流发送量来自真实接受前缀，不把输入准备量当成提交量。
+fn socket_write_all(file: &SocketFile, input: &[u8]) -> TestResult {
+    let mut done = 0;
+    while done < input.len() {
+        let count = child_operation(file.write(&input[done..]))?;
+        if count == 0 {
+            return Err(TestError("native socket send made no progress"));
+        }
+        done += count;
+    }
+    Ok(())
+}
+
+/// 只等待实际 EndpointSlot 归还，根服务继续存活并推进正常 FIN/TIME_WAIT。
+fn socket_retired(net: &NetStackRef) -> TestResult {
+    let end = time::now()
+        .checked_add(time::Duration::from_secs(30))
+        .ok_or(TestError("socket retirement deadline overflow"))?;
+    while net.ktest_live_endpoints() != 0 {
+        if end <= time::now() {
+            return Err(TestError(
+                "normal socket protocol retirement did not finish",
+            ));
+        }
+        timer::sleep(time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// 固定接收容量直接交给正式 scan，逐项保存真实事件字段供多轮 ET 消费核对。
+fn socket_epoll_collect(file: &EpollFile, output: &mut [EpollEvent]) -> Result<usize, FsError> {
+    let mut count = 0;
+    file.scan(output.len(), &mut |event| {
+        output[count] = event;
+        count += 1;
+        Ok(())
+    })
+}
+
+#[ktest::suite(fixture = StackOwner, suite_resources = SuiteBaseline, context = "Thread", tags("network-socket"), timeout_ms = 45000)]
+pub(crate) mod socket_native {
+    use super::*;
+
+    /// 已领取 child 正常退休不得重发旧 ready 的 ET；后继握手仍须产生新事件并正常归还全部端点。
+    #[test]
+    fn accepted_child_retirement_does_not_rearm_listener_edge(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let local = InetEndpoint {
+            port: 45650,
+            ..SERVER
+        };
+        let listener = socket_listener(context, &fixture.net, local.port)?;
+        let listener_weak = Arc::downgrade(listener.endpoint());
+        let listener_file_weak = Arc::downgrade(&listener);
+        let listener_watch_weak = Arc::downgrade(
+            listener
+                .watch_head()
+                .ok_or(TestError("native listener has no real watch head"))?,
+        );
+        let client_a = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(context, client_a.connect(local, FileIoContext::Kernel))?;
+        let server_a = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        context.expect_eq(Arc::ptr_eq(&listener, &server_a), false);
+        context.expect_eq(Arc::ptr_eq(listener.endpoint(), server_a.endpoint()), false);
+        context.expect_eq(Arc::ptr_eq(client_a.endpoint(), server_a.endpoint()), false);
+        context.expect_eq(listener.endpoint().state(), State::Listen);
+        let server_a_weak = Arc::downgrade(server_a.endpoint());
+        let server_a_file_weak = Arc::downgrade(&server_a);
+        let client_a_weak = Arc::downgrade(client_a.endpoint());
+
+        let epoll = operation(context, EpollFile::try_new(0))?;
+        let epoll_weak = Arc::downgrade(&epoll);
+        let expected = EpollEvent {
+            events: PollMask::POLLIN.0,
+            data: 0xa1b2_c3d4_e5f6_0758,
+        };
+        {
+            let owner: FileRef = epoll.clone();
+            let target: FileRef = listener.clone();
+            operation(
+                context,
+                epoll.control(
+                    &owner,
+                    EPOLL_CTL_ADD,
+                    &target,
+                    0,
+                    Some(EpollEvent {
+                        events: expected.events | EPOLLET,
+                        data: expected.data,
+                    }),
+                ),
+            )?;
+        }
+        let client_b = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(context, client_b.connect(local, FileIoContext::Kernel))?;
+        let readable = PollMask::POLLIN | PollMask::POLLRDNORM;
+        observe(
+            || listener.poll(None) == Ok(readable) && epoll.poll(None) == Ok(readable),
+            "second handshake did not make listener and real epoll readable",
+        )?;
+        let peer_b = operation(context, client_b.endpoint().local_address())?;
+        let server_b_weak = Arc::downgrade(
+            &fixture
+                .net
+                .tables()
+                .lookup_tcp(TcpTuple {
+                    local,
+                    peer: peer_b,
+                })
+                .ok_or(TestError("ready B is missing from actual TCP tuple table"))?,
+        );
+        let client_b_weak = Arc::downgrade(client_b.endpoint());
+        let mut events = [EpollEvent::default(); 1];
+        let first = operation(context, socket_epoll_collect(&epoll, &mut events))?;
+        context.expect_eq(first, 1);
+        context.expect_eq(events[0], expected);
+        if first != 1 || events[0] != expected {
+            return Err(TestError(
+                "ready B did not deliver exactly one listener IN/data event",
+            ));
+        }
+        let second = operation(context, socket_epoll_collect(&epoll, &mut events))?;
+        context.expect_eq(second, 0);
+        if second != 0 {
+            return Err(TestError(
+                "listener edge was not consumed before accepted A retirement",
+            ));
+        }
+
+        operation(context, client_a.shutdown(1))?;
+        context.expect_eq(operation(context, server_a.read(&mut [0u8; 1]))?, 0);
+        operation(context, server_a.shutdown(1))?;
+        context.expect_eq(operation(context, client_a.read(&mut [0u8; 1]))?, 0);
+        drop(server_a);
+        context.expect_eq(server_a_file_weak.upgrade().is_none(), true);
+        // 被动端最后 Weak 失效覆盖退休者等待 Timer/Work、撤 parent child 和释放表拥有的全尾。
+        observe(
+            || server_a_weak.upgrade().is_none(),
+            "accepted A did not finish normal FIN/EOF endpoint retirement",
+        )?;
+        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(operation(context, listener.poll(None))?, readable);
+        context.expect_eq(
+            server_b_weak.upgrade().map(|endpoint| endpoint.state()),
+            Some(State::Established),
+        );
+        let third = operation(context, socket_epoll_collect(&epoll, &mut events))?;
+        context.diagnostic(format_args!(
+            "network-socket accepted_a_retired={} listener_state={:?} listener_mask={:?} retirement_scan_count={} retirement_scan_event={:?}",
+            server_a_weak.upgrade().is_none(), listener.endpoint().state(),
+            operation(context, listener.poll(None))?, third,
+            if third == 0 { None } else { Some(events[0]) }
+        ));
+        context.expect_eq(third, 0);
+        if third != 0 {
+            return Err(TestError(
+                "accepted child retirement rearmed listener ET without a new ready child",
+            ));
+        }
+
+        let client_c = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(context, client_c.connect(local, FileIoContext::Kernel))?;
+        observe(
+            || epoll.poll(None) == Ok(readable),
+            "new ready C did not notify the consumed listener edge",
+        )?;
+        let peer_c = operation(context, client_c.endpoint().local_address())?;
+        let server_c_weak = Arc::downgrade(
+            &fixture
+                .net
+                .tables()
+                .lookup_tcp(TcpTuple {
+                    local,
+                    peer: peer_c,
+                })
+                .ok_or(TestError("ready C is missing from actual TCP tuple table"))?,
+        );
+        let client_c_weak = Arc::downgrade(client_c.endpoint());
+        let fourth = operation(context, socket_epoll_collect(&epoll, &mut events))?;
+        context.expect_eq(fourth, 1);
+        context.expect_eq(events[0], expected);
+        if fourth != 1 || events[0] != expected {
+            return Err(TestError(
+                "new ready C did not deliver exactly one listener IN/data event",
+            ));
+        }
+        context.expect_eq(
+            operation(context, socket_epoll_collect(&epoll, &mut events))?,
+            0,
+        );
+
+        let server_b = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let server_c = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        context.expect_eq(
+            server_b_weak
+                .upgrade()
+                .is_some_and(|endpoint| Arc::ptr_eq(&endpoint, server_b.endpoint())),
+            true,
+        );
+        context.expect_eq(
+            server_c_weak
+                .upgrade()
+                .is_some_and(|endpoint| Arc::ptr_eq(&endpoint, server_c.endpoint())),
+            true,
+        );
+        context.expect_eq(Arc::ptr_eq(&listener, &server_b), false);
+        context.expect_eq(Arc::ptr_eq(&listener, &server_c), false);
+        context.expect_eq(Arc::ptr_eq(&server_b, &server_c), false);
+        context.expect_eq(Arc::ptr_eq(server_b.endpoint(), server_c.endpoint()), false);
+        context.expect_eq(Arc::ptr_eq(server_b.endpoint(), client_b.endpoint()), false);
+        context.expect_eq(Arc::ptr_eq(server_c.endpoint(), client_c.endpoint()), false);
+        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(
+            operation(context, listener.poll(None))?,
+            PollMask::default(),
+        );
+        for (client, server) in [(&client_b, &server_b), (&client_c, &server_c)] {
+            operation(context, client.shutdown(1))?;
+            context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
+            operation(context, server.shutdown(1))?;
+            context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
+        }
+        drop((
+            epoll, listener, client_a, client_b, client_c, server_b, server_c,
+        ));
+        context.expect_eq(epoll_weak.upgrade().is_none(), true);
+        context.expect_eq(listener_file_weak.upgrade().is_none(), true);
+        context.expect_eq(listener_watch_weak.upgrade().is_none(), true);
+        socket_retired(&fixture.net)?;
+        for endpoint in [
+            &listener_weak,
+            &server_a_weak,
+            &client_a_weak,
+            &server_b_weak,
+            &client_b_weak,
+            &server_c_weak,
+            &client_c_weak,
+        ] {
+            context.expect_eq(endpoint.upgrade().is_none(), true);
+        }
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
+        drop((
+            epoll_weak,
+            listener_file_weak,
+            listener_watch_weak,
+            server_a_file_weak,
+            listener_weak,
+            server_a_weak,
+            client_a_weak,
+            server_b_weak,
+            client_b_weak,
+            server_c_weak,
+            client_c_weak,
+        ));
+        Ok(())
+    }
+
+    /// 首笔握手 ACK 丢失后仅用 FIN 完成被动握手，accept 必须交付同一 child 并保留反向流。
+    #[test]
+    fn passive_fin_ack_matures_before_accept(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let local = InetEndpoint {
+            port: 45640,
+            ..SERVER
+        };
+        let peer = InetEndpoint {
+            port: 45641,
+            ..SERVER
+        };
+        let listener = socket_listener(context, &fixture.net, local.port)?;
+        operation(context, listener.set_status_flags(0o4000))?;
+        let client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(context, client.bind(peer))?;
+        operation(
+            context,
+            fixture.net.ktest_drop_handshake_ack(peer.port, local.port),
+        )?;
+        operation(context, client.connect(local, FileIoContext::Kernel))?;
+        observe(
+            || fixture.net.ktest_handshake_ack_dropped(),
+            "selected handshake ACK was not dropped",
+        )?;
+        let child = fixture
+            .net
+            .tables()
+            .lookup_tcp(TcpTuple { local, peer })
+            .ok_or(TestError(
+                "passive handshake child is missing from actual TCP tuple table",
+            ))?;
+        let initial_state = child.state();
+        context.diagnostic(format_args!(
+            "network-socket handshake_ack_dropped={} child_id={} initial_state={:?} listener_state={:?}",
+            fixture.net.ktest_handshake_ack_dropped(), child.id(), initial_state, listener.endpoint().state()
+        ));
+        if initial_state != State::SynReceived {
+            return Err(TestError(
+                "dropped handshake ACK did not leave actual child in SYN-RECEIVED",
+            ));
+        }
+        context.expect_eq(client.endpoint().state(), State::Established);
+        context.expect_eq(listener.endpoint().state(), State::Listen);
+
+        // 首笔应用发送就是 FIN；任何先行 payload 都会另带 ACK，使这个被动握手窗口消失。
+        operation(context, client.shutdown(1))?;
+        observe(
+            || child.state() == State::CloseWait,
+            "passive child did not process actual FIN into CLOSE-WAIT",
+        )?;
+        let fin_state = child.state();
+        let accepted = listener.accept(0, 0, 0, FileIoContext::Kernel);
+        let server = match accepted {
+            Ok(server) => {
+                context.diagnostic(format_args!(
+                    "network-socket handshake_ack_dropped={} child_id={} fin_state={:?} accept_result=Ok accepted_child_id={}",
+                    fixture.net.ktest_handshake_ack_dropped(), child.id(), fin_state, server.endpoint().id()
+                ));
+                server
+            }
+            Err(error) => {
+                context.diagnostic(format_args!(
+                    "network-socket handshake_ack_dropped={} child_id={} fin_state={:?} accept_result=Err({:?}) listener_state={:?}",
+                    fixture.net.ktest_handshake_ack_dropped(), child.id(), fin_state, error, listener.endpoint().state()
+                ));
+                return Err(TestError(match error {
+                    FsError::WouldBlock => {
+                        "passive FIN completed handshake but nonblocking accept returned WouldBlock"
+                    }
+                    _ => "passive FIN nonblocking accept failed",
+                }));
+            }
+        };
+        context.expect_eq(Arc::ptr_eq(server.endpoint(), &child), true);
+        context.expect_eq(Arc::ptr_eq(&listener, &server), false);
+        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
+        context.expect_eq(server.endpoint().state(), State::CloseWait);
+        socket_write_all(&server, b"accepted after FIN")?;
+        let mut output = [0u8; 18];
+        socket_read_exact(&client, &mut output)?;
+        context.expect_eq(&output, b"accepted after FIN");
+        operation(context, server.shutdown(1))?;
+        context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
+        context.expect_eq(listener.endpoint().state(), State::Listen);
+        let child_weak = Arc::downgrade(&child);
+        let client_weak = Arc::downgrade(client.endpoint());
+        let server_file_weak = Arc::downgrade(&server);
+        let client_file_weak = Arc::downgrade(&client);
+        operation(context, fixture.net.ktest_clear_packet_control())?;
+        drop((child, client, server, listener));
+        context.expect_eq(client_file_weak.upgrade().is_none(), true);
+        context.expect_eq(server_file_weak.upgrade().is_none(), true);
+        socket_retired(&fixture.net)?;
+        context.expect_eq(child_weak.upgrade().is_none(), true);
+        context.expect_eq(client_weak.upgrade().is_none(), true);
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
+        drop((child_weak, client_weak, server_file_weak, client_file_weak));
+        Ok(())
+    }
+
+    /// A 的真实处理拥有持续期间，另一 CPU 的 B 普通文件收发和后台 ACK 独立完成。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn socket_other_cpu_completes_while_connection_is_owned(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener_a = socket_listener(context, &fixture.net, 45610)?;
+        let listener_b = socket_listener(context, &fixture.net, 45611)?;
+        let client_a = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        let client_b = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        let cpu_a = client_a.endpoint().work_cpu();
+        let cpu_b = client_b.endpoint().work_cpu();
+        if cpu_a == cpu_b {
+            return Err(TestError(
+                "native socket clients do not have distinct protocol CPUs",
+            ));
+        }
+        operation(
+            context,
+            client_a.connect(
+                InetEndpoint {
+                    port: 45610,
+                    ..SERVER
+                },
+                FileIoContext::Kernel,
+            ),
+        )?;
+        operation(
+            context,
+            client_b.connect(
+                InetEndpoint {
+                    port: 45611,
+                    ..SERVER
+                },
+                FileIoContext::Kernel,
+            ),
+        )?;
+        let server_a = operation(context, listener_a.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let server_b = operation(context, listener_b.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let held = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("native socket ownership observation allocation failed"))?;
+        let held_by_a = held.clone();
+        let release = fixture.release.clone();
+        let a = client_a.clone();
+        let holder = crate::ktest::spawn_result_on(cpu_a, move |token| {
+            let guard = a.endpoint().lock();
+            if cpu::current().id != cpu_a || guard.state() != State::Established {
+                return Err(TestError("native socket owner has wrong CPU or state"));
+            }
+            held_by_a.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) && !token.stop_requested() {
+                timer::sleep(time::Duration::from_millis(1));
+            }
+            drop(guard);
+            Ok(0)
+        })?;
+        observe(
+            || held.load(Ordering::Acquire),
+            "native A did not take processing ownership",
+        )?;
+        let b = client_b.clone();
+        let b_complete = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("native B completion observation allocation failed"))?;
+        let completed = b_complete.clone();
+        let child = crate::ktest::spawn_result_on(cpu_b, move |_| {
+            if cpu::current().id != cpu_b {
+                return Err(TestError("native B ran on wrong CPU"));
+            }
+            let input: [u8; 97] = ::core::array::from_fn(pattern);
+            socket_write_all(&b, &input)?;
+            let mut reply = [0u8; 97];
+            socket_read_exact(&b, &mut reply)?;
+            if reply != input {
+                return Err(TestError("native B response bytes differ"));
+            }
+            completed.store(true, Ordering::Release);
+            Ok(0)
+        })?;
+        let mut output = [0u8; 97];
+        socket_read_exact(&server_b, &mut output)?;
+        context.expect_eq(output, ::core::array::from_fn(pattern));
+        socket_write_all(&server_b, &output)?;
+        observe(
+            || b_complete.load(Ordering::Acquire),
+            "native B stalled under A ownership",
+        )?;
+        context.expect_eq(fixture.release.load(Ordering::Acquire), false);
+        context.expect_eq(child.join()?, 0);
+        fixture.release.store(true, Ordering::Release);
+        context.expect_eq(holder.join()?, 0);
+        drop((
+            client_a, client_b, server_a, server_b, listener_a, listener_b,
+        ));
+        socket_retired(&fixture.net)
+    }
+
+    /// 只丢一笔普通 data 段，真实 raw At/RTO 后同 seq 重到达并交付全部字节。
+    #[test]
+    fn one_data_segment_retransmits_at_real_raw_deadline(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = socket_listener(context, &fixture.net, 45620)?;
+        let client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(
+            context,
+            client.bind(InetEndpoint {
+                port: 45621,
+                ..SERVER
+            }),
+        )?;
+        operation(
+            context,
+            client.connect(
+                InetEndpoint {
+                    port: 45620,
+                    ..SERVER
+                },
+                FileIoContext::Kernel,
+            ),
+        )?;
+        let server = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let healthy_listener = socket_listener(context, &fixture.net, 45622)?;
+        let healthy_client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(
+            context,
+            healthy_client.connect(
+                InetEndpoint {
+                    port: 45622,
+                    ..SERVER
+                },
+                FileIoContext::Kernel,
+            ),
+        )?;
+        let healthy_server = operation(
+            context,
+            healthy_listener.accept(0, 0, 0, FileIoContext::Kernel),
+        )?;
+        operation(context, fixture.net.ktest_drop_next_data(45621, 45620))?;
+        let input: [u8; 97] = ::core::array::from_fn(pattern);
+        context.expect_eq(operation(context, client.write(&input))?, input.len());
+        observe(
+            || fixture.net.ktest_loss_observation().dropped == 1,
+            "selected data segment was not dropped",
+        )?;
+        let first = fixture.net.ktest_loss_observation();
+        let deadline = match client.endpoint().lock().deadline(time::now()) {
+            ProtocolDeadline::At(at) => at,
+            _ => {
+                return Err(TestError(
+                    "dropped data did not retain actual raw retransmission deadline",
+                ))
+            }
+        };
+        if deadline.as_nanos() <= first.first_ns
+            || first.retransmissions != 0
+            || first.sequence.is_none()
+        {
+            return Err(TestError("data drop observation did not precede raw RTO"));
+        }
+        let mut output = [0u8; 97];
+        socket_read_exact(&server, &mut output)?;
+        context.expect_eq(output, input);
+        let loss = fixture.net.ktest_loss_observation();
+        context.expect_eq(loss.dropped, 1);
+        context.expect_eq(loss.sequence, first.sequence);
+        if loss.retransmissions == 0 || loss.repeated_ns < deadline.as_nanos() {
+            return Err(TestError(
+                "data arrived without actual At deadline retransmission",
+            ));
+        }
+        context.expect_eq(client.endpoint().state(), State::Established);
+        context.expect_eq(server.endpoint().state(), State::Established);
+        context.expect_eq(healthy_client.endpoint().state(), State::Established);
+        context.expect_eq(healthy_server.endpoint().state(), State::Established);
+        socket_write_all(&healthy_client, &input)?;
+        socket_read_exact(&healthy_server, &mut output)?;
+        context.expect_eq(output, input);
+        context.diagnostic(format_args!(
+            "network-socket controlled_drop={} sequence={:?} first_ns={} raw_deadline_ns={} repeated_ns={} retransmissions={}",
+            loss.dropped, loss.sequence, loss.first_ns, deadline.as_nanos(), loss.repeated_ns, loss.retransmissions
+        ));
+        operation(context, fixture.net.ktest_clear_packet_control())?;
+        drop((
+            client,
+            server,
+            listener,
+            healthy_client,
+            healthy_server,
+            healthy_listener,
+        ));
+        socket_retired(&fixture.net)
+    }
+
+    /// 末 OFD 先释放 watch，协议仍送 FIN 并进入真实 TIME_WAIT，最终 Weak 和 slot 同时归还。
+    #[test]
+    fn last_ofd_fin_time_wait_and_endpoint_slot_retire_normally(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = socket_listener(context, &fixture.net, 45630)?;
+        let client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 1000, 2000),
+        )?;
+        operation(
+            context,
+            client.connect(
+                InetEndpoint {
+                    port: 45630,
+                    ..SERVER
+                },
+                FileIoContext::Kernel,
+            ),
+        )?;
+        let server = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let file_weak = Arc::downgrade(&client);
+        let client_weak = Arc::downgrade(client.endpoint());
+        let server_weak = Arc::downgrade(server.endpoint());
+        socket_write_all(&client, b"tail before FIN")?;
+        drop(client);
+        context.expect_eq(file_weak.upgrade().is_none(), true);
+        context.expect_eq(client_weak.upgrade().is_some(), true);
+        let mut output = [0u8; 15];
+        socket_read_exact(&server, &mut output)?;
+        context.expect_eq(&output, b"tail before FIN");
+        context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
+        context.expect_eq(server.endpoint().state(), State::CloseWait);
+        drop(server);
+        observe(
+            || {
+                client_weak
+                    .upgrade()
+                    .is_some_and(|endpoint| endpoint.state() == State::TimeWait)
+            },
+            "last OFD did not progress through real TIME_WAIT",
+        )?;
+        context.expect_eq(fixture.net.is_stopping(), false);
+        context.expect_eq(0 < fixture.net.ktest_live_endpoints(), true);
+        drop(listener);
+        socket_retired(&fixture.net)?;
+        context.expect_eq(client_weak.upgrade().is_none(), true);
+        context.expect_eq(server_weak.upgrade().is_none(), true);
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        drop((file_weak, client_weak, server_weak));
         Ok(())
     }
 }

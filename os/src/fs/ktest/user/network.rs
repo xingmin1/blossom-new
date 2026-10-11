@@ -1,0 +1,376 @@
+//! 普通静态 TCP 程序复用原用户身份图、文件表和整组网络域。
+
+use super::*;
+use crate::fs::FileRef;
+use crate::task::UserThread;
+use ::core::convert::TryInto;
+
+const PROGRAM: &[u8] = b"/bin/network-smoke";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NetworkMode {
+    Identity,
+    Listener,
+    Connect,
+    Stream,
+    Backpressure,
+    HalfClose,
+    Address,
+    Signal,
+    Epoll,
+}
+
+impl NetworkMode {
+    /// 参数名直接选择普通 C main 的实际消费者。
+    fn argument(self) -> &'static [u8] {
+        match self {
+            Self::Identity => b"identity",
+            Self::Listener => b"listener",
+            Self::Connect => b"connect",
+            Self::Stream => b"stream",
+            Self::Backpressure => b"backpressure",
+            Self::HalfClose => b"half-close",
+            Self::Address => b"address",
+            Self::Signal => b"signal",
+            Self::Epoll => b"epoll",
+        }
+    }
+
+    /// 只有需要观察真实阻塞或 SYN 的模式继承两个普通管道描述符。
+    fn coordinated(self) -> bool {
+        matches!(self, Self::Connect | Self::Backpressure | Self::Signal)
+    }
+}
+
+impl UserOwner {
+    /// 普通 C 完成 wait/reap 后继续等待实际协议退休，整组网络 owner 保持运行。
+    pub(super) fn network_mode(
+        &mut self,
+        context: &mut TestContext<'_>,
+        mode: NetworkMode,
+    ) -> TestResult {
+        self.prepare_tty(context, 4)?;
+        if self.net.ktest_live_endpoints() != 0 {
+            return Err(TestError("network user case inherited live endpoints"));
+        }
+        let result = self.network_run(context, mode);
+        if result.is_err() {
+            self.graph().request_root_exit(9);
+            if self.running.is_some() {
+                self.wait(context)?;
+            }
+            self.reap_children(context, true)?;
+        }
+        let observer_result = self.observer.take().map(|observer| observer.join());
+        if self.net.ktest_has_held_syn() {
+            checked(context, self.net.ktest_release_syn())?;
+        }
+        checked(context, self.net.ktest_clear_packet_control())?;
+        network_until(
+            || self.net.ktest_live_endpoints() == 0,
+            "network user protocols did not retire",
+            30,
+        )?;
+        if let Some(status) = observer_result {
+            context.expect_eq(status, 0);
+            if status != 0 {
+                return Err(TestError("network user coordinator failed"));
+            }
+        }
+        context.diagnostic(format_args!(
+            "network-user mode={:?} live_endpoints={} protocols_retired=1",
+            mode,
+            self.net.ktest_live_endpoints()
+        ));
+        result
+    }
+
+    /// 映像、真实文件描述符及协调 Task 均在发表用户之前准备，失败由原拥有析构。
+    fn network_run(&mut self, context: &mut TestContext<'_>, mode: NetworkMode) -> TestResult {
+        let credentials = if mode == NetworkMode::Identity {
+            Credentials {
+                uid: 1000,
+                gid: 2000,
+            }
+        } else {
+            Credentials::ROOT
+        };
+        let runtime = checked(
+            context,
+            UserRuntime::try_new(
+                self.path.vfs().clone(),
+                self.path.context().clone(),
+                credentials,
+                self.net.clone(),
+            ),
+        )?;
+        checked(context, runtime.install_console())?;
+        let channels = if mode.coordinated() {
+            let (ready_reader, ready_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
+            let (go_reader, go_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
+            checked(context, ready_reader.set_status_flags(0o4000))?;
+            let ready_fd = checked(context, runtime.files.reserve())?
+                .publish(ready_writer, DescriptorFlags::default());
+            let go_fd = checked(context, runtime.files.reserve())?
+                .publish(go_reader, DescriptorFlags::default());
+            Some((ready_reader, go_writer, ready_fd, go_fd))
+        } else {
+            None
+        };
+        let mut argv: [&[u8]; 4] = [PROGRAM, mode.argument(), &[], &[]];
+        let (ready_text, ready_start) = decimal_fd(channels.as_ref().map_or(0, |x| x.2));
+        let (go_text, go_start) = decimal_fd(channels.as_ref().map_or(0, |x| x.3));
+        argv[2] = &ready_text[ready_start..];
+        argv[3] = &go_text[go_start..];
+        let arguments = Arguments::from_kernel(
+            PROGRAM,
+            &argv[..if channels.is_some() { 4 } else { 2 }],
+            &[],
+        )
+        .map_err(|_| TestError("network user arguments failed"))?;
+        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
+            .map_err(|error| {
+                context.diagnostic(format_args!("network-user image-error={:?}", error));
+                TestError("network user image preparation failed")
+            })?;
+        let prepared = task::prepare_program(self.graph(), None, image, runtime, Placement::Any)
+            .map_err(|_| TestError("network user task preparation failed"))?;
+        let pid = prepared.pid();
+        let coordinator = if let Some((reader, writer, _, _)) = channels {
+            let user = prepared.user();
+            let graph = self.graph().clone();
+            let net = self.net.clone();
+            Some(
+                task::prepare_kernel(move || {
+                    let result = coordinate(mode, &reader, &writer, &graph, &user, &net);
+                    if let Err(error) = result {
+                        crate::ktest::report::diagnostic(format_args!(
+                            "network-user coordinator-error={:?}",
+                            error
+                        ));
+                        graph.request_root_exit(9);
+                        if net.ktest_has_held_syn() {
+                            let _ = net.ktest_release_syn();
+                        }
+                        return 1;
+                    }
+                    0
+                })
+                .map_err(|_| TestError("network coordinator preparation failed"))?,
+            )
+        } else {
+            None
+        };
+        match mode {
+            NetworkMode::Connect => checked(context, self.net.ktest_hold_syn(45204))?,
+            NetworkMode::Signal => checked(context, self.net.ktest_hold_syn(45214))?,
+            _ => {}
+        }
+        let join = prepared
+            .publish()
+            .map_err(|_| TestError("network user publication failed"))?;
+        self.running = Some(RunningProgram {
+            pid,
+            target: None,
+            coordinator: cpu::current().id,
+            expected_task: Some(join.task_id()),
+            join,
+        });
+        self.observer = coordinator.map(|task| task.publish());
+        let event = self.wait(context)?;
+        context.expect_eq(event.status, 0);
+        if event.status != 0 {
+            self.graph().request_root_exit(9);
+        }
+        self.reap_children(context, event.status != 0)?;
+        if event.status != 0 {
+            return Err(TestError("ordinary network program failed"));
+        }
+        Ok(())
+    }
+}
+
+/// 测试仅观察事实；有限期限不驱动协议或覆盖生产时钟。
+fn network_until(mut ready: impl FnMut() -> bool, error: &'static str, seconds: u64) -> TestResult {
+    let end = time::now()
+        .checked_add(time::Duration::from_secs(seconds))
+        .ok_or(TestError("network user observation deadline overflow"))?;
+    while !ready() {
+        if end <= time::now() {
+            return Err(TestError(error));
+        }
+        timer::sleep(time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// 原非阻塞 pipe 逐字节取得 C 交付的三个 uint32 字段，退出和 EOF 都是失败。
+fn message(reader: &FileRef, root: &UserThread) -> Result<[u32; 3], TestError> {
+    let mut bytes = [0u8; 12];
+    let mut done = 0;
+    let end = time::now()
+        .checked_add(time::Duration::from_secs(10))
+        .ok_or(TestError("network report deadline overflow"))?;
+    while done < bytes.len() {
+        match reader.read(&mut bytes[done..]) {
+            Ok(0) => return Err(TestError("network report ended before expected phase")),
+            Ok(count) => done += count,
+            Err(FsError::WouldBlock) => {
+                if root.mm().is_none() || end <= time::now() {
+                    return Err(TestError("network report did not arrive"));
+                }
+                timer::sleep(time::Duration::from_millis(1));
+            }
+            Err(_) => return Err(TestError("network report read failed")),
+        }
+    }
+    Ok(::core::array::from_fn(|i| {
+        u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+    }))
+}
+
+/// 阶段和 errno 必须由 C 真实报告，不能只确认有一条管道数据。
+fn phase(
+    reader: &FileRef,
+    root: &UserThread,
+    expected: u8,
+    value: u32,
+) -> Result<usize, TestError> {
+    let message = message(reader, root)?;
+    if message[0] != u32::from(expected) || message[2] != value {
+        return Err(TestError("network C reported unexpected phase or errno"));
+    }
+    crate::ktest::report::diagnostic(format_args!(
+        "network-user report-phase={} pid={} value={}",
+        expected as char, message[1], message[2]
+    ));
+    Ok(message[1] as usize)
+}
+
+/// 选择原身份图中的实际 Task 并观察 Blocked，不把用户提示字当成等待证明。
+fn blocked(graph: &TaskGraph, pid: usize) -> TestResult {
+    let user = graph
+        .lookup_thread(pid)
+        .ok_or(TestError("network reported PID disappeared"))?;
+    let task = user
+        .executor()
+        .ok_or(TestError("network reported Task disappeared"))?;
+    network_until(
+        || sched::test_state(&task) == State::Blocked || user.mm().is_none(),
+        "network user did not block",
+        5,
+    )?;
+    if user.mm().is_none() {
+        return Err(TestError("network user exited before blocking"));
+    }
+    Ok(())
+}
+
+/// 放行只写真实 pipe，不直接修改用户内存或协议状态。
+fn go(writer: &FileRef) -> TestResult {
+    if writer.write(b"G") != Ok(1) {
+        return Err(TestError("network control pipe write failed"));
+    }
+    Ok(())
+}
+
+/// 按实际 C 阶段观察 held SYN、发送满和原信号重启，所有资源交原 observer join 回收。
+fn coordinate(
+    mode: NetworkMode,
+    reader: &FileRef,
+    writer: &FileRef,
+    graph: &TaskGraph,
+    root: &UserThread,
+    net: &NetStackRef,
+) -> TestResult {
+    match mode {
+        NetworkMode::Connect => {
+            phase(reader, root, b'C', 114)?;
+            network_until(|| net.ktest_has_held_syn(), "connect SYN was not held", 5)?;
+            net.ktest_release_syn()
+                .map_err(|_| TestError("connect SYN release failed"))?;
+            go(writer)
+        }
+        NetworkMode::Backpressure => {
+            let pid = phase(reader, root, b'B', 0)?;
+            blocked(graph, pid)?;
+            crate::ktest::report::diagnostic(format_args!(
+                "network-user writer-pid={} full-send-blocked=1",
+                pid
+            ));
+            go(writer)
+        }
+        NetworkMode::Signal => {
+            let pid = phase(reader, root, b'R', 0)?;
+            blocked(graph, pid)?;
+            graph
+                .send_kernel(pid, 10)
+                .map_err(|_| TestError("empty read signal failed"))?;
+            phase(reader, root, b'I', 4)?;
+            go(writer)?;
+            let child = phase(reader, root, b'T', 0)?;
+            blocked(graph, child)?;
+            graph
+                .send_kernel(child, 10)
+                .map_err(|_| TestError("restarted read signal failed"))?;
+            if phase(reader, root, b'H', 10)? != child {
+                return Err(TestError("read handler ran in wrong process"));
+            }
+            blocked(graph, child)?;
+            go(writer)?;
+            let pid = phase(reader, root, b'K', 0)?;
+            network_until(
+                || net.ktest_has_held_syn(),
+                "interrupted connect SYN missing",
+                5,
+            )?;
+            blocked(graph, pid)?;
+            graph
+                .send_kernel(pid, 10)
+                .map_err(|_| TestError("connect signal failed"))?;
+            phase(reader, root, b'J', 4)?;
+            net.ktest_release_syn()
+                .map_err(|_| TestError("interrupted SYN release failed"))?;
+            go(writer)?;
+            phase(reader, root, b'V', 0)?;
+            net.ktest_clear_packet_control()
+                .map_err(|_| TestError("previous SYN control did not end"))?;
+            net.ktest_hold_syn(45215)
+                .map_err(|_| TestError("restart SYN control failed"))?;
+            go(writer)?;
+            let pid = phase(reader, root, b'W', 0)?;
+            network_until(
+                || net.ktest_has_held_syn(),
+                "restarted connect SYN missing",
+                5,
+            )?;
+            blocked(graph, pid)?;
+            graph
+                .send_kernel(pid, 10)
+                .map_err(|_| TestError("restart connect signal failed"))?;
+            if phase(reader, root, b'H', 10)? != pid {
+                return Err(TestError("connect handler ran in wrong process"));
+            }
+            blocked(graph, pid)?;
+            net.ktest_release_syn()
+                .map_err(|_| TestError("restart SYN release failed"))?;
+            phase(reader, root, b'Z', 0)?;
+            Ok(())
+        }
+        _ => Err(TestError("uncoordinated network mode has coordinator")),
+    }
+}
+
+/// 描述符参数只在准备期编码一次，固定栈数组不创建额外字符串拥有。
+fn decimal_fd(mut value: usize) -> ([u8; 20], usize) {
+    let mut bytes = [0u8; 20];
+    let mut start = bytes.len();
+    loop {
+        start -= 1;
+        bytes[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return (bytes, start);
+        }
+    }
+}

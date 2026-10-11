@@ -14,6 +14,8 @@ use ::core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+#[cfg(feature = "ktest")]
+use smoltcp::wire::TcpControl;
 use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Cidr};
 use spin::Once;
 
@@ -94,6 +96,39 @@ struct Egress {
     open: bool,
     packets: VecDeque<OwnedPacket>,
     waiting: Vec<u64>,
+    #[cfg(feature = "ktest")]
+    packet_control: Option<TestPacketControl>,
+}
+
+/// 只记录所选实际普通段的丢失及同 seq 再到达，时间来自生产 monotonic 域。
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TestLossObservation {
+    pub dropped: usize,
+    pub sequence: Option<i32>,
+    pub retransmissions: usize,
+    pub first_ns: u64,
+    pub repeated_ns: u64,
+}
+
+/// 控制只作用于本域 lo 交付窗口，held 保存原包而不合成握手应答。
+#[cfg(feature = "ktest")]
+enum TestPacketControl {
+    HoldSyn {
+        destination_port: u16,
+        held: Option<OwnedPacket>,
+        released: bool,
+    },
+    DropData {
+        source_port: u16,
+        destination_port: u16,
+        observation: TestLossObservation,
+    },
+    DropHandshakeAck {
+        source_port: u16,
+        destination_port: u16,
+        dropped: bool,
+    },
 }
 
 /// 控制发表与停止串行，逐连接协议处理不持这把控制互斥。
@@ -136,6 +171,8 @@ impl NetStack {
                 open: true,
                 packets,
                 waiting,
+                #[cfg(feature = "ktest")]
+                packet_control: None,
             }),
             retired: SpinLock::new(retired),
             queue: Once::new(),
@@ -370,6 +407,220 @@ impl NetStack {
         self.egress.lock().waiting.contains(&id)
     }
 
+    /// 只读实际 EndpointSlot 数，包含准备中、表、退休和外部真实拥有。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_live_endpoints(&self) -> usize {
+        self.endpoints.load(Ordering::Acquire)
+    }
+
+    /// 为选定目的端口关闭 SYN 交付窗口；本域同时仅能存在一个具体控制。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_hold_syn(&self, destination_port: u16) -> Result<(), FsError> {
+        let mut egress = self.egress.lock();
+        if !egress.open {
+            return Err(FsError::NotConnected);
+        }
+        if egress.packet_control.is_some() {
+            return Err(FsError::Busy);
+        }
+        egress.packet_control = Some(TestPacketControl::HoldSyn {
+            destination_port,
+            held: None,
+            released: false,
+        });
+        Ok(())
+    }
+
+    /// 只观察原 SYN 包是否已在真正交付窗口移入 held。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_has_held_syn(&self) -> bool {
+        matches!(
+            self.egress.lock().packet_control.as_ref(),
+            Some(TestPacketControl::HoldSyn { held: Some(_), .. })
+        )
+    }
+
+    /// 在同一队列短锁内移动原包回 lo；未接受时 held 的原拥有保持不变。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_release_syn(&self) -> Result<(), FsError> {
+        {
+            let mut egress = self.egress.lock();
+            if !egress.open {
+                return Err(FsError::NotConnected);
+            }
+            if egress.packets.len() == LOOPBACK_CAPACITY {
+                return Err(FsError::WouldBlock);
+            }
+            let packet = match egress.packet_control.as_mut() {
+                Some(TestPacketControl::HoldSyn { held, released, .. }) => {
+                    let packet = held.take().ok_or(FsError::InvalidOperation)?;
+                    *released = true;
+                    packet
+                }
+                _ => return Err(FsError::InvalidOperation),
+            };
+            egress.packets.push_back(packet);
+        }
+        let _ = self.ingress.get().unwrap().as_ref().queue();
+        Ok(())
+    }
+
+    /// 选择一笔真实带 payload 的普通 TCP 段丢失，不修改 raw 时钟或重传算法。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_drop_next_data(
+        &self,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Result<(), FsError> {
+        let mut egress = self.egress.lock();
+        if !egress.open {
+            return Err(FsError::NotConnected);
+        }
+        if egress.packet_control.is_some() {
+            return Err(FsError::Busy);
+        }
+        egress.packet_control = Some(TestPacketControl::DropData {
+            source_port,
+            destination_port,
+            observation: TestLossObservation::default(),
+        });
+        Ok(())
+    }
+
+    /// 丢失所选端口的首笔真实空 ACK，后续交付不变；关门或已有控制时拒绝配置。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_drop_handshake_ack(
+        &self,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Result<(), FsError> {
+        let mut egress = self.egress.lock();
+        if !egress.open {
+            return Err(FsError::NotConnected);
+        }
+        if egress.packet_control.is_some() {
+            return Err(FsError::Busy);
+        }
+        egress.packet_control = Some(TestPacketControl::DropHandshakeAck {
+            source_port,
+            destination_port,
+            dropped: false,
+        });
+        Ok(())
+    }
+
+    /// 只读取原 ACK 在 lo 交付边界实际丢失的事实，不安排协议进度。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_handshake_ack_dropped(&self) -> bool {
+        matches!(
+            self.egress.lock().packet_control.as_ref(),
+            Some(TestPacketControl::DropHandshakeAck { dropped: true, .. })
+        )
+    }
+
+    /// 返回实际交付边界的计数快照，查询本身不推动包或协议。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_loss_observation(&self) -> TestLossObservation {
+        match self.egress.lock().packet_control.as_ref() {
+            Some(TestPacketControl::DropData { observation, .. }) => *observation,
+            _ => TestLossObservation::default(),
+        }
+    }
+
+    /// 仅允许结束已经没有 held 包的控制；控制拥有的最终析构在短锁外。
+    #[cfg(feature = "ktest")]
+    pub fn ktest_clear_packet_control(&self) -> Result<(), FsError> {
+        let control = {
+            let mut egress = self.egress.lock();
+            if matches!(
+                egress.packet_control.as_ref(),
+                Some(TestPacketControl::HoldSyn { held: Some(_), .. })
+            ) {
+                return Err(FsError::Busy);
+            }
+            egress.packet_control.take()
+        };
+        drop(control);
+        Ok(())
+    }
+
+    /// 报文解析在短锁外，锁内只移动原 SYN 或记录所选 data、空 ACK 的真实到达事实。
+    #[cfg(feature = "ktest")]
+    fn controlled_loopback_packet(&self, packet: OwnedPacket) -> Option<OwnedPacket> {
+        if packet.protocol() != IpProtocol::Tcp {
+            return Some(packet);
+        }
+        let (_, repr) = packet.tcp().expect("validated loopback TCP packet");
+        let (source, destination, control, payload, sequence, acknowledged) = (
+            repr.src_port,
+            repr.dst_port,
+            repr.control,
+            repr.payload.len(),
+            repr.seq_number.0,
+            repr.ack_number.is_some(),
+        );
+        let now = time::now().as_nanos();
+        let mut egress = self.egress.lock();
+        match egress.packet_control.as_mut() {
+            Some(TestPacketControl::HoldSyn {
+                destination_port,
+                held,
+                released,
+            }) if destination == *destination_port && control == TcpControl::Syn && !*released => {
+                if held.is_none() {
+                    *held = Some(packet);
+                    return None;
+                }
+                drop(egress);
+                drop(packet);
+                return None;
+            }
+            Some(TestPacketControl::DropHandshakeAck {
+                source_port,
+                destination_port,
+                dropped,
+            }) if source == *source_port
+                && destination == *destination_port
+                && control == TcpControl::None
+                && payload == 0
+                && acknowledged
+                && !*dropped =>
+            {
+                *dropped = true;
+                drop(egress);
+                drop(packet);
+                return None;
+            }
+            Some(TestPacketControl::DropData {
+                source_port,
+                destination_port,
+                observation,
+            }) if source == *source_port
+                && destination == *destination_port
+                && 0 < payload
+                && matches!(control, TcpControl::None | TcpControl::Psh) =>
+            {
+                if observation.dropped == 0 {
+                    observation.dropped = 1;
+                    observation.sequence = Some(sequence);
+                    observation.first_ns = now;
+                    drop(egress);
+                    drop(packet);
+                    return None;
+                }
+                if observation.sequence == Some(sequence) {
+                    observation.retransmissions += 1;
+                    if observation.retransmissions == 1 {
+                        observation.repeated_ns = now;
+                    }
+                }
+            }
+            _ => {}
+        }
+        drop(egress);
+        Some(packet)
+    }
+
     /// 有界领取后释放队列锁，再通知原等待者并处理同一个 IPv4 路径。
     fn receive_loopback(&self) {
         for _ in 0..PROTOCOL_BUDGET {
@@ -396,6 +647,10 @@ impl NetStack {
             }
             let Some(packet) = packet else {
                 return;
+            };
+            #[cfg(feature = "ktest")]
+            let Some(packet) = self.controlled_loopback_packet(packet) else {
+                continue;
             };
             if let Err(error) = self.deliver_ipv4(packet) {
                 crate::klog!(
@@ -475,6 +730,11 @@ impl NetStack {
         }
         for endpoint in udp {
             endpoint.stop_sync();
+        }
+        #[cfg(feature = "ktest")]
+        {
+            let control = self.egress.lock().packet_control.take();
+            drop(control);
         }
         let packets = {
             let mut egress = self.egress.lock();

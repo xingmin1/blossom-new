@@ -11,18 +11,19 @@ use smoltcp::wire::TcpControl;
 use spin::Once;
 
 use crate::cpu;
-use crate::fs::FsError;
+use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
+use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::InetEndpoint;
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
 use crate::net::table::{BindLease, TcpTuple, TransportProtocol};
 use crate::net::{
-    EndpointSlot, NetStack, NetStackRef, ENDPOINT_CAPACITY, LOOPBACK_CAPACITY, PROTOCOL_BUDGET,
+    EndpointSlot, IoProgress, NetStack, NetStackRef, ENDPOINT_CAPACITY, LOOPBACK_CAPACITY,
+    PROTOCOL_BUDGET,
 };
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::time;
 use crate::timer::{Timer, TimerKind};
-use crate::wait::WaitQueue;
 use crate::workqueue::Work;
 
 /// 输入在用户持有核心时保持拥有，立即回应未接受时也留在同一节点。
@@ -40,6 +41,9 @@ struct Metadata {
     parent: Weak<TcpEndpoint>,
     engaged: bool,
     error: Option<FsError>,
+    connected: bool,
+    read_closed: bool,
+    write_closed: bool,
 }
 
 /// 半连接与可接受连接共享实际 backlog 上限，只有成熟 Established 才进入 ready。
@@ -57,7 +61,7 @@ pub struct TcpEndpoint {
     input: SpinLock<Input>,
     metadata: SpinLock<Metadata>,
     children: SpinLock<Children>,
-    changed: WaitQueue,
+    source: Arc<PollWaitHead>,
     work: Once<Pin<Arc<Work>>>,
     timer: Once<Pin<Arc<Timer>>>,
     stopped: AtomicBool,
@@ -71,11 +75,38 @@ enum OperationMode {
     Observe,
 }
 
+/// 一次拥有期的原事实快照只用于识别通知，不保存另一份协议状态。
+struct Observation {
+    received: usize,
+    sent: usize,
+    mask: PollMask,
+    ready_children: usize,
+}
+
+impl Observation {
+    /// 从本次拥有前后的事实提取新就绪方向，队列消费不产生数据到达通知。
+    fn notification_since(&self, previous: &Self) -> PollMask {
+        let mut notification = self.mask & !previous.mask;
+        if previous.received < self.received || previous.ready_children < self.ready_children {
+            notification |= self.mask & (PollMask::POLLIN | PollMask::POLLRDNORM);
+        }
+        if self.mask.contains(PollMask::POLLRDHUP) && !previous.mask.contains(PollMask::POLLRDHUP) {
+            notification |=
+                self.mask & (PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLRDHUP);
+        }
+        if self.sent < previous.sent {
+            notification |= self.mask & (PollMask::POLLOUT | PollMask::POLLWRNORM);
+        }
+        notification
+    }
+}
+
 /// 普通操作保护只在释放核心后安排同一个协议 Work。
 pub struct TcpOperationGuard<'a> {
     endpoint: &'a TcpEndpoint,
     core: Option<SleepMutexGuard<'a, TcpCore>>,
     mode: OperationMode,
+    initial: Observation,
 }
 
 impl Deref for TcpOperationGuard<'_> {
@@ -94,13 +125,24 @@ impl DerefMut for TcpOperationGuard<'_> {
 }
 
 impl Drop for TcpOperationGuard<'_> {
-    /// 先释放核心，再以输入短锁领取真实受阻事实，封住失锁登记和拥有释放之间的窗口。
+    /// 在核心保护内发布连接事实，解锁后只通知新增方向；只读保护仅移交已有 Work 责任。
     fn drop(&mut self) {
+        let notification = if self.mode == OperationMode::Modify {
+            let core = self.core.as_deref().unwrap();
+            self.endpoint.record_connected(core);
+            let current = self.endpoint.observation(core);
+            current.notification_since(&self.initial)
+        } else {
+            PollMask::default()
+        };
         drop(self.core.take());
         let owner_waiting = {
             let mut input = self.endpoint.input.lock();
             core::mem::take(&mut input.owner_waiting)
         };
+        if !notification.is_empty() {
+            self.endpoint.source.notify(notification);
+        }
         if self.mode == OperationMode::Modify || owner_waiting {
             self.endpoint.schedule();
         }
@@ -134,13 +176,16 @@ impl TcpEndpoint {
                 parent: Weak::new(),
                 engaged: false,
                 error: None,
+                connected: false,
+                read_closed: false,
+                write_closed: false,
             }),
             children: SpinLock::new(Children {
                 limit: 0,
                 pending: Vec::new(),
                 ready: VecDeque::new(),
             }),
-            changed: WaitQueue::new(),
+            source: Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
             work: Once::new(),
             timer: Once::new(),
             stopped: AtomicBool::new(false),
@@ -175,20 +220,14 @@ impl TcpEndpoint {
 
     /// 普通任务取得本连接拥有，结束后由 guard 安排积存输入和发送责任。
     pub fn lock(&self) -> TcpOperationGuard<'_> {
-        TcpOperationGuard {
-            endpoint: self,
-            core: Some(self.core.lock()),
-            mode: OperationMode::Modify,
-        }
+        self.operation(self.core.lock(), OperationMode::Modify)
     }
 
     /// 不等待另一操作拥有者，失败也不消耗输入或安排重复后台票。
     pub fn try_lock(&self) -> Option<TcpOperationGuard<'_>> {
-        self.core.try_lock().map(|core| TcpOperationGuard {
-            endpoint: self,
-            core: Some(core),
-            mode: OperationMode::Modify,
-        })
+        self.core
+            .try_lock()
+            .map(|core| self.operation(core, OperationMode::Modify))
     }
 
     /// 只观察成熟状态；释放时仅移交已经因本操作拥有受阻的真实 Work，不主动开始协议进度。
@@ -197,12 +236,192 @@ impl TcpEndpoint {
     }
 
     /// 普通只读访问也参与操作拥有交接，未有真实 Work 受阻时不安排后台票。
-    fn observe(&self) -> TcpOperationGuard<'_> {
+    pub(crate) fn observe(&self) -> TcpOperationGuard<'_> {
+        self.operation(self.core.lock(), OperationMode::Observe)
+    }
+
+    /// 本保护的前后事实用于识别真实修改，不因一次只读容量查询产生 ET 通知。
+    fn operation<'a>(
+        &'a self,
+        core: SleepMutexGuard<'a, TcpCore>,
+        mode: OperationMode,
+    ) -> TcpOperationGuard<'a> {
+        let initial = self.observation(&core);
         TcpOperationGuard {
             endpoint: self,
-            core: Some(self.core.lock()),
-            mode: OperationMode::Observe,
+            core: Some(core),
+            mode,
+            initial,
         }
+    }
+
+    /// 就绪位只来自本核心、关闭事实与 child 队列；读取不安排协议处理。
+    fn ready_mask(&self, core: &TcpCore) -> PollMask {
+        if core.state() == State::Listen {
+            return if self.children.lock().ready.is_empty() {
+                PollMask::default()
+            } else {
+                PollMask::POLLIN | PollMask::POLLRDNORM
+            };
+        }
+        let metadata = self.metadata.lock();
+        let mut mask = PollMask::default();
+        if metadata.error.is_some() {
+            mask |= PollMask::POLLERR;
+        }
+        let closed = core.state() == State::Closed;
+        if closed || (metadata.read_closed && metadata.write_closed) {
+            mask |= PollMask::POLLHUP;
+        }
+        if core.receive_finished() || metadata.read_closed || (closed && metadata.connected) {
+            mask |= PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLRDHUP;
+        }
+        if core.can_receive() {
+            mask |= PollMask::POLLIN | PollMask::POLLRDNORM;
+        }
+        if core.can_send() || metadata.write_closed || closed {
+            mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
+        }
+        mask
+    }
+
+    /// 读取原收发队列、完整就绪位与 ready child 数量，快照只存活于本次拥有期。
+    fn observation(&self, core: &TcpCore) -> Observation {
+        Observation {
+            received: core.receive_queue(),
+            sent: core.send_queue(),
+            mask: self.ready_mask(core),
+            ready_children: self.children.lock().ready.len(),
+        }
+    }
+
+    /// 曾建立连接只在成熟核心确认握手后记录，正常关闭不删除这一 ABI 事实。
+    fn record_connected(&self, core: &TcpCore) {
+        if matches!(core.state(), State::Established | State::CloseWait) {
+            self.metadata.lock().connected = true;
+        }
+    }
+
+    /// 先登记唯一持续源再观察，不从查询路径收包、dispatch 或主动通知。
+    pub fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError> {
+        if let Some(table) = table {
+            table.register(&self.source)?;
+        }
+        let core = self.observe();
+        Ok(self.ready_mask(&core))
+    }
+
+    /// 返回同一次真实握手的结果，错误查询不消费 SO_ERROR 或重新发表 tuple。
+    pub fn connection_result(&self) -> Result<Option<()>, FsError> {
+        let core = self.observe();
+        let metadata = self.metadata.lock();
+        if let Some(error) = metadata.error {
+            return Err(error);
+        }
+        if matches!(core.state(), State::SynSent | State::SynReceived) {
+            return Ok(None);
+        }
+        if metadata.connected && matches!(core.state(), State::Established | State::CloseWait) {
+            return Ok(Some(()));
+        }
+        Err(FsError::NotConnected)
+    }
+
+    /// 同一连接拥有覆盖暂存、copyout 和消费；已有数据先于错误及 EOF 交付。
+    pub fn receive(&self, target: &mut ReadBuffer<'_>, peek: bool) -> Result<IoProgress, FsError> {
+        if target.copied() == target.len() {
+            return Ok(IoProgress::Ready(0));
+        }
+        let mut core = self.lock();
+        if core.can_receive() {
+            return core.receive(target, peek);
+        }
+        let mut metadata = self.metadata.lock();
+        if let Some(error) = metadata.error.take() {
+            return Err(error);
+        }
+        if metadata.read_closed || (metadata.connected && core.state() == State::Closed) {
+            return Ok(IoProgress::Eof);
+        }
+        drop(metadata);
+        core.receive(target, peek)
+    }
+
+    /// 仅提交调用者已准备的内核前缀，raw 接受量与用户输入复制量分开。
+    pub fn send(&self, source: &mut WriteBuffer<'_>) -> Result<IoProgress, FsError> {
+        if source.copied() == source.len() {
+            return Ok(IoProgress::Ready(0));
+        }
+        let mut core = self.lock();
+        let mut metadata = self.metadata.lock();
+        if let Some(error) = metadata.error.take() {
+            return Err(error);
+        }
+        if metadata.write_closed || (metadata.connected && core.state() == State::Closed) {
+            return Err(FsError::BrokenPipe);
+        }
+        drop(metadata);
+        core.send(source)
+    }
+
+    /// 关闭指定方向；发送关闭沿 raw FIN，接收方向仍能在 SHUT_WR 后独立推进。
+    pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
+        if 2 < how {
+            return Err(FsError::InvalidOperation);
+        }
+        let mut core = self.lock();
+        let mut metadata = self.metadata.lock();
+        if !metadata.connected || core.state() == State::Closed {
+            return Err(FsError::NotConnected);
+        }
+        if how == 0 || how == 2 {
+            metadata.read_closed = true;
+        }
+        if how == 1 || how == 2 {
+            metadata.write_closed = true;
+            core.close();
+        }
+        Ok(())
+    }
+
+    /// 已连接返回实际路由源，绑定保原通配，未绑定返回零地址及零端口。
+    pub fn local_address(&self) -> Result<InetEndpoint, FsError> {
+        let core = self.observe();
+        Ok(core
+            .local_endpoint()
+            .or_else(|| {
+                self.metadata
+                    .lock()
+                    .lease
+                    .as_ref()
+                    .map(|lease| lease.local())
+            })
+            .unwrap_or(InetEndpoint {
+                address: [0; 4],
+                port: 0,
+            }))
+    }
+
+    /// 只返回真正建立连接且 raw 仍拥有的远端端点。
+    pub fn peer_address(&self) -> Result<InetEndpoint, FsError> {
+        let core = self.observe();
+        if !self.metadata.lock().connected {
+            return Err(FsError::NotConnected);
+        }
+        core.remote_endpoint().ok_or(FsError::NotConnected)
+    }
+
+    /// 在只读核心保护下消费一次 pending error，不主动通知或安排握手。
+    pub fn take_error(&self) -> Option<FsError> {
+        let core = self.observe();
+        let error = self.metadata.lock().error.take();
+        drop(core);
+        error
+    }
+
+    /// 只观察原核心是否仍为 Listen。
+    pub fn is_listener(&self) -> bool {
+        self.state() == State::Listen
     }
 
     /// 取得仍存在的网络域，停止后的操作不得再发表新索引。
@@ -229,46 +448,71 @@ impl TcpEndpoint {
         Ok(local)
     }
 
-    /// listener 始终保 Listen；队列在表发表前 fallible 准备，半连接也占 backlog。
+    /// 重复 listen 只更新有限 backlog，既有半连接及 ready 仍由原队列拥有。
+    /// backlog 零保留一项正常队列容量；扩容准备不持 child 短锁。
     pub fn listen(self: &Arc<Self>, backlog: usize) -> Result<(), FsError> {
-        if backlog == 0 || ENDPOINT_CAPACITY < backlog {
-            return Err(FsError::InvalidOperation);
-        }
+        let limit = backlog.clamp(1, ENDPOINT_CAPACITY);
         let mut core = self.lock();
-        if core.state() != State::Closed || self.metadata.lock().engaged {
+        let listening = core.state() == State::Listen;
+        if !listening && (core.state() != State::Closed || self.metadata.lock().engaged) {
             return Err(FsError::InvalidOperation);
         }
+        let capacity = {
+            let children = self.children.lock();
+            if limit <= children.pending.capacity() && limit <= children.ready.capacity() {
+                0
+            } else {
+                limit.max(children.pending.len() + children.ready.len())
+            }
+        };
         let mut pending = Vec::new();
-        pending
-            .try_reserve_exact(backlog)
-            .map_err(|_| FsError::NoMemory)?;
         let mut ready = VecDeque::new();
-        ready
-            .try_reserve_exact(backlog)
-            .map_err(|_| FsError::NoMemory)?;
+        if 0 < capacity {
+            pending
+                .try_reserve_exact(capacity)
+                .map_err(|_| FsError::NoMemory)?;
+            ready
+                .try_reserve_exact(capacity)
+                .map_err(|_| FsError::NoMemory)?;
+        }
         let net = self.net()?;
         let _admission = net.admission()?;
-        let lease = self.binding_or_ephemeral(&net)?;
-        core.listen(lease.local())?;
-        if let Err(error) = net.tables().publish_listener(self.id, lease.local()) {
-            core.close();
-            return Err(error);
+        if !listening {
+            let lease = self.binding_or_ephemeral(&net)?;
+            core.listen(lease.local())?;
+            if let Err(error) = net.tables().publish_listener(self.id, lease.local()) {
+                core.close();
+                return Err(error);
+            }
         }
-        *self.children.lock() = Children {
-            limit: backlog,
-            pending,
-            ready,
-        };
+        {
+            let mut children = self.children.lock();
+            if 0 < capacity {
+                pending.extend(children.pending.drain(..));
+                ready.extend(children.ready.drain(..));
+                core::mem::swap(&mut pending, &mut children.pending);
+                core::mem::swap(&mut ready, &mut children.ready);
+            }
+            children.limit = limit;
+        }
         self.metadata.lock().engaged = true;
         Ok(())
     }
 
-    /// 路由选择实际源，租约仍保通配；明确四元组先发表再允许握手 Work。
+    /// 首次发表实际 tuple；进行中和曾连接成功的重复调用不重新启动握手。
     pub fn connect(self: &Arc<Self>, peer: InetEndpoint) -> Result<(), FsError> {
         let mut core = self.lock();
-        if core.state() != State::Closed || self.metadata.lock().engaged {
-            return Err(FsError::InvalidOperation);
+        let metadata = self.metadata.lock();
+        if metadata.connected {
+            return Err(FsError::AlreadyConnected);
         }
+        if matches!(core.state(), State::SynSent | State::SynReceived) {
+            return Err(FsError::AlreadyInProgress);
+        }
+        if core.state() != State::Closed || metadata.engaged {
+            return Err(metadata.error.unwrap_or(FsError::NotConnected));
+        }
+        drop(metadata);
         let net = self.net()?;
         let admission = net.admission()?;
         let lease = self.binding_or_ephemeral(&net)?;
@@ -316,7 +560,7 @@ impl TcpEndpoint {
 
     /// 只领取已完成握手的真实 child，不替换 listener 或提前创建用户描述符。
     pub fn accept(&self) -> Result<Option<Arc<TcpEndpoint>>, FsError> {
-        let core = self.observe();
+        let core = self.lock();
         if core.state() != State::Listen {
             return Err(FsError::InvalidOperation);
         }
@@ -324,11 +568,14 @@ impl TcpEndpoint {
         Ok(child)
     }
 
-    /// 最后打开对象只请求正常关闭，FIN 和 TIME_WAIT 继续由原 Work/Timer 推进。
+    /// 最后打开对象请求双方向关闭；FIN 和 TIME_WAIT 继续由原 Work/Timer 推进。
     pub fn close(&self) {
         let mut core = self.lock();
         core.close();
-        self.metadata.lock().engaged = true;
+        let mut metadata = self.metadata.lock();
+        metadata.engaged = true;
+        metadata.read_closed = true;
+        metadata.write_closed = true;
     }
 
     /// 未交给打开对象的节点终止协议，仍保留真实待发 RST 的 dispatch 责任。
@@ -368,7 +615,7 @@ impl TcpEndpoint {
         let _ = self.work.get().unwrap().as_ref().queue();
     }
 
-    /// 先登记真实拥有责任，释放输入锁再尝试核心；成功后清登记，失败由操作拥有者释放时交接。
+    /// 先登记真实拥有责任；完成协议和方向计算、释放核心后才通知原持续源。
     fn run(&self) {
         let Some(net) = self.stack.upgrade() else {
             return;
@@ -381,44 +628,50 @@ impl TcpEndpoint {
             return;
         };
         self.input.lock().owner_waiting = false;
+        let previous = self.observation(&core);
         let mut notification = None;
         let result = self.advance(&net, &mut core, &mut notification);
+        let blocked = result == Err(FsError::WouldBlock);
         if let Err(error) = result {
-            if error == FsError::WouldBlock {
-                self.timer.get().unwrap().as_ref().cancel_pending();
-                drop(core);
-                if let Some(parent) = notification {
-                    parent.changed.wake_all();
-                }
-                net.wait_egress(self.id);
-                return;
+            if !blocked {
+                self.metadata.lock().error.get_or_insert(error);
+                core.abort();
+                crate::klog!(
+                    crate::klog::Level::Debug,
+                    "TCP endpoint {} failed: {:?}",
+                    self.id,
+                    error
+                );
             }
-            self.metadata.lock().error = Some(error);
-            core.abort();
-            crate::klog!(
-                crate::klog::Level::Debug,
-                "TCP endpoint {} failed: {:?}",
-                self.id,
-                error
-            );
-            drop(core);
-            if let Some(parent) = notification {
-                parent.changed.wake_all();
-            }
-            net.retire_tcp(self.id);
-            return;
         }
+        self.record_connected(&core);
+        let current = self.observation(&core);
+        let mask = current.notification_since(&previous);
         let deadline = core.deadline(time::now());
+        let (queued, reply_pending) = {
+            let input = self.input.lock();
+            (!input.packets.is_empty(), input.reply.is_some())
+        };
         let ended = core.state() == State::Closed
             && deadline == ProtocolDeadline::Ingress
-            && self.metadata.lock().engaged;
-        let queued = !self.input.lock().packets.is_empty();
+            && self.metadata.lock().engaged
+            && !reply_pending;
         drop(core);
+        if !mask.is_empty() {
+            self.source.notify(mask);
+        }
         if let Some(parent) = notification {
-            parent.changed.wake_all();
+            parent
+                .source
+                .notify(PollMask::POLLIN | PollMask::POLLRDNORM);
         }
         if ended {
             net.retire_tcp(self.id);
+            return;
+        }
+        if blocked {
+            self.timer.get().unwrap().as_ref().cancel_pending();
+            net.wait_egress(self.id);
             return;
         }
         if net.is_stopping() {
@@ -467,11 +720,30 @@ impl TcpEndpoint {
                 }
             } else if core.state() != State::Closed {
                 let previous = core.state();
+                let reset = packet.tcp()?.1.control == TcpControl::Rst;
                 let reply = core.process(&packet, time::now())?;
-                if previous != State::Established {
-                    if let Some(parent) = self.report_established(core.state()) {
-                        *notification = Some(parent);
+                self.record_connected(core);
+                if reset && core.state() == State::Closed {
+                    let mut metadata = self.metadata.lock();
+                    let error = if previous == State::SynSent {
+                        Some(FsError::ConnectionRefused)
+                    } else if metadata.connected {
+                        Some(FsError::ConnectionReset)
+                    } else {
+                        None
+                    };
+                    if let Some(error) = error {
+                        metadata.error.get_or_insert(error);
                     }
+                }
+                if previous == State::SynReceived && core.state() == State::Listen {
+                    // 被动 child 的原握手已失败，不能将其回到 Listen 后留在半连接队列。
+                    if self.metadata.lock().parent.upgrade().is_some() {
+                        core.close();
+                    }
+                }
+                if let Some(parent) = self.report_established(core.state()) {
+                    *notification = Some(parent);
                 }
                 if let Some(reply) = reply {
                     self.input.lock().reply = Some(reply);
@@ -504,7 +776,7 @@ impl TcpEndpoint {
         }
     }
 
-    /// listener 核心只提供配置；child 先准备和发表，再由自己的 Work 处理原 SYN。
+    /// listener 核心提供配置，fallible child 准备不持域控制锁；只在发表时核 tuple。
     fn receive_syn(
         &self,
         net: &NetStackRef,
@@ -517,9 +789,7 @@ impl TcpEndpoint {
         }
         let (peer, local) = packet.tcp_endpoints()?;
         let tuple = TcpTuple { local, peer };
-        let admission = net.admission()?;
         if let Some(child) = net.tables().lookup_tcp(tuple) {
-            drop(admission);
             return child.enqueue(packet);
         }
         {
@@ -543,12 +813,17 @@ impl TcpEndpoint {
         let listener = net
             .tables()
             .tcp_by_id(self.id)
-            .expect("listener lost table ownership");
+            .ok_or(FsError::NotConnected)?;
         {
             let mut metadata = child.metadata.lock();
             metadata.lease = Some(lease);
             metadata.parent = Arc::downgrade(&listener);
             metadata.engaged = true;
+        }
+        let admission = net.admission()?;
+        if let Some(existing) = net.tables().lookup_tcp(tuple) {
+            drop(admission);
+            return existing.enqueue(packet);
         }
         net.tables().insert_tcp(child.clone())?;
         if let Err(error) = net.tables().publish_tcp_tuple(id, tuple) {
@@ -562,9 +837,9 @@ impl TcpEndpoint {
         child.enqueue(packet)
     }
 
-    /// child 真正 Established 后转移同一 pending Arc，返回锁外通知所需的真实 parent 拥有。
+    /// child 完成被动握手后转移同一 pending Arc，返回锁外通知所需的真实 parent 拥有。
     fn report_established(&self, state: State) -> Option<Arc<TcpEndpoint>> {
-        if state != State::Established {
+        if !matches!(state, State::Established | State::CloseWait) {
             return None;
         }
         let parent = self.metadata.lock().parent.upgrade()?;
@@ -598,14 +873,24 @@ impl TcpEndpoint {
         self.input.lock().closed = true;
         self.timer.get().unwrap().as_ref().close_sync();
         self.work.get().unwrap().as_ref().close_sync();
-        self.core.lock().abort();
+        {
+            let mut core = self.core.lock();
+            if core.state() != State::Closed {
+                self.metadata
+                    .lock()
+                    .error
+                    .get_or_insert(FsError::NotConnected);
+            }
+            core.abort();
+        }
         let (packets, reply) = {
             let mut input = self.input.lock();
             (core::mem::take(&mut input.packets), input.reply.take())
         };
-        let (lease, parent) = {
+        // 已退休协议仍可由 OFD 查询绑定；租约仅随 endpoint 最后拥有归还。
+        let parent = {
             let mut metadata = self.metadata.lock();
-            (metadata.lease.take(), core::mem::take(&mut metadata.parent))
+            core::mem::take(&mut metadata.parent)
         };
         let children = {
             let mut children = self.children.lock();
@@ -621,11 +906,12 @@ impl TcpEndpoint {
         if let Some(parent) = parent.upgrade() {
             parent.remove_child(self.id);
         }
-        drop((packets, reply, lease));
-        self.changed.wake_all();
+        drop((packets, reply));
+        self.source
+            .notify(PollMask::POLLIN | PollMask::POLLOUT | PollMask::POLLERR | PollMask::POLLHUP);
     }
 
-    /// 已结束的 child 从 listener 队列撤下，最后 Arc 析构在锁外发生。
+    /// 撤下已结束的 child 只缩减队列，不产生新增读事件；最后 Arc 析构在锁外发生。
     fn remove_child(&self, id: u64) {
         let removed = {
             let mut children = self.children.lock();

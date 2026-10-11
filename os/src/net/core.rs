@@ -119,8 +119,8 @@ impl TcpCore {
         }
     }
 
-    /// 普通任务持本连接 SleepMutex 交付连续前缀，copyout 故障只消费实际 copied 差量。
-    /// PEEK 可交付连续短前缀但不移动 ring。
+    /// 持本连接操作拥有暂存至多 4096 字节；raw 借用结束后复制，按实际交付差量消费。
+    /// PEEK 使用同一连续前缀，但不改变接收位置。
     pub fn receive(
         &mut self,
         target: &mut ReadBuffer<'_>,
@@ -130,22 +130,29 @@ impl TcpCore {
             return Ok(IoProgress::Ready(0));
         }
         let before = target.copied();
-        if peek {
-            let bytes = match self.socket.peek(target.len() - before) {
+        let mut prefix = [0u8; 4096];
+        let length = {
+            let bytes = match self.socket.peek((target.len() - before).min(prefix.len())) {
                 Ok(bytes) => bytes,
                 Err(error) => return self.receive_error(error),
             };
-            let copied = target.push(bytes);
-            return copy_progress(target.copied() - before, copied);
+            prefix[..bytes.len()].copy_from_slice(bytes);
+            bytes.len()
+        };
+        let result = target.push(&prefix[..length]);
+        let copied = target.copied() - before;
+        if !peek && 0 < copied {
+            self.socket
+                .recv(|bytes| {
+                    assert!(
+                        copied <= bytes.len(),
+                        "TCP receive prefix changed under ownership"
+                    );
+                    (copied, ())
+                })
+                .expect("TCP receive state changed under ownership");
         }
-        match self.socket.recv(|bytes| {
-            let copied = target.push(bytes);
-            let consumed = target.copied() - before;
-            (consumed, copy_progress(consumed, copied))
-        }) {
-            Ok(progress) => progress,
-            Err(error) => self.receive_error(error),
-        }
+        copy_progress(copied, result)
     }
 
     /// 输入直接复制到本连接连续 TX 空段，只有闭包返回的真实差量成为 raw 已接受字节。
@@ -252,6 +259,17 @@ impl TcpCore {
     /// 就绪判断直接取原算法的发送能力和真实 ring 容量。
     pub fn can_send(&self) -> bool {
         self.socket.can_send()
+    }
+
+    /// 接收 FIN 的状态由原协议表达；本地关闭发送方向仍不结束接收。
+    pub fn receive_finished(&self) -> bool {
+        matches!(
+            self.socket.state(),
+            tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait
+        )
     }
 }
 

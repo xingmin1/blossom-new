@@ -121,10 +121,14 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
 .PHONY: userland
-userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_SCRIPTS)
+userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_SCRIPTS)
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
 
 $(USERLAND_ROOT)/bin/libc-smoke: tests/user/libc-smoke.c
+	mkdir -p "$(dir $@)"
+	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) "$<" -o "$@"
+
+$(USERLAND_ROOT)/bin/network-smoke: tests/user/network-smoke.c
 	mkdir -p "$(dir $@)"
 	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) "$<" -o "$@"
 
