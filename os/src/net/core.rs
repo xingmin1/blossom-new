@@ -155,9 +155,9 @@ impl TcpCore {
         copy_progress(copied, result)
     }
 
-    /// 输入直接复制到本连接连续 TX 空段，只有闭包返回的真实差量成为 raw 已接受字节。
+    /// 仅可发送状态接受零请求；非零输入的真实 TX 提交量来自 raw 闭包差量。
     pub fn send(&mut self, source: &mut WriteBuffer<'_>) -> Result<IoProgress, FsError> {
-        if source.copied() == source.len() {
+        if source.copied() == source.len() && self.socket.may_send() {
             return Ok(IoProgress::Ready(0));
         }
         let before = source.copied();
@@ -239,6 +239,16 @@ impl TcpCore {
     /// 返回 raw 发送 ring 的实际容量，不另存一份可能失配的配置。
     pub fn send_capacity(&self) -> usize {
         self.socket.send_capacity()
+    }
+
+    /// 查询 raw 的实际 Nagle 策略，不从发送队列或状态推算 TCP_NODELAY。
+    pub fn nagle_enabled(&self) -> bool {
+        self.socket.nagle_enabled()
+    }
+
+    /// 调用者持本连接修改保护；新策略由原 dispatch 和 Work 安排生效。
+    pub fn set_nagle_enabled(&mut self, enabled: bool) {
+        self.socket.set_nagle_enabled(enabled);
     }
 
     /// 返回当前可交付字节数，不能以它替代 FIN 或错误查询。

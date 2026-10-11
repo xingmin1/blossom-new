@@ -1453,6 +1453,47 @@ pub(crate) mod programs {
         fixture.network_mode(context, NetworkMode::Epoll)
     }
 
+    /// 同一 UDP OFD 的消息目的、默认 peer、来源与断连接都由普通 C 核验。
+    #[test]
+    #[ktest(tags("network-user", "network-udp"))]
+    fn network_udp_address(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::UdpAddress)
+    }
+
+    /// 普通消息入口区分零长消费、短消息丢尾与 PEEK/TRUNC。
+    #[test]
+    #[ktest(tags("network-user", "network-udp"))]
+    fn network_udp_message(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::UdpMessage)
+    }
+
+    /// 匿名 UNIX 双向流跨真实环容量，共享 OFD 和末关闭错误仍沿原用户拥有。
+    #[test]
+    #[ktest(tags("network-user", "network-unix"))]
+    fn network_unix_pair(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::UnixPair)
+    }
+
+    /// 目标消息头与向量跨段消费核验真实接受前缀及用户故障后的后继。
+    #[test]
+    #[ktest(tags("network-user", "network-message"))]
+    fn network_message_vector(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::MessageVector)
+    }
+
+    /// 复用策略、监听冲突、实际 UDP 选择和 TCP child 继承由普通 syscall 核验。
+    #[test]
+    #[ktest(tags("network-user", "network-options"))]
+    fn network_socket_options(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::SocketOptions)
+    }
+
     /// 真实 ELF 的边缘、BSS、参数和缓存私有性由 loader 与实际用户指令共同验证。
     #[test]
     #[ktest(min_cpus = 2)]

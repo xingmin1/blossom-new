@@ -8,6 +8,7 @@ use crate::fs::FsError;
 use crate::net::address::InetEndpoint;
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
+use crate::net::unix::UnixPair;
 use crate::net::{NetStack, NetStackRef};
 use crate::sync::SpinLock;
 
@@ -33,6 +34,7 @@ pub struct BindLease {
     protocol: TransportProtocol,
     local: InetEndpoint,
     owner_id: u64,
+    lease_id: u64,
     net: Weak<NetStack>,
     /// 准备中的 Arc 尚未发表，失败析构不能撤其它真实记录。
     published: bool,
@@ -48,6 +50,11 @@ impl BindLease {
     pub fn owner_id(&self) -> u64 {
         self.owner_id
     }
+
+    /// 每次预留使用独立不复用身份，旧发送的最后租约不能撤除后继绑定。
+    pub fn id(&self) -> u64 {
+        self.lease_id
+    }
 }
 
 impl Drop for BindLease {
@@ -55,7 +62,7 @@ impl Drop for BindLease {
     fn drop(&mut self) {
         if self.published {
             if let Some(net) = self.net.upgrade() {
-                net.tables().release_binding(self.owner_id);
+                net.tables().release_binding(self.lease_id);
             }
         }
     }
@@ -66,6 +73,8 @@ struct Binding {
     protocol: TransportProtocol,
     local: InetEndpoint,
     owner_id: u64,
+    lease_id: u64,
+    reuse: bool,
 }
 
 struct TablesState {
@@ -74,7 +83,8 @@ struct TablesState {
     tuples: Vec<(u64, TcpTuple)>,
     listeners: Vec<(u64, InetEndpoint)>,
     udp: Vec<Arc<UdpEndpoint>>,
-    udp_keys: Vec<(u64, InetEndpoint)>,
+    udp_keys: Vec<(u64, InetEndpoint, Option<InetEndpoint>)>,
+    unix: Vec<Arc<UnixPair>>,
     next_port: u16,
     closed: bool,
 }
@@ -95,19 +105,21 @@ impl NetTables {
                 listeners: reserved_entries()?,
                 udp: reserved_entries()?,
                 udp_keys: reserved_entries()?,
+                unix: reserved_entries()?,
                 next_port: FIRST_EPHEMERAL_PORT,
                 closed: false,
             }),
         })
     }
 
-    /// 锁外准备 Lease；选端口、核冲突与发表记录在同一短锁内完成。
+    /// 锁外准备独立租约身份；选端口、复用冲突与发表记录在同一短锁完成。
     pub fn reserve_binding(
         &self,
         net: &NetStackRef,
         owner_id: u64,
         protocol: TransportProtocol,
         requested: InetEndpoint,
+        reuse: bool,
     ) -> Result<Arc<BindLease>, FsError> {
         if !requested.is_unspecified() && !net.routes().is_local(requested.address) {
             return Err(FsError::AddressNotAvailable);
@@ -116,6 +128,7 @@ impl NetTables {
             protocol,
             local: requested,
             owner_id,
+            lease_id: net.allocate_identity(),
             net: Arc::downgrade(net),
             published: false,
         })
@@ -125,20 +138,19 @@ impl NetTables {
             if state.closed {
                 return Err(FsError::InvalidOperation);
             }
-            if state
-                .bindings
-                .iter()
-                .any(|entry| entry.owner_id == owner_id)
-            {
-                return Err(FsError::InvalidOperation);
-            }
             if state.bindings.len() == TABLE_CAPACITY {
                 return Err(FsError::NoMemory);
             }
             let local = if requested.port == 0 {
                 choose_ephemeral(&mut state, protocol, requested)?
             } else {
-                if binding_conflicts(&state.bindings, protocol, requested) {
+                if binding_conflicts(&state.bindings, protocol, requested, reuse)
+                    || (protocol == TransportProtocol::Tcp
+                        && state
+                            .listeners
+                            .iter()
+                            .any(|entry| overlaps(entry.1, requested)))
+                {
                     return Err(FsError::AddressInUse);
                 }
                 requested
@@ -150,19 +162,37 @@ impl NetTables {
                 protocol: prepared.protocol,
                 local,
                 owner_id,
+                lease_id: prepared.lease_id,
+                reuse,
             });
             prepared.published = true;
         }
         Ok(lease)
     }
 
-    /// 只移除小型绑定记录；协议索引的撤除不提前归还端口。
-    pub fn release_binding(&self, owner_id: u64) {
+    /// 按当前租约身份更新已有策略，不影响同 owner 的旧在途发送租约。
+    pub fn set_reuse(&self, lease_id: u64, reuse: bool) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
+        if let Some(binding) = state
+            .bindings
+            .iter_mut()
+            .find(|entry| entry.lease_id == lease_id)
+        {
+            binding.reuse = reuse;
+        }
+        Ok(())
+    }
+
+    /// 最后租约只撤自己的绑定记录，旧租约释放不撤同 owner 的后继绑定。
+    pub fn release_binding(&self, lease_id: u64) {
         let mut state = self.state.lock();
         if let Some(index) = state
             .bindings
             .iter()
-            .position(|entry| entry.owner_id == owner_id)
+            .position(|entry| entry.lease_id == lease_id)
         {
             state.bindings.swap_remove(index);
         }
@@ -196,6 +226,20 @@ impl NetTables {
         Ok(())
     }
 
+    /// pair 和两个端点完整准备后才发表根拥有；失败拥有由调用者在表锁外释放。
+    pub fn insert_unix(&self, pair: Arc<UnixPair>) -> Result<(), FsError> {
+        let id = pair.id();
+        let mut state = self.state.lock();
+        if state.closed || state.unix.iter().any(|entry| entry.id() == id) {
+            return Err(FsError::InvalidOperation);
+        }
+        if state.unix.len() == TABLE_CAPACITY {
+            return Err(FsError::NoMemory);
+        }
+        state.unix.push(pair);
+        Ok(())
+    }
+
     /// 同锁核完整 tuple 唯一性后发表，重复 SYN 不能取得第二个连接键。
     pub fn publish_tcp_tuple(&self, id: u64, tuple: TcpTuple) -> Result<(), FsError> {
         let mut state = self.state.lock();
@@ -215,22 +259,59 @@ impl NetTables {
         Ok(())
     }
 
-    /// 稳定 listener 的本地键单独发表，不替换连接 tuple 或对象拥有。
+    /// 监听发表复核当前绑定策略；重叠监听者永远不能共享地址和端口。
     pub fn publish_listener(&self, id: u64, local: InetEndpoint) -> Result<(), FsError> {
         let mut state = self.state.lock();
         if state.closed || !state.tcp.iter().any(|entry| entry.id() == id) {
             return Err(FsError::BadFd);
         }
+        let binding = state
+            .bindings
+            .iter()
+            .find(|entry| entry.owner_id == id)
+            .ok_or(FsError::BadFd)?;
+        if binding.protocol != TransportProtocol::Tcp || binding.local != local {
+            return Err(FsError::InvalidOperation);
+        }
+        if state.listeners.iter().any(|entry| overlaps(entry.1, local))
+            || state.bindings.iter().any(|entry| {
+                entry.owner_id != id
+                    && entry.protocol == TransportProtocol::Tcp
+                    && overlaps(entry.local, local)
+                    && !(binding.reuse && entry.reuse)
+            })
+        {
+            return Err(FsError::AddressInUse);
+        }
         publish_local(&mut state.listeners, id, local)
     }
 
-    /// UDP 的本地键只关联 UDP 拥有表，与 TCP 监听空间分开。
-    pub fn publish_udp(&self, id: u64, local: InetEndpoint) -> Result<(), FsError> {
+    /// UDP 键只复制端点当前地址和 peer；合法复用不再被精确地址检查否定。
+    pub fn publish_udp(
+        &self,
+        id: u64,
+        local: InetEndpoint,
+        peer: Option<InetEndpoint>,
+    ) -> Result<(), FsError> {
         let mut state = self.state.lock();
         if state.closed || !state.udp.iter().any(|entry| entry.id() == id) {
             return Err(FsError::BadFd);
         }
-        publish_local(&mut state.udp_keys, id, local)
+        if local.port == 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        if let Some(index) = state.udp_keys.iter().position(|entry| entry.0 == id) {
+            state.udp_keys.remove(index);
+        } else if state.udp_keys.len() == TABLE_CAPACITY {
+            return Err(FsError::NoMemory);
+        }
+        state.udp_keys.push((id, local, peer));
+        Ok(())
+    }
+
+    /// 断开自动绑定只撤本身份的查询键，节点拥有和租约由各自拥有者结束。
+    pub fn unpublish_udp(&self, id: u64) {
+        self.state.lock().udp_keys.retain(|entry| entry.0 != id);
     }
 
     /// 查完整 tuple 并取得真实节点引用；协议调用由持引用者在解锁后执行。
@@ -253,10 +334,31 @@ impl NetTables {
         state.tcp.iter().find(|entry| entry.id() == id).cloned()
     }
 
-    /// 先查具体地址再查通配 UDP 键，数据和 source 仍由包拥有。
-    pub fn lookup_udp(&self, local: InetEndpoint) -> Option<Arc<UdpEndpoint>> {
+    /// connected peer 优先，其次具体本地地址，同评分取最近发表的真实节点。
+    pub fn lookup_udp(&self, local: InetEndpoint, peer: InetEndpoint) -> Option<Arc<UdpEndpoint>> {
         let state = self.state.lock();
-        let id = lookup_local(&state.udp_keys, local)?;
+        let id = state
+            .udp_keys
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.1.port == local.port
+                    && (entry.1.is_unspecified() || entry.1.address == local.address)
+                    && entry.2.map_or(true, |expected| expected == peer)
+            })
+            .max_by_key(|(index, entry)| {
+                (
+                    u8::from(entry.2.is_some()) * 2 + u8::from(!entry.1.is_unspecified()),
+                    *index,
+                )
+            })
+            .map(|(_, entry)| entry.0)?;
+        state.udp.iter().find(|entry| entry.id() == id).cloned()
+    }
+
+    /// 定向容量通知只取得这个 UDP 身份，解表锁后才访问接收事实或持续源。
+    pub fn udp_by_id(&self, id: u64) -> Option<Arc<UdpEndpoint>> {
+        let state = self.state.lock();
         state.udp.iter().find(|entry| entry.id() == id).cloned()
     }
 
@@ -277,14 +379,31 @@ impl NetTables {
         Some(state.udp.swap_remove(index))
     }
 
-    /// 唯一整域停止关闭发表并移动两张拥有表；绑定只随最后 Lease 结束。
-    pub fn take_all(&self) -> (Vec<Arc<TcpEndpoint>>, Vec<Arc<UdpEndpoint>>) {
+    /// 两端均已关闭后移出根 pair 拥有，最后释放发生在调用者的锁外作用域。
+    pub fn take_unix(&self, id: u64) -> Option<Arc<UnixPair>> {
+        let mut state = self.state.lock();
+        let index = state.unix.iter().position(|entry| entry.id() == id)?;
+        Some(state.unix.swap_remove(index))
+    }
+
+    /// 唯一整域停止关闭发表并移动三类拥有；绑定只随最后 Lease 结束。
+    pub fn take_all(
+        &self,
+    ) -> (
+        Vec<Arc<TcpEndpoint>>,
+        Vec<Arc<UdpEndpoint>>,
+        Vec<Arc<UnixPair>>,
+    ) {
         let mut state = self.state.lock();
         state.closed = true;
         state.tuples.clear();
         state.listeners.clear();
         state.udp_keys.clear();
-        (mem::take(&mut state.tcp), mem::take(&mut state.udp))
+        (
+            mem::take(&mut state.tcp),
+            mem::take(&mut state.udp),
+            mem::take(&mut state.unix),
+        )
     }
 }
 
@@ -297,22 +416,25 @@ fn reserved_entries<T>() -> Result<Vec<T>, FsError> {
     Ok(entries)
 }
 
-/// 同协议同端口中，通配任一方或相同具体地址构成冲突。
+/// 同协议的重叠绑定仅在双方显式允许复用时不冲突。
 fn binding_conflicts(
     bindings: &[Binding],
     protocol: TransportProtocol,
     local: InetEndpoint,
+    reuse: bool,
 ) -> bool {
     bindings.iter().any(|entry| {
-        entry.protocol == protocol
-            && entry.local.port == local.port
-            && (entry.local.is_unspecified()
-                || local.is_unspecified()
-                || entry.local.address == local.address)
+        entry.protocol == protocol && overlaps(entry.local, local) && !(reuse && entry.reuse)
     })
 }
 
-/// 游标仅覆盖动态端口区间，选中和发表由调用者保持同一绑定锁。
+/// 通配或相同具体地址在同一个端口上占据重叠本地地址。
+fn overlaps(left: InetEndpoint, right: InetEndpoint) -> bool {
+    left.port == right.port
+        && (left.is_unspecified() || right.is_unspecified() || left.address == right.address)
+}
+
+/// 游标仅覆盖动态端口区间，自动端口不使用复用策略；选中和发表保持同一锁。
 fn choose_ephemeral(
     state: &mut TablesState,
     protocol: TransportProtocol,
@@ -329,7 +451,7 @@ fn choose_ephemeral(
         } else {
             state.next_port + 1
         };
-        if !binding_conflicts(&state.bindings, protocol, local) {
+        if !binding_conflicts(&state.bindings, protocol, local, false) {
             return Ok(local);
         }
         if state.next_port == start {

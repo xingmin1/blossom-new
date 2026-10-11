@@ -10,7 +10,6 @@ use smoltcp::socket::tcp::State;
 use smoltcp::wire::TcpControl;
 use spin::Once;
 
-use crate::cpu;
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::InetEndpoint;
@@ -44,6 +43,7 @@ struct Metadata {
     connected: bool,
     read_closed: bool,
     write_closed: bool,
+    reuse: bool,
 }
 
 /// 半连接与可接受连接共享实际 backlog 上限，只有成熟 Established 才进入 ready。
@@ -150,7 +150,7 @@ impl Drop for TcpOperationGuard<'_> {
 }
 
 impl TcpEndpoint {
-    /// 根取得额度和核心后准备所有异步节点；未发表失败对象从未产生回调票。
+    /// 根取得额度和核心后准备异步节点，Work 与 Timer 使用独立轮转的同一 CPU。
     pub(crate) fn try_new(
         net: &NetStackRef,
         id: u64,
@@ -179,6 +179,7 @@ impl TcpEndpoint {
                 connected: false,
                 read_closed: false,
                 write_closed: false,
+                reuse: false,
             }),
             children: SpinLock::new(Children {
                 limit: 0,
@@ -192,7 +193,7 @@ impl TcpEndpoint {
             _slot: slot,
         })
         .map_err(|_| FsError::NoMemory)?;
-        let cpu = ((id - 1) % cpu::count() as u64) as usize;
+        let cpu = net.allocate_protocol_cpu();
         let context = Arc::as_ptr(&endpoint) as usize;
         let work = Work::try_new(net.work_queue(), cpu, run_tcp, context)
             .map_err(|_| FsError::NoMemory)?;
@@ -347,11 +348,8 @@ impl TcpEndpoint {
         core.receive(target, peek)
     }
 
-    /// 仅提交调用者已准备的内核前缀，raw 接受量与用户输入复制量分开。
+    /// 先查询关闭和错误事实，再由原核心核发送许可及真正接受量，零请求也保留 EPIPE。
     pub fn send(&self, source: &mut WriteBuffer<'_>) -> Result<IoProgress, FsError> {
-        if source.copied() == source.len() {
-            return Ok(IoProgress::Ready(0));
-        }
         let mut core = self.lock();
         let mut metadata = self.metadata.lock();
         if let Some(error) = metadata.error.take() {
@@ -424,6 +422,50 @@ impl TcpEndpoint {
         self.state() == State::Listen
     }
 
+    /// 复用选项属于这个打开端点，accepted child 不读取 parent 的后来修改。
+    pub fn reuse_address(&self) -> bool {
+        self.metadata.lock().reuse
+    }
+
+    /// 本核心串行控制选项；child 共享租约时只改自己的事实，不修改 parent 绑定。
+    pub fn set_reuse_address(&self, reuse: bool) -> Result<(), FsError> {
+        let _core = self.observe();
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        let mut metadata = self.metadata.lock();
+        if let Some(lease) = metadata.lease.as_ref() {
+            if lease.owner_id() == self.id {
+                net.tables().set_reuse(lease.id(), reuse)?;
+            }
+        }
+        metadata.reuse = reuse;
+        Ok(())
+    }
+
+    /// 只读原 raw Nagle 标志，不驱动发送或产生就绪通知。
+    pub fn nodelay(&self) -> Result<bool, FsError> {
+        Ok(!self.observe().nagle_enabled())
+    }
+
+    /// 修改真实 raw 标志，保护释放后由既有 Work 处理受策略影响的发送。
+    pub fn set_nodelay(&self, enabled: bool) -> Result<(), FsError> {
+        let mut core = self.lock();
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        core.set_nagle_enabled(!enabled);
+        Ok(())
+    }
+
+    /// 观察本连接原接收 ring 容量，listener child 使用相同真实容量。
+    pub fn receive_capacity(&self) -> usize {
+        self.observe().receive_capacity()
+    }
+
+    /// 观察本连接原发送 ring 容量，不给已接受量增加用户准备前缀。
+    pub fn send_capacity(&self) -> usize {
+        self.observe().send_capacity()
+    }
+
     /// 取得仍存在的网络域，停止后的操作不得再发表新索引。
     fn net(&self) -> Result<NetStackRef, FsError> {
         self.stack.upgrade().ok_or(FsError::NotConnected)
@@ -440,9 +482,13 @@ impl TcpEndpoint {
         if self.metadata.lock().lease.is_some() {
             return Err(FsError::InvalidOperation);
         }
-        let lease = net
-            .tables()
-            .reserve_binding(&net, self.id, TransportProtocol::Tcp, local)?;
+        let lease = net.tables().reserve_binding(
+            &net,
+            self.id,
+            TransportProtocol::Tcp,
+            local,
+            self.reuse_address(),
+        )?;
         let local = lease.local();
         self.metadata.lock().lease = Some(lease);
         Ok(local)
@@ -553,6 +599,7 @@ impl TcpEndpoint {
                 address: [0; 4],
                 port: 0,
             },
+            self.reuse_address(),
         )?;
         self.metadata.lock().lease = Some(lease.clone());
         Ok(lease)
@@ -671,7 +718,9 @@ impl TcpEndpoint {
         }
         if blocked {
             self.timer.get().unwrap().as_ref().cancel_pending();
-            net.wait_egress(self.id);
+            if net.egress_ready(self.id) == Ok(true) {
+                net.notify_egress(self.id);
+            }
             return;
         }
         if net.is_stopping() {
@@ -808,6 +857,7 @@ impl TcpEndpoint {
         let slot = net.claim_endpoint_slot()?;
         let id = net.allocate_identity();
         let mut child_core = net.new_core(id, core.receive_capacity(), core.send_capacity())?;
+        child_core.set_nagle_enabled(core.nagle_enabled());
         child_core.listen(local)?;
         let child = Self::try_new(net, id, child_core, slot)?;
         let listener = net
@@ -819,6 +869,7 @@ impl TcpEndpoint {
             metadata.lease = Some(lease);
             metadata.parent = Arc::downgrade(&listener);
             metadata.engaged = true;
+            metadata.reuse = self.reuse_address();
         }
         let admission = net.admission()?;
         if let Some(existing) = net.tables().lookup_tcp(tuple) {

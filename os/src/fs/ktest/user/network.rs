@@ -18,6 +18,11 @@ pub(super) enum NetworkMode {
     Address,
     Signal,
     Epoll,
+    UdpAddress,
+    UdpMessage,
+    UnixPair,
+    MessageVector,
+    SocketOptions,
 }
 
 impl NetworkMode {
@@ -33,12 +38,27 @@ impl NetworkMode {
             Self::Address => b"address",
             Self::Signal => b"signal",
             Self::Epoll => b"epoll",
+            Self::UdpAddress => b"udp-address",
+            Self::UdpMessage => b"udp-message",
+            Self::UnixPair => b"unix-pair",
+            Self::MessageVector => b"message-vector",
+            Self::SocketOptions => b"socket-options",
         }
     }
 
-    /// 只有需要观察真实阻塞或 SYN 的模式继承两个普通管道描述符。
+    /// 需要协议观察或完成确认的模式继承原来的两条普通管道。
     fn coordinated(self) -> bool {
-        matches!(self, Self::Connect | Self::Backpressure | Self::Signal)
+        matches!(
+            self,
+            Self::Connect
+                | Self::Backpressure
+                | Self::Signal
+                | Self::UdpAddress
+                | Self::UdpMessage
+                | Self::UnixPair
+                | Self::MessageVector
+                | Self::SocketOptions
+        )
     }
 }
 
@@ -274,7 +294,7 @@ fn go(writer: &FileRef) -> TestResult {
     Ok(())
 }
 
-/// 按实际 C 阶段观察 held SYN、发送满和原信号重启，所有资源交原 observer join 回收。
+/// 按真实阶段观察协议、发送阻塞和信号，消息模式最后确认普通 C 已完成全部断言。
 fn coordinate(
     mode: NetworkMode,
     reader: &FileRef,
@@ -356,6 +376,20 @@ fn coordinate(
                 .map_err(|_| TestError("restart SYN release failed"))?;
             phase(reader, root, b'Z', 0)?;
             Ok(())
+        }
+        NetworkMode::UnixPair => {
+            let pid = phase(reader, root, b'U', 0)?;
+            blocked(graph, pid)?;
+            go(writer)?;
+            phase(reader, root, b'4', 0)?;
+            go(writer)
+        }
+        NetworkMode::UdpAddress
+        | NetworkMode::UdpMessage
+        | NetworkMode::MessageVector
+        | NetworkMode::SocketOptions => {
+            phase(reader, root, b'4', 0)?;
+            go(writer)
         }
         _ => Err(TestError("uncoordinated network mode has coordinator")),
     }

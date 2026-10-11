@@ -85,6 +85,8 @@ pub enum FsError {
     InProgress,
     MessageTooLarge,
     NotSocket,
+    /// UDP 发送既无本次目的地址，也无默认对端。
+    DestinationRequired,
     WouldBlock,
     BrokenPipe,
     Interrupted,
@@ -96,7 +98,7 @@ pub enum FsError {
 
 impl FsError {
     /// 将页填充的实际格式或 I/O 错误写入共享 folio，等待者读取同一原因。
-    /// 根选择、名字查找、文件能力、socket 连接结果和 inode 加载取消不属于页填充结果。
+    /// 根选择、名字查找、文件能力、socket 控制与消息错误和 inode 加载取消不属于页填充结果。
     pub(crate) fn folio_error(self) -> BlockError {
         match self {
             Self::NoMemory => BlockError::NoMemory,
@@ -129,6 +131,7 @@ impl FsError {
             | Self::InProgress
             | Self::MessageTooLarge
             | Self::NotSocket
+            | Self::DestinationRequired
             | Self::WouldBlock
             | Self::BrokenPipe
             | Self::Interrupted

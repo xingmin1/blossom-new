@@ -147,7 +147,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if matches!(request.number, 129..=139 | 240) {
         return signal::dispatch(user, request);
     }
-    if matches!(request.number, 198 | 200..=210 | 242) {
+    if matches!(request.number, 198..=212 | 242) {
         return net::dispatch(user, request);
     }
     if matches!(request.number, 29 | 63..=66) {

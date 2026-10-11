@@ -44,7 +44,7 @@ const OPENAT_SUPPORTED: u32 = 0o3
     | CLOEXEC;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
-const MAX_IOV_COUNT: usize = 1024;
+pub(super) const MAX_IOV_COUNT: usize = 1024;
 
 /// 只接受两个管道打开位；两个原预留槽在完整 copyout 成功后才分别发表。
 pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
@@ -71,7 +71,7 @@ pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
 }
 
 /// 一次读取目标 16 字节 iovec 数组，小请求借原栈快照，大请求才分配有限拥有。
-fn import_vectors<'a>(
+pub(super) fn import_vectors<'a>(
     mm: &Mm,
     address: usize,
     count: usize,
@@ -157,7 +157,7 @@ pub(super) fn readv(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.read_into(&mut target, FileIoContext::User(user))? as isize)
 }
 
-/// 总向量是一笔写请求，只进入一次 OFD 和 inode 写事务，不逐段提交位置。
+/// 总向量是一笔写请求；socket 的空请求仍交协议处理零报文和发送关闭。
 pub(super) fn writev(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("writev has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
@@ -171,7 +171,7 @@ pub(super) fn writev(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }; 8];
     let vectors = import_vectors(&mm, raw[1], raw[2], &mut fast)?;
     let mut source = WriteBuffer::user_vector(&mm, &vectors)?;
-    if source.len() == 0 {
+    if source.len() == 0 && file.socket().is_none() {
         return Ok(0);
     }
     Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)

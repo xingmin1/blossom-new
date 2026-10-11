@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stddef.h>
@@ -27,6 +28,17 @@ _Static_assert(sizeof(socklen_t) == 4, "socklen ABI");
 _Static_assert(sizeof(struct epoll_event) == 16, "natural epoll ABI");
 _Static_assert(offsetof(struct epoll_event, events) == 0, "epoll events ABI");
 _Static_assert(offsetof(struct epoll_event, data) == 8, "epoll data ABI");
+_Static_assert(sizeof(struct iovec) == 16, "iovec ABI");
+_Static_assert(offsetof(struct iovec, iov_base) == 0, "iovec base ABI");
+_Static_assert(offsetof(struct iovec, iov_len) == 8, "iovec length ABI");
+_Static_assert(sizeof(struct msghdr) == 56, "msghdr LP64 ABI");
+_Static_assert(offsetof(struct msghdr, msg_name) == 0, "message name ABI");
+_Static_assert(offsetof(struct msghdr, msg_namelen) == 8, "message namelen ABI");
+_Static_assert(offsetof(struct msghdr, msg_iov) == 16, "message iov ABI");
+_Static_assert(offsetof(struct msghdr, msg_iovlen) == 24, "message iovlen ABI");
+_Static_assert(offsetof(struct msghdr, msg_control) == 32, "message control ABI");
+_Static_assert(offsetof(struct msghdr, msg_controllen) == 40, "message controllen ABI");
+_Static_assert(offsetof(struct msghdr, msg_flags) == 48, "message flags ABI");
 
 static pid_t children[8];
 static size_t child_count;
@@ -187,7 +199,7 @@ static int exec_identity(int argc, char **argv)
     return 37;
 }
 
-/// 真实凭据、dup/fork 的共享 flags 与 exec 的逐槽 CLOEXEC 分别核对。
+/// TCP 与 UDP 身份核真实凭据，dup/fork 共享 OFD，exec 只撤逐槽 CLOEXEC。
 static void identity(const char *program)
 {
     CHECK(getuid() == 1000 && getgid() == 2000);
@@ -211,6 +223,20 @@ static void identity(const char *program)
         CHECK(value == expected[i]);
     }
     ERROR(lseek(fd, 0, SEEK_SET), ESPIPE);
+    int udp = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    CHECK(0 <= udp);
+    CHECK(fstat(udp, &second) == 0 && S_ISSOCK(second.st_mode));
+    CHECK(second.st_uid == 1000 && second.st_gid == 2000 && second.st_ino != first.st_ino);
+    CHECK(fcntl(udp, F_GETFD) == FD_CLOEXEC && (fcntl(udp, F_GETFL) & O_NONBLOCK) != 0);
+    const int udp_options[] = {SO_TYPE, SO_DOMAIN, SO_PROTOCOL};
+    const int udp_expected[] = {SOCK_DGRAM, AF_INET, IPPROTO_UDP};
+    for (size_t i = 0; i < 3; ++i) {
+        int value = -1;
+        socklen_t length = sizeof value;
+        CHECK(getsockopt(udp, SOL_SOCKET, udp_options[i], &value, &length) == 0);
+        CHECK(length == sizeof value && value == udp_expected[i]);
+    }
+    CHECK(close(udp) == 0);
     int channel[2];
     CHECK(pipe(channel) == 0);
     pid_t child = fork_child();
@@ -444,6 +470,10 @@ static void half_close(void)
     CHECK(signals_seen == 0);
     ERROR(send(client, "x", 1, 0), EPIPE);
     CHECK(signals_seen == 1);
+    ERROR(send(client, NULL, 0, MSG_NOSIGNAL), EPIPE);
+    CHECK(signals_seen == 1);
+    ERROR(send(client, NULL, 0, 0), EPIPE);
+    CHECK(signals_seen == 2);
     CHECK(close(client) == 0 && close(server) == 0);
 }
 
@@ -763,6 +793,430 @@ static void epoll_stream(void)
     CHECK(close(new_client) == 0 && close(client) == 0 && close(epfd) == 0);
 }
 
+/// 绑定 UDP 后用实际名称取得自动端口，后续断言比较同条报文的来源。
+static int datagram(struct sockaddr_in *local)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(0 <= fd);
+    *local = address(0);
+    CHECK(bind(fd, (struct sockaddr *)local, sizeof *local) == 0);
+    socklen_t length = sizeof *local;
+    CHECK(getsockname(fd, (struct sockaddr *)local, &length) == 0);
+    CHECK(length == sizeof *local && local->sin_port != 0);
+    return fd;
+}
+
+/// 等待真实消息就绪后只接收一次，完整比较消息字节与同条记录的发送者。
+static void datagram_expect(int fd, const char *text, const struct sockaddr_in *sender)
+{
+    unsigned char bytes[64];
+    struct sockaddr_in source = {0};
+    socklen_t length = sizeof source;
+    size_t size = strlen(text);
+    CHECK(wait_ready(fd, POLLIN) & POLLIN);
+    CHECK(recvfrom(fd, bytes, sizeof bytes, 0, (struct sockaddr *)&source, &length) == (ssize_t)size);
+    CHECK(memcmp(bytes, text, size) == 0 && length == sizeof source);
+    CHECK(source.sin_family == AF_INET && source.sin_port == sender->sin_port);
+    CHECK(source.sin_addr.s_addr == sender->sin_addr.s_addr);
+}
+
+/// 每消息目的不改默认 peer，connected 过滤与显式、自动绑定断 peer 各核正常后继。
+static void udp_address(void)
+{
+    struct sockaddr_in a, b, local;
+    int first = datagram(&a), second = datagram(&b), fd = datagram(&local);
+    ERROR(send(fd, "x", 1, 0), EDESTADDRREQ);
+    CHECK(sendto(fd, "one", 3, 0, (struct sockaddr *)&a, sizeof a) == 3);
+    datagram_expect(first, "one", &local);
+    CHECK(sendto(fd, "two", 3, 0, (struct sockaddr *)&b, sizeof b) == 3);
+    datagram_expect(second, "two", &local);
+    CHECK(connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
+    CHECK(sendto(fd, "override", 8, 0, (struct sockaddr *)&b, sizeof b) == 8);
+    datagram_expect(second, "override", &local);
+    CHECK(send(fd, "default", 7, 0) == 7);
+    datagram_expect(first, "default", &local);
+    struct sockaddr_in peer;
+    socklen_t length = sizeof peer;
+    CHECK(getpeername(fd, (struct sockaddr *)&peer, &length) == 0);
+    CHECK(length == sizeof peer && peer.sin_port == a.sin_port && peer.sin_addr.s_addr == a.sin_addr.s_addr);
+    CHECK(sendto(second, "filtered", 8, 0, (struct sockaddr *)&local, sizeof local) == 8);
+    CHECK(sendto(first, "accepted", 8, 0, (struct sockaddr *)&local, sizeof local) == 8);
+    datagram_expect(fd, "accepted", &a);
+    unsigned char byte;
+    ERROR(recv(fd, &byte, 1, MSG_DONTWAIT), EAGAIN);
+    struct sockaddr disconnect = {.sa_family = AF_UNSPEC};
+    CHECK(connect(fd, &disconnect, sizeof disconnect.sa_family) == 0);
+    length = sizeof peer;
+    ERROR(getpeername(fd, (struct sockaddr *)&peer, &length), ENOTCONN);
+    CHECK(getsockname(fd, (struct sockaddr *)&peer, &length) == 0 && peer.sin_port == local.sin_port);
+    CHECK(sendto(second, "unfiltered", 10, 0, (struct sockaddr *)&local, sizeof local) == 10);
+    datagram_expect(fd, "unfiltered", &b);
+    CHECK(close(fd) == 0);
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(0 <= fd && connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
+    length = sizeof local;
+    CHECK(getsockname(fd, (struct sockaddr *)&local, &length) == 0 && local.sin_port != 0);
+    CHECK(send(fd, "auto", 4, 0) == 4);
+    datagram_expect(first, "auto", &local);
+    CHECK(connect(fd, &disconnect, sizeof disconnect.sa_family) == 0);
+    length = sizeof peer;
+    CHECK(getsockname(fd, (struct sockaddr *)&peer, &length) == 0);
+    CHECK(peer.sin_port == 0 && peer.sin_addr.s_addr == 0);
+    int reuse = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(0 <= reuse && bind(reuse, (struct sockaddr *)&local, sizeof local) == 0);
+    CHECK(sendto(fd, "after disconnect", 16, 0, (struct sockaddr *)&b, sizeof b) == 16);
+    length = sizeof peer;
+    CHECK(getsockname(fd, (struct sockaddr *)&peer, &length) == 0 && peer.sin_port != 0);
+    CHECK(peer.sin_addr.s_addr == 0);
+    // 未连接自动绑定名称保通配，报文来源必须是本次路由选出的环回地址。
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    datagram_expect(second, "after disconnect", &peer);
+    CHECK(close(reuse) == 0 && close(fd) == 0 && close(first) == 0 && close(second) == 0);
+}
+
+/// 零长消息仍占记录，read0 与 recv0 消费不同；短尾、PEEK 和 TRUNC 都比较后继消息。
+static void udp_message(void)
+{
+    struct sockaddr_in sender, destination;
+    int fd = datagram(&sender), receiver = datagram(&destination);
+    CHECK(connect(fd, (struct sockaddr *)&destination, sizeof destination) == 0);
+    struct iovec empty[2] = {{(void *)1, 0}, {(void *)1, 0}};
+    struct msghdr message = {.msg_iov = empty, .msg_iovlen = 2};
+    CHECK(sendto(fd, NULL, 0, 0, (struct sockaddr *)&destination, sizeof destination) == 0);
+    CHECK(sendmsg(fd, &message, 0) == 0);
+    CHECK(writev(fd, empty, 2) == 0);
+    CHECK(send(fd, "after zeros", 11, 0) == 11);
+    CHECK(wait_ready(receiver, POLLIN) & POLLIN);
+    CHECK(read(receiver, (void *)1, 0) == 0);
+    for (unsigned i = 0; i < 3; ++i) datagram_expect(receiver, "", &sender);
+    datagram_expect(receiver, "after zeros", &sender);
+    CHECK(send(fd, "discard", 7, 0) == 7 && send(fd, "kept", 4, 0) == 4);
+    CHECK(recv(receiver, (void *)1, 0, 0) == 0);
+    datagram_expect(receiver, "kept", &sender);
+    unsigned char output[32];
+    CHECK(send(fd, "short-tail", 10, 0) == 10 && send(fd, "next", 4, 0) == 4);
+    CHECK(recv(receiver, output, 3, 0) == 3 && memcmp(output, "sho", 3) == 0);
+    datagram_expect(receiver, "next", &sender);
+    CHECK(send(fd, "peek-full", 9, 0) == 9);
+    CHECK(recv(receiver, output, 4, MSG_PEEK) == 4 && memcmp(output, "peek", 4) == 0);
+    CHECK(recv(receiver, output, 4, MSG_PEEK | MSG_TRUNC) == 9 && memcmp(output, "peek", 4) == 0);
+    datagram_expect(receiver, "peek-full", &sender);
+    CHECK(send(fd, "truncated", 9, 0) == 9 && send(fd, "following", 9, 0) == 9);
+    struct sockaddr_in source;
+    socklen_t length = sizeof source;
+    CHECK(recvfrom(receiver, output, 3, MSG_TRUNC, (struct sockaddr *)&source, &length) == 9);
+    CHECK(memcmp(output, "tru", 3) == 0 && length == sizeof source && source.sin_port == sender.sin_port);
+    datagram_expect(receiver, "following", &sender);
+    unsigned char large[1473];
+    for (size_t i = 0; i < sizeof large; ++i) large[i] = (unsigned char)(i * 29u + 7u);
+    ERROR(send(fd, large, sizeof large, 0), EMSGSIZE);
+    CHECK(send(fd, large, sizeof large - 1, 0) == sizeof large - 1);
+    unsigned char received[1472];
+    CHECK(recv(receiver, received, sizeof received, 0) == sizeof received);
+    CHECK(memcmp(received, large, sizeof received) == 0);
+    install_handler(SIGPIPE, 0);
+    CHECK(shutdown(fd, SHUT_WR) == 0);
+    ERROR(send(fd, NULL, 0, 0), EPIPE);
+    CHECK(signals_seen == 0);
+    CHECK(sendto(receiver, "reply", 5, 0, (struct sockaddr *)&sender, sizeof sender) == 5);
+    datagram_expect(fd, "reply", &destination);
+    CHECK(close(fd) == 0 && close(receiver) == 0);
+}
+
+/// 两槽必须同时准备；满表与 fd 数组 fault 后，原最小空槽仍可正常 dup 及建 pair。
+static void unix_slots(int base)
+{
+    int copies[128], result[2] = {-1, -1};
+    size_t count = 0;
+    for (;;) {
+        int fd = dup(base);
+        if (fd == -1) { CHECK(errno == EMFILE); break; }
+        CHECK(count < 128);
+        copies[count++] = fd;
+    }
+    ERROR(socketpair(AF_UNIX, SOCK_STREAM, 0, result), EMFILE);
+    CHECK(result[0] == -1 && result[1] == -1 && 2 <= count);
+    int last = copies[--count];
+    CHECK(close(last) == 0);
+    ERROR(socketpair(AF_UNIX, SOCK_STREAM, 0, result), EMFILE);
+    CHECK(dup(base) == last);
+    CHECK(close(last) == 0);
+    int other = copies[--count];
+    CHECK(close(other) == 0);
+    unsigned char *mapping = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mapping != MAP_FAILED && munmap(mapping + 4096, 4096) == 0);
+    ERROR(syscall(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0, mapping + 4093), EFAULT);
+    int lower = other < last ? other : last, upper = other < last ? last : other;
+    CHECK(dup(base) == lower && dup(base) == upper);
+    CHECK(close(lower) == 0 && close(upper) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, result) == 0);
+    CHECK(result[0] == lower && result[1] == upper);
+    write_all(result[0], "slots survived", 14);
+    unsigned char output[14];
+    read_all(result[1], output, sizeof output);
+    CHECK(memcmp(output, "slots survived", sizeof output) == 0);
+    CHECK(close(result[0]) == 0 && close(result[1]) == 0 && munmap(mapping, 4096) == 0);
+    while (0 < count) CHECK(close(copies[--count]) == 0);
+}
+
+/// 双向全文超过环容量并回绕；dup/fork 共享身份，半关闭、零 EPIPE 和未读末关闭保真实错误。
+static void unix_pair(void)
+{
+    int fds[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+    int alias = dup(fds[0]);
+    CHECK(0 <= alias);
+    struct stat first, duplicate, peer;
+    CHECK(fstat(fds[0], &first) == 0 && fstat(alias, &duplicate) == 0 && fstat(fds[1], &peer) == 0);
+    CHECK(S_ISSOCK(first.st_mode) && first.st_ino == duplicate.st_ino && first.st_ino != peer.st_ino);
+    CHECK(fcntl(fds[0], F_GETFD) == FD_CLOEXEC && fcntl(alias, F_GETFD) == 0);
+    struct sockaddr name;
+    socklen_t length = sizeof name;
+    CHECK(getsockname(alias, &name, &length) == 0 && length == 2 && name.sa_family == AF_UNIX);
+    length = sizeof name;
+    CHECK(getpeername(alias, &name, &length) == 0 && length == 2 && name.sa_family == AF_UNIX);
+    unix_slots(alias);
+    unsigned char input[40001], output[40001];
+    for (size_t i = 0; i < sizeof input; ++i)
+        input[i] = (unsigned char)(i * 43u + (i >> 8) * 19u + (i >> 12) * 7u + 19u);
+    int notice[2];
+    CHECK(pipe(notice) == 0);
+    pid_t child = fork_child();
+    if (child == 0) {
+        CHECK(close(notice[0]) == 0 && close(fds[0]) == 0);
+        CHECK(fcntl(alias, F_SETFL, O_NONBLOCK) == 0);
+        write_all(notice[1], "shared", 6);
+        CHECK(close(alias) == 0 && close(notice[1]) == 0);
+        report('U', getpid(), 0);
+        write_all(fds[1], input, sizeof input);
+        read_all(fds[1], output, sizeof output);
+        CHECK(memcmp(output, input, sizeof input) == 0);
+        CHECK(shutdown(fds[1], SHUT_WR) == 0);
+        CHECK(read(fds[1], output, 1) == 0);
+        CHECK(close(fds[1]) == 0);
+        _exit(0);
+    }
+    CHECK(close(notice[1]) == 0 && close(fds[1]) == 0);
+    read_all(notice[0], output, 6);
+    CHECK(memcmp(output, "shared", 6) == 0 && (fcntl(fds[0], F_GETFL) & O_NONBLOCK) != 0);
+    CHECK(close(notice[0]) == 0 && fcntl(alias, F_SETFL, 0) == 0);
+    proceed();
+    read_all(alias, output, sizeof output);
+    CHECK(memcmp(output, input, sizeof input) == 0);
+    write_all(alias, input, sizeof input);
+    CHECK(read(alias, output, 1) == 0 && shutdown(alias, SHUT_WR) == 0);
+    install_handler(SIGPIPE, 0);
+    ERROR(send(alias, NULL, 0, MSG_NOSIGNAL), EPIPE);
+    CHECK(signals_seen == 0);
+    ERROR(send(alias, NULL, 0, 0), EPIPE);
+    CHECK(signals_seen == 1);
+    reap(child, 0);
+    CHECK(close(alias) == 0 && close(fds[0]) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(shutdown(fds[0], SHUT_WR) == 0);
+    write_all(fds[1], "still receives", 14);
+    read_all(fds[0], output, 14);
+    CHECK(memcmp(output, "still receives", 14) == 0);
+    CHECK(close(fds[0]) == 0 && close(fds[1]) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    write_all(fds[1], "unread", 6);
+    write_all(fds[0], "before reset", 12);
+    CHECK(close(fds[0]) == 0);
+    read_all(fds[1], output, 12);
+    CHECK(memcmp(output, "before reset", 12) == 0);
+    CHECK(socket_error(fds[1]) == ECONNRESET && socket_error(fds[1]) == 0);
+    ERROR(send(fds[1], NULL, 0, MSG_NOSIGNAL), EPIPE);
+    CHECK(close(fds[1]) == 0);
+}
+
+/// 只允许 recvmsg 输出已选字段，其余头字节及 padding 保持原用户值。
+static void unchanged_header(const struct msghdr *before, const struct msghdr *after, int named)
+{
+    const unsigned char *a = (const unsigned char *)before, *b = (const unsigned char *)after;
+    for (size_t i = 0; i < sizeof *before; ++i) {
+        if ((named && 8 <= i && i < 12) || (40 <= i && i < 48) || (48 <= i && i < 52)) continue;
+        CHECK(a[i] == b[i]);
+    }
+}
+
+/// 向量按一次消息消费，真实窗口限制和后段用户 fault 不得把准备字节计为接受字节。
+static void message_vector(void)
+{
+    int fds[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) == 0);
+    unsigned char fill[16381], output[16384];
+    memset(fill, 0x39, sizeof fill);
+    write_all(fds[0], fill, sizeof fill);
+    struct iovec input[] = {{(void *)"abcdef", 6}, {(void *)1, 8}};
+    struct msghdr message = {.msg_iov = input, .msg_iovlen = 2, .msg_flags = MSG_OOB};
+    CHECK(sendmsg(fds[0], &message, MSG_NOSIGNAL) == 3);
+    read_all(fds[1], output, sizeof output);
+    CHECK(memcmp(output, fill, sizeof fill) == 0 && memcmp(output + sizeof fill, "abc", 3) == 0);
+    input[0] = (struct iovec){(void *)"prefix!", 7};
+    CHECK(sendmsg(fds[0], &message, MSG_NOSIGNAL) == 7);
+    read_all(fds[1], output, 7);
+    CHECK(memcmp(output, "prefix!", 7) == 0);
+    ERROR(recv(fds[1], output, 1, MSG_DONTWAIT), EAGAIN);
+    input[0] = (struct iovec){(void *)1, 1};
+    ERROR(sendmsg(fds[0], &message, MSG_NOSIGNAL), EFAULT);
+    input[0] = (struct iovec){(void *)"cross-", 6};
+    input[1] = (struct iovec){(void *)"iov-full", 8};
+    CHECK(sendmsg(fds[0], &message, 0) == 14);
+    unsigned char first[3], second[11];
+    struct iovec target[] = {{first, 3}, {second, 11}};
+    struct msghdr header;
+    memset(&header, 0xa5, sizeof header);
+    header.msg_name = NULL;
+    header.msg_namelen = (socklen_t)-1;
+    header.msg_iov = target;
+    header.msg_iovlen = 2;
+    header.msg_control = (void *)1;
+    header.msg_controllen = 0;
+    // musl 会清长度高位并整头复制返回；保留头字节的断言直接观察 raw syscall。
+    // 内核两长度为 LP64 unsigned long，完整初始化八字节，真正 padding 仍保留哨兵。
+    const uint64_t kernel_iovlen = 2, kernel_controllen = 0;
+    memcpy((unsigned char *)&header + offsetof(struct msghdr, msg_iovlen), &kernel_iovlen, sizeof kernel_iovlen);
+    memcpy((unsigned char *)&header + offsetof(struct msghdr, msg_controllen), &kernel_controllen, sizeof kernel_controllen);
+    struct msghdr saved;
+    memcpy(&saved, &header, sizeof saved);
+    CHECK(syscall(SYS_recvmsg, fds[1], &header, 0) == 14);
+    CHECK(memcmp(first, "cro", 3) == 0 && memcmp(second, "ss-iov-full", 11) == 0);
+    CHECK(header.msg_flags == 0 && header.msg_controllen == 0);
+    unchanged_header(&saved, &header, 0);
+    write_all(fds[0], "read-fault", 10);
+    target[0] = (struct iovec){output, 4};
+    target[1] = (struct iovec){(void *)1, 6};
+    CHECK(recvmsg(fds[1], &header, 0) == 4 && memcmp(output, "read", 4) == 0);
+    read_all(fds[1], output, 6);
+    CHECK(memcmp(output, "-fault", 6) == 0);
+    CHECK(close(fds[0]) == 0 && close(fds[1]) == 0);
+    struct sockaddr_in local, sender, source;
+    int fd = datagram(&sender), receiver = datagram(&local);
+    input[0] = (struct iovec){(void *)"vector-", 7};
+    input[1] = (struct iovec){(void *)"datagram", 8};
+    message.msg_name = &local;
+    message.msg_namelen = sizeof local;
+    CHECK(sendmsg(fd, &message, 0) == 15);
+    target[0] = (struct iovec){first, 3};
+    target[1] = (struct iovec){second, 5};
+    header.msg_name = &source;
+    header.msg_namelen = sizeof source;
+    memcpy(&saved, &header, sizeof saved);
+    CHECK(syscall(SYS_recvmsg, receiver, &header, MSG_PEEK | MSG_TRUNC) == 15);
+    CHECK(header.msg_flags == MSG_TRUNC && header.msg_namelen == sizeof source && header.msg_controllen == 0);
+    CHECK(source.sin_port == sender.sin_port && source.sin_addr.s_addr == sender.sin_addr.s_addr);
+    CHECK(memcmp(first, "vec", 3) == 0 && memcmp(second, "tor-d", 5) == 0);
+    unchanged_header(&saved, &header, 1);
+    datagram_expect(receiver, "vector-datagram", &sender);
+    CHECK(sendmsg(fd, &message, 0) == 15);
+    CHECK(recvmsg(receiver, &header, 0) == 8);
+    CHECK(header.msg_flags == MSG_TRUNC);
+    CHECK(memcmp(first, "vec", 3) == 0 && memcmp(second, "tor-d", 5) == 0);
+    ERROR(recv(receiver, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    input[1] = (struct iovec){(void *)1, 8};
+    ERROR(sendmsg(fd, &message, 0), EFAULT);
+    ERROR(recv(receiver, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    input[1] = (struct iovec){(void *)"datagram", 8};
+    CHECK(sendmsg(fd, &message, 0) == 15);
+    target[1] = (struct iovec){(void *)1, 5};
+    ERROR(recvmsg(receiver, &header, MSG_PEEK), EFAULT);
+    CHECK(memcmp(first, "vec", 3) == 0);
+    ERROR(recvmsg(receiver, &header, 0), EFAULT);
+    ERROR(recv(receiver, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    target[1] = (struct iovec){second, 5};
+    // libc 发送前会复制 control；非空控制不支持检查必须提供真实可读输入。
+    message.msg_control = output;
+    message.msg_controllen = 1;
+    ERROR(sendmsg(fd, &message, 0), EOPNOTSUPP);
+    message.msg_controllen = 0;
+    message.msg_iovlen = 1025;
+    ERROR(sendmsg(fd, &message, 0), EMSGSIZE);
+    message.msg_iovlen = 2;
+    CHECK(sendmsg(fd, &message, 0) == 15);
+    header.msg_name = (void *)1;
+    header.msg_namelen = sizeof source;
+    ERROR(recvmsg(receiver, &header, 0), EFAULT);
+    ERROR(recv(receiver, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    CHECK(sendto(fd, "healthy", 7, 0, (struct sockaddr *)&local, sizeof local) == 7);
+    datagram_expect(receiver, "healthy", &sender);
+    CHECK(close(fd) == 0 && close(receiver) == 0);
+}
+
+/// int 选项通过实际 syscall 查询，不用本地保存的设置值充当内核事实。
+static int option(int fd, int level, int name)
+{
+    int value = -1;
+    socklen_t length = sizeof value;
+    CHECK(getsockopt(fd, level, name, &value, &length) == 0 && length == sizeof value);
+    return value;
+}
+
+/// 双方 reuse 才允许重叠，listener 仍互斥，UDP 查找真选 connected，TCP child 继承独立选项。
+static void socket_options(void)
+{
+    int enabled = -7, disabled = 0;
+    struct sockaddr_in local;
+    int first = datagram(&local), second = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    CHECK(0 <= second);
+    CHECK(setsockopt(second, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof enabled) == 0);
+    ERROR(bind(second, (struct sockaddr *)&local, sizeof local), EADDRINUSE);
+    CHECK(setsockopt(first, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof enabled) == 0);
+    CHECK(bind(second, (struct sockaddr *)&local, sizeof local) == 0);
+    CHECK(option(first, SOL_SOCKET, SO_REUSEADDR) == 1 && option(second, SOL_SOCKET, SO_REUSEADDR) == 1);
+    struct sockaddr_in sender;
+    int fd = datagram(&sender);
+    CHECK(connect(first, (struct sockaddr *)&sender, sizeof sender) == 0);
+    CHECK(sendto(fd, "connected wins", 14, 0, (struct sockaddr *)&local, sizeof local) == 14);
+    datagram_expect(first, "connected wins", &sender);
+    unsigned char output[32];
+    ERROR(recv(second, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    struct sockaddr disconnect = {.sa_family = AF_UNSPEC};
+    CHECK(connect(first, &disconnect, 2) == 0);
+    CHECK(sendto(fd, "recent wins", 11, 0, (struct sockaddr *)&local, sizeof local) == 11);
+    datagram_expect(first, "recent wins", &sender);
+    ERROR(recv(second, output, sizeof output, MSG_DONTWAIT), EAGAIN);
+    CHECK(close(first) == 0);
+    CHECK(sendto(fd, "overlap survivor", 16, 0, (struct sockaddr *)&local, sizeof local) == 16);
+    datagram_expect(second, "overlap survivor", &sender);
+    ERROR(setsockopt(second, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof enabled), ENOPROTOOPT);
+    CHECK(close(fd) == 0 && close(second) == 0);
+    first = socket(AF_INET, SOCK_STREAM, 0);
+    second = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= first && 0 <= second);
+    CHECK(setsockopt(first, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof enabled) == 0);
+    local = address(0);
+    CHECK(bind(first, (struct sockaddr *)&local, sizeof local) == 0);
+    socklen_t length = sizeof local;
+    CHECK(getsockname(first, (struct sockaddr *)&local, &length) == 0);
+    ERROR(bind(second, (struct sockaddr *)&local, sizeof local), EADDRINUSE);
+    CHECK(setsockopt(second, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof enabled) == 0);
+    CHECK(bind(second, (struct sockaddr *)&local, sizeof local) == 0);
+    CHECK(option(first, IPPROTO_TCP, TCP_NODELAY) == 0);
+    CHECK(setsockopt(first, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof enabled) == 0);
+    CHECK(option(first, IPPROTO_TCP, TCP_NODELAY) == 1);
+    CHECK(listen(first, 4) == 0);
+    ERROR(listen(second, 4), EADDRINUSE);
+    CHECK(close(second) == 0);
+    second = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= second);
+    CHECK(setsockopt(second, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof enabled) == 0);
+    ERROR(bind(second, (struct sockaddr *)&local, sizeof local), EADDRINUSE);
+    CHECK(close(second) == 0);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(0 <= fd && connect(fd, (struct sockaddr *)&local, sizeof local) == 0);
+    int child = accept(first, NULL, NULL);
+    CHECK(0 <= child && option(child, IPPROTO_TCP, TCP_NODELAY) == 1);
+    CHECK(option(child, SOL_SOCKET, SO_REUSEADDR) == 1);
+    CHECK(setsockopt(child, IPPROTO_TCP, TCP_NODELAY, &disabled, sizeof disabled) == 0);
+    CHECK(option(child, IPPROTO_TCP, TCP_NODELAY) == 0 && option(first, IPPROTO_TCP, TCP_NODELAY) == 1);
+    CHECK(setsockopt(child, SOL_SOCKET, SO_REUSEADDR, &disabled, sizeof disabled) == 0);
+    CHECK(option(first, SOL_SOCKET, SO_REUSEADDR) == 1);
+    write_all(fd, "option child", 12);
+    read_all(child, output, 12);
+    CHECK(memcmp(output, "option child", 12) == 0);
+    CHECK(close(fd) == 0 && close(child) == 0 && close(first) == 0);
+}
+
 /// 普通 argv 描述符完整解析，非法字符串不能默认为标准流。
 static int descriptor(const char *text)
 {
@@ -789,7 +1243,18 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "address") == 0) address_faults();
     else if (strcmp(argv[1], "signal") == 0) interrupted();
     else if (strcmp(argv[1], "epoll") == 0) epoll_stream();
+    else if (strcmp(argv[1], "udp-address") == 0) udp_address();
+    else if (strcmp(argv[1], "udp-message") == 0) udp_message();
+    else if (strcmp(argv[1], "unix-pair") == 0) unix_pair();
+    else if (strcmp(argv[1], "message-vector") == 0) message_vector();
+    else if (strcmp(argv[1], "socket-options") == 0) socket_options();
     else fail("unknown mode", __LINE__);
+    if (strcmp(argv[1], "udp-address") == 0 || strcmp(argv[1], "udp-message") == 0
+        || strcmp(argv[1], "unix-pair") == 0 || strcmp(argv[1], "message-vector") == 0
+        || strcmp(argv[1], "socket-options") == 0) {
+        report('4', getpid(), 0);
+        proceed();
+    }
     if (0 <= ready_fd) CHECK(close(ready_fd) == 0 && close(go_fd) == 0);
     CHECK(child_count == 0);
     printf("network-smoke mode=%s passed\n", argv[1]);

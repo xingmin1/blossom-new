@@ -14,7 +14,7 @@ use crate::fs::{
 use crate::ktest::execution_services::{baseline, Baseline, SuiteBaseline};
 use crate::mm::space::Mm;
 use crate::mm::user_table::PagePermissions;
-use crate::net::address::InetEndpoint;
+use crate::net::address::{InetEndpoint, SocketAddress};
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
 use crate::net::socket::SocketFile;
@@ -734,14 +734,6 @@ pub(crate) mod stack {
         let listener_b = listener(context, &fixture.net, 45211)?;
         let client_a = operation(context, fixture.net.try_new_tcp(256, 256))?;
         let client_b = operation(context, fixture.net.try_new_tcp(256, 256))?;
-        context.expect_eq(
-            client_a.work_cpu(),
-            (client_a.id() as usize - 1) % cpu::count(),
-        );
-        context.expect_eq(
-            client_b.work_cpu(),
-            (client_b.id() as usize - 1) % cpu::count(),
-        );
         if client_a.work_cpu() == client_b.work_cpu() {
             return Err(TestError("independent clients share protocol CPU"));
         }
@@ -880,10 +872,13 @@ pub(crate) mod stack {
             fixture
                 .net
                 .tables()
-                .lookup_udp(InetEndpoint {
-                    port: destination.port,
-                    ..SERVER
-                })
+                .lookup_udp(
+                    InetEndpoint {
+                        port: destination.port,
+                        ..SERVER
+                    },
+                    CLIENT,
+                )
                 .is_none(),
             true,
         );
@@ -1221,7 +1216,10 @@ fn socket_listener(
     port: u16,
 ) -> Result<Arc<SocketFile>, TestError> {
     let file = operation(context, SocketFile::try_new_tcp(net.clone(), 0, 0, 0))?;
-    operation(context, file.bind(InetEndpoint { port, ..SERVER }))?;
+    operation(
+        context,
+        file.bind(SocketAddress::Inet(InetEndpoint { port, ..SERVER })),
+    )?;
     operation(context, file.listen(4))?;
     Ok(file)
 }
@@ -1293,7 +1291,7 @@ pub(crate) mod socket_native {
             ..SERVER
         };
         let listener = socket_listener(context, &fixture.net, local.port)?;
-        let listener_weak = Arc::downgrade(listener.endpoint());
+        let listener_weak = Arc::downgrade(listener.tcp_endpoint().unwrap());
         let listener_file_weak = Arc::downgrade(&listener);
         let listener_watch_weak = Arc::downgrade(
             listener
@@ -1304,15 +1302,30 @@ pub(crate) mod socket_native {
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
         )?;
-        operation(context, client_a.connect(local, FileIoContext::Kernel))?;
+        operation(
+            context,
+            client_a.connect(SocketAddress::Inet(local), FileIoContext::Kernel),
+        )?;
         let server_a = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
         context.expect_eq(Arc::ptr_eq(&listener, &server_a), false);
-        context.expect_eq(Arc::ptr_eq(listener.endpoint(), server_a.endpoint()), false);
-        context.expect_eq(Arc::ptr_eq(client_a.endpoint(), server_a.endpoint()), false);
-        context.expect_eq(listener.endpoint().state(), State::Listen);
-        let server_a_weak = Arc::downgrade(server_a.endpoint());
+        context.expect_eq(
+            Arc::ptr_eq(
+                listener.tcp_endpoint().unwrap(),
+                server_a.tcp_endpoint().unwrap(),
+            ),
+            false,
+        );
+        context.expect_eq(
+            Arc::ptr_eq(
+                client_a.tcp_endpoint().unwrap(),
+                server_a.tcp_endpoint().unwrap(),
+            ),
+            false,
+        );
+        context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
+        let server_a_weak = Arc::downgrade(server_a.tcp_endpoint().unwrap());
         let server_a_file_weak = Arc::downgrade(&server_a);
-        let client_a_weak = Arc::downgrade(client_a.endpoint());
+        let client_a_weak = Arc::downgrade(client_a.tcp_endpoint().unwrap());
 
         let epoll = operation(context, EpollFile::try_new(0))?;
         let epoll_weak = Arc::downgrade(&epoll);
@@ -1341,13 +1354,16 @@ pub(crate) mod socket_native {
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
         )?;
-        operation(context, client_b.connect(local, FileIoContext::Kernel))?;
+        operation(
+            context,
+            client_b.connect(SocketAddress::Inet(local), FileIoContext::Kernel),
+        )?;
         let readable = PollMask::POLLIN | PollMask::POLLRDNORM;
         observe(
             || listener.poll(None) == Ok(readable) && epoll.poll(None) == Ok(readable),
             "second handshake did not make listener and real epoll readable",
         )?;
-        let peer_b = operation(context, client_b.endpoint().local_address())?;
+        let peer_b = operation(context, client_b.tcp_endpoint().unwrap().local_address())?;
         let server_b_weak = Arc::downgrade(
             &fixture
                 .net
@@ -1358,7 +1374,7 @@ pub(crate) mod socket_native {
                 })
                 .ok_or(TestError("ready B is missing from actual TCP tuple table"))?,
         );
-        let client_b_weak = Arc::downgrade(client_b.endpoint());
+        let client_b_weak = Arc::downgrade(client_b.tcp_endpoint().unwrap());
         let mut events = [EpollEvent::default(); 1];
         let first = operation(context, socket_epoll_collect(&epoll, &mut events))?;
         context.expect_eq(first, 1);
@@ -1387,7 +1403,7 @@ pub(crate) mod socket_native {
             || server_a_weak.upgrade().is_none(),
             "accepted A did not finish normal FIN/EOF endpoint retirement",
         )?;
-        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
         context.expect_eq(operation(context, listener.poll(None))?, readable);
         context.expect_eq(
             server_b_weak.upgrade().map(|endpoint| endpoint.state()),
@@ -1396,7 +1412,7 @@ pub(crate) mod socket_native {
         let third = operation(context, socket_epoll_collect(&epoll, &mut events))?;
         context.diagnostic(format_args!(
             "network-socket accepted_a_retired={} listener_state={:?} listener_mask={:?} retirement_scan_count={} retirement_scan_event={:?}",
-            server_a_weak.upgrade().is_none(), listener.endpoint().state(),
+            server_a_weak.upgrade().is_none(), listener.tcp_endpoint().unwrap().state(),
             operation(context, listener.poll(None))?, third,
             if third == 0 { None } else { Some(events[0]) }
         ));
@@ -1411,12 +1427,15 @@ pub(crate) mod socket_native {
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
         )?;
-        operation(context, client_c.connect(local, FileIoContext::Kernel))?;
+        operation(
+            context,
+            client_c.connect(SocketAddress::Inet(local), FileIoContext::Kernel),
+        )?;
         observe(
             || epoll.poll(None) == Ok(readable),
             "new ready C did not notify the consumed listener edge",
         )?;
-        let peer_c = operation(context, client_c.endpoint().local_address())?;
+        let peer_c = operation(context, client_c.tcp_endpoint().unwrap().local_address())?;
         let server_c_weak = Arc::downgrade(
             &fixture
                 .net
@@ -1427,7 +1446,7 @@ pub(crate) mod socket_native {
                 })
                 .ok_or(TestError("ready C is missing from actual TCP tuple table"))?,
         );
-        let client_c_weak = Arc::downgrade(client_c.endpoint());
+        let client_c_weak = Arc::downgrade(client_c.tcp_endpoint().unwrap());
         let fourth = operation(context, socket_epoll_collect(&epoll, &mut events))?;
         context.expect_eq(fourth, 1);
         context.expect_eq(events[0], expected);
@@ -1446,22 +1465,40 @@ pub(crate) mod socket_native {
         context.expect_eq(
             server_b_weak
                 .upgrade()
-                .is_some_and(|endpoint| Arc::ptr_eq(&endpoint, server_b.endpoint())),
+                .is_some_and(|endpoint| Arc::ptr_eq(&endpoint, server_b.tcp_endpoint().unwrap())),
             true,
         );
         context.expect_eq(
             server_c_weak
                 .upgrade()
-                .is_some_and(|endpoint| Arc::ptr_eq(&endpoint, server_c.endpoint())),
+                .is_some_and(|endpoint| Arc::ptr_eq(&endpoint, server_c.tcp_endpoint().unwrap())),
             true,
         );
         context.expect_eq(Arc::ptr_eq(&listener, &server_b), false);
         context.expect_eq(Arc::ptr_eq(&listener, &server_c), false);
         context.expect_eq(Arc::ptr_eq(&server_b, &server_c), false);
-        context.expect_eq(Arc::ptr_eq(server_b.endpoint(), server_c.endpoint()), false);
-        context.expect_eq(Arc::ptr_eq(server_b.endpoint(), client_b.endpoint()), false);
-        context.expect_eq(Arc::ptr_eq(server_c.endpoint(), client_c.endpoint()), false);
-        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(
+            Arc::ptr_eq(
+                server_b.tcp_endpoint().unwrap(),
+                server_c.tcp_endpoint().unwrap(),
+            ),
+            false,
+        );
+        context.expect_eq(
+            Arc::ptr_eq(
+                server_b.tcp_endpoint().unwrap(),
+                client_b.tcp_endpoint().unwrap(),
+            ),
+            false,
+        );
+        context.expect_eq(
+            Arc::ptr_eq(
+                server_c.tcp_endpoint().unwrap(),
+                client_c.tcp_endpoint().unwrap(),
+            ),
+            false,
+        );
+        context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
         context.expect_eq(
             operation(context, listener.poll(None))?,
             PollMask::default(),
@@ -1528,12 +1565,15 @@ pub(crate) mod socket_native {
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
         )?;
-        operation(context, client.bind(peer))?;
+        operation(context, client.bind(SocketAddress::Inet(peer)))?;
         operation(
             context,
             fixture.net.ktest_drop_handshake_ack(peer.port, local.port),
         )?;
-        operation(context, client.connect(local, FileIoContext::Kernel))?;
+        operation(
+            context,
+            client.connect(SocketAddress::Inet(local), FileIoContext::Kernel),
+        )?;
         observe(
             || fixture.net.ktest_handshake_ack_dropped(),
             "selected handshake ACK was not dropped",
@@ -1548,15 +1588,15 @@ pub(crate) mod socket_native {
         let initial_state = child.state();
         context.diagnostic(format_args!(
             "network-socket handshake_ack_dropped={} child_id={} initial_state={:?} listener_state={:?}",
-            fixture.net.ktest_handshake_ack_dropped(), child.id(), initial_state, listener.endpoint().state()
+            fixture.net.ktest_handshake_ack_dropped(), child.id(), initial_state, listener.tcp_endpoint().unwrap().state()
         ));
         if initial_state != State::SynReceived {
             return Err(TestError(
                 "dropped handshake ACK did not leave actual child in SYN-RECEIVED",
             ));
         }
-        context.expect_eq(client.endpoint().state(), State::Established);
-        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(client.tcp_endpoint().unwrap().state(), State::Established);
+        context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
 
         // 首笔应用发送就是 FIN；任何先行 payload 都会另带 ACK，使这个被动握手窗口消失。
         operation(context, client.shutdown(1))?;
@@ -1570,14 +1610,14 @@ pub(crate) mod socket_native {
             Ok(server) => {
                 context.diagnostic(format_args!(
                     "network-socket handshake_ack_dropped={} child_id={} fin_state={:?} accept_result=Ok accepted_child_id={}",
-                    fixture.net.ktest_handshake_ack_dropped(), child.id(), fin_state, server.endpoint().id()
+                    fixture.net.ktest_handshake_ack_dropped(), child.id(), fin_state, server.tcp_endpoint().unwrap().id()
                 ));
                 server
             }
             Err(error) => {
                 context.diagnostic(format_args!(
                     "network-socket handshake_ack_dropped={} child_id={} fin_state={:?} accept_result=Err({:?}) listener_state={:?}",
-                    fixture.net.ktest_handshake_ack_dropped(), child.id(), fin_state, error, listener.endpoint().state()
+                    fixture.net.ktest_handshake_ack_dropped(), child.id(), fin_state, error, listener.tcp_endpoint().unwrap().state()
                 ));
                 return Err(TestError(match error {
                     FsError::WouldBlock => {
@@ -1587,20 +1627,20 @@ pub(crate) mod socket_native {
                 }));
             }
         };
-        context.expect_eq(Arc::ptr_eq(server.endpoint(), &child), true);
+        context.expect_eq(Arc::ptr_eq(server.tcp_endpoint().unwrap(), &child), true);
         context.expect_eq(Arc::ptr_eq(&listener, &server), false);
-        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
         context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
-        context.expect_eq(server.endpoint().state(), State::CloseWait);
+        context.expect_eq(server.tcp_endpoint().unwrap().state(), State::CloseWait);
         socket_write_all(&server, b"accepted after FIN")?;
         let mut output = [0u8; 18];
         socket_read_exact(&client, &mut output)?;
         context.expect_eq(&output, b"accepted after FIN");
         operation(context, server.shutdown(1))?;
         context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
-        context.expect_eq(listener.endpoint().state(), State::Listen);
+        context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
         let child_weak = Arc::downgrade(&child);
-        let client_weak = Arc::downgrade(client.endpoint());
+        let client_weak = Arc::downgrade(client.tcp_endpoint().unwrap());
         let server_file_weak = Arc::downgrade(&server);
         let client_file_weak = Arc::downgrade(&client);
         operation(context, fixture.net.ktest_clear_packet_control())?;
@@ -1633,8 +1673,8 @@ pub(crate) mod socket_native {
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
         )?;
-        let cpu_a = client_a.endpoint().work_cpu();
-        let cpu_b = client_b.endpoint().work_cpu();
+        let cpu_a = client_a.tcp_endpoint().unwrap().work_cpu();
+        let cpu_b = client_b.tcp_endpoint().unwrap().work_cpu();
         if cpu_a == cpu_b {
             return Err(TestError(
                 "native socket clients do not have distinct protocol CPUs",
@@ -1643,20 +1683,20 @@ pub(crate) mod socket_native {
         operation(
             context,
             client_a.connect(
-                InetEndpoint {
+                SocketAddress::Inet(InetEndpoint {
                     port: 45610,
                     ..SERVER
-                },
+                }),
                 FileIoContext::Kernel,
             ),
         )?;
         operation(
             context,
             client_b.connect(
-                InetEndpoint {
+                SocketAddress::Inet(InetEndpoint {
                     port: 45611,
                     ..SERVER
-                },
+                }),
                 FileIoContext::Kernel,
             ),
         )?;
@@ -1668,7 +1708,7 @@ pub(crate) mod socket_native {
         let release = fixture.release.clone();
         let a = client_a.clone();
         let holder = crate::ktest::spawn_result_on(cpu_a, move |token| {
-            let guard = a.endpoint().lock();
+            let guard = a.tcp_endpoint().unwrap().lock();
             if cpu::current().id != cpu_a || guard.state() != State::Established {
                 return Err(TestError("native socket owner has wrong CPU or state"));
             }
@@ -1732,18 +1772,18 @@ pub(crate) mod socket_native {
         )?;
         operation(
             context,
-            client.bind(InetEndpoint {
+            client.bind(SocketAddress::Inet(InetEndpoint {
                 port: 45621,
                 ..SERVER
-            }),
+            })),
         )?;
         operation(
             context,
             client.connect(
-                InetEndpoint {
+                SocketAddress::Inet(InetEndpoint {
                     port: 45620,
                     ..SERVER
-                },
+                }),
                 FileIoContext::Kernel,
             ),
         )?;
@@ -1756,10 +1796,10 @@ pub(crate) mod socket_native {
         operation(
             context,
             healthy_client.connect(
-                InetEndpoint {
+                SocketAddress::Inet(InetEndpoint {
                     port: 45622,
                     ..SERVER
-                },
+                }),
                 FileIoContext::Kernel,
             ),
         )?;
@@ -1775,7 +1815,7 @@ pub(crate) mod socket_native {
             "selected data segment was not dropped",
         )?;
         let first = fixture.net.ktest_loss_observation();
-        let deadline = match client.endpoint().lock().deadline(time::now()) {
+        let deadline = match client.tcp_endpoint().unwrap().lock().deadline(time::now()) {
             ProtocolDeadline::At(at) => at,
             _ => {
                 return Err(TestError(
@@ -1800,10 +1840,16 @@ pub(crate) mod socket_native {
                 "data arrived without actual At deadline retransmission",
             ));
         }
-        context.expect_eq(client.endpoint().state(), State::Established);
-        context.expect_eq(server.endpoint().state(), State::Established);
-        context.expect_eq(healthy_client.endpoint().state(), State::Established);
-        context.expect_eq(healthy_server.endpoint().state(), State::Established);
+        context.expect_eq(client.tcp_endpoint().unwrap().state(), State::Established);
+        context.expect_eq(server.tcp_endpoint().unwrap().state(), State::Established);
+        context.expect_eq(
+            healthy_client.tcp_endpoint().unwrap().state(),
+            State::Established,
+        );
+        context.expect_eq(
+            healthy_server.tcp_endpoint().unwrap().state(),
+            State::Established,
+        );
         socket_write_all(&healthy_client, &input)?;
         socket_read_exact(&healthy_server, &mut output)?;
         context.expect_eq(output, input);
@@ -1837,17 +1883,17 @@ pub(crate) mod socket_native {
         operation(
             context,
             client.connect(
-                InetEndpoint {
+                SocketAddress::Inet(InetEndpoint {
                     port: 45630,
                     ..SERVER
-                },
+                }),
                 FileIoContext::Kernel,
             ),
         )?;
         let server = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
         let file_weak = Arc::downgrade(&client);
-        let client_weak = Arc::downgrade(client.endpoint());
-        let server_weak = Arc::downgrade(server.endpoint());
+        let client_weak = Arc::downgrade(client.tcp_endpoint().unwrap());
+        let server_weak = Arc::downgrade(server.tcp_endpoint().unwrap());
         socket_write_all(&client, b"tail before FIN")?;
         drop(client);
         context.expect_eq(file_weak.upgrade().is_none(), true);
@@ -1856,7 +1902,7 @@ pub(crate) mod socket_native {
         socket_read_exact(&server, &mut output)?;
         context.expect_eq(&output, b"tail before FIN");
         context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
-        context.expect_eq(server.endpoint().state(), State::CloseWait);
+        context.expect_eq(server.tcp_endpoint().unwrap().state(), State::CloseWait);
         drop(server);
         observe(
             || {
@@ -1874,6 +1920,289 @@ pub(crate) mod socket_native {
         context.expect_eq(server_weak.upgrade().is_none(), true);
         context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
         drop((file_weak, client_weak, server_weak));
+        Ok(())
+    }
+
+    /// TCP_NODELAY 修改真正 raw Nagle，child 继承后仍可独立修改而不改变 listener。
+    #[test]
+    fn socket_options_modify_raw_nagle_and_child_inherits(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        let endpoint = operation(context, listener.tcp_endpoint())?;
+        context.expect_eq(endpoint.lock().nagle_enabled(), true);
+        operation(context, listener.set_nodelay(true))?;
+        context.expect_eq(endpoint.lock().nagle_enabled(), false);
+        operation(context, listener.set_nodelay(false))?;
+        context.expect_eq(endpoint.lock().nagle_enabled(), true);
+        operation(context, listener.set_nodelay(true))?;
+        operation(context, listener.set_reuse_address(true))?;
+        operation(
+            context,
+            listener.bind(SocketAddress::Inet(InetEndpoint {
+                port: 45660,
+                ..SERVER
+            })),
+        )?;
+        operation(context, listener.listen(4))?;
+        let client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), 0, 0, 0),
+        )?;
+        operation(
+            context,
+            client.connect(
+                SocketAddress::Inet(InetEndpoint {
+                    port: 45660,
+                    ..SERVER
+                }),
+                FileIoContext::Kernel,
+            ),
+        )?;
+        let child = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        context.expect_eq(
+            operation(context, child.tcp_endpoint())?
+                .lock()
+                .nagle_enabled(),
+            false,
+        );
+        context.expect_eq(child.reuse_address(), true);
+        operation(context, child.set_nodelay(false))?;
+        operation(context, child.set_reuse_address(false))?;
+        context.expect_eq(
+            operation(context, child.tcp_endpoint())?
+                .lock()
+                .nagle_enabled(),
+            true,
+        );
+        context.expect_eq(endpoint.lock().nagle_enabled(), false);
+        context.expect_eq(listener.reuse_address(), true);
+        socket_write_all(&client, b"raw policy child")?;
+        let mut output = [0u8; 16];
+        socket_read_exact(&child, &mut output)?;
+        context.expect_eq(&output, b"raw policy child");
+        operation(context, client.shutdown(1))?;
+        context.expect_eq(operation(context, child.read(&mut [0u8; 1]))?, 0);
+        operation(context, child.shutdown(1))?;
+        context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
+        drop((child, client, listener));
+        socket_retired(&fixture.net)?;
+        context.expect_eq(fixture.net.is_stopping(), false);
+        Ok(())
+    }
+
+    /// UNIX 末 OFD 撤真实 watch，别名保活到最后 put，两个 slot 在根未停止时归还。
+    #[test]
+    fn unix_last_ofd_watch_weak_and_slots_retire_normally(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let [first, second] = operation(
+            context,
+            SocketFile::try_new_unix_pair(fixture.net.clone(), 0, 0, 0),
+        )?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 2);
+        let alias = first.clone();
+        let file_weak = Arc::downgrade(&first);
+        let watch_weak = Arc::downgrade(
+            first
+                .watch_head()
+                .ok_or(TestError("UNIX file has no watch"))?,
+        );
+        let epoll = operation(context, EpollFile::try_new(0))?;
+        {
+            let owner: FileRef = epoll.clone();
+            let target: FileRef = first.clone();
+            operation(
+                context,
+                epoll.control(
+                    &owner,
+                    EPOLL_CTL_ADD,
+                    &target,
+                    0,
+                    Some(EpollEvent {
+                        events: PollMask::POLLIN.0 | EPOLLET,
+                        data: first.id(),
+                    }),
+                ),
+            )?;
+        }
+        drop(first);
+        context.expect_eq(file_weak.upgrade().is_some(), true);
+        context.expect_eq(
+            operation(
+                context,
+                second.send(
+                    &mut WriteBuffer::kernel(b"last alias bytes"),
+                    None,
+                    0,
+                    FileIoContext::Kernel,
+                ),
+            )?,
+            16,
+        );
+        let mut events = [EpollEvent::default(); 1];
+        context.expect_eq(
+            operation(context, socket_epoll_collect(&epoll, &mut events))?,
+            1,
+        );
+        context.expect_eq(events[0].data, alias.id());
+        let mut output = [0u8; 16];
+        socket_read_exact(&alias, &mut output)?;
+        context.expect_eq(&output, b"last alias bytes");
+        operation(context, alias.shutdown(1))?;
+        context.expect_eq(operation(context, second.read(&mut [0u8; 1]))?, 0);
+        operation(context, second.shutdown(1))?;
+        context.expect_eq(operation(context, alias.read(&mut [0u8; 1]))?, 0);
+        drop(alias);
+        context.expect_eq(file_weak.upgrade().is_none(), true);
+        context.expect_eq(watch_weak.upgrade().is_none(), true);
+        context.expect_eq(
+            operation(context, socket_epoll_collect(&epoll, &mut events))?,
+            0,
+        );
+        drop((second, epoll));
+        socket_retired(&fixture.net)?;
+        let [first, second] = operation(context, fixture.net.try_new_unix_pair())?;
+        let first_weak = Arc::downgrade(&first);
+        let second_weak = Arc::downgrade(&second);
+        context.expect_eq(first.id() != second.id(), true);
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 2);
+        context.expect_eq(
+            operation(context, first.send(b"endpoint bytes"))?,
+            IoProgress::Ready(14),
+        );
+        context.expect_eq(
+            operation(
+                context,
+                second.receive(&mut ReadBuffer::kernel(&mut output), false),
+            )?,
+            IoProgress::Ready(14),
+        );
+        context.expect_eq(&output[..14], b"endpoint bytes");
+        first.close();
+        second.close();
+        drop((first, second));
+        context.expect_eq(first_weak.upgrade().is_none(), true);
+        context.expect_eq(second_weak.upgrade().is_none(), true);
+        socket_retired(&fixture.net)?;
+        // 只剩一份真实端点额度时，pair 的第二份准备失败必须归还第一份未发表额度。
+        let mut occupied = Vec::new();
+        occupied
+            .try_reserve_exact(127)
+            .map_err(|_| TestError("UNIX slot observation allocation failed"))?;
+        for _ in 0..127 {
+            occupied.push(operation(context, fixture.net.try_new_udp())?);
+        }
+        match fixture.net.try_new_unix_pair() {
+            Err(FsError::NoMemory) => {}
+            _ => return Err(TestError("UNIX pair exceeded two actual endpoint slots")),
+        }
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 127);
+        let last = operation(context, fixture.net.try_new_udp())?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 128);
+        last.close();
+        for endpoint in &occupied {
+            endpoint.close();
+        }
+        drop((last, occupied));
+        socket_retired(&fixture.net)?;
+        let [first, second] = operation(context, fixture.net.try_new_unix_pair())?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 2);
+        first.close();
+        second.close();
+        drop((first, second));
+        socket_retired(&fixture.net)?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
+        drop((file_weak, watch_weak, first_weak, second_weak));
+        Ok(())
+    }
+
+    /// AF_UNSPEC 后旧准备 Lease 保端口，旧末 put 不得撤同端点的后继绑定或阻止真实新包交付。
+    #[test]
+    fn udp_prepared_lease_survives_disconnect_without_unbinding_successor(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let receiver = operation(context, fixture.net.try_new_udp())?;
+        let destination = operation(
+            context,
+            receiver.bind(InetEndpoint {
+                port: 45670,
+                ..SERVER
+            }),
+        )?;
+        let sender = operation(context, fixture.net.try_new_udp())?;
+        operation(context, sender.connect(Some(destination)))?;
+        let (old_packet, old_lease) =
+            operation(context, sender.prepare_send(b"old prepared message", None))?;
+        let old_local = old_lease.local();
+        context.expect_eq(
+            operation(context, old_packet.udp_endpoints())?.0.port,
+            old_local.port,
+        );
+        operation(context, sender.connect(None))?;
+        context.expect_eq(sender.peer_address(), Err(FsError::NotConnected));
+        context.expect_eq(
+            operation(context, sender.local_address())?,
+            InetEndpoint {
+                address: [0; 4],
+                port: 0,
+            },
+        );
+        let contender = operation(context, fixture.net.try_new_udp())?;
+        context.expect_eq(contender.bind(old_local), Err(FsError::AddressInUse));
+        let input = b"successor prepared datagram";
+        let (new_packet, new_lease) =
+            operation(context, sender.prepare_send(input, Some(destination)))?;
+        let new_local = new_lease.local();
+        context.expect_eq(new_local.port != old_local.port, true);
+        context.expect_eq(sender.peer_address(), Err(FsError::NotConnected));
+        let expected_source = InetEndpoint {
+            address: SERVER.address,
+            port: new_local.port,
+        };
+        context.expect_eq(
+            operation(context, new_packet.udp_endpoints())?,
+            (expected_source, destination),
+        );
+        drop((old_packet, old_lease));
+        context.expect_eq(operation(context, contender.bind(old_local))?, old_local);
+        let third = operation(context, fixture.net.try_new_udp())?;
+        context.expect_eq(third.bind(new_local), Err(FsError::AddressInUse));
+        operation(context, fixture.net.send_ipv4(new_packet))?;
+        let mut delivered = None;
+        observe(
+            || {
+                delivered = receiver.take_datagram();
+                delivered.is_some()
+            },
+            "successor UDP packet did not reach actual receiver",
+        )?;
+        let delivered = delivered.ok_or(TestError("successor UDP record disappeared"))?;
+        context.expect_eq(
+            operation(context, delivered.udp_endpoints())?,
+            (expected_source, destination),
+        );
+        context.expect_eq(operation(context, delivered.udp_payload())?, &input[..]);
+        context.expect_eq(receiver.take_datagram().is_none(), true);
+        context.diagnostic(format_args!(
+            "network-socket udp-old-port={} udp-new-port={} successor-payload-bytes={} default-peer-none=1",
+            old_local.port, new_local.port, input.len()
+        ));
+        sender.close();
+        receiver.close();
+        contender.close();
+        third.close();
+        drop((delivered, new_lease, sender, receiver, contender, third));
+        socket_retired(&fixture.net)?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
         Ok(())
     }
 }

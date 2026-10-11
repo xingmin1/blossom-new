@@ -1,4 +1,4 @@
-//! 打开对象和 TCP 协议拥有分离；本连接的睡眠互斥不限制其它核心。
+//! 打开对象持有具体协议端点；流前缀与完整报文分别在真实接受点提交。
 
 use alloc::sync::Arc;
 use core::ops::Range;
@@ -10,6 +10,8 @@ use crate::fs::{DirectoryEntry, FileStat, FsError, InodeKind, InodeRef, InodeTim
 use crate::fs::{FileIoContext, FileLike, ReadBuffer, SeekFrom, WriteBuffer};
 use crate::net::address::{InetEndpoint, SocketAddress};
 use crate::net::tcp::TcpEndpoint;
+use crate::net::udp::UdpEndpoint;
+use crate::net::unix::UnixEndpoint;
 use crate::net::{IoProgress, MessageResult, NetStackRef};
 use crate::wait::WaitResult;
 
@@ -19,14 +21,44 @@ const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u32 = 0o2000000;
 const MSG_PEEK: u32 = 0x2;
+const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
 const MSG_NOSIGNAL: u32 = 0x4000;
 const STREAM_PREFIX_LEN: usize = 4096;
+const DATAGRAM_PREFIX_LEN: usize = 1472;
+
+/// 一个打开实例只选择一种真实协议端点，不引入另一层 socket 表。
+#[derive(Clone)]
+enum Endpoint {
+    Tcp(Arc<TcpEndpoint>),
+    Udp(Arc<UdpEndpoint>),
+    Unix(Arc<UnixEndpoint>),
+}
+
+impl Endpoint {
+    /// 构造失败时撤销未发表端点，TCP 保留原协议终止责任。
+    fn abandon(&self) {
+        match self {
+            Self::Tcp(endpoint) => endpoint.abandon(),
+            Self::Udp(endpoint) => endpoint.close(),
+            Self::Unix(endpoint) => endpoint.close(),
+        }
+    }
+
+    /// 末 OFD 请求正常关闭，不同步等待对端或协议 Work。
+    fn close(&self) {
+        match self {
+            Self::Tcp(endpoint) => endpoint.close(),
+            Self::Udp(endpoint) => endpoint.close(),
+            Self::Unix(endpoint) => endpoint.close(),
+        }
+    }
+}
 
 /// 打开对象持稳定协议端点、网络域和创建者凭据，并保存共享 OFD 状态位。
 /// 构造只准备打开实例，不发表用户 fd。
 pub struct SocketFile {
-    endpoint: Arc<TcpEndpoint>,
+    endpoint: Endpoint,
     net: NetStackRef,
     uid: u32,
     gid: u32,
@@ -49,7 +81,43 @@ impl SocketFile {
             return Err(FsError::InvalidOperation);
         }
         let endpoint = net.try_new_tcp(TCP_BUFFER_LEN, TCP_BUFFER_LEN)?;
-        Self::allocate(net, endpoint, flags, uid, gid)
+        Self::allocate(net, Endpoint::Tcp(endpoint), flags, uid, gid)
+    }
+
+    /// 从本域准备 UDP 打开实例，零长消息仍由真实报文端点提交。
+    pub fn try_new_udp(
+        net: NetStackRef,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<Self>, FsError> {
+        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let endpoint = net.try_new_udp()?;
+        Self::allocate(net, Endpoint::Udp(endpoint), flags, uid, gid)
+    }
+
+    /// 完整准备真实匿名 pair 的两个 OFD，任一分配失败关闭尚未发表的两侧。
+    pub fn try_new_unix_pair(
+        net: NetStackRef,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<[Arc<Self>; 2], FsError> {
+        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let [first, second] = net.try_new_unix_pair()?;
+        let first = match Self::allocate(net.clone(), Endpoint::Unix(first), flags, uid, gid) {
+            Ok(first) => first,
+            Err(error) => {
+                second.close();
+                return Err(error);
+            }
+        };
+        let second = Self::allocate(net, Endpoint::Unix(second), flags, uid, gid)?;
+        Ok([first, second])
     }
 
     /// 为已拥有的本域协议端点构造独立 OFD，不搬走 raw 核心或替换稳定 listener。
@@ -66,13 +134,13 @@ impl SocketFile {
         if !endpoint.belongs_to(&net) {
             return Err(FsError::InvalidOperation);
         }
-        Self::allocate(net, endpoint, flags, uid, gid)
+        Self::allocate(net, Endpoint::Tcp(endpoint), flags, uid, gid)
     }
 
     /// 分配失败撤回未交给打开实例的协议拥有，成功后才赋予末 OFD 关闭责任。
     fn allocate(
         net: NetStackRef,
-        endpoint: Arc<TcpEndpoint>,
+        endpoint: Endpoint,
         flags: u32,
         uid: u32,
         gid: u32,
@@ -108,9 +176,46 @@ impl SocketFile {
         }
     }
 
-    /// 借用稳定端点拥有者，协议索引可 clone 此 Arc 而不保整张文件表。
-    pub fn endpoint(&self) -> &Arc<TcpEndpoint> {
-        &self.endpoint
+    /// 仅向原 TCP 内核消费者借用稳定端点，其他协议不能被误当 TCP。
+    pub fn tcp_endpoint(&self) -> Result<&Arc<TcpEndpoint>, FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => Ok(endpoint),
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 返回本打开实例的真实流或报文类型。
+    pub fn socket_type(&self) -> u32 {
+        match &self.endpoint {
+            Endpoint::Udp(_) => 2,
+            Endpoint::Tcp(_) | Endpoint::Unix(_) => 1,
+        }
+    }
+
+    /// 返回实际地址域，匿名 pair 保持 AF_UNIX。
+    pub fn domain(&self) -> u16 {
+        match &self.endpoint {
+            Endpoint::Unix(_) => 1,
+            Endpoint::Tcp(_) | Endpoint::Udp(_) => 2,
+        }
+    }
+
+    /// 返回实际协议编号，匿名 UNIX stream 使用默认协议零。
+    pub fn protocol(&self) -> i32 {
+        match &self.endpoint {
+            Endpoint::Tcp(_) => 6,
+            Endpoint::Udp(_) => 17,
+            Endpoint::Unix(_) => 0,
+        }
+    }
+
+    /// 每个真实端点拥有独立且不复用的本域身份。
+    pub fn id(&self) -> u64 {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.id(),
+            Endpoint::Udp(endpoint) => endpoint.id(),
+            Endpoint::Unix(endpoint) => endpoint.id(),
+        }
     }
 
     /// 返回构造时的同一网络域；dup 和 fork 共享打开实例及这个引用。
@@ -130,21 +235,42 @@ impl SocketFile {
         Ok(())
     }
 
-    /// 在本域预留真实地址，通配与自动端口由原端点统一处理。
-    pub fn bind(&self, local: InetEndpoint) -> Result<(), FsError> {
-        self.endpoint.bind(local).map(|_| ())
+    /// 按实际地址域绑定本端点，匿名 UNIX 不提供路径绑定。
+    pub fn bind(&self, local: SocketAddress) -> Result<(), FsError> {
+        match (&self.endpoint, local) {
+            (Endpoint::Tcp(endpoint), SocketAddress::Inet(local)) => {
+                endpoint.bind(local).map(|_| ())
+            }
+            (Endpoint::Udp(endpoint), SocketAddress::Inet(local)) => {
+                endpoint.bind(local).map(|_| ())
+            }
+            (Endpoint::Unix(_), _) => Err(FsError::Unsupported),
+            _ => Err(FsError::AddressFamilyNotSupported),
+        }
     }
 
-    /// 更新稳定 listener 的有限 backlog，原握手和 ready child 仍归同一端点。
+    /// 只有 TCP 能更新稳定 listener 的 backlog，其他端点明确拒绝监听。
     pub fn listen(&self, backlog: usize) -> Result<(), FsError> {
-        self.endpoint.listen(backlog)
+        self.tcp_endpoint()?.listen(backlog)
     }
 
-    /// 首次发起实际握手；阻塞重启只等待既有握手，不再次发表四元组。
-    /// 中断或等待资源准备失败保留未领取结果，领取实际成功或连接失败结果后才清除。
-    pub fn connect(&self, peer: InetEndpoint, caller: FileIoContext<'_>) -> Result<(), FsError> {
+    /// UDP 更新默认 peer 或断开，TCP 阻塞重启只领取既有握手的实际结果。
+    /// 中断或等待资源准备失败保留未领取事实，成功或连接失败才清除。
+    pub fn connect(&self, peer: SocketAddress, caller: FileIoContext<'_>) -> Result<(), FsError> {
+        let endpoint = match (&self.endpoint, peer) {
+            (Endpoint::Udp(endpoint), SocketAddress::Inet(peer)) => {
+                return endpoint.connect(Some(peer))
+            }
+            (Endpoint::Udp(endpoint), SocketAddress::Unspecified) => return endpoint.connect(None),
+            (Endpoint::Tcp(endpoint), SocketAddress::Inet(_)) => endpoint,
+            (Endpoint::Unix(_), _) => return Err(FsError::Unsupported),
+            _ => return Err(FsError::AddressFamilyNotSupported),
+        };
+        let SocketAddress::Inet(peer) = peer else {
+            unreachable!("TCP connection requires an Inet address");
+        };
         let nonblock = self.flags() & O_NONBLOCK != 0;
-        match self.endpoint.connect(peer) {
+        match endpoint.connect(peer) {
             Ok(()) if nonblock => return Err(FsError::InProgress),
             Ok(()) => self.connect_unclaimed.store(true, Ordering::Release),
             Err(FsError::AlreadyInProgress) if !nonblock => {
@@ -160,7 +286,7 @@ impl SocketFile {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            match self.endpoint.connection_result() {
+            match endpoint.connection_result() {
                 Ok(Some(())) => {
                     self.connect_unclaimed.store(false, Ordering::Release);
                     return Ok(());
@@ -199,13 +325,14 @@ impl SocketFile {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
+        let endpoint = self.tcp_endpoint()?;
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            if let Some(child) = self.endpoint.accept()? {
+            if let Some(child) = endpoint.accept()? {
                 return Self::from_endpoint(self.net.clone(), child, flags, uid, gid);
             }
             if self.flags() & O_NONBLOCK != 0 {
@@ -223,18 +350,24 @@ impl SocketFile {
         }
     }
 
-    /// 交付同一 TCP 流的连续前缀，PEEK 不消费；名称沿流语义保持为空。
+    /// 流交付连续前缀，UDP 领取同条消息及元数据；TRUNC 只允许用于 UDP。
     pub fn receive(
         &self,
         target: &mut ReadBuffer<'_>,
         flags: u32,
         caller: FileIoContext<'_>,
     ) -> Result<MessageResult, FsError> {
-        if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
+        let allowed = MSG_DONTWAIT
+            | MSG_PEEK
+            | if matches!(&self.endpoint, Endpoint::Udp(_)) {
+                MSG_TRUNC
+            } else {
+                0
+            };
+        if flags & !allowed != 0 {
             return Err(FsError::Unsupported);
         }
-        let start = target.copied();
-        if start == target.len() {
+        if target.copied() == target.len() && !matches!(&self.endpoint, Endpoint::Udp(_)) {
             return Ok(Self::stream_result(0));
         }
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
@@ -243,13 +376,9 @@ impl SocketFile {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            match self.endpoint.receive(target, flags & MSG_PEEK != 0) {
-                Ok(IoProgress::Ready(count)) => return Ok(Self::stream_result(count)),
-                Ok(IoProgress::Eof) => return Ok(Self::stream_result(0)),
-                Err(error) => {
-                    return Self::progress(target.copied() - start, error).map(Self::stream_result);
-                }
-                Ok(IoProgress::Blocked) => {}
+            match self.receive_once(target, flags & MSG_PEEK != 0)? {
+                Some(result) => return Ok(result),
+                None => {}
             }
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
@@ -266,36 +395,71 @@ impl SocketFile {
         }
     }
 
-    /// 锁外取得至多一段用户前缀，再提交 raw 实际接受量；Blocked 保留原段重试。
+    /// 单次数据面查询保留流的正交付前缀，UDP fault 不转换成部分消息成功。
+    fn receive_once(
+        &self,
+        target: &mut ReadBuffer<'_>,
+        peek: bool,
+    ) -> Result<Option<MessageResult>, FsError> {
+        let start = target.copied();
+        let result = match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.receive(target, peek),
+            Endpoint::Unix(endpoint) => endpoint.receive(target, peek),
+            Endpoint::Udp(endpoint) => return endpoint.receive(target, peek),
+        };
+        match result {
+            Ok(IoProgress::Ready(count)) => Ok(Some(Self::stream_result(count))),
+            Ok(IoProgress::Eof) => Ok(Some(Self::stream_result(0))),
+            Ok(IoProgress::Blocked) => Ok(None),
+            Err(error) => Self::progress(target.copied() - start, error)
+                .map(Self::stream_result)
+                .map(Some),
+        }
+    }
+
+    /// 锁外准备同一流前缀或完整 UDP 消息，返回协议实际接受量。
     pub fn send(
         &self,
         source: &mut WriteBuffer<'_>,
+        destination: Option<SocketAddress>,
         flags: u32,
         caller: FileIoContext<'_>,
     ) -> Result<usize, FsError> {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(FsError::Unsupported);
         }
-        if source.copied() == source.len() {
-            return Ok(0);
+        match &self.endpoint {
+            Endpoint::Udp(endpoint) => {
+                let destination = match destination {
+                    Some(SocketAddress::Inet(peer)) => Some(peer),
+                    None => None,
+                    _ => return Err(FsError::AddressFamilyNotSupported),
+                };
+                return self.send_datagram(endpoint, source, destination, flags, caller);
+            }
+            Endpoint::Unix(_) if destination.is_some() => return Err(FsError::AlreadyConnected),
+            Endpoint::Tcp(_) | Endpoint::Unix(_) => {}
         }
         let mut prefix = [0u8; STREAM_PREFIX_LEN];
         let prepared = source.pull(&mut prefix)?;
-        assert!(0 < prepared, "nonempty socket input made no progress");
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            // 临时输入只借内核前缀；端点调用结束后已释放核心和 raw 借用。
-            let result = self
-                .endpoint
-                .send(&mut WriteBuffer::kernel(&prefix[..prepared]));
+            // 空前缀仍交给端点核对真实发送关闭，不能在 OFD 层吞掉 EPIPE。
+            let result = match &self.endpoint {
+                Endpoint::Tcp(endpoint) => {
+                    endpoint.send(&mut WriteBuffer::kernel(&prefix[..prepared]))
+                }
+                Endpoint::Unix(endpoint) => endpoint.send(&prefix[..prepared]),
+                Endpoint::Udp(_) => unreachable!("datagram send uses complete packets"),
+            };
             match result {
                 Ok(IoProgress::Ready(count)) => return Ok(count),
                 Ok(IoProgress::Blocked) => {}
-                Ok(IoProgress::Eof) => unreachable!("TCP send returned receive EOF"),
+                Ok(IoProgress::Eof) => unreachable!("stream send returned receive EOF"),
                 Err(FsError::BrokenPipe) => {
                     if flags & MSG_NOSIGNAL == 0 {
                         if let FileIoContext::User(user) = caller {
@@ -321,39 +485,144 @@ impl SocketFile {
         }
     }
 
-    /// 关闭指定流方向，发送 FIN 后接收仍使用相同端点。
+    /// 一次完整 copyin 后保留原包和 Lease，容量等待不重新取用户输入或改变目的。
+    fn send_datagram(
+        &self,
+        endpoint: &Arc<UdpEndpoint>,
+        source: &mut WriteBuffer<'_>,
+        destination: Option<InetEndpoint>,
+        flags: u32,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        let length = source.len() - source.copied();
+        if DATAGRAM_PREFIX_LEN < length {
+            return Err(FsError::MessageTooLarge);
+        }
+        let mut prefix = [0u8; DATAGRAM_PREFIX_LEN];
+        let prepared = source.pull(&mut prefix[..length])?;
+        if prepared < length {
+            // WriteBuffer 保留首个 copyin 错误；UDP 不提交已经取得的部分输入。
+            source.pull(&mut [])?;
+            unreachable!("incomplete datagram copy has no stored error");
+        }
+        let (mut packet, _lease) = endpoint.prepare_send(&prefix[..length], destination)?;
+        let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
+        let mut interrupted = false;
+        loop {
+            if let Some((context, _)) = &waiting {
+                context.clear_triggered();
+            }
+            endpoint.check_send()?;
+            if self.net.egress_ready(endpoint.id())? {
+                match self.net.try_emit(packet) {
+                    Ok(()) => return Ok(length),
+                    Err((FsError::WouldBlock, returned)) => packet = returned,
+                    Err((error, _packet)) => return Err(error),
+                }
+            }
+            if self.nonblocking(flags) {
+                return Err(FsError::WouldBlock);
+            }
+            if interrupted {
+                return Err(FsError::Interrupted);
+            }
+            if let Some((context, _)) = &waiting {
+                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                    == WaitResult::Interrupted;
+            } else {
+                waiting = Some(self.prepare_wait()?);
+            }
+        }
+    }
+
+    /// 关闭协议实际方向，流发送关闭不妨碍反向接收。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
-        self.endpoint.shutdown(how)
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.shutdown(how),
+            Endpoint::Udp(endpoint) => endpoint.shutdown(how),
+            Endpoint::Unix(endpoint) => endpoint.shutdown(how),
+        }
     }
 
-    /// 查询实际绑定或路由选择后的本地地址，不制造流消息来源。
+    /// 查询实际绑定或路由选源，匿名 UNIX 返回无路径名称。
     pub fn local_address(&self) -> Result<SocketAddress, FsError> {
-        self.endpoint.local_address().map(SocketAddress::Inet)
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.local_address().map(SocketAddress::Inet),
+            Endpoint::Udp(endpoint) => endpoint.local_address().map(SocketAddress::Inet),
+            Endpoint::Unix(endpoint) => endpoint.local_address(),
+        }
     }
 
-    /// 只返回真正已连接的对端，未连接状态由协议对象判定。
+    /// 返回真实连接的 peer 或匿名名称，未连接错误由协议对象保留。
     pub fn peer_address(&self) -> Result<SocketAddress, FsError> {
-        self.endpoint.peer_address().map(SocketAddress::Inet)
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.peer_address().map(SocketAddress::Inet),
+            Endpoint::Udp(endpoint) => endpoint.peer_address().map(SocketAddress::Inet),
+            Endpoint::Unix(endpoint) => endpoint.peer_address(),
+        }
     }
 
-    /// 消费一次协议实际记录的 pending error，不发起连接或推进协议。
+    /// 一次消费协议记录的实际错误，查询不主动推进收发。
     pub fn take_error(&self) -> Option<FsError> {
-        self.endpoint.take_error()
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.take_error(),
+            Endpoint::Udp(endpoint) => endpoint.take_error(),
+            Endpoint::Unix(endpoint) => endpoint.take_error(),
+        }
     }
 
-    /// 观察同一协议端点是否为稳定 listener。
+    /// 只有真实 TCP listener 才提供接受连接能力。
     pub fn is_listener(&self) -> bool {
-        self.endpoint.is_listener()
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.is_listener(),
+            Endpoint::Udp(_) | Endpoint::Unix(_) => false,
+        }
     }
 
-    /// 查询实际接收 ring 容量，不把 Linux 缓冲翻倍规则套到 raw 存储。
+    /// 返回实际协议接收存储的字节容量，不套用 skb 记账翻倍规则。
     pub fn receive_capacity(&self) -> usize {
-        self.endpoint.observe().receive_capacity()
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.receive_capacity(),
+            Endpoint::Udp(endpoint) => endpoint.receive_capacity(),
+            Endpoint::Unix(endpoint) => endpoint.receive_capacity(),
+        }
     }
 
-    /// 查询实际发送 ring 容量，接受量与空闲量仍由数据面决定。
+    /// 返回实际发送存储容量，UDP 读取本域共享 egress 的完整 IP 字节容量。
     pub fn send_capacity(&self) -> usize {
-        self.endpoint.observe().send_capacity()
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.send_capacity(),
+            Endpoint::Udp(endpoint) => endpoint.send_capacity(),
+            Endpoint::Unix(endpoint) => endpoint.send_capacity(),
+        }
+    }
+
+    /// 查询协议保存的地址复用事实，不改变绑定索引或产生通知。
+    pub fn reuse_address(&self) -> bool {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.reuse_address(),
+            Endpoint::Udp(endpoint) => endpoint.reuse_address(),
+            Endpoint::Unix(endpoint) => endpoint.reuse_address(),
+        }
+    }
+
+    /// 沿协议端点更新复用策略，绑定表和 listener 约束由同域控制处理。
+    pub fn set_reuse_address(&self, reuse: bool) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.set_reuse_address(reuse),
+            Endpoint::Udp(endpoint) => endpoint.set_reuse_address(reuse),
+            Endpoint::Unix(endpoint) => endpoint.set_reuse_address(reuse),
+        }
+    }
+
+    /// TCP_NODELAY 只查询 TCP 的实际 Nagle 状态，其他协议明确不支持。
+    pub fn nodelay(&self) -> Result<bool, FsError> {
+        self.tcp_endpoint()?.nodelay()
+    }
+
+    /// 修改 TCP 的实际 Nagle 状态，由原端点安排协议 Work。
+    pub fn set_nodelay(&self, enabled: bool) -> Result<(), FsError> {
+        self.tcp_endpoint()?.set_nodelay(enabled)
     }
 
     /// 真实 Blocked 后才准备原等待上下文与一源表，登记结束后由调用者重新扫描。
@@ -370,7 +639,7 @@ impl SocketFile {
         self.flags() & O_NONBLOCK != 0 || flags & MSG_DONTWAIT != 0
     }
 
-    /// TCP 的消息元数据只描述本次实际交付的流前缀。
+    /// 流消息元数据只描述本次交付前缀，不构造报文来源。
     fn stream_result(count: usize) -> MessageResult {
         MessageResult {
             copied: count,
@@ -396,7 +665,7 @@ impl SocketFile {
             nanoseconds: 0,
         };
         FileStat {
-            inode: self.endpoint.id(),
+            inode: self.id(),
             kind: InodeKind::Socket,
             mode: 0o140777,
             size: 0,
@@ -417,17 +686,24 @@ impl SocketFile {
 impl Pollable for SocketFile {
     /// 首轮登记端点唯一持续源，其后只查询原协议状态，不收包或 dispatch。
     fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError> {
-        self.endpoint.poll(table)
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.poll(table),
+            Endpoint::Udp(endpoint) => endpoint.poll(table),
+            Endpoint::Unix(endpoint) => endpoint.poll(table),
+        }
     }
 }
 
 impl FileLike for SocketFile {
-    /// 普通 read/readv 与 recv 使用同一流交付及等待路径。
+    /// 普通零长 read 不消费报文，非空请求沿同一协议交付和等待路径。
     fn read_into(
         &self,
         target: &mut ReadBuffer<'_>,
         caller: FileIoContext<'_>,
     ) -> Result<usize, FsError> {
+        if target.copied() == target.len() {
+            return Ok(0);
+        }
         self.receive(target, 0, caller).map(|result| result.copied)
     }
 
@@ -509,13 +785,13 @@ impl FileLike for SocketFile {
         Err(FsError::NotDirectory)
     }
 
-    /// 普通 write/writev 与 send 共用 raw 接受量及调用线程 SIGPIPE 路径。
+    /// 普通 write/writev 使用默认 peer，UDP 空输入仍提交真实零长消息。
     fn write_from(
         &self,
         source: &mut WriteBuffer<'_>,
         caller: FileIoContext<'_>,
     ) -> Result<usize, FsError> {
-        self.send(source, 0, caller)
+        self.send(source, None, 0, caller)
     }
 
     /// TCP 流不能执行 pwrite。

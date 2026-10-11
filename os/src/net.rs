@@ -8,6 +8,7 @@ pub mod socket;
 pub mod table;
 pub mod tcp;
 pub mod udp;
+pub mod unix;
 
 use ::core::pin::Pin;
 use ::core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +29,7 @@ use crate::net::route::RouteTable;
 use crate::net::table::{NetTables, TcpTuple};
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
+use crate::net::unix::{UnixEndpoint, UnixPair};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::time;
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
@@ -145,6 +147,7 @@ pub struct NetStack {
     stopped: AtomicBool,
     endpoints: AtomicUsize,
     next_connection: AtomicU64,
+    next_protocol_cpu: AtomicUsize,
     seed: u64,
 }
 
@@ -182,6 +185,7 @@ impl NetStack {
             stopped: AtomicBool::new(true),
             endpoints: AtomicUsize::new(0),
             next_connection: AtomicU64::new(1),
+            next_protocol_cpu: AtomicUsize::new(0),
             seed: time::now().as_nanos(),
         })
         .map_err(|_| FsError::NoMemory)?;
@@ -243,6 +247,11 @@ impl NetStack {
             .expect("network connection identity exhausted")
     }
 
+    /// TCP 工作与期限按节点准备次序轮转，调度位置独立于端点和租约身份。
+    pub(crate) fn allocate_protocol_cpu(&self) -> usize {
+        self.next_protocol_cpu.fetch_add(1, Ordering::Relaxed) % cpu::count()
+    }
+
     /// 关门后所有外部生产和期限重排都停止。
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
@@ -299,6 +308,16 @@ impl NetStack {
         Ok(endpoint)
     }
 
+    /// 在同一准入内准备两份节点额度和身份，完整 pair 成功后才交根表拥有。
+    pub fn try_new_unix_pair(self: &NetStackRef) -> Result<[Arc<UnixEndpoint>; 2], FsError> {
+        let _admission = self.admission()?;
+        let slots = [self.claim_endpoint_slot()?, self.claim_endpoint_slot()?];
+        let ids = [self.allocate_identity(), self.allocate_identity()];
+        let (pair, endpoints) = UnixPair::try_new(self, ids, slots)?;
+        self.tables.insert_unix(pair)?;
+        Ok(endpoints)
+    }
+
     /// 返回当前唯一 lo 的真实地址和掩码。
     pub fn loopback_cidr(&self) -> Ipv4Cidr {
         Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8)
@@ -343,35 +362,36 @@ impl NetStack {
         self.try_emit(packet).map_err(|(error, _packet)| error)
     }
 
-    /// 同锁重查容量并登记具体身份，释放短锁后才安排恢复空间的连接。
-    pub(crate) fn wait_egress(&self, id: u64) {
-        let ready = {
-            let mut egress = self.egress.lock();
-            if !egress.open {
-                return;
-            }
-            if egress.packets.len() < LOOPBACK_CAPACITY {
-                true
-            } else {
-                if !egress.waiting.contains(&id) {
-                    assert!(egress.waiting.len() < ENDPOINT_CAPACITY);
-                    egress.waiting.push(id);
-                }
-                false
-            }
-        };
-        if ready {
-            self.schedule_tcp(id);
+    /// 容量和满队列登记使用同一短锁，关门返回真实错误，不访问协议或持续源。
+    pub(crate) fn egress_ready(&self, id: u64) -> Result<bool, FsError> {
+        let mut egress = self.egress.lock();
+        if !egress.open {
+            return Err(FsError::NotConnected);
         }
+        if egress.packets.len() < LOOPBACK_CAPACITY {
+            return Ok(true);
+        }
+        if !egress.waiting.contains(&id) {
+            assert!(egress.waiting.len() < ENDPOINT_CAPACITY);
+            egress.waiting.push(id);
+        }
+        Ok(false)
     }
 
-    /// 根据真正的表拥有定向安排，不扫描其它 socket。
-    pub(crate) fn schedule_tcp(&self, id: u64) {
+    /// 末关闭只撤本端点身份，不影响同一共享容量上的其它等待者。
+    pub(crate) fn cancel_egress_wait(&self, id: u64) {
+        self.egress.lock().waiting.retain(|waiting| *waiting != id);
+    }
+
+    /// 表锁只克隆本身份拥有，解锁后定向安排 TCP Work 或通知 UDP 的同一源。
+    pub(crate) fn notify_egress(&self, id: u64) {
         if self.is_stopping() {
             return;
         }
         if let Some(endpoint) = self.tables.tcp_by_id(id) {
             endpoint.schedule();
+        } else if let Some(endpoint) = self.tables.udp_by_id(id) {
+            endpoint.notify_egress();
         }
     }
 
@@ -387,7 +407,7 @@ impl NetStack {
                 retired.push(endpoint);
             }
         }
-        self.egress.lock().waiting.retain(|waiting| *waiting != id);
+        self.cancel_egress_wait(id);
         let _ = self
             .reaper
             .get()
@@ -643,7 +663,7 @@ impl NetStack {
                 (packet, count)
             };
             for id in &waiting[..count] {
-                self.schedule_tcp(*id);
+                self.notify_egress(*id);
             }
             let Some(packet) = packet else {
                 return;
@@ -682,8 +702,8 @@ impl NetStack {
                 }
             }
             IpProtocol::Udp => {
-                let (_, local) = packet.udp_endpoints()?;
-                if let Some(endpoint) = self.tables.lookup_udp(local) {
+                let (peer, local) = packet.udp_endpoints()?;
+                if let Some(endpoint) = self.tables.lookup_udp(local, peer) {
                     return endpoint.enqueue(packet);
                 }
             }
@@ -723,13 +743,16 @@ impl NetStack {
         }
         self.ingress.get().unwrap().as_ref().close_sync();
         self.reaper.get().unwrap().as_ref().close_sync();
-        let (tcp, udp) = self.tables.take_all();
+        let (tcp, udp, unix) = self.tables.take_all();
         let retired = ::core::mem::take(&mut *self.retired.lock());
         for endpoint in tcp.into_iter().chain(retired) {
             endpoint.stop_sync();
         }
         for endpoint in udp {
             endpoint.stop_sync();
+        }
+        for pair in unix {
+            pair.stop_sync();
         }
         #[cfg(feature = "ktest")]
         {

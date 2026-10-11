@@ -121,6 +121,7 @@ fn writeback_errno(error: FsError) -> u32 {
         FsError::InProgress => 115,
         FsError::MessageTooLarge => 90,
         FsError::NotSocket => 88,
+        FsError::DestinationRequired => 89,
         FsError::WouldBlock => 11,
         FsError::BrokenPipe => 32,
         FsError::Interrupted => 4,
