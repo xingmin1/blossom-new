@@ -1,448 +1,656 @@
-use super::{Mutex, Socket};
-use crate::{
-    fs::{file_trait::File, FileDescriptor, OpenFlags}, net::{
-        address,
-        config::NET_INTERFACE,
-        MAX_BUFFER_SIZE, SHUT_WR,
-    }, task::current_task, utils::{
-        error::{GeneralRet, SyscallErr, SyscallRet},
-        random::RNG,
-    }
-};
-use alloc::{ sync::Arc, vec};
-use core::time::Duration;
-use log::info;
-use smoltcp::{
-    iface::SocketHandle,
-    socket::{self, tcp},
-    wire::{IpEndpoint, IpListenEndpoint},
-};
+//! 每个 TCP 端点独立拥有核心、输入和期限；表与退休拥有覆盖回调的完整寿命。
 
-use crate::mm::UserBuffer;
-use crate::fs::Stat;
-use crate::fs::DiskInodeType;
-use alloc::sync::Weak;
-use crate::fs::directory_tree::DirectoryTreeNode;
+use alloc::collections::VecDeque;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use alloc::string::String;
-use crate::fs::dirent::Dirent;
-use crate::fs::SeekWhence;
-use crate::fs::fat32::PageCache;
+use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use smoltcp::socket::tcp::State;
+use smoltcp::wire::TcpControl;
+use spin::Once;
 
-
-
-pub const TCP_MSS_DEFAULT: u32 = 1 << 15;
-pub const TCP_MSS: u32 = if TCP_MSS_DEFAULT > MAX_BUFFER_SIZE as u32 {
-    MAX_BUFFER_SIZE as u32
-} else {
-    TCP_MSS_DEFAULT
+use crate::cpu;
+use crate::fs::FsError;
+use crate::net::address::InetEndpoint;
+use crate::net::core::{ProtocolDeadline, TcpCore};
+use crate::net::packet::OwnedPacket;
+use crate::net::table::{BindLease, TcpTuple, TransportProtocol};
+use crate::net::{
+    EndpointSlot, NetStack, NetStackRef, ENDPOINT_CAPACITY, LOOPBACK_CAPACITY, PROTOCOL_BUDGET,
 };
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
+use crate::time;
+use crate::timer::{Timer, TimerKind};
+use crate::wait::WaitQueue;
+use crate::workqueue::Work;
 
-pub struct TcpSocket {
-    inner: Mutex<TcpSocketInner>,
-    socket_handler: SocketHandle,
+/// 输入在用户持有核心时保持拥有，立即回应未接受时也留在同一节点。
+struct Input {
+    closed: bool,
+    // 真实 Work 正在尝试或等待操作拥有，释放者移交此责任；它不代表另一个 pending 票。
+    owner_waiting: bool,
+    packets: VecDeque<OwnedPacket>,
+    reply: Option<OwnedPacket>,
 }
 
-#[allow(unused)]
-struct TcpSocketInner {
-    local_endpoint: IpListenEndpoint,
-    remote_endpoint: Option<IpEndpoint>,
-    last_state: tcp::State,
-    recvbuf_size: usize,
-    sendbuf_size: usize,
-    // TODO: add more
+/// 绑定和 listener 关联只保存真实拥有，不复制 raw 协议状态。
+struct Metadata {
+    lease: Option<Arc<BindLease>>,
+    parent: Weak<TcpEndpoint>,
+    engaged: bool,
+    error: Option<FsError>,
 }
 
-impl Socket for TcpSocket {
-    fn bind(&self, addr: IpListenEndpoint) -> SyscallRet {
-        info!("[tcp::bind] bind to: {:?}", addr);
-        self.inner.lock().local_endpoint = addr;
-        Ok(0)
-    }
+/// 半连接与可接受连接共享实际 backlog 上限，只有成熟 Established 才进入 ready。
+struct Children {
+    limit: usize,
+    pending: Vec<Arc<TcpEndpoint>>,
+    ready: VecDeque<Arc<TcpEndpoint>>,
+}
 
-    fn listen(&self) -> SyscallRet {
-        let local = self.inner.lock().local_endpoint;
-        info!(
-            "[Tcp::listen] {} listening: {:?}",
-            self.socket_handler, local
-        );
-        NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-            let ret = socket.listen(local).ok().ok_or(SyscallErr::EADDRINUSE);
-            self.inner.lock().last_state = socket.state();
-            ret
-        })?;
-        Ok(0)
-    }
+/// 表强持稳定节点，节点弱指网络域和 listener；普通 Work 固定轮转 CPU。
+pub struct TcpEndpoint {
+    id: u64,
+    stack: Weak<NetStack>,
+    core: SleepMutex<TcpCore>,
+    input: SpinLock<Input>,
+    metadata: SpinLock<Metadata>,
+    children: SpinLock<Children>,
+    changed: WaitQueue,
+    work: Once<Pin<Arc<Work>>>,
+    timer: Once<Pin<Arc<Timer>>>,
+    stopped: AtomicBool,
+    _slot: EndpointSlot,
+}
 
-    fn accept(&self, sockfd: u32, addr: usize, addrlen: usize) -> crate::utils::error::SyscallRet {
-        // get old socket
-        let task = current_task().unwrap();
-        let mut fd_table = task.files.lock();
-        let mut socket_table = task.socket_table.lock();
-        let old_file = fd_table.get_ref(sockfd as usize).unwrap();
-        let old_nonblock = old_file.get_nonblock();
-        let old_cloexec = old_file.get_cloexec();
+/// 修改操作主动安排协议；只读观察只移交已经受阻的真实 Work。
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OperationMode {
+    Modify,
+    Observe,
+}
 
-        let peer_addr = self._accept(old_nonblock)?;
-        log::info!("[Socket::accept] get peer_addr: {:?}", peer_addr);
-        let local = self.loacl_endpoint();
-        log::info!("[Socket::accept] new socket try bind to : {:?}", local);
-        let new_socket = TcpSocket::new();
-        use core::convert::TryInto;
-        new_socket.bind(local.try_into().expect("cannot convert to ListenEndpoint"))?;
-        log::info!("[Socket::accept] new socket listen");
-        new_socket.listen()?;
-        address::fill_with_endpoint(peer_addr, addr, addrlen)?;
-        let new_socket = Arc::new(new_socket);
-        log::debug!("[Socket::accept] take old sock");
-        // 取出旧的
-        let old_file = fd_table.take(sockfd as usize).unwrap();
-        let old_socket: Option<Arc<dyn Socket>> =
-            socket_table.get_ref(sockfd as usize).cloned();
-        // 新的替换旧的
-        log::debug!("[Socket::accept] replace old sock to new");
-        let _ = fd_table.insert_at(
-            FileDescriptor::new(old_cloexec, old_nonblock, new_socket.clone()),
-            sockfd as usize,
-        );
-        socket_table
-            .insert(sockfd as usize, new_socket.clone());
-        // 旧的插在新的fd上
-        let fd = fd_table.insert(old_file).unwrap();
-        socket_table.insert(fd, old_socket.unwrap());
-        log::info!("[Socket::accept] insert old sock to newfd: {}", fd);
-        Ok(fd)
-    }
+/// 普通操作保护只在释放核心后安排同一个协议 Work。
+pub struct TcpOperationGuard<'a> {
+    endpoint: &'a TcpEndpoint,
+    core: Option<SleepMutexGuard<'a, TcpCore>>,
+    mode: OperationMode,
+}
 
-    fn socket_type(&self) -> super::SocketType {
-        super::SocketType::SOCK_STREAM
-    }
-
-    fn connect<'a>(&'a self, addr_buf: &'a [u8]) -> crate::utils::error::SyscallRet {
-        let remote_endpoint = address::endpoint(addr_buf)?;
-        self._connect(remote_endpoint)?;
-        loop {
-            let state = NET_INTERFACE.tcp_socket(self.socket_handler, |socket| socket.state());
-            match state {
-                tcp::State::Closed => {
-                    // close but not already connect, retry
-                    info!("[Tcp::connect] {} already closed, try again", self.socket_handler);
-                    self._connect(remote_endpoint)?;
-                }
-                tcp::State::Established => {
-                    info!("[Tcp::connect] {} connected, state {:?}", self.socket_handler, state);
-                    return Ok(0);
-                }
-                _ => {
-                    info!("[Tcp::connect] {} not connect yet, state {:?}", self.socket_handler, state);
-                }
-            }
-            suspend_current_and_run_next();
-            // thread::sleep(Duration::from_secs(1));
-        }
-    }
-    fn recv_buf_size(&self) -> usize {
-        self.inner.lock().recvbuf_size
-    }
-
-    fn send_buf_size(&self) -> usize {
-        self.inner.lock().sendbuf_size
-    }
-
-    fn set_recv_buf_size(&self, size: usize) {
-        self.inner.lock().recvbuf_size = size;
-    }
-
-    fn set_send_buf_size(&self, size: usize) {
-        self.inner.lock().sendbuf_size = size;
-    }
-
-    fn loacl_endpoint(&self) -> IpListenEndpoint {
-        self.inner.lock().local_endpoint
-    }
-
-    fn remote_endpoint(&self) -> Option<IpEndpoint> {
-        NET_INTERFACE.poll();
-        let ret = NET_INTERFACE.tcp_socket(self.socket_handler, |socket| socket.remote_endpoint());
-        NET_INTERFACE.poll();
-        ret
-    }
-
-    fn shutdown(&self, how: u32) -> GeneralRet<()> {
-        info!("[TcpSocket::shutdown] how {}", how);
-        NET_INTERFACE.tcp_socket(self.socket_handler, |socket| match how {
-            SHUT_WR => socket.close(),
-            _ => socket.abort(),
-        });
-        NET_INTERFACE.poll();
-        Ok(())
-    }
-
-    fn set_nagle_enabled(&self, enabled: bool) -> SyscallRet {
-        NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-            socket.set_nagle_enabled(enabled)
-        });
-        Ok(0)
-    }
-
-    fn set_keep_alive(&self, enabled: bool) -> SyscallRet {
-        if enabled {
-            NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-                socket.set_keep_alive(Some(Duration::from_secs(1).into()))
-            });
-        }
-        Ok(0)
+impl Deref for TcpOperationGuard<'_> {
+    type Target = TcpCore;
+    /// 借用本次真正持有的核心保护，不创建第二个协议对象。
+    fn deref(&self) -> &TcpCore {
+        self.core.as_deref().unwrap()
     }
 }
 
-impl TcpSocket {
-    pub fn new() -> Self {
-        let tx_buf = socket::tcp::SocketBuffer::new(vec![0 as u8; MAX_BUFFER_SIZE]);
-        let rx_buf = socket::tcp::SocketBuffer::new(vec![0 as u8; MAX_BUFFER_SIZE]);
-        let socket = socket::tcp::Socket::new(rx_buf, tx_buf);
-        let socket_handler = NET_INTERFACE.add_socket(socket);
-        info!("[TcpSocket::new] new {}", socket_handler);
-        NET_INTERFACE.poll();
-        Self {
-            socket_handler,
-            inner: Mutex::new(TcpSocketInner {
-                local_endpoint: IpListenEndpoint {
-                    addr: None,
-                    port: unsafe { RNG.positive_u32() as u16 },
-                },
-                remote_endpoint: None,
-                last_state: tcp::State::Closed,
-                recvbuf_size: MAX_BUFFER_SIZE,
-                sendbuf_size: MAX_BUFFER_SIZE,
-            }),
-        }
-    }
-
-    fn _connect(&self, remote_endpoint: IpEndpoint) -> GeneralRet<()> {
-        self.inner.lock().remote_endpoint = Some(remote_endpoint);
-        let local = self.inner.lock().local_endpoint;
-        info!(
-            "[Tcp::connect] local: {:?}, remote: {:?}",
-            local, remote_endpoint
-        );
-        NET_INTERFACE.inner_handler(|inner| {
-            let socket = inner.sockets.get_mut::<tcp::Socket>(self.socket_handler);
-            let ret = socket.connect(inner.iface.context(), remote_endpoint, local);
-            if ret.is_err() {
-                log::info!("[Tcp::connect] {} connect error occur", self.socket_handler);
-                match ret.err().unwrap() {
-                    tcp::ConnectError::Unaddressable => return Err(SyscallErr::EINVAL),
-                    tcp::ConnectError::InvalidState => return Err(SyscallErr::EISCONN),
-                }
-            }
-            info!("berfore poll socket state: {}", socket.state());
-            Ok(())
-        })?;
-        Ok(())
-    }
-    fn _accept(&self, nonblock: bool) -> GeneralRet<IpEndpoint> {
-        loop {
-            NET_INTERFACE.poll();
-            let ret = NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-                if !socket.is_open() {
-                    log::info!("[TcpAcceptFuture::poll] this socket is not open");
-                    return Err(SyscallErr::EINVAL);
-                }
-                if socket.state() == tcp::State::SynReceived
-                    || socket.state() == tcp::State::Established
-                {
-                    self.inner.lock().last_state = socket.state();
-                    log::info!("[TcpAcceptFuture::poll] state become {:?}", socket.state());
-                    return Ok(socket.remote_endpoint().unwrap());
-                }
-                // log::info!(
-                //     "[TcpAcceptFuture::poll] not syn yet, state {:?}",
-                //     socket.state()
-                // );
-                if nonblock {
-                    log::info!("[TcpAcceptFuture::poll] flags set nonblock");
-                    return Err(SyscallErr::EAGAIN);
-                }
-                // 使用 continue 跳过当前循环并开始下一次迭代
-                return Err(SyscallErr::EAGAIN);
-            });
-            NET_INTERFACE.poll();
-            match ret {
-                Ok(endpoint) => return GeneralRet::Ok(endpoint),
-                Err(SyscallErr::EAGAIN) => {
-                    suspend_current_and_run_next();
-                    // 如果返回 EAGAIN 错误，继续循环
-                    continue;
-                }
-                Err(err) => return GeneralRet::Err(err),
-            }
-        }
+impl DerefMut for TcpOperationGuard<'_> {
+    /// 可变借用仅在本连接 SleepMutex 的操作拥有期间存在。
+    fn deref_mut(&mut self) -> &mut TcpCore {
+        self.core.as_deref_mut().unwrap()
     }
 }
-use crate::task::suspend_current_and_run_next;
-impl Drop for TcpSocket {
+
+impl Drop for TcpOperationGuard<'_> {
+    /// 先释放核心，再以输入短锁领取真实受阻事实，封住失锁登记和拥有释放之间的窗口。
     fn drop(&mut self) {
-        info!(
-            "[TcpSocket::drop] drop socket {}, localep {:?}",
-            self.socket_handler,
-            self.inner.lock().local_endpoint
-        );
-        NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-            info!("[TcpSocket::drop] before state is {:?}", socket.state());
-            if socket.is_open() {
-                socket.close();
-            }
-            info!("[TcpSocket::drop] after state is {:?}", socket.state());
-        });
-        NET_INTERFACE.poll();
-        NET_INTERFACE.remove(self.socket_handler);
-        NET_INTERFACE.poll();
+        drop(self.core.take());
+        let owner_waiting = {
+            let mut input = self.endpoint.input.lock();
+            core::mem::take(&mut input.owner_waiting)
+        };
+        if self.mode == OperationMode::Modify || owner_waiting {
+            self.endpoint.schedule();
+        }
     }
 }
 
-impl File for TcpSocket {
-    fn deep_clone(&self) -> Arc<dyn File>{
-        todo!();
+impl TcpEndpoint {
+    /// 根取得额度和核心后准备所有异步节点；未发表失败对象从未产生回调票。
+    pub(crate) fn try_new(
+        net: &NetStackRef,
+        id: u64,
+        core: TcpCore,
+        slot: EndpointSlot,
+    ) -> Result<Arc<Self>, FsError> {
+        let mut packets = VecDeque::new();
+        packets
+            .try_reserve_exact(LOOPBACK_CAPACITY)
+            .map_err(|_| FsError::NoMemory)?;
+        let endpoint = Arc::try_new(Self {
+            id,
+            stack: Arc::downgrade(net),
+            core: SleepMutex::new(core),
+            input: SpinLock::new(Input {
+                closed: false,
+                owner_waiting: false,
+                packets,
+                reply: None,
+            }),
+            metadata: SpinLock::new(Metadata {
+                lease: None,
+                parent: Weak::new(),
+                engaged: false,
+                error: None,
+            }),
+            children: SpinLock::new(Children {
+                limit: 0,
+                pending: Vec::new(),
+                ready: VecDeque::new(),
+            }),
+            changed: WaitQueue::new(),
+            work: Once::new(),
+            timer: Once::new(),
+            stopped: AtomicBool::new(false),
+            _slot: slot,
+        })
+        .map_err(|_| FsError::NoMemory)?;
+        let cpu = ((id - 1) % cpu::count() as u64) as usize;
+        let context = Arc::as_ptr(&endpoint) as usize;
+        let work = Work::try_new(net.work_queue(), cpu, run_tcp, context)
+            .map_err(|_| FsError::NoMemory)?;
+        let timer = Timer::try_new(cpu, TimerKind::Precise, tcp_expired, context)
+            .map_err(|_| FsError::NoMemory)?;
+        endpoint.work.call_once(|| work);
+        endpoint.timer.call_once(|| timer);
+        Ok(endpoint)
     }
-    fn readable(&self) -> bool{
-        true
+
+    /// 返回本域不复用的身份，描述符编号不进入协议索引。
+    pub fn id(&self) -> u64 {
+        self.id
     }
-    fn writable(&self) -> bool{
-        true
+
+    /// 返回普通 Work 和精确 Timer 共同固定的执行 CPU。
+    pub fn work_cpu(&self) -> usize {
+        self.work.get().unwrap().cpu()
     }
-    fn read(&self, _offset: Option<&mut usize>, buf: &mut [u8]) -> usize{
-        let ret = self._read(buf).unwrap();
-        ret
+
+    /// 只比较弱域与真实 Arc 的身份，不延长域的服务寿命。
+    pub fn belongs_to(&self, net: &NetStackRef) -> bool {
+        self.stack.as_ptr() == Arc::as_ptr(net)
     }
-    fn write(&self, _offset: Option<&mut usize>, buf: &[u8]) -> usize{
-        NET_INTERFACE.poll();
-        let ret = NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-            if !socket.may_send() {
-                log::info!("[TcpSendFuture::poll] err when send");
-                return SyscallErr::ENOTCONN as usize;
+
+    /// 普通任务取得本连接拥有，结束后由 guard 安排积存输入和发送责任。
+    pub fn lock(&self) -> TcpOperationGuard<'_> {
+        TcpOperationGuard {
+            endpoint: self,
+            core: Some(self.core.lock()),
+            mode: OperationMode::Modify,
+        }
+    }
+
+    /// 不等待另一操作拥有者，失败也不消耗输入或安排重复后台票。
+    pub fn try_lock(&self) -> Option<TcpOperationGuard<'_>> {
+        self.core.try_lock().map(|core| TcpOperationGuard {
+            endpoint: self,
+            core: Some(core),
+            mode: OperationMode::Modify,
+        })
+    }
+
+    /// 只观察成熟状态；释放时仅移交已经因本操作拥有受阻的真实 Work，不主动开始协议进度。
+    pub fn state(&self) -> State {
+        self.observe().state()
+    }
+
+    /// 普通只读访问也参与操作拥有交接，未有真实 Work 受阻时不安排后台票。
+    fn observe(&self) -> TcpOperationGuard<'_> {
+        TcpOperationGuard {
+            endpoint: self,
+            core: Some(self.core.lock()),
+            mode: OperationMode::Observe,
+        }
+    }
+
+    /// 取得仍存在的网络域，停止后的操作不得再发表新索引。
+    fn net(&self) -> Result<NetStackRef, FsError> {
+        self.stack.upgrade().ok_or(FsError::NotConnected)
+    }
+
+    /// 源地址校验与真正端口预留在控制发表阶段完成，通配值保持原样。
+    pub fn bind(self: &Arc<Self>, local: InetEndpoint) -> Result<InetEndpoint, FsError> {
+        let core = self.lock();
+        if core.state() != State::Closed || self.metadata.lock().engaged {
+            return Err(FsError::InvalidOperation);
+        }
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        if self.metadata.lock().lease.is_some() {
+            return Err(FsError::InvalidOperation);
+        }
+        let lease = net
+            .tables()
+            .reserve_binding(&net, self.id, TransportProtocol::Tcp, local)?;
+        let local = lease.local();
+        self.metadata.lock().lease = Some(lease);
+        Ok(local)
+    }
+
+    /// listener 始终保 Listen；队列在表发表前 fallible 准备，半连接也占 backlog。
+    pub fn listen(self: &Arc<Self>, backlog: usize) -> Result<(), FsError> {
+        if backlog == 0 || ENDPOINT_CAPACITY < backlog {
+            return Err(FsError::InvalidOperation);
+        }
+        let mut core = self.lock();
+        if core.state() != State::Closed || self.metadata.lock().engaged {
+            return Err(FsError::InvalidOperation);
+        }
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(backlog)
+            .map_err(|_| FsError::NoMemory)?;
+        let mut ready = VecDeque::new();
+        ready
+            .try_reserve_exact(backlog)
+            .map_err(|_| FsError::NoMemory)?;
+        let net = self.net()?;
+        let _admission = net.admission()?;
+        let lease = self.binding_or_ephemeral(&net)?;
+        core.listen(lease.local())?;
+        if let Err(error) = net.tables().publish_listener(self.id, lease.local()) {
+            core.close();
+            return Err(error);
+        }
+        *self.children.lock() = Children {
+            limit: backlog,
+            pending,
+            ready,
+        };
+        self.metadata.lock().engaged = true;
+        Ok(())
+    }
+
+    /// 路由选择实际源，租约仍保通配；明确四元组先发表再允许握手 Work。
+    pub fn connect(self: &Arc<Self>, peer: InetEndpoint) -> Result<(), FsError> {
+        let mut core = self.lock();
+        if core.state() != State::Closed || self.metadata.lock().engaged {
+            return Err(FsError::InvalidOperation);
+        }
+        let net = self.net()?;
+        let admission = net.admission()?;
+        let lease = self.binding_or_ephemeral(&net)?;
+        let route = net.routes().resolve(peer.address, lease.local().address)?;
+        let local = InetEndpoint {
+            address: route.source,
+            port: lease.local().port,
+        };
+        core.connect(local, peer, time::now())?;
+        if let Err(error) = net
+            .tables()
+            .publish_tcp_tuple(self.id, TcpTuple { local, peer })
+        {
+            core.abort();
+            self.metadata.lock().error = Some(error);
+            self.metadata.lock().engaged = true;
+            drop(admission);
+            drop(core);
+            net.retire_tcp(self.id);
+            return Err(error);
+        }
+        self.metadata.lock().engaged = true;
+        drop(admission);
+        drop(core);
+        Ok(())
+    }
+
+    /// 调用者持本核心及控制准入，首次自动绑定预留真正的临时端口。
+    fn binding_or_ephemeral(&self, net: &NetStackRef) -> Result<Arc<BindLease>, FsError> {
+        if let Some(lease) = self.metadata.lock().lease.as_ref().cloned() {
+            return Ok(lease);
+        }
+        let lease = net.tables().reserve_binding(
+            net,
+            self.id,
+            TransportProtocol::Tcp,
+            InetEndpoint {
+                address: [0; 4],
+                port: 0,
+            },
+        )?;
+        self.metadata.lock().lease = Some(lease.clone());
+        Ok(lease)
+    }
+
+    /// 只领取已完成握手的真实 child，不替换 listener 或提前创建用户描述符。
+    pub fn accept(&self) -> Result<Option<Arc<TcpEndpoint>>, FsError> {
+        let core = self.observe();
+        if core.state() != State::Listen {
+            return Err(FsError::InvalidOperation);
+        }
+        let child = self.children.lock().ready.pop_front();
+        Ok(child)
+    }
+
+    /// 最后打开对象只请求正常关闭，FIN 和 TIME_WAIT 继续由原 Work/Timer 推进。
+    pub fn close(&self) {
+        let mut core = self.lock();
+        core.close();
+        self.metadata.lock().engaged = true;
+    }
+
+    /// 未交给打开对象的节点终止协议，仍保留真实待发 RST 的 dispatch 责任。
+    pub fn abandon(&self) {
+        let mut core = self.lock();
+        core.abort();
+        self.metadata.lock().engaged = true;
+    }
+
+    /// 输入接收不等待用户核心，只在预留队列发表完整拥有，然后安排同 Work。
+    pub(crate) fn enqueue(&self, packet: OwnedPacket) -> Result<(), FsError> {
+        {
+            let mut input = self.input.lock();
+            if input.closed {
+                return Err(FsError::NotConnected);
             }
-            if !socket.can_send() {
-                log::info!("[TcpSendFuture::poll] cannot send yet");
-                suspend_current_and_run_next();
-                return SyscallErr::EAGAIN as usize;
+            if input.packets.len() == LOOPBACK_CAPACITY {
+                return Err(FsError::WouldBlock);
             }
-            log::info!("[TcpSendFuture::poll] start to send...");
-            info!(
-                "[TcpSendFuture::poll] {:?} -> {:?}",
-                socket.local_endpoint(),
-                socket.remote_endpoint()
+            input.packets.push_back(packet);
+        }
+        self.schedule();
+        Ok(())
+    }
+
+    /// 原 Work 的 pending 协议负责合并；停止时拒绝新增票，不维护第二 scheduled 位。
+    pub(crate) fn schedule(&self) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(net) = self.stack.upgrade() else {
+            return;
+        };
+        if net.is_stopping() {
+            return;
+        }
+        let _ = self.work.get().unwrap().as_ref().queue();
+    }
+
+    /// 先登记真实拥有责任，释放输入锁再尝试核心；成功后清登记，失败由操作拥有者释放时交接。
+    fn run(&self) {
+        let Some(net) = self.stack.upgrade() else {
+            return;
+        };
+        if net.is_stopping() || self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        self.input.lock().owner_waiting = true;
+        let Some(mut core) = self.core.try_lock() else {
+            return;
+        };
+        self.input.lock().owner_waiting = false;
+        let mut notification = None;
+        let result = self.advance(&net, &mut core, &mut notification);
+        if let Err(error) = result {
+            if error == FsError::WouldBlock {
+                self.timer.get().unwrap().as_ref().cancel_pending();
+                drop(core);
+                if let Some(parent) = notification {
+                    parent.changed.wake_all();
+                }
+                net.wait_egress(self.id);
+                return;
+            }
+            self.metadata.lock().error = Some(error);
+            core.abort();
+            crate::klog!(
+                crate::klog::Level::Debug,
+                "TCP endpoint {} failed: {:?}",
+                self.id,
+                error
             );
-            match socket.send_slice(buf) {
-                Ok(nbytes) => {
-                    info!("[TcpSendFuture::poll] send {} bytes", nbytes);
-                    return nbytes;
-                }
-                Err(_) => SyscallErr::ENOTCONN as usize,
+            drop(core);
+            if let Some(parent) = notification {
+                parent.changed.wake_all();
             }
-        });
-        NET_INTERFACE.poll();
-        ret
+            net.retire_tcp(self.id);
+            return;
+        }
+        let deadline = core.deadline(time::now());
+        let ended = core.state() == State::Closed
+            && deadline == ProtocolDeadline::Ingress
+            && self.metadata.lock().engaged;
+        let queued = !self.input.lock().packets.is_empty();
+        drop(core);
+        if let Some(parent) = notification {
+            parent.changed.wake_all();
+        }
+        if ended {
+            net.retire_tcp(self.id);
+            return;
+        }
+        if net.is_stopping() {
+            return;
+        }
+        match deadline {
+            ProtocolDeadline::At(at) => {
+                let _ = self.timer.get().unwrap().as_ref().arm(at);
+            }
+            ProtocolDeadline::Now => {
+                self.timer.get().unwrap().as_ref().cancel_pending();
+                self.schedule();
+            }
+            ProtocolDeadline::Ingress => {
+                self.timer.get().unwrap().as_ref().cancel_pending();
+            }
+        }
+        if queued {
+            self.schedule();
+        }
     }
-    fn r_ready(&self) -> bool{true}
-    fn w_ready(&self) -> bool{true}
-    fn read_user(&self, _offset: Option<usize>, buf: UserBuffer) -> usize{
-        let mut buffers = buf.buffers;
-        let buf = unsafe { core::slice::from_raw_parts_mut(buffers[0].as_mut_ptr() as *mut u8, buf.len as usize) };
-        let ret = self._read(buf).unwrap();
-        ret
-    }
-    fn write_user(&self, _offset: Option<usize>, buf: UserBuffer) -> usize{
-        let mut buffers = buf.buffers;
-        let buf = unsafe { core::slice::from_raw_parts_mut(buffers[0].as_mut_ptr() as *mut u8, buf.len as usize) };
-        self.write(None, buf)
-    }
-    fn get_size(&self) -> usize{todo!();}
-    fn get_stat(&self) -> Stat{todo!();}
-    fn get_file_type(&self) -> DiskInodeType{todo!();}
-    fn is_dir(&self) -> bool {todo!();}
-    fn is_file(&self) -> bool {todo!();}
-    fn info_dirtree_node(&self, _dirnode_ptr: Weak<DirectoryTreeNode>){todo!();}
-    fn get_dirtree_node(&self) -> Option<Arc<DirectoryTreeNode>>{todo!();}
-    /// open
-    fn open(&self, _flags: OpenFlags, _special_use: bool) -> Arc<dyn File>{todo!();}
-    fn open_subfile(&self) -> Result<Vec<(String, Arc<dyn File>)>, isize>{todo!();}
-    /// create
-    fn create(&self, _name: &str, _file_type: DiskInodeType) -> Result<Arc<dyn File>, isize>{todo!();}
-    fn link_child(&self, _name: &str, _child: &Self) -> Result<(), isize>{todo!();}
-    /// delete(unlink)
-    fn unlink(&self, _delete: bool) -> Result<(), isize>{todo!();}
-    /// dirent
-    fn get_dirent(&self, _count: usize) -> Vec<Dirent>{todo!();}
-    /// offset
-    fn get_offset(&self) -> usize {todo!();}
-    fn lseek(&self, _offset: isize, _whence: SeekWhence) -> Result<usize, isize>{todo!();}
-    /// size
-    fn modify_size(&self, _diff: isize) -> Result<(), isize>{todo!();}
-    fn truncate_size(&self, _new_size: usize) -> Result<(), isize>{todo!();}
-    // time
-    fn set_timestamp(&self, _ctime: Option<usize>, _atime: Option<usize>, _mtime: Option<usize>){todo!();}
-    /// cache
-    fn get_single_cache(&self, _offset: usize) -> Result<Arc<Mutex<PageCache>>, ()>{todo!();}
-    fn get_all_caches(&self) -> Result<Vec<Arc<Mutex<PageCache>>>, ()>{todo!();}
-    /// memory related
-    fn oom(&self) -> usize{todo!();}
-    /// poll, select related
-    fn hang_up(&self) -> bool{todo!();}
-    /// iotcl
-    fn ioctl(&self, _cmd: u32, _argp: usize) -> isize {todo!();}
-    /// fcntl
-    fn fcntl(&self, _cmd: u32, _arg: u32) -> isize{todo!();}
 
-    
-}
-
-impl TcpSocket {
-    fn _read<'a>(&'a self, buf: &'a mut [u8]) -> GeneralRet<usize> {
-        loop {
-            NET_INTERFACE.poll();
-            let ret = NET_INTERFACE.tcp_socket(self.socket_handler, |socket| {
-                if socket.state() == tcp::State::CloseWait || 
-                socket.state() == tcp::State::TimeWait || socket.state() == tcp::State::FinWait2{
-                    log::info!("[TcpRecvFuture::poll] state become {:?}", socket.state());
-                    return Ok(0);
-                }
-                if !socket.may_recv() {
-                    log::info!(
-                        "[TcpRecvFuture::poll] err when recv, state {:?}",
-                        socket.state()
+    /// 每轮先交付旧应答，再处理有限输入；未接受应答禁止继续消费 backlog。
+    fn advance(
+        &self,
+        net: &NetStackRef,
+        core: &mut TcpCore,
+        notification: &mut Option<Arc<TcpEndpoint>>,
+    ) -> Result<(), FsError> {
+        self.emit_reply(net)?;
+        let mut remaining = PROTOCOL_BUDGET;
+        while 0 < remaining {
+            let packet = self.input.lock().packets.pop_front();
+            let Some(packet) = packet else {
+                break;
+            };
+            remaining -= 1;
+            if core.state() == State::Listen && self.children.lock().limit != 0 {
+                if let Err(error) = self.receive_syn(net, core, packet) {
+                    crate::klog!(
+                        crate::klog::Level::Debug,
+                        "TCP listener {} child preparation failed: {:?}",
+                        self.id,
+                        error
                     );
-                    return Err(SyscallErr::ENOTCONN);
                 }
-                log::info!("[TcpRecvFuture::poll] state {:?}", socket.state());
-                if !socket.can_recv() {
-                    // panic!();
-                    log::info!("[TcpRecvFuture::poll] cannot recv yet");
-                    return Err(SyscallErr::EAGAIN);
-                }
-                log::info!("[TcpRecvFuture::poll] start to recv...");
-                info!(
-                    "[TcpRecvFuture::poll] {:?} <- {:?}",
-                    socket.local_endpoint(),
-                    socket.remote_endpoint()
-                );
-                match socket.recv_slice(buf) {
-                    Ok(nbytes) => {
-                        info!("[TcpRecvFuture::poll] recv {} bytes", nbytes);
-                        Ok(nbytes)
+            } else if core.state() != State::Closed {
+                let previous = core.state();
+                let reply = core.process(&packet, time::now())?;
+                if previous != State::Established {
+                    if let Some(parent) = self.report_established(core.state()) {
+                        *notification = Some(parent);
                     }
-                    Err(_) => return Err(SyscallErr::ENOTCONN),
                 }
-            });
-            NET_INTERFACE.poll();
-            match ret {
-                Ok(result) => return GeneralRet::Ok(result),
-                Err(SyscallErr::EAGAIN) => {
-                    suspend_current_and_run_next();
-                    // 如果返回 EAGAIN 错误，继续循环
-                    continue;
+                if let Some(reply) = reply {
+                    self.input.lock().reply = Some(reply);
+                    self.emit_reply(net)?;
                 }
-                Err(err) => return GeneralRet::Err(err),
+            }
+        }
+        while 0 < remaining {
+            remaining -= 1;
+            core.dispatch(time::now(), |packet| net.send_ipv4(packet))?;
+            if core.deadline(time::now()) != ProtocolDeadline::Now {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// try_emit 的失败完整包重新成为 pending，成功才结束立即应答责任。
+    fn emit_reply(&self, net: &NetStackRef) -> Result<(), FsError> {
+        let reply = self.input.lock().reply.take();
+        let Some(reply) = reply else {
+            return Ok(());
+        };
+        match net.try_emit(reply) {
+            Ok(()) => Ok(()),
+            Err((error, reply)) => {
+                self.input.lock().reply = Some(reply);
+                Err(error)
             }
         }
     }
+
+    /// listener 核心只提供配置；child 先准备和发表，再由自己的 Work 处理原 SYN。
+    fn receive_syn(
+        &self,
+        net: &NetStackRef,
+        core: &TcpCore,
+        packet: OwnedPacket,
+    ) -> Result<(), FsError> {
+        let (_, repr) = packet.tcp()?;
+        if repr.control != TcpControl::Syn {
+            return Ok(());
+        }
+        let (peer, local) = packet.tcp_endpoints()?;
+        let tuple = TcpTuple { local, peer };
+        let admission = net.admission()?;
+        if let Some(child) = net.tables().lookup_tcp(tuple) {
+            drop(admission);
+            return child.enqueue(packet);
+        }
+        {
+            let children = self.children.lock();
+            if children.limit <= children.pending.len() + children.ready.len() {
+                return Ok(());
+            }
+        }
+        let lease = self
+            .metadata
+            .lock()
+            .lease
+            .as_ref()
+            .cloned()
+            .expect("listener has no binding");
+        let slot = net.claim_endpoint_slot()?;
+        let id = net.allocate_identity();
+        let mut child_core = net.new_core(id, core.receive_capacity(), core.send_capacity())?;
+        child_core.listen(local)?;
+        let child = Self::try_new(net, id, child_core, slot)?;
+        let listener = net
+            .tables()
+            .tcp_by_id(self.id)
+            .expect("listener lost table ownership");
+        {
+            let mut metadata = child.metadata.lock();
+            metadata.lease = Some(lease);
+            metadata.parent = Arc::downgrade(&listener);
+            metadata.engaged = true;
+        }
+        net.tables().insert_tcp(child.clone())?;
+        if let Err(error) = net.tables().publish_tcp_tuple(id, tuple) {
+            let unpublished = net.tables().take_tcp(id);
+            drop(admission);
+            drop(unpublished);
+            return Err(error);
+        }
+        self.children.lock().pending.push(child.clone());
+        drop(admission);
+        child.enqueue(packet)
+    }
+
+    /// child 真正 Established 后转移同一 pending Arc，返回锁外通知所需的真实 parent 拥有。
+    fn report_established(&self, state: State) -> Option<Arc<TcpEndpoint>> {
+        if state != State::Established {
+            return None;
+        }
+        let parent = self.metadata.lock().parent.upgrade()?;
+        let ready = {
+            let mut children = parent.children.lock();
+            if let Some(index) = children
+                .pending
+                .iter()
+                .position(|child| child.id == self.id)
+            {
+                let child = children.pending.swap_remove(index);
+                children.ready.push_back(child);
+                true
+            } else {
+                false
+            }
+        };
+        if ready {
+            Some(parent)
+        } else {
+            None
+        }
+    }
+
+    /// 退休者或根拥有局部 Arc 后才能调用，先停 Timer 再等 Work，不持核心或短锁等待。
+    pub(crate) fn stop_sync(&self) {
+        assert!(
+            !self.stopped.swap(true, Ordering::AcqRel),
+            "TCP endpoint stopped twice"
+        );
+        self.input.lock().closed = true;
+        self.timer.get().unwrap().as_ref().close_sync();
+        self.work.get().unwrap().as_ref().close_sync();
+        self.core.lock().abort();
+        let (packets, reply) = {
+            let mut input = self.input.lock();
+            (core::mem::take(&mut input.packets), input.reply.take())
+        };
+        let (lease, parent) = {
+            let mut metadata = self.metadata.lock();
+            (metadata.lease.take(), core::mem::take(&mut metadata.parent))
+        };
+        let children = {
+            let mut children = self.children.lock();
+            children.limit = 0;
+            (
+                core::mem::take(&mut children.pending),
+                core::mem::take(&mut children.ready),
+            )
+        };
+        for child in children.0.into_iter().chain(children.1) {
+            child.abandon();
+        }
+        if let Some(parent) = parent.upgrade() {
+            parent.remove_child(self.id);
+        }
+        drop((packets, reply, lease));
+        self.changed.wake_all();
+    }
+
+    /// 已结束的 child 从 listener 队列撤下，最后 Arc 析构在锁外发生。
+    fn remove_child(&self, id: u64) {
+        let removed = {
+            let mut children = self.children.lock();
+            if let Some(index) = children.pending.iter().position(|child| child.id == id) {
+                Some(children.pending.swap_remove(index))
+            } else if let Some(index) = children.ready.iter().position(|child| child.id == id) {
+                children.ready.remove(index)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+}
+
+/// 表、退休队列或停止者的局部 Arc 保活节点，Work 本身不猜测业务 Arc 控制块。
+fn run_tcp(work: Pin<&Work>) {
+    // SAFETY: context 来自构造期稳定 Arc；发表后真实表/退休/停止局部拥有一直覆盖 Work 全尾。
+    let endpoint = unsafe { &*(work.context() as *const TcpEndpoint) };
+    endpoint.run();
+}
+
+/// 硬中断只安排同一个普通 Work，不取得 SleepMutex 或运行协议。
+fn tcp_expired(timer: Pin<&Timer>) {
+    // SAFETY: Timer context 来自稳定节点 Arc；退休与根停止均先等本 Timer 全尾再释放节点。
+    let endpoint = unsafe { &*(timer.context() as *const TcpEndpoint) };
+    endpoint.schedule();
 }

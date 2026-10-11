@@ -136,6 +136,6 @@ pub fn write(level: Level, arguments: fmt::Arguments<'_>) -> u64 {
 #[macro_export]
 macro_rules! klog {
     ($level:expr, $($argument:tt)*) => {
-        $crate::klog::write($level, core::format_args!($($argument)*))
+        $crate::klog::write($level, ::core::format_args!($($argument)*))
     };
 }

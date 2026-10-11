@@ -251,7 +251,7 @@ fn init() -> i32 {
     }
 }
 
-/// 普通系统共享一个网络域给磁盘 PID1，用户和文件系统退休后才释放系统拥有。
+/// 普通系统共享一个网络域给磁盘 PID1，用户全部退出后先结束网络责任再同步文件系统。
 #[cfg(not(feature = "ktest"))]
 fn init_filesystems(
     storage: &storage::Storage,
@@ -290,7 +290,8 @@ fn init_filesystems(
         selected.extra,
         selected.root_mode
     );
-    let net = net::NetStack::try_new_lo()?;
+    let net_owner = net::NetStack::try_new_lo()?;
+    let net = Arc::clone(net_owner.stack());
     let graph = task::process::TaskGraph::try_new(128, task::process::RootRole::System)?;
     let arguments = task::exec::Arguments::from_kernel(
         selected.init,
@@ -342,6 +343,8 @@ fn init_filesystems(
             Err(error) => return Err(error.into()),
         }
     }
+    drop(net_owner);
+    drop(net);
     vfs.sync()?;
     drop(graph);
     drop(context);

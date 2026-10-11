@@ -6,7 +6,7 @@ use crate::fs::ktest::tty::SerialTtyOwner;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
-use crate::net::{NetStack, NetStackRef};
+use crate::net::{NetStack, NetStackOwner, NetStackRef};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
 use crate::task::process::{RootRole, TaskGraph, WaitEvent, WaitSelector};
@@ -45,6 +45,7 @@ struct ReservedDescriptor {
 
 /// 所有真实用户运行资源在首例基线前共享同一设备库存与网络域。
 struct UserSuite {
+    net_owner: Option<NetStackOwner>,
     inventory: DeviceInventory,
     net: NetStackRef,
 }
@@ -53,8 +54,25 @@ impl Fixture for UserSuite {
     /// 整组只发现一次设备并准备一次网络域，失败仍交原 suite 设置错误路径处理。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
-        let net = checked(context, NetStack::try_new_lo())?;
-        Ok(Self { inventory, net })
+        let net_owner = checked(context, NetStack::try_new_lo())?;
+        let net = Arc::clone(net_owner.stack());
+        Ok(Self {
+            net_owner: Some(net_owner),
+            inventory,
+            net,
+        })
+    }
+
+    /// 所有 case 已停止用户生产后，先完成网络回调全尾再停止原设备库存。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        drop(self.net_owner.take());
+        <DeviceInventory as Fixture>::quiesce(&mut self.inventory, context)
+    }
+
+    /// 唯一网络 owner 移出后消费原库存，失败设置与未进入 quiesce 的路径也结束真实网络。
+    fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
+        drop(self.net_owner.take());
+        <DeviceInventory as Fixture>::tear_down(self.inventory, context)
     }
 }
 
@@ -73,16 +91,16 @@ impl Fixture for UserProgramSuite {
         Ok(Self { resources, serial })
     }
 
-    /// 全部 case 的任务、OFD 与 raw 阶段结束后先恢复 Raw，再结束原库存的异步责任。
+    /// 全部 case 的任务、OFD 与 raw 阶段结束后先恢复 Raw，再停止共同网络与原设备责任。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()?;
-        <DeviceInventory as Fixture>::quiesce(&mut self.resources.inventory, context)
+        <UserSuite as Fixture>::quiesce(&mut self.resources, context)
     }
 
-    /// 串口已停止后消费原库存，不重新发现设备或销毁常驻 TTY 服务。
+    /// 串口已停止后消费共同网络与原库存，不重新发现设备或销毁常驻 TTY 服务。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()?;
-        <DeviceInventory as Fixture>::tear_down(self.resources.inventory, context)
+        <UserSuite as Fixture>::tear_down(self.resources, context)
     }
 }
 

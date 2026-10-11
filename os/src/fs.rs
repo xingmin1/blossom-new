@@ -74,7 +74,9 @@ pub enum FsError {
     NoProcess,
     DeviceIo,
     AddressFamilyNotSupported,
+    AddressInUse,
     AddressNotAvailable,
+    NetworkUnreachable,
     NotConnected,
     MessageTooLarge,
     NotSocket,
@@ -111,7 +113,9 @@ impl FsError {
             | Self::NoProcess
             | Self::DeviceIo
             | Self::AddressFamilyNotSupported
+            | Self::AddressInUse
             | Self::AddressNotAvailable
+            | Self::NetworkUnreachable
             | Self::NotConnected
             | Self::MessageTooLarge
             | Self::NotSocket

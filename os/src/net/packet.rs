@@ -2,7 +2,11 @@
 
 use alloc::vec::Vec;
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{IpAddress, IpProtocol, IpRepr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr};
+use smoltcp::socket::tcp::Socket as RawTcpSocket;
+use smoltcp::wire::{
+    IpAddress, IpProtocol, IpRepr, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
+    TcpRepr, UdpPacket, UdpRepr,
+};
 
 use crate::fs::FsError;
 use crate::net::address::InetEndpoint;
@@ -17,8 +21,14 @@ impl OwnedPacket {
     /// 验证输入后复制真正的 IPv4 长度；介质尾部 padding 不进入软件包。
     pub fn try_from_ipv4(bytes: &[u8]) -> Result<Self, FsError> {
         let packet = checked_ipv4(bytes)?;
-        if packet.next_header() == IpProtocol::Tcp {
-            parse_tcp(&packet)?;
+        match packet.next_header() {
+            IpProtocol::Tcp => {
+                parse_tcp(&packet)?;
+            }
+            IpProtocol::Udp => {
+                parse_udp(&packet)?;
+            }
+            _ => {}
         }
         let length = packet.total_len() as usize;
         let mut owned = Vec::new();
@@ -58,6 +68,96 @@ impl OwnedPacket {
             &checksums,
         );
         Ok(Self { bytes })
+    }
+
+    /// 一次编码完整 IPv4/UDP 报文，超过路径 MTU 时不发送应用数据前缀。
+    pub fn try_from_udp(
+        source: InetEndpoint,
+        destination: InetEndpoint,
+        payload: &[u8],
+        mtu: usize,
+    ) -> Result<Self, FsError> {
+        if destination.port == 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let udp = UdpRepr {
+            src_port: source.port,
+            dst_port: destination.port,
+        };
+        let payload_len = udp
+            .header_len()
+            .checked_add(payload.len())
+            .ok_or(FsError::MessageTooLarge)?;
+        let ip = Ipv4Repr {
+            src_addr: Ipv4Address::from(source.address),
+            dst_addr: Ipv4Address::from(destination.address),
+            next_header: IpProtocol::Udp,
+            payload_len,
+            hop_limit: 64,
+        };
+        let length = ip
+            .buffer_len()
+            .checked_add(payload_len)
+            .ok_or(FsError::MessageTooLarge)?;
+        if mtu < length || (u16::MAX as usize) < length {
+            return Err(FsError::MessageTooLarge);
+        }
+        let mut bytes = zeroed_bytes(length)?;
+        let checksums = ChecksumCapabilities::default();
+        let mut packet = Ipv4Packet::new_unchecked(bytes.as_mut_slice());
+        ip.emit(&mut packet, &checksums);
+        udp.emit(
+            &mut UdpPacket::new_unchecked(packet.payload_mut()),
+            &IpAddress::Ipv4(ip.src_addr),
+            &IpAddress::Ipv4(ip.dst_addr),
+            payload.len(),
+            |target| target.copy_from_slice(payload),
+            &checksums,
+        );
+        Ok(Self { bytes })
+    }
+
+    /// 使用成熟协议的正常拒绝应答；输入 RST 不再生成 RST。
+    pub fn try_tcp_reset(&self, mtu: usize) -> Result<Option<Self>, FsError> {
+        let (ip, tcp) = self.tcp()?;
+        if tcp.control == TcpControl::Rst {
+            return Ok(None);
+        }
+        let (reply_ip, reply_tcp) = RawTcpSocket::rst_reply(&ip, &tcp);
+        Self::try_from_tcp(&reply_ip, &reply_tcp, mtu).map(Some)
+    }
+
+    /// 查询构造时验证的 IPv4 协议号，不重新解析传输校验和。
+    pub fn protocol(&self) -> IpProtocol {
+        Ipv4Packet::new_unchecked(self.bytes.as_slice()).next_header()
+    }
+
+    /// UDP 地址与端口均来自当前不可变报文，不保存另一个 source 快照。
+    pub fn udp_endpoints(&self) -> Result<(InetEndpoint, InetEndpoint), FsError> {
+        let ip = Ipv4Packet::new_unchecked(self.bytes.as_slice());
+        if ip.next_header() != IpProtocol::Udp {
+            return Err(FsError::Unsupported);
+        }
+        let udp = UdpPacket::new_unchecked(ip.payload());
+        Ok((
+            InetEndpoint {
+                address: ip.src_addr().octets(),
+                port: udp.src_port(),
+            },
+            InetEndpoint {
+                address: ip.dst_addr().octets(),
+                port: udp.dst_port(),
+            },
+        ))
+    }
+
+    /// 借用同一已验证 UDP 记录的实际 payload，零长报文返回空切片。
+    pub fn udp_payload(&self) -> Result<&[u8], FsError> {
+        let ip = Ipv4Packet::new_unchecked(self.bytes.as_slice());
+        if ip.next_header() != IpProtocol::Udp {
+            return Err(FsError::Unsupported);
+        }
+        Ok(UdpPacket::new_unchecked(ip.payload()).payload())
     }
 
     /// 借用本包的完整 IPv4 字节，借用期内拥有者不能进入另一队列或释放。
@@ -157,6 +257,23 @@ fn parse_tcp<'a>(packet: &Ipv4Packet<&'a [u8]>) -> Result<TcpRepr<'a>, FsError> 
     }
     TcpRepr::parse(
         &tcp,
+        &source,
+        &destination,
+        &ChecksumCapabilities::ignored(),
+    )
+    .map_err(|_| FsError::Corrupt)
+}
+
+/// UDP 长度先校验；IPv4 的零 checksum 表示发送者合法省略校验和。
+fn parse_udp(packet: &Ipv4Packet<&[u8]>) -> Result<UdpRepr, FsError> {
+    let udp = UdpPacket::new_checked(packet.payload()).map_err(|_| FsError::Corrupt)?;
+    let source = IpAddress::Ipv4(packet.src_addr());
+    let destination = IpAddress::Ipv4(packet.dst_addr());
+    if !udp.verify_checksum(&source, &destination) {
+        return Err(FsError::Checksum);
+    }
+    UdpRepr::parse(
+        &udp,
         &source,
         &destination,
         &ChecksumCapabilities::ignored(),

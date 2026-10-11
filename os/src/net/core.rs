@@ -224,6 +224,16 @@ impl TcpCore {
         }
     }
 
+    /// 返回 raw 接收 ring 的实际容量，listener child 用它准备同容量存储。
+    pub fn receive_capacity(&self) -> usize {
+        self.socket.recv_capacity()
+    }
+
+    /// 返回 raw 发送 ring 的实际容量，不另存一份可能失配的配置。
+    pub fn send_capacity(&self) -> usize {
+        self.socket.send_capacity()
+    }
+
     /// 返回当前可交付字节数，不能以它替代 FIN 或错误查询。
     pub fn receive_queue(&self) -> usize {
         self.socket.recv_queue()

@@ -1,52 +1,17 @@
 //! 打开对象和 TCP 协议拥有分离；本连接的睡眠互斥不限制其它核心。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::fs::{FileStat, FsError, InodeKind, InodeTime};
-use crate::net::core::TcpCore;
-use crate::net::{NetStack, NetStackRef};
-use crate::sync::{SleepMutex, SleepMutexGuard};
+use crate::net::tcp::TcpEndpoint;
+use crate::net::NetStackRef;
 
 pub const TCP_BUFFER_LEN: usize = 16 * 1024;
 const O_RDWR: u32 = 2;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u32 = 0o2000000;
-
-/// 本域稳定协议身份与独立操作互斥；弱域引用仅验证归属，不形成强拥有环。
-pub struct TcpEndpoint {
-    id: u64,
-    stack: Weak<NetStack>,
-    core: SleepMutex<TcpCore>,
-}
-
-impl TcpEndpoint {
-    /// 仅由域构造器分配身份和环境，再发表一个可被 OFD 与协议索引独立持有的 Arc。
-    pub(crate) fn try_new(net: &NetStackRef, id: u64, core: TcpCore) -> Result<Arc<Self>, FsError> {
-        Arc::try_new(Self {
-            id,
-            stack: Arc::downgrade(net),
-            core: SleepMutex::new(core),
-        })
-        .map_err(|_| FsError::NoMemory)
-    }
-
-    /// 返回本域内不复用的协议编号，不将描述符编号作为连接身份。
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// 普通可睡眠任务取得本连接处理权；调用者不得同时持有网络域或设备短锁。
-    pub fn lock(&self) -> SleepMutexGuard<'_, TcpCore> {
-        self.core.lock()
-    }
-
-    /// 尝试取得本连接处理权，未取得时不等待或改动 raw 状态。
-    pub fn try_lock(&self) -> Option<SleepMutexGuard<'_, TcpCore>> {
-        self.core.try_lock()
-    }
-}
 
 /// 打开对象持稳定协议端点、网络域和创建者凭据，并保存共享 OFD 状态位。
 /// 构造只准备打开实例，不发表用户 fd。
@@ -56,6 +21,7 @@ pub struct SocketFile {
     uid: u32,
     gid: u32,
     flags: AtomicU32,
+    opened: bool,
 }
 
 impl SocketFile {
@@ -84,13 +50,13 @@ impl SocketFile {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
-        if endpoint.stack.as_ptr() != Arc::as_ptr(&net) {
+        if !endpoint.belongs_to(&net) {
             return Err(FsError::InvalidOperation);
         }
         Self::allocate(net, endpoint, flags, uid, gid)
     }
 
-    /// 两条构造路径完成各自输入核对后，只分配真实 OFD，不再次检查已确定的域和 flags。
+    /// 分配失败撤回未交给打开实例的协议拥有，成功后才赋予末 OFD 关闭责任。
     fn allocate(
         net: NetStackRef,
         endpoint: Arc<TcpEndpoint>,
@@ -98,14 +64,26 @@ impl SocketFile {
         uid: u32,
         gid: u32,
     ) -> Result<Arc<Self>, FsError> {
-        Arc::try_new(Self {
-            endpoint,
+        let result = Arc::try_new(Self {
+            endpoint: endpoint.clone(),
             net,
             uid,
             gid,
             flags: AtomicU32::new(O_RDWR | (flags & O_NONBLOCK)),
-        })
-        .map_err(|_| FsError::NoMemory)
+            opened: false,
+        });
+        match result {
+            Ok(mut file) => {
+                Arc::get_mut(&mut file)
+                    .expect("unpublished socket file is shared")
+                    .opened = true;
+                Ok(file)
+            }
+            Err(_) => {
+                endpoint.abandon();
+                Err(FsError::NoMemory)
+            }
+        }
     }
 
     /// 借用稳定端点拥有者，协议索引可 clone 此 Arc 而不保整张文件表。
@@ -151,6 +129,15 @@ impl SocketFile {
             atime: zero,
             mtime: zero,
             ctime: zero,
+        }
+    }
+}
+
+impl Drop for SocketFile {
+    /// 末打开实例只请求协议关闭，不同步等待 peer、期限或后台 Work。
+    fn drop(&mut self) {
+        if self.opened {
+            self.endpoint.close();
         }
     }
 }

@@ -1,7 +1,10 @@
-//! 原生 TCP 核心经 owned IPv4 包驱动协议，输入和复制故障使用实际内核对象。
+//! 原生协议消费者分别使用本例同步 wire 与生产后台网络域，输入和复制故障使用实际内核对象。
 
+use ::core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ::ktest::{Fixture, TestContext, TestError, TestResult};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use smoltcp::socket::tcp::State;
 
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
@@ -9,11 +12,15 @@ use crate::ktest::execution_services::{baseline, Baseline, SuiteBaseline};
 use crate::mm::space::Mm;
 use crate::mm::user_table::PagePermissions;
 use crate::net::address::InetEndpoint;
-use crate::net::core::ProtocolDeadline;
+use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
-use crate::net::socket::TcpEndpoint;
-use crate::net::{IoProgress, NetStack, NetStackRef, LOOPBACK_CAPACITY};
-use crate::{time, timer};
+use crate::net::tcp::TcpEndpoint;
+use crate::net::udp::UdpEndpoint;
+use crate::net::{
+    IoProgress, NetStack, NetStackOwner, NetStackRef, LOOPBACK_CAPACITY, LOOPBACK_MTU,
+};
+use crate::sync::{SleepMutex, SpinLock};
+use crate::{cpu, time, timer};
 
 const CLIENT: InetEndpoint = InetEndpoint {
     address: [127, 0, 0, 1],
@@ -32,23 +39,31 @@ const RW: PagePermissions = PagePermissions {
 
 struct NetworkOwner {
     before: Baseline,
-    net: NetStackRef,
-    client: Arc<TcpEndpoint>,
-    server: Arc<TcpEndpoint>,
+    wire: SpinLock<VecDeque<OwnedPacket>>,
+    client: SleepMutex<TcpCore>,
+    server: SleepMutex<TcpCore>,
 }
 
 impl Fixture<SuiteBaseline> for NetworkOwner {
     /// 两核心、队列和随机环境均在本例基线之后准备，设置失败由局部拥有释放。
     fn set_up(context: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
         let before = baseline();
-        let net = operation(context, NetStack::try_new_lo())?;
-        let client = operation(context, net.try_new_tcp(256, 256))?;
-        let server = operation(context, net.try_new_tcp(256, 256))?;
+        let mut wire = VecDeque::new();
+        wire.try_reserve_exact(LOOPBACK_CAPACITY)
+            .map_err(|_| TestError("network core wire allocation failed"))?;
+        let client = SleepMutex::new(operation(
+            context,
+            TcpCore::try_new(256, 256, LOOPBACK_MTU, 1),
+        )?);
+        let server = SleepMutex::new(operation(
+            context,
+            TcpCore::try_new(256, 256, LOOPBACK_MTU, 2),
+        )?);
         operation(context, server.lock().listen(SERVER))?;
         operation(context, client.lock().connect(CLIENT, SERVER, time::now()))?;
         Ok(Self {
             before,
-            net,
+            wire: SpinLock::new(wire),
             client,
             server,
         })
@@ -73,18 +88,31 @@ impl Fixture<SuiteBaseline> for NetworkOwner {
 }
 
 impl NetworkOwner {
+    /// 本例 wire 只移动真实包拥有；满时向成熟 emitter 返回原容量错误。
+    fn enqueue(&self, packet: OwnedPacket) -> Result<(), FsError> {
+        let mut wire = self.wire.lock();
+        if LOOPBACK_CAPACITY <= wire.len() {
+            return Err(FsError::WouldBlock);
+        }
+        wire.push_back(packet);
+        Ok(())
+    }
+
+    /// 锁外处理包与复制，wire 不持生产网络域或其它核心处理权。
+    fn take_packet(&self) -> Option<OwnedPacket> {
+        self.wire.lock().pop_front()
+    }
+
     /// 两端编码真实包，领取后以实际输入构造重新核线性字节，再锁外选目的端处理。
     fn pump(&self, context: &TestContext<'_>) -> TestResult {
         let now = time::now();
         for endpoint in [&self.client, &self.server] {
             operation(
                 context,
-                endpoint
-                    .lock()
-                    .dispatch(now, |packet| self.net.enqueue_loopback(packet)),
+                endpoint.lock().dispatch(now, |packet| self.enqueue(packet)),
             )?;
         }
-        while let Some(packet) = self.net.take_loopback() {
+        while let Some(packet) = self.take_packet() {
             let packet = operation(context, OwnedPacket::try_from_ipv4(packet.bytes()))?;
             let (_, destination) = operation(context, packet.tcp_endpoints())?;
             let endpoint = if destination == SERVER {
@@ -96,7 +124,7 @@ impl NetworkOwner {
             };
             let reply = operation(context, endpoint.lock().process(&packet, now))?;
             if let Some(reply) = reply {
-                operation(context, self.net.enqueue_loopback(reply))?;
+                operation(context, self.enqueue(reply))?;
             }
         }
         Ok(())
@@ -129,8 +157,8 @@ impl NetworkOwner {
 /// 保留具体失败原因供 guest 原诊断消费，不将错误改成零进度或通过。
 fn operation<T>(context: &TestContext<'_>, result: Result<T, FsError>) -> Result<T, TestError> {
     result.map_err(|error| {
-        context.diagnostic(format_args!("network-core operation-error={:?}", error));
-        TestError("network core operation failed")
+        context.diagnostic(format_args!("network operation-error={:?}", error));
+        TestError("network operation failed")
     })
 }
 
@@ -141,9 +169,9 @@ fn pattern(position: usize) -> u8 {
         .wrapping_add((position / 251) as u8)
 }
 
-/// 保留原生宏实际锚点，不增加新的测试入口、feature或分派器。
-pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
-    core::__ktest_anchor()
+/// 保留两个具名套件的真实宏锚点，不增加入口或中央分派器。
+pub(super) fn anchors() -> [&'static ::ktest::SuiteSlot; 2] {
+    [core::__ktest_anchor(), stack::__ktest_anchor()]
 }
 
 #[ktest::suite(fixture = NetworkOwner, suite_resources = SuiteBaseline, context = "Thread", tags("network-core"), timeout_ms = 30000)]
@@ -245,23 +273,24 @@ pub(crate) mod core {
         fixture: &mut NetworkOwner,
     ) -> TestResult {
         for index in 0..LOOPBACK_CAPACITY {
-            let endpoint = operation(context, fixture.net.try_new_tcp(64, 64))?;
+            let mut endpoint = operation(
+                context,
+                TcpCore::try_new(64, 64, LOOPBACK_MTU, 3 + index as u64),
+            )?;
             let local = InetEndpoint {
                 address: CLIENT.address,
                 port: 36000 + index as u16,
             };
-            operation(context, endpoint.lock().connect(local, SERVER, time::now()))?;
+            operation(context, endpoint.connect(local, SERVER, time::now()))?;
             operation(
                 context,
-                endpoint
-                    .lock()
-                    .dispatch(time::now(), |packet| fixture.net.enqueue_loopback(packet)),
+                endpoint.dispatch(time::now(), |packet| fixture.enqueue(packet)),
             )?;
         }
         let mut attempted = None;
         let failure = fixture.client.lock().dispatch(time::now(), |packet| {
             attempted = Some(packet.tcp()?.1.seq_number);
-            fixture.net.enqueue_loopback(packet)
+            fixture.enqueue(packet)
         });
         context.expect_eq(failure, Err(FsError::WouldBlock));
         context.expect_eq(
@@ -270,8 +299,7 @@ pub(crate) mod core {
         );
         for _ in 0..LOOPBACK_CAPACITY {
             fixture
-                .net
-                .take_loopback()
+                .take_packet()
                 .ok_or(TestError("full queue lost an accepted packet"))?;
         }
         let mut submitted = None;
@@ -279,7 +307,7 @@ pub(crate) mod core {
             context,
             fixture.client.lock().dispatch(time::now(), |packet| {
                 submitted = Some(packet.tcp()?.1.seq_number);
-                fixture.net.enqueue_loopback(packet)
+                fixture.enqueue(packet)
             }),
         )?;
         context.expect_eq(submitted, attempted);
@@ -363,6 +391,820 @@ pub(crate) mod core {
             IoProgress::Ready(9),
         );
         context.expect_eq(&output[..9], b"nine real");
+        Ok(())
+    }
+}
+
+struct StackOwner {
+    before: Baseline,
+    owner: Option<NetStackOwner>,
+    net: NetStackRef,
+    release: Arc<AtomicBool>,
+}
+
+impl Fixture<SuiteBaseline> for StackOwner {
+    /// 每例基线之后创建独立服务 owner，设置失败仍由真实 owner 在普通任务停止。
+    fn set_up(context: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
+        let before = baseline();
+        let owner = operation(context, NetStack::try_new_lo())?;
+        let net = Arc::clone(owner.stack());
+        let release = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("network stack release allocation failed"))?;
+        Ok(Self {
+            before,
+            owner: Some(owner),
+            net,
+            release,
+        })
+    }
+
+    /// 先解除本例真实 CPU 停点，框架随后合作停止并 join 原子任务。
+    fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
+        self.release.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// 原子任务已离栈后才停止域全尾，释放所有观察拥有，再比较完整 MM 和 metadata。
+    fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
+        let before = self.before;
+        drop(self.owner.take());
+        drop(self);
+        let after = baseline();
+        context.diagnostic(format_args!(
+            "network-stack resources-before={:?} resources-after={:?}",
+            before, after
+        ));
+        context.expect_eq(after.0, before.0);
+        context.expect_eq(after.1, before.1);
+        if after != before {
+            return Err(TestError("network stack resources did not converge"));
+        }
+        Ok(())
+    }
+}
+
+/// 只观察后台已产生的事实，等待本身不处理包、不安排协议 Work。
+fn observe(mut ready: impl FnMut() -> bool, error: &'static str) -> TestResult {
+    let end = time::now()
+        .checked_add(time::Duration::from_secs(5))
+        .ok_or(TestError("network stack observation deadline overflow"))?;
+    while !ready() {
+        if end <= time::now() {
+            return Err(TestError(error));
+        }
+        timer::sleep(time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// 子任务保留真实错误诊断，不能把绑定或队列错误转换成成功退出。
+fn child_operation<T>(result: Result<T, FsError>) -> Result<T, TestError> {
+    result.map_err(|error| {
+        crate::ktest::report::diagnostic(format_args!("network-stack child-error={:?}", error));
+        TestError("network stack child operation failed")
+    })
+}
+
+/// listener 先构造并保持原对象，两个 client 的编号轮转不受动态 child 构造影响。
+fn listener(
+    context: &TestContext<'_>,
+    net: &NetStackRef,
+    port: u16,
+) -> Result<Arc<TcpEndpoint>, TestError> {
+    let endpoint = operation(context, net.try_new_tcp(256, 256))?;
+    operation(context, endpoint.bind(InetEndpoint { port, ..SERVER }))?;
+    operation(context, endpoint.listen(4))?;
+    Ok(endpoint)
+}
+
+/// 完整握手由后台进行；accept 只消费真正 ready child，失败不会伪造连接。
+fn accepted(
+    context: &mut TestContext<'_>,
+    listener: &Arc<TcpEndpoint>,
+    client: &Arc<TcpEndpoint>,
+) -> Result<Arc<TcpEndpoint>, TestError> {
+    observe(
+        || client.state() == State::Established,
+        "background loopback handshake did not finish",
+    )?;
+    let mut child = None;
+    let mut failure = None;
+    observe(
+        || {
+            match listener.accept() {
+                Ok(value) => child = value,
+                Err(error) => failure = Some(error),
+            }
+            child.is_some() || failure.is_some()
+        },
+        "background listener child did not become ready",
+    )?;
+    if let Some(error) = failure {
+        return operation(context, Err(error));
+    }
+    context.expect_eq(listener.state(), State::Listen);
+    let child = child.ok_or(TestError("listener ready child missing"))?;
+    context.expect_eq(child.state(), State::Established);
+    Ok(child)
+}
+
+#[ktest::suite(fixture = StackOwner, suite_resources = SuiteBaseline, context = "Thread", tags("network-stack"), timeout_ms = 30000)]
+pub(crate) mod stack {
+    use super::*;
+
+    /// 同域跨 Task 使用原通配绑定冲突；TCP 与 UDP 的端口拥有彼此独立。
+    #[test]
+    fn cross_task_bind_wildcard_and_protocol_spaces(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let wildcard = InetEndpoint {
+            address: [0; 4],
+            port: 45120,
+        };
+        let first = operation(context, fixture.net.try_new_tcp(128, 128))?;
+        context.expect_eq(operation(context, first.bind(wildcard))?, wildcard);
+        operation(context, first.listen(4))?;
+        let net = Arc::clone(&fixture.net);
+        let child =
+            crate::ktest::spawn_result_on((cpu::current().id + 1) % cpu::count(), move |_| {
+                let tcp = child_operation(net.try_new_tcp(128, 128))?;
+                if tcp.bind(InetEndpoint {
+                    address: SERVER.address,
+                    port: wildcard.port,
+                }) != Err(FsError::AddressInUse)
+                {
+                    return Err(TestError("cross Task wildcard bind conflict missing"));
+                }
+                let udp = child_operation(net.try_new_udp())?;
+                if child_operation(udp.bind(wildcard))? != wildcard || udp.local() != Some(wildcard)
+                {
+                    return Err(TestError("UDP wildcard or protocol space changed"));
+                }
+                Ok(0)
+            })?;
+        context.expect_eq(child.join()?, 0);
+        context.expect_eq(first.lock().listen_endpoint(), wildcard);
+        Ok(())
+    }
+
+    /// 两个固定 CPU 的原 Task 同时申请自动端口，每个协议的全部活绑定均不重复。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn concurrent_port_zero_is_unique(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let mut ports = Vec::new();
+        ports
+            .try_reserve_exact(64)
+            .map_err(|_| TestError("port observation allocation failed"))?;
+        let ports = Arc::try_new(SpinLock::new(ports))
+            .map_err(|_| TestError("port observation owner allocation failed"))?;
+        let start = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("port start allocation failed"))?;
+        let ready = Arc::try_new(AtomicUsize::new(0))
+            .map_err(|_| TestError("port readiness allocation failed"))?;
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(2)
+            .map_err(|_| TestError("port child handles allocation failed"))?;
+        for id in 0..2 {
+            let net = Arc::clone(&fixture.net);
+            let ports = Arc::clone(&ports);
+            let start = Arc::clone(&start);
+            let ready = Arc::clone(&ready);
+            handles.push(crate::ktest::spawn_result_on(id, move |token| {
+                if cpu::current().id != id {
+                    return Err(TestError(
+                        "automatic port Task did not run on its fixed CPU",
+                    ));
+                }
+                ready.fetch_add(1, Ordering::Release);
+                while !start.load(Ordering::Acquire) {
+                    if token.stop_requested() {
+                        return Ok(0);
+                    }
+                    timer::sleep(time::Duration::from_millis(1));
+                }
+                for _ in 0..16 {
+                    let tcp = child_operation(net.try_new_tcp(128, 128))?;
+                    let local = child_operation(tcp.bind(InetEndpoint {
+                        address: [0; 4],
+                        port: 0,
+                    }))?;
+                    if local.address != [0; 4] || local.port < 49152 {
+                        return Err(TestError(
+                            "automatic TCP bind changed wildcard or port range",
+                        ));
+                    }
+                    ports.lock().push((true, local.port));
+                    let udp = child_operation(net.try_new_udp())?;
+                    let local = child_operation(udp.bind(InetEndpoint {
+                        address: [0; 4],
+                        port: 0,
+                    }))?;
+                    if local.address != [0; 4] || local.port < 49152 {
+                        return Err(TestError("automatic bind changed wildcard or port range"));
+                    }
+                    ports.lock().push((false, local.port));
+                }
+                Ok(0)
+            })?);
+        }
+        observe(
+            || ready.load(Ordering::Acquire) == 2,
+            "automatic port participants did not reach start gate",
+        )?;
+        start.store(true, Ordering::Release);
+        for handle in handles {
+            context.expect_eq(handle.join()?, 0);
+        }
+        let ports = ports.lock();
+        context.expect_eq(ports.len(), 64);
+        for (index, port) in ports.iter().enumerate() {
+            if ports[..index].contains(port) {
+                return Err(TestError("concurrent automatic ports repeated"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 握手、全文、环回绕、PEEK 和 FIN 尾部仅由独立后台包处理推进。
+    #[test]
+    fn background_handshake_full_stream_peek_and_fin(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = listener(context, &fixture.net, SERVER.port)?;
+        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        operation(context, client.connect(SERVER))?;
+        let server = accepted(context, &listener, &client)?;
+        let input: [u8; 1025] = ::core::array::from_fn(pattern);
+        let mut output = [0u8; 1025];
+        let mut sent = 0;
+        let mut received = 0;
+        let end = time::now()
+            .checked_add(time::Duration::from_secs(5))
+            .unwrap();
+        while sent < input.len() || received < input.len() {
+            if sent < input.len() {
+                if let IoProgress::Ready(count) = operation(
+                    context,
+                    client.lock().send(&mut WriteBuffer::kernel(&input[sent..])),
+                )? {
+                    sent += count;
+                }
+            }
+            let mut core = server.lock();
+            if 0 < core.receive_queue() {
+                let before = core.receive_queue();
+                let mut peek = [0u8; 31];
+                let IoProgress::Ready(count) = operation(
+                    context,
+                    core.receive(&mut ReadBuffer::kernel(&mut peek), true),
+                )?
+                else {
+                    return Err(TestError("background TCP peek lost queued data"));
+                };
+                context.expect_eq(&peek[..count], &input[received..received + count]);
+                context.expect_eq(core.receive_queue(), before);
+                let IoProgress::Ready(count) = operation(
+                    context,
+                    core.receive(&mut ReadBuffer::kernel(&mut output[received..]), false),
+                )?
+                else {
+                    return Err(TestError("background TCP read lost queued data"));
+                };
+                received += count;
+            }
+            drop(core);
+            if end <= time::now() {
+                return Err(TestError("background TCP full stream deadline"));
+            }
+            timer::sleep(time::Duration::from_millis(1));
+        }
+        context.expect_eq(output, input);
+        let tail = b"background final tail";
+        context.expect_eq(
+            operation(context, client.lock().send(&mut WriteBuffer::kernel(tail)))?,
+            IoProgress::Ready(tail.len()),
+        );
+        client.close();
+        observe(
+            || server.state() == State::CloseWait,
+            "background FIN not received",
+        )?;
+        let mut bytes = [0u8; 32];
+        context.expect_eq(
+            operation(
+                context,
+                server
+                    .lock()
+                    .receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            )?,
+            IoProgress::Ready(tail.len()),
+        );
+        context.expect_eq(&bytes[..tail.len()], tail);
+        context.expect_eq(
+            operation(
+                context,
+                server
+                    .lock()
+                    .receive(&mut ReadBuffer::kernel(&mut bytes), false),
+            )?,
+            IoProgress::Eof,
+        );
+        Ok(())
+    }
+
+    /// A 真持操作 guard 时，另一个 CPU 的 B 原 Task 和后台连接仍完成全文传输。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn independent_connection_advances_while_other_is_owned(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener_a = listener(context, &fixture.net, 45210)?;
+        let listener_b = listener(context, &fixture.net, 45211)?;
+        let client_a = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        let client_b = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        context.expect_eq(
+            client_a.work_cpu(),
+            (client_a.id() as usize - 1) % cpu::count(),
+        );
+        context.expect_eq(
+            client_b.work_cpu(),
+            (client_b.id() as usize - 1) % cpu::count(),
+        );
+        if client_a.work_cpu() == client_b.work_cpu() {
+            return Err(TestError("independent clients share protocol CPU"));
+        }
+        operation(
+            context,
+            client_a.connect(InetEndpoint {
+                port: 45210,
+                ..SERVER
+            }),
+        )?;
+        operation(
+            context,
+            client_b.connect(InetEndpoint {
+                port: 45211,
+                ..SERVER
+            }),
+        )?;
+        let server_a = accepted(context, &listener_a, &client_a)?;
+        let server_b = accepted(context, &listener_b, &client_b)?;
+        let held = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("operation ownership observation allocation failed"))?;
+        let held_by_a = Arc::clone(&held);
+        let release = Arc::clone(&fixture.release);
+        let a = Arc::clone(&client_a);
+        let a_cpu = a.work_cpu();
+        let holder = crate::ktest::spawn_result_on(a_cpu, move |token| {
+            if cpu::current().id != a_cpu {
+                return Err(TestError("A operation owner ran on the wrong CPU"));
+            }
+            let owned = a.lock();
+            held_by_a.store(true, Ordering::Release);
+            let end = time::now()
+                .checked_add(time::Duration::from_secs(5))
+                .unwrap();
+            while !release.load(Ordering::Acquire) && !token.stop_requested() {
+                if end <= time::now() {
+                    return Err(TestError("A ownership release deadline"));
+                }
+                timer::sleep(time::Duration::from_millis(1));
+            }
+            if owned.state() != State::Established {
+                return Err(TestError("owned A protocol state changed"));
+            }
+            Ok(0)
+        })?;
+        observe(
+            || held.load(Ordering::Acquire),
+            "A did not acquire actual operation guard",
+        )?;
+        let b = Arc::clone(&client_b);
+        let target_cpu = b.work_cpu();
+        let child = crate::ktest::spawn_result_on(target_cpu, move |_| {
+            if cpu::current().id != target_cpu {
+                return Err(TestError(
+                    "independent client Task did not run on its fixed CPU",
+                ));
+            }
+            let input: [u8; 97] = ::core::array::from_fn(pattern);
+            if child_operation(b.lock().send(&mut WriteBuffer::kernel(&input)))?
+                != IoProgress::Ready(input.len())
+            {
+                return Err(TestError("independent B send prefix incomplete"));
+            }
+            Ok(0)
+        })?;
+        context.expect_eq(child.join()?, 0);
+        observe(
+            || server_b.lock().receive_queue() == 97,
+            "B stalled while A operation was owned",
+        )?;
+        let mut output = [0u8; 97];
+        context.expect_eq(
+            operation(
+                context,
+                server_b
+                    .lock()
+                    .receive(&mut ReadBuffer::kernel(&mut output), false),
+            )?,
+            IoProgress::Ready(97),
+        );
+        context.expect_eq(output, ::core::array::from_fn(pattern));
+        context.expect_eq(server_a.state(), State::Established);
+        fixture.release.store(true, Ordering::Release);
+        context.expect_eq(holder.join()?, 0);
+        Ok(())
+    }
+
+    /// UDP 查找经真实 lo ingress 交付同记录的源、长度和数据，空消息仍可被领取。
+    #[test]
+    fn udp_index_delivers_owned_and_zero_length_records(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let udp = operation(context, fixture.net.try_new_udp())?;
+        let destination = operation(
+            context,
+            udp.bind(InetEndpoint {
+                address: [0; 4],
+                port: 45310,
+            }),
+        )?;
+        context.expect_eq(destination.address, [0; 4]);
+        for payload in [&b"real UDP record"[..], &b""[..]] {
+            let packet = operation(
+                context,
+                OwnedPacket::try_from_udp(
+                    CLIENT,
+                    InetEndpoint {
+                        address: SERVER.address,
+                        port: destination.port,
+                    },
+                    payload,
+                    LOOPBACK_MTU,
+                ),
+            )?;
+            operation(context, fixture.net.send_ipv4(packet))?;
+            let mut record = None;
+            observe(
+                || {
+                    record = udp.take_datagram();
+                    record.is_some()
+                },
+                "UDP ingress record missing",
+            )?;
+            let record = record.ok_or(TestError("UDP observed record disappeared"))?;
+            context.expect_eq(operation(context, record.udp_endpoints())?.0, CLIENT);
+            context.expect_eq(operation(context, record.udp_payload())?, payload);
+            context.expect_eq(
+                operation(context, record.udp_payload())?.len(),
+                payload.len(),
+            );
+        }
+        context.expect_eq(udp.take_datagram().is_none(), true);
+        udp.close();
+        context.expect_eq(
+            fixture
+                .net
+                .tables()
+                .lookup_udp(InetEndpoint {
+                    port: destination.port,
+                    ..SERVER
+                })
+                .is_none(),
+            true,
+        );
+        Ok(())
+    }
+
+    /// 同一个 inbox 的 32 个完整 MTU 记录占满真实字节预算，领取后恢复；空记录同样满。
+    #[test]
+    fn udp_inbox_record_and_payload_capacity_recovers(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let udp = operation(context, fixture.net.try_new_udp())?;
+        let destination = operation(
+            context,
+            udp.bind(InetEndpoint {
+                port: 45311,
+                ..SERVER
+            }),
+        )?;
+        let payload: [u8; LOOPBACK_MTU - 28] = ::core::array::from_fn(pattern);
+        for input in [&payload[..], &b""[..]] {
+            for _ in 0..32 {
+                let packet = operation(
+                    context,
+                    OwnedPacket::try_from_udp(CLIENT, destination, input, LOOPBACK_MTU),
+                )?;
+                operation(context, udp.enqueue(packet))?;
+            }
+            let packet = operation(
+                context,
+                OwnedPacket::try_from_udp(CLIENT, destination, input, LOOPBACK_MTU),
+            )?;
+            context.expect_eq(udp.enqueue(packet), Err(FsError::WouldBlock));
+            let record = udp
+                .take_datagram()
+                .ok_or(TestError("full UDP inbox lost record"))?;
+            context.expect_eq(operation(context, record.udp_payload())?, input);
+            context.expect_eq(operation(context, record.udp_endpoints())?.0, CLIENT);
+            drop(record);
+            let packet = operation(
+                context,
+                OwnedPacket::try_from_udp(CLIENT, destination, input, LOOPBACK_MTU),
+            )?;
+            operation(context, udp.enqueue(packet))?;
+            for _ in 0..32 {
+                let record = udp
+                    .take_datagram()
+                    .ok_or(TestError("UDP inbox recovery lost record"))?;
+                context.expect_eq(operation(context, record.udp_payload())?, input);
+            }
+            context.expect_eq(udp.take_datagram().is_none(), true);
+        }
+        Ok(())
+    }
+
+    /// 真实 Closed 之后表与退休 worker 释放最后节点拥有，外部 Weak 不延长 Work/Timer 寿命。
+    #[test]
+    fn closed_connections_retire_work_timer_and_endpoint_slots(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = listener(context, &fixture.net, 45410)?;
+        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        operation(
+            context,
+            client.connect(InetEndpoint {
+                port: 45410,
+                ..SERVER
+            }),
+        )?;
+        let server = accepted(context, &listener, &client)?;
+        let client_weak = Arc::downgrade(&client);
+        let server_weak = Arc::downgrade(&server);
+        client.abandon();
+        drop(client);
+        drop(server);
+        observe(
+            || client_weak.upgrade().is_none() && server_weak.upgrade().is_none(),
+            "closed protocol nodes retained after retirement",
+        )?;
+        listener.close();
+        let listener_weak = Arc::downgrade(&listener);
+        drop(listener);
+        observe(
+            || listener_weak.upgrade().is_none(),
+            "closed listener retained after retirement",
+        )?;
+        let mut nodes: Vec<Arc<UdpEndpoint>> = Vec::new();
+        nodes
+            .try_reserve_exact(128)
+            .map_err(|_| TestError("endpoint capacity observation allocation failed"))?;
+        for _ in 0..128 {
+            nodes.push(operation(context, fixture.net.try_new_udp())?);
+        }
+        match fixture.net.try_new_udp() {
+            Err(FsError::NoMemory) => {}
+            _ => return Err(TestError("live endpoint slot capacity not enforced")),
+        }
+        for endpoint in &nodes {
+            endpoint.close();
+        }
+        drop(nodes);
+        let recovered = operation(context, fixture.net.try_new_udp())?;
+        recovered.close();
+        Ok(())
+    }
+
+    /// 固定 CPU0 的短 IRQ 停点使真实 lo 满；另一核 SYN emitter 登记等待后由容量恢复唤醒。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn full_egress_waits_for_real_capacity_and_resumes(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = listener(context, &fixture.net, 45420)?;
+        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        context.expect_eq(client.work_cpu(), 1);
+        let destination = InetEndpoint {
+            port: 45421,
+            ..SERVER
+        };
+        let mut packets = Vec::new();
+        packets
+            .try_reserve_exact(LOOPBACK_CAPACITY)
+            .map_err(|_| TestError("egress prepared packets allocation failed"))?;
+        for _ in 0..LOOPBACK_CAPACITY {
+            packets.push(operation(
+                context,
+                OwnedPacket::try_from_udp(
+                    CLIENT,
+                    destination,
+                    b"real egress capacity",
+                    LOOPBACK_MTU,
+                ),
+            )?);
+        }
+        let extra = operation(
+            context,
+            OwnedPacket::try_from_udp(
+                CLIENT,
+                destination,
+                b"unaccepted owned packet",
+                LOOPBACK_MTU,
+            ),
+        )?;
+        let full = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("egress full observation allocation failed"))?;
+        let full_by_child = Arc::clone(&full);
+        let release = Arc::clone(&fixture.release);
+        let net = Arc::clone(&fixture.net);
+        let controlled_client = Arc::clone(&client);
+        let controller = crate::ktest::spawn_result_on(1, move |_| {
+            let client = controlled_client;
+            let queued_net = Arc::clone(&net);
+            let gate_release = Arc::clone(&release);
+            let child = crate::ktest::spawn_result_on(0, move |token| {
+                let mut unaccepted = None;
+                let mut error = None;
+                let mut packets = packets.into_iter();
+                {
+                    // 所有报文和控制拥有已在普通上下文准备；停点内只短锁移包和原子观察。
+                    let irq = crate::sync::IrqSaveGuard::new();
+                    for packet in packets.by_ref() {
+                        if let Err((_, packet)) = queued_net.try_emit(packet) {
+                            unaccepted = Some(packet);
+                            error = Some("prepared egress queue did not accept 32 records");
+                            break;
+                        }
+                    }
+                    if error.is_none() {
+                        let pointer = extra.bytes().as_ptr();
+                        let length = extra.len();
+                        match queued_net.try_emit(extra) {
+                            Err((FsError::WouldBlock, packet))
+                                if packet.bytes().as_ptr() == pointer && packet.len() == length =>
+                            {
+                                unaccepted = Some(packet);
+                                full_by_child.store(true, Ordering::Release);
+                            }
+                            Err((_, packet)) => {
+                                unaccepted = Some(packet);
+                                error = Some(
+                                    "full egress did not preserve unaccepted packet ownership",
+                                );
+                            }
+                            Ok(()) => error = Some("egress queue exceeded actual packet capacity"),
+                        }
+                    }
+                    let end = time::now()
+                        .checked_add(time::Duration::from_secs(5))
+                        .unwrap();
+                    while error.is_none()
+                        && !gate_release.load(Ordering::Acquire)
+                        && !token.stop_requested()
+                    {
+                        if end <= time::now() {
+                            error = Some("egress IRQ gate release deadline");
+                            break;
+                        }
+                        ::core::hint::spin_loop();
+                    }
+                    drop(irq);
+                }
+                drop(packets);
+                drop(unaccepted);
+                error.map_or(Ok(0), |message| Err(TestError(message)))
+            })?;
+            observe(
+                || full.load(Ordering::Acquire) || child.try_join().is_some(),
+                "egress queue did not reach actual full capacity",
+            )?;
+            if !full.load(Ordering::Acquire) {
+                return Err(TestError(
+                    "egress capacity control failed before full observation",
+                ));
+            }
+            child_operation(client.connect(InetEndpoint {
+                port: 45420,
+                ..SERVER
+            }))?;
+            observe(
+                || net.egress_waiting(client.id()),
+                "full SYN emitter did not register actual egress wait",
+            )?;
+            if client.state() != State::SynSent {
+                return Err(TestError(
+                    "full egress submitted SYN before capacity recovered",
+                ));
+            }
+            timer::sleep(time::Duration::from_millis(20));
+            if !net.egress_waiting(client.id()) {
+                return Err(TestError(
+                    "egress wait disappeared while ingress CPU was stopped",
+                ));
+            }
+            release.store(true, Ordering::Release);
+            if child.join()? != 0 {
+                return Err(TestError("egress IRQ gate child failed"));
+            }
+            Ok(0)
+        })?;
+        context.expect_eq(controller.join()?, 0);
+        let server = accepted(context, &listener, &client)?;
+        context.expect_eq(fixture.net.egress_waiting(client.id()), false);
+        let input = b"capacity recovered stream";
+        context.expect_eq(
+            operation(context, client.lock().send(&mut WriteBuffer::kernel(input)))?,
+            IoProgress::Ready(input.len()),
+        );
+        observe(
+            || server.lock().receive_queue() == input.len(),
+            "capacity-restored stream did not advance independently",
+        )?;
+        let mut output = [0u8; 64];
+        context.expect_eq(
+            operation(
+                context,
+                server
+                    .lock()
+                    .receive(&mut ReadBuffer::kernel(&mut output), false),
+            )?,
+            IoProgress::Ready(input.len()),
+        );
+        context.expect_eq(&output[..input.len()], input);
+        Ok(())
+    }
+
+    /// 真实 owner 停止仍被外部 Arc 保活的连接与 UDP 队列，关闭后的域不再接受节点或包。
+    #[test]
+    fn owner_stop_ends_live_protocol_and_rejects_new_ownership(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let listener = listener(context, &fixture.net, 45430)?;
+        let client = operation(context, fixture.net.try_new_tcp(256, 256))?;
+        operation(
+            context,
+            client.connect(InetEndpoint {
+                port: 45430,
+                ..SERVER
+            }),
+        )?;
+        let server = accepted(context, &listener, &client)?;
+        let udp = operation(context, fixture.net.try_new_udp())?;
+        let local = operation(
+            context,
+            udp.bind(InetEndpoint {
+                port: 45431,
+                ..SERVER
+            }),
+        )?;
+        operation(
+            context,
+            udp.enqueue(operation(
+                context,
+                OwnedPacket::try_from_udp(CLIENT, local, b"owned until shutdown", LOOPBACK_MTU),
+            )?),
+        )?;
+        operation(
+            context,
+            client
+                .lock()
+                .send(&mut WriteBuffer::kernel(b"pending TCP shutdown")),
+        )?;
+        drop(fixture.owner.take());
+        context.expect_eq(fixture.net.is_stopping(), true);
+        context.expect_eq(client.state(), State::Closed);
+        context.expect_eq(server.state(), State::Closed);
+        context.expect_eq(listener.state(), State::Closed);
+        context.expect_eq(udp.take_datagram().is_none(), true);
+        context.expect_eq(udp.local(), None);
+        match fixture.net.try_new_udp() {
+            Err(FsError::NotConnected) => {}
+            _ => return Err(TestError("stopped network accepted new endpoint ownership")),
+        }
+        let packet = operation(
+            context,
+            OwnedPacket::try_from_udp(CLIENT, local, b"", LOOPBACK_MTU),
+        )?;
+        match fixture.net.try_emit(packet) {
+            Err((FsError::NotConnected, packet)) => {
+                context.expect_eq(operation(context, packet.udp_payload())?, &b""[..]);
+            }
+            _ => return Err(TestError("stopped network accepted new egress ownership")),
+        }
         Ok(())
     }
 }

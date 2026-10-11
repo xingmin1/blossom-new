@@ -17,6 +17,11 @@ pub struct InetEndpoint {
 }
 
 impl InetEndpoint {
+    /// 判断本域通配绑定；源路由选择不能改变这个地址值。
+    pub fn is_unspecified(self) -> bool {
+        self.address == [0; 4]
+    }
+
     /// 将明确的本地或远端地址交给协议核心，不在转换时选择地址或端口。
     pub fn raw(self) -> IpEndpoint {
         IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::from(self.address)), self.port)
@@ -25,7 +30,7 @@ impl InetEndpoint {
     /// 监听允许通配地址，端口必须由网络域的绑定责任选定。
     pub fn raw_listen(self) -> IpListenEndpoint {
         IpListenEndpoint {
-            addr: if self.address == [0; 4] {
+            addr: if self.is_unspecified() {
                 None
             } else {
                 Some(IpAddress::Ipv4(Ipv4Address::from(self.address)))
