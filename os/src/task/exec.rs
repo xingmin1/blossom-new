@@ -7,22 +7,31 @@ use core::convert::TryInto;
 
 use crate::arch::{self, UserContext};
 use crate::block::BlockError;
-use crate::fs::{FileIoContext, FileRef, FsError, InodeKind, ReadBuffer};
+use crate::fs::{
+    self, ExecAccess, FileIoContext, FileRef, FsContext, FsError, InodeKind, ReadBuffer,
+    ResolveMode, Vfs,
+};
 use crate::mm::space::{Mm, VmError};
 use crate::mm::uaccess::CStringError;
 use crate::mm::user_table::{PagePermissions, PageTableError};
 use crate::mm::{alloc_pages, PAGE_SIZE};
+use crate::task::Credentials;
 
 pub(crate) const MAX_ARGUMENT_BYTES: usize = 32768;
 pub(crate) const MAX_ARGUMENT_COUNT: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
-const STACK_BYTES: usize = 65536;
+const STACK_BYTES: usize = 8 * 1024 * 1024;
+const STACK_BOTTOM: usize = arch::USER_STACK_TOP - STACK_BYTES;
+const LOAD_LIMIT: usize = STACK_BOTTOM - PAGE_SIZE;
 const MAX_IMAGE_PAGES: usize = 16384;
 const MAX_IMAGE_SPAN: usize = 256 * 1024 * 1024;
 const ELF_HEADER_BYTES: usize = 64;
+const SCRIPT_HEADER_BYTES: usize = 256;
+const MAX_INTERPRETER_DEPTH: usize = 5;
 const PHDR_BYTES: usize = 56;
 const PT_LOAD: u32 = 1;
 const PT_PHDR: u32 = 6;
+const PT_TLS: u32 = 7;
 const PF_R: u32 = 4;
 const PF_W: u32 = 2;
 const PF_X: u32 = 1;
@@ -47,6 +56,7 @@ const RWX: PagePermissions = PagePermissions {
 pub(crate) enum ExecError {
     Format,
     ArgumentsTooBig,
+    TooManyInterpreters,
     NoMemory,
     File(FsError),
     Vm(VmError),
@@ -117,6 +127,67 @@ impl Arguments {
         args.ensure_argv0()?;
         args.read_vector(mm, envp, false)?;
         Ok(args)
+    }
+
+    /// 原执行路径保持不变，解释器替换 argv[0] 不改变 AT_EXECFN。
+    pub(crate) fn filename(&self) -> &[u8] {
+        &self.filename
+    }
+
+    /// 先核完整预算并准备新增字符串和原向量容量，再一次移动前缀；失败保持原参数内容。
+    fn prepend_interpreter(
+        &mut self,
+        interpreter: &[u8],
+        optional: Option<&[u8]>,
+        original: bool,
+    ) -> Result<(), ExecError> {
+        let script = if original {
+            &self.filename
+        } else {
+            &self.argv[0]
+        };
+        let argc = self.argv.len() + 1 + usize::from(optional.is_some());
+        if MAX_ARGUMENT_COUNT < argc + self.envp.len() {
+            return Err(ExecError::ArgumentsTooBig);
+        }
+        let word = core::mem::size_of::<usize>();
+        let old_bytes = self.bytes - self.argv[0].len() - 1 - word;
+        let inserted = interpreter.len()
+            + script.len()
+            + 2 * (1 + word)
+            + optional.map_or(0, |argument| argument.len() + 1 + word);
+        let bytes = old_bytes
+            .checked_add(inserted)
+            .filter(|bytes| *bytes <= MAX_ARGUMENT_BYTES)
+            .ok_or(ExecError::ArgumentsTooBig)?;
+        let additional = argc - self.argv.len();
+        let interpreter = copy_bytes(interpreter)?;
+        let optional = optional.map(copy_bytes).transpose()?;
+        let script = if original && self.argv[0] != self.filename {
+            Some(copy_bytes(script)?)
+        } else {
+            None
+        };
+
+        self.argv
+            .try_reserve_exact(additional)
+            .map_err(|_| ExecError::NoMemory)?;
+        let script = match script {
+            Some(script) => script,
+            None => core::mem::take(&mut self.argv[0]),
+        };
+        match optional {
+            Some(optional) => drop(self.argv.splice(
+                0..1,
+                IntoIterator::into_iter([interpreter, optional, script]),
+            )),
+            None => drop(
+                self.argv
+                    .splice(0..1, IntoIterator::into_iter([interpreter, script])),
+            ),
+        }
+        self.bytes = bytes;
+        Ok(())
     }
 
     /// 输入已验证有界；移动路径并预留argc与两个终止指针的预算。
@@ -237,6 +308,121 @@ pub(crate) struct LoadedImage {
     pub context: UserContext,
 }
 
+/// 在同一 root/cwd 快照下准备可执行文件及有限脚本链，成功前不改变正在运行的映像。
+pub(crate) fn prepare(
+    vfs: &Vfs,
+    context: &FsContext,
+    mut args: Arguments,
+    credentials: Credentials,
+) -> Result<LoadedImage, ExecError> {
+    let (mut file, mut access) = open_executable(vfs, context, args.filename(), credentials)?;
+    for depth in 0..=MAX_INTERPRETER_DEPTH {
+        let mut header = [0; SCRIPT_HEADER_BYTES];
+        read_prefix(&file, 0, &mut header[..ELF_HEADER_BYTES])?;
+        if header[..2] != *b"#!" {
+            return load_elf(
+                file,
+                access,
+                (&header[..ELF_HEADER_BYTES]).try_into().unwrap(),
+                &args,
+                credentials.uid,
+                credentials.gid,
+            );
+        }
+        read_prefix(
+            &file,
+            ELF_HEADER_BYTES as u64,
+            &mut header[ELF_HEADER_BYTES..],
+        )?;
+        let (interpreter, optional) = script_interpreter(&header)?;
+        args.prepend_interpreter(interpreter, optional, depth == 0)?;
+        let next = open_executable(vfs, context, &args.argv[0], credentials)?;
+        // 新文件已经取得写排斥，接替后才放掉上一个脚本的文件与执行写占用。
+        (file, access) = next;
+    }
+    Err(ExecError::TooManyInterpreters)
+}
+
+/// 每层解释器都使用同一凭据与路径规则，首读前取得真实普通 inode 的执行写占用。
+fn open_executable(
+    vfs: &Vfs,
+    context: &FsContext,
+    pathname: &[u8],
+    credentials: Credentials,
+) -> Result<(FileRef, ExecAccess), ExecError> {
+    let path = vfs.resolve_from(
+        context,
+        context.cwd(),
+        pathname,
+        ResolveMode::Follow,
+        Some((credentials.uid, credentials.gid)),
+    )?;
+    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Regular {
+        return Err(ExecError::File(FsError::Permission));
+    }
+    path.check_access(credentials.uid, credentials.gid, 1)?;
+    let file = fs::open_path(vfs, path)?;
+    let access = file
+        .mapping_inode()
+        .ok_or(ExecError::Format)?
+        .deny_writes()?;
+    Ok((file, access))
+}
+
+/// 只将空格和 tab 当作分隔符，拒绝截断的解释器路径，余下内容作为一个可选参数。
+fn script_interpreter(
+    header: &[u8; SCRIPT_HEADER_BYTES],
+) -> Result<(&[u8], Option<&[u8]>), ExecError> {
+    let newline = header
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .position(|byte| *byte == b'\n');
+    let mut end = newline.unwrap_or(SCRIPT_HEADER_BYTES - 1);
+    if newline.is_none() {
+        let name = header[2..=end]
+            .iter()
+            .position(|byte| !matches!(*byte, b' ' | b'\t'))
+            .map(|index| index + 2)
+            .ok_or(ExecError::Format)?;
+        if !header[name..=end]
+            .iter()
+            .any(|byte| matches!(*byte, b' ' | b'\t' | 0))
+        {
+            return Err(ExecError::Format);
+        }
+    }
+    while 2 < end && matches!(header[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    let start = header[2..=end]
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .map(|index| index + 2)
+        .filter(|start| *start < end)
+        .ok_or(ExecError::Format)?;
+    let separator = header[start..=end]
+        .iter()
+        .position(|byte| matches!(*byte, b' ' | b'\t' | 0))
+        .map(|index| index + start);
+    let name_end = separator.unwrap_or(end);
+    let optional = separator
+        .filter(|index| header[*index] != 0)
+        .and_then(|separator| {
+            header[separator..=end]
+                .iter()
+                .position(|byte| !matches!(*byte, b' ' | b'\t'))
+                .map(|index| separator + index)
+        })
+        .map(|start| {
+            let stop = header[start..end]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map_or(end, |index| start + index);
+            &header[start..stop]
+        });
+    Ok((&header[start..name_end], optional))
+}
+
 /// 首次读取 ELF 前禁止同 inode 写入，责任随真实 Mm 保留，全部准备失败由 RAII 释放。
 pub(crate) fn load(
     file: FileRef,
@@ -248,7 +434,21 @@ pub(crate) fn load(
         .mapping_inode()
         .ok_or(ExecError::Format)?
         .deny_writes()?;
-    let elf = Elf::read(&file)?;
+    let mut header = [0; ELF_HEADER_BYTES];
+    read_exact(&file, 0, &mut header)?;
+    load_elf(file, access, &header, args, uid, gid)
+}
+
+/// 消费已经首读和禁止写入的同一文件，所有入口共用唯一 ELF、VMA 与初始栈算法。
+fn load_elf(
+    file: FileRef,
+    access: ExecAccess,
+    header: &[u8; ELF_HEADER_BYTES],
+    args: &Arguments,
+    uid: u32,
+    gid: u32,
+) -> Result<LoadedImage, ExecError> {
+    let elf = Elf::read(&file, header)?;
     let mut mm = Mm::try_new()?;
     map_segments(&mut mm, &file, &elf.segments)?;
     map_return_page(&mut mm)?;
@@ -333,8 +533,7 @@ impl ProgramHeader {
             .address
             .checked_add(self.memsz)
             .ok_or(ExecError::Format)?;
-        let reserved = arch::USER_STACK_TOP - STACK_BYTES - PAGE_SIZE;
-        if self.address < PAGE_SIZE || reserved < page_end(end)? {
+        if self.address < PAGE_SIZE || LOAD_LIMIT < page_end(end)? {
             return Err(ExecError::Format);
         }
         #[cfg(target_arch = "riscv64")]
@@ -352,18 +551,16 @@ impl ProgramHeader {
 }
 
 impl Elf {
-    /// 先完成头、所有程序头与映像关系校验，再允许申请用户根和原页。
-    fn read(file: &FileRef) -> Result<Self, ExecError> {
+    /// 复用写排斥期间读取的首部，完成所有程序头与映像关系校验后才申请用户根和原页。
+    fn read(file: &FileRef, header: &[u8; ELF_HEADER_BYTES]) -> Result<Self, ExecError> {
         let stat = file.stat()?;
         if stat.kind != InodeKind::Regular {
             return Err(ExecError::File(FsError::IsDirectory));
         }
-        let mut header = [0; ELF_HEADER_BYTES];
-        read_exact(file, 0, &mut header)?;
-        validate_header(&header, stat.size)?;
-        let entry = word64(&header, 24) as usize;
-        let phoff = word64(&header, 32);
-        let phnum = word16(&header, 56) as usize;
+        validate_header(header, stat.size)?;
+        let entry = word64(header, 24) as usize;
+        let phoff = word64(header, 32);
+        let phnum = word16(header, 56) as usize;
         let table_bytes = phnum * PHDR_BYTES;
         let mut table = Vec::new();
         table
@@ -376,6 +573,7 @@ impl Elf {
             .try_reserve_exact(phnum)
             .map_err(|_| ExecError::NoMemory)?;
         let mut declared_phdr = None;
+        let mut tls = None;
         for bytes in table.chunks_exact(PHDR_BYTES) {
             let ph = ProgramHeader::decode(bytes);
             if ph.kind == 0 {
@@ -389,8 +587,18 @@ impl Elf {
                         segments.push(segment);
                     }
                 }
-                // 动态、解释器、保留的 SHLIB 及尚无用户 TLS 初始化的映像不能静默装载。
-                2 | 3 | 5 | 7 => return Err(ExecError::Format),
+                // 动态、解释器和保留的 SHLIB 不属于静态映像。
+                2 | 3 | 5 => return Err(ExecError::Format),
+                PT_TLS => {
+                    if tls.is_some()
+                        || ph.memsz < ph.filesz
+                        || (1 < ph.align
+                            && ph.address & (ph.align - 1) != ph.offset as usize & (ph.align - 1))
+                    {
+                        return Err(ExecError::Format);
+                    }
+                    tls = Some(ph);
+                }
                 PT_PHDR => {
                     if declared_phdr.is_some()
                         || ph.offset != phoff
@@ -413,6 +621,12 @@ impl Elf {
         segments.sort_unstable_by_key(|segment| segment.start);
         let end = validate_segments(&segments, entry)?;
         let phdr = find_phdr(&segments, phoff, table_bytes, declared_phdr)?;
+        if let Some(tls) = tls {
+            // libc 自行分配 TLS 零尾；这里只要求非零模板确由可读 LOAD 的原文件前缀提供。
+            if !source_covered(&segments, tls.address, tls.offset, tls.filesz, true) {
+                return Err(ExecError::Format);
+            }
+        }
         Ok(Self {
             segments,
             entry,
@@ -603,8 +817,8 @@ fn source_covered(
     true
 }
 
-/// 沿真实正前缀读取完整字节；零读报告 ShortIo，文件错误直接返回而不重试或补零。
-fn read_exact(file: &FileRef, offset: u64, bytes: &mut [u8]) -> Result<(), ExecError> {
+/// 沿真实正前缀读到缓冲尾或 EOF，返回实际字节数，未读取部分保持调用者的初始化值。
+fn read_prefix(file: &FileRef, offset: u64, bytes: &mut [u8]) -> Result<usize, ExecError> {
     let mut copied = 0;
     while copied < bytes.len() {
         let read = file.read_at_into(
@@ -613,13 +827,21 @@ fn read_exact(file: &FileRef, offset: u64, bytes: &mut [u8]) -> Result<(), ExecE
             FileIoContext::Kernel,
         )?;
         if read == 0 {
-            return Err(ExecError::File(FsError::Io(BlockError::ShortIo)));
+            break;
         }
         assert!(
             read <= bytes.len() - copied,
             "file read exceeded requested bytes"
         );
         copied += read;
+    }
+    Ok(copied)
+}
+
+/// 完整读取沿同一前缀算法，EOF 前不足请求长度报告 ShortIo，真实文件错误直接返回。
+fn read_exact(file: &FileRef, offset: u64, bytes: &mut [u8]) -> Result<(), ExecError> {
+    if read_prefix(file, offset, bytes)? < bytes.len() {
+        return Err(ExecError::File(FsError::Io(BlockError::ShortIo)));
     }
     Ok(())
 }
@@ -758,7 +980,7 @@ fn map_return_page(mm: &mut Mm) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// 建立固定大小 RW 私有栈，栈下一个 guard 页和顶端返回页之间不增加虚假映射。
+/// 发表按需分配的 8MiB 私有 RW 栈 VMA，栈下保留一页 guard，实际初始栈写入才触页。
 fn make_stack(
     mm: &Mm,
     elf: &Elf,
@@ -766,7 +988,7 @@ fn make_stack(
     uid: u32,
     gid: u32,
 ) -> Result<usize, ExecError> {
-    let bottom = arch::USER_STACK_TOP - STACK_BYTES;
+    let bottom = STACK_BOTTOM;
     mm.map_anonymous(bottom, STACK_BYTES, RW, RWX)?;
     let mut cursor = arch::USER_STACK_TOP;
     let execfn = stack_string(mm, &mut cursor, &args.filename)?;
@@ -822,7 +1044,7 @@ fn stack_string(mm: &Mm, cursor: &mut usize, bytes: &[u8]) -> Result<usize, Exec
     let address = cursor
         .checked_sub(bytes.len() + 1)
         .ok_or(ExecError::ArgumentsTooBig)?;
-    if address < arch::USER_STACK_TOP - STACK_BYTES {
+    if address < STACK_BOTTOM {
         return Err(ExecError::ArgumentsTooBig);
     }
     copyout_exact(mm, address, bytes)?;

@@ -19,7 +19,7 @@ struct FileOwner {
 impl FileOwner {
     /// 正文构造完整路径视图与固定表，失败时保留原设备的清理责任。
     fn prepare(&mut self, context: &TestContext<'_>, capacity: usize) -> TestResult {
-        self.path.prepare_path(context, AccessMode::ReadOnly)?;
+        self.path.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let table = Arc::try_new(checked(context, FileTable::try_new(capacity))?)
             .map_err(|_| TestError("file table owner OOM"))?;
         self.table = Some(table);

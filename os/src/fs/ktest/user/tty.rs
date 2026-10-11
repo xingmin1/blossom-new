@@ -16,7 +16,7 @@ enum TtyWait {
 impl UserOwner {
     /// 本例挂载真实 devfs 后执行双目标 ELF，所有阶段结束才允许关闭最后串口 OFD。
     pub(super) fn tty_abi(&mut self, context: &mut TestContext<'_>, mode: &[u8]) -> TestResult {
-        self.prepare_tty(context)?;
+        self.prepare_tty(context, 4)?;
         checked(
             context,
             tty::set_termios(Termios::default(), 2, FileIoContext::Kernel),

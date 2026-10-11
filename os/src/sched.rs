@@ -675,3 +675,30 @@ pub fn test_migrate_to(target: usize) {
     }
     yield_now();
 }
+
+/// 在调度锁内为已阻塞的 Any Task 指定下一次真实分派 CPU。
+#[cfg(feature = "ktest")]
+pub(crate) fn test_request_migration(task: &Task, target: usize) {
+    assert!(target < cpu::count(), "migration CPU is out of range");
+    assert!(
+        cpu::get(target).online.load(Ordering::Acquire),
+        "migration CPU is offline"
+    );
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY: 调度锁保护状态、placement 和 next_cpu；调用者强引用保持 Task 活着。
+    let data = unsafe { &mut *task.scheduling.get() };
+    assert_eq!(
+        data.state,
+        State::Blocked,
+        "migration request requires Blocked task"
+    );
+    assert!(
+        matches!(data.placement, Placement::Any),
+        "migration request requires Any task"
+    );
+    assert!(
+        data.next_cpu.is_none(),
+        "task already has a migration target"
+    );
+    data.next_cpu = Some(target);
+}

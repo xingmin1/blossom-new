@@ -33,7 +33,7 @@ fn prepare_tmp(
     context: &TestContext<'_>,
     fixture: &mut PathOwner,
 ) -> Result<Arc<MemoryFs>, TestError> {
-    fixture.prepare_path(context, AccessMode::ReadOnly)?;
+    fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
     let fs = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o777))?;
     let covered = resolve(context, fixture, b"/plain")?;
     checked(

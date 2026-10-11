@@ -1,0 +1,33 @@
+#!/bin/busybox sh
+set -e
+[ "$(pwd)" = "/" ]
+cd /test/scripts
+[ "$(pwd)" = "/test/scripts" ]
+cd /
+mount -t proc proc /proc
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t devfs devfs /test/dev-view
+case "$(cat /proc/mounts)" in *" /tmp tmpfs rw 0 0"*) ;; *) exit 1;; esac
+case "$(cat /proc/mounts)" in *" /proc proc ro 0 0"*) ;; *) exit 1;; esac
+case "$(cat /proc/mounts)" in *" /test/dev-view devfs ro 0 0"*) ;; *) exit 1;; esac
+printf 'tmpfs-data\n' > /tmp/abi-data
+[ "$(cat /tmp/abi-data)" = "tmpfs-data" ]
+printf 'pipe-data\n' | cat > /tmp/abi-pipe
+[ "$(cat /tmp/abi-pipe)" = "pipe-data" ]
+cd /tmp
+/bin/libc-smoke --abi stage7
+sync
+cd /tmp
+[ "$(pwd)" = "/tmp" ]
+if busy="$(umount /tmp 2>&1)"; then exit 1; fi
+case "$busy" in *"Resource busy"*) ;; *) exit 1;; esac
+cd /
+exec 3</tmp/abi-data
+if busy="$(umount /tmp 2>&1)"; then exit 1; fi
+case "$busy" in *"Resource busy"*) ;; *) exit 1;; esac
+exec 3<&-
+umount /tmp
+umount /test/dev-view
+umount /run
+umount /proc

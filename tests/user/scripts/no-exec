@@ -1,0 +1,2 @@
+#!/bin/libc-smoke
+no-exec

@@ -15,6 +15,7 @@ mod background;
 mod events;
 mod jobs;
 mod layout;
+mod libc;
 mod lifecycle;
 mod namespace;
 mod pipe;
@@ -54,12 +55,17 @@ struct UserOwner {
 impl UserOwner {
     /// 每例只用本例设备与根建立身份域，库存由同一 suite 保活到最后一个 case。
     fn prepare(&mut self, context: &TestContext<'_>) -> TestResult {
-        self.prepare_mode(context, AccessMode::ReadOnly)
+        self.prepare_mode(context, AccessMode::ReadOnly, 4)
     }
 
-    /// 显式卷和挂载权限决定普通用户程序的文件能力，不根据程序名字推导写权限。
-    fn prepare_mode(&mut self, context: &TestContext<'_>, mode: AccessMode) -> TestResult {
-        self.path.prepare_path(context, mode)?;
+    /// 显式卷权限与挂载容量决定本例视图，不根据程序名字推导资源预算。
+    fn prepare_mode(
+        &mut self,
+        context: &TestContext<'_>,
+        mode: AccessMode,
+        mount_capacity: usize,
+    ) -> TestResult {
+        self.path.prepare_path(context, mode, mount_capacity)?;
         self.graph = Some(TaskGraph::try_new(64).map_err(|error| {
             context.diagnostic(format_args!("user-graph-prepare error={:?}", error));
             TestError("user identity graph preparation failed")
@@ -67,9 +73,9 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 为真实用户串口用例在 ext4 中的空 `/dev` 目录挂载本例 devfs。
-    fn prepare_tty(&mut self, context: &TestContext<'_>) -> TestResult {
-        self.prepare(context)?;
+    /// 按本例显式容量准备根视图，再把真实 devfs 挂在 ext4 的空 `/dev` 目录。
+    fn prepare_tty(&mut self, context: &TestContext<'_>, mount_capacity: usize) -> TestResult {
+        self.prepare_mode(context, AccessMode::ReadOnly, mount_capacity)?;
         let mountpoint = checked(
             context,
             self.path
@@ -108,14 +114,19 @@ impl UserOwner {
         Arguments::from_kernel(PROGRAM, &[PROGRAM, b"raw"], &[b"USER_SMOKE=1"])
     }
 
-    /// 通过同一正式 loader 准备真实盘 ELF，不把错误转换为默认页或备用程序。
+    /// 从本例文件系统快照准备真实程序，路径、凭据和解释器解析共用正式入口。
     fn load(&self, context: &TestContext<'_>) -> Result<LoadedImage, TestError> {
-        let file = self.file(context, PROGRAM)?;
         let arguments = self.arguments().map_err(|error| {
             context.diagnostic(format_args!("user-arguments-prepare error={:?}", error));
             TestError("user arguments preparation failed")
         })?;
-        exec::load(file, &arguments, 0, 0).map_err(|error| {
+        exec::prepare(
+            self.path.vfs(),
+            self.path.context(),
+            arguments,
+            Credentials::ROOT,
+        )
+        .map_err(|error| {
             context.diagnostic(format_args!("user-image-prepare error={:?}", error));
             TestError("user image preparation failed")
         })
@@ -203,7 +214,7 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 具名普通程序复用正式ELF loader和原始argv，没有内嵌应用或测试syscall。
+    /// 具名普通程序以原始 argv 和真实根凭据经过同一程序准备入口。
     fn load_named(
         &self,
         context: &TestContext<'_>,
@@ -215,7 +226,13 @@ impl UserOwner {
                 context.diagnostic(format_args!("user-named-arguments error={:?}", error));
                 TestError("named user arguments failed")
             })?;
-        exec::load(self.file(context, program)?, &arguments, 0, 0).map_err(|error| {
+        exec::prepare(
+            self.path.vfs(),
+            self.path.context(),
+            arguments,
+            Credentials::ROOT,
+        )
+        .map_err(|error| {
             context.diagnostic(format_args!("user-named-load error={:?}", error));
             TestError("named user image failed")
         })
@@ -232,7 +249,7 @@ impl UserOwner {
         self.run_named_as(context, program, mode, reserve_parent_fd, Credentials::ROOT)
     }
 
-    /// 不可变凭据只在准备Runtime时注入，用户请求仍经过正式dispatcher与正常wait。
+    /// 映像准备与Runtime使用同一凭据，用户请求仍经正式dispatcher与正常wait。
     fn run_named_as(
         &mut self,
         context: &mut TestContext<'_>,
@@ -241,7 +258,13 @@ impl UserOwner {
         reserve_parent_fd: bool,
         credentials: Credentials,
     ) -> Result<WaitEvent, TestError> {
-        let image = self.load_named(context, program, mode)?;
+        let arguments = Arguments::from_kernel(program, &[program, mode], &[])
+            .map_err(|_| TestError("named user arguments failed"))?;
+        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
+            .map_err(|error| {
+                context.diagnostic(format_args!("user-named-load error={:?}", error));
+                TestError("named user image failed")
+            })?;
         let affine_group = !matches!(mode.first(), Some(b't' | b'T' | b'g' | b'c'));
         self.start_program(context, image, affine_group, reserve_parent_fd, credentials)?;
         let event = self.wait(context)?;
@@ -261,7 +284,7 @@ impl UserOwner {
     /// 普通写程序同步退出后关闭原缓存域，在同盘只读新生命周期核全文与内嵌链接盘面格式。
     fn production_writeback_cold_reopen(&mut self, context: &mut TestContext<'_>) -> TestResult {
         const PROGRAM: &[u8] = b"/test/bin/user-writeback";
-        self.prepare_mode(context, AccessMode::ReadWrite)?;
+        self.prepare_mode(context, AccessMode::ReadWrite, 4)?;
         let event = self.run_named(context, PROGRAM, b"w", false)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -331,7 +354,7 @@ impl UserOwner {
             Arc::try_new(checked(context, InodeCache::try_new(64))?)
                 .map_err(|_| TestError("production writeback cold cache OOM"))?,
         );
-        self.prepare_mode(context, AccessMode::ReadOnly)?;
+        self.prepare_mode(context, AccessMode::ReadOnly, 4)?;
         let root = self.path.vfs().root();
         context.expect_eq(
             checked(context, checked(context, root.inode())?.disk_volume())?
@@ -1566,6 +1589,27 @@ pub(crate) mod programs {
         fixture.jobs_winsize_changes(context)
     }
 
+    /// 普通静态 C 从真实磁盘启动，核 TLS、主栈、标准流和基础文件 ABI。
+    #[test]
+    #[ktest(tags("T31", "user-libc"), timeout_ms = 120000)]
+    fn libc_static_smoke(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.libc_static_smoke(context)
+    }
+
+    /// 同一用户 Task 在两次 pipe 唤醒窗口实际迁核并校验 TLS 与浮点现场。
+    #[test]
+    #[ktest(min_cpus = 2, tags("T31", "user-libc"), timeout_ms = 120000)]
+    fn libc_migration(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.libc_migration(context)
+    }
+
+    /// 普通脚本的解释器参数、环境和原始执行路径由实际用户程序核验。
+    #[test]
+    #[ktest(tags("T32", "user-script"), timeout_ms = 120000)]
+    fn script_exec(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.script_exec(context)
+    }
+
     /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。
     #[test]
     #[ktest(tags("T04", "T30", "fs-device-mapping"))]
@@ -1603,7 +1647,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
         replace: bool,
     ) -> TestResult {
-        fixture.prepare_mode(context, AccessMode::ReadWrite)?;
+        fixture.prepare_mode(context, AccessMode::ReadWrite, 4)?;
         let vfs = fixture.path.vfs();
         let fs_context = fixture.path.context();
         let pathname = if replace {

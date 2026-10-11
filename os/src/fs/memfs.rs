@@ -60,6 +60,14 @@ impl Filesystem {
         }
     }
 
+    /// 以实际 Arc 地址排序同实例 rename 锁，地址只用于内核同步且不作为设备号。
+    pub(crate) fn identity_address(&self) -> usize {
+        match self {
+            Self::Ext4(fs) => Arc::as_ptr(fs) as usize,
+            Self::Memory(fs) => Arc::as_ptr(fs) as usize,
+        }
+    }
+
     /// 按后端取得共同名字域，内存节点不登记磁盘 canonical 域。
     pub(crate) fn dentry_namespace(
         &self,

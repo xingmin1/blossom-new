@@ -1,9 +1,8 @@
 //! 用户任务ABI只复制已初始化字节，状态消费与用户交付分开完成。
 
-use crate::fs::{self, InodeKind, ResolveMode};
 use crate::mm::space::VmError;
 use crate::syscall::error::{copyout, Errno, SysResult};
-use crate::syscall::{file, Outcome, Request, Restart};
+use crate::syscall::{Outcome, Request, Restart};
 use crate::task::clone::{self, CloneArguments, CloneError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::process::{ChildEvent, WaitSelector};
@@ -48,22 +47,18 @@ pub(super) fn execve(user: &UserThread, request: Request) -> Outcome {
     Outcome::NewImage
 }
 
-/// 路径与参数只读取一次；正式OFD校验后在私有Mm完成ELF与初始栈准备。
+/// 路径与参数只读取一次，在同一 FS 和凭据快照下准备拥有式 ELF 或脚本映像。
 fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, UserRuntime), Errno> {
     let runtime = user.runtime().expect("exec has no runtime");
     let mm = user.mm().expect("exec has no MM");
     let pathname = mm.read_c_string(raw[0], 4096)?;
-    let path = file::resolve_bytes(&runtime, (-100i32) as usize, &pathname, ResolveMode::Follow)?;
-    let credentials = runtime.credentials;
-    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Regular {
-        return Err(Errno::Permission);
-    }
-    path.check_access(credentials.uid, credentials.gid, 1)?;
-    let vfs = runtime.fs.lock().vfs.clone();
-    let file = fs::open_path(&vfs, path)?;
     let arguments = Arguments::from_user(&mm, pathname, raw[1], raw[2]).map_err(exec_error)?;
+    let (vfs, context) = {
+        let fs = runtime.fs.lock();
+        (fs.vfs.clone(), fs.context.clone())
+    };
     let image =
-        exec::load(file, &arguments, credentials.uid, credentials.gid).map_err(exec_error)?;
+        exec::prepare(&vfs, &context, arguments, runtime.credentials).map_err(exec_error)?;
     Ok((image, runtime))
 }
 
@@ -75,8 +70,19 @@ fn abort_exec(user: &UserThread) -> Outcome {
     Outcome::GroupExit(status)
 }
 
-/// 有限进程组、会话和亲缘查询共用原身份图，不从调度队列按PID查执行者。
+/// 凭据查询返回当前真实 uid/gid；进程组、会话和亲缘查询继续使用原身份图。
 pub(super) fn identity(user: &UserThread, number: usize, raw: [usize; 6]) -> SysResult {
+    if (174..=177).contains(&number) {
+        let credentials = user
+            .runtime()
+            .expect("identity syscall has no runtime")
+            .credentials;
+        return Ok(match number {
+            174 | 175 => credentials.uid as isize,
+            176 | 177 => credentials.gid as isize,
+            _ => unreachable!("credential dispatch outside range"),
+        });
+    }
     let identity = user.identity().expect("identity syscall has no identity");
     let graph = identity.graph();
     match number {
@@ -264,6 +270,7 @@ fn exec_error(error: ExecError) -> Errno {
     match error {
         ExecError::Format => Errno::ExecFormat,
         ExecError::ArgumentsTooBig => Errno::ArgumentsTooBig,
+        ExecError::TooManyInterpreters => Errno::TooManySymlinks,
         ExecError::NoMemory | ExecError::Vm(VmError::NoMemory) => Errno::NoMemory,
         ExecError::File(error) | ExecError::Vm(VmError::File(error)) => error.into(),
         ExecError::Vm(_) => Errno::BadAddress,

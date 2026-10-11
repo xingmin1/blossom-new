@@ -268,6 +268,15 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
     )?)
     .map_err(|_| fs::FsError::NoMemory)?;
     let context = fs::FsContext::new(vfs.root(), vfs.root())?;
+    {
+        let mountpoint = vfs.resolve(&context, b"/dev", fs::ResolveMode::Follow)?;
+        let devfs = fs::devfs::try_new(0o755)?;
+        vfs.mount(
+            &mountpoint,
+            fs::memfs::Filesystem::Memory(devfs),
+            block::AccessMode::ReadOnly,
+        )?;
+    }
     let files = fs::FileTable::try_new(4)?;
     crate::klog!(
         klog::Level::Info,
@@ -307,12 +316,21 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         &vfs,
         &context,
         b"/test/bin/user-smoke",
-        b"raw",
+        &[b"/test/bin/user-smoke", b"raw"],
         &[b"USER_SMOKE=1"],
+        false,
     )?;
     // 该普通程序断言 EROFS，只在真实只读根验证；可写根由独立写入程序消费。
     if selected.root_mode == block::AccessMode::ReadOnly {
-        run_disk_program(&graph, &vfs, &context, b"/test/bin/user-io", b"raw", &[])?;
+        run_disk_program(
+            &graph,
+            &vfs,
+            &context,
+            b"/test/bin/user-io",
+            &[b"/test/bin/user-io", b"raw"],
+            &[],
+            false,
+        )?;
     }
     const PROGRAMS: &[(&[u8], &[u8])] = &[
         (b"/test/bin/user-clone", b"F0"),
@@ -321,7 +339,15 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         (b"/test/bin/user-lifecycle", b"u"),
     ];
     for &(program, argument) in PROGRAMS {
-        run_disk_program(&graph, &vfs, &context, program, argument, &[])?;
+        run_disk_program(
+            &graph,
+            &vfs,
+            &context,
+            program,
+            &[program, argument],
+            &[],
+            false,
+        )?;
     }
     if selected.root_mode == block::AccessMode::ReadWrite {
         run_disk_program(
@@ -329,8 +355,9 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
             &vfs,
             &context,
             b"/test/bin/user-writeback",
-            b"a",
+            &[b"/test/bin/user-writeback", b"a"],
             &[],
+            false,
         )?;
         let pathname = "/test/writeback-dir/result";
         let summary = fs::system::read_summary(&files, &vfs, &context, pathname.as_bytes())?;
@@ -343,6 +370,38 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
             summary.crc32c
         );
     }
+    run_disk_program(
+        &graph,
+        &vfs,
+        &context,
+        b"/bin/libc-smoke",
+        &[b"/bin/libc-smoke", b"stage7"],
+        &[],
+        true,
+    )?;
+    for script in [
+        b"/test/scripts/no-option".as_slice(),
+        b"/test/scripts/option".as_slice(),
+    ] {
+        run_disk_program(
+            &graph,
+            &vfs,
+            &context,
+            script,
+            &[script, b"tail"],
+            &[b"BLOSSOM_SCRIPT=stage7"],
+            true,
+        )?;
+    }
+    run_disk_program(
+        &graph,
+        &vfs,
+        &context,
+        b"/bin/busybox",
+        &[b"/bin/busybox", b"echo", b"stage7 busybox"],
+        &[],
+        true,
+    )?;
     drop(files);
     drop(graph);
     drop(context);
@@ -354,22 +413,24 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
     Ok(())
 }
 
-/// 同一正式 loader 运行一个磁盘程序，核主体与离栈状态并逐个回收转亲后的全部子组。
+/// 以完整 argv 准备磁盘程序，按调用者约定安装标准流，再核退出、离栈与全部子组回收。
 #[cfg(not(feature = "ktest"))]
 fn run_disk_program(
     graph: &Arc<task::process::TaskGraph>,
     vfs: &Arc<fs::Vfs>,
     context: &fs::FsContext,
     program: &[u8],
-    argument: &[u8],
+    argv: &[&[u8]],
     environment: &[&[u8]],
+    console: bool,
 ) -> Result<(), task::ProgramError> {
-    let path = vfs.resolve(context, program, fs::ResolveMode::Follow)?;
-    let file = fs::open_path(vfs, path)?;
-    let arguments = task::exec::Arguments::from_kernel(program, &[program, argument], environment)?;
+    let arguments = task::exec::Arguments::from_kernel(program, argv, environment)?;
+    let image = task::exec::prepare(vfs, context, arguments, task::Credentials::ROOT)?;
     let runtime =
         task::UserRuntime::try_new(Arc::clone(vfs), context.clone(), task::Credentials::ROOT)?;
-    let image = task::exec::load(file, &arguments, 0, 0)?;
+    if console {
+        runtime.install_console()?;
+    }
     let prepared = task::prepare_program(graph, None, image, runtime, task::Placement::Any)?;
     let pid = prepared.pid();
     let child = prepared.publish()?;
@@ -378,9 +439,9 @@ fn run_disk_program(
     let task_status = child.join();
     crate::klog!(
         klog::Level::Info,
-        "USER exited program={} argument={} pid={} task={} status={} task_status={} interrupts={} timers={} cpu={}",
+        "USER exited program={} argc={} pid={} task={} status={} task_status={} interrupts={} timers={} cpu={}",
         core::str::from_utf8(program).expect("static program path is ASCII"),
-        core::str::from_utf8(argument).expect("static program argument is ASCII"),
+        argv.len(),
         event.pid,
         event.task_id.as_usize(),
         event.status,

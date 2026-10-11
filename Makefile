@@ -24,8 +24,10 @@ LLVM_MC ?= llvm-mc
 USER_LD ?= rust-lld
 USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback device-map pipe events tty jobs)
 MUSL_CROSS ?= $(ARCH)-linux-musl-
+MUSL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie
 USERLAND_BUILD ?= build/busybox-$(ARCH)
 USERLAND_ROOT ?= build/userland-$(ARCH)
+USERLAND_SCRIPTS := $(patsubst tests/user/scripts/%,$(USERLAND_ROOT)/test/scripts/%,$(wildcard tests/user/scripts/*))
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -117,9 +119,20 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
 .PHONY: userland
-userland: $(USERLAND_BUILD)/.config
+userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_SCRIPTS)
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
-	$(MUSL_CROSS)gcc -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie tests/user/libc-smoke.c -o "$(USERLAND_ROOT)/bin/libc-smoke"
+
+$(USERLAND_ROOT)/bin/libc-smoke: tests/user/libc-smoke.c
+	mkdir -p "$(dir $@)"
+	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) "$<" -o "$@"
+
+$(USERLAND_ROOT)/test/scripts/%: tests/user/scripts/%
+	mkdir -p "$(dir $@)"
+	install -m 755 "$<" "$@"
+
+$(USERLAND_ROOT)/test/scripts/no-exec: tests/user/scripts/no-exec
+	mkdir -p "$(dir $@)"
+	install -m 644 "$<" "$@"
 
 .DELETE_ON_ERROR: $(USERLAND_BUILD)/.config
 $(USERLAND_BUILD)/.config: userland/busybox.config

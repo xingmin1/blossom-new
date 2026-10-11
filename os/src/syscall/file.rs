@@ -23,6 +23,10 @@ const DIRECTORY: u32 = 0x1_0000;
 const NOFOLLOW: u32 = 0x2_0000;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
+const AT_NO_AUTOMOUNT: u32 = 0x800;
+const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+const STATX_BASIC_STATS: u32 = 0x7ff;
+const STATX_RESERVED: u32 = 0x8000_0000;
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_SYMLINK_FOLLOW: u32 = 0x400;
 const RENAME_NOREPLACE: u32 = 1;
@@ -605,24 +609,66 @@ pub(super) fn statat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let runtime = user.runtime().expect("statat has no runtime");
     let mm = user.mm().expect("statat has no MM");
-    let pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
-    let stat = if pathname.is_empty() && raw[3] & AT_EMPTY_PATH != 0 {
-        if raw[0] as i32 == AT_FDCWD {
-            let (_, context) = fs_snapshot(&runtime);
-            fs::stat_path(context.cwd())?
+    let stat = query_stat(&runtime, &mm, raw[0], raw[1], raw[3], false)?;
+    copyout(&mm, raw[2], &encode_stat(stat)?)?;
+    Ok(0)
+}
+
+/// 从唯一 FileStat 查询编码 statx；本地当前属性不需要远程同步或磁盘 FLUSH。
+pub(super) fn statx(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let flags = raw[2] as u32;
+    let mask = raw[3] as u32;
+    let supported =
+        AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32 | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
+    if flags & !supported != 0
+        || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+        || mask & STATX_RESERVED != 0
+    {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("statx has no runtime");
+    let mm = user.mm().expect("statx has no MM");
+    let path_flags = (flags & !(AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) as usize;
+    let allow_null = path_flags == AT_EMPTY_PATH;
+    if raw[1] == 0 && !allow_null {
+        return Err(Errno::BadAddress);
+    }
+    let stat = query_stat(&runtime, &mm, raw[0], raw[1], path_flags, allow_null)?;
+    copyout(&mm, raw[4], &encode_statx(stat))?;
+    Ok(0)
+}
+
+/// 共用 dirfd、空路径和最后链接属性查询；只有 statx 明确授权的 NULL 才视作空串。
+fn query_stat(
+    runtime: &UserRuntime,
+    mm: &Mm,
+    dirfd: usize,
+    address: usize,
+    flags: usize,
+    allow_null: bool,
+) -> Result<FileStat, Errno> {
+    let pathname = if address == 0 && allow_null {
+        Vec::new()
+    } else {
+        mm.read_c_string(address, MAX_PATH_BYTES)?
+    };
+    if pathname.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dirfd as i32 == AT_FDCWD {
+            let (_, context) = fs_snapshot(runtime);
+            Ok(fs::stat_path(context.cwd())?)
         } else {
-            runtime.files.stat(descriptor(raw[0])?)?
+            Ok(runtime.files.stat(descriptor(dirfd)?)?)
         }
     } else {
-        let mode = if raw[3] & AT_SYMLINK_NOFOLLOW != 0 {
+        let mode = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             ResolveMode::NoFollow
         } else {
             ResolveMode::Follow
         };
-        fs::stat_path(&resolve_bytes(&runtime, raw[0], &pathname, mode)?)?
-    };
-    copyout(&mm, raw[2], &encode_stat(stat)?)?;
-    Ok(0)
+        Ok(fs::stat_path(&resolve_bytes(
+            runtime, dirfd, &pathname, mode,
+        )?)?)
+    }
 }
 
 /// 只在一条dirent完整写入后授权OFD提交cookie，半条记录不算返回前缀。
@@ -689,6 +735,35 @@ pub(super) fn chdir(user: &UserThread, address: usize) -> SysResult {
         address,
         ResolveMode::Follow,
     )?;
+    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
+        return Err(Errno::NotDirectory);
+    }
+    path.check_access(runtime.credentials.uid, runtime.credentials.gid, 1)?;
+    let retired = runtime.fs.lock().context.exchange_cwd(path);
+    drop(retired);
+    Ok(0)
+}
+
+/// 返回真实 cwd 原始字节及 NUL 的总长度，容量不足和用户写故障不改 FS 上下文。
+pub(super) fn getcwd(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("getcwd has no runtime");
+    let mm = user.mm().expect("getcwd has no MM");
+    let (vfs, context) = fs_snapshot(&runtime);
+    let mut bytes = vfs.cwd_bytes(&context)?;
+    if raw[1] < bytes.len() + 1 {
+        return Err(Errno::Range);
+    }
+    // cwd_bytes 已准备包含 NUL 的容量，此处不增加分配或读取第二次路径。
+    bytes.push(0);
+    copyout(&mm, raw[0], &bytes)?;
+    Ok(bytes.len() as isize)
+}
+
+/// 从一次 fd 查找所得 OFD 的真实目录 Path 核搜索权限，锁内只交换 cwd 拥有。
+pub(super) fn fchdir(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("fchdir has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    let path = file.path().ok_or(Errno::NotDirectory)?.clone();
     if path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
         return Err(Errno::NotDirectory);
     }
@@ -789,13 +864,44 @@ fn encode_stat(stat: FileStat) -> Result<[u8; 128], Errno> {
     Ok(bytes)
 }
 
+/// 以零初始化的 256 字节快照交付真实基本属性，未支持能力、时间和保留域保持零。
+fn encode_statx(stat: FileStat) -> [u8; 256] {
+    let mut bytes = [0u8; 256];
+    put_u32(&mut bytes, 0, STATX_BASIC_STATS);
+    put_u32(&mut bytes, 4, stat.block_size);
+    put_u32(&mut bytes, 16, stat.links);
+    put_u32(&mut bytes, 20, stat.uid);
+    put_u32(&mut bytes, 24, stat.gid);
+    bytes[28..30].copy_from_slice(&stat.mode.to_le_bytes());
+    put_u64(&mut bytes, 32, stat.inode);
+    put_u64(&mut bytes, 40, stat.size);
+    put_u64(&mut bytes, 48, stat.blocks);
+    for (offset, time) in [(64, stat.atime), (96, stat.ctime), (112, stat.mtime)] {
+        put_u64(&mut bytes, offset, time.seconds as u64);
+        put_u32(&mut bytes, offset + 8, time.nanoseconds);
+    }
+    for (offset, device) in [(128, stat.rdev), (136, stat.device)] {
+        let (major, minor) = device_numbers(device);
+        put_u32(&mut bytes, offset, major);
+        put_u32(&mut bytes, offset + 4, minor);
+    }
+    bytes
+}
+
+/// 将已有 Linux 编码 dev_t64 拆为实际主次号，高位设备身份不得截断为单个 minor。
+fn device_numbers(device: u64) -> (u32, u32) {
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
+    (major as u32, minor as u32)
+}
+
 /// 完整初始化快照中固定八字节字段编码，偏移只由此模块的ABI常量提供。
-fn put_u64(bytes: &mut [u8; 128], offset: usize, value: u64) {
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 /// 完整初始化快照中固定四字节字段编码，不从用户字节构造Rust布局对象。
-fn put_u32(bytes: &mut [u8; 128], offset: usize, value: u32) {
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 

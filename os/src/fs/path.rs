@@ -259,6 +259,11 @@ impl Vfs {
         &self.inodes
     }
 
+    /// 在已有实例 rename 锁下取得当前目录原始绝对路径，4096 字节预算包含调用方的 NUL。
+    pub fn cwd_bytes(&self, context: &FsContext) -> Result<Vec<u8>, FsError> {
+        path_bytes(context.cwd(), context.root())
+    }
+
     /// 内核从 cwd 无凭据行走，与显式 dirfd 查找共用同一逐组件算法。
     pub fn resolve(
         &self,
@@ -1048,11 +1053,7 @@ impl Vfs {
             }
         };
         let same_parent = old.parent.ptr_eq(&new.parent);
-        let _rename_guard = if same_parent {
-            None
-        } else {
-            Some(old.parent.filesystem().lock_rename())
-        };
+        let _rename_guard = old.parent.filesystem().lock_rename();
         let source_first = same_parent
             || is_path_within(&old.parent, &new.parent)
             || !is_path_within(&new.parent, &old.parent);
@@ -1449,6 +1450,27 @@ impl Vfs {
             let position = unmount_position(&mounts, covered, None)?;
             mounts[position].clone()
         };
+        self.retire_mount(mount)
+    }
+
+    /// 消费解析得到的真实子挂载根，将这份 Mount 拥有作为卸载检查的唯一 held 基数。
+    pub fn unmount_path(&self, path: Path) -> Result<(), FsError> {
+        if !path.dentry.ptr_eq(&path.mount.root) {
+            return Err(FsError::InvalidOperation);
+        }
+        let Path { mount, dentry } = path;
+        drop(dentry);
+        let covered = mount.covered.as_ref().ok_or(FsError::InvalidOperation)?;
+        {
+            let mounts = self.mounts.lock();
+            unmount_position(&mounts, covered, Some(&mount))?;
+        }
+        self.retire_mount(mount)
+    }
+
+    /// 保有同一实例直到锁外同步完成，重查后摘表，名字与后端的最后释放始终在表锁外。
+    fn retire_mount(&self, mount: Arc<Mount>) -> Result<(), FsError> {
+        let covered = mount.covered.as_ref().ok_or(FsError::InvalidOperation)?;
         mount.filesystem.sync()?;
         let victim = {
             let mut mounts = self.mounts.lock();
@@ -1465,6 +1487,29 @@ impl Vfs {
             volume.prune_unused();
         }
         Ok(())
+    }
+
+    /// 锁外准备有限后端快照；同步全部实际实例并保留首个 WB、元数据或 FLUSH 错误。
+    pub fn sync(&self) -> Result<(), FsError> {
+        let mut filesystems = Vec::new();
+        filesystems
+            .try_reserve_exact(self.mount_capacity)
+            .map_err(|_| FsError::NoMemory)?;
+        {
+            let mounts = self.mounts.lock();
+            filesystems.extend(mounts.iter().map(|mount| mount.filesystem.clone()));
+        }
+        filesystems.sort_unstable_by_key(Filesystem::identity_address);
+        filesystems.dedup_by(|a, b| a.ptr_eq(b));
+        let mut result = Ok(());
+        for filesystem in &filesystems {
+            if let Err(error) = filesystem.sync() {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
+        result
     }
 
     /// 回收名字与磁盘静止缓存；RAM 权威目录项和内容不属于可丢弃缓存。
@@ -1634,32 +1679,82 @@ fn append_mount_component(text: &mut Vec<u8>, name: &[u8]) -> Result<(), FsError
     append_mount_bytes(text, &name[start..])
 }
 
-/// 沿真实dentry与覆盖点回到完整根Path；每个名字域的跨父rename锁固定祖先边。
+/// 复用原始路径采集，再独立应用 proc 文本转义，目录名中的 slash 分隔符保持原样。
 fn append_mount_path(text: &mut Vec<u8>, path: &Path, root: &Path) -> Result<(), FsError> {
-    let mut components = Vec::new();
+    append_mount_component(text, &path_bytes(path, root)?)
+}
+
+/// 先沿不可变 covered 链保有全部后端，按 Arc 地址锁序固定跨挂载祖先及名字。
+fn path_bytes(path: &Path, root: &Path) -> Result<Vec<u8>, FsError> {
+    let mut count = 1;
+    let mut mount = &path.mount;
+    while !Arc::ptr_eq(mount, &root.mount) {
+        mount = &mount.covered.as_ref().ok_or(FsError::NotFound)?.mount;
+        count += 1;
+    }
+    let mut filesystems = Vec::new();
+    filesystems
+        .try_reserve_exact(count)
+        .map_err(|_| FsError::NoMemory)?;
+    mount = &path.mount;
+    loop {
+        filesystems.push(mount.filesystem.clone());
+        if Arc::ptr_eq(mount, &root.mount) {
+            break;
+        }
+        mount = &mount.covered.as_ref().ok_or(FsError::NotFound)?.mount;
+    }
+    filesystems.sort_unstable_by_key(Filesystem::identity_address);
+    filesystems.dedup_by(|a, b| a.ptr_eq(b));
+    let mut guards = Vec::new();
+    guards
+        .try_reserve_exact(filesystems.len())
+        .map_err(|_| FsError::NoMemory)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(4096)
+        .map_err(|_| FsError::NoMemory)?;
+    bytes.resize(4096, 0);
+    for filesystem in &filesystems {
+        guards.push(filesystem.lock_rename());
+    }
+    let result = collect_path_bytes(path, root, &mut bytes);
+    drop(guards);
+    let start = result?;
+    let length = 4095 - start;
+    bytes.copy_within(start..4095, 0);
+    bytes.truncate(length);
+    Ok(bytes)
+}
+
+/// 在预留缓冲末端反向写完整组件；原 Path 及 covered 链保活所有临时祖先和名字。
+fn collect_path_bytes(path: &Path, root: &Path, bytes: &mut [u8]) -> Result<usize, FsError> {
     let mut current = path.clone();
+    let mut start = bytes.len() - 1;
     while !current.ptr_eq(root) {
-        let mount = current.mount.clone();
-        let rename = mount.filesystem.lock_rename();
-        while !current.dentry.ptr_eq(&mount.root) && !current.ptr_eq(root) {
-            let (parent, name) = current.dentry.topology_snapshot();
-            components.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-            components.push(name);
-            current.dentry = parent.ok_or(FsError::InvalidOperation)?;
+        if current.dentry.ptr_eq(&current.mount.root) {
+            current = current.mount.covered.clone().ok_or(FsError::NotFound)?;
+            continue;
         }
-        drop(rename);
-        if !current.ptr_eq(root) {
-            current = mount.covered.clone().ok_or(FsError::InvalidOperation)?;
+        if !current.dentry.is_hashed() {
+            return Err(FsError::NotFound);
         }
+        let (parent, name) = current.dentry.topology_snapshot();
+        let required = name.len() + 1;
+        if start < required {
+            return Err(FsError::NameTooLong);
+        }
+        start -= name.len();
+        bytes[start..start + name.len()].copy_from_slice(&name);
+        start -= 1;
+        bytes[start] = b'/';
+        current.dentry = parent.ok_or(FsError::NotFound)?;
     }
-    append_mount_bytes(text, b"/")?;
-    for (position, name) in components.iter().rev().enumerate() {
-        if position != 0 {
-            append_mount_bytes(text, b"/")?;
-        }
-        append_mount_component(text, name)?;
+    if start == bytes.len() - 1 {
+        start -= 1;
+        bytes[start] = b'/';
     }
-    Ok(())
+    Ok(start)
 }
 
 /// 只接受实际正目录，缓存命中和点组件都不能绕过类型检查。

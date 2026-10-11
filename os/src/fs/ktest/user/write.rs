@@ -100,7 +100,7 @@ impl WriteOwner {
         self.inodes
             .try_reserve_exact(16)
             .map_err(|_| TestError("write inode owner OOM"))?;
-        self.user.prepare_mode(context, AccessMode::ReadWrite)
+        self.user.prepare_mode(context, AccessMode::ReadWrite, 4)
     }
     /// 原生 namespace 消费者沿同一 RW PathOwner 准备，并让原清理无论 graph 状态都同步此卷。
     pub(super) fn prepare_namespace(&mut self, context: &TestContext<'_>) -> TestResult {

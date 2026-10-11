@@ -8,7 +8,7 @@ impl UserOwner {
     /// 本例建立原文件和身份夹具；各模式由客体验证字节、fd、信号与真实退出状态。
     pub(super) fn pipe_abi(&mut self, context: &mut TestContext<'_>, mode: &[u8]) -> TestResult {
         if mode == b"v" {
-            self.prepare_mode(context, AccessMode::ReadWrite)?;
+            self.prepare_mode(context, AccessMode::ReadWrite, 4)?;
         } else {
             self.prepare(context)?;
         }

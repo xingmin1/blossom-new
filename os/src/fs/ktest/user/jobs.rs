@@ -206,7 +206,7 @@ impl UserOwner {
 
     /// 与旧串口客体共用 devfs、真实磁盘 loader、TaskGraph 和 UART 阶段 owner。
     fn start_jobs(&mut self, context: &TestContext<'_>, mode: &[u8]) -> Result<Arc<Mm>, TestError> {
-        self.prepare_tty(context)?;
+        self.prepare_tty(context, 4)?;
         checked(
             context,
             tty::set_termios(Termios::default(), 2, FileIoContext::Kernel),

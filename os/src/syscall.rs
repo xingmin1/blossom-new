@@ -6,6 +6,7 @@ mod futex;
 mod memory;
 mod poll;
 pub(crate) mod signal;
+mod system;
 mod task;
 pub(crate) mod time;
 
@@ -162,6 +163,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let result: SysResult = match request.number {
         93 => return Outcome::Exit(((raw[0] & 255) << 8) as i32),
         94 => return Outcome::GroupExit(((raw[0] & 255) << 8) as i32),
+        17 => file::getcwd(user, raw),
         23 => file::dup(user, raw[0]),
         24 => file::dup3(user, raw),
         25 => file::fcntl(user, raw),
@@ -169,9 +171,12 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         35 => file::unlinkat(user, raw),
         36 => file::symlinkat(user, raw),
         37 => file::linkat(user, raw),
+        39 => system::umount(user, &raw),
+        40 => system::mount(user, &raw),
         45 => file::truncate(user, raw),
         46 => file::ftruncate(user, raw),
         49 => file::chdir(user, raw[0]),
+        50 => file::fchdir(user, raw),
         56 => file::openat(user, raw),
         57 => file::close(user, raw[0]),
         59 => file::pipe2(user, raw),
@@ -182,12 +187,13 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         78 => file::readlink(user, raw),
         79 => file::statat(user, raw),
         80 => file::fstat(user, raw),
+        81 => system::sync(user),
         82 => file::fsync(user, raw[0]),
         83 => file::fdatasync(user, raw[0]),
         166 => file::umask(user, raw[0]),
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
-        154..=157 | 173 => task::identity(user, request.number, raw),
+        154..=157 | 173..=177 => task::identity(user, request.number, raw),
         124 => {
             sched::yield_now();
             Ok(0)
@@ -209,6 +215,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         227 => memory::msync(user, raw),
         260 => return task::wait4(user, request),
         276 => file::renameat2(user, raw),
+        291 => file::statx(user, raw),
         _ => Err(Errno::NoSyscall),
     };
     Outcome::Return(result.unwrap_or_else(Errno::result))

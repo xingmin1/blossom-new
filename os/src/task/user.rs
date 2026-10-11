@@ -5,11 +5,16 @@ use alloc::sync::{Arc, Weak};
 use core::alloc::AllocError;
 use core::cell::{Cell, RefCell, RefMut};
 use core::mem;
+#[cfg(feature = "ktest")]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use spin::Once;
 
 use crate::arch::{self, UserContext, UserTrap};
-use crate::fs::{FileTable, FsContext, FsError, Vfs};
+use crate::fs::{
+    open_path_with_flags, DescriptorFlags, FileIoContext, FileTable, FsContext, FsError,
+    ResolveMode, Vfs,
+};
 use crate::mm::space::{self, Mm, MmUser, VmError};
 use crate::sync::{Completion, IrqSaveGuard, SleepMutex, SpinLock};
 use crate::syscall::Restart;
@@ -71,6 +76,33 @@ impl UserRuntime {
             credentials,
             sighand,
         })
+    }
+
+    /// 在尚未发表的用户表中一次准备并发表共享 console 标准流，失败时保留空表契约。
+    pub(crate) fn install_console(&self) -> Result<(), FsError> {
+        let (vfs, context) = {
+            let fs = self.fs.lock();
+            (Arc::clone(&fs.vfs), fs.context.clone())
+        };
+        let path = vfs.resolve(&context, b"/dev/console", ResolveMode::Follow)?;
+        let console = open_path_with_flags(&vfs, path, 2, FileIoContext::Kernel)?;
+        let first = self.files.reserve()?;
+        if first.fd() != 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        let second = self.files.reserve()?;
+        if second.fd() != 1 {
+            return Err(FsError::InvalidOperation);
+        }
+        let third = self.files.reserve()?;
+        if third.fd() != 2 {
+            return Err(FsError::InvalidOperation);
+        }
+        let flags = DescriptorFlags::default();
+        first.publish(console.clone(), flags);
+        second.publish(console.clone(), flags);
+        third.publish(console, flags);
+        Ok(())
     }
 
     /// 消费运行快照，按三个独立共享轴取得文件表、FS和动作表，所有分配在短锁外。
@@ -180,6 +212,8 @@ pub struct UserThread {
     user_time: Once<UserTime>,
     restart: Cell<Option<Restart>>,
     saved_mask: Cell<Option<u64>>,
+    #[cfg(feature = "ktest")]
+    user_cpu_mask: AtomicUsize,
 }
 
 // SAFETY: context、user_timer_interrupts、restart与saved_mask仅由弱关联指定的唯一Running Task访问；
@@ -199,6 +233,8 @@ impl UserThread {
             user_time: Once::new(),
             restart: Cell::new(None),
             saved_mask: Cell::new(None),
+            #[cfg(feature = "ktest")]
+            user_cpu_mask: AtomicUsize::new(0),
         })
     }
 
@@ -479,6 +515,9 @@ impl UserThread {
         // IRQ guard 关闭本地中断，MM 与 CPU 活动拥有保证全部根、用户页及内核映射存活。
         // 架构在同一调用栈返回，IRQ 关闭且硬中断 guard 已结束，期间不切换 Task。
         let trap = unsafe { arch::run_user(&mut context) };
+        #[cfg(feature = "ktest")]
+        self.user_cpu_mask
+            .fetch_or(1usize << local.id, Ordering::Relaxed);
         crate::accounting::user_leave();
         if local.timer_interrupts.load(Ordering::Relaxed) != timer_before {
             self.user_timer_interrupts.set(
@@ -489,6 +528,12 @@ impl UserThread {
             );
         }
         trap
+    }
+
+    /// 取走自上次观察以来真实返回用户入口的 CPU 位集合。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_take_user_cpu_mask(&self) -> usize {
+        self.user_cpu_mask.swap(0, Ordering::AcqRel)
     }
 
     /// 用户入口正常结束时先解绑运行资源，最后 MM 拥有在锁外释放。

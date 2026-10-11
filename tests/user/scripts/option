@@ -1,0 +1,2 @@
+#!/bin/libc-smoke 	--script-option one	 two 	
+# 空格和 tab 只修剪首尾，内部保持一个参数。

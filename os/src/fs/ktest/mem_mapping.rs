@@ -45,7 +45,7 @@ pub(crate) mod mapping {
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
-        fixture.prepare_path(context, AccessMode::ReadOnly)?;
+        fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let covered = resolve(context, fixture, b"/plain")?;
         let memory = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o777))?;
         checked(

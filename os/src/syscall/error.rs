@@ -40,6 +40,7 @@ pub(super) enum Errno {
     ReadOnly = 30,
     TooManyLinks = 31,
     BrokenPipe = 32,
+    Range = 34,
     NameTooLong = 36,
     NoSyscall = 38,
     NotEmpty = 39,
