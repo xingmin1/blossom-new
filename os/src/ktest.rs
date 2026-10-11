@@ -30,7 +30,7 @@ pub(crate) use runner::{early, requested_context, run_boot, spawn_thread, RunCom
 pub(crate) fn fatal_event(kind: &'static str, message: core::fmt::Arguments<'_>) -> ! {
     if crate::arch::cpu_local().is_null() {
         emergency_write(format_args!("KTEST early fatal {}: {}\n", kind, message));
-        crate::arch::shutdown();
+        crate::arch::emergency_shutdown();
     }
     report::fatal_event(kind, message)
 }

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+/bin/mount -t proc proc /proc
+/bin/mount -t tmpfs tmpfs /run
+/bin/mount -t tmpfs tmpfs /tmp

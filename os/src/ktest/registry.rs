@@ -213,7 +213,7 @@ impl Registry {
             "{{\"type\":\"catalog_end\",\"suites\":{},\"cases\":{}}}\n",
             self.count, cases
         ));
-        crate::arch::shutdown()
+        crate::arch::emergency_shutdown()
     }
 }
 struct Attributes<'a>(&'a Defaults);

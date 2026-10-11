@@ -4889,6 +4889,7 @@ pub(crate) mod writes {
                     PROGRAM_WRITE,
                     b"h",
                     false,
+                    0,
                     Credentials {
                         uid: 1001,
                         gid: 1001,

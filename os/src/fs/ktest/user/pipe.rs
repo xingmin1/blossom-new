@@ -22,13 +22,14 @@ impl UserOwner {
                 PROGRAM,
                 mode,
                 false,
+                0,
                 Credentials {
                     uid: 1000,
                     gid: 2000,
                 },
             )?
         } else {
-            self.run_named(context, PROGRAM, mode, false)?
+            self.run_named(context, PROGRAM, mode, false, 0)?
         };
         context.expect_eq(event.status, 0);
         if event.status != 0 {

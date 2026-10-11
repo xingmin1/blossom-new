@@ -11,7 +11,7 @@ impl UserOwner {
         let event = if matches!(mode, b"b" | b"s") {
             self.events_blocked(context, mode)?
         } else {
-            self.run_named(context, PROGRAM, mode, false)?
+            self.run_named(context, PROGRAM, mode, false, 0)?
         };
         context.expect_eq(event.status, 0);
         if event.status != 0 {

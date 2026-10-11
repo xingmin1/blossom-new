@@ -31,7 +31,7 @@ struct SystemOwner {
 
 impl SystemOwner {
     /// 仅借原拥有者已经启动的槽，缺选中槽保留 MissingRoot，不猜其它磁盘。
-    fn selected(&self, selection: BootDevices) -> Result<(DiskRef, Option<DiskRef>), FsError> {
+    fn selected(&self, selection: BootDevices<'_>) -> Result<(DiskRef, Option<DiskRef>), FsError> {
         let root = self
             .owner
             .disks
@@ -50,8 +50,11 @@ impl SystemOwner {
         Ok((root.clone(), extra))
     }
 
-    /// 正文按实际命令行的同一根权限构造卷与视图，所有局部准备成功后才发表。
-    fn prepare(&mut self, context: &mut TestContext<'_>) -> Result<BootDevices, TestError> {
+    /// 正文按永久命令行的根权限构造卷与视图，返回的 init 字节仍借 BootInfo。
+    fn prepare(
+        &mut self,
+        context: &mut TestContext<'_>,
+    ) -> Result<BootDevices<'static>, TestError> {
         self.owner.disk()?;
         let selection = checked(context, boot_devices(crate::boot::info().bootargs()))?;
         let (root, extra) = checked(context, self.selected(selection))?;
@@ -364,7 +367,7 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 6] {
 )]
 pub(crate) mod arguments {
     use super::*;
-    /// 纯命令行模型覆盖根权限默认值、完整 token 及末值优先，实际设备权限由挂载消费者验证。
+    /// 纯命令行模型覆盖根权限及 init 缺键、末值和原始字节边界，实际执行由用户消费者验证。
     #[test]
     #[ktest(tags("B01"))]
     fn parser_boundaries_are_not_boot_selection(context: &mut TestContext<'_>) -> TestResult {
@@ -375,6 +378,7 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: None,
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -383,6 +387,7 @@ pub(crate) mod arguments {
                     root: 1,
                     extra: Some(0),
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -391,6 +396,7 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: Some(2),
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -399,6 +405,7 @@ pub(crate) mod arguments {
                     root: 25,
                     extra: None,
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -407,6 +414,7 @@ pub(crate) mod arguments {
                     root: 1,
                     extra: Some(0),
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -415,6 +423,7 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: None,
                     root_mode: AccessMode::ReadWrite,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -423,6 +432,7 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: None,
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -431,6 +441,7 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: None,
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -439,6 +450,7 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: None,
                     root_mode: AccessMode::ReadWrite,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -447,6 +459,7 @@ pub(crate) mod arguments {
                     root: 1,
                     extra: Some(0),
                     root_mode: AccessMode::ReadWrite,
+                    init: b"/sbin/init",
                 },
             ),
             (
@@ -455,10 +468,38 @@ pub(crate) mod arguments {
                     root: 0,
                     extra: None,
                     root_mode: AccessMode::ReadOnly,
+                    init: b"/sbin/init",
                 },
             ),
         ] {
             context.expect_eq(boot_devices(bytes), Ok(expected));
+        }
+        for (bytes, init) in [
+            (
+                b"root=/dev/vda init=/bin/init".as_slice(),
+                b"/bin/init".as_slice(),
+            ),
+            (b"root=/dev/vda init=/bad init=/sbin/init", b"/sbin/init"),
+            (b"root=/dev/vda init=/sbin/init init=", b""),
+            (b"root=/dev/vda init= init=/missing", b"/missing"),
+            (
+                b"root=/dev/vda\tinit=/bad\x0binit=/sbin/init\x0c",
+                b"/sbin/init",
+            ),
+            (b"root=/dev/vda init=/sbin/init\0tail", b"/sbin/init\0tail"),
+        ] {
+            context.expect_eq(checked(context, boot_devices(bytes))?.init, init);
+        }
+        for bytes in [
+            b"root=/dev/vda init=".as_slice(),
+            b"root=/dev/vda init=/sbin/init\0tail",
+        ] {
+            let selected = checked(context, boot_devices(bytes))?;
+            context.expect_eq(
+                crate::task::exec::Arguments::from_kernel(selected.init, &[selected.init], &[])
+                    .err(),
+                Some(crate::task::exec::ExecError::Format),
+            );
         }
         for bytes in [
             b"".as_slice(),

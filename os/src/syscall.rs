@@ -194,6 +194,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
         154..=157 | 173..=177 => task::identity(user, request.number, raw),
+        142 => return system::reboot(user, &raw),
         124 => {
             sched::yield_now();
             Ok(0)

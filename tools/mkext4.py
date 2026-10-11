@@ -88,37 +88,32 @@ def write_pattern(path, length):
 
 
 
-def system_staging(directory, arch, identity):
-    """只在首次使用时创建可编辑普通系统树，现有目录的内容保持不变。"""
+def system_staging(directory, userland_root):
+    """首次复制已构建 bin/sbin/usr 和普通系统配置；已有 staging 不读取或安装任何输入。"""
     if directory.exists():
         if not directory.is_dir():
             raise ValueError("--staging must be a directory")
         return directory
-    probe = ROOT / "os" / ("bash-rv" if arch == "riscv64" else "bash-la")
-    if not probe.is_file():
-        raise ValueError(f"repository ELF missing: {probe}")
-    with probe.open("rb") as stream:
-        if stream.read(4) != b"\x7fELF":
-            raise ValueError(f"repository probe is not an ELF: {probe}")
+    for name in ("bin", "sbin", "usr"):
+        if not (userland_root / name).is_dir():
+            raise ValueError(f"built userland directory missing: {userland_root / name}")
+    for name in ("bin/busybox", "bin/sh", "sbin/init", "bin/libc-smoke"):
+        if not (userland_root / name).is_file():
+            raise ValueError(f"build the ordinary userland first: {userland_root / name}")
     directory.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="system-staging-", dir=directory.parent) as temporary:
         tree = Path(temporary) / "root"
-        test = tree / "test"
-        (test / "bin").mkdir(parents=True)
-        (test / "links").mkdir()
-        (tree / "mnt" / "extra").mkdir(parents=True)
-        (test / "identity").write_bytes(f"blossom-{identity}\n".encode("ascii"))
-        write_pattern(test / "data.bin", PATTERN_SIZE)
-        (test / "empty").touch()
-        with (test / "sparse.bin").open("xb") as stream:
-            stream.write(pattern(0, 4096))
-            stream.seek(12288)
-            stream.write(pattern(12288, 37))
-        shutil.copyfile(probe, test / "bin" / "probe.elf")
-        os.link(test / "data.bin", test / "links" / "hard")
-        for name, target in (("relative", "../data.bin"), ("absolute", "/test/data.bin"),
-                             ("loop", "loop")):
-            os.symlink(target, test / "links" / name)
+        tree.mkdir(mode=0o755)
+        tree.chmod(0o755)
+        for name in ("bin", "sbin", "usr"):
+            shutil.copytree(userland_root / name, tree / name, symlinks=True)
+        shutil.copytree(ROOT / "userland" / "system" / "etc", tree / "etc", symlinks=True)
+        for name in ("dev", "proc", "run", "tmp", "var", "var/tmp", "root", "home",
+                     "usr/bin", "usr/sbin", "mnt", "mnt/extra"):
+            (tree / name).mkdir(parents=True, exist_ok=True)
+            (tree / name).chmod(0o755)
+        (tree / "tmp").chmod(0o1777)
+        (tree / "var" / "tmp").chmod(0o1777)
         os.rename(tree, directory)
     return directory
 
@@ -407,13 +402,15 @@ def damaged_images(directory):
 
 
 def main(argv=None):
-    """普通系统盘读取可编辑树后原子换盘；既有完整夹具仍由独立选项生成。"""
+    """普通系统盘只在无 source 的首次 staging 安装用户树，既有夹具保持独立生成。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile", choices=PROFILES, default="seed4k")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--arch", choices=("riscv64", "loongarch64"), default="riscv64")
     parser.add_argument("--staging", type=Path)
+    parser.add_argument("--userland-root", type=Path,
+                        help="built bin/sbin/usr input for a new ordinary staging tree")
     parser.add_argument("--identity", choices=("root", "extra"), default="root")
     parser.add_argument("--size-mib", type=int, default=256)
     parser.add_argument("--fixtures", action="store_true")
@@ -450,7 +447,8 @@ def main(argv=None):
             source = args.source
             if source is None:
                 directory = args.staging or ROOT / "build" / f"system-{args.arch}-{args.identity}"
-                source = system_staging(directory, args.arch, args.identity)
+                userland_root = args.userland_root or ROOT / "build" / f"userland-{args.arch}"
+                source = system_staging(directory, userland_root)
             if not source.is_dir():
                 raise ValueError("--source must be an existing directory")
             if args.write_fixture:

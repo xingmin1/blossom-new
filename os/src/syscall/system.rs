@@ -1,9 +1,11 @@
-//! 本地挂载和同步只使用当前用户的真实 VFS，不引入块设备或关机占位路径。
+//! 挂载、同步与关机准入只消费当前用户的真实 VFS、凭据和身份图。
 
 use crate::block::AccessMode;
 use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind};
 use crate::fs::{devfs, procfs, ResolveMode};
 use crate::syscall::error::{Errno, SysResult};
+use crate::syscall::Outcome;
+use crate::task::process::{RootRole, ShutdownOperation};
 use crate::task::UserThread;
 
 const PATH_LIMIT: usize = 4096;
@@ -108,6 +110,37 @@ pub(super) fn sync(user: &UserThread) -> SysResult {
     let vfs = runtime.fs.lock().vfs.clone();
     vfs.sync()?;
     Ok(0)
+}
+
+/// 先核真实 uid 与 32 位 reboot 参数，停机意图交给系统图，当前用户只沿组退出离栈。
+pub(super) fn reboot(user: &UserThread, raw: &[usize; 6]) -> Outcome {
+    let runtime = user.runtime().expect("reboot has no runtime");
+    if runtime.credentials.uid != 0 {
+        return Outcome::Return(Errno::NotPermitted.result());
+    }
+    let magic1 = raw[0] as u32;
+    let magic2 = raw[1] as u32;
+    let command = raw[2] as u32;
+    if magic1 != 0xfee1dead || !matches!(magic2, 672274793 | 85072278 | 369367448 | 537993216) {
+        return Outcome::Return(Errno::InvalidArgument.result());
+    }
+    let operation = match command {
+        // 串口平台没有 CAD 键事件源，其禁用状态固定；重复禁用不另造无人读取的开关。
+        0 => return Outcome::Return(0),
+        0x01234567 => ShutdownOperation::Restart,
+        0xcdef0123 => ShutdownOperation::Halt,
+        0x4321fedc => ShutdownOperation::PowerOff,
+        _ => return Outcome::Return(Errno::InvalidArgument.result()),
+    };
+    let identity = user.identity().expect("reboot has no identity");
+    let graph = identity.graph();
+    if graph.root_role() != RootRole::System {
+        return Outcome::Return(Errno::InvalidArgument.result());
+    }
+    match graph.request_shutdown(operation) {
+        Ok(()) => Outcome::GroupExit(0),
+        Err(error) => Outcome::Return(Errno::from(error).result()),
+    }
 }
 
 /// 只解析唯一完整八进制 mode，空选项使用 1777；逗号、重复键及超出权限位均拒绝。

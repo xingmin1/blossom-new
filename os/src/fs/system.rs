@@ -1,4 +1,4 @@
-//! 明确选择启动盘及根权限，复用正式挂载与文件表完成有限内核读取。
+//! 明确选择启动盘、根权限与用户系统根路径，复用正式挂载和文件表。
 
 use alloc::sync::Arc;
 
@@ -12,23 +12,27 @@ use crate::mm::PAGE_SIZE;
 
 /// 启动参数选中的固定磁盘槽；是否存在由本次真实设备表检查。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BootDevices {
+pub(crate) struct BootDevices<'a> {
     pub root: usize,
     pub extra: Option<usize>,
     pub root_mode: AccessMode,
+    pub init: &'a [u8],
 }
 
-/// 按 ASCII 空白消费 root/extra 和完整 ro/rw token 的最后值，根权限默认只读。
-/// 仅支持完整的 /dev/vd[a-z] 块选择名；缺 root 或最后值不支持时返回 MissingRoot。
-pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices, FsError> {
+/// 一次按 ASCII 空白消费 root/extra/init 与完整 ro/rw token 的最后值，根默认只读。
+/// 仅支持完整的 /dev/vd[a-z] 块选择名；init 仅在缺键时默认 /sbin/init，显式错误留给 exec。
+pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError> {
     let mut root = None;
     let mut extra = None;
     let mut root_mode = AccessMode::ReadOnly;
+    let mut init = None;
     for argument in arguments.split(|byte| byte.is_ascii_whitespace() || *byte == 0x0b) {
         if let Some(value) = argument.strip_prefix(b"root=") {
             root = Some(value);
         } else if let Some(value) = argument.strip_prefix(b"extra=") {
             extra = Some(value);
+        } else if let Some(value) = argument.strip_prefix(b"init=") {
+            init = Some(value);
         } else if argument == b"ro" {
             root_mode = AccessMode::ReadOnly;
         } else if argument == b"rw" {
@@ -39,6 +43,7 @@ pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices, FsError> {
         root: device_index(root.ok_or(FsError::MissingRoot)?)?,
         extra: extra.map(device_index).transpose()?,
         root_mode,
+        init: init.unwrap_or(b"/sbin/init"),
     })
 }
 

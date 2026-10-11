@@ -7,7 +7,7 @@ use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
-use crate::task::process::{TaskGraph, WaitEvent, WaitSelector};
+use crate::task::process::{RootRole, TaskGraph, WaitEvent, WaitSelector};
 use crate::task::{Credentials, JoinObserver, Placement, TaskId, UserRuntime};
 use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
@@ -21,6 +21,7 @@ mod namespace;
 mod pipe;
 mod preparation;
 mod readahead;
+mod system;
 mod tty;
 mod write;
 
@@ -58,7 +59,7 @@ impl UserOwner {
         self.prepare_mode(context, AccessMode::ReadOnly, 4)
     }
 
-    /// 显式卷权限与挂载容量决定本例视图，不根据程序名字推导资源预算。
+    /// 显式卷权限与挂载容量决定本例视图，普通消费者始终建立 Kernel 根图。
     fn prepare_mode(
         &mut self,
         context: &TestContext<'_>,
@@ -66,7 +67,7 @@ impl UserOwner {
         mount_capacity: usize,
     ) -> TestResult {
         self.path.prepare_path(context, mode, mount_capacity)?;
-        self.graph = Some(TaskGraph::try_new(64).map_err(|error| {
+        self.graph = Some(TaskGraph::try_new(64, RootRole::Kernel).map_err(|error| {
             context.diagnostic(format_args!("user-graph-prepare error={:?}", error));
             TestError("user identity graph preparation failed")
         })?);
@@ -76,6 +77,21 @@ impl UserOwner {
     /// 按本例显式容量准备根视图，再把真实 devfs 挂在 ext4 的空 `/dev` 目录。
     fn prepare_tty(&mut self, context: &TestContext<'_>, mount_capacity: usize) -> TestResult {
         self.prepare_mode(context, AccessMode::ReadOnly, mount_capacity)?;
+        self.mount_console_devfs(context)
+    }
+
+    /// 系统例直接在同源八槽视图中构造唯一系统图，准备失败仍由原夹具回收。
+    fn prepare_system(&mut self, context: &TestContext<'_>) -> TestResult {
+        self.path.prepare_path(context, AccessMode::ReadOnly, 8)?;
+        self.graph = Some(TaskGraph::try_new(64, RootRole::System).map_err(|error| {
+            context.diagnostic(format_args!("user-system-graph-prepare error={:?}", error));
+            TestError("system identity graph preparation failed")
+        })?);
+        self.mount_console_devfs(context)
+    }
+
+    /// 所有 console 消费者在原 ext4 的实际挂载点安装同一种 devfs。
+    fn mount_console_devfs(&self, context: &TestContext<'_>) -> TestResult {
         let mountpoint = checked(
             context,
             self.path
@@ -238,24 +254,33 @@ impl UserOwner {
         })
     }
 
-    /// 普通参数只选确定程序模式，真实退出与整棵树离栈后才返回，不用用户完成字当回收。
+    /// 具名模式显式传入完整预期退出状态，正常信号退出不关闭可继续运行的身份图。
     fn run_named(
         &mut self,
         context: &mut TestContext<'_>,
         program: &[u8],
         mode: &[u8],
         reserve_parent_fd: bool,
+        expected_status: i32,
     ) -> Result<WaitEvent, TestError> {
-        self.run_named_as(context, program, mode, reserve_parent_fd, Credentials::ROOT)
+        self.run_named_as(
+            context,
+            program,
+            mode,
+            reserve_parent_fd,
+            expected_status,
+            Credentials::ROOT,
+        )
     }
 
-    /// 映像准备与Runtime使用同一凭据，用户请求仍经正式dispatcher与正常wait。
+    /// 映像与 Runtime 共用真实凭据；只有实际 wait 状态不符才永久取消本图的余下用户。
     fn run_named_as(
         &mut self,
         context: &mut TestContext<'_>,
         program: &[u8],
         mode: &[u8],
         reserve_parent_fd: bool,
+        expected_status: i32,
         credentials: Credentials,
     ) -> Result<WaitEvent, TestError> {
         let arguments = Arguments::from_kernel(program, &[program, mode], &[])
@@ -268,7 +293,7 @@ impl UserOwner {
         let affine_group = !matches!(mode.first(), Some(b't' | b'T' | b'g' | b'c'));
         self.start_program(context, image, affine_group, reserve_parent_fd, credentials)?;
         let event = self.wait(context)?;
-        let cancelling = event.status != 0;
+        let cancelling = event.status != expected_status;
         if cancelling {
             self.graph().request_root_exit(9);
         }
@@ -285,7 +310,7 @@ impl UserOwner {
     fn production_writeback_cold_reopen(&mut self, context: &mut TestContext<'_>) -> TestResult {
         const PROGRAM: &[u8] = b"/test/bin/user-writeback";
         self.prepare_mode(context, AccessMode::ReadWrite, 4)?;
-        let event = self.run_named(context, PROGRAM, b"w", false)?;
+        let event = self.run_named(context, PROGRAM, b"w", false, 0)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
             return Err(TestError("production writeback writer failed"));
@@ -365,7 +390,7 @@ impl UserOwner {
         context.expect_eq(root.filesystem().mode(), AccessMode::ReadOnly);
         context.expect_eq(root.filesystem().device() != old_device, true);
         drop(root);
-        let event = self.run_named(context, PROGRAM, b"r", false)?;
+        let event = self.run_named(context, PROGRAM, b"r", false, 0)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
             return Err(TestError("production writeback cold reader failed"));
@@ -1307,7 +1332,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-io", b"raw", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-io", b"raw", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1610,6 +1635,29 @@ pub(crate) mod programs {
         fixture.script_exec(context)
     }
 
+    /// 系统根以普通 fork、pipe 和 wait 消费两类孤儿后才请求真实 PowerOff 意图。
+    #[test]
+    #[ktest(tags("T33", "fs-system-user", "fs-pid1"), timeout_ms = 120000)]
+    fn system_pid1_adopts_orphans(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.system_pid1_adopts_orphans(context)
+    }
+
+    /// 同号码内核根按普通 SIGKILL 退出，两种真实凭据分别核 reboot 权限与参数错误。
+    #[test]
+    #[case("root", false)]
+    #[case("nonroot", true)]
+    #[ktest(tags("T33", "fs-system-user", "fs-pid1"), timeout_ms = 120000)]
+    fn fixture_root_signal_semantics(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        nonroot: bool,
+    ) -> TestResult {
+        fixture.fixture_root_signal_semantics(context, nonroot)
+    }
+
     /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。
     #[test]
     #[ktest(tags("T04", "T30", "fs-device-mapping"))]
@@ -1632,7 +1680,7 @@ pub(crate) mod programs {
                 AccessMode::ReadOnly,
             ),
         )?;
-        let event = fixture.run_named(context, b"/test/bin/user-device-map", b"raw", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-device-map", b"raw", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1781,8 +1829,14 @@ pub(crate) mod programs {
             "user-access-credentials uid={} gid={} denied_owner={}:{} no_search_owner={}:{}",
             credentials.uid, credentials.gid, denied.uid, denied.gid, no_search.uid, no_search.gid
         ));
-        let event =
-            fixture.run_named_as(context, b"/test/bin/user-io", b"access", false, credentials)?;
+        let event = fixture.run_named_as(
+            context,
+            b"/test/bin/user-io",
+            b"access",
+            false,
+            0,
+            credentials,
+        )?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1797,7 +1851,7 @@ pub(crate) mod programs {
         fixture.prepare(context)?;
         const MODES: &[&[u8]] = &[b"f0", b"v1", b"s2", b"T3"];
         for &mode in MODES {
-            let event = fixture.run_named(context, b"/test/bin/user-clone", mode, false)?;
+            let event = fixture.run_named(context, b"/test/bin/user-clone", mode, false, 0)?;
             context.expect_eq(event.status, 0);
         }
         Ok(())
@@ -1811,7 +1865,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-clone", b"r0", true)?;
+        let event = fixture.run_named(context, b"/test/bin/user-clone", b"r0", true, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1823,7 +1877,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"p", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"p", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1835,7 +1889,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"v", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"v", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1847,9 +1901,9 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"a", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"a", false, 0)?;
         context.expect_eq(event.status, 0);
-        let reset = fixture.run_named(context, b"/test/bin/user-signal", b"x", false)?;
+        let reset = fixture.run_named(context, b"/test/bin/user-signal", b"x", false, 10)?;
         context.expect_eq(reset.status, 10);
         Ok(())
     }
@@ -1883,7 +1937,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"f", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"f", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1895,7 +1949,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"z", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"z", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1907,7 +1961,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"n", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"n", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1919,11 +1973,11 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let returned = fixture.run_named(context, b"/test/bin/user-signal", b"b", false)?;
+        let returned = fixture.run_named(context, b"/test/bin/user-signal", b"b", false, 11)?;
         context.expect_eq(returned.status, 11);
-        let written = fixture.run_named(context, b"/test/bin/user-signal", b"w", false)?;
+        let written = fixture.run_named(context, b"/test/bin/user-signal", b"w", false, 11)?;
         context.expect_eq(written.status, 11);
-        let privileged = fixture.run_named(context, b"/test/bin/user-signal", b"k", false)?;
+        let privileged = fixture.run_named(context, b"/test/bin/user-signal", b"k", false, 11)?;
         context.expect_eq(privileged.status, 11);
         Ok(())
     }
@@ -1935,7 +1989,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"s", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"s", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1947,7 +2001,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"d", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"d", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1959,7 +2013,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"g", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"g", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -1982,7 +2036,7 @@ pub(crate) mod programs {
         fixture: &mut UserOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let event = fixture.run_named(context, b"/test/bin/user-signal", b"c", false)?;
+        let event = fixture.run_named(context, b"/test/bin/user-signal", b"c", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
     }
@@ -2122,7 +2176,8 @@ pub(crate) mod programs {
     ) -> TestResult {
         fixture.prepare(context)?;
         for (mode, signal) in [(b"s" as &[u8], 11), (b"b", 7), (b"i", 4)] {
-            let event = fixture.run_named(context, b"/test/bin/user-lifecycle", mode, false)?;
+            let event =
+                fixture.run_named(context, b"/test/bin/user-lifecycle", mode, false, signal)?;
             context.expect_eq(event.status, signal);
         }
         Ok(())

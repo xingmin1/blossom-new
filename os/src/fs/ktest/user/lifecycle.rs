@@ -69,14 +69,15 @@ impl UserOwner {
         Ok(image)
     }
 
-    /// 状态消费与整组离栈走既有路径，异常状态不被清理动作转换成成功。
+    /// 只在完整 wait 状态不属于调用者明确接受的结果时取消，预期信号退出仍正常回收离栈。
     fn finish_lifecycle(
         &mut self,
         context: &mut TestContext<'_>,
         mode: &[u8],
+        expected_statuses: &[i32],
     ) -> Result<WaitEvent, TestError> {
         let event = self.wait(context)?;
-        let cancelling = event.status != 0;
+        let cancelling = !expected_statuses.contains(&event.status);
         if cancelling {
             self.graph().request_root_exit(9);
         }
@@ -149,10 +150,11 @@ impl UserOwner {
                     executor.id().as_usize()
                 ));
                 Self::lifecycle_go(&new_mm, 100)?;
-                let event = self.finish_lifecycle(context, mode)?;
+                let event = self.finish_lifecycle(context, mode, &[0])?;
                 context.expect_eq(event.status, 0);
             } else {
-                let event = self.finish_lifecycle(context, mode)?;
+                let expected_statuses: &[i32] = if mode == b"c" { &[9, 11] } else { &[] };
+                let event = self.finish_lifecycle(context, mode, expected_statuses)?;
                 context.expect_eq(mode == b"c" && matches!(event.status, 9 | 11), true);
                 context.diagnostic(format_args!("user-exec-race fatal-status={}", event.status));
             }
@@ -195,7 +197,7 @@ impl UserOwner {
             "user-exec-shared private-files=1 private-sighand=1 old-mm-users=1 clear-tid=0"
         ));
         Self::lifecycle_go(&new_mm, 100)?;
-        let event = self.finish_lifecycle(context, b"x")?;
+        let event = self.finish_lifecycle(context, b"x", &[0])?;
         context.expect_eq(event.status, 0);
         context.expect_eq(old_mm.user_count(), 0);
         context.expect_eq(new_mm.user_count(), 0);
@@ -204,7 +206,7 @@ impl UserOwner {
 
     /// 父在旧Mm释放时恢复而非等待新程序退出；取消后子仍能独立完成与转亲。
     pub(super) fn lifecycle_vfork(&mut self, context: &mut TestContext<'_>) -> TestResult {
-        let event = self.run_named(context, PROGRAM, b"z", false)?;
+        let event = self.run_named(context, PROGRAM, b"z", false, 0)?;
         context.expect_eq(event.status, 0);
         for mode in [b"v" as &[u8], b"k"] {
             let (old_mm, root) = self.start_lifecycle(context, mode)?;
@@ -235,7 +237,7 @@ impl UserOwner {
                 self.reap_children(context, false)?;
             } else {
                 Self::lifecycle_go(&old_mm, 1)?;
-                let event = self.finish_lifecycle(context, mode)?;
+                let event = self.finish_lifecycle(context, mode, &[0])?;
                 context.expect_eq(event.status, 0);
             }
             context.expect_eq(old_mm.user_count(), 0);
@@ -312,7 +314,7 @@ impl UserOwner {
             old_number
         ));
         Self::lifecycle_go(&mm, 5)?;
-        let event = self.finish_lifecycle(context, b"p")?;
+        let event = self.finish_lifecycle(context, b"p", &[0])?;
         context.expect_eq(event.status, 0);
         context.expect_eq(mm.user_count(), 0);
 
@@ -321,7 +323,7 @@ impl UserOwner {
         let peer = self.futex_child(&mm, 0)?;
         Self::futex_waiting(&mm, &peer, FUTEX_CONTROL + 68, true, u32::MAX)?;
         Self::lifecycle_go(&mm, 1)?;
-        let event = self.finish_lifecycle(context, b"g")?;
+        let event = self.finish_lifecycle(context, b"g", &[5 << 8])?;
         context.expect_eq(event.status, 5 << 8);
         context.expect_eq(peer.mm().is_none(), true);
         context.expect_eq(mm.user_count(), 0);
@@ -355,7 +357,7 @@ impl UserOwner {
         let count = futex::wake(&mm, FUTEX_CONTROL + 12, false, 1, u32::MAX)
             .map_err(|_| TestError("wait计算子真实futex唤醒失败"))?;
         context.expect_eq(count, 1);
-        let event = self.finish_lifecycle(context, b"w")?;
+        let event = self.finish_lifecycle(context, b"w", &[0])?;
         context.expect_eq(event.status, 0);
         let first = mm
             .load_user_u32(FUTEX_CONTROL + 24)
@@ -422,7 +424,7 @@ impl UserOwner {
                 mode, task_id.as_usize(), wait_result, wait_status, signal_result
             ));
             Self::lifecycle_go(&mm, 3)?;
-            let event = self.finish_lifecycle(context, mode)?;
+            let event = self.finish_lifecycle(context, mode, &[0])?;
             context.expect_eq(event.status, 0);
             context.expect_eq(mm.user_count(), 0);
         }

@@ -689,9 +689,29 @@ pub unsafe fn external_complete(source: u32) {
     // SAFETY: 本核真实 claim 与已验证 S context 对应，固定 enable 保留其完成资格。
     unsafe { mmio_write(claim_offset(), source) };
 }
-/// 请求 SBI SRST 关机，失败或异常返回均报告。
+/// 用户与 FS 生命周期已停稳后请求 SBI SRST poweroff，拒绝固件错误和异常返回。
 pub fn shutdown() -> ! {
-    sbi(0x53525354, 0, 0, 0, 0).expect("SBI SRST failed");
+    system_reset(0)
+}
+
+/// 所选固件平台的 HALT 与 poweroff 使用同一整机停止动作，调用前生命周期必须停稳。
+pub fn halt() -> ! {
+    shutdown()
+}
+
+/// 用户与 FS 生命周期已停稳后请求 SBI SRST cold restart，拒绝固件错误和异常返回。
+pub fn restart() -> ! {
+    system_reset(1)
+}
+
+/// 早期或致命错误仅请求固件 poweroff，不等待 AP、CSD 或文件生命周期。
+pub fn emergency_shutdown() -> ! {
+    system_reset(0)
+}
+
+/// 使用 SRST 的明确 reset type 和无故障 reason；成功动作不得返回内核。
+fn system_reset(reset_type: usize) -> ! {
+    sbi(0x53525354, 0, reset_type, 0, 0).expect("SBI SRST failed");
     panic!("SBI SRST unexpectedly returned");
 }
 #[cfg(feature = "ktest")]

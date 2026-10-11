@@ -5,6 +5,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::pin::pin;
 use core::ptr;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::fs::{tty, FsError};
 use crate::sched;
@@ -35,6 +36,25 @@ pub(crate) enum ProcessError {
     Access,
     InvalidArgument,
 }
+
+/// 根回收职责属于构造图时选定的角色，不由首个号码推断。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootRole {
+    Kernel,
+    System,
+}
+
+/// 用户接受的最终机器动作，图只保存意图并停止用户生产者。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ShutdownOperation {
+    Halt = 2,
+    PowerOff = 3,
+    Restart = 4,
+}
+
+const RUNNING: u8 = 0;
+const CANCELLED: u8 = 1;
 
 /// 数字不可变的身份对象；诊断引用不参与号码占用判定。
 pub(crate) struct Pid {
@@ -101,6 +121,11 @@ impl ThreadGroup {
     /// 借用组独有pending与控制拥有，不把共享动作轴等同于线程组。
     pub(crate) fn signals(&self) -> &Arc<SignalGroup> {
         &self.signals
+    }
+
+    /// 系统首根角色仅保存在原信号对象中，普通号码1没有特殊退出或信号权限。
+    pub(crate) fn is_system_init(&self) -> bool {
+        self.signals.is_system_init()
     }
 
     /// 借用真实组CPU时间和itimer拥有，线程私有时间由执行者另持。
@@ -252,6 +277,8 @@ struct Slot {
     roles: [usize; 4],
     thread: Option<ThreadEntry>,
     process: Option<ProcessEntry>,
+    // 用户wait与autoreap移出的未确认离栈观察，不继续占用任何号码角色。
+    completed: Option<Box<PreparedExecution>>,
 }
 
 impl Slot {
@@ -263,6 +290,16 @@ impl Slot {
             roles: [0; 4],
             thread: None,
             process: None,
+            completed: None,
+        }
+    }
+}
+
+impl Drop for Slot {
+    /// 整图释放时迭代归还残余小观察，未确认离栈者仍由scheduler独立拥有运行资源。
+    fn drop(&mut self) {
+        while let Some(mut execution) = self.completed.take() {
+            self.completed = execution.next.take();
         }
     }
 }
@@ -271,6 +308,9 @@ impl Slot {
 pub(crate) struct TaskGraph {
     // ponytail: 有限号码域使用线性预留与转亲扫描；大号码域再换独立空闲索引。
     slots: SpinLock<Vec<Slot>>,
+    root_role: RootRole,
+    // 仅持slots关系锁提交；锁外Acquire读取只观察已接受的最终动作。
+    closing: AtomicU8,
     waiters: WaitQueue,
     control_waiters: WaitQueue,
 }
@@ -290,8 +330,8 @@ pub(crate) struct PreparedIdentity {
 }
 
 impl TaskGraph {
-    /// 锁外预留整个有限号码域，1..=capacity 兼容有符号 Linux pid_t。
-    pub(crate) fn try_new(capacity: usize) -> Result<Arc<Self>, ProcessError> {
+    /// 锁外预留整个有限号码域并固定根角色，1..=capacity兼容有符号Linux pid_t。
+    pub(crate) fn try_new(capacity: usize, root_role: RootRole) -> Result<Arc<Self>, ProcessError> {
         if capacity == 0 || (i32::MAX as usize) < capacity {
             return Err(ProcessError::InvalidCapacity);
         }
@@ -302,13 +342,68 @@ impl TaskGraph {
         slots.resize_with(capacity, Slot::vacant);
         Arc::try_new(Self {
             slots: SpinLock::new(slots),
+            root_role,
+            closing: AtomicU8::new(RUNNING),
             waiters: WaitQueue::new(),
             control_waiters: WaitQueue::new(),
         })
         .map_err(|_| ProcessError::NoMemory)
     }
 
-    /// 新进程私有预留号码与已解码的退出信号，锁外完成分配；None指定内核根回收者。
+    /// 根角色在构造后不变，系统调用与协调者使用同一图判断职责。
+    pub(crate) fn root_role(&self) -> RootRole {
+        self.root_role
+    }
+
+    /// 保存首次系统关机动作并在同一关系事务关闭派生准入、请求全部活组退出。
+    pub(crate) fn request_shutdown(
+        &self,
+        operation: ShutdownOperation,
+    ) -> Result<(), ProcessError> {
+        let capacity = {
+            let slots = self.slots.lock();
+            if self.root_role != RootRole::System {
+                return Err(ProcessError::InvalidArgument);
+            }
+            if self.closing.load(Ordering::Relaxed) != RUNNING {
+                return Err(ProcessError::Busy);
+            }
+            let root = slots[0]
+                .process
+                .as_ref()
+                .ok_or(ProcessError::InvalidParent)?;
+            if !root.group.is_system_init()
+                || root.parent.is_some()
+                || root.members == 0
+                || root.exit.is_some()
+                || root.group.signals.exit_request().is_some()
+            {
+                return Err(ProcessError::InvalidParent);
+            }
+            self.closing.store(operation as u8, Ordering::Release);
+            for process in slots.iter().filter_map(|slot| slot.process.as_ref()) {
+                if 0 < process.members {
+                    process.group.signals.mark_exit(0);
+                }
+            }
+            slots.len()
+        };
+        self.notify_exiting_groups(capacity);
+        Ok(())
+    }
+
+    /// 只返回实际接受的用户机器动作，kernel取消不伪造关机操作。
+    pub(crate) fn shutdown_operation(&self) -> Option<ShutdownOperation> {
+        match self.closing.load(Ordering::Acquire) {
+            RUNNING | CANCELLED => None,
+            2 => Some(ShutdownOperation::Halt),
+            3 => Some(ShutdownOperation::PowerOff),
+            4 => Some(ShutdownOperation::Restart),
+            _ => panic!("invalid task graph shutdown state"),
+        }
+    }
+
+    /// 新进程私有预留号码与退出信号，None仅为Kernel根或System唯一首根。
     pub(crate) fn prepare_process(
         self: &Arc<Self>,
         parent: Option<&Arc<ThreadGroup>>,
@@ -329,7 +424,8 @@ impl TaskGraph {
             }
             None => (pid.clone(), pid.clone()),
         };
-        let signals = SignalGroup::try_new(Arc::downgrade(self), pid.number, sighand)
+        let system_init = self.root_role == RootRole::System && parent.is_none();
+        let signals = SignalGroup::try_new(Arc::downgrade(self), pid.number, sighand, system_init)
             .map_err(|_| ProcessError::NoMemory)?;
         let private = ThreadSignals::try_new(signals.clone(), inherited)
             .map_err(|_| ProcessError::NoMemory)?;
@@ -389,7 +485,7 @@ impl TaskGraph {
         })
     }
 
-    /// 同一关系锁中核对真实组并取得唯一空号，后续对象准备不持图锁。
+    /// 关系锁内统一检查关闭准入、真实父组和唯一首根预留，后续准备不持图锁。
     fn reserve_number(
         self: &Arc<Self>,
         parent: Option<&Arc<ThreadGroup>>,
@@ -398,6 +494,9 @@ impl TaskGraph {
         self.prune_completed();
         let index = {
             let mut slots = self.slots.lock();
+            if self.closing.load(Ordering::Relaxed) != RUNNING {
+                return Err(ProcessError::Busy);
+            }
             if let Some(parent) = parent {
                 self.live_parent(&slots, parent)?;
                 if thread
@@ -411,10 +510,17 @@ impl TaskGraph {
                     return Err(ProcessError::Busy);
                 }
             }
-            let index = slots
-                .iter()
-                .position(|slot| !slot.reserved && slot.pid.is_none())
-                .ok_or(ProcessError::NoPid)?;
+            let index = if self.root_role == RootRole::System && parent.is_none() {
+                if slots[0].reserved || slots[0].pid.is_some() {
+                    return Err(ProcessError::InvalidParent);
+                }
+                0
+            } else {
+                slots
+                    .iter()
+                    .position(|slot| !slot.reserved && slot.pid.is_none())
+                    .ok_or(ProcessError::NoPid)?
+            };
             slots[index].reserved = true;
             index
         };
@@ -425,22 +531,15 @@ impl TaskGraph {
         })
     }
 
-    /// 再次创建前摘走已确认离栈的观察，不让活组积累历史完成对象。
+    /// 再次创建前移出活组及已回收槽中确认离栈的观察，锁外释放节点。
     fn prune_completed(&self) {
         let mut discarded = None;
         {
             let mut slots = self.slots.lock();
-            for process in slots.iter_mut().filter_map(|slot| slot.process.as_mut()) {
-                let mut link = &mut process.completed;
-                while let Some(execution) = link.as_ref() {
-                    if execution.join.try_join().is_some() {
-                        let mut execution = link.take().expect("completed member disappeared");
-                        *link = execution.next.take();
-                        execution.next = discarded.take();
-                        discarded = Some(execution);
-                    } else {
-                        link = &mut link.as_mut().expect("member disappeared").next;
-                    }
+            for slot in slots.iter_mut() {
+                discard_completed(&mut slot.completed, &mut discarded);
+                if let Some(process) = slot.process.as_mut() {
+                    discard_completed(&mut process.completed, &mut discarded);
                 }
             }
         }
@@ -485,9 +584,19 @@ impl TaskGraph {
         self.slots.lock().get(pid.checked_sub(1)?)?.pid.clone()
     }
 
-    /// 首个组退出原因保留，锁外通知所有真实成员在自己的合法用户返回点退出。
+    /// 图关系锁下保留首个组退出原因，锁外通知真实成员在合法点退出。
     pub(crate) fn request_exit(&self, identity: &UserIdentity, status: i32) {
-        identity.group.signals.request_exit(status);
+        {
+            let slots = self.slots.lock();
+            assert!(ptr::eq(self, identity.graph.as_ref()));
+            let process = slots[identity.tgid() - 1]
+                .process
+                .as_ref()
+                .expect("exit requested for an unpublished process");
+            assert!(Arc::ptr_eq(&process.group, &identity.group));
+            identity.group.signals.mark_exit(status);
+        }
+        identity.group.signals.notify();
     }
 
     /// 当前执行者在IRQ和业务短锁外读取本组控制，不允许远核改用户现场或释放栈。
@@ -651,7 +760,7 @@ impl TaskGraph {
         Ok(process)
     }
 
-    /// 最后成员在锁外停稳定时器后重查父关系，按父当前处置发表退出或移出回收拥有。
+    /// 最后成员锁外停稳定时器并转完全部直属子，随后重查父处置发表最终退出事件。
     pub(crate) fn exit(
         &self,
         identity: &UserIdentity,
@@ -727,6 +836,10 @@ impl TaskGraph {
                 process.control_event = Some(event);
             }
             let last = process.members == 0;
+            assert!(
+                !last || !group.is_system_init() || self.closing.load(Ordering::Relaxed) != RUNNING,
+                "system init exited without shutdown or kernel cancellation"
+            );
             let exit = last.then(|| WaitEvent {
                 pid: identity.tgid(),
                 status: group
@@ -753,13 +866,13 @@ impl TaskGraph {
                     .map(|tty| (tty, old_sid.clone()));
                 drop(relations);
                 notify_new_orphan_locked(&mut slots, &old_pgid, old_orphan);
-                notify_unlinked_children_locked(&mut slots, identity.tgid(), &old_pgid, &old_sid);
-                for slot in slots.iter_mut() {
-                    if let Some(child) = slot.process.as_mut() {
-                        if child.parent == Some(identity.tgid()) {
-                            child.parent = None;
-                        }
-                    }
+                if !group.is_system_init() {
+                    notify_unlinked_children_locked(
+                        &mut slots,
+                        identity.tgid(),
+                        &old_pgid,
+                        &old_sid,
+                    );
                 }
                 hangup
             } else {
@@ -776,6 +889,7 @@ impl TaskGraph {
                 tty::hangup_session(self, &session);
             }
             self.flush_group_notifications();
+            self.reparent_children(&group);
             let (parent, mut retired) = {
                 let mut slots = self.slots.lock();
                 let process = slots[identity.tgid() - 1]
@@ -784,7 +898,30 @@ impl TaskGraph {
                     .expect("last exiting group disappeared before timer stop");
                 assert!(Arc::ptr_eq(&process.group, &group));
                 assert_eq!(process.members, 0);
+                assert!(
+                    process.exec_owner.is_none(),
+                    "retiring group has an exec owner"
+                );
+                assert!(
+                    process.exit.is_none(),
+                    "retiring group already has an exit event"
+                );
+                assert!(
+                    !group.is_system_init() || self.closing.load(Ordering::Relaxed) != RUNNING,
+                    "system init retired without shutdown or kernel cancellation"
+                );
                 let parent_number = process.parent;
+                assert!(
+                    !slots
+                        .iter()
+                        .filter_map(|slot| slot.process.as_ref())
+                        .any(|child| child.parent == Some(group.tgid())),
+                    "parent exit published before child reparenting"
+                );
+                let process = slots[group.tgid() - 1]
+                    .process
+                    .as_mut()
+                    .expect("retiring group disappeared");
                 process.exit = Some(exit);
                 // 父可能在timer.stop期间最后退出并转亲；最终发布只使用此刻的关系与动作表。
                 let signum = group.relations.lock().exit_signal;
@@ -802,7 +939,7 @@ impl TaskGraph {
                             .map(|thread| &thread.signals),
                     )
                 });
-                let retired = autoreap.then(|| reap_child(&mut slots, identity.tgid() - 1));
+                let retired = autoreap.then(|| reap_child(&mut slots, identity.tgid() - 1, false));
                 (parent, retired)
             };
             if let Some(parent) = parent {
@@ -824,6 +961,78 @@ impl TaskGraph {
         drop(group);
     }
 
+    /// 逐槽转亲并递送已有完整僵尸事件，每次关系与处置同锁提交，最后拥有锁外释放。
+    fn reparent_children(&self, group: &ThreadGroup) {
+        let capacity = self.slots.lock().len();
+        for index in 0..capacity {
+            let (parent, mut retired) = {
+                let mut slots = self.slots.lock();
+                let father = slots[group.tgid() - 1]
+                    .process
+                    .as_ref()
+                    .expect("retiring parent disappeared before reparenting");
+                assert!(ptr::eq(father.group.as_ref(), group));
+                assert_eq!(father.members, 0);
+                assert!(father.exit.is_none() && father.exec_owner.is_none());
+                if !slots[index]
+                    .process
+                    .as_ref()
+                    .is_some_and(|child| child.parent == Some(group.tgid()))
+                {
+                    continue;
+                }
+                let parent = if self.root_role == RootRole::System
+                    && self.closing.load(Ordering::Relaxed) == RUNNING
+                {
+                    let root = slots[0]
+                        .process
+                        .as_ref()
+                        .expect("system reaper disappeared");
+                    assert!(
+                        root.group.is_system_init()
+                            && root.group.tgid() == 1
+                            && root.parent.is_none()
+                            && 0 < root.members
+                            && root.exit.is_none(),
+                        "system reaper is not a live root"
+                    );
+                    Some(root.group.clone())
+                } else {
+                    None
+                };
+                let child = slots[index].process.as_mut().expect("child disappeared");
+                child.parent = parent.as_ref().map(|parent| parent.tgid());
+                if self.root_role == RootRole::System {
+                    child.group.relations.lock().exit_signal = 17;
+                }
+                let child_group = child.group.clone();
+                let event = child.exit;
+                let autoreap = match (parent.as_ref(), event) {
+                    (Some(parent), Some(event)) => parent.signals.deliver_child_exit(
+                        child_signal_info(17, exit_child_event(&child_group, event.status)),
+                        slots
+                            .iter()
+                            .filter_map(|slot| slot.thread.as_ref())
+                            .filter(|thread| Arc::ptr_eq(&thread.group, parent))
+                            .map(|thread| &thread.signals),
+                    ),
+                    _ => false,
+                };
+                // 原槽或移出的回收拥有持续保活child_group，临时引用不会在图锁中成为最后拥有。
+                let retired = autoreap.then(|| reap_child(&mut slots, index, false));
+                (parent.filter(|_| event.is_some()), retired)
+            };
+            if let Some(parent) = parent {
+                parent.signals.notify();
+            }
+            if let Some(retired) = retired.as_mut() {
+                self.complete_retired_notification(retired);
+            }
+            drop(retired);
+        }
+        self.waiters.wake_all();
+    }
+
     /// 用户等待只消费退出信息，不等待成员离栈；nowait保留事件，具体子PID只允许一次消费。
     pub(crate) fn try_wait(
         &self,
@@ -831,16 +1040,17 @@ impl TaskGraph {
         pid: usize,
         nowait: bool,
     ) -> Result<Option<WaitEvent>, ProcessError> {
-        self.collect_child(parent, pid, nowait)
+        self.collect_child(parent, pid, nowait, false)
             .map(|child| child.map(|child| child.event))
     }
 
-    /// 同锁核对亲缘并移出完整回收快照，通知与所有最后拥有均在关系锁外。
+    /// 同锁消费亲缘与事件，kernel等待保留离栈链，用户消费把未确认观察转给原槽。
     fn collect_child(
         &self,
         parent: Option<&ThreadGroup>,
         pid: usize,
         nowait: bool,
+        kernel_join: bool,
     ) -> Result<Option<CollectedChild>, ProcessError> {
         let mut collected = {
             let mut slots = self.slots.lock();
@@ -871,7 +1081,7 @@ impl TaskGraph {
             if let Some(parent) = parent {
                 parent.time.add_reaped_child(&process.group.time);
             }
-            reap_child(&mut slots, index)
+            reap_child(&mut slots, index, kernel_join)
         };
         self.complete_retired_notification(&mut collected);
         self.waiters.wake_all();
@@ -901,7 +1111,7 @@ impl TaskGraph {
     ) -> Result<CollectedChild, ProcessError> {
         sched::assert_switchable();
         loop {
-            if let Some(collected) = self.collect_child(parent, pid, false)? {
+            if let Some(collected) = self.collect_child(parent, pid, false, true)? {
                 return Ok(collected);
             }
             let waiter = Waiter::new();
@@ -909,25 +1119,47 @@ impl TaskGraph {
             // SAFETY: self借用保活固定源；node固定当前Task栈，registration先于
             // node/waiter析构，复查关闭早通知窗口，返回前撤链后才可等待成员join。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
-            if let Some(collected) = self.collect_child(parent, pid, false)? {
+            if let Some(collected) = self.collect_child(parent, pid, false, true)? {
                 return Ok(collected);
             }
             waiter.park();
         }
     }
 
-    /// 内核根协调者逐个回收转亲后的真实进程树，每次仍等待原成员离栈。
+    /// 回收kernel根的真实树；无残余组时仍逐个确认用户wait与autoreap留下的原执行者离栈。
     pub(crate) fn wait_root(&self) -> Result<WaitEvent, ProcessError> {
-        let pid = {
-            let slots = self.slots.lock();
-            slots
+        let (pid, mut completed) = {
+            let mut slots = self.slots.lock();
+            let pid = slots
                 .iter()
                 .filter_map(|slot| slot.process.as_ref())
                 .find(|process| process.parent.is_none())
-                .map(|process| process.group.tgid())
-                .ok_or(ProcessError::NoChild)?
+                .map(|process| process.group.tgid());
+            let mut completed = None;
+            if pid.is_none() {
+                assert!(
+                    slots.iter().all(|slot| slot.process.is_none()),
+                    "process tree has no root"
+                );
+                for slot in slots.iter_mut() {
+                    while let Some(mut execution) = slot.completed.take() {
+                        slot.completed = execution.next.take();
+                        execution.next = completed.take();
+                        completed = Some(execution);
+                    }
+                }
+            }
+            (pid, completed)
         };
-        self.wait(None, pid)
+        if let Some(pid) = pid {
+            return self.wait(None, pid);
+        }
+        // 原图已无已发表组，节点全部移出锁后才能建立join等待登记。
+        while let Some(mut execution) = completed.take() {
+            completed = execution.next.take();
+            execution.join.join();
+        }
+        Err(ProcessError::NoChild)
     }
 
     /// 用户waitid登记沿用原退出通知源，业务事件在登记后仍须复查。
@@ -935,10 +1167,13 @@ impl TaskGraph {
         &self.waiters
     }
 
-    /// 内核根回收者关闭现存组的合法点执行，统一标记后锁外提醒，派生发表重新核对退出请求。
+    /// kernel明确取消关闭派生准入，保留已接受的机器动作与各组首次退出原因。
     pub(crate) fn request_root_exit(&self, status: i32) {
         let capacity = {
             let slots = self.slots.lock();
+            if self.closing.load(Ordering::Relaxed) == RUNNING {
+                self.closing.store(CANCELLED, Ordering::Release);
+            }
             for process in slots.iter().filter_map(|slot| slot.process.as_ref()) {
                 if 0 < process.members {
                     process.group.signals.mark_exit(status);
@@ -946,6 +1181,11 @@ impl TaskGraph {
             }
             slots.len()
         };
+        self.notify_exiting_groups(capacity);
+    }
+
+    /// 逐槽保活当前退出组并锁外提醒，不为全图取消或关机分配通知列表。
+    fn notify_exiting_groups(&self, capacity: usize) {
         for index in 0..capacity {
             let group = {
                 let slots = self.slots.lock();
@@ -1035,7 +1275,7 @@ impl TaskGraph {
                         selected = Some(exit_child_event(&process.group, exit.status));
                         if options & NOWAIT == 0 {
                             parent.time.add_reaped_child(&process.group.time);
-                            retired = Some(reap_child(&mut slots, index));
+                            retired = Some(reap_child(&mut slots, index, false));
                         }
                         break;
                     }
@@ -1573,7 +1813,7 @@ impl TaskGraph {
                         match pid {
                             1.. => target.tgid() == pid as usize,
                             0 => target.pgid() == sender.group.pgid(),
-                            -1 => target.tgid() != 1 && target.tgid() != sender.tgid(),
+                            -1 => !target.is_system_init() && target.tgid() != sender.tgid(),
                             _ => target.pgid() == pid.unsigned_abs() as usize,
                         }
                     })
@@ -1940,7 +2180,7 @@ impl PreparedIdentity {
         self.identity.clone()
     }
 
-    /// 最终关系发表重查父或当前组；新成员只挂TID，进程级角色与亲缘仅由组首发表。
+    /// 最终关系发表与关闭准入同锁重查，私有首根必须仍是System唯一PID1。
     pub(crate) fn publish(
         mut self,
         user: Weak<UserThread>,
@@ -1950,6 +2190,9 @@ impl PreparedIdentity {
         let mut old_relations = None;
         {
             let mut slots = graph.slots.lock();
+            if graph.closing.load(Ordering::Relaxed) != RUNNING {
+                return Err(ProcessError::Busy);
+            }
             let leader = self.identity.tid() == self.identity.tgid();
             let parent = if leader {
                 match self.parent.as_ref() {
@@ -1964,7 +2207,17 @@ impl PreparedIdentity {
                         ));
                         Some(number)
                     }
-                    None => None,
+                    None => {
+                        if graph.root_role == RootRole::System
+                            && (self.reservation.index != 0
+                                || self.identity.tgid() != 1
+                                || !self.identity.group.is_system_init()
+                                || slots[0].process.is_some())
+                        {
+                            return Err(ProcessError::InvalidParent);
+                        }
+                        None
+                    }
                 }
             } else {
                 graph.live_parent(&slots, &self.identity.group)?;
@@ -2134,15 +2387,40 @@ fn child_event(group: &ThreadGroup, code: i32, status: i32) -> ChildEvent {
     }
 }
 
-/// 图锁内唯一移走退出进程并解绑全部角色，移出的小拥有在锁外释放或join。
-fn reap_child(slots: &mut [Slot], index: usize) -> CollectedChild {
-    let retired = slots[index]
+/// 图锁中仅摘走Acquire确认离栈的节点，保留未完成链并把最后拥有交给锁外调用者。
+fn discard_completed(
+    completed: &mut Option<Box<PreparedExecution>>,
+    discarded: &mut Option<Box<PreparedExecution>>,
+) {
+    let mut link = completed;
+    while let Some(execution) = link.as_ref() {
+        if execution.join.try_join().is_some() {
+            let mut execution = link.take().expect("completed member disappeared");
+            *link = execution.next.take();
+            execution.next = discarded.take();
+            *discarded = Some(execution);
+        } else {
+            link = &mut link.as_mut().expect("member disappeared").next;
+        }
+    }
+}
+
+/// 图锁中移走退出组并解绑角色；用户消费保留原执行观察，kernel消费移出链供锁外join。
+fn reap_child(slots: &mut [Slot], index: usize, kernel_join: bool) -> CollectedChild {
+    let mut retired = slots[index]
         .process
         .take()
         .expect("wait process disappeared");
     assert_eq!(retired.members, 0, "reaping a live group");
     assert!(slots[index].thread.is_none(), "reaping a live leader");
     let event = retired.exit.expect("reaping without exit event");
+    if !kernel_join {
+        while let Some(mut execution) = retired.completed.take() {
+            retired.completed = execution.next.take();
+            execution.next = slots[index].completed.take();
+            slots[index].completed = Some(execution);
+        }
+    }
     let notification_parent = retired
         .parent
         .filter(|_| matches!(retired.notification, Some(GroupNotification::Continued(_))))
@@ -2245,7 +2523,7 @@ fn release_terminal_locked(
     tty.control().lock().take()
 }
 
-/// 孤儿判断只看活组成员与实际用户父的不同PGID、相同SID连接。
+/// 孤儿判断排除真正系统首根，普通父组仍以不同PGID、相同SID连接判断。
 fn orphaned_process_group(slots: &[Slot], pgid: &Arc<Pid>) -> bool {
     !slots
         .iter()
@@ -2262,7 +2540,7 @@ fn orphaned_process_group(slots: &[Slot], pgid: &Arc<Pid>) -> bool {
                 .parent
                 .and_then(|number| slots[number - 1].process.as_ref());
             parent.is_some_and(|parent| {
-                if parent.members == 0 {
+                if parent.members == 0 || parent.group.is_system_init() {
                     return false;
                 }
                 let parent_relations = parent.group.relations.lock();

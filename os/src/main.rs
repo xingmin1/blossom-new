@@ -218,7 +218,7 @@ fn enter_scheduler() -> ! {
     sched::run()
 }
 
-/// 在普通任务栈一次发现并保活存储，按明确启动参数读取系统盘，再完成有限消费者。
+/// 在普通任务栈一次发现并保活存储，等待真实系统根和文件系统退休后执行硬件动作。
 #[cfg(not(feature = "ktest"))]
 fn init() -> i32 {
     let inventory = drivers::discover().expect("device resource discovery failed");
@@ -241,15 +241,20 @@ fn init() -> i32 {
         "STORAGE online devices={}",
         storage.count()
     );
-    init_filesystems(storage).expect("filesystem boot initialization failed");
-    init_consumers();
+    let operation = init_filesystems(storage).expect("system lifecycle failed");
     drop(inventory);
-    0
+    match operation {
+        task::process::ShutdownOperation::Halt => arch::halt(),
+        task::process::ShutdownOperation::PowerOff => arch::shutdown(),
+        task::process::ShutdownOperation::Restart => arch::restart(),
+    }
 }
 
-/// 普通 init 按明确根权限运行磁盘程序，全部路径、回写和缓存退场后才结束文件系统消费者。
+/// 普通系统只发表磁盘 PID1，日常子进程由它回收，接受关闭后才结束全部用户和文件系统拥有。
 #[cfg(not(feature = "ktest"))]
-fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError> {
+fn init_filesystems(
+    storage: &storage::Storage,
+) -> Result<task::process::ShutdownOperation, task::ProgramError> {
     let selected = fs::system::boot_devices(boot::info().bootargs())?;
     let root = storage
         .disk(selected.root)
@@ -277,7 +282,6 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
             block::AccessMode::ReadOnly,
         )?;
     }
-    let files = fs::FileTable::try_new(4)?;
     crate::klog!(
         klog::Level::Info,
         "ROOTFS selected root={} extra={:?} mode={:?}",
@@ -285,194 +289,62 @@ fn init_filesystems(storage: &storage::Storage) -> Result<(), task::ProgramError
         selected.extra,
         selected.root_mode
     );
-    const PATHS: &[(&str, bool)] = &[
-        ("/test/identity", false),
-        ("/test/data.bin", false),
-        ("/test/empty", false),
-        ("/test/sparse.bin", false),
-        ("/test/bin/probe.elf", false),
-        ("/mnt/extra/test/identity", true),
-        ("/mnt/extra/test/data.bin", true),
-        ("/mnt/extra/test/empty", true),
-        ("/mnt/extra/test/sparse.bin", true),
-        ("/mnt/extra/test/bin/probe.elf", true),
-    ];
-    for &(pathname, extra) in PATHS {
-        if extra && selected.extra.is_none() {
-            continue;
+    let graph = task::process::TaskGraph::try_new(128, task::process::RootRole::System)?;
+    let arguments = task::exec::Arguments::from_kernel(
+        selected.init,
+        &[selected.init],
+        &[
+            b"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            b"HOME=/root",
+            b"TERM=vt102",
+        ],
+    )?;
+    let image = task::exec::prepare(&vfs, &context, arguments, task::Credentials::ROOT)?;
+    let runtime =
+        task::UserRuntime::try_new(Arc::clone(&vfs), context.clone(), task::Credentials::ROOT)?;
+    runtime.install_console()?;
+    let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
+    let pid = prepared.pid();
+    assert_eq!(pid, 1, "system root must be PID1");
+    let child = prepared.publish()?;
+    let task_id = child.task_id();
+    early_println!("INIT running pid={} task={}", pid, task_id.as_usize());
+    let event = graph.wait(None, pid)?;
+    let task_status = child.join();
+    assert_eq!(event.pid, pid, "system wait returned another process");
+    assert_eq!(event.task_id, task_id, "system wait returned another task");
+    assert_eq!(task_status, event.status, "system join disagrees with wait");
+    let operation = graph
+        .shutdown_operation()
+        .expect("system root exited without a shutdown request");
+    early_println!(
+        "INIT exited pid={} status={} operation={:?}",
+        pid,
+        event.status,
+        operation
+    );
+    // 关闭准入已随关机请求提交；此后只回收残余组，合法信号退出状态原样保留。
+    loop {
+        match graph.wait_root() {
+            Ok(event) => early_println!(
+                "INIT child-reaped pid={} task={} status={}",
+                event.pid,
+                event.task_id.as_usize(),
+                event.status
+            ),
+            Err(task::process::ProcessError::NoChild) => break,
+            Err(error) => return Err(error.into()),
         }
-        let summary = fs::system::read_summary(&files, &vfs, &context, pathname.as_bytes())?;
-        crate::klog!(
-            klog::Level::Info,
-            "fs-system-summary path={} bytes={} crc32c={:08x}",
-            pathname,
-            summary.bytes,
-            summary.crc32c
-        );
     }
-    let graph = task::process::TaskGraph::try_new(128)?;
-    run_disk_program(
-        &graph,
-        &vfs,
-        &context,
-        b"/test/bin/user-smoke",
-        &[b"/test/bin/user-smoke", b"raw"],
-        &[b"USER_SMOKE=1"],
-        false,
-    )?;
-    // 该普通程序断言 EROFS，只在真实只读根验证；可写根由独立写入程序消费。
-    if selected.root_mode == block::AccessMode::ReadOnly {
-        run_disk_program(
-            &graph,
-            &vfs,
-            &context,
-            b"/test/bin/user-io",
-            &[b"/test/bin/user-io", b"raw"],
-            &[],
-            false,
-        )?;
-    }
-    const PROGRAMS: &[(&[u8], &[u8])] = &[
-        (b"/test/bin/user-clone", b"F0"),
-        (b"/test/bin/user-clone", b"t3"),
-        (b"/test/bin/user-signal", b"f"),
-        (b"/test/bin/user-lifecycle", b"u"),
-    ];
-    for &(program, argument) in PROGRAMS {
-        run_disk_program(
-            &graph,
-            &vfs,
-            &context,
-            program,
-            &[program, argument],
-            &[],
-            false,
-        )?;
-    }
-    if selected.root_mode == block::AccessMode::ReadWrite {
-        run_disk_program(
-            &graph,
-            &vfs,
-            &context,
-            b"/test/bin/user-writeback",
-            &[b"/test/bin/user-writeback", b"a"],
-            &[],
-            false,
-        )?;
-        let pathname = "/test/writeback-dir/result";
-        let summary = fs::system::read_summary(&files, &vfs, &context, pathname.as_bytes())?;
-        assert_eq!(summary.bytes, 8229, "writeback result size is inconsistent");
-        crate::klog!(
-            klog::Level::Info,
-            "fs-system-summary path={} bytes={} crc32c={:08x}",
-            pathname,
-            summary.bytes,
-            summary.crc32c
-        );
-    }
-    run_disk_program(
-        &graph,
-        &vfs,
-        &context,
-        b"/bin/libc-smoke",
-        &[b"/bin/libc-smoke", b"stage7"],
-        &[],
-        true,
-    )?;
-    for script in [
-        b"/test/scripts/no-option".as_slice(),
-        b"/test/scripts/option".as_slice(),
-    ] {
-        run_disk_program(
-            &graph,
-            &vfs,
-            &context,
-            script,
-            &[script, b"tail"],
-            &[b"BLOSSOM_SCRIPT=stage7"],
-            true,
-        )?;
-    }
-    run_disk_program(
-        &graph,
-        &vfs,
-        &context,
-        b"/bin/busybox",
-        &[b"/bin/busybox", b"echo", b"stage7 busybox"],
-        &[],
-        true,
-    )?;
-    drop(files);
+    vfs.sync()?;
     drop(graph);
     drop(context);
     vfs.prune_unused();
     drop(vfs);
     inode_eviction.wait_retired()?;
     drop(inode_eviction);
-    crate::klog!(klog::Level::Info, "ROOTFS completed");
-    Ok(())
-}
-
-/// 以完整 argv 准备磁盘程序，按调用者约定安装标准流，再核退出、离栈与全部子组回收。
-#[cfg(not(feature = "ktest"))]
-fn run_disk_program(
-    graph: &Arc<task::process::TaskGraph>,
-    vfs: &Arc<fs::Vfs>,
-    context: &fs::FsContext,
-    program: &[u8],
-    argv: &[&[u8]],
-    environment: &[&[u8]],
-    console: bool,
-) -> Result<(), task::ProgramError> {
-    let arguments = task::exec::Arguments::from_kernel(program, argv, environment)?;
-    let image = task::exec::prepare(vfs, context, arguments, task::Credentials::ROOT)?;
-    let runtime =
-        task::UserRuntime::try_new(Arc::clone(vfs), context.clone(), task::Credentials::ROOT)?;
-    if console {
-        runtime.install_console()?;
-    }
-    let prepared = task::prepare_program(graph, None, image, runtime, task::Placement::Any)?;
-    let pid = prepared.pid();
-    let child = prepared.publish()?;
-    let task_id = child.task_id();
-    let event = graph.wait(None, pid)?;
-    let task_status = child.join();
-    crate::klog!(
-        klog::Level::Info,
-        "USER exited program={} argc={} pid={} task={} status={} task_status={} interrupts={} timers={} cpu={}",
-        core::str::from_utf8(program).expect("static program path is ASCII"),
-        argv.len(),
-        event.pid,
-        event.task_id.as_usize(),
-        event.status,
-        task_status,
-        event.user_interrupts,
-        event.user_timer_interrupts,
-        event.cpu
-    );
-    assert_eq!(event.pid, pid, "user wait returned another process");
-    assert_eq!(event.task_id, task_id, "user wait returned another task");
-    assert_eq!(event.status, 0, "ordinary user program failed");
-    assert_eq!(task_status, event.status, "user join disagrees with wait");
-    loop {
-        match graph.wait_root() {
-            Ok(event) => {
-                crate::klog!(
-                    klog::Level::Info,
-                    "USER child-reaped pid={} task={} status={} interrupts={} timers={} cpu={}",
-                    event.pid,
-                    event.task_id.as_usize(),
-                    event.status,
-                    event.user_interrupts,
-                    event.user_timer_interrupts,
-                    event.cpu
-                );
-                assert_eq!(event.status, 0, "ordinary user child failed");
-            }
-            Err(task::process::ProcessError::NoChild) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
-    }
+    early_println!("ROOTFS synchronized and retired operation={:?}", operation);
+    Ok(operation)
 }
 
 /// 只记录启用 MMIO 槽、实际 block 候选与 PCI 功能资源，不触碰设备队列或读取磁盘。
@@ -538,136 +410,6 @@ fn report_device_resources(inventory: &DeviceInventory) {
         "DEVICE discovery mmio-blocks={} pci-functions={}",
         inventory.mmio_blocks.len(),
         inventory.pci.devices().len()
-    );
-}
-
-/// 在普通任务之间传送有限数据，源登记后复查槽状态，结束时消费真实 join。
-#[cfg(not(feature = "ktest"))]
-fn init_consumers() {
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicBool, Ordering};
-    use sync::SleepMutex;
-    use wait::queue::{WaitNode, WaitQueue};
-    use wait::Waiter;
-
-    static INIT_DONE: AtomicBool = AtomicBool::new(false);
-
-    struct Channel {
-        slot: SleepMutex<Option<usize>>,
-        changed: WaitQueue,
-    }
-
-    impl Channel {
-        /// 在同一槽上执行生产或消费，失败时登记源并再次检查后才 park。
-        fn transfer(&self, input: Option<usize>) -> usize {
-            loop {
-                {
-                    let mut slot = self.slot.lock();
-                    if input.is_some() == slot.is_none() {
-                        let result = slot.take().unwrap_or(0);
-                        *slot = input;
-                        drop(slot);
-                        self.changed.wake_all();
-                        return result;
-                    }
-                }
-                let waiter = Waiter::new();
-                let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
-                // SAFETY: node 在当前栈固定，Arc Channel 保持源地址有效；registration 不被遗忘，
-                // 成功、恢复与正常退栈路径都在 node 和 waiter 析构之前撤销链接。
-                let registration = unsafe { self.changed.register(node.as_mut()) };
-                {
-                    // 已登记资源等待时不能再创建 mutex 等待轮次；先撤该轮再等待锁。
-                    let Some(mut slot) = self.slot.try_lock() else {
-                        drop(registration);
-                        drop(waiter);
-                        drop(self.slot.lock());
-                        continue;
-                    };
-                    if input.is_some() == slot.is_none() {
-                        let result = slot.take().unwrap_or(0);
-                        *slot = input;
-                        drop(slot);
-                        drop(registration);
-                        drop(waiter);
-                        self.changed.wake_all();
-                        return result;
-                    }
-                }
-                waiter.park();
-                drop(registration);
-                drop(waiter);
-            }
-        }
-    }
-
-    let watchdog = task::spawn_kernel_on(0, || {
-        let deadline = time::now()
-            .checked_add(time::Duration::from_secs(20))
-            .expect("initial task deadline overflows");
-        while !INIT_DONE.load(Ordering::Acquire) {
-            assert!(time::now() < deadline, "initial task deadline");
-            sched::yield_now();
-        }
-        0
-    })
-    .expect("init watchdog allocation failed");
-
-    let channel = Arc::new(Channel {
-        slot: SleepMutex::new(None),
-        changed: WaitQueue::new(),
-    });
-    let producer_channel = Arc::clone(&channel);
-    let producer = task::spawn_kernel(move || {
-        for value in 1..=8 {
-            producer_channel.transfer(Some(value));
-        }
-        8
-    })
-    .expect("producer allocation failed");
-    let consumer =
-        task::spawn_kernel(move || (0..8).map(|_| channel.transfer(None)).sum::<usize>() as i32)
-            .expect("consumer allocation failed");
-
-    let counter = Arc::new(SleepMutex::new(0usize));
-    let guard = counter.lock();
-    let first_counter = Arc::clone(&counter);
-    let first = task::spawn_kernel_on(0, move || {
-        for _ in 0..16 {
-            *first_counter.lock() += 1;
-            sched::yield_now();
-        }
-        16
-    })
-    .expect("counter task allocation failed");
-    let second_counter = Arc::clone(&counter);
-    let second = task::spawn_kernel_on(0, move || {
-        for _ in 0..16 {
-            *second_counter.lock() += 1;
-            sched::yield_now();
-        }
-        16
-    })
-    .expect("counter task allocation failed");
-    sched::yield_now();
-    drop(guard);
-    assert_eq!(producer.join(), 8);
-    let sum = consumer.join();
-    assert_eq!(sum, (1..=8).sum::<i32>());
-    assert_eq!(first.join() + second.join(), 32);
-    assert_eq!(*counter.lock(), 32);
-    INIT_DONE.store(true, Ordering::Release);
-    assert_eq!(watchdog.join(), 0);
-    let final_counter = *counter.lock();
-    crate::klog!(
-        klog::Level::Info,
-        "INIT completed task={} cpu={} produced=8 consumed=8 sum={} counter={}",
-        task::current_task_id()
-            .expect("initial kernel task")
-            .as_usize(),
-        cpu::current().id,
-        sum,
-        final_counter
     );
 }
 

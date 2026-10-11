@@ -353,6 +353,7 @@ struct GroupState {
 pub(crate) struct SignalGroup {
     graph: Weak<TaskGraph>,
     tgid: usize,
+    system_init: bool,
     sighand: SpinLock<Arc<Sighand>>,
     state: SpinLock<GroupState>,
 }
@@ -376,15 +377,17 @@ pub(crate) enum SignalSelection {
 }
 
 impl SignalGroup {
-    /// 在身份发表前绑定完整动作表并分配组信号拥有，弱图关联仅供锁外通知。
+    /// 身份发表前固定系统首根角色并绑定完整动作表，弱图关联仅供锁外通知。
     pub(crate) fn try_new(
         graph: Weak<TaskGraph>,
         tgid: usize,
         sighand: Arc<Sighand>,
+        system_init: bool,
     ) -> Result<Arc<Self>, AllocError> {
         Arc::try_new(Self {
             graph,
             tgid,
+            system_init,
             sighand: SpinLock::new(sighand),
             state: SpinLock::new(GroupState {
                 pending: Pending::new(),
@@ -395,6 +398,11 @@ impl SignalGroup {
                 exit: None,
             }),
         })
+    }
+
+    /// 不可变角色随真实信号组共享，exec和线程成员变化都不改变首根职责。
+    pub(crate) fn is_system_init(&self) -> bool {
+        self.system_init
     }
 
     /// IRQ普通定时信号无分配，发送与通知在siglock两侧，调用者不得已持siglock。
@@ -468,7 +476,7 @@ impl SignalGroup {
         )
     }
 
-    /// 调用者持续持有canonical绑定锁与动作锁，普通发送和子退出共用同一pending及控制事务。
+    /// 持canonical动作锁递送；系统根忽略普通默认处置及KILL/STOP，强制故障另行领取。
     fn deliver_locked<'a>(
         &self,
         info: SignalInfo,
@@ -478,6 +486,9 @@ impl SignalGroup {
         queued: bool,
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<bool, SignalError> {
+        if self.system_init && matches!(info.signum, 9 | 19) {
+            return Ok(false);
+        }
         let mut group = self.state.lock();
         if group.members == 0 || (group.exit.is_some() && info.signum != 18) {
             return Ok(false);
@@ -516,14 +527,14 @@ impl SignalGroup {
         if info.signum == 9 {
             group.exit.get_or_insert(9);
             group.stop_signal = None;
-        } else if blocked || !ignored(action, info.signum) {
+        } else if blocked || !ignored(action, info.signum, self.system_init) {
             match target {
                 Some(thread) => thread.state.lock().pending.push(info, queued)?,
                 None => group.pending.push(info, queued)?,
             }
             if eligible
                 && action.handler == 0
-                && !ignored(action, info.signum)
+                && !ignored(action, info.signum, self.system_init)
                 && !matches!(info.signum, 19..=22)
             {
                 group.exit.get_or_insert(info.signum as i32);
@@ -553,7 +564,7 @@ impl SignalGroup {
         autoreap
     }
 
-    /// 动作替换与当前组pending丢弃同锁执行，共享处置的其他组仍保各自pending拥有。
+    /// 动作替换与当前组忽略pending同锁执行，系统首根角色不影响共享处置的其他组。
     pub(super) fn update_action<'a>(
         &self,
         signal: usize,
@@ -570,7 +581,7 @@ impl SignalGroup {
             action.flags &= ACTION_FLAGS;
             action.mask &= !UNBLOCKABLE;
             actions[signal - 1] = action;
-            if ignored(action, signal as u8) {
+            if ignored(action, signal as u8, self.system_init) {
                 let discard = 1 << (signal - 1);
                 self.state.lock().pending.discard(discard);
                 for thread in threads {
@@ -579,12 +590,6 @@ impl SignalGroup {
             }
         }
         Ok(previous)
-    }
-
-    /// 首次退出原因保留，全组停止取消，通知在锁外触达真实成员。
-    pub(crate) fn request_exit(&self, status: i32) {
-        self.mark_exit(status);
-        self.notify();
     }
 
     /// 图根回收事务只写合法点退出请求，不在持关系锁时通知或反查成员。
@@ -739,13 +744,14 @@ impl ThreadSignals {
         mask
     }
 
-    /// 同一次canonical动作锁与private锁快照裁决终端信号的阻塞或忽略处置。
+    /// 同一动作锁与private锁裁决终端信号，系统根默认处置遵守真实角色。
     pub(crate) fn blocked_or_ignored(&self, signum: u8) -> bool {
         let bit = signal_bit(signum).expect("invalid terminal signal");
         let binding = self.group.sighand.lock();
         let actions = binding.actions.lock();
         let private = self.state.lock();
-        private.mask & bit != 0 || ignored(actions[signum as usize - 1], signum)
+        private.mask & bit != 0
+            || ignored(actions[signum as usize - 1], signum, self.group.system_init)
     }
 
     /// sigtimedwait暂时解除请求集阻断，保存真实旧mask以免忽略或默认致命丢失等待实例。
@@ -815,7 +821,7 @@ impl ThreadSignals {
             .or_else(|| group.pending.take(allowed))
     }
 
-    /// 一次选择、消费与处置快照同时完成，帧copyout只能在返回且解锁之后执行。
+    /// 一次领取与处置快照同时完成；强制同步故障不应用系统根默认忽略规则。
     pub(crate) fn select(&self) -> Option<SignalSelection> {
         let binding = self.group.sighand.lock();
         let mut actions = binding.actions.lock();
@@ -832,13 +838,17 @@ impl ThreadSignals {
         }
         loop {
             let allowed = !private.mask;
+            let forced = private.fault.is_some();
             let info = private
                 .fault
                 .take()
                 .or_else(|| private.pending.take(allowed))
                 .or_else(|| group.pending.take(allowed))?;
-            let action = actions[info.signum as usize - 1];
-            if ignored(action, info.signum) {
+            let mut action = actions[info.signum as usize - 1];
+            if forced && action.handler == 1 {
+                action = SignalAction::DEFAULT;
+            }
+            if ignored(action, info.signum, !forced && self.group.system_init) {
                 continue;
             }
             if action.handler == 0 {
@@ -921,16 +931,16 @@ impl ThreadSignals {
         drop(removed);
     }
 
-    /// Killable接受KILL、组退出和私有exec退出，Interruptible还接受可处理pending与组控制。
+    /// Killable接受退出控制，Interruptible还接受按真实首根角色可处理的pending。
     pub(crate) fn interruption_pending(&self, mode: WaitMode) -> bool {
         let binding = self.group.sighand.lock();
         let actions = binding.actions.lock();
         let group = self.group.state.lock();
         let private = self.state.lock();
-        interruption(&actions, &group, &private, mode)
+        interruption(&actions, &group, &private, mode, self.group.system_init)
     }
 
-    /// 在短锁中取得原Waker快照，升级任务和真正notify都在锁外。
+    /// 短锁中按组角色取得可中断等待快照，真正通知与最后Waker拥有都在锁外。
     pub(crate) fn notify_wait(&self) {
         let waker = {
             let binding = self.group.sighand.lock();
@@ -938,7 +948,8 @@ impl ThreadSignals {
             let group = self.group.state.lock();
             let private = self.state.lock();
             private.wait.as_ref().and_then(|(_, waker, mode)| {
-                interruption(&actions, &group, &private, *mode).then(|| waker.clone())
+                interruption(&actions, &group, &private, *mode, self.group.system_init)
+                    .then(|| waker.clone())
             })
         };
         if let Some(waker) = waker {
@@ -1000,9 +1011,11 @@ fn signal_bit(signum: u8) -> Result<u64, SignalError> {
     Ok(1 << (signum - 1))
 }
 
-/// 默认忽略集合包含CONT的递送动作，CONT的恢复副作用在图发送事务中独立执行。
-fn ignored(action: SignalAction, signum: u8) -> bool {
-    action.handler == 1 || (action.handler == 0 && matches!(signum, 17 | 18 | 23 | 28))
+/// 系统首根忽略普通默认处置和KILL/STOP；forced同步故障调用时不传此角色。
+fn ignored(action: SignalAction, signum: u8, system_init: bool) -> bool {
+    (system_init && (action.handler == 0 || matches!(signum, 9 | 19)))
+        || action.handler == 1
+        || (action.handler == 0 && matches!(signum, 17 | 18 | 23 | 28))
 }
 
 /// 实际活成员全部确认时记录停止完成，成员退出不能制造空组停止事件。
@@ -1020,18 +1033,19 @@ fn stopped_event(group: &mut GroupState) -> Option<u8> {
     None
 }
 
-/// 短锁中的中断判定不分配、通知或反查身份图。
+/// 短锁中按真实系统角色判断中断，不分配、通知或反查身份图。
 fn interruption(
     actions: &[SignalAction; SIGNAL_COUNT],
     group: &GroupState,
     private: &ThreadState,
     mode: WaitMode,
+    system_init: bool,
 ) -> bool {
     if group.exit.is_some() || private.exec_exit {
         return true;
     }
     let pending = private.pending.bits | group.pending.bits;
-    if pending & (1 << 8) != 0 {
+    if !system_init && pending & (1 << 8) != 0 {
         return true;
     }
     if mode == WaitMode::Killable {
@@ -1046,7 +1060,7 @@ fn interruption(
     let mut allowed = pending & !private.mask;
     while allowed != 0 {
         let index = allowed.trailing_zeros() as usize;
-        if !ignored(actions[index], index as u8 + 1) {
+        if !ignored(actions[index], index as u8 + 1, system_init) {
             return true;
         }
         allowed &= allowed - 1;

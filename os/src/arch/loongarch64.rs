@@ -4,7 +4,7 @@ use crate::sched::context::TaskContext;
 use crate::sync::SpinLock;
 use core::arch::{asm, global_asm};
 use core::mem::{offset_of, size_of, MaybeUninit};
-use core::sync::atomic::{AtomicBool, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const NAME: &str = "loongarch64";
 
@@ -568,14 +568,64 @@ pub unsafe fn external_complete(source: u32) {
     iocsr_write32(ext_reg(0x400 + word), bit);
     barrier();
 }
-/// 写入所选 virt FDT 的 GED syscon poweroff 字节。
+/// 用户与 FS 生命周期已停稳后停其它 online 核，再请求所选 virt 平台 poweroff。
+/// 调用者在普通 IRQ 可服务上下文中，不持锁且没有需要继续运行的 CSD 责任。
 pub fn shutdown() -> ! {
+    let _stop = crate::cpu::stop_other_online_cpus();
+    ged_action(0, 0x34)
+}
+
+/// 用户与 FS 生命周期已停稳后永久停全部核，保留虚拟机而不写 GED poweroff。
+/// 调用环境与 shutdown 相同，永久停核确认不能用于恢复 CPU。
+pub fn halt() -> ! {
+    let _stop = crate::cpu::stop_other_online_cpus();
+    disable_stop_sources();
+    permanent_idle()
+}
+
+/// 用户与 FS 生命周期已停稳后停其它 online 核，再写 GED reset 请求整机重启。
+/// 调用环境与 shutdown 相同，reset 使用平台规定的单字节寄存器。
+pub fn restart() -> ! {
+    let _stop = crate::cpu::stop_other_online_cpus();
+    ged_action(2, 0x42)
+}
+
+/// 早期或致命错误仅请求平台 poweroff，不等待 AP、CSD 或文件生命周期。
+pub fn emergency_shutdown() -> ! {
+    ged_action(0, 0x34)
+}
+
+/// 关闭本核可唤醒源，发布永久确认后只执行 IDLE；只供已完成 CSD 的停核 IPI 使用。
+pub(crate) fn stop_current_cpu(stopped: &AtomicBool) -> ! {
+    disable_stop_sources();
+    stopped.store(true, Ordering::Release);
+    permanent_idle()
+}
+
+/// 永久停核前关闭本核 timer、全局 IRQ 与 ECFG 使能源，不恢复被中断的执行者。
+fn disable_stop_sources() {
     irq_save();
-    // SAFETY: QEMU virt 固定 GED poweroff 寄存器在永久强序 DMW 中，按硬件要求进行单字节写入。
+    disable_timer();
+    // SAFETY: 入口运行于 PLV0，ECFG 为本核 CSR；清使能位只关闭此核 IRQ 源，
+    // 停核已不再需要 trap 返回或调度，本函数不改变共享控制器及内核映射。
+    unsafe { csr_write::<4>(0) };
+    barrier();
+}
+
+/// 对固定 GED 字节寄存器执行最终平台动作，之后本核不再运行生产者。
+fn ged_action(offset: usize, value: u8) -> ! {
+    disable_stop_sources();
+    // SAFETY: 所选 virt 平台的 GED 基址 0x100e001c 在永久强序 DMW 中；
+    // 私有调用仅传 sleep_ctl 偏移 0/值 0x34 或 reset 偏移 2/值 0x42，设备要求单字节访问。
     unsafe {
-        core::ptr::write_volatile(mmio_address(0x100e001c) as *mut u8, 0x34);
+        core::ptr::write_volatile(mmio_address(0x100e001c + offset) as *mut u8, value);
     }
     barrier();
+    permanent_idle()
+}
+
+/// IRQ 与本核使能源已关闭后永久 IDLE，不返回 trap 或普通执行栈。
+fn permanent_idle() -> ! {
     loop {
         wait_for_interrupt();
     }

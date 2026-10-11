@@ -188,7 +188,7 @@ pub(crate) fn complete(name: &str, passed: bool) -> ! {
         if passed { "ok" } else { "not ok" },
         name
     ));
-    crate::arch::shutdown()
+    crate::arch::emergency_shutdown()
 }
 /// 明确保存独立 SuiteError；未开始项由宿主记 NotRun，不伪造 case 结果。
 pub(crate) fn suite_error(name: &str, stage: &str, failure: Failure) -> ! {
@@ -214,7 +214,7 @@ pub(crate) fn case_abort(name: &str, id: u32, phase: Phase, outcome: &CaseOutcom
         AbortLedger(outcome),
         name
     ));
-    crate::arch::shutdown()
+    crate::arch::emergency_shutdown()
 }
 /// suite 哨兵保留独立 SuiteError；原因正文包含完整账本，不占用 case 身份。
 pub(crate) fn suite_abort(name: &str, stage: &str, outcome: &CaseOutcome) -> ! {
@@ -225,7 +225,7 @@ pub(crate) fn suite_abort(name: &str, stage: &str, outcome: &CaseOutcome) -> ! {
         AbortLedger(outcome),
         name
     ));
-    crate::arch::shutdown()
+    crate::arch::emergency_shutdown()
 }
 /// 真实错误控制者调用；类型来自实际故障而非 armed 期望。
 /// 正文流式适配仍在一次无锁应急写入内完成，整条消息共享原 UART 有界预算。
@@ -243,5 +243,5 @@ pub(crate) fn fatal_event(kind: &'static str, message: fmt::Arguments<'_>) -> ! 
             Diagnostic(format_args!("fatal outside case: {}: {}", kind, message))
         ));
     }
-    crate::arch::shutdown()
+    crate::arch::emergency_shutdown()
 }

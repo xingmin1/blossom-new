@@ -18,6 +18,8 @@ pub const STACK_SIZE: usize = 64 * 1024;
 pub(crate) const KICK_RESCHEDULE: usize = 1 << 0;
 pub(crate) const KICK_TIMER_REPROGRAM: usize = 1 << 1;
 pub(crate) const KICK_LOG_PRINTER: usize = 1 << 2;
+#[cfg(target_arch = "loongarch64")]
+const KICK_STOP: usize = 1 << 3;
 
 /// 链接期保留的独立启动栈，不由旧页分配器申请。
 #[repr(C, align(16))]
@@ -117,6 +119,9 @@ pub struct CpuLocal {
     pub(crate) need_resched: AtomicBool,
     pub(crate) idle: AtomicBool,
     kick_reasons: AtomicUsize,
+    /// 永久停机的完成确认；只发布一次，不作为 CPU 恢复或 online 的替代状态。
+    #[cfg(target_arch = "loongarch64")]
+    stopped: AtomicBool,
     #[cfg(feature = "ktest")]
     test_idle_pause: AtomicUsize,
     #[cfg(feature = "ktest")]
@@ -171,6 +176,8 @@ impl CpuLocal {
             need_resched: AtomicBool::new(false),
             idle: AtomicBool::new(false),
             kick_reasons: AtomicUsize::new(0),
+            #[cfg(target_arch = "loongarch64")]
+            stopped: AtomicBool::new(false),
             #[cfg(feature = "ktest")]
             test_idle_pause: AtomicUsize::new(0),
             #[cfg(feature = "ktest")]
@@ -379,7 +386,7 @@ impl Drop for CallbackGuard {
     }
 }
 
-/// 在硬件通知已清除后取出真实请求，锁外执行并发布完成。
+/// 在硬件通知已清除后执行真实 CSD 并发布完成；永久停机只在队列处理结束后消费。
 pub fn handle_ipi() {
     let local = current();
     local.ipi_interrupts.fetch_add(1, Ordering::Relaxed);
@@ -413,6 +420,10 @@ pub fn handle_ipi() {
             ((*request).callback)((*request).argument);
             (*request).done.store(true, Ordering::Release);
         }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    if reasons & KICK_STOP != 0 {
+        crate::arch::stop_current_cpu(&local.stopped);
     }
 }
 
@@ -466,7 +477,7 @@ pub fn pending_calls(target: usize) -> usize {
 /// 先发布固定软件原因再发送硬件 IPI；允许持调度锁调用，不等待目标执行。
 pub(crate) fn kick(target: usize, reason: usize) {
     assert!(
-        reason != 0 && reason & !(KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER) == 0,
+        reason != 0 && reason & !kick_mask() == 0,
         "invalid CPU kick reason"
     );
     let local = get(target);
@@ -474,6 +485,67 @@ pub(crate) fn kick(target: usize, reason: usize) {
     if local.online.load(Ordering::Acquire) {
         crate::arch::send_ipi(local.hardware_id);
     }
+}
+
+/// 与 IPI 消费分支保持同一有效原因集合，永久停核仅用于有该协议的架构。
+fn kick_mask() -> usize {
+    let mask = KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER;
+    #[cfg(target_arch = "loongarch64")]
+    let mask = mask | KICK_STOP;
+    mask
+}
+
+/// 在生命周期停止生产者后永久停稳其它 online 核，返回的 guard 固定协调核直到整机动作。
+/// 调用者不得持业务锁，所有用户已离栈、FS 已退休且不再有必须继续运行的 CSD 责任；
+/// 本核必须能服务 IPI，CPU 集合不得继续上线，返回后不能恢复普通执行或重用停稳确认。
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
+    assert!(crate::arch::irq_enabled(), "CPU stop requires IRQ enabled");
+    let guard = crate::sync::PreemptGuard::new();
+    let coordinator = current();
+    assert!(
+        coordinator.online.load(Ordering::Acquire),
+        "CPU stop coordinator is offline"
+    );
+    assert_eq!(
+        coordinator.hardirq_depth.load(Ordering::Relaxed),
+        0,
+        "CPU stop in hard IRQ"
+    );
+    assert_eq!(
+        coordinator.bh_depth.load(Ordering::Relaxed),
+        0,
+        "CPU stop in bottom half"
+    );
+    let mut targets = 0usize;
+    for id in 0..count() {
+        let local = get(id);
+        if id != coordinator.id && local.online.load(Ordering::Acquire) {
+            assert!(
+                !local.stopped.load(Ordering::Acquire),
+                "CPU stop acknowledgement reused"
+            );
+            targets |= 1 << id;
+        }
+    }
+    for id in 0..count() {
+        if targets & (1 << id) != 0 {
+            kick(id, KICK_STOP);
+        }
+    }
+    for id in 0..count() {
+        if targets & (1 << id) != 0 {
+            while !get(id).stopped.load(Ordering::Acquire) {
+                spin_loop();
+            }
+        }
+    }
+    crate::early_println!(
+        "CPU stop complete: coordinator={} acknowledged={:#x}",
+        coordinator.id,
+        targets
+    );
+    guard
 }
 
 /// 在真实硬中断分支内记录嵌套，析构只结束本次硬中断。

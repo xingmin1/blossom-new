@@ -2,8 +2,10 @@
 
 
 
-def disk_arguments(disks, args, names):
-    """按实际槽位附盘并传完整根挂载模式；硬件只读与显式设备选择相互独立。"""
+def disk_arguments(disks, args, names, init=None):
+    """按实际槽位附盘并传根挂载模式；显式 init 保留空值，只拒绝启动 token 分隔符。"""
+    if init is not None and any(character in " \t\n\r\v\f\0" for character in init):
+        raise ValueError("init must not contain ASCII whitespace or NUL")
     command = []
     for index, (name, path) in enumerate(disks):
         drive = f"if=none,id=disk{index},format=raw,file={str(path).replace(',', ',,')}"
@@ -30,5 +32,7 @@ def disk_arguments(disks, args, names):
         bootargs.append(f"root={root}")
     if args.extra_root is not None:
         bootargs.append(f"extra={args.extra_root}")
+    if init is not None:
+        bootargs.append(f"init={init}")
     command += ["-append", " ".join(bootargs)]
     return command
