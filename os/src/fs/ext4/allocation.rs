@@ -228,9 +228,11 @@ impl Ext4Volume {
             InodeKind::Regular => 0x8000,
             InodeKind::Directory => 0x4000,
             InodeKind::Symlink => 0xa000,
-            InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other => {
-                return Err(FsError::InvalidOperation)
-            }
+            InodeKind::Character
+            | InodeKind::Block
+            | InodeKind::Fifo
+            | InodeKind::Socket
+            | InodeKind::Other => return Err(FsError::InvalidOperation),
         };
         let parent_setgid = parent.mode & 0o2000 != 0;
         let mut mode = kind_mode

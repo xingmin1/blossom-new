@@ -7,6 +7,7 @@ mod diagnostic;
 mod execution_core;
 mod execution_services;
 mod fatal_return;
+mod network;
 pub(crate) mod panic;
 mod registers;
 mod registry;

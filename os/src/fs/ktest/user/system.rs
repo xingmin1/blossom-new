@@ -91,6 +91,7 @@ impl UserOwner {
                 self.path.vfs().clone(),
                 self.path.context().clone(),
                 credentials,
+                self.net.clone(),
             ),
         )?;
         checked(context, runtime.install_console())?;

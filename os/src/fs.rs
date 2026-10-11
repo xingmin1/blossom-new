@@ -41,7 +41,7 @@ pub use types::{DirectoryEntry, InodeKind, InodeTime};
 
 use crate::block::BlockError;
 
-/// 文件能力、格式、名字与块 I/O 错误保留各自原因，不以零内容代替失败。
+/// 文件能力、socket地址、格式、名字与块I/O错误保留各自原因，不以零内容代替失败。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
     NoMemory,
@@ -73,6 +73,11 @@ pub enum FsError {
     NoDeviceAddress,
     NoProcess,
     DeviceIo,
+    AddressFamilyNotSupported,
+    AddressNotAvailable,
+    NotConnected,
+    MessageTooLarge,
+    NotSocket,
     WouldBlock,
     BrokenPipe,
     Interrupted,
@@ -105,6 +110,11 @@ impl FsError {
             | Self::NoDeviceAddress
             | Self::NoProcess
             | Self::DeviceIo
+            | Self::AddressFamilyNotSupported
+            | Self::AddressNotAvailable
+            | Self::NotConnected
+            | Self::MessageTooLarge
+            | Self::NotSocket
             | Self::WouldBlock
             | Self::BrokenPipe
             | Self::Interrupted

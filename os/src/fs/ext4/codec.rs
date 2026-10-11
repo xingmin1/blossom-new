@@ -573,7 +573,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         0x2000 => InodeKind::Character,
         0x6000 => InodeKind::Block,
         0x1000 => InodeKind::Fifo,
-        0xc000 => InodeKind::Other,
+        0xc000 => InodeKind::Socket,
         _ => return Err(FsError::Corrupt),
     };
     let flags = le32(data, 32)?;

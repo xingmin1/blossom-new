@@ -1208,7 +1208,11 @@ pub(crate) fn prepare_truncate(
     if inode.fast_symlink
         || matches!(
             inode.kind,
-            InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other
+            InodeKind::Character
+                | InodeKind::Block
+                | InodeKind::Fifo
+                | InodeKind::Socket
+                | InodeKind::Other
         )
     {
         if new_size != 0 {

@@ -470,7 +470,11 @@ impl Ext4Volume {
         if !inode.fast_symlink
             && !matches!(
                 inode.kind,
-                InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other
+                InodeKind::Character
+                    | InodeKind::Block
+                    | InodeKind::Fifo
+                    | InodeKind::Socket
+                    | InodeKind::Other
             )
         {
             mapping::validate_root(g, &inode)?;
@@ -493,7 +497,11 @@ impl Ext4Volume {
         if inode.fast_symlink
             || matches!(
                 inode.kind,
-                InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other
+                InodeKind::Character
+                    | InodeKind::Block
+                    | InodeKind::Fifo
+                    | InodeKind::Socket
+                    | InodeKind::Other
             )
         {
             return Err(FsError::Unsupported);
@@ -681,7 +689,11 @@ impl Ext4Volume {
             || old.flags & codec::EA_INODE != 0
             || matches!(
                 old.kind,
-                InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other
+                InodeKind::Character
+                    | InodeKind::Block
+                    | InodeKind::Fifo
+                    | InodeKind::Socket
+                    | InodeKind::Other
             )
         {
             return Err(FsError::InvalidOperation);

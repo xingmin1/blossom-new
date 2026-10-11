@@ -11,6 +11,7 @@ pub enum InodeKind {
     Character,
     Block,
     Fifo,
+    Socket,
     Other,
 }
 

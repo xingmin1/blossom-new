@@ -10,6 +10,7 @@ use crate::fs::file::WriteBuffer;
 use crate::fs::ktest::user::write::{
     allocation_counts, bytes_at, shared_alias, SyncObservation, WriteOwner, SHARED_ALIAS,
 };
+use crate::fs::ktest::user::UserSuite;
 use crate::fs::ktest::*;
 use crate::fs::{FileRef, SeekFrom};
 use crate::mm::dma::MappedPages;
@@ -211,14 +212,11 @@ impl BackgroundOwner {
     }
 }
 
-impl Fixture<DeviceInventory> for BackgroundOwner {
-    /// 原设备库存只由 suite 发现一次，每例继续使用原 WriteOwner 的真实基线。
-    fn set_up(
-        context: &mut TestContext<'_>,
-        inventory: &DeviceInventory,
-    ) -> Result<Self, TestError> {
+impl Fixture<UserSuite> for BackgroundOwner {
+    /// 库存与网络只由suite准备一次，每例继续使用原WriteOwner的真实基线。
+    fn set_up(context: &mut TestContext<'_>, suite: &UserSuite) -> Result<Self, TestError> {
         Ok(Self {
-            write: <WriteOwner as Fixture<DeviceInventory>>::set_up(context, inventory)?,
+            write: <WriteOwner as Fixture<UserSuite>>::set_up(context, suite)?,
             control: None,
             domain: None,
             retired: None,
@@ -257,7 +255,7 @@ impl Fixture<DeviceInventory> for BackgroundOwner {
         drop(self.retired.take());
         self.control.take();
         drop(self.source.take());
-        <WriteOwner as Fixture<DeviceInventory>>::quiesce(&mut self.write, context)
+        <WriteOwner as Fixture<UserSuite>>::quiesce(&mut self.write, context)
     }
 
     /// 控制存储已经释放，原 MM 六字段和用户三项元数据逐项比较各自同 VM 基线。
@@ -270,7 +268,7 @@ impl Fixture<DeviceInventory> for BackgroundOwner {
         );
         assert!(self.observers.iter().all(Option::is_none));
         assert!(self.retired.is_none());
-        <WriteOwner as Fixture<DeviceInventory>>::tear_down(self.write, context)
+        <WriteOwner as Fixture<UserSuite>>::tear_down(self.write, context)
     }
 }
 
@@ -465,7 +463,7 @@ pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
     waves::__ktest_anchor()
 }
 
-#[ktest::suite(fixture = BackgroundOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-background", "fs-sync", "fs-path"), resources("root"), timeout_ms = 240000)]
+#[ktest::suite(fixture = BackgroundOwner, suite_resources = UserSuite, context = "Thread", tags("fs-background", "fs-sync", "fs-path"), resources("root"), timeout_ms = 240000)]
 pub(crate) mod waves {
     use super::*;
 

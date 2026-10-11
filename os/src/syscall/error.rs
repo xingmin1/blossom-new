@@ -46,7 +46,12 @@ pub(super) enum Errno {
     NotEmpty = 39,
     TooManySymlinks = 40,
     Overflow = 75,
+    NotSocket = 88,
+    MessageTooLarge = 90,
     Unsupported = 95,
+    AddressFamilyNotSupported = 97,
+    AddressNotAvailable = 99,
+    NotConnected = 107,
     TimedOut = 110,
 }
 
@@ -60,7 +65,7 @@ impl Errno {
 }
 
 impl From<FsError> for Errno {
-    /// 保留文件访问、写排斥、磁盘空间和真实内存错误，盘格式错误不伪装 EOF。
+    /// 保留文件、socket与真实内存错误，盘格式错误不伪装EOF。
     fn from(error: FsError) -> Self {
         match error {
             FsError::NoMemory | FsError::Io(BlockError::NoMemory) => Self::NoMemory,
@@ -90,6 +95,11 @@ impl From<FsError> for Errno {
             FsError::NoDeviceAddress => Self::NoDeviceAddress,
             FsError::NoProcess => Self::NoProcess,
             FsError::DeviceIo => Self::Io,
+            FsError::AddressFamilyNotSupported => Self::AddressFamilyNotSupported,
+            FsError::AddressNotAvailable => Self::AddressNotAvailable,
+            FsError::NotConnected => Self::NotConnected,
+            FsError::MessageTooLarge => Self::MessageTooLarge,
+            FsError::NotSocket => Self::NotSocket,
             FsError::WouldBlock => Self::Again,
             FsError::BrokenPipe => Self::BrokenPipe,
             FsError::Interrupted => Self::Interrupted,

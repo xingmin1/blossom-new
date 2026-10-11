@@ -914,6 +914,7 @@ fn dirent_type(entry: &DirectoryEntry) -> u8 {
         Some(InodeKind::Character) => 2,
         Some(InodeKind::Block) => 6,
         Some(InodeKind::Fifo) => 1,
+        Some(InodeKind::Socket) => 12,
         _ => 0,
     }
 }

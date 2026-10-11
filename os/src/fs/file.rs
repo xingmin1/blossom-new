@@ -17,6 +17,7 @@ use crate::fs::{
 };
 use crate::fs::{devfs, procfs};
 use crate::mm::space::{Mm, VmError};
+use crate::net::socket::SocketFile;
 use crate::sync::{SleepMutex, SpinLock};
 use crate::task::UserThread;
 
@@ -413,6 +414,11 @@ pub trait FileLike: Send + Sync {
         None
     }
 
+    /// 只借用实际socket端点，普通文件、管道和其它匿名对象不提供网络控制能力。
+    fn socket(&self) -> Option<&SocketFile> {
+        None
+    }
+
     /// 可持久监测的OFD保留反向watch，最后释放先同步撤登记再结束其源拥有。
     fn watch_head(&self) -> Option<&Arc<WatchHead>> {
         None
@@ -607,9 +613,11 @@ pub fn open_path_with_flags(
             .map_err(|_| FsError::NoMemory)?)
         }
         InodeKind::Symlink => Err(FsError::TooManySymlinks),
-        InodeKind::Character | InodeKind::Block | InodeKind::Fifo | InodeKind::Other => {
-            Err(FsError::Unsupported)
-        }
+        InodeKind::Character
+        | InodeKind::Block
+        | InodeKind::Fifo
+        | InodeKind::Socket
+        | InodeKind::Other => Err(FsError::Unsupported),
     }
 }
 
@@ -1070,6 +1078,7 @@ pub fn stat_path(path: &Path) -> Result<FileStat, FsError> {
                 InodeKind::Character => 0o020000,
                 InodeKind::Block => 0o060000,
                 InodeKind::Fifo => 0o010000,
+                InodeKind::Socket => 0o140000,
                 InodeKind::Other => unreachable!(),
             },
         size: data.size,

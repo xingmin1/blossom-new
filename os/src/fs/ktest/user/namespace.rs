@@ -13,6 +13,7 @@ use crate::fs::ext4::{codec, BlockMapping, Ext4Volume};
 use crate::fs::ktest::user::write::{
     allocation_counts, block_allocation_bit, inode_allocation_bit, WriteOwner,
 };
+use crate::fs::ktest::user::UserSuite;
 use crate::fs::ktest::*;
 use crate::fs::writeback::sync_metadata;
 use crate::fs::{
@@ -1183,7 +1184,7 @@ fn cold_reopen_namespace(
     Ok(())
 }
 /// 原 namespace writer 与本例路径读取保持同一 canonical inode/Work 生命周期。
-#[ktest::suite(fixture = WriteOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-path", "fs-namespace"), resources("root"), timeout_ms = 240000)]
+#[ktest::suite(fixture = WriteOwner, suite_resources = UserSuite, context = "Thread", tags("fs-path", "fs-namespace"), resources("root"), timeout_ms = 240000)]
 pub(crate) mod native {
     use super::*;
 

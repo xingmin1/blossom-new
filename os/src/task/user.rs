@@ -16,6 +16,7 @@ use crate::fs::{
     ResolveMode, Vfs,
 };
 use crate::mm::space::{self, Mm, MmUser, VmError};
+use crate::net::NetStackRef;
 use crate::sync::{Completion, IrqSaveGuard, SleepMutex, SpinLock};
 use crate::syscall::Restart;
 use crate::task::exec::{ExecError, LoadedImage};
@@ -49,21 +50,23 @@ pub(crate) struct UserFs {
     pub(crate) context: FsContext,
 }
 
-/// 文件表和文件系统上下文各有独立共享引用，不由线程组代持运行资源。
+/// 文件、FS、信号与网络各保留明确拥有；派生程序继续共享同一网络域。
 #[derive(Clone)]
 pub(crate) struct UserRuntime {
     pub(crate) files: Arc<FileTable>,
     pub(crate) fs: Arc<SleepMutex<UserFs>>,
     pub(crate) credentials: Credentials,
     pub(crate) sighand: Arc<Sighand>,
+    pub(crate) net: NetStackRef,
 }
 
 impl UserRuntime {
-    /// 在普通任务锁外准备有限文件表和完整文件系统拥有，失败不发表用户身份。
+    /// 在普通任务锁外准备运行资源并持已有网络域引用，失败不发表用户身份。
     pub(crate) fn try_new(
         vfs: Arc<Vfs>,
         context: FsContext,
         credentials: Credentials,
+        net: NetStackRef,
     ) -> Result<Self, crate::fs::FsError> {
         let files = FileTable::try_new(USER_DESCRIPTOR_CAPACITY)?;
         let files = Arc::try_new(files).map_err(|_| crate::fs::FsError::NoMemory)?;
@@ -75,6 +78,7 @@ impl UserRuntime {
             fs,
             credentials,
             sighand,
+            net,
         })
     }
 
@@ -105,7 +109,7 @@ impl UserRuntime {
         Ok(())
     }
 
-    /// 消费运行快照，按三个独立共享轴取得文件表、FS和动作表，所有分配在短锁外。
+    /// 按三个独立共享轴复制运行资源，网络域始终共享；所有分配在短锁外。
     pub(crate) fn try_fork(
         self,
         share_files: bool,
@@ -117,6 +121,7 @@ impl UserRuntime {
             fs,
             credentials,
             sighand,
+            net,
         } = self;
         let files = if share_files {
             files
@@ -145,6 +150,7 @@ impl UserRuntime {
             fs,
             credentials,
             sighand,
+            net,
         })
     }
 
@@ -155,13 +161,14 @@ impl UserRuntime {
             fs,
             credentials,
             sighand,
+            net,
         } = self;
-        let files = if files.user_count() > 1 {
+        let files = if 1 < files.user_count() {
             Arc::try_new(files.try_clone()?).map_err(|_| FsError::NoMemory)?
         } else {
             files
         };
-        let sighand = if sighand.user_count() > 1 {
+        let sighand = if 1 < sighand.user_count() {
             sighand.try_copy().map_err(|_| FsError::NoMemory)?
         } else {
             sighand
@@ -171,6 +178,7 @@ impl UserRuntime {
             fs,
             credentials,
             sighand,
+            net,
         })
     }
 }

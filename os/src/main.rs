@@ -23,6 +23,7 @@ mod klog;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod mm;
+mod net;
 mod platform;
 mod sched;
 mod storage;
@@ -250,7 +251,7 @@ fn init() -> i32 {
     }
 }
 
-/// 普通系统只发表磁盘 PID1，日常子进程由它回收，接受关闭后才结束全部用户和文件系统拥有。
+/// 普通系统共享一个网络域给磁盘 PID1，用户和文件系统退休后才释放系统拥有。
 #[cfg(not(feature = "ktest"))]
 fn init_filesystems(
     storage: &storage::Storage,
@@ -289,6 +290,7 @@ fn init_filesystems(
         selected.extra,
         selected.root_mode
     );
+    let net = net::NetStack::try_new_lo()?;
     let graph = task::process::TaskGraph::try_new(128, task::process::RootRole::System)?;
     let arguments = task::exec::Arguments::from_kernel(
         selected.init,
@@ -300,8 +302,12 @@ fn init_filesystems(
         ],
     )?;
     let image = task::exec::prepare(&vfs, &context, arguments, task::Credentials::ROOT)?;
-    let runtime =
-        task::UserRuntime::try_new(Arc::clone(&vfs), context.clone(), task::Credentials::ROOT)?;
+    let runtime = task::UserRuntime::try_new(
+        Arc::clone(&vfs),
+        context.clone(),
+        task::Credentials::ROOT,
+        Arc::clone(&net),
+    )?;
     runtime.install_console()?;
     let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
     let pid = prepared.pid();

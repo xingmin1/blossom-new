@@ -4,6 +4,7 @@ use crate::arch::UserAccess;
 use crate::block::{Bio, BioAllocator, BlkOperation, IoResult, SECTOR_BYTES};
 use crate::fs::ext4::BlockMapping;
 use crate::fs::ktest::user::write::WriteOwner;
+use crate::fs::ktest::user::UserSuite;
 use crate::fs::ktest::*;
 use crate::fs::readahead::ReadaheadSnapshot;
 use crate::fs::SeekFrom;
@@ -208,7 +209,7 @@ fn vm<T>(context: &TestContext<'_>, result: Result<T, VmError>) -> Result<T, Tes
 }
 
 /// 共用原可写拥有者的停止、I/O 全尾、MM 六域和用户 metadata 三域清理。
-#[ktest::suite(fixture = WriteOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-readahead", "fs-write", "W29"), resources("root"), timeout_ms = 180000)]
+#[ktest::suite(fixture = WriteOwner, suite_resources = UserSuite, context = "Thread", tags("fs-readahead", "fs-write", "W29"), resources("root"), timeout_ms = 180000)]
 pub(crate) mod reads {
     use super::*;
 

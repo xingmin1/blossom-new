@@ -3919,7 +3919,12 @@ impl InodeRef {
         let kind_mode = match kind {
             InodeKind::Directory => 0x4000,
             InodeKind::Symlink => 0xa000,
-            _ => 0x8000,
+            InodeKind::Regular => 0x8000,
+            InodeKind::Character
+            | InodeKind::Block
+            | InodeKind::Fifo
+            | InodeKind::Socket
+            | InodeKind::Other => unreachable!("unsupported kind in a new directory entry"),
         };
         let mut mode = kind_mode
             | if kind == InodeKind::Symlink {

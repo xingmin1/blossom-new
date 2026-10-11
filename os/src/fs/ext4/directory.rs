@@ -658,7 +658,7 @@ fn record(g: &Geometry, data: &[u8], offset: usize, end: usize) -> Result<Record
             3 => Some(InodeKind::Character),
             4 => Some(InodeKind::Block),
             5 => Some(InodeKind::Fifo),
-            6 => Some(InodeKind::Other),
+            6 => Some(InodeKind::Socket),
             7 => Some(InodeKind::Symlink),
             _ => return Err(FsError::Corrupt),
         }
@@ -1288,6 +1288,7 @@ fn directory_file_type(kind: InodeKind) -> u8 {
         InodeKind::Character => 3,
         InodeKind::Block => 4,
         InodeKind::Fifo => 5,
+        InodeKind::Socket => 6,
         InodeKind::Symlink => 7,
         InodeKind::Other => 0,
     }

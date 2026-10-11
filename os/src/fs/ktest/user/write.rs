@@ -464,14 +464,11 @@ impl WriteOwner {
     }
 }
 
-impl Fixture<DeviceInventory> for WriteOwner {
-    /// 设备与压力存储均复用既有拥有者，正文失败也保留停止责任。
-    fn set_up(
-        context: &mut TestContext<'_>,
-        inventory: &DeviceInventory,
-    ) -> Result<Self, TestError> {
+impl Fixture<UserSuite> for WriteOwner {
+    /// 设备、网络域与压力存储均复用整组拥有，正文失败仍保原停止责任。
+    fn set_up(context: &mut TestContext<'_>, suite: &UserSuite) -> Result<Self, TestError> {
         Ok(Self {
-            user: <UserOwner as Fixture<DeviceInventory>>::set_up(context, inventory)?,
+            user: <UserOwner as Fixture<UserSuite>>::set_up(context, suite)?,
             inodes: Vec::new(),
             append_gate: None,
             shared_mm: None,
@@ -612,14 +609,14 @@ impl Fixture<DeviceInventory> for WriteOwner {
         drop(core::mem::take(&mut self.inodes));
         drop(self.cold_cache.take());
         drop(self.cold_volume.take());
-        let cleanup = <UserOwner as Fixture<DeviceInventory>>::quiesce(&mut self.user, context);
+        let cleanup = <UserOwner as Fixture<UserSuite>>::quiesce(&mut self.user, context);
         context.expect_eq(first, None);
         cleanup
     }
 
     /// 两层六域和 Task/worker/domain 均由原拥有者比较，不重置统计。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
-        <UserOwner as Fixture<DeviceInventory>>::tear_down(self.user, context)
+        <UserOwner as Fixture<UserSuite>>::tear_down(self.user, context)
     }
 }
 
@@ -1155,7 +1152,7 @@ fn truncate_contents(
     Ok(())
 }
 
-#[ktest::suite(fixture = WriteOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-write", "fs-path", "fs-oom"), resources("root"), timeout_ms = 180000)]
+#[ktest::suite(fixture = WriteOwner, suite_resources = UserSuite, context = "Thread", tags("fs-write", "fs-path", "fs-oom"), resources("root"), timeout_ms = 180000)]
 pub(crate) mod writes {
     use super::*;
 
@@ -4051,6 +4048,7 @@ pub(crate) mod writes {
                 fixture.user.path.vfs().clone(),
                 fixture.user.path.context().clone(),
                 Credentials::ROOT,
+                fixture.user.net.clone(),
             ),
         )?;
         let prepared = task::prepare_program(
@@ -4089,6 +4087,7 @@ pub(crate) mod writes {
                 fixture.user.path.vfs().clone(),
                 fixture.user.path.context().clone(),
                 Credentials::ROOT,
+                fixture.user.net.clone(),
             ),
         )?;
         let graph = fixture.user.graph().clone();

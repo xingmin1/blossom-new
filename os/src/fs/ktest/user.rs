@@ -6,6 +6,7 @@ use crate::fs::ktest::tty::SerialTtyOwner;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
+use crate::net::{NetStack, NetStackRef};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
 use crate::task::process::{RootRole, TaskGraph, WaitEvent, WaitSelector};
@@ -42,36 +43,52 @@ struct ReservedDescriptor {
     join: JoinHandle,
 }
 
-/// 用户程序整组共享唯一设备库存与串口 TTY 接收附着，case 仍独立拥有路径和用户任务。
-struct UserProgramSuite {
+/// 所有真实用户运行资源在首例基线前共享同一设备库存与网络域。
+struct UserSuite {
     inventory: DeviceInventory,
+    net: NetStackRef,
+}
+
+impl Fixture for UserSuite {
+    /// 整组只发现一次设备并准备一次网络域，失败仍交原 suite 设置错误路径处理。
+    fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+        let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
+        let net = checked(context, NetStack::try_new_lo())?;
+        Ok(Self { inventory, net })
+    }
+}
+
+/// 用户程序整组共享设备库存、网络域与串口 TTY 接收附着，case 独立拥有路径和用户任务。
+struct UserProgramSuite {
+    resources: UserSuite,
     serial: SerialTtyOwner,
 }
 
 impl Fixture for UserProgramSuite {
-    /// 原库存只发现一次，随后在首个 case 准备前附着真实 TTY 接收。
+    /// 共享资源与真实 TTY 接收均在首例基线前准备，case 不承担整组准备开销。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
-        let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
+        let resources = <UserSuite as Fixture>::set_up(context, &())?;
         let serial = SerialTtyOwner::attach()?;
         crate::workqueue::testing::wait_services_blocked();
-        Ok(Self { inventory, serial })
+        Ok(Self { resources, serial })
     }
 
     /// 全部 case 的任务、OFD 与 raw 阶段结束后先恢复 Raw，再结束原库存的异步责任。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()?;
-        <DeviceInventory as Fixture>::quiesce(&mut self.inventory, context)
+        <DeviceInventory as Fixture>::quiesce(&mut self.resources.inventory, context)
     }
 
     /// 串口已停止后消费原库存，不重新发现设备或销毁常驻 TTY 服务。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()?;
-        <DeviceInventory as Fixture>::tear_down(self.inventory, context)
+        <DeviceInventory as Fixture>::tear_down(self.resources.inventory, context)
     }
 }
 
 struct UserOwner {
     path: PathOwner,
+    net: NetStackRef,
     metadata_before: MetadataStats,
     graph: Option<Arc<TaskGraph>>,
     running: Option<RunningProgram>,
@@ -201,6 +218,7 @@ impl UserOwner {
                 self.path.vfs().clone(),
                 self.path.context().clone(),
                 credentials,
+                self.net.clone(),
             ),
         )?;
         let coordinator = cpu::current().id;
@@ -695,6 +713,7 @@ impl UserOwner {
                 self.path.vfs().clone(),
                 self.path.context().clone(),
                 Credentials::ROOT,
+                self.net.clone(),
             ),
         )?;
         let coordinator = cpu::current().id;
@@ -1235,15 +1254,13 @@ impl UserOwner {
     }
 }
 
-impl Fixture<DeviceInventory> for UserOwner {
-    /// 设置期保留原设备清理责任；路径、身份与用户映像均在 case 正文准备。
-    fn set_up(
-        context: &mut TestContext<'_>,
-        inventory: &DeviceInventory,
-    ) -> Result<Self, TestError> {
+impl Fixture<UserSuite> for UserOwner {
+    /// 每例保留原设备清理责任并共享整组网络域，路径、身份与映像仍在正文准备。
+    fn set_up(context: &mut TestContext<'_>, suite: &UserSuite) -> Result<Self, TestError> {
         let metadata_before = metadata_stats();
         Ok(Self {
-            path: <PathOwner as Fixture<DeviceInventory>>::set_up(context, inventory)?,
+            path: <PathOwner as Fixture<DeviceInventory>>::set_up(context, &suite.inventory)?,
+            net: suite.net.clone(),
             metadata_before,
             graph: None,
             running: None,
@@ -1293,6 +1310,7 @@ impl Fixture<DeviceInventory> for UserOwner {
                 && !self.tty_io.active(),
         );
         let before = self.metadata_before;
+        drop(self.net);
         <PathOwner as Fixture<DeviceInventory>>::tear_down(self.path, context)?;
         let after = metadata_stats();
         context.diagnostic(format_args!(
@@ -1307,19 +1325,19 @@ impl Fixture<DeviceInventory> for UserOwner {
 }
 
 impl Fixture<UserProgramSuite> for UserOwner {
-    /// 用户程序借组合中同一库存，继续由原设备夹具保存每例清理责任。
+    /// 用户程序借组合中同一库存与网络域，原拥有者继续承担每例清理。
     fn set_up(context: &mut TestContext<'_>, suite: &UserProgramSuite) -> Result<Self, TestError> {
-        <Self as Fixture<DeviceInventory>>::set_up(context, &suite.inventory)
+        <Self as Fixture<UserSuite>>::set_up(context, &suite.resources)
     }
 
     /// 用户图、文件和 raw 阶段仍按原 case 顺序停止，接收附着保留至最后一例结束。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
-        <Self as Fixture<DeviceInventory>>::quiesce(self, context)
+        <Self as Fixture<UserSuite>>::quiesce(self, context)
     }
 
     /// 消费原每例拥有并保留完整 MM 与任务元数据断言。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
-        <Self as Fixture<DeviceInventory>>::tear_down(self, context)
+        <Self as Fixture<UserSuite>>::tear_down(self, context)
     }
 }
 

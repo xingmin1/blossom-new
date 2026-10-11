@@ -318,12 +318,13 @@ fn argument_bytes(
     Ok(())
 }
 
-/// 使用已有完整 FS 上下文预备真实运行资源，不发表任何用户 Task。
+/// 使用已有 FS 上下文与整组共享的网络域预备运行资源，不发表任何用户 Task。
 fn runtime(context: &TestContext<'_>, fixture: &UserOwner) -> Result<UserRuntime, TestError> {
     UserRuntime::try_new(
         Arc::clone(fixture.path.vfs()),
         fixture.path.context().clone(),
         Credentials::ROOT,
+        fixture.net.clone(),
     )
     .map_err(|error| {
         context.diagnostic(format_args!("user preparation runtime error={:?}", error));
