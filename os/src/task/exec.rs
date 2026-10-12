@@ -1,9 +1,9 @@
-//! 静态磁盘映像只在私有 Mm 中准备；文件整页保持同源，边缘页在发表前完成初始化。
+//! 磁盘主映像与真实 ELF 解释器在同一私有 Mm 中准备，文件整页同源，边缘页先初始化。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::{max, min};
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 
 use crate::arch::{self, UserContext};
 use crate::block::BlockError;
@@ -16,13 +16,13 @@ use crate::mm::uaccess::CStringError;
 use crate::mm::user_table::{PagePermissions, PageTableError};
 use crate::mm::{alloc_pages, PAGE_SIZE};
 use crate::task::Credentials;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const MAX_ARGUMENT_BYTES: usize = 32768;
 pub(crate) const MAX_ARGUMENT_COUNT: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
-const STACK_BYTES: usize = 8 * 1024 * 1024;
-const STACK_BOTTOM: usize = arch::USER_STACK_TOP - STACK_BYTES;
-const LOAD_LIMIT: usize = STACK_BOTTOM - PAGE_SIZE;
+pub(crate) const DEFAULT_STACK_BYTES: u64 = 8 * 1024 * 1024;
+const LOAD_LIMIT: usize = arch::USER_STACK_TOP - DEFAULT_STACK_BYTES as usize - PAGE_SIZE;
 const MAX_IMAGE_PAGES: usize = 16384;
 const MAX_IMAGE_SPAN: usize = 256 * 1024 * 1024;
 const ELF_HEADER_BYTES: usize = 64;
@@ -30,6 +30,12 @@ const SCRIPT_HEADER_BYTES: usize = 256;
 const MAX_INTERPRETER_DEPTH: usize = 5;
 const PHDR_BYTES: usize = 56;
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
+const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
+const MAIN_DYN_BASE: usize = 0x2000_0000;
+const INTERP_DYN_BASE: usize = 0x3000_0000;
 const PT_PHDR: u32 = 6;
 const PT_TLS: u32 = 7;
 const PF_R: u32 = 4;
@@ -50,6 +56,8 @@ const RWX: PagePermissions = PagePermissions {
     write: true,
     execute: true,
 };
+
+static EXEC_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// 格式、参数预算和实际文件、VM、分配失败保持可区分。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,12 +316,13 @@ pub(crate) struct LoadedImage {
     pub context: UserContext,
 }
 
-/// 在同一 root/cwd 快照下准备可执行文件及有限脚本链，成功前不改变正在运行的映像。
+/// 在同一 root/cwd 和栈限额快照下准备 ELF 或脚本链，成功前不改变正在运行的映像。
 pub(crate) fn prepare(
     vfs: &Vfs,
     context: &FsContext,
     mut args: Arguments,
     credentials: Credentials,
+    stack_limit: u64,
 ) -> Result<LoadedImage, ExecError> {
     let (mut file, mut access) = open_executable(vfs, context, args.filename(), credentials)?;
     for depth in 0..=MAX_INTERPRETER_DEPTH {
@@ -321,12 +330,14 @@ pub(crate) fn prepare(
         read_prefix(&file, 0, &mut header[..ELF_HEADER_BYTES])?;
         if header[..2] != *b"#!" {
             return load_elf(
+                vfs,
+                context,
                 file,
                 access,
                 (&header[..ELF_HEADER_BYTES]).try_into().unwrap(),
                 &args,
-                credentials.uid,
-                credentials.gid,
+                credentials,
+                stack_limit,
             );
         }
         read_prefix(
@@ -423,12 +434,14 @@ fn script_interpreter(
     Ok((&header[start..name_end], optional))
 }
 
-/// 首次读取 ELF 前禁止同 inode 写入，责任随真实 Mm 保留，全部准备失败由 RAII 释放。
+/// 首读前取得主 inode 写排斥，按显式栈限额与同一文件系统快照准备，失败归还候选拥有。
 pub(crate) fn load(
+    vfs: &Vfs,
+    context: &FsContext,
     file: FileRef,
     args: &Arguments,
-    uid: u32,
-    gid: u32,
+    credentials: Credentials,
+    stack_limit: u64,
 ) -> Result<LoadedImage, ExecError> {
     let access = file
         .mapping_inode()
@@ -436,33 +449,83 @@ pub(crate) fn load(
         .deny_writes()?;
     let mut header = [0; ELF_HEADER_BYTES];
     read_exact(&file, 0, &mut header)?;
-    load_elf(file, access, &header, args, uid, gid)
+    load_elf(
+        vfs,
+        context,
+        file,
+        access,
+        &header,
+        args,
+        credentials,
+        stack_limit,
+    )
 }
 
-/// 消费已经首读和禁止写入的同一文件，所有入口共用唯一 ELF、VMA 与初始栈算法。
+/// 所有入口共用两映像与限额快照；全部准备结束前不发表 Mm 或改变原用户现场。
 fn load_elf(
+    vfs: &Vfs,
+    fs_context: &FsContext,
     file: FileRef,
     access: ExecAccess,
     header: &[u8; ELF_HEADER_BYTES],
     args: &Arguments,
-    uid: u32,
-    gid: u32,
+    credentials: Credentials,
+    stack_limit: u64,
 ) -> Result<LoadedImage, ExecError> {
-    let elf = Elf::read(&file, header)?;
+    let elf = Elf::read(&file, header, MAIN_DYN_BASE)?;
+    let interpreter = if let Some(pathname) = &elf.interp {
+        let (file, access) = open_executable(vfs, fs_context, pathname, credentials)?;
+        let mut header = [0; ELF_HEADER_BYTES];
+        read_exact(&file, 0, &mut header)?;
+        let image = Elf::read(&file, &header, INTERP_DYN_BASE)?;
+        if image.interp.is_some() {
+            return Err(ExecError::Format);
+        }
+        validate_images(&elf, &image)?;
+        Some((file, access, image))
+    } else {
+        None
+    };
+    let bottom = stack_bottom(
+        stack_limit,
+        &elf,
+        interpreter.as_ref().map(|(_, _, image)| image),
+    )?;
     let mut mm = Mm::try_new()?;
     map_segments(&mut mm, &file, &elf.segments)?;
+    let (entry, base) = if let Some((file, _, image)) = &interpreter {
+        map_segments(&mut mm, file, &image.segments)?;
+        (image.entry, image.bias)
+    } else {
+        (elf.entry, 0)
+    };
     map_return_page(&mut mm)?;
-    let sp = make_stack(&mm, &elf, args, uid, gid)?;
+    let sp = make_stack(
+        &mm,
+        &elf,
+        base,
+        args,
+        credentials.uid,
+        credentials.gid,
+        bottom,
+    )?;
     let heap = page_end(elf.end)?;
     mm.set_heap(heap, heap)?;
-    let context = UserContext::new(elf.entry, sp);
+    let context = UserContext::new(entry, sp);
     mm.bind_executable(file, access);
+    if let Some((file, access, _)) = interpreter {
+        mm.bind_interpreter(file, access);
+    }
     let mm = Arc::try_new(mm).map_err(|_| ExecError::NoMemory)?;
     Ok(LoadedImage { mm, context })
 }
 
 /// 只保存装载所需的有界元数据，不创建完整文件的第二数据源。
 struct Elf {
+    kind: u16,
+    max_align: usize,
+    interp: Option<Vec<u8>>,
+    bias: usize,
     segments: Vec<Segment>,
     entry: usize,
     phdr: usize,
@@ -519,7 +582,7 @@ impl ProgramHeader {
         Ok(())
     }
 
-    /// LOAD 的内存覆盖包括零尾，页内偏移及声明对齐必须与文件位置同余。
+    /// 未偏移 LOAD 只校验源跨度和声明同余，用户范围在统一偏移确定后检查。
     fn segment(&self) -> Result<Segment, ExecError> {
         if self.memsz < self.filesz
             || self.flags & !7 != 0
@@ -533,16 +596,16 @@ impl ProgramHeader {
             .address
             .checked_add(self.memsz)
             .ok_or(ExecError::Format)?;
-        if self.address < PAGE_SIZE || LOAD_LIMIT < page_end(end)? {
-            return Err(ExecError::Format);
-        }
         #[cfg(target_arch = "riscv64")]
         if self.flags & PF_W != 0 && self.flags & PF_R == 0 {
             return Err(ExecError::Format);
         }
         Ok(Segment {
             start: self.address,
-            file_end: self.address + self.filesz,
+            file_end: self
+                .address
+                .checked_add(self.filesz)
+                .ok_or(ExecError::Format)?,
             end,
             offset: self.offset,
             flags: self.flags,
@@ -551,8 +614,12 @@ impl ProgramHeader {
 }
 
 impl Elf {
-    /// 复用写排斥期间读取的首部，完成所有程序头与映像关系校验后才申请用户根和原页。
-    fn read(file: &FileRef, header: &[u8; ELF_HEADER_BYTES]) -> Result<Self, ExecError> {
+    /// 首部、程序头和模板复用同一文件，先收集真实对齐再为全部地址施加统一偏移。
+    fn read(
+        file: &FileRef,
+        header: &[u8; ELF_HEADER_BYTES],
+        dyn_base: usize,
+    ) -> Result<Self, ExecError> {
         let stat = file.stat()?;
         if stat.kind != InodeKind::Regular {
             return Err(ExecError::File(FsError::IsDirectory));
@@ -574,6 +641,8 @@ impl Elf {
             .map_err(|_| ExecError::NoMemory)?;
         let mut declared_phdr = None;
         let mut tls = None;
+        let mut interp = None;
+        let mut max_align = PAGE_SIZE;
         for bytes in table.chunks_exact(PHDR_BYTES) {
             let ph = ProgramHeader::decode(bytes);
             if ph.kind == 0 {
@@ -582,13 +651,21 @@ impl Elf {
             ph.validate(stat.size)?;
             match ph.kind {
                 PT_LOAD => {
+                    max_align = max(max_align, ph.align);
                     let segment = ph.segment()?;
                     if segment.start != segment.end {
                         segments.push(segment);
                     }
                 }
-                // 动态、解释器和保留的 SHLIB 不属于静态映像。
-                2 | 3 | 5 => return Err(ExecError::Format),
+                PT_INTERP => {
+                    if interp.is_some() {
+                        return Err(ExecError::Format);
+                    }
+                    interp = Some(read_interpreter(file, &ph)?);
+                }
+                // 动态表由用户解释器消费，内核只校验程序头描述的文件与地址跨度。
+                PT_DYNAMIC => {}
+                5 => return Err(ExecError::Format),
                 PT_TLS => {
                     if tls.is_some()
                         || ph.memsz < ph.filesz
@@ -619,7 +696,6 @@ impl Elf {
             }
         }
         segments.sort_unstable_by_key(|segment| segment.start);
-        let end = validate_segments(&segments, entry)?;
         let phdr = find_phdr(&segments, phoff, table_bytes, declared_phdr)?;
         if let Some(tls) = tls {
             // libc 自行分配 TLS 零尾；这里只要求非零模板确由可读 LOAD 的原文件前缀提供。
@@ -627,14 +703,84 @@ impl Elf {
                 return Err(ExecError::Format);
             }
         }
-        Ok(Self {
+        let mut elf = Self {
+            kind: word16(header, 16),
+            max_align,
+            interp,
+            bias: 0,
             segments,
             entry,
             phdr,
             phnum,
-            end,
-        })
+            end: 0,
+        };
+        elf.relocate(dyn_base)?;
+        Ok(elf)
     }
+
+    /// 地址偏移按最大 LOAD 对齐取整，所有加法检查后才校验实际用户页范围与入口。
+    fn relocate(&mut self, dyn_base: usize) -> Result<(), ExecError> {
+        self.bias = if self.kind == ET_DYN {
+            dyn_base
+                .checked_add(self.max_align - 1)
+                .ok_or(ExecError::Format)?
+                & !(self.max_align - 1)
+        } else {
+            0
+        };
+        for segment in &mut self.segments {
+            segment.start = segment
+                .start
+                .checked_add(self.bias)
+                .ok_or(ExecError::Format)?;
+            segment.file_end = segment
+                .file_end
+                .checked_add(self.bias)
+                .ok_or(ExecError::Format)?;
+            segment.end = segment
+                .end
+                .checked_add(self.bias)
+                .ok_or(ExecError::Format)?;
+            if segment.start < PAGE_SIZE || LOAD_LIMIT < page_end(segment.end)? {
+                return Err(ExecError::Format);
+            }
+        }
+        self.entry = self.entry.checked_add(self.bias).ok_or(ExecError::Format)?;
+        self.phdr = self.phdr.checked_add(self.bias).ok_or(ExecError::Format)?;
+        self.end = validate_segments(&self.segments, self.entry)?;
+        Ok(())
+    }
+}
+
+/// 解释器路径保留原始字节；必须完整终止且不包含截断路径或内嵌 NUL。
+fn read_interpreter(file: &FileRef, ph: &ProgramHeader) -> Result<Vec<u8>, ExecError> {
+    if ph.filesz < 2 || MAX_PATH_BYTES < ph.filesz {
+        return Err(ExecError::Format);
+    }
+    let mut pathname = Vec::new();
+    pathname
+        .try_reserve_exact(ph.filesz)
+        .map_err(|_| ExecError::NoMemory)?;
+    pathname.resize(ph.filesz, 0);
+    read_exact(file, ph.offset, &mut pathname)?;
+    if pathname.pop() != Some(0) || pathname.contains(&0) {
+        return Err(ExecError::Format);
+    }
+    Ok(pathname)
+}
+
+/// 两文件不能占用同一硬件页，即使其有效字节区间在该页内互不相交。
+fn validate_images(main: &Elf, interpreter: &Elf) -> Result<(), ExecError> {
+    for left in &main.segments {
+        for right in &interpreter.segments {
+            if page_start(left.start) < page_end(right.end)?
+                && page_start(right.start) < page_end(left.end)?
+            {
+                return Err(ExecError::Format);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 校验执行类别、目标、ABI 与全部元数据跨度；扩展 section/PHDR 编号不在支持范围。
@@ -650,7 +796,7 @@ fn validate_header(header: &[u8; ELF_HEADER_BYTES], size: u64) -> Result<(), Exe
     if header[..7] != *b"\x7fELF\x02\x01\x01"
         || !matches!(header[7], 0 | 3)
         || header[8] != 0
-        || word16(header, 16) != 2
+        || !matches!(word16(header, 16), ET_EXEC | ET_DYN)
         || word16(header, 18) != MACHINE
         || word32(header, 20) != 1
         || word16(header, 52) as usize != ELF_HEADER_BYTES
@@ -980,28 +1126,60 @@ fn map_return_page(mm: &mut Mm) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// 发表按需分配的 8MiB 私有 RW 栈 VMA，栈下保留一页 guard，实际初始栈写入才触页。
+/// 将本次 soft 向下取整到基本页；整个栈与未映射 guard 必须位于两映像之上、返回页之下。
+fn stack_bottom(
+    stack_limit: u64,
+    main: &Elf,
+    interpreter: Option<&Elf>,
+) -> Result<usize, ExecError> {
+    let bytes = usize::try_from(stack_limit & !(PAGE_SIZE as u64 - 1))
+        .map_err(|_| ExecError::Vm(VmError::InvalidRange))?;
+    if bytes == 0 {
+        return Err(ExecError::ArgumentsTooBig);
+    }
+    let bottom = arch::USER_STACK_TOP
+        .checked_sub(bytes)
+        .filter(|bottom| PAGE_SIZE <= *bottom)
+        .ok_or(ExecError::Vm(VmError::InvalidRange))?;
+    let guard = bottom
+        .checked_sub(PAGE_SIZE)
+        .ok_or(ExecError::Vm(VmError::InvalidRange))?;
+    if arch::USER_ADDRESS_END < arch::USER_STACK_TOP
+        || arch::SIGNAL_RETURN_PAGE < arch::USER_STACK_TOP
+    {
+        return Err(ExecError::Vm(VmError::InvalidRange));
+    }
+    let image_end = max(main.end, interpreter.map_or(0, |image| image.end));
+    if guard < page_end(image_end)? {
+        return Err(ExecError::Vm(VmError::Occupied));
+    }
+    Ok(bottom)
+}
+
+/// 在本次真实栈范围中构造主映像 auxv；参数或指针放不下时不发表候选 Mm。
 fn make_stack(
     mm: &Mm,
     elf: &Elf,
+    interpreter_base: usize,
     args: &Arguments,
     uid: u32,
     gid: u32,
+    bottom: usize,
 ) -> Result<usize, ExecError> {
-    let bottom = STACK_BOTTOM;
-    mm.map_anonymous(bottom, STACK_BYTES, RW, RWX)?;
+    mm.map_anonymous(bottom, arch::USER_STACK_TOP - bottom, RW, RWX)?;
     let mut cursor = arch::USER_STACK_TOP;
-    let execfn = stack_string(mm, &mut cursor, &args.filename)?;
+    let execfn = stack_string(mm, &mut cursor, &args.filename, bottom)?;
     let mut pointers = [0usize; MAX_ARGUMENT_COUNT];
     for (slot, string) in args.argv.iter().chain(&args.envp).enumerate() {
-        pointers[slot] = stack_string(mm, &mut cursor, string)?;
+        pointers[slot] = stack_string(mm, &mut cursor, string, bottom)?;
     }
+    let random = stack_random(mm, &mut cursor, bottom)?;
     let auxv = [
         (3, elf.phdr),
         (4, PHDR_BYTES),
         (5, elf.phnum),
         (6, PAGE_SIZE),
-        (7, 0),
+        (7, interpreter_base),
         (8, 0),
         (9, elf.entry),
         (11, uid as usize),
@@ -1011,6 +1189,7 @@ fn make_stack(
         (16, hwcap()),
         (17, 100),
         (23, 0),
+        (25, random),
         (31, execfn),
         (0, 0),
     ];
@@ -1039,18 +1218,47 @@ fn make_stack(
     Ok(sp)
 }
 
-/// 在已映射的私有栈中复制原字节及唯一 NUL，失败保持 uaccess 的实际原因。
-fn stack_string(mm: &Mm, cursor: &mut usize, bytes: &[u8]) -> Result<usize, ExecError> {
+/// 在本次私有栈底界内复制原字节及唯一 NUL，失败保持 uaccess 的实际原因。
+fn stack_string(
+    mm: &Mm,
+    cursor: &mut usize,
+    bytes: &[u8],
+    bottom: usize,
+) -> Result<usize, ExecError> {
     let address = cursor
         .checked_sub(bytes.len() + 1)
         .ok_or(ExecError::ArgumentsTooBig)?;
-    if address < STACK_BOTTOM {
+    if address < bottom {
         return Err(ExecError::ArgumentsTooBig);
     }
     copyout_exact(mm, address, bytes)?;
     copyout_exact(mm, address + bytes.len(), &[0])?;
     *cursor = address;
     Ok(address)
+}
+
+/// 在本次栈底界内保留完整16字节初始化区；硬件计数与单调序号只提供非加密字节源。
+fn stack_random(mm: &Mm, cursor: &mut usize, bottom: usize) -> Result<usize, ExecError> {
+    let address = cursor
+        .checked_sub(16)
+        .filter(|address| bottom <= *address)
+        .ok_or(ExecError::ArgumentsTooBig)?;
+    // ponytail: 教学字节源没有安全熵承诺；需要密钥或安全随机时须另实现真实熵源。
+    let seed = arch::read_counter() ^ EXEC_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&mix_random_word(seed).to_le_bytes());
+    bytes[8..]
+        .copy_from_slice(&mix_random_word(seed.wrapping_add(0x9e37_79b9_7f4a_7c15)).to_le_bytes());
+    copyout_exact(mm, address, &bytes)?;
+    *cursor = address;
+    Ok(address)
+}
+
+/// 固定整数混合只扩散初始化种子的位，不增加熵或密码学保证。
+fn mix_random_word(mut word: u64) -> u64 {
+    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    word ^ (word >> 31)
 }
 
 /// 初始栈整数以目标小端机器字序列写入，不创建指向已映射用户页的 Rust 引用。

@@ -23,7 +23,7 @@ pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let command = operation & COMMAND_MASK;
     let private = operation & PRIVATE != 0;
     if matches!(command, WAIT | WAIT_BITSET) {
-        let parsed = parse_deadline(user, raw[3], command);
+        let parsed = parse_deadline(user, raw[3], operation);
         let deadline = match parsed {
             Ok(deadline) => deadline,
             Err(error) => return Outcome::Return(error.result()),
@@ -118,11 +118,11 @@ fn quota(raw: usize) -> Result<usize, Errno> {
     }
 }
 
-/// WAIT相对时长只换算一次，BITSET直接使用与公开clock相同来源的绝对期限。
+/// WAIT 相对时长只换算一次；BITSET 按本次时钟位将绝对期限投影到单调等待域。
 fn parse_deadline(
     user: &UserThread,
     address: usize,
-    command: u32,
+    operation: u32,
 ) -> Result<Option<MonotonicInstant>, Errno> {
     if address == 0 {
         return Ok(None);
@@ -131,13 +131,17 @@ fn parse_deadline(
     let mut bytes = [0; 16];
     error::copyin(&mm, &mut bytes, address)?;
     let ns = time::decode_time(&bytes, 1_000_000_000, 1)?;
-    let ns = if command == WAIT {
-        clock::now()
-            .as_nanos()
-            .checked_add(ns)
-            .ok_or(Errno::Overflow)?
+    let deadline = if operation & COMMAND_MASK == WAIT {
+        MonotonicInstant::from_nanos(
+            clock::now()
+                .as_nanos()
+                .checked_add(ns)
+                .ok_or(Errno::Overflow)?,
+        )
+    } else if operation & CLOCK_REALTIME != 0 {
+        clock::realtime_deadline(ns)
     } else {
-        ns
+        MonotonicInstant::from_nanos(ns)
     };
-    Ok(Some(MonotonicInstant::from_nanos(ns)))
+    Ok(Some(deadline))
 }

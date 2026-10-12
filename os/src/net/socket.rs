@@ -14,7 +14,9 @@ use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::UnixEndpoint;
 use crate::net::{IoProgress, MessageResult, NetStackRef};
+use crate::time::{self, MonotonicInstant};
 use crate::wait::WaitResult;
+use core::time::Duration;
 use smoltcp::socket::tcp::CongestionControl;
 
 pub const TCP_BUFFER_LEN: usize = 128 * 1024;
@@ -30,6 +32,24 @@ const STREAM_PREFIX_LEN: usize = 4096;
 const MAX_DATAGRAM_LEN: usize = 65507;
 const BUFFER_HINT_MAX: u32 = 65536;
 const BUFFER_BUDGET_MIN: usize = 1024;
+
+/// 端点的两向等待配置使用纳秒；无限与立即返回分别由 None 和 Some(0) 表示。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SocketTimeouts {
+    pub(crate) receive: Option<u64>,
+    pub(crate) send: Option<u64>,
+}
+
+impl SocketTimeouts {
+    /// 在端点短锁内只替换所选方向，另一向保持同一对象的原配置。
+    pub(crate) fn set(&mut self, receive: bool, timeout: Option<u64>) {
+        if receive {
+            self.receive = timeout;
+        } else {
+            self.send = timeout;
+        }
+    }
+}
 
 /// 一个打开实例只选择一种真实协议端点，不引入另一层 socket 表。
 #[derive(Clone)]
@@ -301,7 +321,7 @@ impl SocketFile {
     }
 
     /// UDP 更新默认 peer 或断开，TCP 阻塞重启只领取既有握手的实际结果。
-    /// 中断或等待资源准备失败保留未领取事实，成功或连接失败才清除。
+    /// 无进度才消费本次发送期限，中断或到期保留原握手的未领取事实。
     pub fn connect(&self, peer: SocketAddress, caller: FileIoContext<'_>) -> Result<(), FsError> {
         let endpoint = match &self.endpoint {
             Endpoint::Udp(endpoint) => {
@@ -320,6 +340,7 @@ impl SocketFile {
             Endpoint::Tcp(endpoint) => endpoint,
             Endpoint::Unix(_) => return Err(FsError::Unsupported),
         };
+        let deadline = self.deadline(false);
         let peer = peer.normalize(
             endpoint.family(),
             endpoint.v6_only(),
@@ -354,11 +375,10 @@ impl SocketFile {
                 }
                 Ok(None) => {}
             }
-            if interrupted {
-                return Err(FsError::Interrupted);
-            }
+            let deadline = Self::check_wait(deadline, interrupted, FsError::InProgress)?;
             if let Some((context, _)) = &waiting {
-                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                interrupted = context
+                    .park_until(matches!(caller, FileIoContext::User(_)), deadline)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(match self.prepare_wait() {
@@ -372,6 +392,7 @@ impl SocketFile {
     }
 
     /// 从稳定 listener 领取成熟 child，为它准备新 OFD；新状态位只来自 accept4。
+    /// 同一次接收期限覆盖所有通知后的重查，成熟连接优先于到期或信号。
     pub fn accept(
         &self,
         flags: u32,
@@ -383,6 +404,7 @@ impl SocketFile {
             return Err(FsError::InvalidOperation);
         }
         let endpoint = self.tcp_endpoint()?;
+        let deadline = self.deadline(true);
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
@@ -395,11 +417,10 @@ impl SocketFile {
             if self.flags() & O_NONBLOCK != 0 {
                 return Err(FsError::WouldBlock);
             }
-            if interrupted {
-                return Err(FsError::Interrupted);
-            }
+            let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
-                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                interrupted = context
+                    .park_until(matches!(caller, FileIoContext::User(_)), deadline)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(self.prepare_wait()?);
@@ -408,6 +429,7 @@ impl SocketFile {
     }
 
     /// 流交付连续前缀，UDP 领取同条消息及元数据；TRUNC 只允许用于 UDP。
+    /// 每次入口固定接收期限，实际交付和非阻塞结果先于等待控制结果。
     pub fn receive(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -427,6 +449,7 @@ impl SocketFile {
         if target.copied() == target.len() && !matches!(&self.endpoint, Endpoint::Udp(_)) {
             return Ok(Self::stream_result(0));
         }
+        let deadline = self.deadline(true);
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
@@ -440,11 +463,10 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
-            if interrupted {
-                return Err(FsError::Interrupted);
-            }
+            let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
-                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                interrupted = context
+                    .park_until(matches!(caller, FileIoContext::User(_)), deadline)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(self.prepare_wait()?);
@@ -475,6 +497,7 @@ impl SocketFile {
     }
 
     /// 锁外准备同一流前缀或完整 UDP 消息，返回协议实际接受量。
+    /// 两种发送共用入口时的期限快照，消息准备和就绪唤醒都不重新计时。
     pub fn send(
         &self,
         source: &mut WriteBuffer<'_>,
@@ -485,6 +508,7 @@ impl SocketFile {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(FsError::Unsupported);
         }
+        let deadline = self.deadline(false);
         match &self.endpoint {
             Endpoint::Udp(endpoint) => {
                 let destination = destination
@@ -497,7 +521,7 @@ impl SocketFile {
                         )
                     })
                     .transpose()?;
-                return self.send_datagram(endpoint, source, destination, flags, caller);
+                return self.send_datagram(endpoint, source, destination, flags, caller, deadline);
             }
             Endpoint::Unix(_) if destination.is_some() => return Err(FsError::AlreadyConnected),
             Endpoint::Tcp(_) | Endpoint::Unix(_) => {}
@@ -535,11 +559,10 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
-            if interrupted {
-                return Err(FsError::Interrupted);
-            }
+            let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
-                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                interrupted = context
+                    .park_until(matches!(caller, FileIoContext::User(_)), deadline)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(self.prepare_wait()?);
@@ -547,7 +570,7 @@ impl SocketFile {
         }
     }
 
-    /// 一次完整堆 copyin 后保留同份消息，等待期间只重试真实 raw 接纳。
+    /// 完整 copyin 后保留同份消息和入口期限，等待期间只重试真实 raw 接纳。
     fn send_datagram(
         &self,
         endpoint: &Arc<UdpEndpoint>,
@@ -555,6 +578,7 @@ impl SocketFile {
         destination: Option<InetEndpoint>,
         flags: u32,
         caller: FileIoContext<'_>,
+        deadline: Result<Option<MonotonicInstant>, FsError>,
     ) -> Result<usize, FsError> {
         let length = source.len() - source.copied();
         if MAX_DATAGRAM_LEN < length {
@@ -581,11 +605,10 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
-            if interrupted {
-                return Err(FsError::Interrupted);
-            }
+            let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
-                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                interrupted = context
+                    .park_until(matches!(caller, FileIoContext::User(_)), deadline)
                     == WaitResult::Interrupted;
             } else {
                 waiting = Some(self.prepare_wait()?);
@@ -713,6 +736,60 @@ impl SocketFile {
                 Ok(())
             }
         }
+    }
+
+    /// 只复制实际端点的控制属性，不取得协议操作权或推动后台进度。
+    pub(crate) fn timeout(&self, receive: bool) -> Option<u64> {
+        let timeouts = match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.timeouts(),
+            Endpoint::Udp(endpoint) => endpoint.timeouts(),
+            Endpoint::Unix(endpoint) => endpoint.timeouts(),
+        };
+        if receive {
+            timeouts.receive
+        } else {
+            timeouts.send
+        }
+    }
+
+    /// 锁外完成 ABI 转换后，将期限写入与 dup、fork 共享的真实端点。
+    pub(crate) fn set_timeout(&self, receive: bool, timeout: Option<u64>) {
+        match &self.endpoint {
+            Endpoint::Tcp(endpoint) => endpoint.set_timeout(receive, timeout),
+            Endpoint::Udp(endpoint) => endpoint.set_timeout(receive, timeout),
+            Endpoint::Unix(endpoint) => endpoint.set_timeout(receive, timeout),
+        }
+    }
+
+    /// 每次请求只计算一次绝对期限；有限加法溢出保留真实参数错误。
+    fn deadline(&self, receive: bool) -> Result<Option<MonotonicInstant>, FsError> {
+        self.timeout(receive)
+            .map(|nanos| {
+                time::now()
+                    .checked_add(Duration::from_nanos(nanos))
+                    .ok_or(FsError::InvalidOperation)
+            })
+            .transpose()
+    }
+
+    /// 无进度且已排除 nonblock 后检查期限与中断，业务结果不被加法溢出覆盖。
+    fn check_wait(
+        deadline: Result<Option<MonotonicInstant>, FsError>,
+        interrupted: bool,
+        expired: FsError,
+    ) -> Result<Option<MonotonicInstant>, FsError> {
+        let deadline = deadline?;
+        if deadline.is_some_and(|limit| limit <= time::now()) {
+            return Err(expired);
+        }
+        if interrupted {
+            return Err(if deadline.is_some() {
+                FsError::InterruptedNoRestart
+            } else {
+                FsError::Interrupted
+            });
+        }
+        Ok(deadline)
     }
 
     /// MSS 查询沿 raw 当前 tuple 与路径决策，不在打开对象重复计算。

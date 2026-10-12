@@ -624,7 +624,7 @@ impl Ext4Volume {
                 state.block_checksum = checksum;
             }
             self.commit_group(group, &descriptor, offset, state);
-            let now_ns = time::now().as_nanos();
+            let now_ns = time::realtime();
             superblock
                 .update(&self.claim, |bytes| {
                     codec::patch_super_counts(
@@ -763,7 +763,7 @@ impl Ext4Volume {
             reservation.offset,
             state,
         );
-        let now_ns = time::now().as_nanos();
+        let now_ns = time::realtime();
         reservation
             .superblock
             .update(&self.claim, |bytes| {

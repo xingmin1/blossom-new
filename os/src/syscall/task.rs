@@ -1,11 +1,13 @@
 //! 用户任务ABI只复制已初始化字节，状态消费与用户交付分开完成。
 
+use core::convert::TryInto;
+
 use crate::mm::space::VmError;
-use crate::syscall::error::{copyout, Errno, SysResult};
+use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::clone::{self, CloneArguments, CloneError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
-use crate::task::process::{ChildEvent, WaitSelector};
+use crate::task::process::{ChildEvent, StackLimit, WaitSelector};
 use crate::task::signal::{SignalInfo, SignalPayload};
 use crate::task::{UserRuntime, UserThread};
 use crate::wait::{WaitNode, WaitResult, Waiter};
@@ -47,7 +49,7 @@ pub(super) fn execve(user: &UserThread, request: Request) -> Outcome {
     Outcome::NewImage
 }
 
-/// 路径与参数只读取一次，在同一 FS 和凭据快照下准备拥有式 ELF 或脚本映像。
+/// 路径与参数只读取一次，在同一 FS、凭据和组主栈限额快照下准备 ELF 或脚本映像。
 fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, UserRuntime), Errno> {
     let runtime = user.runtime().expect("exec has no runtime");
     let mm = user.mm().expect("exec has no MM");
@@ -57,8 +59,14 @@ fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, User
         let fs = runtime.fs.lock();
         (fs.vfs.clone(), fs.context.clone())
     };
-    let image =
-        exec::prepare(&vfs, &context, arguments, runtime.credentials).map_err(exec_error)?;
+    let stack_limit = user
+        .identity()
+        .expect("exec has no identity")
+        .group()
+        .stack_limit()
+        .current;
+    let image = exec::prepare(&vfs, &context, arguments, runtime.credentials, stack_limit)
+        .map_err(exec_error)?;
     Ok((image, runtime))
 }
 
@@ -68,6 +76,69 @@ fn abort_exec(user: &UserThread) -> Outcome {
     let status = identity.graph().exit_request(&identity).unwrap_or(11);
     identity.graph().request_exit(&identity, status);
     Outcome::GroupExit(status)
+}
+
+/// getrlimit 的输出指针必须完整交付两个 LP64 字段，空指针保真实 EFAULT。
+pub(super) fn getrlimit(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    resource_limit(user, 0, raw[0] as u32, None, Some(raw[1]))
+}
+
+/// setrlimit 先导入完整 LP64 值，提交只影响组限额，不修改已经存在的栈 VMA。
+pub(super) fn setrlimit(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    resource_limit(user, 0, raw[0] as u32, Some(raw[1]), None)
+}
+
+/// prlimit64 的零 PID 选择本组；新旧指针为空时分别省略修改或交付。
+pub(super) fn prlimit64(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    resource_limit(
+        user,
+        raw[0] as i32,
+        raw[1] as u32,
+        (raw[2] != 0).then_some(raw[2]),
+        (raw[3] != 0).then_some(raw[3]),
+    )
+}
+
+/// 用户复制全部在 Graph 和组限额锁外，旧值 copyout 故障不撤销已经提交的新值。
+fn resource_limit(
+    user: &UserThread,
+    pid: i32,
+    resource: u32,
+    new_address: Option<usize>,
+    old_address: Option<usize>,
+) -> SysResult {
+    if 16 <= resource {
+        return Err(Errno::InvalidArgument);
+    }
+    if resource != 3 {
+        return Err(Errno::NoSyscall);
+    }
+    let mm = user.mm().expect("rlimit has no MM");
+    let new = match new_address {
+        Some(address) => {
+            let mut bytes = [0u8; 16];
+            copyin(&mm, &mut bytes, address)?;
+            Some(StackLimit {
+                current: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                maximum: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            })
+        }
+        None => None,
+    };
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    let identity = user.identity().expect("rlimit has no identity");
+    let old = identity
+        .graph()
+        .prlimit_stack(&identity, pid as usize, new)?;
+    if let Some(address) = old_address {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&old.current.to_le_bytes());
+        bytes[8..].copy_from_slice(&old.maximum.to_le_bytes());
+        copyout(&mm, address, &bytes)?;
+    }
+    Ok(0)
 }
 
 /// 凭据查询返回当前真实 uid/gid；进程组、会话和亲缘查询继续使用原身份图。

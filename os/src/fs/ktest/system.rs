@@ -50,7 +50,7 @@ impl SystemOwner {
         Ok((root.clone(), extra))
     }
 
-    /// 正文按永久命令行的根权限构造卷与视图，返回的 init 字节仍借 BootInfo。
+    /// 正文按永久命令行的根权限与目录构造卷和视图，返回的路径字节仍借 BootInfo。
     fn prepare(
         &mut self,
         context: &mut TestContext<'_>,
@@ -59,26 +59,34 @@ impl SystemOwner {
         let selection = checked(context, boot_devices(crate::boot::info().bootargs()))?;
         let (root, extra) = checked(context, self.selected(selection))?;
         self.owner.cache().ktest_set_load_hook(None);
-        let vfs = Arc::try_new(checked(
+        let (vfs, fs_context) = checked(
             context,
-            mount_disks(root, extra, self.owner.cache().clone(), selection.root_mode),
-        )?)
-        .map_err(|_| TestError("system VFS owner OOM"))?;
-        let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
+            mount_disks(
+                root,
+                extra,
+                self.owner.cache().clone(),
+                selection.root_mode,
+                selection.rootdir,
+            ),
+        )?;
+        let vfs = Arc::try_new(vfs).map_err(|_| TestError("system VFS owner OOM"))?;
         let files = Arc::try_new(checked(context, FileTable::try_new(8))?)
             .map_err(|_| TestError("system file table owner OOM"))?;
         context.expect_eq(
-            checked(context, checked(context, vfs.root().inode())?.disk_volume())?
-                .disk()
-                .identity(),
+            checked(
+                context,
+                checked(context, fs_context.root().inode())?.disk_volume(),
+            )?
+            .disk()
+            .identity(),
             self.owner.disks[selection.root].identity(),
         );
-        context.expect_eq(vfs.root().filesystem().mode(), selection.root_mode);
+        context.expect_eq(fs_context.root().filesystem().mode(), selection.root_mode);
         let writable = match selection.root_mode {
             AccessMode::ReadOnly => Err(FsError::ReadOnly),
             AccessMode::ReadWrite => Ok(()),
         };
-        context.expect_eq(vfs.root().check_writable(), writable);
+        context.expect_eq(fs_context.root().check_writable(), writable);
         if selection.extra.is_some() {
             let extra = checked(
                 context,
@@ -367,112 +375,78 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 6] {
 )]
 pub(crate) mod arguments {
     use super::*;
-    /// 纯命令行模型覆盖根权限及 init 缺键、末值和原始字节边界，实际执行由用户消费者验证。
+    /// 纯模型覆盖设备和根权限的末值，以及 rootdir/init 原始字节；实际根视图由磁盘消费者验证。
     #[test]
     #[ktest(tags("B01"))]
     fn parser_boundaries_are_not_boot_selection(context: &mut TestContext<'_>) -> TestResult {
-        for (bytes, expected) in [
-            (
-                b"root=/dev/vda".as_slice(),
-                BootDevices {
-                    root: 0,
-                    extra: None,
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
-            ),
+        for (bytes, root, extra, mode) in [
+            (b"root=/dev/vda".as_slice(), 0, None, AccessMode::ReadOnly),
             (
                 b" \troot=/dev/vdb\r\nextra=/dev/vda\x0b\x0c",
-                BootDevices {
-                    root: 1,
-                    extra: Some(0),
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
+                1,
+                Some(0),
+                AccessMode::ReadOnly,
             ),
             (
                 b"root=/dev/vdz root=/dev/vda extra=/dev/vda extra=/dev/vdc",
-                BootDevices {
-                    root: 0,
-                    extra: Some(2),
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
+                0,
+                Some(2),
+                AccessMode::ReadOnly,
             ),
             (
                 b"console=ttyS0 root=/dev/vdz",
-                BootDevices {
-                    root: 25,
-                    extra: None,
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
+                25,
+                None,
+                AccessMode::ReadOnly,
             ),
             (
                 b"root=unsupported root=/dev/vdb extra=unsupported extra=/dev/vda",
-                BootDevices {
-                    root: 1,
-                    extra: Some(0),
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
+                1,
+                Some(0),
+                AccessMode::ReadOnly,
             ),
-            (
-                b"rw root=/dev/vda ro rw",
-                BootDevices {
-                    root: 0,
-                    extra: None,
-                    root_mode: AccessMode::ReadWrite,
-                    init: b"/sbin/init",
-                },
-            ),
-            (
-                b"root=/dev/vda rw ro",
-                BootDevices {
-                    root: 0,
-                    extra: None,
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
-            ),
+            (b"rw root=/dev/vda ro rw", 0, None, AccessMode::ReadWrite),
+            (b"root=/dev/vda rw ro", 0, None, AccessMode::ReadOnly),
             (
                 b"root=/dev/vda rw=1 ro=1 xrw rwx xro rox",
-                BootDevices {
-                    root: 0,
-                    extra: None,
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
+                0,
+                None,
+                AccessMode::ReadOnly,
             ),
             (
                 b"root=/dev/vda rw ro=1 xro rox",
-                BootDevices {
-                    root: 0,
-                    extra: None,
-                    root_mode: AccessMode::ReadWrite,
-                    init: b"/sbin/init",
-                },
+                0,
+                None,
+                AccessMode::ReadWrite,
             ),
             (
                 b"rw\troot=/dev/vdz\rro\nroot=/dev/vdb\x0brw\x0cextra=/dev/vda ",
-                BootDevices {
-                    root: 1,
-                    extra: Some(0),
-                    root_mode: AccessMode::ReadWrite,
-                    init: b"/sbin/init",
-                },
+                1,
+                Some(0),
+                AccessMode::ReadWrite,
             ),
             (
                 b"root=/dev/vda rw\x85ro rw\0ro",
-                BootDevices {
-                    root: 0,
-                    extra: None,
-                    root_mode: AccessMode::ReadOnly,
-                    init: b"/sbin/init",
-                },
+                0,
+                None,
+                AccessMode::ReadOnly,
             ),
         ] {
-            context.expect_eq(boot_devices(bytes), Ok(expected));
+            let selected = checked(context, boot_devices(bytes))?;
+            context.expect_eq(
+                (selected.root, selected.extra, selected.root_mode),
+                (root, extra, mode),
+            );
+        }
+        for (bytes, rootdir) in [
+            (b"rootdir=/".as_slice(), b"/".as_slice()),
+            (b"rootdir=/bad rootdir=/test", b"/test"),
+            (b"rootdir=/test rootdir=", b""),
+            (b"rootdir= rootdir=/missing", b"/missing"),
+            (b"rootdir=/bad\x0brootdir=/\x0c", b"/"),
+            (b"rootdir=/test\0tail", b"/test\0tail"),
+        ] {
+            context.expect_eq(checked(context, boot_devices(bytes))?.rootdir, rootdir);
         }
         for (bytes, init) in [
             (
@@ -502,9 +476,7 @@ pub(crate) mod arguments {
             );
         }
         for bytes in [
-            b"".as_slice(),
-            b"extra=/dev/vda",
-            b"root=",
+            b"root=".as_slice(),
             b"root=/dev/vdaa",
             b"root=/dev/vdA",
             b"root=/dev/vda1",
@@ -526,6 +498,87 @@ pub(crate) mod arguments {
 #[ktest::suite(fixture = SystemOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-system", "fs-system-root"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod root {
     use super::*;
+    /// 根目录来自同一磁盘的真实子目录；绝对路径与父组件都受返回上下文的完整 Path 约束。
+    #[test]
+    #[ktest(tags("fs-system-rootdir"))]
+    fn initial_directory_view_is_real_and_bounded(
+        context: &mut TestContext<'_>,
+        fixture: &mut SystemOwner,
+    ) -> TestResult {
+        fixture.owner.disk()?;
+        let selected = checked(context, boot_devices(crate::boot::info().bootargs()))?;
+        let (root, _) = checked(context, fixture.selected(selected))?;
+        fixture.owner.cache().ktest_set_load_hook(None);
+        let (vfs, fs_context) = checked(
+            context,
+            mount_disks(
+                root,
+                None,
+                fixture.owner.cache().clone(),
+                selected.root_mode,
+                b"/test",
+            ),
+        )?;
+        context.expect_eq(fs_context.root().ptr_eq(fs_context.cwd()), true);
+        let file = checked(
+            context,
+            vfs.resolve(&fs_context, b"/identity", ResolveMode::Follow),
+        )?;
+        let parent_file = checked(
+            context,
+            vfs.resolve(&fs_context, b"../../identity", ResolveMode::Follow),
+        )?;
+        context.expect_eq(file.ptr_eq(&parent_file), true);
+        context.expect_eq(
+            vfs.resolve(&fs_context, b"/test/identity", ResolveMode::Follow)
+                .err(),
+            Some(FsError::NotFound),
+        );
+        context.expect_eq(
+            checked(context, checked(context, file.inode())?.disk_volume())?
+                .disk()
+                .identity(),
+            fixture.owner.disks[selected.root].identity(),
+        );
+        drop(parent_file);
+        drop(file);
+        fixture.vfs = Some(Arc::try_new(vfs).map_err(|_| TestError("rootdir VFS owner OOM"))?);
+        fixture.context = Some(fs_context);
+        Ok(())
+    }
+
+    /// 显式不存在、普通文件、空值与 NUL 路径保留真实错误，不回退物理根；原 fixture 负责错误尾回收。
+    #[test]
+    #[ktest(tags("fs-system-rootdir"))]
+    fn invalid_directory_does_not_fall_back(
+        context: &mut TestContext<'_>,
+        fixture: &mut SystemOwner,
+    ) -> TestResult {
+        fixture.owner.disk()?;
+        let selected = checked(context, boot_devices(crate::boot::info().bootargs()))?;
+        let (root, _) = checked(context, fixture.selected(selected))?;
+        fixture.owner.cache().ktest_set_load_hook(None);
+        for (rootdir, error) in [
+            (b"/test/absent".as_slice(), FsError::NotFound),
+            (b"/test/identity", FsError::NotDirectory),
+            (b"", FsError::NotFound),
+            (b"/test\0tail", FsError::InvalidName),
+        ] {
+            context.expect_eq(
+                mount_disks(
+                    root.clone(),
+                    None,
+                    fixture.owner.cache().clone(),
+                    selected.root_mode,
+                    rootdir,
+                )
+                .err(),
+                Some(error),
+            );
+        }
+        Ok(())
+    }
+
     /// 单盘正式 factory 完整读普通树，并真实消费硬链接、相对链接、绝对链接和循环错误。
     #[test]
     #[ktest(tags("B01", "B16", "B24"))]

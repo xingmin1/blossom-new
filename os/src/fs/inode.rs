@@ -1873,7 +1873,7 @@ impl InodeRef {
         let volume = self.disk_volume()?;
         let g = volume.geometry();
         let old = *state.metadata.lock();
-        let now = time::now().as_nanos();
+        let now = time::realtime();
         if deleting && old.kind == InodeKind::Symlink && old.fast_symlink {
             return self.truncate_fast_symlink_locked(state, claim, &old, now, context);
         }
@@ -2250,7 +2250,7 @@ impl InodeRef {
             0,
             prepared.added_blocks,
             prepared.removed_blocks,
-            time::now().as_nanos(),
+            time::realtime(),
         ) {
             Ok(next) => next,
             Err(error) => {
@@ -2428,7 +2428,7 @@ impl InodeRef {
                 pulled,
                 prepared.added_blocks,
                 prepared.removed_blocks,
-                time::now().as_nanos(),
+                time::realtime(),
             ) {
                 Ok(next) => next,
                 Err(error) => {
@@ -2908,6 +2908,61 @@ impl InodeWriteGuard<'_> {
     /// 预备仅改变 ctime 的 inode-table 记录。
     pub(crate) fn prepare_ctime(&self, now_ns: u64) -> Result<PreparedInodeMetadata, FsError> {
         prepare_inode_ctime(self.inode, self.state, now_ns)
+    }
+
+    /// 在 canonical 写侧核所有者并预备权限和 ctime；原类型、内容与执行写占用不改变。
+    pub(crate) fn prepare_mode(
+        &self,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        now_ns: u64,
+    ) -> Result<PreparedInodeMetadata, FsError> {
+        let old = self.metadata_snapshot();
+        if uid != 0 && uid != old.uid {
+            return Err(FsError::NotPermitted);
+        }
+        let mut permissions = mode & 0o7777;
+        if uid != 0 && gid != old.gid {
+            permissions &= !0o2000;
+        }
+        let mut prepared = self.prepare_ctime(now_ns)?;
+        prepared.next.mode = (old.mode & !0o7777) | permissions;
+        Ok(prepared)
+    }
+
+    /// 在唯一写侧预备时间和当前 ctime；省略的字段保留旧值，内容写占用不参与属性修改。
+    pub(crate) fn prepare_times(
+        &self,
+        atime: Option<InodeTime>,
+        mtime: Option<InodeTime>,
+        now_ns: u64,
+    ) -> Result<PreparedInodeMetadata, FsError> {
+        let old = self.metadata_snapshot();
+        let mut next = old;
+        let now = memory_time(now_ns);
+        if self.inode.is_memory() {
+            self.inode.require_memory_write()?;
+            if atime
+                .into_iter()
+                .chain(mtime)
+                .any(|time| 1_000_000_000 <= time.nanoseconds)
+            {
+                return Err(FsError::InvalidOperation);
+            }
+            next.atime = atime.unwrap_or(old.atime);
+            next.mtime = mtime.unwrap_or(old.mtime);
+            next.ctime = now;
+        } else {
+            if let Some(time) = atime {
+                next.atime = codec::prepare_inode_time(time, 140, old.extra_isize)?;
+            }
+            if let Some(time) = mtime {
+                next.mtime = codec::prepare_inode_time(time, 136, old.extra_isize)?;
+            }
+            next.ctime = codec::prepare_inode_time(now, 132, old.extra_isize)?;
+        }
+        prepare_inode_metadata(self.inode, self.state, old, next)
     }
 
     /// 在已持有的 canonical 写侧内消费记录准备并发布属性。
@@ -3992,7 +4047,7 @@ impl InodeRef {
         let prepared = guard.prepare_memory_edit(
             MemoryEdit::Insert(name, child.number(), kind),
             i32::from(kind == InodeKind::Directory),
-            time::now().as_nanos(),
+            time::realtime(),
             true,
         )?;
         guard.publish(prepared);
@@ -4077,7 +4132,7 @@ impl InodeRef {
             }
             let mut next = current;
             next.size = current.size.max(position + pulled as u64);
-            next.mtime = memory_time(time::now().as_nanos());
+            next.mtime = memory_time(time::realtime());
             next.ctime = next.mtime;
             *state.metadata.lock() = next;
             accepted += pulled;
@@ -4125,7 +4180,7 @@ impl InodeRef {
         }
         let mut next = old;
         next.size = new_size;
-        next.mtime = memory_time(time::now().as_nanos());
+        next.mtime = memory_time(time::realtime());
         next.ctime = next.mtime;
         *state.metadata.lock() = next;
         let first = new_size.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;

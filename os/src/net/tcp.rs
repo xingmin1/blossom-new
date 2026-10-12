@@ -15,6 +15,7 @@ use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::{AddressFamily, InetEndpoint};
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
+use crate::net::socket::SocketTimeouts;
 use crate::net::table::{BindLease, TcpTuple, TransportProtocol};
 use crate::net::{
     EndpointSlot, IoProgress, NetStack, NetStackRef, ENDPOINT_CAPACITY, LOOPBACK_CAPACITY,
@@ -45,6 +46,7 @@ struct Metadata {
     write_closed: bool,
     reuse: bool,
     v6_only: bool,
+    timeouts: SocketTimeouts,
 }
 
 /// 半连接与可接受连接共享实际 backlog 上限，只有成熟 Established 才进入 ready。
@@ -193,6 +195,7 @@ impl TcpEndpoint {
                 write_closed: false,
                 reuse: false,
                 v6_only: false,
+                timeouts: SocketTimeouts::default(),
             }),
             children: SpinLock::new(Children {
                 limit: 0,
@@ -215,6 +218,16 @@ impl TcpEndpoint {
         endpoint.work.call_once(|| work);
         endpoint.timer.call_once(|| timer);
         Ok(endpoint)
+    }
+
+    /// 两向等待值属于同一端点，查询不取得可睡协议操作权。
+    pub(crate) fn timeouts(&self) -> SocketTimeouts {
+        self.metadata.lock().timeouts
+    }
+
+    /// 控制属性只在 metadata 短锁内修改，监听子对象独立持有握手时的快照。
+    pub(crate) fn set_timeout(&self, receive: bool, timeout: Option<u64>) {
+        self.metadata.lock().timeouts.set(receive, timeout);
     }
 
     /// 返回本域不复用的身份，描述符编号不进入协议索引。
@@ -950,7 +963,7 @@ impl TcpEndpoint {
         }
     }
 
-    /// listener 操作拥有提供当前配置；同物理后备的 child 在发表前继承策略并选实际 MTU。
+    /// listener 操作拥有提供 raw 配置；metadata 同次快照在 child 发表前继承。
     fn receive_syn(
         &self,
         net: &NetStackRef,
@@ -973,13 +986,19 @@ impl TcpEndpoint {
                 return Ok(());
             }
         }
-        let lease = self
-            .metadata
-            .lock()
-            .lease
-            .as_ref()
-            .cloned()
-            .expect("listener has no binding");
+        let (lease, reuse, v6_only, timeouts) = {
+            let metadata = self.metadata.lock();
+            (
+                metadata
+                    .lease
+                    .as_ref()
+                    .cloned()
+                    .expect("listener has no binding"),
+                metadata.reuse,
+                metadata.v6_only,
+                metadata.timeouts,
+            )
+        };
         let slot = net.claim_endpoint_slot()?;
         let id = net.allocate_identity();
         let child = Self::try_new(
@@ -1009,8 +1028,9 @@ impl TcpEndpoint {
             metadata.lease = Some(lease);
             metadata.parent = Arc::downgrade(&listener);
             metadata.engaged = true;
-            metadata.reuse = self.reuse_address();
-            metadata.v6_only = self.metadata.lock().v6_only;
+            metadata.reuse = reuse;
+            metadata.v6_only = v6_only;
+            metadata.timeouts = timeouts;
         }
         let admission = net.admission()?;
         if let Some(existing) = net.tables().lookup_tcp(tuple) {

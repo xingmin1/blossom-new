@@ -23,6 +23,7 @@ use crate::block::{
 use crate::cache::{BufferRef, MetadataCache};
 use crate::fs::background::WritebackDomain;
 use crate::fs::inode::{InodeDomain, InodeMetadata, InodeRef};
+use crate::fs::memfs::FilesystemStat;
 use crate::fs::{writeback, DirectoryCursor, DirectoryEntry, FsError, InodeKind, InodeTime};
 use crate::mm::{FolioRead, PAGE_SIZE};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
@@ -389,6 +390,38 @@ impl Ext4Volume {
     /// 同一卷的所有 Arc 引用共享稳定非零编号，不泄漏地址或宿主设备号。
     pub fn device(&self) -> u64 {
         u64::from(self.device)
+    }
+
+    /// 持卷分配睡眠锁采样主超级块当前空闲计数，使用分配与归还共同修改的元数据页。
+    /// 总量保留完整卷几何，不扣除独立推算的元数据开销；读取和内容借用失败原样返回。
+    pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
+        let _allocation = self.allocation.lock();
+        let g = &self.geometry;
+        // 主超级块位于页零的固定窗口，普通 metadata_block 的数据块校验不接受此保留块。
+        let superblock = self.metadata.get(0, PAGE_SIZE, None)?;
+        superblock.with_read(|bytes| {
+            let record = codec::bytes(bytes, 1024, 1024)?;
+            let mut free = u64::from(codec::le32(record, 12)?);
+            let mut reserved = u64::from(codec::le32(record, 8)?);
+            if g.features_incompat & 0x80 != 0 {
+                free |= u64::from(codec::le32(record, 344)?) << 32;
+                reserved |= u64::from(codec::le32(record, 340)?) << 32;
+            }
+            let freefiles = u64::from(codec::le32(record, 16)?);
+            if g.blocks_count < free || g.inodes_count < freefiles {
+                return Err(FsError::Corrupt);
+            }
+            Ok(FilesystemStat {
+                fs_type: 0xef53,
+                block_size: g.block_size as u64,
+                blocks: g.blocks_count,
+                free,
+                available: free.saturating_sub(reserved),
+                files: g.inodes_count,
+                freefiles,
+                device: self.device(),
+            })
+        })?
     }
 
     /// 借用保活且被实际 FS 占用保护的磁盘。

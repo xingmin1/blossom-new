@@ -92,6 +92,11 @@ impl Path {
         &self.mount.filesystem
     }
 
+    /// 观察本路径实际挂载的独立权限，同一后端上的其它挂载不影响此值。
+    pub fn mount_mode(&self) -> AccessMode {
+        self.mount.mode
+    }
+
     /// 借用原挂载，为同一实际文件系统的零链接 inode 构造未入名字索引的路径。
     /// 调用者须在可睡眠任务中持合法 canonical inode；本操作不创建名字或替换挂载根。
     pub(crate) fn unhashed_inode(&self, inode: InodeRef) -> Result<Self, FsError> {
@@ -196,6 +201,12 @@ impl FsContext {
     /// 只替换 cwd；调用方先在锁外验证新 Path，并在锁外释放旧 Path。
     pub fn exchange_cwd(&mut self, cwd: Path) -> Path {
         core::mem::replace(&mut self.cwd, cwd)
+    }
+
+    /// 只替换 root，保留 cwd 与 umask；调用方在共享锁外核目录、搜索及换根权限。
+    /// 锁内仅移动已核 Path，返回的旧 root 必须在锁外释放。
+    pub fn exchange_root(&mut self, root: Path) -> Path {
+        core::mem::replace(&mut self.root, root)
     }
 }
 
@@ -637,7 +648,7 @@ impl Vfs {
                     if !parent_inode.is_memory() && self.inodes.is_full() {
                         lookup.parent.mount.dcache.prune_unused();
                     }
-                    let now_ns = crate::time::now().as_nanos();
+                    let now_ns = crate::time::realtime();
                     let new_inode = self.inodes.prepare_regular_inode(
                         &parent_inode,
                         &parent_metadata,
@@ -750,7 +761,7 @@ impl Vfs {
         if !parent_inode.is_memory() && self.inodes.is_full() {
             lookup.parent.mount.dcache.prune_unused();
         }
-        let now_ns = crate::time::now().as_nanos();
+        let now_ns = crate::time::realtime();
         let new_inode = self.inodes.prepare_directory_inode(
             &parent_inode,
             &parent_metadata,
@@ -821,7 +832,7 @@ impl Vfs {
         if !parent_inode.is_memory() && self.inodes.is_full() {
             lookup.parent.mount.dcache.prune_unused();
         }
-        let now_ns = crate::time::now().as_nanos();
+        let now_ns = crate::time::realtime();
         let new_inode = self.inodes.prepare_symlink_inode(
             &parent_inode,
             &parent_metadata,
@@ -889,7 +900,7 @@ impl Vfs {
         if child_metadata.links == 0 {
             return Err(FsError::NotFound);
         }
-        let now_ns = crate::time::now().as_nanos();
+        let now_ns = crate::time::realtime();
         let child_edit = child.prepare_link_delta(-1, now_ns)?;
         let directory_edit = directory.prepare_remove(name.as_slice(), 0, now_ns)?;
         child.publish_metadata(child_edit);
@@ -955,7 +966,7 @@ impl Vfs {
             .mount
             .dcache
             .try_prepare_child(&lookup.parent.dentry, name.clone())?;
-        let now_ns = crate::time::now().as_nanos();
+        let now_ns = crate::time::realtime();
         let source_edit = source_guard.prepare_link_delta(1, now_ns)?;
         let directory_edit = directory.prepare_insert(
             name.as_slice(),
@@ -1011,7 +1022,7 @@ impl Vfs {
         if !child.is_empty()? {
             return Err(FsError::NotEmpty);
         }
-        let now_ns = crate::time::now().as_nanos();
+        let now_ns = crate::time::realtime();
         let child_edit = child.prepare_link_delta(-2, now_ns)?;
         let directory_edit = directory.prepare_remove(name.as_slice(), -1, now_ns)?;
         child.publish_metadata(child_edit);
@@ -1278,7 +1289,7 @@ impl Vfs {
             }
         }
 
-        let now_ns = crate::time::now().as_nanos();
+        let now_ns = crate::time::realtime();
         let source_metadata_edit = if source_is_directory && !same_parent {
             None
         } else if let Some(directory) = source_directory.as_ref() {
@@ -1531,8 +1542,8 @@ impl Vfs {
         removed + self.inodes.prune_unused()
     }
 
-    /// 导出当前挂载的六列快照；只在短表锁内克隆预留槽中的拥有，路径和文本均锁外准备。
-    pub fn mounts_text(&self) -> Result<Vec<u8>, FsError> {
+    /// 导出相对所给真实根的六列挂载快照；根外挂载不显示，路径与文本在短表锁外准备。
+    pub fn mounts_text(&self, root: &Path) -> Result<Vec<u8>, FsError> {
         let mut snapshot = Vec::new();
         snapshot
             .try_reserve_exact(self.mount_capacity)
@@ -1541,12 +1552,17 @@ impl Vfs {
             let mounts = self.mounts.lock();
             snapshot.extend(mounts.iter().cloned());
         }
-        let root = Path {
-            mount: snapshot[0].clone(),
-            dentry: snapshot[0].root.clone(),
-        };
         let mut text = Vec::new();
         for mount in &snapshot {
+            let path = Path {
+                mount: mount.clone(),
+                dentry: mount.root.clone(),
+            };
+            let pathname = match path_bytes(&path, root) {
+                Ok(pathname) => pathname,
+                Err(FsError::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
             let kind: &[u8] = match &mount.filesystem {
                 Filesystem::Ext4(_) => b"ext4",
                 Filesystem::Memory(filesystem) => match filesystem.kind() {
@@ -1559,11 +1575,7 @@ impl Vfs {
             append_mount_bytes(&mut text, b":")?;
             append_mount_device(&mut text, mount.filesystem.device())?;
             append_mount_bytes(&mut text, b" ")?;
-            let path = Path {
-                mount: mount.clone(),
-                dentry: mount.root.clone(),
-            };
-            append_mount_path(&mut text, &path, &root)?;
+            append_mount_component(&mut text, &pathname)?;
             append_mount_bytes(&mut text, b" ")?;
             append_mount_bytes(&mut text, kind)?;
             let writable = mount.mode == AccessMode::ReadWrite
@@ -1677,11 +1689,6 @@ fn append_mount_component(text: &mut Vec<u8>, name: &[u8]) -> Result<(), FsError
         }
     }
     append_mount_bytes(text, &name[start..])
-}
-
-/// 复用原始路径采集，再独立应用 proc 文本转义，目录名中的 slash 分隔符保持原样。
-fn append_mount_path(text: &mut Vec<u8>, path: &Path, root: &Path) -> Result<(), FsError> {
-    append_mount_component(text, &path_bytes(path, root)?)
 }
 
 /// 先沿不可变 covered 链保有全部后端，按 Arc 地址锁序固定跨挂载祖先及名字。

@@ -231,8 +231,14 @@ impl WriteOwner {
             drop(self.open(context, pathname, 0)?);
         }
         let image = self.user.load_named(context, PROGRAM_WRITE, mode)?;
-        self.user
-            .start_program(context, image, false, false, Credentials::ROOT)?;
+        self.user.start_program(
+            context,
+            image,
+            self.user.path.context().clone(),
+            false,
+            false,
+            Credentials::ROOT,
+        )?;
         let event = self.user.wait(context)?;
         if event.status != 0 {
             self.user.graph().request_root_exit(9);
@@ -268,8 +274,14 @@ impl WriteOwner {
 
     /// 用户执行固定在另一 CPU，控制者不持文件锁等待其普通指令检查点。
     fn start_shared(&mut self, context: &TestContext<'_>, image: LoadedImage) -> TestResult {
-        self.user
-            .start_program(context, image, true, false, Credentials::ROOT)
+        self.user.start_program(
+            context,
+            image,
+            self.user.path.context().clone(),
+            true,
+            false,
+            Credentials::ROOT,
+        )
     }
     /// 按指定的真实用户身份启动同一普通 ELF，并保留原 UserOwner 的 wait/join。
     fn start_shared_as(
@@ -278,8 +290,14 @@ impl WriteOwner {
         image: LoadedImage,
         credentials: Credentials,
     ) -> TestResult {
-        self.user
-            .start_program(context, image, true, false, credentials)
+        self.user.start_program(
+            context,
+            image,
+            self.user.path.context().clone(),
+            true,
+            false,
+            credentials,
+        )
     }
 
     /// 实际退出离栈必须在原十秒内可观察，随后消费原 wait 事件和全部子进程。
@@ -3321,10 +3339,10 @@ pub(crate) mod writes {
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-kernel", 2)?;
         let inode = fixture.inodes.last().unwrap().clone();
-        let first_write = time::now().as_nanos();
+        let first_write = time::realtime();
         let input = [0x39; 1027];
         context.expect_eq(checked(context, file.write_at(4093, &input))?, input.len());
-        modified_between(context, &file, &inode, first_write, time::now().as_nanos())?;
+        modified_between(context, &file, &inode, first_write, time::realtime())?;
         context.expect_eq(checked(context, file.stat())?.size, 5120);
         bytes_at(context, &file, 0, &[0; 4093])?;
         bytes_at(context, &file, 4093, &input)?;
@@ -3336,12 +3354,12 @@ pub(crate) mod writes {
             context,
             WriteBuffer::user(&address_space, SOURCE + 4079, 64),
         )?;
-        let prefix_write = time::now().as_nanos();
+        let prefix_write = time::realtime();
         context.expect_eq(
             checked(context, file.write_from(&mut source, FileIoContext::Kernel))?,
             17,
         );
-        modified_between(context, &file, &inode, prefix_write, time::now().as_nanos())?;
+        modified_between(context, &file, &inode, prefix_write, time::realtime())?;
         context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 17);
         context.expect_eq(checked(context, file.stat())?.size, 5120);
         bytes_at(context, &file, 0, &[0x72; 17])?;
@@ -3905,7 +3923,7 @@ pub(crate) mod writes {
             0,
         );
         let before = allocation_counts(context, &volume)?;
-        let first_write = time::now().as_nanos();
+        let first_write = time::realtime();
         for (index, logical) in [0u64, 12, 268, 65804].iter().copied().enumerate() {
             let bytes = [0x31 + index as u8; 17];
             context.expect_eq(
@@ -3921,7 +3939,7 @@ pub(crate) mod writes {
             );
             bytes_at(context, &file, logical * 1024, &expected)?;
         }
-        modified_between(context, &file, &inode, first_write, time::now().as_nanos())?;
+        modified_between(context, &file, &inode, first_write, time::realtime())?;
         let mapped = tree(context, &inode)?;
         context.expect_eq((mapped.data, mapped.nodes), (4, 6));
         let after = allocation_counts(context, &volume)?;
@@ -3931,7 +3949,7 @@ pub(crate) mod writes {
         Ok(())
     }
 
-    /// 真实 loader、fork 和未发表 Task 控制 deny 寿命，普通 private 文件映射不取得 deny。
+    /// 真实 loader、fork 和未发表 Task 控制 deny 寿命，文件系统视图在 OOM 前保活；普通 private 文件映射不取得 deny。
     #[test]
     #[ktest(tags("W08"))]
     fn executable_deny_prepare_fork_and_private_map(
@@ -3939,6 +3957,8 @@ pub(crate) mod writes {
         fixture: &mut WriteOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
+        let vfs = fixture.user.path.vfs().clone();
+        let fs_context = fixture.user.path.context().clone();
         let program = fixture.open(context, PROGRAM_WRITE, 0)?;
         let path = checked(
             context,
@@ -3960,12 +3980,27 @@ pub(crate) mod writes {
         let args = Arguments::from_kernel(PROGRAM_WRITE, &[PROGRAM_WRITE, b"e"], &[])
             .map_err(|_| TestError("deny arguments OOM"))?;
         context.expect_eq(
-            exec::load(program.clone(), &args, 0, 0).err(),
+            exec::load(
+                &vfs,
+                &fs_context,
+                program.clone(),
+                &args,
+                Credentials::ROOT,
+                exec::DEFAULT_STACK_BYTES,
+            )
+            .err(),
             Some(ExecError::File(FsError::TextBusy)),
         );
         drop(writer);
-        let image = exec::load(program.clone(), &args, 0, 0)
-            .map_err(|_| TestError("deny real ELF load failed"))?;
+        let image = exec::load(
+            &vfs,
+            &fs_context,
+            program.clone(),
+            &args,
+            Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|_| TestError("deny real ELF load failed"))?;
         context.expect_eq(
             open_path_with_flags(
                 fixture.user.path.vfs(),
@@ -4036,12 +4071,27 @@ pub(crate) mod writes {
         )?);
         let bad = fixture.open(context, b"/test/write-map", 0)?;
         context.expect_eq(
-            exec::load(bad.clone(), &args, 0, 0).err(),
+            exec::load(
+                &vfs,
+                &fs_context,
+                bad.clone(),
+                &args,
+                Credentials::ROOT,
+                exec::DEFAULT_STACK_BYTES,
+            )
+            .err(),
             Some(ExecError::Format),
         );
         drop(fixture.open(context, b"/test/write-map", 1)?);
-        let image = exec::load(program.clone(), &args, 0, 0)
-            .map_err(|_| TestError("prepare deny real load failed"))?;
+        let image = exec::load(
+            &vfs,
+            &fs_context,
+            program.clone(),
+            &args,
+            Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|_| TestError("prepare deny real load failed"))?;
         let runtime = checked(
             context,
             UserRuntime::try_new(
@@ -4079,8 +4129,15 @@ pub(crate) mod writes {
                 FileIoContext::Kernel,
             ),
         )?);
-        let image = exec::load(program.clone(), &args, 0, 0)
-            .map_err(|_| TestError("OOM deny real load failed"))?;
+        let image = exec::load(
+            &vfs,
+            &fs_context,
+            program.clone(),
+            &args,
+            Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|_| TestError("OOM deny real load failed"))?;
         let runtime = checked(
             context,
             UserRuntime::try_new(
@@ -4139,7 +4196,15 @@ pub(crate) mod writes {
                 let _pin = PreemptGuard::new();
                 pages.exhaust()
             };
-            let error = exec::load(program.clone(), &args, 0, 0).err();
+            let error = exec::load(
+                &vfs,
+                &fs_context,
+                program.clone(),
+                &args,
+                Credentials::ROOT,
+                exec::DEFAULT_STACK_BYTES,
+            )
+            .err();
             drop(pages);
             (evidence, error)
         };

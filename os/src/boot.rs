@@ -128,6 +128,8 @@ pub struct BootInfo {
     pub reserved: [Region; MAX_RESERVED_REGIONS],
     pub dtb: Region,
     pub interrupts: InterruptResources,
+    /// 唯一启用 RTC 的物理寄存器区间，运行期只用于 BSP 初始日历采样。
+    pub rtc: Region,
     pub pci: PciResources,
     pub virtio_mmio: [VirtioMmioResource; MAX_VIRTIO_MMIO],
     pub virtio_mmio_count: usize,
@@ -150,6 +152,7 @@ impl BootInfo {
             reserved: [Region::default(); MAX_RESERVED_REGIONS],
             dtb: Region::default(),
             interrupts: InterruptResources::default(),
+            rtc: Region::default(),
             pci: PciResources::default(),
             virtio_mmio: [VirtioMmioResource::default(); MAX_VIRTIO_MMIO],
             virtio_mmio_count: 0,

@@ -848,6 +848,84 @@ impl ServiceFixture {
 #[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "time"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
+
+    /// 生产日历换算覆盖 Unix 起点、闰年、世纪、有效时分秒及纳秒容量边界。
+    #[test]
+    fn rtc_calendar_boundaries(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(|| {
+            let fields = |month: u32, day: u32, hour: u32, minute: u32, second: u32| {
+                (month << 26) | (day << 21) | (hour << 16) | (minute << 10) | (second << 4)
+            };
+            assert_eq!(
+                clock::testing::rtc_calendar(70, fields(1, 1, 0, 0, 0)),
+                Some(0)
+            );
+            assert_eq!(
+                clock::testing::rtc_calendar(100, fields(2, 29, 0, 0, 0)),
+                Some(951_782_400_000_000_000)
+            );
+            assert_eq!(
+                clock::testing::rtc_calendar(138, fields(1, 19, 3, 14, 7)),
+                Some(2_147_483_647_000_000_000)
+            );
+            assert_eq!(
+                clock::testing::rtc_calendar(200, fields(2, 29, 0, 0, 0)),
+                None
+            );
+            assert_eq!(
+                clock::testing::rtc_calendar(123, fields(2, 29, 0, 0, 0)),
+                None
+            );
+            assert_eq!(clock::testing::rtc_calendar(0, fields(1, 1, 0, 0, 0)), None);
+            assert_eq!(
+                clock::testing::rtc_calendar(8099, fields(1, 1, 0, 0, 0)),
+                None
+            );
+            assert_eq!(
+                clock::testing::rtc_calendar(u32::MAX, fields(1, 1, 0, 0, 0)),
+                None
+            );
+            for low in [
+                fields(0, 1, 0, 0, 0),
+                fields(13, 1, 0, 0, 0),
+                fields(1, 0, 0, 0, 0),
+                fields(4, 31, 0, 0, 0),
+                fields(1, 1, 24, 0, 0),
+                fields(1, 1, 0, 60, 0),
+                fields(1, 1, 0, 0, 60),
+            ] {
+                assert_eq!(clock::testing::rtc_calendar(126, low), None);
+            }
+            Ok(())
+        })
+    }
+
+    /// RTC 日历投影保持同一单调采样区间，过去 UTC 立即返回且未来睡眠沿原精确 timer。
+    #[test]
+    fn realtime_and_monotonic_deadlines(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(|| {
+            let before = clock::now();
+            let utc = clock::realtime();
+            let after = clock::now();
+            let projected = clock::realtime_deadline(utc);
+            assert!(before <= projected && projected <= after);
+            assert!(after.as_nanos() < utc, "RTC epoch is absent from realtime");
+            assert_eq!(clock::realtime_deadline(0), MonotonicInstant::from_nanos(0));
+            crate::timer::sleep_until(clock::realtime_deadline(0));
+            let utc_deadline = clock::realtime().checked_add(20_000_000).unwrap();
+            let deadline = clock::realtime_deadline(utc_deadline);
+            crate::timer::sleep_until(deadline);
+            assert!(deadline <= clock::now());
+            assert!(utc_deadline <= clock::realtime());
+            Ok(())
+        })
+    }
     /// 重新武装真实quantum后验证硬IRQ仅置请求、合法安全点切换与整数寄存器保存。
     #[test]
     fn deferred_quantum(

@@ -60,6 +60,7 @@ fn same_resources(
     context.expect_eq(actual.memory, expected.memory);
     context.expect_eq(actual.memory_count, expected.memory_count);
     context.expect_eq(actual.dtb, expected.dtb);
+    context.expect_eq(actual.rtc, expected.rtc);
     context.expect_eq(actual.interrupts.uart, expected.interrupts.uart);
     context.expect_eq(actual.interrupts.controller, expected.interrupts.controller);
     context.expect_eq(
@@ -149,12 +150,66 @@ pub(crate) mod cases {
             "PCI config={:#x}..{:#x} windows={}",
             live.pci.configuration.start, live.pci.configuration.end, live.pci.range_count
         ));
+        assert!(!live.memory[..live.memory_count]
+            .iter()
+            .any(|ram| ram.overlaps(live.rtc)));
+        context.diagnostic(format_args!(
+            "RTC start={:#x} end={:#x}",
+            live.rtc.start, live.rtc.end
+        ));
         for range in &live.pci.ranges[..live.pci.range_count] {
             context.diagnostic(format_args!(
                 "PCI WINDOW flags={:#x} bus={:#x} physical={:#x}..{:#x}",
                 range.flags, range.bus_start, range.cpu.start, range.cpu.end
             ));
         }
+    }
+
+    /// RTC 缺失、窗口损坏或覆盖 RAM 均由实际资源发现拒绝，不生成日历默认值。
+    #[test]
+    #[case("missing", 0u8)]
+    #[case("unaligned", 1u8)]
+    #[case("short_window", 2u8)]
+    #[case("ram_overlap", 3u8)]
+    fn rtc_resource_rejection(_: &mut TestContext<'_>, fixture: &mut Dtb, mode: u8) {
+        let live = boot::info();
+        #[cfg(target_arch = "riscv64")]
+        let binding = "google,goldfish-rtc";
+        #[cfg(target_arch = "loongarch64")]
+        let binding = "loongson,ls7a-rtc";
+        let (offset, length) = {
+            let tree = fdt::Fdt::new(fixture.bytes).expect("actual DTB invalid");
+            let rtc = tree.find_compatible(&[binding]).expect("actual RTC absent");
+            let property = rtc
+                .property(if mode == 0 { "compatible" } else { "reg" })
+                .expect("actual RTC resource absent");
+            (
+                property.value.as_ptr() as usize - fixture.bytes.as_ptr() as usize,
+                property.value.len(),
+            )
+        };
+        if mode == 0 {
+            fixture.bytes[offset] = b'x';
+        } else {
+            assert_eq!(
+                length, 16,
+                "fixed virt RTC reg is not two address and two size cells"
+            );
+            match mode {
+                1 => fixture.bytes[offset + 7] |= 1,
+                2 => fixture.bytes[offset + 8..offset + 16].copy_from_slice(&4u64.to_be_bytes()),
+                3 => fixture.bytes[offset..offset + 8]
+                    .copy_from_slice(&(live.memory[0].start as u64).to_be_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        assert!(platform::ktest_discover_tree(
+            fixture.bytes,
+            live.raw_args,
+            live.bsp_hardware_id,
+            live.dtb.start
+        )
+        .is_err());
     }
 
     /// 所有不完整前缀都必须由生产边界验证拒绝。

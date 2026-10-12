@@ -12,6 +12,7 @@ use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::file::{import_vectors, MAX_IOV_COUNT};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::UserThread;
+use crate::timer::TICK_NS;
 use smoltcp::socket::tcp::CongestionControl;
 
 const SOCK_STREAM: u32 = 1;
@@ -39,11 +40,14 @@ const SO_ERROR: i32 = 4;
 const SO_KEEPALIVE: i32 = 9;
 const SO_SNDBUF: i32 = 7;
 const SO_RCVBUF: i32 = 8;
+const SO_RCVTIMEO: i32 = 20;
+const SO_SNDTIMEO: i32 = 21;
+const TIMEVAL_LEN: usize = 16;
 const SO_ACCEPTCONN: i32 = 30;
 const SO_PROTOCOL: i32 = 38;
 const SO_DOMAIN: i32 = 39;
 
-/// 无进度的协议中断交给原信号重启出口，其余结果仅在此处编码为负 errno。
+/// 仅无限等待的内部中断标记进入信号重启出口，有限等待交付实际 EINTR。
 pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     let raw = request.arguments;
     let result = match request.number {
@@ -66,7 +70,7 @@ pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         _ => Err(Errno::NoSyscall),
     };
     match result {
-        Err(Errno::Interrupted) => Outcome::Restart(Restart::Syscall { request }),
+        Err(Errno::RestartSyscall) => Outcome::Restart(Restart::Syscall { request }),
         other => Outcome::Return(other.unwrap_or_else(Errno::result)),
     }
 }
@@ -497,7 +501,7 @@ fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
 /// 所选选项的协议和只读边界在 copyin 前检查，不把不支持的设置当作成功。
 fn check_option(socket: &SocketFile, level: i32, option: i32, setting: bool) -> Result<(), Errno> {
     match (level, option) {
-        (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE) => Ok(()),
+        (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE | SO_RCVTIMEO | SO_SNDTIMEO) => Ok(()),
         (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) if !setting || socket.domain() != AF_UNIX => Ok(()),
         (SOL_SOCKET, SO_TYPE | SO_ERROR | SO_ACCEPTCONN | SO_PROTOCOL | SO_DOMAIN) if !setting => {
             Ok(())
@@ -526,7 +530,42 @@ fn input_congestion(
     Ok(name)
 }
 
-/// 选项 copyin 全在端点锁外，缓冲提示和开关只以完整内核值修改原对象。
+/// LP64 timeval 只导入完整 16 字节；微秒先校验，负秒随后表示立即返回。
+fn input_timeout(mm: &Mm, address: usize, length: usize) -> Result<Option<u64>, Errno> {
+    if length < TIMEVAL_LEN {
+        return Err(Errno::InvalidArgument);
+    }
+    let mut bytes = [0u8; TIMEVAL_LEN];
+    copyin(mm, &mut bytes, address)?;
+    let seconds = i64::from_ne_bytes(bytes[..8].try_into().expect("fixed timeval seconds"));
+    let microseconds =
+        i64::from_ne_bytes(bytes[8..].try_into().expect("fixed timeval microseconds"));
+    if microseconds < 0 || 1_000_000 <= microseconds {
+        return Err(Errno::Domain);
+    }
+    if seconds < 0 {
+        return Ok(Some(0));
+    }
+    if seconds == 0 && microseconds == 0 {
+        return Ok(None);
+    }
+    // 输入和上取整在宽整数域完成，超出内部纳秒范围沿无限 sentinel 返回。
+    let nanos = seconds as u128 * 1_000_000_000 + microseconds as u128 * 1_000;
+    let tick = u128::from(TICK_NS);
+    let quantized = nanos.div_ceil(tick) * tick;
+    Ok(u64::try_from(quantized).ok())
+}
+
+/// getter 导出端点实际量化值；无限与立即值均按 timeval 零值表示。
+fn timeout_bytes(timeout: Option<u64>) -> [u8; TIMEVAL_LEN] {
+    let nanos = timeout.unwrap_or(0);
+    let mut bytes = [0u8; TIMEVAL_LEN];
+    bytes[..8].copy_from_slice(&((nanos / 1_000_000_000) as i64).to_ne_bytes());
+    bytes[8..].copy_from_slice(&((nanos % 1_000_000_000 / 1_000) as i64).to_ne_bytes());
+    bytes
+}
+
+/// 选项 copyin 全在端点锁外，完整期限、缓冲提示和开关只修改原对象。
 fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let file = socket_file(user, raw[0])?;
     let socket = file.socket().expect("checked socket capability");
@@ -538,6 +577,11 @@ fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let option = raw[2] as i32;
     check_option(socket, level, option, true)?;
     let mm = user.mm().expect("setsockopt has no MM");
+    if level == SOL_SOCKET && matches!(option, SO_RCVTIMEO | SO_SNDTIMEO) {
+        let timeout = input_timeout(&mm, raw[3], length as usize)?;
+        socket.set_timeout(option == SO_RCVTIMEO, timeout);
+        return Ok(0);
+    }
     if level == IPPROTO_TCP && option == TCP_CONGESTION {
         if length == 0 {
             return Err(Errno::InvalidArgument);
@@ -589,7 +633,7 @@ fn output_option(mm: &Mm, raw: [usize; 6], capacity: usize, bytes: &[u8]) -> Sys
     Ok(0)
 }
 
-/// 查询真实协议配置和预算，pending error 在交付用户字节前一次消费。
+/// 查询真实期限和协议配置；pending error 一次消费后使用最终 ABI errno 交付。
 fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let file = socket_file(user, raw[0])?;
     let socket = file.socket().expect("checked socket capability");
@@ -598,6 +642,10 @@ fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     check_option(socket, level, option, false)?;
     let mm = user.mm().expect("getsockopt has no MM");
     let capacity = capacity(&mm, raw[4])?;
+    if level == SOL_SOCKET && matches!(option, SO_RCVTIMEO | SO_SNDTIMEO) {
+        let bytes = timeout_bytes(socket.timeout(option == SO_RCVTIMEO));
+        return output_option(&mm, raw, capacity, &bytes);
+    }
     if level == IPPROTO_TCP && option == TCP_CONGESTION {
         return output_option(&mm, raw, capacity, &congestion_name(socket)?);
     }
@@ -612,7 +660,7 @@ fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
         (SOL_SOCKET, SO_TYPE) => socket.socket_type() as i32,
         (SOL_SOCKET, SO_ERROR) => socket
             .take_error()
-            .map_or(0, |error| Errno::from(error) as i32),
+            .map_or(0, |error| (-Errno::from(error).result()) as i32),
         (SOL_SOCKET, SO_SNDBUF) => {
             i32::try_from(socket.send_budget()).map_err(|_| Errno::Overflow)?
         }

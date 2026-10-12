@@ -118,7 +118,8 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
     // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
     unsafe { mm::initialize(resources) };
-    // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前发表 BootInfo 的计数器频率。
+    // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前初始化时间源；
+    // BootInfo 的频率与 RTC 资源已验证，永久 MMIO 映射有效，尚无其他 RTC 访问者。
     unsafe { time::initialize(resources) };
     timer::initialize_services().expect("timer service task allocation failed");
     workqueue::initialize_services().expect("worker pool service task allocation failed");
@@ -255,7 +256,7 @@ fn init() -> i32 {
     }
 }
 
-/// 普通系统共享一个网络域给磁盘 PID1，用户全部退出后先结束网络责任再同步文件系统。
+/// 普通系统沿已选目录视图启动磁盘 PID1，共享网络域；用户全部退出后结束网络并同步退休文件系统。
 ///
 /// # Safety
 /// inventory 须来自初始化 storage 的同一次唯一发现，调用者仍独占其中的网络设备。
@@ -275,14 +276,9 @@ unsafe fn init_filesystems(
         .transpose()?;
     let inodes = Arc::try_new(fs::InodeCache::try_new(64)?).map_err(|_| fs::FsError::NoMemory)?;
     let inode_eviction = inodes.watch();
-    let vfs = Arc::try_new(fs::system::mount_disks(
-        root,
-        extra,
-        inodes,
-        selected.root_mode,
-    )?)
-    .map_err(|_| fs::FsError::NoMemory)?;
-    let context = fs::FsContext::new(vfs.root(), vfs.root())?;
+    let (vfs, context) =
+        fs::system::mount_disks(root, extra, inodes, selected.root_mode, selected.rootdir)?;
+    let vfs = Arc::try_new(vfs).map_err(|_| fs::FsError::NoMemory)?;
     {
         let mountpoint = vfs.resolve(&context, b"/dev", fs::ResolveMode::Follow)?;
         let devfs = fs::devfs::try_new(0o755)?;
@@ -320,7 +316,13 @@ unsafe fn init_filesystems(
             b"TERM=vt102",
         ],
     )?;
-    let image = task::exec::prepare(&vfs, &context, arguments, task::Credentials::ROOT)?;
+    let image = task::exec::prepare(
+        &vfs,
+        &context,
+        arguments,
+        task::Credentials::ROOT,
+        task::exec::DEFAULT_STACK_BYTES,
+    )?;
     let runtime = task::UserRuntime::try_new(
         Arc::clone(&vfs),
         context.clone(),

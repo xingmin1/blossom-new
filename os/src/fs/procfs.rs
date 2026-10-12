@@ -97,7 +97,17 @@ pub fn open(
         return Err(FsError::ReadOnly);
     }
     let bytes = match special {
-        MemorySpecial::Mounts => vfs.mounts_text()?,
+        MemorySpecial::Mounts => {
+            let root = match caller {
+                FileIoContext::Kernel => vfs.root(),
+                FileIoContext::User(thread) => {
+                    let runtime = thread.runtime().ok_or(FsError::InvalidOperation)?;
+                    let fs = runtime.fs.lock();
+                    fs.context.root().clone()
+                }
+            };
+            vfs.mounts_text(&root)?
+        }
         MemorySpecial::Meminfo => meminfo()?,
         MemorySpecial::Uptime => uptime()?,
         MemorySpecial::NetDev | MemorySpecial::NetRoute => {

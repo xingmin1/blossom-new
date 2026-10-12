@@ -68,6 +68,13 @@ impl Pid {
     }
 }
 
+/// 线程组的主栈字节限额；Infinity 使用目标 LP64 ABI 的全一值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StackLimit {
+    pub(crate) current: u64,
+    pub(crate) maximum: u64,
+}
+
 /// 组身份对象保持不变；可变角色和退出信号由关系锁事务更新。
 pub(crate) struct ThreadGroup {
     graph: Weak<TaskGraph>,
@@ -76,6 +83,7 @@ pub(crate) struct ThreadGroup {
     uid: u32,
     signals: Arc<SignalGroup>,
     time: Arc<GroupTime>,
+    stack_limit: SpinLock<StackLimit>,
 }
 
 struct GroupRelations {
@@ -131,6 +139,11 @@ impl ThreadGroup {
     /// 借用真实组CPU时间和itimer拥有，线程私有时间由执行者另持。
     pub(crate) fn time(&self) -> &Arc<GroupTime> {
         &self.time
+    }
+
+    /// 在短锁内快照组的主栈限额，fork 与 exec 在锁外消费该值。
+    pub(crate) fn stack_limit(&self) -> StackLimit {
+        *self.stack_limit.lock()
     }
 }
 
@@ -403,7 +416,7 @@ impl TaskGraph {
         }
     }
 
-    /// 新进程私有预留号码与退出信号，None仅为Kernel根或System唯一首根。
+    /// 新进程预留独立号码并快照父组栈限额，首根采用默认 soft 和 Infinity hard。
     pub(crate) fn prepare_process(
         self: &Arc<Self>,
         parent: Option<&Arc<ThreadGroup>>,
@@ -430,6 +443,13 @@ impl TaskGraph {
         let private = ThreadSignals::try_new(signals.clone(), inherited)
             .map_err(|_| ProcessError::NoMemory)?;
         let time = GroupTime::try_new(signals.clone()).map_err(|_| ProcessError::NoMemory)?;
+        let stack_limit = parent.map_or(
+            StackLimit {
+                current: crate::task::exec::DEFAULT_STACK_BYTES,
+                maximum: u64::MAX,
+            },
+            |parent| parent.stack_limit(),
+        );
         let group = Arc::try_new(ThreadGroup {
             graph: Arc::downgrade(self),
             pid: pid.clone(),
@@ -442,6 +462,7 @@ impl TaskGraph {
             uid,
             signals,
             time,
+            stack_limit: SpinLock::new(stack_limit),
         })
         .map_err(|_| ProcessError::NoMemory)?;
         let identity = Arc::try_new(UserIdentity {
@@ -1342,6 +1363,35 @@ impl TaskGraph {
         let slots = self.slots.lock();
         let group = self.identity_target(&slots, caller, pid)?;
         Ok(group.sid())
+    }
+
+    /// 在同一活身份事务中读取或替换目标组栈限额，返回提交前的完整旧值。
+    /// 锁序为 Graph 后组限额；用户字节复制与既有 Mm 映射不属于此事务。
+    pub(crate) fn prlimit_stack(
+        &self,
+        caller: &UserIdentity,
+        pid: usize,
+        new: Option<StackLimit>,
+    ) -> Result<StackLimit, ProcessError> {
+        if new.is_some_and(|limit| limit.maximum < limit.current) {
+            return Err(ProcessError::InvalidArgument);
+        }
+        let slots = self.slots.lock();
+        let group = self.identity_target(&slots, caller, pid)?;
+        self.live_parent(&slots, group)
+            .map_err(|_| ProcessError::NoProcess)?;
+        if caller.group.uid != 0 && caller.group.uid != group.uid {
+            return Err(ProcessError::Permission);
+        }
+        let mut limit = group.stack_limit.lock();
+        let old = *limit;
+        if let Some(new) = new {
+            if caller.group.uid != 0 && old.maximum < new.maximum {
+                return Err(ProcessError::Permission);
+            }
+            *limit = new;
+        }
+        Ok(old)
     }
 
     /// 关系锁内验证调用者原组，数字查询只命中当前实际发表的身份。

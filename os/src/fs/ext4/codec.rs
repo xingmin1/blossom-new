@@ -754,6 +754,22 @@ fn time_encoding(
     }
 }
 
+/// 按该时间字段的真实记录精度准备值，整秒记录不保留无法写回的纳秒。
+pub(crate) fn prepare_inode_time(
+    mut time: InodeTime,
+    extra: usize,
+    extra_isize: usize,
+) -> Result<InodeTime, FsError> {
+    if 1_000_000_000 <= time.nanoseconds {
+        return Err(FsError::InvalidOperation);
+    }
+    if 128 + extra_isize < extra + 4 {
+        time.nanoseconds = 0;
+    }
+    time_encoding(time, extra, extra_isize)?;
+    Ok(time)
+}
+
 /// 写提交使用已有时钟的时间值，mtime 和 ctime 各按实际扩展字段保留纳秒或整秒。
 pub(crate) fn prepare_inode_write_times(
     nanoseconds: u64,
@@ -763,24 +779,8 @@ pub(crate) fn prepare_inode_write_times(
         seconds: (nanoseconds / 1_000_000_000) as i64,
         nanoseconds: (nanoseconds % 1_000_000_000) as u32,
     };
-    let mtime = if 140 <= 128 + extra_isize {
-        modified
-    } else {
-        InodeTime {
-            nanoseconds: 0,
-            ..modified
-        }
-    };
-    let ctime = if 136 <= 128 + extra_isize {
-        modified
-    } else {
-        InodeTime {
-            nanoseconds: 0,
-            ..modified
-        }
-    };
-    time_encoding(mtime, 136, extra_isize)?;
-    time_encoding(ctime, 132, extra_isize)?;
+    let mtime = prepare_inode_time(modified, 136, extra_isize)?;
+    let ctime = prepare_inode_time(modified, 132, extra_isize)?;
     Ok((mtime, ctime))
 }
 

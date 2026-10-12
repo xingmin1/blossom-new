@@ -118,8 +118,13 @@ fn check_stack(
     Ok(())
 }
 
-/// 指针表与字符串均跨页；复制后修改原表和原串，正式装载只能使用此前拥有的字节。
-fn snapshot_arguments(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> TestResult {
+/// 指针表与字符串均跨页；复制后修改原表和原串，同一文件系统视图装载时只能使用此前拥有的字节。
+fn snapshot_arguments(
+    context: &mut TestContext<'_>,
+    fixture: &UserOwner,
+    mm: &Mm,
+    file: &FileRef,
+) -> TestResult {
     let raw: &[u8] = b"raw\xff\x81";
     write_bytes(context, mm, STRING, PROGRAM)?;
     write_bytes(context, mm, STRING + PROGRAM.len(), &[0])?;
@@ -142,7 +147,17 @@ fn snapshot_arguments(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) ->
     write_bytes(context, mm, STRING, b"changed\0")?;
     write_bytes(context, mm, RAW, b"bad\0")?;
     write_bytes(context, mm, ENVIRONMENT, b"broken\0")?;
-    let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
+    let image = checked_exec(
+        context,
+        exec::load(
+            fixture.path.vfs(),
+            fixture.path.context(),
+            Arc::clone(file),
+            &arguments,
+            Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
+        ),
+    )?;
     check_stack(context, &image, &[PROGRAM, raw], &[b"USER_SMOKE=1"])
 }
 
@@ -216,8 +231,13 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
     Ok(())
 }
 
-/// NULL 与显式空 argv 都按真实初始栈补空 argv[0]，合计计数上限包含环境项。
-fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> TestResult {
+/// NULL 与显式空 argv 都按同一文件系统视图下的真实初始栈补空 argv[0]，合计计数上限包含环境项。
+fn argument_count(
+    context: &mut TestContext<'_>,
+    fixture: &UserOwner,
+    mm: &Mm,
+    file: &FileRef,
+) -> TestResult {
     write_vector(context, mm, ARGV, &[])?;
     for table in [0, ARGV] {
         let arguments = checked_exec(
@@ -229,7 +249,17 @@ fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> Tes
                 0,
             ),
         )?;
-        let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
+        let image = checked_exec(
+            context,
+            exec::load(
+                fixture.path.vfs(),
+                fixture.path.context(),
+                Arc::clone(file),
+                &arguments,
+                Credentials::ROOT,
+                exec::DEFAULT_STACK_BYTES,
+            ),
+        )?;
         check_stack(context, &image, &[b""], &[])?;
     }
     write_bytes(context, mm, STRING, &[0])?;
@@ -246,7 +276,17 @@ fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> Tes
             ENVP,
         ),
     )?;
-    let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
+    let image = checked_exec(
+        context,
+        exec::load(
+            fixture.path.vfs(),
+            fixture.path.context(),
+            Arc::clone(file),
+            &arguments,
+            Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
+        ),
+    )?;
     let empty: [&[u8]; MAX_ARGUMENT_COUNT] = [b""; MAX_ARGUMENT_COUNT];
     check_stack(
         context,
@@ -277,9 +317,10 @@ fn argument_count(context: &mut TestContext<'_>, mm: &Mm, file: &FileRef) -> Tes
     Ok(())
 }
 
-/// 精确总字节预算包含路径、NUL、argc 与指针；满预算后再加环境项必须返回 E2BIG。
+/// 精确总字节预算包含路径、NUL、argc 与指针；同一文件系统视图下满预算后再加环境项必须返回 E2BIG。
 fn argument_bytes(
     context: &mut TestContext<'_>,
+    fixture: &UserOwner,
     mm: &Mm,
     file: &FileRef,
     source: &[u8],
@@ -297,7 +338,17 @@ fn argument_bytes(
             0,
         ),
     )?;
-    let image = checked_exec(context, exec::load(Arc::clone(file), &arguments, 0, 0))?;
+    let image = checked_exec(
+        context,
+        exec::load(
+            fixture.path.vfs(),
+            fixture.path.context(),
+            Arc::clone(file),
+            &arguments,
+            Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
+        ),
+    )?;
     check_stack(context, &image, &[&source[..length]], &[])?;
     drop(image);
     drop(arguments);
@@ -477,7 +528,7 @@ fn allocation_failure(
     Ok(())
 }
 
-/// 在原正常映像的 Mm 中验证坏参数与真实 OOM，候选全部归还后执行该旧映像并等待真实退出。
+/// 在原正常映像的 Mm 和文件系统视图中验证坏参数与真实 OOM，候选全部归还后执行该旧映像并等待真实退出。
 pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
     fixture.prepare(context)?;
     let old_image = fixture.load(context)?;
@@ -491,10 +542,10 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
         .try_reserve_exact(MAX_ARGUMENT_BYTES)
         .map_err(|_| TestError("user preparation source bytes OOM"))?;
     source.resize(MAX_ARGUMENT_BYTES, b'x');
-    snapshot_arguments(context, &old_image.mm, &file)?;
+    snapshot_arguments(context, fixture, &old_image.mm, &file)?;
     invalid_arguments(context, &old_image.mm, &source)?;
-    argument_count(context, &old_image.mm, &file)?;
-    argument_bytes(context, &old_image.mm, &file, &source)?;
+    argument_count(context, fixture, &old_image.mm, &file)?;
+    argument_bytes(context, fixture, &old_image.mm, &file, &source)?;
     let old_identity = abandon_program(context, fixture)?;
     allocation_failure(context, fixture, &source, &old_identity)?;
     drop(source);

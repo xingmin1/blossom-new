@@ -8,6 +8,7 @@ pub(crate) use sleep::sleep_until_interruptible;
 #[cfg(feature = "ktest")]
 pub(crate) use sleep::test_sleep_until;
 pub use sleep::{after, periodic_deadline, sleep, sleep_until};
+pub(crate) use wheel::TICK_NS;
 
 use alloc::sync::Arc;
 use core::alloc::AllocError;

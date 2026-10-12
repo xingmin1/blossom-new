@@ -23,7 +23,14 @@ impl UserOwner {
         )?;
         let image = self.load_named(context, PROGRAM, mode)?;
         let mm = image.mm.clone();
-        self.start_program(context, image, false, false, Credentials::ROOT)?;
+        self.start_program(
+            context,
+            image,
+            self.path.context().clone(),
+            false,
+            false,
+            Credentials::ROOT,
+        )?;
         let pid = self
             .running
             .as_ref()

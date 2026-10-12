@@ -95,7 +95,9 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
         let mut bytes = [0; 16];
         error::copyin(&mm, &mut bytes, address)?;
         let ns = decode_time(&bytes, NSEC_PER_SEC, 1)?;
-        let deadline = if absolute {
+        let deadline = if absolute && clock == 0 {
+            time::realtime_deadline(ns)
+        } else if absolute {
             MonotonicInstant::from_nanos(ns)
         } else {
             MonotonicInstant::from_nanos(
@@ -120,20 +122,21 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
     }
 }
 
-/// 只公开现有 counter 时间域与真实 CPU 账支持的具体 clock IDs。
+/// 只公开 RTC 日历、原 counter 时间域及真实 CPU 账支持的具体 clock IDs。
 fn validate_clock(raw: usize) -> Result<i32, Errno> {
     let clock = raw as i32;
-    if (0..=3).contains(&clock) {
+    if matches!(clock, 0 | 1 | 2 | 3 | 5 | 6) {
         Ok(clock)
     } else {
         Err(Errno::InvalidArgument)
     }
 }
 
-/// REALTIME 尚无外部同步，其初值沿 counter 注册起点为零，与 MONOTONIC 使用同一基准。
+/// 日历沿启动 RTC 与单调经过时间推进，coarse 查询可交付更细的实际样本。
 fn read_clock(user: &UserThread, raw: usize) -> Result<u64, Errno> {
     match validate_clock(raw)? {
-        0 | 1 => Ok(time::now().as_nanos()),
+        0 | 5 => Ok(time::realtime()),
+        1 | 6 => Ok(time::now().as_nanos()),
         2 => Ok(user
             .user_time()
             .expect("process clock has no time")
@@ -157,24 +160,28 @@ fn clock_gettime(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(0)
 }
 
-/// 所有公开 clock 都由相同硬件 counter 采样，分辨率向上取整到可表示纳秒。
+/// 精细 clock 使用 counter 分辨率，coarse 声明既有基础 tick，不建立周期缓存。
 fn clock_getres(user: &UserThread, raw: [usize; 6]) -> SysResult {
-    validate_clock(raw[0])?;
+    let clock = validate_clock(raw[0])?;
     if raw[1] != 0 {
         let frequency = crate::boot::info().counter_frequency;
         assert!(0 < frequency, "clock resolution has no counter frequency");
-        let resolution = NSEC_PER_SEC / frequency + u64::from(NSEC_PER_SEC % frequency != 0);
+        let resolution = if matches!(clock, 5 | 6) {
+            timer::TICK_NS
+        } else {
+            NSEC_PER_SEC / frequency + u64::from(NSEC_PER_SEC % frequency != 0)
+        };
         let mm = user.mm().expect("clock_getres has no MM");
         error::copyout(&mm, raw[1], &timespec(resolution.max(1)))?;
     }
     Ok(0)
 }
 
-/// timeval 与 timezone 全部字段初始化；没有外部日历同步或本地时区配置。
+/// timeval 交付实际 UTC，timezone 保持无本地时区配置的零字段。
 fn gettimeofday(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mm = user.mm().expect("gettimeofday has no MM");
     if raw[0] != 0 {
-        error::copyout(&mm, raw[0], &timeval(time::now().as_nanos(), false))?;
+        error::copyout(&mm, raw[0], &timeval(time::realtime(), false))?;
     }
     if raw[1] != 0 {
         error::copyout(&mm, raw[1], &[0; 8])?;

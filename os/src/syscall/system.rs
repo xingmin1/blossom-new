@@ -1,9 +1,11 @@
-//! 挂载、同步与关机准入只消费当前用户的真实 VFS、凭据和身份图。
+//! 系统身份、挂载、同步与关机准入消费当前用户的真实 MM、VFS、凭据和身份图。
 
 use crate::block::AccessMode;
-use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind};
-use crate::fs::{devfs, procfs, ResolveMode};
-use crate::syscall::error::{Errno, SysResult};
+use crate::fs::memfs::{FilesystemStat, MemoryFs, MemoryFsKind};
+use crate::fs::system::device_index;
+use crate::fs::{devfs, procfs, Ext4Volume, Filesystem, Path, ResolveMode};
+use crate::storage::Storage;
+use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::syscall::Outcome;
 use crate::task::process::{RootRole, ShutdownOperation};
 use crate::task::UserThread;
@@ -12,8 +14,118 @@ const PATH_LIMIT: usize = 4096;
 const MS_RDONLY: usize = 1;
 const MS_SILENT: usize = 0x8000;
 const UMOUNT_NOFOLLOW: usize = 8;
+const STATFS_SIZE: usize = 120;
+const ST_RDONLY: u64 = 1;
+const ST_VALID: u64 = 0x20;
 
-/// uid0 才可建立所选真实内存后端；输入各读取一次，完整准备后沿原 Mount 发表。
+const UTS_FIELD_LEN: usize = 65;
+#[cfg(target_arch = "riscv64")]
+const UTS_MACHINE: &[u8] = b"riscv64";
+#[cfg(target_arch = "loongarch64")]
+const UTS_MACHINE: &[u8] = b"loongarch64";
+static UTS_NAME: [u8; UTS_FIELD_LEN * 6] = uname_bytes();
+
+/// 向本次 MM 交付固定系统身份；用户访问可处理缺页并睡眠，部分故障保留已写前缀并返回 EFAULT。
+pub(super) fn uname(user: &UserThread, raw: &[usize; 6]) -> SysResult {
+    let mm = user.mm().expect("uname has no MM");
+    copyout(&mm, raw[0], &UTS_NAME)?;
+    Ok(0)
+}
+
+/// 在编译期构造六个 NUL 结尾、余部为零的固定身份字段，不依赖 Rust 结构体布局。
+const fn uname_bytes() -> [u8; UTS_FIELD_LEN * 6] {
+    let fields: [&[u8]; 6] = [
+        b"Linux",
+        b"blossom",
+        b"6.12.0-blossom",
+        env!("CARGO_PKG_VERSION").as_bytes(),
+        UTS_MACHINE,
+        b"(none)",
+    ];
+    let mut bytes = [0; UTS_FIELD_LEN * 6];
+    let mut field = 0;
+    while field < fields.len() {
+        assert!(fields[field].len() < UTS_FIELD_LEN);
+        let mut index = 0;
+        while index < fields[field].len() {
+            bytes[field * UTS_FIELD_LEN + index] = fields[field][index];
+            index += 1;
+        }
+        field += 1;
+    }
+    bytes
+}
+
+/// 一次导入路径并沿当前 root/cwd 跟随链接，采样所选实际挂载后在锁外交付容量。
+pub(super) fn statfs(user: &UserThread, raw: &[usize; 6]) -> SysResult {
+    let mm = user.mm().expect("statfs has no MM");
+    let pathname = mm.read_c_string(raw[0], PATH_LIMIT)?;
+    let runtime = user.runtime().expect("statfs has no runtime");
+    let (vfs, context) = {
+        let fs = runtime.fs.lock();
+        (fs.vfs.clone(), fs.context.clone())
+    };
+    let path = vfs.resolve_from(
+        &context,
+        context.cwd(),
+        &pathname,
+        ResolveMode::Follow,
+        Some((runtime.credentials.uid, runtime.credentials.gid)),
+    )?;
+    write_statfs(user, &path, raw[1])
+}
+
+/// 一次取得 fd 的原 OFD并借其 Path；无效 fd 返回 EBADF，未具文件系统来源的对象保 ENOSYS。
+pub(super) fn fstatfs(user: &UserThread, raw: &[usize; 6]) -> SysResult {
+    let fd = raw[0] as i32;
+    if fd < 0 {
+        return Err(Errno::BadFd);
+    }
+    let runtime = user.runtime().expect("fstatfs has no runtime");
+    let file = runtime.files.lookup(fd as usize)?;
+    let path = file.path().ok_or(Errno::NoSyscall)?;
+    write_statfs(user, path, raw[1])
+}
+
+/// 后端采样结束后一次交付完整字节，用户缺页和部分写入故障沿原 copyout 返回 EFAULT。
+fn write_statfs(user: &UserThread, path: &Path, address: usize) -> SysResult {
+    let stat = path.filesystem().statfs()?;
+    let bytes = encode_statfs(stat, path.mount_mode());
+    let mm = user.mm().expect("statfs copyout has no MM");
+    copyout(&mm, address, &bytes)?;
+    Ok(0)
+}
+
+/// 编码 asm-generic LP64 的 120 字节布局，所有保留字节为零，不创建用户结构体引用。
+fn encode_statfs(stat: FilesystemStat, mode: AccessMode) -> [u8; STATFS_SIZE] {
+    let flags = ST_VALID
+        | if mode == AccessMode::ReadOnly {
+            ST_RDONLY
+        } else {
+            0
+        };
+    // ABI: 前七项各占八字节；fsid 是低、高两个四字节字，之后依次为 namelen、frsize 和 flags。
+    let fields = [
+        stat.fs_type,
+        stat.block_size,
+        stat.blocks,
+        stat.free,
+        stat.available,
+        stat.files,
+        stat.freefiles,
+        stat.device,
+        255,
+        stat.block_size,
+        flags,
+    ];
+    let mut bytes = [0u8; STATFS_SIZE];
+    for (index, value) in fields.iter().enumerate() {
+        bytes[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// uid0 才可挂载原设备的 ext4 或独立内存后端；输入各读取一次，锁外准备后沿原 Mount 发表。
 pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("mount has no runtime");
     if runtime.credentials.uid != 0 {
@@ -23,10 +135,11 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("mount has no MM");
-    if raw[0] != 0 {
-        // 所选后端没有设备来源；字符串仍按普通 ABI 校验一次，不构造 Disk。
-        mm.read_c_string(raw[0], PATH_LIMIT)?;
-    }
+    let source = if raw[0] == 0 {
+        None
+    } else {
+        Some(mm.read_c_string(raw[0], PATH_LIMIT)?)
+    };
     let target = mm.read_c_string(raw[1], PATH_LIMIT)?;
     let kind = mm.read_c_string(raw[2], PATH_LIMIT)?;
     let options = if raw[4] == 0 {
@@ -35,15 +148,27 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         Some(mm.read_c_string(raw[4], PATH_LIMIT)?)
     };
     let options = options.as_deref().unwrap_or(b"");
+    let requested_mode = if raw[3] & MS_RDONLY != 0 {
+        AccessMode::ReadOnly
+    } else {
+        AccessMode::ReadWrite
+    };
     let (filesystem, mode) = match kind.as_slice() {
+        b"ext4" => {
+            if !options.is_empty() {
+                return Err(Errno::InvalidArgument);
+            }
+            let source = source.as_deref().ok_or(Errno::NoDevice)?;
+            let index = device_index(source).map_err(|_| Errno::NoDevice)?;
+            let storage = Storage::get().ok_or(Errno::NoDevice)?;
+            let disk = storage.disk(index).ok_or(Errno::NoDevice)?;
+            let volume = Ext4Volume::open(disk, requested_mode, 64)?;
+            (Filesystem::Ext4(volume), requested_mode)
+        }
         b"tmpfs" => {
             let root_mode = tmpfs_mode(options)?;
-            let mode = if raw[3] & MS_RDONLY != 0 {
-                AccessMode::ReadOnly
-            } else {
-                AccessMode::ReadWrite
-            };
-            (MemoryFs::try_new(MemoryFsKind::Tmpfs, root_mode)?, mode)
+            let filesystem = MemoryFs::try_new(MemoryFsKind::Tmpfs, root_mode)?;
+            (Filesystem::Memory(filesystem), requested_mode)
         }
         b"proc" | b"devfs" => {
             if !options.is_empty() {
@@ -54,7 +179,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
             } else {
                 devfs::try_new(0o755)?
             };
-            (filesystem, AccessMode::ReadOnly)
+            (Filesystem::Memory(filesystem), AccessMode::ReadOnly)
         }
         _ => return Err(Errno::NoDevice),
     };
@@ -69,7 +194,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         ResolveMode::Follow,
         Some((runtime.credentials.uid, runtime.credentials.gid)),
     )?;
-    vfs.mount(&path, Filesystem::Memory(filesystem), mode)?;
+    vfs.mount(&path, filesystem, mode)?;
     Ok(0)
 }
 

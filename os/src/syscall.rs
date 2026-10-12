@@ -11,9 +11,12 @@ mod system;
 mod task;
 pub(crate) mod time;
 
+use alloc::vec::Vec;
+
 use crate::arch::UserContext;
+use crate::klog;
 use crate::sched;
-use crate::syscall::error::{Errno, SysResult};
+use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::task::UserThread;
 
 #[cfg(target_arch = "riscv64")]
@@ -160,7 +163,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
             _ => unreachable!(),
         };
         return match result {
-            Err(Errno::Interrupted) => Outcome::Restart(Restart::Syscall { request }),
+            Err(Errno::RestartSyscall) => Outcome::Restart(Restart::Syscall { request }),
             other => Outcome::Return(other.unwrap_or_else(Errno::result)),
         };
     }
@@ -177,10 +180,16 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         37 => file::linkat(user, raw),
         39 => system::umount(user, &raw),
         40 => system::mount(user, &raw),
+        43 => system::statfs(user, &raw),
+        44 => system::fstatfs(user, &raw),
         45 => file::truncate(user, raw),
         46 => file::ftruncate(user, raw),
+        48 => file::faccessat(user, raw, 0),
         49 => file::chdir(user, raw[0]),
         50 => file::fchdir(user, raw),
+        51 => file::chroot(user, raw[0]),
+        52 => file::fchmod(user, raw),
+        53 => file::fchmodat(user, raw),
         56 => file::openat(user, raw),
         57 => file::close(user, raw[0]),
         59 => file::pipe2(user, raw),
@@ -194,10 +203,16 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         81 => system::sync(user),
         82 => file::fsync(user, raw[0]),
         83 => file::fdatasync(user, raw[0]),
+        88 => file::utimensat(user, raw),
+        116 => syslog(user, raw),
         166 => file::umask(user, raw[0]),
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
         154..=157 | 173..=177 => task::identity(user, request.number, raw),
+        160 => system::uname(user, &raw),
+        163 => task::getrlimit(user, raw),
+        164 => task::setrlimit(user, raw),
+        261 => task::prlimit64(user, raw),
         142 => return system::reboot(user, &raw),
         124 => {
             sched::yield_now();
@@ -221,7 +236,73 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         260 => return task::wait4(user, request),
         276 => file::renameat2(user, raw),
         291 => file::statx(user, raw),
+        439 => file::faccessat(user, raw, raw[3] as u32),
         _ => Err(Errno::NoSyscall),
     };
     Outcome::Return(result.unwrap_or_else(Errno::result))
+}
+
+/// 从同一记录环读取有界的最后完整正文；不清环、不移动打印者或 kmsg 的游标。
+fn syslog(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let action = raw[0] as i32;
+    if action == 10 {
+        return Ok((klog::CAPACITY * klog::TEXT_CAPACITY) as isize);
+    }
+    if action != 3 {
+        return Err(if (0..=9).contains(&action) {
+            Errno::NoSyscall
+        } else {
+            Errno::InvalidArgument
+        });
+    }
+    let capacity = raw[2] as i32;
+    if raw[1] == 0 || capacity < 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    if capacity == 0 {
+        return Ok(0);
+    }
+    let end = klog::next_sequence();
+    let mut cursor = klog::Cursor::oldest();
+    let mut text = Vec::new();
+    let mut lengths = [0; klog::CAPACITY];
+    let mut count = 0;
+    while count < lengths.len() {
+        let Some(read) = cursor.read() else {
+            break;
+        };
+        let record = read.record;
+        if end <= record.seq {
+            break;
+        }
+        if text.capacity() == 0 {
+            text.try_reserve_exact(klog::CAPACITY * (klog::TEXT_CAPACITY + 4))
+                .map_err(|_| Errno::NoMemory)?;
+        }
+        let begin = text.len();
+        let level = match record.level {
+            klog::Level::Error => b'3',
+            klog::Level::Warn => b'4',
+            klog::Level::Info => b'6',
+            klog::Level::Debug => b'7',
+        };
+        text.extend_from_slice(&[b'<', level, b'>']);
+        text.extend_from_slice(record.text().as_bytes());
+        if !record.text().ends_with('\n') {
+            text.push(b'\n');
+        }
+        lengths[count] = text.len() - begin;
+        count += 1;
+    }
+    let mut start = 0;
+    for length in &lengths[..count] {
+        if text.len() - start <= capacity as usize {
+            break;
+        }
+        start += length;
+    }
+    let output = &text[start..];
+    let mm = user.mm().expect("syslog has no MM");
+    copyout(&mm, raw[1], output)?;
+    Ok(output.len() as isize)
 }

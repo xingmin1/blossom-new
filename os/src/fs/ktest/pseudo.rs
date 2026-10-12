@@ -338,7 +338,10 @@ pub(crate) mod filesystems {
         )?;
         let first = open(context, fixture, b"/plain/proc/mounts", 0)?;
         let before = text(context, &first)?;
-        context.expect_eq(&before, &checked(context, fixture.vfs().mounts_text())?);
+        context.expect_eq(
+            &before,
+            &checked(context, fixture.vfs().mounts_text(&fixture.vfs().root()))?,
+        );
         let change_cover = resolve(context, fixture, b"/plain/change")?;
         let change = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o777))?;
         checked(
@@ -351,7 +354,10 @@ pub(crate) mod filesystems {
         )?;
         let second = open(context, fixture, b"/plain/proc/mounts", 0)?;
         let after = text(context, &second)?;
-        context.expect_eq(&after, &checked(context, fixture.vfs().mounts_text())?);
+        context.expect_eq(
+            &after,
+            &checked(context, fixture.vfs().mounts_text(&fixture.vfs().root()))?,
+        );
         context.expect_eq(before == after, false);
         checked(context, first.seek(SeekFrom::Start(0)))?;
         context.expect_eq(&text(context, &first)?, &before);

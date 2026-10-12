@@ -7,6 +7,7 @@ use crate::fs::pipe::{PipeBuffer, PIPE_BUF};
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::SocketAddress;
+use crate::net::socket::SocketTimeouts;
 use crate::net::{EndpointSlot, IoProgress, NetStack, NetStackRef};
 use crate::sync::{SleepMutex, SpinLock};
 
@@ -85,6 +86,7 @@ pub struct UnixEndpoint {
     side: usize,
     pair: Arc<UnixPair>,
     reuse: AtomicBool,
+    timeouts: SpinLock<SocketTimeouts>,
     _slot: EndpointSlot,
 }
 
@@ -114,6 +116,7 @@ impl UnixPair {
             side: 0,
             pair: Arc::clone(&pair),
             reuse: AtomicBool::new(false),
+            timeouts: SpinLock::new(SocketTimeouts::default()),
             _slot: first_slot,
         })
         .map_err(|_| FsError::NoMemory)?;
@@ -122,6 +125,7 @@ impl UnixPair {
             side: 1,
             pair: Arc::clone(&pair),
             reuse: AtomicBool::new(false),
+            timeouts: SpinLock::new(SocketTimeouts::default()),
             _slot: second_slot,
         })
         .map_err(|_| FsError::NoMemory)?;
@@ -229,6 +233,16 @@ impl UnixPair {
 }
 
 impl UnixEndpoint {
+    /// 每侧端点保存独立控制值，查询不等待任一方向的数据交付锁。
+    pub(crate) fn timeouts(&self) -> SocketTimeouts {
+        *self.timeouts.lock()
+    }
+
+    /// dup 与 fork 共享此端点短锁值，另一侧 pair 的期限保持不变。
+    pub(crate) fn set_timeout(&self, receive: bool, timeout: Option<u64>) {
+        self.timeouts.lock().set(receive, timeout);
+    }
+
     /// 匿名 inode 身份来自本域端点编号，两侧不会共享同一个编号。
     pub fn id(&self) -> u64 {
         self.id

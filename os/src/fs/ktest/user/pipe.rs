@@ -42,7 +42,14 @@ impl UserOwner {
     fn pipe_positioned(&mut self, context: &mut TestContext<'_>) -> Result<WaitEvent, TestError> {
         let image = self.load_named(context, PROGRAM, b"p")?;
         let mm = image.mm.clone();
-        self.start_program(context, image, false, false, Credentials::ROOT)?;
+        self.start_program(
+            context,
+            image,
+            self.path.context().clone(),
+            false,
+            false,
+            Credentials::ROOT,
+        )?;
         let event = self.wait(context)?;
         let result = mm
             .load_user_u32(FUTEX_CONTROL + 12)
@@ -64,7 +71,14 @@ impl UserOwner {
     ) -> Result<WaitEvent, TestError> {
         let image = self.load_named(context, PROGRAM, mode)?;
         let mm = image.mm.clone();
-        self.start_program(context, image, false, false, Credentials::ROOT)?;
+        self.start_program(
+            context,
+            image,
+            self.path.context().clone(),
+            false,
+            false,
+            Credentials::ROOT,
+        )?;
         let pid = self
             .running
             .as_ref()

@@ -27,6 +27,7 @@ mod observation;
 mod pipe;
 mod preparation;
 mod readahead;
+mod runtime;
 mod system;
 mod tty;
 mod write;
@@ -229,6 +230,7 @@ impl UserOwner {
             self.path.context(),
             arguments,
             Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|error| {
             context.diagnostic(format_args!("user-image-prepare error={:?}", error));
@@ -238,14 +240,16 @@ impl UserOwner {
 
     /// 原首ELF保持真实远核退出断言，具名后续负载复用同一准备与发表。
     fn start(&mut self, context: &TestContext<'_>, image: LoadedImage) -> TestResult {
-        self.start_program(context, image, true, false, Credentials::ROOT)
+        let fs_context = self.path.context().clone();
+        self.start_program(context, image, fs_context, true, false, Credentials::ROOT)
     }
 
-    /// 完整资源和可选并发预留先准备，身份发表后才发布普通用户Task。
+    /// 映像与运行资源使用调用者同一 FS 快照，完整预留准备后才发表身份和普通用户 Task。
     fn start_program(
         &mut self,
         context: &TestContext<'_>,
         image: LoadedImage,
+        fs_context: FsContext,
         affine_group: bool,
         reserve_parent_fd: bool,
         credentials: Credentials,
@@ -258,7 +262,7 @@ impl UserOwner {
             context,
             UserRuntime::try_new(
                 self.path.vfs().clone(),
-                self.path.context().clone(),
+                fs_context,
                 credentials,
                 self.net.clone(),
             ),
@@ -336,6 +340,7 @@ impl UserOwner {
             self.path.context(),
             arguments,
             Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|error| {
             context.diagnostic(format_args!("user-named-load error={:?}", error));
@@ -374,13 +379,27 @@ impl UserOwner {
     ) -> Result<WaitEvent, TestError> {
         let arguments = Arguments::from_kernel(program, &[program, mode], &[])
             .map_err(|_| TestError("named user arguments failed"))?;
-        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
-            .map_err(|error| {
-                context.diagnostic(format_args!("user-named-load error={:?}", error));
-                TestError("named user image failed")
-            })?;
+        let image = exec::prepare(
+            self.path.vfs(),
+            self.path.context(),
+            arguments,
+            credentials,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!("user-named-load error={:?}", error));
+            TestError("named user image failed")
+        })?;
         let affine_group = !matches!(mode.first(), Some(b't' | b'T' | b'g' | b'c'));
-        self.start_program(context, image, affine_group, reserve_parent_fd, credentials)?;
+        let fs_context = self.path.context().clone();
+        self.start_program(
+            context,
+            image,
+            fs_context,
+            affine_group,
+            reserve_parent_fd,
+            credentials,
+        )?;
         let event = self.wait(context)?;
         let cancelling = event.status != expected_status;
         if cancelling {
@@ -642,7 +661,8 @@ impl UserOwner {
         #[cfg(target_arch = "loongarch64")]
         let marker = image.context.gpr[3] - 8;
         let mm = Arc::clone(&image.mm);
-        self.start_program(context, image, true, false, Credentials::ROOT)?;
+        let fs_context = self.path.context().clone();
+        self.start_program(context, image, fs_context, true, false, Credentials::ROOT)?;
         let pid = self
             .running
             .as_ref()
@@ -702,7 +722,8 @@ impl UserOwner {
         let first_used = block::tests::used_index(&disk, legacy);
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
-        self.start_program(context, image, true, false, Credentials::ROOT)?;
+        let fs_context = self.path.context().clone();
+        self.start_program(context, image, fs_context, true, false, Credentials::ROOT)?;
         let pid = self.running.as_ref().unwrap().pid;
         let user = self
             .graph()
@@ -860,7 +881,8 @@ impl UserOwner {
         #[cfg(target_arch = "loongarch64")]
         let marker = image.context.gpr[3] - 16;
         let mm = Arc::clone(&image.mm);
-        self.start_program(context, image, true, false, Credentials::ROOT)?;
+        let fs_context = self.path.context().clone();
+        self.start_program(context, image, fs_context, true, false, Credentials::ROOT)?;
         let pid = self
             .running
             .as_ref()
@@ -1050,7 +1072,8 @@ impl UserOwner {
     fn futex_program(&mut self, context: &mut TestContext<'_>, mode: &[u8]) -> TestResult {
         let image = self.load_named(context, b"/test/bin/user-futex", mode)?;
         let mm = Arc::clone(&image.mm);
-        self.start_program(context, image, true, false, Credentials::ROOT)?;
+        let fs_context = self.path.context().clone();
+        self.start_program(context, image, fs_context, true, false, Credentials::ROOT)?;
         let pid = self
             .running
             .as_ref()
@@ -1420,6 +1443,71 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
 #[ktest::suite(fixture = UserOwner, suite_resources = UserProgramSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
+
+    /// 原 musl 聚合程序在真实族根执行 argv/env，主映像与解释器身份从用户栈核对。
+    #[test]
+    #[case("argv", b"argv" as &[u8])]
+    #[case("env", b"env" as &[u8])]
+    #[ktest(tags("runtime-dynamic", "runtime-musl"))]
+    fn runtime_musl(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        selector: &[u8],
+    ) -> TestResult {
+        fixture.runtime_dynamic(context, b"/musl", selector)
+    }
+
+    /// 原 glibc PIE 聚合程序在真实族根执行 argv/env，退出与离栈仍由原拥有者消费。
+    #[test]
+    #[case("argv", b"argv" as &[u8])]
+    #[case("env", b"env" as &[u8])]
+    #[ktest(tags("runtime-dynamic", "runtime-glibc"))]
+    fn runtime_glibc(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        selector: &[u8],
+    ) -> TestResult {
+        fixture.runtime_dynamic(context, b"/glibc", selector)
+    }
+
+    /// 原 loader 自身作为无 PT_INTERP 的 ET_DYN 入口启动，再由其正常执行原聚合程序。
+    #[test]
+    #[case("musl", b"/musl" as &[u8])]
+    #[case("glibc", b"/glibc" as &[u8])]
+    #[ktest(tags("runtime-loader", "Q05", "B2", "B3"))]
+    fn runtime_loader_without_interpreter(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        family: &[u8],
+    ) -> TestResult {
+        fixture.runtime_loader(context, family)
+    }
+
+    /// 两映像的非 VM fork 保留两份 inode 执行责任，真实末程序退出后才允许写准备。
+    #[test]
+    #[case("musl", b"/musl" as &[u8])]
+    #[case("glibc", b"/glibc" as &[u8])]
+    #[ktest(tags("runtime-fork-deny", "Q06", "B5"))]
+    fn runtime_two_images_fork_last_owner(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        family: &[u8],
+    ) -> TestResult {
+        fixture.runtime_fork(context, family)
+    }
+
+    /// 解释器普通错误与真实 OOM 只销毁候选，旧两映像随后仍正常运行并完整退出。
+    #[test]
+    #[case("musl", b"/musl" as &[u8])]
+    #[case("glibc", b"/glibc" as &[u8])]
+    #[ktest(tags("runtime-preparation", "Q06", "B5"), min_cpus = 2)]
+    fn runtime_interpreter_failures_preserve_old_image(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        family: &[u8],
+    ) -> TestResult {
+        fixture.runtime_failures(context, family)
+    }
 
     /// 普通只读日志验证独立 open、共享 dup、覆盖恢复和真实用户复制错误的消费点。
     #[test]
@@ -1936,6 +2024,80 @@ pub(crate) mod programs {
     #[ktest(min_cpus = 2, tags("T29", "user-tty", "user-jobs"), timeout_ms = 90000)]
     fn jobs_winsize_changes(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.jobs_winsize_changes(context)
+    }
+
+    /// 普通 C 经真实 uname/chroot 系统调用核字节故障、旧 cwd/FD 和独立父子根。
+    #[test]
+    #[case("root", Credentials::ROOT)]
+    #[case("nonroot", Credentials { uid: 1000, gid: 2000 })]
+    #[ktest(tags("runtime-view", "user-libc", "fs-path"), timeout_ms = 120000)]
+    fn runtime_view(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        credentials: Credentials,
+    ) -> TestResult {
+        fixture.runtime_view(context, credentials)
+    }
+
+    /// 原生 C 在可写卷核时间字段、特殊纳秒和权限，用户操作的实际错误不能由根 fixture 覆盖。
+    #[test]
+    #[case("root", Credentials::ROOT)]
+    #[case("nonroot", Credentials { uid: 1000, gid: 2000 })]
+    #[ktest(
+        tags("runtime-file-times", "user-libc", "fs-path"),
+        timeout_ms = 120000
+    )]
+    fn runtime_file_times(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        credentials: Credentials,
+    ) -> TestResult {
+        fixture.runtime_file_times(context, credentials)
+    }
+
+    /// 原生 C 核 socket 的真实有限等待、共享选项、child 继承与信号重启差异。
+    #[test]
+    #[ktest(
+        tags("runtime-socket-timeouts", "user-libc", "user-network"),
+        timeout_ms = 120000
+    )]
+    fn runtime_socket_timeouts(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.runtime_socket_timeouts(context)
+    }
+
+    /// 原生 C 从硬件 UTC 核日期字段和绝对睡眠，单调与 CPU 账保持各自语义。
+    #[test]
+    #[ktest(tags("runtime-clock", "user-libc", "fs-path"), timeout_ms = 120000)]
+    fn runtime_clock(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.runtime_clock(context)
+    }
+    /// 根凭据从真实 C 程序消费限额、fork 与 exec 主栈范围，退出后沿原用户拥有者归还。
+    #[test]
+    #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
+    fn runtime_stack_limits_root(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.runtime_limits(context, Credentials::ROOT)
+    }
+
+    /// 非根凭据从真实 C 程序核限额权限和 exec 范围，用户错误不被 fixture 根凭据覆盖。
+    #[test]
+    #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
+    fn runtime_stack_limits_nonroot(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.runtime_limits(
+            context,
+            Credentials {
+                uid: 1000,
+                gid: 2000,
+            },
+        )
     }
 
     /// 普通静态 C 从真实磁盘启动，核 TLS、主栈、标准流和基础文件 ABI。

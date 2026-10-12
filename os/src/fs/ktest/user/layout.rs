@@ -11,7 +11,7 @@ use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::Mm;
 use crate::mm::{FolioRef, PAGE_SIZE};
 use crate::task;
-use crate::task::exec::{self, ExecError, LoadedImage};
+use crate::task::exec::LoadedImage;
 use ::ktest::{TestContext, TestError, TestResult};
 
 #[derive(Clone, Copy)]
@@ -461,28 +461,6 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
     verify_private_write(context, &file, &image, layout.segments[1])?;
     drop(image);
 
-    let interpreter = fixture.file(context, b"/test/bin/user-interp")?;
-    let arguments = checked(
-        context,
-        "ELF arguments preparation failed",
-        0,
-        fixture.arguments(),
-    )?;
-    match exec::load(interpreter, &arguments, 0, 0) {
-        Err(ExecError::Format) => {}
-        Err(error) => {
-            context.diagnostic(format_args!(
-                "user-layout PT_INTERP unexpected error={:?}",
-                error
-            ));
-            return Err(TestError("PT_INTERP did not return Format"));
-        }
-        Ok(image) => {
-            drop(image);
-            return Err(TestError("unsupported PT_INTERP was loaded"));
-        }
-    }
-    drop(arguments);
     drop(file);
 
     let pristine = fixture.load(context)?;

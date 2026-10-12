@@ -3,15 +3,15 @@
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::convert::TryFrom;
+use core::convert::{TryFrom, TryInto};
 
 use crate::arch;
 use crate::fs::{
-    self, DescriptorFlags, DirectoryEntry, FileIoContext, FileStat, FsContext, InodeKind, Path,
-    ReadBuffer, ResolveMode, SeekFrom, UserIoVector, Vfs, WriteBuffer,
+    self, DescriptorFlags, DirectoryEntry, FileIoContext, FileStat, FsContext, InodeKind,
+    InodeTime, Path, ReadBuffer, ResolveMode, SeekFrom, UserIoVector, Vfs, WriteBuffer,
 };
 use crate::mm::space::Mm;
-use crate::syscall::error::{copyout, Errno, SysResult};
+use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::task::{UserRuntime, UserThread};
 
 const AT_FDCWD: i32 = -100;
@@ -23,6 +23,7 @@ const DIRECTORY: u32 = 0x1_0000;
 const NOFOLLOW: u32 = 0x2_0000;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
+const AT_EACCESS: u32 = 0x200;
 const AT_NO_AUTOMOUNT: u32 = 0x800;
 const AT_STATX_SYNC_TYPE: u32 = 0x6000;
 const STATX_BASIC_STATS: u32 = 0x7ff;
@@ -744,6 +745,30 @@ pub(super) fn chdir(user: &UserThread, address: usize) -> SysResult {
     Ok(0)
 }
 
+/// 在可睡眠用户任务中解析并核目录、搜索及 uid0 权限，只提交当前共享 FS 的 root。
+/// 路径与权限检查不持 FS 锁，cwd、umask 和已打开文件保持原拥有，旧 root 锁外释放。
+pub(super) fn chroot(user: &UserThread, address: usize) -> SysResult {
+    let runtime = user.runtime().expect("chroot has no runtime");
+    let mm = user.mm().expect("chroot has no MM");
+    let path = resolve(
+        &runtime,
+        &mm,
+        AT_FDCWD as usize,
+        address,
+        ResolveMode::Follow,
+    )?;
+    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Directory {
+        return Err(Errno::NotDirectory);
+    }
+    path.check_access(runtime.credentials.uid, runtime.credentials.gid, 1)?;
+    if runtime.credentials.uid != 0 {
+        return Err(Errno::NotPermitted);
+    }
+    let retired = runtime.fs.lock().context.exchange_root(path);
+    drop(retired);
+    Ok(0)
+}
+
 /// 返回真实 cwd 原始字节及 NUL 的总长度，容量不足和用户写故障不改 FS 上下文。
 pub(super) fn getcwd(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("getcwd has no runtime");
@@ -770,6 +795,184 @@ pub(super) fn fchdir(user: &UserThread, raw: [usize; 6]) -> SysResult {
     path.check_access(runtime.credentials.uid, runtime.credentials.gid, 1)?;
     let retired = runtime.fs.lock().context.exchange_cwd(path);
     drop(retired);
+    Ok(0)
+}
+
+/// 按普通 fd 的真实 Path 修改权限；特殊对象没有 inode 路径时保留具体错误。
+pub(super) fn fchmod(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("fchmod has no runtime");
+    let file = runtime.files.lookup(descriptor(raw[0])?)?;
+    let path = file.path().ok_or(Errno::InvalidArgument)?;
+    chmod_path(&runtime, path, raw[1] as u16)
+}
+
+/// 导入一次原路径并按 dirfd 跟随最后链接，沿 canonical 属性协议提交实际权限。
+pub(super) fn fchmodat(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("fchmodat has no runtime");
+    let mm = user.mm().expect("fchmodat has no MM");
+    let path = resolve(&runtime, &mm, raw[0], raw[1], ResolveMode::Follow)?;
+    chmod_path(&runtime, &path, raw[2] as u16)
+}
+
+/// 一次导入路径后查询真实 DAC 与挂载写权限；当前不可变凭据的 real/effective 身份相同。
+pub(super) fn faccessat(user: &UserThread, raw: [usize; 6], flags: u32) -> SysResult {
+    let mode = raw[2] as u32;
+    if mode & !7 != 0
+        || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0
+    {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("faccessat has no runtime");
+    let mm = user.mm().expect("faccessat has no MM");
+    let pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
+    let path = if pathname.is_empty() && flags & AT_EMPTY_PATH as u32 != 0 {
+        if raw[0] as i32 == AT_FDCWD {
+            fs_snapshot(&runtime).1.cwd().clone()
+        } else {
+            let file = runtime.files.lookup(descriptor(raw[0])?)?;
+            file.path().cloned().ok_or(Errno::NoSyscall)?
+        }
+    } else {
+        let follow = if flags & AT_SYMLINK_NOFOLLOW as u32 != 0 {
+            ResolveMode::NoFollow
+        } else {
+            ResolveMode::Follow
+        };
+        resolve_bytes(&runtime, raw[0], &pathname, follow)?
+    };
+    path.check_access(
+        runtime.credentials.uid,
+        runtime.credentials.gid,
+        mode as u16,
+    )?;
+    Ok(0)
+}
+
+/// 可睡眠路径只持 inode 写序列，准备失败不发布权限或 ctime，不要求文件内容写权限。
+fn chmod_path(runtime: &UserRuntime, path: &Path, mode: u16) -> SysResult {
+    path.check_writable()?;
+    let inode = path.inode()?;
+    let guard = inode.inode_write()?;
+    let prepared = guard.prepare_mode(
+        mode,
+        runtime.credentials.uid,
+        runtime.credentials.gid,
+        crate::time::realtime(),
+    )?;
+    guard.publish_metadata(prepared);
+    Ok(0)
+}
+
+/// 文件时间参数先复制为内核值，NOW 和 OMIT 不消费对应秒字段。
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FileTimeUpdate {
+    Now,
+    Omit,
+    Value(InodeTime),
+}
+
+impl FileTimeUpdate {
+    /// 解码一个 LP64 timespec，普通纳秒必须在一秒内。
+    fn decode(bytes: &[u8]) -> Result<Self, Errno> {
+        let seconds = i64::from_le_bytes(bytes[..8].try_into().expect("timespec seconds"));
+        let nanoseconds =
+            i64::from_le_bytes(bytes[8..16].try_into().expect("timespec nanoseconds"));
+        match nanoseconds {
+            0x3fff_ffff => Ok(Self::Now),
+            0x3fff_fffe => Ok(Self::Omit),
+            0..=999_999_999 => Ok(Self::Value(InodeTime {
+                seconds,
+                nanoseconds: nanoseconds as u32,
+            })),
+            _ => Err(Errno::InvalidArgument),
+        }
+    }
+
+    /// NOW 使用本次提交的共同时间，OMIT 不产生属性更新。
+    fn value(self, now: InodeTime) -> Option<InodeTime> {
+        match self {
+            Self::Now => Some(now),
+            Self::Omit => None,
+            Self::Value(time) => Some(time),
+        }
+    }
+}
+
+/// 一次导入两个64位秒/纳秒对；任何复制失败都发生在路径访问和属性准备之前。
+fn import_file_times(mm: &Mm, address: usize) -> Result<[FileTimeUpdate; 2], Errno> {
+    if address == 0 {
+        return Ok([FileTimeUpdate::Now; 2]);
+    }
+    let mut bytes = [0u8; 32];
+    copyin(mm, &mut bytes, address)?;
+    Ok([
+        FileTimeUpdate::decode(&bytes[..16])?,
+        FileTimeUpdate::decode(&bytes[16..])?,
+    ])
+}
+
+/// NULL 名字只允许普通 fd 的 futimens 形式，空名字按 EMPTY_PATH 取得原 Path。
+fn file_times_path(
+    runtime: &UserRuntime,
+    mm: &Mm,
+    dirfd: usize,
+    address: usize,
+    flags: u32,
+) -> Result<Path, Errno> {
+    if address == 0 && dirfd as i32 != AT_FDCWD {
+        if flags != 0 {
+            return Err(Errno::InvalidArgument);
+        }
+        let file = runtime.files.lookup(descriptor(dirfd)?)?;
+        return file.path().cloned().ok_or(Errno::InvalidArgument);
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let pathname = mm.read_c_string(address, MAX_PATH_BYTES)?;
+    if pathname.is_empty() && flags & AT_EMPTY_PATH as u32 != 0 {
+        if dirfd as i32 == AT_FDCWD {
+            return Ok(fs_snapshot(runtime).1.cwd().clone());
+        }
+        let file = runtime.files.lookup(descriptor(dirfd)?)?;
+        return file.path().cloned().ok_or(Errno::InvalidArgument);
+    }
+    let mode = if flags & AT_SYMLINK_NOFOLLOW as u32 != 0 {
+        ResolveMode::NoFollow
+    } else {
+        ResolveMode::Follow
+    };
+    resolve_bytes(runtime, dirfd, &pathname, mode)
+}
+
+/// 按路径或原 fd 修改真实时间，用户访问先结束；属性提交不取得内容 WriteAccess。
+pub(super) fn utimensat(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let mm = user.mm().expect("utimensat has no MM");
+    let times = import_file_times(&mm, raw[2])?;
+    // 双 OMIT 连无效 fd、名字和 flags 都不访问，也不更新 ctime。
+    if times == [FileTimeUpdate::Omit; 2] {
+        return Ok(0);
+    }
+    let runtime = user.runtime().expect("utimensat has no runtime");
+    let path = file_times_path(&runtime, &mm, raw[0], raw[1], raw[3] as u32)?;
+    path.check_writable()?;
+    let inode = path.inode()?;
+    let guard = inode.inode_write()?;
+    let metadata = guard.metadata_snapshot();
+    let uid = runtime.credentials.uid;
+    if uid != 0 && uid != metadata.uid {
+        if times != [FileTimeUpdate::Now; 2] {
+            return Err(Errno::NotPermitted);
+        }
+        path.check_access(uid, runtime.credentials.gid, 2)?;
+    }
+    let now_ns = crate::time::realtime();
+    let now = InodeTime {
+        seconds: (now_ns / 1_000_000_000) as i64,
+        nanoseconds: (now_ns % 1_000_000_000) as u32,
+    };
+    let prepared = guard.prepare_times(times[0].value(now), times[1].value(now), now_ns)?;
+    guard.publish_metadata(prepared);
     Ok(0)
 }
 

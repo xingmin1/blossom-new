@@ -40,6 +40,7 @@ pub(super) enum Errno {
     ReadOnly = 30,
     TooManyLinks = 31,
     BrokenPipe = 32,
+    Domain = 33,
     Range = 34,
     NameTooLong = 36,
     NoSyscall = 38,
@@ -64,19 +65,24 @@ pub(super) enum Errno {
     ConnectionRefused = 111,
     AlreadyInProgress = 114,
     InProgress = 115,
+    /// 仅供内部重启分派使用，任何用户返回都编码为 EINTR。
+    RestartSyscall = 512,
 }
 
 pub(super) type SysResult = Result<isize, Errno>;
 
 impl Errno {
-    /// 只在普通syscall返回边界转换为目标Linux负errno。
+    /// 普通返回只交付 Linux errno，内部重启标记不得泄露到用户 ABI。
     pub(super) fn result(self) -> isize {
-        -(self as isize)
+        match self {
+            Self::RestartSyscall => -(Self::Interrupted as isize),
+            other => -(other as isize),
+        }
     }
 }
 
 impl From<FsError> for Errno {
-    /// 保留文件、socket与真实内存错误，盘格式错误不伪装EOF。
+    /// 保留文件与 socket 的真实错误；可重启中断仅转换为内部分派标记。
     fn from(error: FsError) -> Self {
         match error {
             FsError::NoMemory | FsError::Io(BlockError::NoMemory) => Self::NoMemory,
@@ -122,7 +128,8 @@ impl From<FsError> for Errno {
             FsError::DestinationRequired => Self::DestinationRequired,
             FsError::WouldBlock => Self::Again,
             FsError::BrokenPipe => Self::BrokenPipe,
-            FsError::Interrupted => Self::Interrupted,
+            FsError::Interrupted => Self::RestartSyscall,
+            FsError::InterruptedNoRestart => Self::Interrupted,
             FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => {
                 Self::Io
             }

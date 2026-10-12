@@ -80,11 +80,17 @@ impl UserOwner {
     ) -> Result<WaitEvent, TestError> {
         let arguments = Arguments::from_kernel(LIBC, &[LIBC, mode, b"stage7"], &[])
             .map_err(|_| TestError("root role arguments preparation failed"))?;
-        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
-            .map_err(|error| {
-                context.diagnostic(format_args!("root-role-image-prepare error={:?}", error));
-                TestError("root role image preparation failed")
-            })?;
+        let image = exec::prepare(
+            self.path.vfs(),
+            self.path.context(),
+            arguments,
+            credentials,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!("root-role-image-prepare error={:?}", error));
+            TestError("root role image preparation failed")
+        })?;
         let runtime = checked(
             context,
             UserRuntime::try_new(

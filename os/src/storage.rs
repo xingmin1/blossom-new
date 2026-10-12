@@ -22,6 +22,11 @@ pub(crate) struct Storage {
 }
 
 impl Storage {
+    /// 借用唯一永久表；未发表时返回 None，设备是否可用仍由 disk 检查 ready。
+    pub(crate) fn get() -> Option<&'static Self> {
+        STORAGE.get()
+    }
+
     /// 在唯一普通初始化 Task 中准备全部设备，发表前把原拥有者放进永久表。
     ///
     /// # Safety

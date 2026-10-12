@@ -271,11 +271,17 @@ impl UserOwner {
         };
         let arguments = Arguments::from_kernel(PROGRAM, &argv[..count], &[])
             .map_err(|_| TestError("network user arguments failed"))?;
-        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
-            .map_err(|error| {
-                context.diagnostic(format_args!("network-user image-error={:?}", error));
-                TestError("network user image preparation failed")
-            })?;
+        let image = exec::prepare(
+            self.path.vfs(),
+            self.path.context(),
+            arguments,
+            credentials,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!("network-user image-error={:?}", error));
+            TestError("network user image preparation failed")
+        })?;
         let prepared = task::prepare_program(self.graph(), None, image, runtime, Placement::Any)
             .map_err(|_| TestError("network user task preparation failed"))?;
         let pid = prepared.pid();
@@ -334,7 +340,11 @@ impl UserOwner {
 }
 
 /// 测试仅观察事实；有限期限不驱动协议或覆盖生产时钟。
-fn network_until(mut ready: impl FnMut() -> bool, error: &'static str, seconds: u64) -> TestResult {
+pub(super) fn network_until(
+    mut ready: impl FnMut() -> bool,
+    error: &'static str,
+    seconds: u64,
+) -> TestResult {
     let end = time::now()
         .checked_add(time::Duration::from_secs(seconds))
         .ok_or(TestError("network user observation deadline overflow"))?;

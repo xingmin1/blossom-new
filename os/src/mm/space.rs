@@ -379,6 +379,8 @@ pub struct Mm {
     users: AtomicUsize,
     /// 原执行文件与写排斥保留到此 Mm 最后实际拥有结束，普通私有映射不取得责任。
     executable: Option<(FileRef, ExecAccess)>,
+    /// 解释器独立保留文件与执行写排斥，不替换主执行文件身份。
+    interpreter: Option<(FileRef, ExecAccess)>,
     #[cfg(feature = "ktest")]
     mkwrite_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(feature = "ktest")]
@@ -611,7 +613,9 @@ impl FutexRead<'_> {
         {
             return None;
         }
-        Some(visit(arch::phys_to_virt(mapping.physical) + address - base))
+        Some(visit(
+            arch::phys_to_virt(mapping.physical) + (address - base),
+        ))
     }
 }
 
@@ -629,6 +633,7 @@ impl Mm {
             mmap: SleepRwLock::new(MmapState::default()),
             users: AtomicUsize::new(0),
             executable: None,
+            interpreter: None,
             #[cfg(feature = "ktest")]
             mkwrite_hook: SpinLock::new(None),
             #[cfg(feature = "ktest")]
@@ -646,6 +651,12 @@ impl Mm {
     pub(crate) fn bind_executable(&mut self, file: FileRef, access: ExecAccess) {
         assert!(self.executable.is_none(), "MM executable already bound");
         self.executable = Some((file, access));
+    }
+
+    /// 未发表 Mm 接受唯一 ELF 解释器责任，末拥有析构与主文件遵守同一寿命边界。
+    pub(crate) fn bind_interpreter(&mut self, file: FileRef, access: ExecAccess) {
+        assert!(self.interpreter.is_none(), "MM interpreter already bound");
+        self.interpreter = Some((file, access));
     }
 
     /// 返回真实用户线程绑定数，不包含 CPU、诊断或同步 key 的拥有引用。
@@ -1378,10 +1389,11 @@ impl Mm {
         Ok(Some(result))
     }
 
-    /// 子 Mm 独立登记文件范围并以 RO 文件叶继承原页，父 COW/TLB 与执行排斥完成后返回。
+    /// 子 Mm 独立登记文件范围并保两映像写排斥，父 COW/TLB 同步完成后才返回。
     pub fn fork(&self) -> Result<Self, VmError> {
         let mut child = Self::try_new()?;
         child.executable = self.executable.clone();
+        child.interpreter = self.interpreter.clone();
         let mmap = self.mmap.write();
         let snapshot = mmap.snapshot(&child.table)?;
         let addresses = self.resident_addresses(&(0..arch::USER_ADDRESS_END))?;

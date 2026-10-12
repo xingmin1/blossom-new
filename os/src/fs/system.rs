@@ -10,27 +10,36 @@ use crate::fs::{
 };
 use crate::mm::PAGE_SIZE;
 
+#[cfg(target_arch = "riscv64")]
+const DEFAULT_ROOTDIR: &[u8] = b"/riscv64";
+#[cfg(target_arch = "loongarch64")]
+const DEFAULT_ROOTDIR: &[u8] = b"/loongarch64";
+
 /// 启动参数选中的固定磁盘槽；是否存在由本次真实设备表检查。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BootDevices<'a> {
     pub root: usize,
     pub extra: Option<usize>,
     pub root_mode: AccessMode,
+    pub rootdir: &'a [u8],
     pub init: &'a [u8],
 }
 
-/// 一次按 ASCII 空白消费 root/extra/init 与完整 ro/rw token 的最后值，根默认只读。
-/// 仅支持完整的 /dev/vd[a-z] 块选择名；init 仅在缺键时默认 /sbin/init，显式错误留给 exec。
+/// 一次按 ASCII 空白消费 root/extra/rootdir/init 与完整 ro/rw token 的最后值，根默认只读。
+/// 缺键时采用固定系统盘及目标根目录；显式设备错误立即返回，路径错误由真实查找或 exec 返回。
 pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError> {
     let mut root = None;
     let mut extra = None;
     let mut root_mode = AccessMode::ReadOnly;
+    let mut rootdir = None;
     let mut init = None;
     for argument in arguments.split(|byte| byte.is_ascii_whitespace() || *byte == 0x0b) {
         if let Some(value) = argument.strip_prefix(b"root=") {
             root = Some(value);
         } else if let Some(value) = argument.strip_prefix(b"extra=") {
             extra = Some(value);
+        } else if let Some(value) = argument.strip_prefix(b"rootdir=") {
+            rootdir = Some(value);
         } else if let Some(value) = argument.strip_prefix(b"init=") {
             init = Some(value);
         } else if argument == b"ro" {
@@ -40,39 +49,44 @@ pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError>
         }
     }
     Ok(BootDevices {
-        root: device_index(root.ok_or(FsError::MissingRoot)?)?,
+        root: device_index(root.unwrap_or(b"/dev/vdb"))?,
         extra: extra.map(device_index).transpose()?,
         root_mode,
+        rootdir: rootdir.unwrap_or(DEFAULT_ROOTDIR),
         init: init.unwrap_or(b"/sbin/init"),
     })
 }
 
 /// 从完整原始字节名字取得一个槽号，不接受分区、LABEL、UUID 或多字母后缀。
-fn device_index(name: &[u8]) -> Result<usize, FsError> {
+pub(crate) fn device_index(name: &[u8]) -> Result<usize, FsError> {
     match name.strip_prefix(b"/dev/vd") {
         Some([letter @ b'a'..=b'z']) => Ok(usize::from(*letter - b'a')),
         _ => Err(FsError::MissingRoot),
     }
 }
 
-/// 普通可睡眠 Task 以同一权限构造根卷和根挂载，仅显式附盘才以只读挂到 /mnt/extra。
-/// 卷与路径只保活原设备及缓存，不停止设备，也不建立全局文件系统拥有者。
+/// 普通可睡眠 Task 挂一次根卷，按真实目录建立 root=cwd 的初始视图，再挂显式只读附盘。
+/// 卷与路径只保活原设备及缓存；目录或附盘准备失败原样返回，不改选盘或物理根。
 pub(crate) fn mount_disks(
     root: DiskRef,
     extra: Option<DiskRef>,
     inodes: Arc<InodeCache>,
     root_mode: AccessMode,
-) -> Result<Vfs, FsError> {
+    rootdir: &[u8],
+) -> Result<(Vfs, FsContext), FsError> {
     let volume = Ext4Volume::open(root, root_mode, 64)?;
-    let vfs = Vfs::try_new(Filesystem::Ext4(volume), inodes, 128, 8, root_mode)?;
+    let vfs = Vfs::try_new(Filesystem::Ext4(volume), inodes, 128, 12, root_mode)?;
+    let physical_root = vfs.root();
+    let physical_context = FsContext::new(physical_root.clone(), physical_root)?;
+    let root = vfs.resolve(&physical_context, rootdir, ResolveMode::Follow)?;
+    let context = FsContext::new(root.clone(), root)?;
+    drop(physical_context);
     if let Some(extra) = extra {
-        let root = vfs.root();
-        let context = FsContext::new(root.clone(), root)?;
         let covered = vfs.resolve(&context, b"/mnt/extra", ResolveMode::Follow)?;
         let volume = Ext4Volume::open(extra, AccessMode::ReadOnly, 64)?;
         vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadOnly)?;
     }
-    Ok(vfs)
+    Ok((vfs, context))
 }
 
 /// 实际交付的完整文件长度与标准最终取反 CRC32C，空文件摘要为零。

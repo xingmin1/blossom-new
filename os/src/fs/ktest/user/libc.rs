@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::fs::ktest::user::network::network_until;
 use crate::fs::{DescriptorFlags, FileRef};
 use crate::task::exec::{self, Arguments, LoadedImage};
 use crate::task::{self, Credentials, Placement, State, UserRuntime};
@@ -16,6 +17,61 @@ const BASE_ABI: &[u8] = b"/test/scripts/base-abi";
 const SCRIPT_ENV: &[u8] = b"BLOSSOM_SCRIPT=stage7";
 
 impl UserOwner {
+    /// 真实 C 核 uname 复制边界及 fork 后独立 root/cwd；凭据错误也由用户程序检查。
+    pub(super) fn runtime_view(
+        &mut self,
+        context: &mut TestContext<'_>,
+        credentials: Credentials,
+    ) -> TestResult {
+        self.prepare_tty(context, 4)?;
+        self.run_console_named(context, LIBC, &[b"--runtime-view"], credentials)
+    }
+
+    /// 真实 C 消费组限额、fork/线程共享、exec 栈边界与用户复制错误，再回收全部执行尾部。
+    pub(super) fn runtime_limits(
+        &mut self,
+        context: &mut TestContext<'_>,
+        credentials: Credentials,
+    ) -> TestResult {
+        self.prepare_tty(context, 4)?;
+        self.run_console_named(context, LIBC, &[b"--runtime-limits"], credentials)
+    }
+
+    /// 可写真实卷上的 C 直接消费 canonical 时间修改与错误权限，退出仍由同一图回收。
+    pub(super) fn runtime_file_times(
+        &mut self,
+        context: &mut TestContext<'_>,
+        credentials: Credentials,
+    ) -> TestResult {
+        self.prepare_mode(context, AccessMode::ReadWrite, 4)?;
+        self.mount_console_devfs(context)?;
+        self.run_console_named(context, LIBC, &[b"--runtime-file-times"], credentials)
+    }
+
+    /// 普通 C 的用户拥有结束后继续等待真实协议退休，再交原夹具比较资源。
+    pub(super) fn runtime_socket_timeouts(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.prepare_tty(context, 4)?;
+        let result = self.run_console_named(
+            context,
+            LIBC,
+            &[b"--runtime-socket-timeouts"],
+            Credentials::ROOT,
+        );
+        network_until(
+            || self.net.ktest_live_endpoints() == 0,
+            "runtime socket protocols did not retire",
+            30,
+        )?;
+        result
+    }
+
+    /// 可写卷上的 C 核 UTC、单调与绝对睡眠，并用真实新文件消费共同日期来源。
+    pub(super) fn runtime_clock(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        self.prepare_mode(context, AccessMode::ReadWrite, 4)?;
+        self.mount_console_devfs(context)?;
+        self.run_console_named(context, LIBC, &[b"--runtime-clock"], Credentials::ROOT)
+    }
+
     /// 在完整标准流和真实执行映像上运行静态 libc smoke，并消费原 wait/reap 资源。
     pub(super) fn libc_static_smoke(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.prepare_tty(context, 4)?;
@@ -71,6 +127,7 @@ impl UserOwner {
             self.path.context(),
             arguments,
             Credentials::ROOT,
+            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|error| {
             context.diagnostic(format_args!("libc-image-prepare error={:?}", error));
@@ -172,6 +229,7 @@ impl UserOwner {
                 self.path.context(),
                 arguments,
                 Credentials::ROOT,
+                exec::DEFAULT_STACK_BYTES,
             )
             .map_err(|error| {
                 context.diagnostic(format_args!("script-image-prepare error={:?}", error));
@@ -266,11 +324,17 @@ impl UserOwner {
         };
         let arguments = Arguments::from_kernel(program, &argv, env)
             .map_err(|_| TestError("console named arguments failed"))?;
-        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
-            .map_err(|error| {
-                context.diagnostic(format_args!("console-image-prepare error={:?}", error));
-                TestError("console image preparation failed")
-            })?;
+        let image = exec::prepare(
+            self.path.vfs(),
+            self.path.context(),
+            arguments,
+            credentials,
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!("console-image-prepare error={:?}", error));
+            TestError("console image preparation failed")
+        })?;
         self.start_console_program(context, image, Placement::Any, credentials)?;
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);

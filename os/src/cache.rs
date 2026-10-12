@@ -125,7 +125,7 @@ fn writeback_errno(error: FsError) -> u32 {
         FsError::DestinationRequired => 89,
         FsError::WouldBlock => 11,
         FsError::BrokenPipe => 32,
-        FsError::Interrupted => 4,
+        FsError::Interrupted | FsError::InterruptedNoRestart => 4,
         FsError::BadAddress => 14,
         FsError::Permission => 13,
         FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => 5,

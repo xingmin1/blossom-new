@@ -18,9 +18,13 @@ const FILES: usize = 0x400;
 const SIGHAND: usize = 0x800;
 const VFORK: usize = 0x4000;
 const THREAD: usize = 0x1_0000;
+// 未实现 SysV IPC 时 undo 集为空；该位不增加新的执行资源。
+const SYSVSEM: usize = 0x4_0000;
 const SETTLS: usize = 0x8_0000;
 const PARENT_SETTID: usize = 0x10_0000;
 const CHILD_CLEARTID: usize = 0x20_0000;
+// 历史 DETACHED 位不决定成员回收，真实 join 与身份退休仍由原图承担。
+const DETACHED: usize = 0x40_0000;
 const CHILD_SETTID: usize = 0x100_0000;
 const SUPPORTED: usize = 0xff
     | VM
@@ -29,10 +33,12 @@ const SUPPORTED: usize = 0xff
     | SIGHAND
     | VFORK
     | THREAD
+    | SYSVSEM
     | SETTLS
     | PARENT_SETTID
     | CHILD_SETTID
-    | CHILD_CLEARTID;
+    | CHILD_CLEARTID
+    | DETACHED;
 
 #[cfg(target_arch = "riscv64")]
 const STACK_REGISTER: usize = 2;
@@ -70,7 +76,7 @@ pub(crate) struct CloneArguments {
 }
 
 impl CloneArguments {
-    /// 根据目标ABI一次解释标志与参数次序，不用指针值推测TLS和child_tid的位置。
+    /// 按目标 ABI 解码共享轴；空 SysV undo 与历史 DETACHED 不改变线程的真实退出责任。
     pub(crate) fn decode(raw: [usize; 6]) -> Result<Self, CloneError> {
         let flags = raw[0];
         if flags & !SUPPORTED != 0 {

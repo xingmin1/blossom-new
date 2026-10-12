@@ -16,6 +16,7 @@ use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer};
 use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress};
 use crate::net::packet::{zeroed_bytes, OwnedPacket};
+use crate::net::socket::SocketTimeouts;
 use crate::net::table::{BindLease, TransportProtocol};
 use crate::net::{EndpointSlot, IoProgress, MessageResult, NetStack, NetStackRef, PROTOCOL_BUDGET};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
@@ -92,6 +93,7 @@ pub struct UdpEndpoint {
     stack: Weak<NetStack>,
     state: SleepMutex<State>,
     input: SpinLock<Input>,
+    timeouts: SpinLock<SocketTimeouts>,
     source: Arc<PollWaitHead>,
     work: Once<Pin<Arc<Work>>>,
     stopped: AtomicBool,
@@ -208,6 +210,7 @@ impl UdpEndpoint {
                 owner_waiting: false,
                 packets,
             }),
+            timeouts: SpinLock::new(SocketTimeouts::default()),
             source: Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
             work: Once::new(),
             stopped: AtomicBool::new(false),
@@ -224,6 +227,16 @@ impl UdpEndpoint {
         .map_err(|_| FsError::NoMemory)?;
         endpoint.work.call_once(|| work);
         Ok(endpoint)
+    }
+
+    /// 查询端点共享的两向期限，不取得可能等待 raw 拥有者的操作锁。
+    pub(crate) fn timeouts(&self) -> SocketTimeouts {
+        *self.timeouts.lock()
+    }
+
+    /// 控制值只占短锁，设置不能阻塞协议 Work 或修改 raw 消息责任。
+    pub(crate) fn set_timeout(&self, receive: bool, timeout: Option<u64>) {
+        self.timeouts.lock().set(receive, timeout);
     }
 
     /// metadata 和 payload 都在堆上预备，128KiB 后备不落任务栈。

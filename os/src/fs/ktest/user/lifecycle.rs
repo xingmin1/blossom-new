@@ -13,7 +13,14 @@ impl UserOwner {
     ) -> Result<(Arc<Mm>, Arc<task::UserThread>), TestError> {
         let image = self.load_named(context, PROGRAM, mode)?;
         let mm = Arc::clone(&image.mm);
-        self.start_program(context, image, false, false, Credentials::ROOT)?;
+        self.start_program(
+            context,
+            image,
+            self.path.context().clone(),
+            false,
+            false,
+            Credentials::ROOT,
+        )?;
         let running = self.running.as_mut().unwrap();
         if matches!(mode, b"n" | b"c") {
             running.expected_task = None;

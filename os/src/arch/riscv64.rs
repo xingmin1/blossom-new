@@ -248,7 +248,7 @@ struct BootMapping {
     flags: usize,
 }
 
-const MAX_BOOT_MAPPINGS: usize = 1 + MAX_MEMORY_REGIONS + 2 + MAX_VIRTIO_MMIO + 1 + 4;
+const MAX_BOOT_MAPPINGS: usize = 1 + MAX_MEMORY_REGIONS + 3 + MAX_VIRTIO_MMIO + 1 + 4;
 
 /// 在建表之前核对页边界、canonical VA 和所有实际映射的虚拟范围不重叠。
 fn add_mapping(
@@ -338,7 +338,7 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
     1 + count
 }
 
-/// 在 AP 释放前为实际 RAM、全部 MMIO 槽、PCI ECAM 和 MEM ranges 安装最终 PTE。
+/// 在 AP 释放前为实际 RAM、UART、RTC、控制器、MMIO 槽和 PCI 资源安装最终 PTE。
 ///
 /// # Safety
 /// 只能由关闭 IRQ 的 BSP 在使用 bootstrap 表且 AP 尚未释放时调用一次。
@@ -375,7 +375,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             0xc6,
         );
     }
-    for region in [info.interrupts.uart, info.interrupts.controller] {
+    for region in [info.interrupts.uart, info.interrupts.controller, info.rtc] {
         add_device_mapping(&mut mappings, &mut count, region);
     }
     for resource in &info.virtio_mmio[..info.virtio_mmio_count] {

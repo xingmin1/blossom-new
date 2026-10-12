@@ -11,7 +11,7 @@ use core::sync::atomic::{compiler_fence, fence, AtomicU64, Ordering};
 use spin::Once;
 
 use crate::arch;
-use crate::boot::BootInfo;
+use crate::boot::{BootInfo, Region};
 use crate::cpu;
 use crate::sync::SpinLock;
 
@@ -290,20 +290,142 @@ impl Timekeeper {
 }
 
 static TIMEKEEPER: Once<Timekeeper> = Once::new();
+static REALTIME_BASE: Once<u64> = Once::new();
 
-/// 在 BSP 上注册一次已发现的稳定计数器，不访问运行期 CPUCFG 或 FDT。
+/// 读取已映射 RTC 内完整对齐的 32 位寄存器，设备屏障维持连续采样的先后顺序。
 ///
 /// # Safety
-/// 仅 BSP 在 MM 初始化后、IRQ 关闭且 AP 尚未释放时调用一次；BootInfo 频率
-/// 必须属于当前跨 CPU 一致的 64 位硬件 counter，之后不得切换计数源。
+/// region 必须来自当前平台已验证的 RTC，且其永久 MMIO 映射已经建立；
+/// offset 必须对应可读寄存器，调用者独占设备采样协议。
+unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
+    assert!(
+        offset % 4 == 0
+            && offset
+                .checked_add(4)
+                .is_some_and(|end| end <= region.end - region.start),
+        "RTC register exceeds its resource window"
+    );
+    let address = arch::mmio_address(region.start)
+        .checked_add(offset)
+        .expect("RTC virtual register address overflows");
+    // SAFETY: 调用者保证实际 RTC 与永久映射；窗口校验保证完整对齐访问，
+    // volatile 不建立设备内存引用，完整屏障在后续寄存器或 counter 采样前完成该读。
+    unsafe {
+        let value = core::ptr::read_volatile(address as *const u32);
+        arch::dma_barrier();
+        value
+    }
+}
+
+/// BSP 在唯一计数基准注册前取得一次实际 UTC，不安装 RTC 中断或周期维护。
+///
+/// # Safety
+/// info 必须是已验证的当前机器启动资源；RTC 已永久映射，IRQ 关闭且 AP 尚未释放，
+/// 没有其它 RTC 访问者，可以独占锁存和 TOY 控制寄存器。
+unsafe fn boot_realtime(info: &BootInfo) -> u64 {
+    #[cfg(target_arch = "riscv64")]
+    {
+        // TIME_LOW 锁存同一采样的高字；必须先读低字再读取该高字。
+        // SAFETY: 初始化调用者独占实际 Goldfish RTC；两个偏移均为可读寄存器，
+        // rtc_register 验证宽度并在两次访问间执行设备屏障。
+        unsafe {
+            let low = rtc_register(info.rtc, 0);
+            let high = rtc_register(info.rtc, 4);
+            (u64::from(high) << 32) | u64::from(low)
+        }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        const TOY_ENABLE: u32 = (1 << 11) | (1 << 8);
+        // SAFETY: BSP 独占 LS7A TOY；控制字只增加计数和晶振使能位，
+        // 不改日历或 alarm，窗口已由平台验证，强序 DMW 与设备屏障排序读改写。
+        unsafe {
+            let control = rtc_register(info.rtc, 0x40);
+            let address = arch::mmio_address(info.rtc.start)
+                .checked_add(0x40)
+                .expect("RTC control address overflows");
+            core::ptr::write_volatile(address as *mut u32, control | TOY_ENABLE);
+            arch::dma_barrier();
+            assert_eq!(
+                rtc_register(info.rtc, 0x40) & TOY_ENABLE,
+                TOY_ENABLE,
+                "RTC TOY could not be enabled"
+            );
+            // 年寄存器不锁存低字；跨年时整组重新采样，避免合成两年的日历。
+            loop {
+                let year = rtc_register(info.rtc, 0x30);
+                let low = rtc_register(info.rtc, 0x2c);
+                if year == rtc_register(info.rtc, 0x30) {
+                    return rtc_calendar(year, low)
+                        .expect("RTC calendar is invalid or out of range");
+                }
+            }
+        }
+    }
+}
+
+/// 将 TOY 的公历字段换算为 UTC Unix 纳秒；年份以 1900 为起点，不猜测无效日期。
+#[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
+fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
+    let year = i64::from(toy_year) + 1900;
+    let month = i64::from((low >> 26) & 0x3f);
+    let day = i64::from((low >> 21) & 0x1f);
+    let hour = i64::from((low >> 16) & 0x1f);
+    let minute = i64::from((low >> 10) & 0x3f);
+    let second = i64::from((low >> 4) & 0x3f);
+    if !(1..=12).contains(&month) || 24 <= hour || 60 <= minute || 60 <= second {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [
+        31,
+        28 + i64::from(leap),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=days[(month - 1) as usize]).contains(&day) {
+        return None;
+    }
+    // 将一、二月移至前一年末尾，闰日统一落在最后一月。
+    let (year, month) = if month <= 2 {
+        (year - 1, month + 10)
+    } else {
+        (year, month - 2)
+    };
+    let days = year / 4 - year / 100 + year / 400 + 367 * month / 12 + day + year * 365 - 719499;
+    let seconds = ((days * 24 + hour) * 60 + minute) * 60 + second;
+    u64::try_from(seconds).ok()?.checked_mul(NSEC_PER_SEC)
+}
+
+/// 在 BSP 上一次采样实际 RTC 并注册稳定计数器，之后日历沿同一单调基准推进。
+///
+/// # Safety
+/// 仅 BSP 在 MM 初始化后、IRQ 关闭且 AP 尚未释放时调用一次；BootInfo 必须是
+/// 当前机器已验证的资源，RTC 永久映射已建立且无其它访问者；频率属于当前跨 CPU
+/// 一致的 64 位硬件 counter，之后不得切换计数源。
 pub unsafe fn initialize(info: &BootInfo) {
     assert!(!arch::irq_enabled(), "time initialization requires IRQ-off");
     assert!(
         TIMEKEEPER.get().is_none(),
         "timekeeper is already initialized"
     );
-    TIMEKEEPER
-        .call_once(|| Timekeeper::new(info.counter_frequency, u64::MAX, arch::read_counter()));
+    TIMEKEEPER.call_once(|| {
+        // SAFETY: 本入口继承 BSP 独占、IRQ-off、AP 未释放和实际 RTC 已映射的启动合同。
+        let realtime = unsafe { boot_realtime(info) };
+        compiler_fence(Ordering::SeqCst);
+        let cycle = arch::read_counter();
+        compiler_fence(Ordering::SeqCst);
+        REALTIME_BASE.call_once(|| realtime);
+        Timekeeper::new(info.counter_frequency, u64::MAX, cycle)
+    });
 }
 
 /// 借用已经完整发表的唯一时间基准，注册前调用直接失败。
@@ -316,6 +438,23 @@ fn keeper() -> &'static Timekeeper {
 /// 读取生产单调时间；panic 与不可屏蔽异常不得等待可能被其打断的写者。
 pub fn now() -> MonotonicInstant {
     keeper().read(arch::read_counter)
+}
+
+/// 将不可变 RTC 起点与原单调经过纳秒相加，日历空间耗尽时直接失败。
+pub fn realtime() -> u64 {
+    REALTIME_BASE
+        .get()
+        .expect("realtime has not been initialized")
+        .checked_add(now().as_nanos())
+        .expect("realtime nanoseconds exhausted")
+}
+
+/// 将 UTC 绝对睡眠期限转换到原单调域；注册前的日历期限对应已经过去的零时刻。
+pub(crate) fn realtime_deadline(nanos: u64) -> MonotonicInstant {
+    let base = *REALTIME_BASE
+        .get()
+        .expect("realtime has not been initialized");
+    MonotonicInstant::from_nanos(nanos.saturating_sub(base))
 }
 
 #[derive(Clone, Copy)]
@@ -470,6 +609,11 @@ pub(crate) mod testing {
     use crate::task::{self, TaskId};
     use core::hint::spin_loop;
     use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 对独立字段调用生产日历换算，不访问或改写实际 RTC。
+    pub(crate) fn rtc_calendar(year: u32, low: u32) -> Option<u64> {
+        super::rtc_calendar(year, low)
+    }
 
     const ARMED: usize = 1;
     const PAUSED: usize = 2;

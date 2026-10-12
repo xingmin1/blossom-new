@@ -445,6 +445,7 @@ fn discover_tree(
     }
     discover_pci(&tree, controller, &mut info)?;
     discover_virtio_mmio(&tree, controller, &mut info)?;
+    discover_rtc(&tree, &mut info)?;
     Ok(info)
 }
 
@@ -490,6 +491,7 @@ fn device_region(region: Region, info: &BootInfo) -> Result<(), &'static str> {
         .any(|old| old.overlaps(region))
         || info.interrupts.uart.overlaps(region)
         || info.interrupts.controller.overlaps(region)
+        || info.rtc.overlaps(region)
         || info.pci.configuration.overlaps(region)
         || info.pci.ranges[..info.pci.range_count]
             .iter()
@@ -500,6 +502,28 @@ fn device_region(region: Region, info: &BootInfo) -> Result<(), &'static str> {
     {
         return Err("FDT device resource overlaps RAM or another device window");
     }
+    Ok(())
+}
+
+/// 从目标绑定取得唯一启用 RTC，固定机器的寄存器几何必须完整且不覆盖其它资源。
+fn discover_rtc(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
+    #[cfg(target_arch = "riscv64")]
+    let (binding, alignment, size) = ("google,goldfish-rtc", 0x1000, 0x1000);
+    #[cfg(target_arch = "loongarch64")]
+    let (binding, alignment, size) = ("loongson,ls7a-rtc", 0x100, 0x100);
+    let mut devices = tree
+        .all_nodes()
+        .filter(|node| enabled(*node) && compatible(*node, binding));
+    let node = devices.next().ok_or("FDT enabled RTC is missing")?;
+    if devices.next().is_some() {
+        return Err("FDT has multiple enabled RTC devices");
+    }
+    let registers = single_region(tree, node)?;
+    if registers.start % alignment != 0 || registers.end - registers.start != size {
+        return Err("FDT RTC register window has invalid size or alignment");
+    }
+    device_region(registers, info)?;
+    info.rtc = registers;
     Ok(())
 }
 

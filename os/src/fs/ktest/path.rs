@@ -756,7 +756,7 @@ pub(crate) mod mounts {
         let proc_root = fixture.resolve(context, b"/mnt/extra/b/moved/raw \t\n\\#")?;
         context.expect_eq(proc_root.check_writable(), Err(FsError::ReadOnly));
         context.expect_eq(vfs.unmount(&nested).err(), Some(FsError::Busy));
-        let text = checked(context, vfs.mounts_text())?;
+        let text = checked(context, vfs.mounts_text(&vfs.root()))?;
         let lines: Vec<&[u8]> = text
             .split(|&byte| byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -787,7 +787,7 @@ pub(crate) mod mounts {
         drop(proc_root);
         checked(context, vfs.unmount(&nested))?;
         context.expect_eq(
-            checked(context, vfs.mounts_text())?
+            checked(context, vfs.mounts_text(&vfs.root()))?
                 .split(|&byte| byte == b'\n')
                 .filter(|line| !line.is_empty())
                 .count(),

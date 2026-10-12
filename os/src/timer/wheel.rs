@@ -5,7 +5,7 @@ use crate::time::MonotonicInstant;
 use super::{ArmError, Timer};
 
 /// 粗定时器的一个基础 tick，对应 HZ=100。
-pub(super) const TICK_NS: u64 = 10_000_000;
+pub(crate) const TICK_NS: u64 = 10_000_000;
 const LEVELS: usize = 8;
 const BUCKETS_PER_LEVEL: usize = 64;
 const LEVEL_SHIFT: usize = 3;

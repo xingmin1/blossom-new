@@ -94,6 +94,8 @@ pub enum FsError {
     WouldBlock,
     BrokenPipe,
     Interrupted,
+    /// 有限 socket 等待已消耗本次期限，信号返回不能重新开始等待。
+    InterruptedNoRestart,
     BadAddress,
     Permission,
     LoadAborted,
@@ -141,6 +143,7 @@ impl FsError {
             | Self::WouldBlock
             | Self::BrokenPipe
             | Self::Interrupted
+            | Self::InterruptedNoRestart
             | Self::Permission
             | Self::NotFound
             | Self::Exists

@@ -13,11 +13,25 @@ use crate::fs::inode::{
 };
 use crate::fs::types::InodeKind;
 use crate::fs::FsError;
+use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
 const INODE_LIMIT: usize = 128;
 const PAGE_LIMIT: usize = 4096;
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1 << 32);
+
+/// 后端容量快照只保存块与 inode 计数；挂载模式由取得快照的完整 Path 提供。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemStat {
+    pub fs_type: u64,
+    pub block_size: u64,
+    pub blocks: u64,
+    pub free: u64,
+    pub available: u64,
+    pub files: u64,
+    pub freefiles: u64,
+    pub device: u64,
+}
 
 /// 挂载强持真实后端实例，磁盘身份与内存身份各自比较。
 #[derive(Clone)]
@@ -32,6 +46,14 @@ impl Filesystem {
         match self {
             Self::Ext4(fs) => fs.device(),
             Self::Memory(fs) => fs.device(),
+        }
+    }
+
+    /// 在普通任务中采样实际后端容量；磁盘元数据读取可能睡眠并保留原始失败。
+    pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
+        match self {
+            Self::Ext4(fs) => fs.statfs(),
+            Self::Memory(fs) => fs.statfs(),
         }
     }
 
@@ -224,6 +246,39 @@ impl MemoryFs {
             MemoryFsKind::Tmpfs => AccessMode::ReadWrite,
             MemoryFsKind::Devfs | MemoryFsKind::Procfs => AccessMode::ReadOnly,
         }
+    }
+
+    /// 同一短索引锁内观察 tmpfs 的原页票和可复用弱槽，不清索引或分配对象。
+    /// 固定设备与 proc 节点没有数据块容量，保持零计数。
+    pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
+        let mut stat = FilesystemStat {
+            fs_type: match self.kind {
+                MemoryFsKind::Tmpfs => 0x0102_1994,
+                MemoryFsKind::Devfs => 0x1373,
+                MemoryFsKind::Procfs => 0x9fa0,
+            },
+            block_size: PAGE_SIZE as u64,
+            blocks: 0,
+            free: 0,
+            available: 0,
+            files: 0,
+            freefiles: 0,
+            device: self.device,
+        };
+        if self.kind == MemoryFsKind::Tmpfs {
+            let index = self.index.lock();
+            let used_inodes = index
+                .inodes
+                .iter()
+                .filter(|slot| 0 < slot.inode.strong_count())
+                .count();
+            stat.blocks = PAGE_LIMIT as u64;
+            stat.free = (PAGE_LIMIT - index.pages) as u64;
+            stat.available = stat.free;
+            stat.files = INODE_LIMIT as u64;
+            stat.freefiles = (INODE_LIMIT - used_inodes) as u64;
+        }
+        Ok(stat)
     }
 
     /// 外部根引用保活本实例，根内部 Arc 不反向强持文件系统。
