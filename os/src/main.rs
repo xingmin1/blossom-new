@@ -219,7 +219,7 @@ fn enter_scheduler() -> ! {
     sched::run()
 }
 
-/// 在普通任务栈一次发现并保活存储，等待真实系统根和文件系统退休后执行硬件动作。
+/// 在普通任务栈一次发现并保活设备库存，等待用户、网络和文件系统退休后执行硬件动作。
 #[cfg(not(feature = "ktest"))]
 fn init() -> i32 {
     let inventory = drivers::discover().expect("device resource discovery failed");
@@ -233,8 +233,8 @@ fn init() -> i32 {
         "filesystem boot initialization failed: {:?}",
         fs::FsError::MissingRoot
     );
-    // SAFETY: init 是一次发现后全部块设备的唯一准备者；Bootstrap 永久映射仍 live，
-    // 固定 Storage 表在发表前持全部 owner，未确认停止的设备不会在 init 返回时丢失。
+    // SAFETY: init 是本次唯一发现后全部块设备的唯一准备者；启动页表的完整强序映射永久有效。
+    // 固定 Storage 表在发表前持全部 owner，库存保留到用户、网络和文件系统全部结束。
     let storage =
         unsafe { storage::Storage::initialize(&inventory) }.expect("storage initialization failed");
     crate::klog!(
@@ -242,7 +242,10 @@ fn init() -> i32 {
         "STORAGE online devices={}",
         storage.count()
     );
-    let operation = init_filesystems(storage).expect("system lifecycle failed");
+    // SAFETY: 库存来自上述唯一发现，Storage 只拥有块设备，网络候选仍由 init 独占。
+    // 库存保留到本调用结束，启动页表的完整强序设备映射在全部消费者和停止尾部期间永久有效。
+    let operation =
+        unsafe { init_filesystems(storage, &inventory) }.expect("system lifecycle failed");
     drop(inventory);
     match operation {
         task::process::ShutdownOperation::Halt => arch::halt(),
@@ -252,9 +255,14 @@ fn init() -> i32 {
 }
 
 /// 普通系统共享一个网络域给磁盘 PID1，用户全部退出后先结束网络责任再同步文件系统。
+///
+/// # Safety
+/// inventory 须来自初始化 storage 的同一次唯一发现，调用者仍独占其中的网络设备。
+/// 库存与完整永久强序设备映射须覆盖本次用户、网络和文件系统的全部寿命。
 #[cfg(not(feature = "ktest"))]
-fn init_filesystems(
+unsafe fn init_filesystems(
     storage: &storage::Storage,
+    inventory: &drivers::DeviceInventory,
 ) -> Result<task::process::ShutdownOperation, task::ProgramError> {
     let selected = fs::system::boot_devices(boot::info().bootargs())?;
     let root = storage
@@ -290,8 +298,17 @@ fn init_filesystems(
         selected.extra,
         selected.root_mode
     );
-    let net_owner = net::NetStack::try_new_lo()?;
-    let net = Arc::clone(net_owner.stack());
+    let has_network = !inventory.mmio_networks.is_empty()
+        || inventory.pci.devices().iter().any(|device| {
+            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1000 | 0x1041)
+        });
+    let net_owner = if has_network {
+        // SAFETY: 调用者传递同一次库存、网络设备独占和完整永久映射义务。
+        // 原 NetStackOwner 在发表前保活 NIC，用户全部 join/reap 后才同步停止；失败不改用 lo。
+        unsafe { net::NetStack::try_new_nic(inventory) }?
+    } else {
+        net::NetStack::try_new_lo()?
+    };
     let graph = task::process::TaskGraph::try_new(128, task::process::RootRole::System)?;
     let arguments = task::exec::Arguments::from_kernel(
         selected.init,
@@ -307,7 +324,7 @@ fn init_filesystems(
         Arc::clone(&vfs),
         context.clone(),
         task::Credentials::ROOT,
-        Arc::clone(&net),
+        Arc::clone(net_owner.stack()),
     )?;
     runtime.install_console()?;
     let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
@@ -344,7 +361,7 @@ fn init_filesystems(
         }
     }
     drop(net_owner);
-    drop(net);
+    early_println!("NET stopped");
     vfs.sync()?;
     drop(graph);
     drop(context);

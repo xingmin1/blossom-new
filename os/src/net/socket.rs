@@ -882,6 +882,16 @@ impl FileLike for SocketFile {
         Some(&self.watches)
     }
 
+    /// 接口与默认路由控制使用本 OFD 的同一网络域和本次调用者，不读取创建者权限。
+    fn ioctl(
+        &self,
+        request: u32,
+        argument: usize,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        crate::net::control::ioctl(&self.net, request, argument, caller)
+    }
+
     /// 读取共享 OFD 状态，CLOEXEC 始终归描述符槽。
     fn flags(&self) -> u32 {
         SocketFile::flags(self)

@@ -26,7 +26,7 @@ use crate::{
         self,
         dma::{CoherentDma, KernelHal, MappedPages},
     },
-    net::{NetStack, NetStackRef},
+    net::{stats::InterfaceStats, NetStack, NetStackRef},
     sync::{SleepMutex, SpinLock},
     time::{self, Duration},
     timer,
@@ -105,6 +105,7 @@ struct State {
     progress_closed: bool,
     notify_active: usize,
     failure: Option<Error>,
+    statistics: InterfaceStats,
 }
 
 /// Root 强持同一稳定 Arc，IRQ/Work 仅借其值，反向协议指针为 Weak。
@@ -156,6 +157,7 @@ impl VirtioNet {
                 progress_closed: false,
                 notify_active: 0,
                 failure: None,
+                statistics: InterfaceStats::default(),
             }),
             control: SleepMutex::new(()),
             registration: SpinLock::new(None),
@@ -232,6 +234,11 @@ impl VirtioNet {
     /// 返回本设备 action 所属的真实共享 IRQ 源。
     pub fn interrupt(&self) -> IrqNumber {
         self.interrupt
+    }
+
+    /// 在原设备短锁内复制真实收发事件累计值，不访问 DMA 页或改变计数。
+    pub fn statistics(&self) -> InterfaceStats {
+        self.state.lock().statistics
     }
 
     /// 锁内认领固定槽，锁外纯编码，再在共同队列锁内交权、提交与安装唯一 head。
@@ -468,7 +475,12 @@ impl VirtioNet {
         }
         let mut received = 0;
         while received < RX_BUDGET {
-            let Some((index, page, len)) = self.take_rx()? else {
+            let Some((index, page, len)) = self.take_rx().map_err(|error| {
+                let mut state = self.state.lock();
+                state.statistics.rx_errors = state.statistics.rx_errors.wrapping_add(1);
+                error
+            })?
+            else {
                 break;
             };
             let result = self.receive_frame(&page, len);
@@ -544,6 +556,9 @@ impl VirtioNet {
         inner.tx_heads[usize::from(used.head)] = None;
         slot.head = None;
         slot.state = SlotState::Free;
+        let frame_len = slot.frame_len as u64;
+        state.statistics.tx_packets = state.statistics.tx_packets.wrapping_add(1);
+        state.statistics.tx_bytes = state.statistics.tx_bytes.wrapping_add(frame_len);
         #[cfg(feature = "ktest")]
         self.observation
             .tx_completed
@@ -585,20 +600,40 @@ impl VirtioNet {
         Ok(Some((index, slot.page.take().unwrap(), len)))
     }
 
-    /// 仅解释设备实际写入前缀，Root 锁外解析 Ethernet 并一次复制 owned IPv4。
+    /// 收权前缀通过头校验后累计 Ethernet 长度，Root 拒绝仍按原语义重投同页。
     fn receive_frame(&self, page: &MappedPages, len: usize) -> Result<(), Error> {
         // SAFETY: 原页首次清零完整映射，真实 used 已收权，Work 独占此页且无裸写别名；
         // 初始化尾部只满足 Rust 读取条件，协议仅取本轮已写 len，借用止于此调用。
         let bytes = unsafe { page.bytes() };
-        let frame = rx_frame(&bytes[..len], self.info.header_len)?;
+        let frame = match rx_frame(&bytes[..len], self.info.header_len) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let mut state = self.state.lock();
+                state.statistics.rx_errors = state.statistics.rx_errors.wrapping_add(1);
+                state.statistics.rx_dropped = state.statistics.rx_dropped.wrapping_add(1);
+                return Err(error);
+            }
+        };
+        {
+            let mut state = self.state.lock();
+            state.statistics.rx_packets = state.statistics.rx_packets.wrapping_add(1);
+            state.statistics.rx_bytes = state.statistics.rx_bytes.wrapping_add(frame.len() as u64);
+        }
         if let Some(net) = self.net.upgrade() {
             if let Err(error) = net.receive_ethernet(frame) {
+                {
+                    let mut state = self.state.lock();
+                    state.statistics.rx_dropped = state.statistics.rx_dropped.wrapping_add(1);
+                }
                 crate::klog!(
                     crate::klog::Level::Debug,
                     "Ethernet input rejected: {:?}",
                     error
                 );
             }
+        } else {
+            let mut state = self.state.lock();
+            state.statistics.rx_dropped = state.statistics.rx_dropped.wrapping_add(1);
         }
         Ok(())
     }

@@ -796,7 +796,7 @@ pub(crate) mod mounts {
         let devfs = checked(context, MemoryFs::try_new(MemoryFsKind::Devfs, 0o755))?;
         checked(
             context,
-            devfs.initialize_special(b"null", MemorySpecial::Null, 0o20600, 0x103),
+            devfs.initialize_special(&devfs.root(), b"null", MemorySpecial::Null, 0o20600, 0x103),
         )?;
         checked(
             context,

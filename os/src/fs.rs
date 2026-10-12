@@ -70,8 +70,10 @@ pub enum FsError {
     IsDirectory,
     IllegalSeek,
     NotTty,
+    NoDevice,
     NoDeviceAddress,
     NoProcess,
+    NoSuchRoute,
     DeviceIo,
     AddressFamilyNotSupported,
     AddressInUse,
@@ -116,8 +118,10 @@ impl FsError {
             | Self::BadAddress
             | Self::IllegalSeek
             | Self::NotTty
+            | Self::NoDevice
             | Self::NoDeviceAddress
             | Self::NoProcess
+            | Self::NoSuchRoute
             | Self::DeviceIo
             | Self::AddressFamilyNotSupported
             | Self::AddressInUse

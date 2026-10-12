@@ -9,7 +9,7 @@ import shutil
 import stat
 import tempfile
 
-from storage import disk_arguments
+from storage import disk_arguments, network_arguments
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,21 +48,22 @@ def working_disks(sources, directory, resume):
 
 
 def qemu_arguments(args, disks):
-    """普通 stdio 运行传递显式 init 并保留真实 restart，不启动测试协议或后台控制进程。"""
+    """普通 stdio 运行按明确网络模式附 NIC，保留 init 与真实 restart，不启用测试协议。"""
     command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
                "-kernel", str(args.kernel), "-m", args.memory, "-smp", str(args.cpus),
-               "-display", "none", "-monitor", "none", "-serial", "stdio", "-nic", "none"]
+               "-display", "none", "-monitor", "none", "-serial", "stdio"]
     if args.arch == "riscv64":
         command += ["-bios", "default"]
         if args.modern:
             command += ["-global", "virtio-mmio.force-legacy=false"]
     if args.debug:
         command += ["-S", "-gdb", "tcp:127.0.0.1:1234"]
-    return command + disk_arguments(disks, args, set(), init=args.init)
+    return (command + network_arguments(args.arch, args.net, args.net_forward)
+            + disk_arguments(disks, args, set(), init=args.init))
 
 
 def main(argv=None):
-    """核启动输入并锁住工作目录，再复制或恢复盘，最后以 QEMU 替换宿主进程。"""
+    """核启动与网络输入并锁住工作目录，复制或恢复盘后以 QEMU 替换宿主进程。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=("riscv64", "loongarch64"), required=True)
     parser.add_argument("--kernel", type=Path, required=True)
@@ -75,6 +76,8 @@ def main(argv=None):
     parser.add_argument("--root-mode", choices=("ro", "rw"), default="ro", help="guest root mount mode; independent of device read-only")
     parser.add_argument("--extra-root", help="explicit guest extra mount device; absent means no extra mount")
     parser.add_argument("--init", default="/sbin/init", help="explicit guest init path; empty or missing paths fail in the kernel")
+    parser.add_argument("--net", choices=("none", "user"), default="none")
+    parser.add_argument("--net-forward", default="", help="explicit QEMU user-network hostfwd rule")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--modern", action="store_true")
     parser.add_argument("--debug", action="store_true", help="pause with the local GDB endpoint")

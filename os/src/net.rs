@@ -1,10 +1,12 @@
 //! 网络域拥有本地报文、索引和后台执行；唯一服务拥有者承担同步停止。
 
 pub mod address;
+pub(crate) mod control;
 pub mod core;
 pub mod packet;
 pub mod route;
 pub mod socket;
+pub mod stats;
 pub mod table;
 pub mod tcp;
 pub mod udp;
@@ -39,7 +41,11 @@ use crate::fs::FsError;
 use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
 use crate::net::core::TcpCore;
 use crate::net::packet::{return_capture_storage, zeroed_bytes, CaptureStorage, OwnedPacket};
-use crate::net::route::{EthernetConfig, InterfaceId, Route};
+use crate::net::route::{
+    unicast, DefaultRouteRequest, EthernetConfig, InterfaceId, InterfaceSnapshot, Route,
+    RouteSnapshot,
+};
+use crate::net::stats::InterfaceStats;
 use crate::net::table::{BindLease, NetTables, TcpTuple};
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
@@ -159,6 +165,7 @@ struct InterfaceState {
     frame: FrameSlot,
     loopback_rx: Vec<u8>,
     medium: Medium,
+    up: bool,
     binding: Option<Arc<BindLease>>,
     capture: CaptureStorage,
 }
@@ -208,14 +215,61 @@ impl InterfaceState {
             frame,
             loopback_rx,
             medium,
+            up: medium == Medium::Ip,
             binding: None,
             capture,
         })
     }
 
-    /// 控制应答与原分片尾必须先取得空槽，不能覆盖已有帧或工作区。
+    /// 只有管理状态为 up 且原帧和分片器空闲时接纳下一份输出。
     fn dispatch_ready(&self) -> bool {
-        self.frame.available() && !self.iface.fragmentation_pending()
+        self.up && self.frame.available() && !self.iface.fragmentation_pending()
+    }
+
+    /// IPv4 地址始终从库 CIDR 读取，不在接口元数据保存副本。
+    fn ipv4(&self) -> Option<Ipv4Cidr> {
+        self.iface.ip_addrs().iter().find_map(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => Some(*cidr),
+            _ => None,
+        })
+    }
+
+    /// 查询只复制 IPv4 和管理状态，不推进协议。
+    fn snapshot(&self, id: InterfaceId) -> InterfaceSnapshot {
+        let cidr = self.ipv4();
+        InterfaceSnapshot {
+            id,
+            address: cidr.map(|cidr| cidr.address().octets()),
+            prefix_len: cidr.map_or(0, |cidr| cidr.prefix_len()),
+            up: self.up,
+        }
+    }
+
+    /// 只替换 IPv4 项，原 IPv6 地址和库邻居刷新协议保持。
+    fn set_ipv4(&mut self, address: [u8; 4], prefix_len: u8) {
+        self.iface.update_ip_addrs(|addresses| {
+            addresses.retain(|cidr| !matches!(cidr, IpCidr::Ipv4(_)));
+            addresses
+                .push(IpCidr::Ipv4(Ipv4Cidr::new(
+                    Ipv4Address::from(address),
+                    prefix_len,
+                )))
+                .expect("interface IPv4 capacity exhausted");
+        });
+    }
+
+    /// 读取 Routes 中实际默认 IPv4 项，不保存额外默认配置。
+    fn default_gateway(&self) -> Option<[u8; 4]> {
+        self.iface
+            .routes()
+            .iter()
+            .find_map(|route| match route.cidr {
+                IpCidr::Ipv4(cidr) if cidr.prefix_len() == 0 => match route.via_router {
+                    IpAddress::Ipv4(address) => Some(address.octets()),
+                    _ => None,
+                },
+                _ => None,
+            })
     }
 }
 
@@ -252,14 +306,11 @@ impl<'a> IngressCollector<'a> {
         }
     }
 
-    /// TCP 入站错误保持；UDP backlog 满只丢未接纳消息，不向发送者提供可靠回压。
+    /// 入队失败保留真实丢弃错误，RX 调用者据实际输入拥有记录 drop。
     fn deliver(self) -> Result<(), FsError> {
         match self.event {
             Some(IngressEvent::Tcp(endpoint, packet)) => endpoint.enqueue(packet),
-            Some(IngressEvent::Udp(endpoint, packet)) => match endpoint.enqueue(packet) {
-                Err(FsError::WouldBlock) => Ok(()),
-                result => result,
-            },
+            Some(IngressEvent::Udp(endpoint, packet)) => endpoint.enqueue(packet),
             None => Ok(()),
         }
     }
@@ -486,6 +537,7 @@ enum TestPacketControl {
 pub struct NetStack {
     tables: NetTables,
     loopback: SleepMutex<Option<InterfaceState>>,
+    loopback_stats: SpinLock<InterfaceStats>,
     admission: SleepMutex<()>,
     egress: SpinLock<Egress>,
     retired: SpinLock<Vec<RetiredEndpoint>>,
@@ -554,6 +606,7 @@ impl NetStack {
                 HardwareAddress::Ip,
                 time::now().as_nanos(),
             )?)),
+            loopback_stats: SpinLock::new(InterfaceStats::default()),
             admission: SleepMutex::new(()),
             egress: SpinLock::new(Egress {
                 open: true,
@@ -642,6 +695,22 @@ impl NetStack {
         })
     }
 
+    /// 交付另外核管理状态，本机地址查询本身仍如实保留 down 接口地址。
+    fn local_destination_up(&self, address: IpAddress) -> bool {
+        for id in [InterfaceId::Loopback, InterfaceId::Ethernet] {
+            let Some(interface) = self.interface(id) else {
+                continue;
+            };
+            let interface = interface.lock();
+            if let Some(state) = interface.as_ref() {
+                if state.iface.is_local(address) {
+                    return state.up;
+                }
+            }
+        }
+        false
+    }
+
     /// 本域本机目的统一走 lo，其它目的由实际 eth 地址和 Routes 选源。
     pub fn resolve_route(
         &self,
@@ -664,7 +733,11 @@ impl NetStack {
         };
         let loopback = self.loopback.lock();
         let state = loopback.as_ref().ok_or(FsError::NotConnected)?;
+        let loopback_up = state.up;
         if state.iface.is_local(destination) {
+            if !loopback_up {
+                return Err(FsError::NetworkUnreachable);
+            }
             let (source, mtu) = state
                 .iface
                 .resolve_route(destination, bound_source)
@@ -682,6 +755,9 @@ impl NetStack {
             .ok_or(FsError::NetworkUnreachable)?
             .lock();
         let state = ethernet.as_ref().ok_or(FsError::NotConnected)?;
+        if !state.up {
+            return Err(FsError::NetworkUnreachable);
+        }
         let local_destination = state.iface.is_local(destination);
         if !local_destination
             && !bound_source.is_unspecified()
@@ -694,6 +770,9 @@ impl NetStack {
             .resolve_route(destination, bound_source)
             .map_err(dispatch_error)?;
         if local_destination {
+            if !loopback_up {
+                return Err(FsError::NetworkUnreachable);
+            }
             Ok(Route {
                 interface: InterfaceId::Loopback,
                 source,
@@ -716,35 +795,21 @@ impl NetStack {
     /// 返回当前 eth0 完整配置副本，不主动推进设备或协议。
     pub fn ethernet_config(&self) -> Option<EthernetConfig> {
         let ethernet = self.ethernet.get()?.lock();
-        let iface = &ethernet.as_ref()?.iface;
-        let address = iface.ip_addrs().iter().find_map(|cidr| match cidr {
-            IpCidr::Ipv4(cidr) => Some(*cidr),
-            _ => None,
-        })?;
-        let gateway = iface.routes().iter().find_map(|route| match route.cidr {
-            IpCidr::Ipv4(cidr) if cidr.prefix_len() == 0 => match route.via_router {
-                IpAddress::Ipv4(address) => Some(address.octets()),
-                _ => None,
-            },
-            _ => None,
-        });
+        let state = ethernet.as_ref()?;
+        let cidr = state.ipv4()?;
         Some(EthernetConfig {
-            address: address.address().octets(),
-            prefix_len: address.prefix_len(),
-            gateway,
+            address: cidr.address().octets(),
+            prefix_len: cidr.prefix_len(),
+            gateway: state.default_gateway(),
         })
     }
 
-    /// 配置只更新库内 IPv4 地址和默认路由，已有 IPv6 地址保持。
+    /// fixture 提交库 IPv4、默认项和 up 状态，已有 IPv6 与原 TCP 未 ACK 数据保持。
     pub fn configure_ethernet(&self, config: EthernetConfig) -> Result<(), FsError> {
         {
             let _admission = self.admission()?;
             config.validate()?;
-            let mut ethernet = self
-                .ethernet
-                .get()
-                .ok_or(FsError::NetworkUnreachable)?
-                .lock();
+            let mut ethernet = self.ethernet.get().ok_or(FsError::NoDevice)?.lock();
             let state = ethernet.as_mut().ok_or(FsError::NotConnected)?;
             state.iface.routes_mut().remove_default_ipv4_route();
             if let Some(gateway) = config.gateway {
@@ -754,18 +819,185 @@ impl NetStack {
                     .add_default_ipv4_route(Ipv4Address::from(gateway))
                     .map_err(|_| FsError::NoMemory)?;
             }
-            state.iface.update_ip_addrs(|addresses| {
-                addresses.retain(|cidr| !matches!(cidr, IpCidr::Ipv4(_)));
-                addresses
-                    .push(IpCidr::Ipv4(Ipv4Cidr::new(
-                        Ipv4Address::from(config.address),
-                        config.prefix_len,
-                    )))
-                    .expect("Ethernet address capacity exhausted");
-            });
+            state.set_ipv4(config.address, config.prefix_len);
+            state.up = true;
+        }
+        self.configuration_changed();
+        Ok(())
+    }
+
+    /// 接口查询只在库接口锁内复制小值，未存在的 eth0 返回真实设备错误。
+    pub fn interface_snapshot(&self, id: InterfaceId) -> Result<InterfaceSnapshot, FsError> {
+        let interface = self.interface(id).ok_or(FsError::NoDevice)?.lock();
+        let state = interface.as_ref().ok_or(FsError::NotConnected)?;
+        Ok(state.snapshot(id))
+    }
+
+    /// 最多两个真实接口的副本，不让格式化者持有库状态。
+    pub fn interface_snapshots(&self) -> [Option<InterfaceSnapshot>; 2] {
+        [
+            self.interface_snapshot(InterfaceId::Loopback).ok(),
+            self.interface_snapshot(InterfaceId::Ethernet).ok(),
+        ]
+    }
+
+    /// 直连从库 CIDR 生成，默认从同一 Routes 生成，最多三条 IPv4 路由。
+    pub fn route_snapshots(&self) -> [Option<RouteSnapshot>; 3] {
+        let mut snapshots = [None; 3];
+        for (index, id) in [InterfaceId::Loopback, InterfaceId::Ethernet]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let Some(interface) = self.interface(id) else {
+                continue;
+            };
+            let interface = interface.lock();
+            let Some(state) = interface.as_ref() else {
+                continue;
+            };
+            if let Some(cidr) = state.ipv4() {
+                snapshots[index] = Some(RouteSnapshot {
+                    interface: id,
+                    destination: ipv4_network(cidr.address().octets(), cidr.prefix_len()),
+                    prefix_len: cidr.prefix_len(),
+                    gateway: None,
+                    up: state.up,
+                });
+            }
+            if id == InterfaceId::Ethernet {
+                snapshots[2] = state.default_gateway().map(|gateway| RouteSnapshot {
+                    interface: id,
+                    destination: [0; 4],
+                    prefix_len: 0,
+                    gateway: Some(gateway),
+                    up: state.up,
+                });
+            }
+        }
+        snapshots
+    }
+
+    /// IPv4 重配保留原 IPv6；eth0 首次赋址才采用 classful 前缀。
+    pub fn set_interface_address(&self, id: InterfaceId, address: [u8; 4]) -> Result<(), FsError> {
+        {
+            let _admission = self.admission()?;
+            let mut interface = self.interface(id).ok_or(FsError::NoDevice)?.lock();
+            let state = interface.as_mut().ok_or(FsError::NotConnected)?;
+            let prefix_len = match id {
+                InterfaceId::Loopback => {
+                    if address != Ipv4Address::LOCALHOST.octets() {
+                        return Err(FsError::InvalidOperation);
+                    }
+                    8
+                }
+                InterfaceId::Ethernet => {
+                    if !unicast(address) {
+                        return Err(FsError::InvalidOperation);
+                    }
+                    state
+                        .ipv4()
+                        .map_or_else(|| classful_prefix(address), |cidr| cidr.prefix_len())
+                }
+            };
+            state.set_ipv4(address, prefix_len);
         }
         self.kick_egress();
         Ok(())
+    }
+
+    /// mask 仅改变已经配置的库 IPv4 CIDR，未赋址不能保存隐式第二配置。
+    pub fn set_interface_netmask(&self, id: InterfaceId, prefix_len: u8) -> Result<(), FsError> {
+        {
+            let _admission = self.admission()?;
+            let mut interface = self.interface(id).ok_or(FsError::NoDevice)?.lock();
+            let state = interface.as_mut().ok_or(FsError::NotConnected)?;
+            if 32 < prefix_len || (id == InterfaceId::Loopback && prefix_len != 8) {
+                return Err(FsError::InvalidOperation);
+            }
+            let cidr = state.ipv4().ok_or(FsError::AddressNotAvailable)?;
+            state.set_ipv4(cidr.address().octets(), prefix_len);
+        }
+        self.kick_egress();
+        Ok(())
+    }
+
+    /// down 保留原软件包和分片责任；恢复后同一 Work 继续，不 reset 设备或 TCP。
+    pub fn set_interface_up(&self, id: InterfaceId, up: bool) -> Result<(), FsError> {
+        {
+            let _admission = self.admission()?;
+            let mut interface = self.interface(id).ok_or(FsError::NoDevice)?.lock();
+            let state = interface.as_mut().ok_or(FsError::NotConnected)?;
+            state.up = up;
+        }
+        if up {
+            self.configuration_changed();
+        } else {
+            self.kick_egress();
+        }
+        Ok(())
+    }
+
+    /// 默认路由只修改实际 eth0 的库 Routes，重复和删除缺项保留各自错误。
+    pub fn change_default_route(
+        &self,
+        request: DefaultRouteRequest,
+        add: bool,
+    ) -> Result<(), FsError> {
+        {
+            let _admission = self.admission()?;
+            let id = request.interface.unwrap_or(InterfaceId::Ethernet);
+            let mut interface = self.interface(id).ok_or(FsError::NoDevice)?.lock();
+            let state = interface.as_mut().ok_or(FsError::NotConnected)?;
+            if id != InterfaceId::Ethernet {
+                return Err(FsError::NetworkUnreachable);
+            }
+            let existing = state.default_gateway();
+            if add {
+                if !state.up {
+                    return Err(FsError::NetworkUnreachable);
+                }
+                let cidr = state.ipv4().ok_or(FsError::NetworkUnreachable)?;
+                let address = cidr.address().octets();
+                let gateway = request.gateway;
+                let network = ipv4_network(address, cidr.prefix_len());
+                let mask = ipv4_mask(cidr.prefix_len());
+                let host = u32::from_be_bytes(gateway) & !mask;
+                if !unicast(gateway) || gateway == address {
+                    return Err(FsError::InvalidOperation);
+                }
+                if !cidr.contains_addr(&Ipv4Address::from(gateway)) {
+                    return Err(FsError::NetworkUnreachable);
+                }
+                if cidr.prefix_len() < 31 && (gateway == network || host == !mask) {
+                    return Err(FsError::InvalidOperation);
+                }
+                if existing.is_some() {
+                    return Err(FsError::Exists);
+                }
+                state
+                    .iface
+                    .routes_mut()
+                    .add_default_ipv4_route(Ipv4Address::from(gateway))
+                    .map_err(|_| FsError::NoMemory)?;
+            } else {
+                if existing != Some(request.gateway) {
+                    return Err(FsError::NoSuchRoute);
+                }
+                state.iface.routes_mut().remove_default_ipv4_route();
+            }
+        }
+        self.kick_egress();
+        Ok(())
+    }
+
+    /// lo 读取真实 IP 交付计数，eth0 读取原 NIC 完成与 RX 收权计数。
+    pub fn statistics(&self, id: InterfaceId) -> Result<InterfaceStats, FsError> {
+        self.interface_snapshot(id)?;
+        match id {
+            InterfaceId::Loopback => Ok(*self.loopback_stats.lock()),
+            InterfaceId::Ethernet => Ok(self.nic.get().ok_or(FsError::NoDevice)?.statistics()),
+        }
     }
 
     /// 所有连接和域 Work 共用这份执行域及原 per-CPU pools。
@@ -867,7 +1099,7 @@ impl NetStack {
         if LOOPBACK_MTU < packet.len() {
             return Err((FsError::MessageTooLarge, packet));
         }
-        let route = match self.resolve_route(packet.destination(), packet.source()) {
+        let route = match self.resolve_output(&packet) {
             Ok(route) => route,
             Err(error) => {
                 let error = if self.is_stopping() {
@@ -895,6 +1127,77 @@ impl NetStack {
         Ok(())
     }
 
+    /// 已发表 TCP 的管理暂停沿原容量等待，不让普通 down 错误终止未 ACK 数据。
+    fn resolve_output(&self, packet: &OwnedPacket) -> Result<Route, FsError> {
+        let result = self.resolve_route(packet.destination(), packet.source());
+        if !matches!(result, Err(FsError::NetworkUnreachable)) {
+            return result;
+        }
+        let Ok((local, peer)) = packet.tcp_endpoints() else {
+            return result;
+        };
+        let Some(endpoint) = self.tables.lookup_tcp(TcpTuple { local, peer }) else {
+            return result;
+        };
+        // 管理状态重查和登记与 up 提交串行，唤醒不能先于暂停登记而丢失。
+        let _admission = self.admission()?;
+        let result = self.resolve_route(packet.destination(), packet.source());
+        if !matches!(result, Err(FsError::NetworkUnreachable))
+            || !self.output_paused(packet.destination(), packet.source())
+        {
+            return result;
+        }
+        let mut egress = self.egress.lock();
+        if !egress.open {
+            return Err(FsError::NotConnected);
+        }
+        if !egress.waiting.contains(&endpoint.id()) {
+            assert!(egress.waiting.len() < ENDPOINT_CAPACITY);
+            egress.waiting.push(endpoint.id());
+        }
+        Err(FsError::WouldBlock)
+    }
+
+    /// 管理暂停要求库中仍存在实际路由，删除默认或错误源地址不能成为容量等待。
+    fn output_paused(&self, destination: IpAddress, source: IpAddress) -> bool {
+        let loopback = self.loopback.lock();
+        let Some(state) = loopback.as_ref() else {
+            return false;
+        };
+        let loopback_up = state.up;
+        if state.iface.is_local(destination) {
+            return !loopback_up && state.iface.resolve_route(destination, source).is_ok();
+        }
+        drop(loopback);
+        let Some(ethernet) = self.ethernet.get() else {
+            return false;
+        };
+        let ethernet = ethernet.lock();
+        ethernet.as_ref().is_some_and(|state| {
+            let local = state.iface.is_local(destination);
+            let valid_source = local || source.is_unspecified() || state.iface.is_local(source);
+            valid_source
+                && state.iface.resolve_route(destination, source).is_ok()
+                && (!state.up || (local && !loopback_up))
+        })
+    }
+
+    /// 配置解锁后移出原等待身份，通知同一协议 Work 并推进原接口 Work。
+    fn configuration_changed(&self) {
+        let mut waiting = [0u64; ENDPOINT_CAPACITY];
+        let count = {
+            let mut egress = self.egress.lock();
+            let count = egress.waiting.len();
+            waiting[..count].copy_from_slice(&egress.waiting);
+            egress.waiting.clear();
+            count
+        };
+        for id in &waiting[..count] {
+            self.notify_egress(*id);
+        }
+        self.kick_egress();
+    }
+
     /// 真实 TX 完成、邻居输入或库期限只安排根 Work，不主动轮询连接。
     pub(crate) fn kick_egress(&self) {
         if !self.is_stopping() {
@@ -912,11 +1215,14 @@ impl NetStack {
         self.try_emit(packet).map_err(|(error, _packet)| error)
     }
 
-    /// 容量和满队列登记使用同一短锁，关门返回真实错误，不访问协议或持续源。
+    /// 满额度和管理暂停共用原等待身份，恢复只由实际容量或配置通知触发。
     pub(crate) fn egress_ready(&self, id: u64) -> Result<bool, FsError> {
         let mut egress = self.egress.lock();
         if !egress.open {
             return Err(FsError::NotConnected);
+        }
+        if egress.waiting.contains(&id) {
+            return Ok(false);
         }
         if egress.packets.len() < LOOPBACK_CAPACITY {
             return Ok(true);
@@ -1135,7 +1441,13 @@ impl NetStack {
         Ok(())
     }
 
-    /// typed repr 借用止于短锁前，锁内只移动原包或记录实际交付事实。
+    /// 只在原软件包或帧确实丢弃后累计，暂存、持有和容量拒绝不计丢失。
+    fn record_loopback_tx_drop(&self) {
+        let mut stats = self.loopback_stats.lock();
+        stats.tx_dropped = stats.tx_dropped.wrapping_add(1);
+    }
+
+    /// typed repr 借用止于短锁前；真实丢弃锁外计数，held 包仍保留拥有。
     #[cfg(feature = "ktest")]
     fn controlled_loopback_packet(&self, packet: OwnedPacket) -> Option<OwnedPacket> {
         if packet.protocol() != IpProtocol::Tcp {
@@ -1164,6 +1476,7 @@ impl NetStack {
                 }
                 drop(egress);
                 drop(packet);
+                self.record_loopback_tx_drop();
                 return None;
             }
             Some(TestPacketControl::DropHandshakeAck {
@@ -1180,6 +1493,7 @@ impl NetStack {
                 *dropped = true;
                 drop(egress);
                 drop(packet);
+                self.record_loopback_tx_drop();
                 return None;
             }
             Some(TestPacketControl::DropData {
@@ -1197,6 +1511,7 @@ impl NetStack {
                     observation.first_ns = now;
                     drop(egress);
                     drop(packet);
+                    self.record_loopback_tx_drop();
                     return None;
                 }
                 if observation.sequence == Some(sequence) {
@@ -1260,6 +1575,9 @@ impl NetStack {
             let state = interface.as_ref().ok_or(FsError::NotConnected)?;
             if self.is_stopping() {
                 return Err(FsError::NotConnected);
+            }
+            if !state.up {
+                return Err(FsError::NetworkUnreachable);
             }
             if id == InterfaceId::Ethernet && !state.dispatch_ready() {
                 return Err(FsError::WouldBlock);
@@ -1326,7 +1644,7 @@ impl NetStack {
             let Some(state) = loopback.as_ref() else {
                 return Ok(false);
             };
-            if state.frame.len == 0 {
+            if !state.up || state.frame.len == 0 {
                 return Ok(false);
             }
             state
@@ -1334,13 +1652,26 @@ impl NetStack {
                 .destination
                 .expect("loopback output has no typed IP destination")
         };
+        if !self.local_destination_up(destination) {
+            let binding = {
+                let mut loopback = self.loopback.lock();
+                let state = loopback.as_mut().ok_or(FsError::NotConnected)?;
+                state.frame.len = 0;
+                state.frame.destination = None;
+                state.binding.take()
+            };
+            drop(binding);
+            self.record_loopback_tx_drop();
+            self.finish_interface_egress(InterfaceId::Loopback);
+            return Ok(true);
+        }
         let (capture, storage) = self.take_ingress_storage(InterfaceId::Loopback)?;
         let mut collector = IngressCollector::new(&self.tables, capture, storage);
         collector.local_destination = self.is_local(destination).then_some(destination);
         let (received, binding) = {
             let mut loopback = self.loopback.lock();
             match loopback.as_mut() {
-                Some(state) if !self.is_stopping() && 0 < state.frame.len => {
+                Some(state) if state.up && !self.is_stopping() && 0 < state.frame.len => {
                     let len = state.frame.len;
                     ::core::mem::swap(&mut state.frame.bytes, &mut state.loopback_rx);
                     state.frame.len = 0;
@@ -1353,6 +1684,11 @@ impl NetStack {
                     state
                         .iface
                         .poll_ingress_single(interface_now(), &mut device, &mut collector);
+                    let mut stats = self.loopback_stats.lock();
+                    stats.tx_bytes = stats.tx_bytes.wrapping_add(len as u64);
+                    stats.tx_packets = stats.tx_packets.wrapping_add(1);
+                    stats.rx_bytes = stats.rx_bytes.wrapping_add(len as u64);
+                    stats.rx_packets = stats.rx_packets.wrapping_add(1);
                     if 0 < state.frame.len {
                         state.frame.destination = state.iface.last_transmit_destination();
                     }
@@ -1367,7 +1703,14 @@ impl NetStack {
         }
         drop(binding);
         self.finish_interface_egress(InterfaceId::Loopback);
-        collector.deliver()?;
+        let udp = matches!(collector.event.as_ref(), Some(IngressEvent::Udp(_, _)));
+        if let Err(error) = collector.deliver() {
+            let mut stats = self.loopback_stats.lock();
+            stats.rx_dropped = stats.rx_dropped.wrapping_add(1);
+            if !udp || error != FsError::WouldBlock {
+                return Err(error);
+            }
+        }
         Ok(true)
     }
 
@@ -1381,7 +1724,7 @@ impl NetStack {
             let Some(state) = ethernet.as_mut() else {
                 return Ok(None);
             };
-            if state.frame.len == 0 || state.frame.in_flight || self.is_stopping() {
+            if !state.up || state.frame.len == 0 || state.frame.in_flight || self.is_stopping() {
                 return Ok(None);
             }
             state.frame.in_flight = true;
@@ -1427,7 +1770,11 @@ impl NetStack {
         let Some(state) = interface.as_mut() else {
             return false;
         };
-        if self.is_stopping() || !state.frame.available() || !state.iface.fragmentation_pending() {
+        if !state.up
+            || self.is_stopping()
+            || !state.frame.available()
+            || !state.iface.fragmentation_pending()
+        {
             return false;
         }
         let mut device = FrameDevice {
@@ -1555,6 +1902,9 @@ impl NetStack {
                 Err(error) => {
                     self.finish_egress(index);
                     drop(packet);
+                    if id == InterfaceId::Loopback {
+                        self.record_loopback_tx_drop();
+                    }
                     crate::klog!(crate::klog::Level::Debug, "IP dispatch failed: {:?}", error);
                 }
             }
@@ -1578,16 +1928,15 @@ impl NetStack {
                 .loopback
                 .lock()
                 .as_ref()
-                .is_some_and(|state| 0 < state.frame.len)
+                .is_some_and(|state| state.up && 0 < state.frame.len)
         {
             return true;
         }
         if !tx_full
             && self.ethernet.get().is_some_and(|ethernet| {
-                ethernet
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|state| 0 < state.frame.len || state.iface.fragmentation_pending())
+                ethernet.lock().as_ref().is_some_and(|state| {
+                    state.up && (0 < state.frame.len || state.iface.fragmentation_pending())
+                })
             })
         {
             return true;
@@ -1631,6 +1980,9 @@ impl NetStack {
                 continue;
             };
             deadline = earlier_deadline(deadline, state.iface.maintenance_deadline());
+            if !state.up {
+                continue;
+            }
             for (interface, destination) in destinations.iter().flatten() {
                 if *interface == id {
                     deadline =
@@ -1679,7 +2031,9 @@ impl NetStack {
                 .lock();
             match ethernet.as_mut() {
                 Some(state) if !self.is_stopping() => {
-                    if state.dispatch_ready() {
+                    if !state.up {
+                        Err(FsError::NetworkUnreachable)
+                    } else if state.dispatch_ready() {
                         let mut device = FrameDevice {
                             frame: &mut state.frame,
                             input: Some(frame),
@@ -1838,6 +2192,31 @@ fn earlier_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Ins
         (Some(left), Some(right)) => Some(left.min(right)),
         (left, right) => left.or(right),
     }
+}
+
+/// 正常静态 IPv4 初次赋址采用 A/B/C 类前缀；调用者已核单播边界。
+fn classful_prefix(address: [u8; 4]) -> u8 {
+    if address[0] < 128 {
+        8
+    } else if address[0] < 192 {
+        16
+    } else {
+        24
+    }
+}
+
+/// 连续 IPv4 mask 的零前缀单独处理，避免移位宽度等于整数位数。
+fn ipv4_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    }
+}
+
+/// proc 直连目的由库 CIDR 的地址与前缀计算网络地址。
+fn ipv4_network(address: [u8; 4], prefix_len: u8) -> [u8; 4] {
+    (u32::from_be_bytes(address) & ipv4_mask(prefix_len)).to_be_bytes()
 }
 
 /// 原文件错误直接表达实际路由、容量和合法报文边界。

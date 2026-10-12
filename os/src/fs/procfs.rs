@@ -12,6 +12,7 @@ use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
     ReadBuffer, SeekFrom, Vfs, WriteBuffer,
 };
+use crate::net::NetStack;
 use crate::sync::SleepMutex;
 use crate::{accounting, cpu, mm, time};
 
@@ -71,17 +72,27 @@ impl Write for SnapshotText {
     }
 }
 
-/// 建立受保护 procfs 命名空间，固定项保存角色而非预生成文本。
+/// 建立受保护的 procfs 权威目录，固定节点只保存来源角色，不提前生成快照。
 pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     let fs = MemoryFs::try_new(MemoryFsKind::Procfs, root_mode)?;
-    fs.initialize_special(b"mounts", MemorySpecial::Mounts, 0o444, 0)?;
-    fs.initialize_special(b"meminfo", MemorySpecial::Meminfo, 0o444, 0)?;
-    fs.initialize_special(b"uptime", MemorySpecial::Uptime, 0o444, 0)?;
+    let root = fs.root();
+    fs.initialize_special(&root, b"mounts", MemorySpecial::Mounts, 0o444, 0)?;
+    fs.initialize_special(&root, b"meminfo", MemorySpecial::Meminfo, 0o444, 0)?;
+    fs.initialize_special(&root, b"uptime", MemorySpecial::Uptime, 0o444, 0)?;
+    let net = fs.initialize_directory(&root, b"net", 0o555)?;
+    fs.initialize_special(&net, b"dev", MemorySpecial::NetDev, 0o444, 0)?;
+    fs.initialize_special(&net, b"route", MemorySpecial::NetRoute, 0o444, 0)?;
     Ok(fs)
 }
 
-/// 在普通可睡眠上下文生成本次快照；借用 VFS 只持续到文本准备完成。
-pub fn open(path: Path, flags: u32, special: MemorySpecial, vfs: &Vfs) -> Result<FileRef, FsError> {
+/// 可睡眠上下文生成独立快照；网络来源取本次用户域，VFS 与网络引用均不移交 OFD。
+pub fn open(
+    path: Path,
+    flags: u32,
+    special: MemorySpecial,
+    vfs: &Vfs,
+    caller: FileIoContext<'_>,
+) -> Result<FileRef, FsError> {
     if flags & 0o3 != 0 || flags & 0o1000 != 0 {
         return Err(FsError::ReadOnly);
     }
@@ -89,6 +100,17 @@ pub fn open(path: Path, flags: u32, special: MemorySpecial, vfs: &Vfs) -> Result
         MemorySpecial::Mounts => vfs.mounts_text()?,
         MemorySpecial::Meminfo => meminfo()?,
         MemorySpecial::Uptime => uptime()?,
+        MemorySpecial::NetDev | MemorySpecial::NetRoute => {
+            let runtime = match caller {
+                FileIoContext::User(thread) => thread.runtime().ok_or(FsError::InvalidOperation)?,
+                FileIoContext::Kernel => return Err(FsError::InvalidOperation),
+            };
+            if special == MemorySpecial::NetDev {
+                net_dev(&runtime.net)?
+            } else {
+                net_route(&runtime.net)?
+            }
+        }
         _ => return Err(FsError::InvalidOperation),
     };
     if SNAPSHOT_LIMIT < bytes.len() {
@@ -101,6 +123,76 @@ pub fn open(path: Path, flags: u32, special: MemorySpecial, vfs: &Vfs) -> Result
         flags: AtomicU32::new(flags),
     })
     .map_err(|_| FsError::NoMemory)?)
+}
+
+/// 先复制接口和 Root 提供的计数，再锁外格式化；未监测的 FIFO、frame、压缩、组播、碰撞及硬件 TX 错误为零。
+fn net_dev(net: &NetStack) -> Result<Vec<u8>, FsError> {
+    let interfaces = net.interface_snapshots();
+    let mut snapshots = [None; 2];
+    for (slot, interface) in snapshots.iter_mut().zip(interfaces.iter()) {
+        if let Some(interface) = interface {
+            *slot = Some((interface.id, net.statistics(interface.id)?));
+        }
+    }
+    let mut text = SnapshotText::try_new()?;
+    let result = (|| {
+        text.write_str(concat!(
+            "Inter-|   Receive                            ",
+            "                    |  Transmit\n",
+            " face |bytes    packets errs drop fifo frame ",
+            "compressed multicast|bytes    packets errs ",
+            "drop fifo colls carrier compressed\n",
+        ))?;
+        for (interface, stats) in snapshots.iter().flatten() {
+            writeln!(
+                text,
+                "{:>6}: {:7} {:7} {:4} {:4} {:4} {:5} {:10} {:9} {:8} {:7} {:4} {:4} {:4} {:5} {:7} {:10}",
+                interface.name(),
+                stats.rx_bytes,
+                stats.rx_packets,
+                stats.rx_errors,
+                stats.rx_dropped,
+                0, 0, 0, 0,
+                stats.tx_bytes,
+                stats.tx_packets,
+                stats.tx_errors,
+                stats.tx_dropped,
+                0, 0, 0, 0,
+            )?;
+        }
+        Ok(())
+    })();
+    text.finish(result)
+}
+
+/// 路由来自当次库 CIDR 与默认项，地址和掩码按目标 little-endian 十六进制输出，未监测列为零。
+fn net_route(net: &NetStack) -> Result<Vec<u8>, FsError> {
+    let routes = net.route_snapshots();
+    let mut text = SnapshotText::try_new()?;
+    let result = (|| {
+        text.write_str(
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
+        )?;
+        for route in routes.iter().flatten() {
+            let mask = if route.prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - route.prefix_len)
+            };
+            let flags = u16::from(route.up) | if route.gateway.is_some() { 2 } else { 0 };
+            writeln!(
+                text,
+                "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t0\t{:08X}\t0\t0\t0",
+                route.interface.name(),
+                u32::from_le_bytes(route.destination),
+                u32::from_le_bytes(route.gateway.unwrap_or([0; 4])),
+                flags,
+                u32::from_le_bytes(mask.to_be_bytes()),
+            )?;
+        }
+        Ok(())
+    })();
+    text.finish(result)
 }
 
 /// 只输出现有账务能给出的可管理 RAM、空页与 slab backing，不估计可用量。

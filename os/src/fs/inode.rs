@@ -3981,16 +3981,17 @@ impl InodeRef {
         Ok(child.map(|child| Self::from_memory(child, fs.clone())))
     }
 
-    /// 可见特殊节点初始化沿共同目录写锁和真实权威项交换，允许只读后端的可信构造。
+    /// 未发表内存节点沿共同目录写锁安装，目录增加父链接，特殊叶保持原链接数。
     pub(crate) fn initialize_memory_child(
         &self,
         name: &[u8],
         child: &InodeRef,
     ) -> Result<(), FsError> {
         let guard = self.directory_write()?;
+        let kind = child.metadata_snapshot()?.kind;
         let prepared = guard.prepare_memory_edit(
-            MemoryEdit::Insert(name, child.number(), child.metadata_snapshot()?.kind),
-            0,
+            MemoryEdit::Insert(name, child.number(), kind),
+            i32::from(kind == InodeKind::Directory),
             time::now().as_nanos(),
             true,
         )?;

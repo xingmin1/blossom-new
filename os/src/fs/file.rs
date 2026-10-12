@@ -512,7 +512,7 @@ pub fn open_path(vfs: &Vfs, path: Path) -> Result<FileRef, FsError> {
     open_path_with_flags(vfs, path, 0, FileIoContext::Kernel)
 }
 
-/// 按已确定的真实对象建立完整 OFD；创建候选由 VFS 在名字发表前交入。
+/// 按已确定的真实对象建立完整 OFD；设备与动态信息取得本次调用者，创建候选由 VFS 交入。
 /// O_TRUNC 在 OFD 存储准备后执行；只读截断的临时写拥有不转入打开实例。
 pub fn open_path_with_flags(
     vfs: &Vfs,
@@ -545,9 +545,11 @@ pub fn open_path_with_flags(
             MemorySpecial::TtySerial | MemorySpecial::Console | MemorySpecial::ControllingTty => {
                 crate::fs::tty::open(path, flags, caller, special)
             }
-            MemorySpecial::Mounts | MemorySpecial::Meminfo | MemorySpecial::Uptime => {
-                procfs::open(path, flags, special, vfs)
-            }
+            MemorySpecial::Mounts
+            | MemorySpecial::Meminfo
+            | MemorySpecial::Uptime
+            | MemorySpecial::NetDev
+            | MemorySpecial::NetRoute => procfs::open(path, flags, special, vfs, caller),
         };
     }
     match kind {

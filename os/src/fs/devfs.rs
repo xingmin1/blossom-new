@@ -23,14 +23,15 @@ pub struct ZeroFile {
     flags: AtomicU32,
 }
 
-/// 建立独立 devfs 实例并发表实际空设备与唯一UART别名。
+/// 建立独立未发表的 devfs 实例，在真实根下安装空设备与唯一 UART 别名。
 pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     let fs = MemoryFs::try_new(MemoryFsKind::Devfs, root_mode)?;
-    fs.initialize_special(b"null", MemorySpecial::Null, 0o666, 0x103)?;
-    fs.initialize_special(b"zero", MemorySpecial::Zero, 0o666, 0x105)?;
-    fs.initialize_special(b"ttyS0", MemorySpecial::TtySerial, 0o666, 0x440)?;
-    fs.initialize_special(b"console", MemorySpecial::Console, 0o666, 0x501)?;
-    fs.initialize_special(b"tty", MemorySpecial::ControllingTty, 0o666, 0x500)?;
+    let root = fs.root();
+    fs.initialize_special(&root, b"null", MemorySpecial::Null, 0o666, 0x103)?;
+    fs.initialize_special(&root, b"zero", MemorySpecial::Zero, 0o666, 0x105)?;
+    fs.initialize_special(&root, b"ttyS0", MemorySpecial::TtySerial, 0o666, 0x440)?;
+    fs.initialize_special(&root, b"console", MemorySpecial::Console, 0o666, 0x501)?;
+    fs.initialize_special(&root, b"tty", MemorySpecial::ControllingTty, 0o666, 0x500)?;
     Ok(fs)
 }
 

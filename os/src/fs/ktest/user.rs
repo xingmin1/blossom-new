@@ -7,7 +7,7 @@ use crate::fs::ktest::user::network::NetworkMode;
 use crate::fs::ktest::*;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::{Mm, VmError};
-use crate::net::route::EthernetConfig;
+use crate::net::route::{DefaultRouteRequest, EthernetConfig, InterfaceSnapshot, RouteSnapshot};
 use crate::net::{NetStack, NetStackOwner, NetStackRef};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::futex::{self, FutexSnapshot};
@@ -126,6 +126,8 @@ impl Fixture for UserProgramSuite {
 struct UserOwner {
     path: PathOwner,
     net: NetStackRef,
+    /// 控制例保存修改前的小值，用户异常退出后仍由原 fixture 恢复共享域。
+    network_control: Option<([Option<InterfaceSnapshot>; 2], [Option<RouteSnapshot>; 3])>,
     metadata_before: MetadataStats,
     graph: Option<Arc<TaskGraph>>,
     running: Option<RunningProgram>,
@@ -1298,6 +1300,7 @@ impl Fixture<UserSuite> for UserOwner {
         Ok(Self {
             path: <PathOwner as Fixture<DeviceInventory>>::set_up(context, &suite.inventory)?,
             net: suite.net.clone(),
+            network_control: None,
             metadata_before,
             graph: None,
             running: None,
@@ -1328,6 +1331,7 @@ impl Fixture<UserSuite> for UserOwner {
             self.reap_children(context, true)?;
             self.lifecycle_child_left_stack()?;
         }
+        self.restore_network_control(context)?;
         if self.tty_io.active() {
             return Err(TestError("TTY UART stage is still active at quiesce"));
         }
@@ -1341,6 +1345,7 @@ impl Fixture<UserSuite> for UserOwner {
         assert!(
             self.running.is_none()
                 && self.graph.is_none()
+                && self.network_control.is_none()
                 && self.reserved.is_none()
                 && self.observer.is_none()
                 && self.lifecycle_child.is_none()
@@ -1406,6 +1411,29 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
 #[ktest::suite(fixture = UserOwner, suite_resources = UserProgramSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
+
+    /// 普通 ioctl 配置双族 lo，并通过实际 proc 打开验证旧快照和共享游标。
+    #[test]
+    #[ktest(tags("network-user", "network-control", "fs-proc"))]
+    fn network_control(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Control)
+    }
+
+    /// 删除并恢复默认路由后沿原 TCP peer 完成真实 NIC 全文业务。
+    #[test]
+    #[ktest(
+        tags(
+            "network-user",
+            "network-control",
+            "network-nic",
+            "network-nic-tcp",
+            "fs-proc"
+        ),
+        resources("net-user")
+    )]
+    fn network_nic_control(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::NicControl)
+    }
 
     /// 普通 TCP 经实际 NIC 与宿主核验双向全文、短前缀、半关闭和真实地址。
     #[test]

@@ -11,6 +11,51 @@ pub enum InterfaceId {
     Ethernet,
 }
 
+impl InterfaceId {
+    /// 返回控制 ABI 和 proc 快照共同使用的固定接口名。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Loopback => "lo",
+            Self::Ethernet => "eth0",
+        }
+    }
+
+    /// 解析已在 ABI 边界去除 NUL 的接口名字；设备是否存在由域查询。
+    pub fn from_name(name: &[u8]) -> Result<Self, FsError> {
+        match name {
+            b"lo" => Ok(Self::Loopback),
+            b"eth0" => Ok(Self::Ethernet),
+            _ => Err(FsError::NoDevice),
+        }
+    }
+}
+
+/// 当前库 IPv4 地址与接口管理状态的无拥有副本。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceSnapshot {
+    pub id: InterfaceId,
+    pub address: Option<[u8; 4]>,
+    pub prefix_len: u8,
+    pub up: bool,
+}
+
+/// 直连 CIDR 或库默认项的一次只读副本。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteSnapshot {
+    pub interface: InterfaceId,
+    pub destination: [u8; 4],
+    pub prefix_len: u8,
+    pub gateway: Option<[u8; 4]>,
+    pub up: bool,
+}
+
+/// 默认路由控制只携带已复制的接口身份和 IPv4 网关。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DefaultRouteRequest {
+    pub interface: Option<InterfaceId>,
+    pub gateway: [u8; 4],
+}
+
 /// 控制入口的一次 IPv4 配置值，提交后由库接口保存真实配置。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EthernetConfig {
@@ -47,6 +92,6 @@ pub struct Route {
 }
 
 /// 当前静态 eth0 控制入口只接受非回环 IPv4 单播值。
-fn unicast(address: [u8; 4]) -> bool {
+pub(crate) fn unicast(address: [u8; 4]) -> bool {
     address[0] != 0 && address[0] != 127 && address[0] < 224
 }

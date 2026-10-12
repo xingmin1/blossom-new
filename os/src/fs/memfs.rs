@@ -108,6 +108,8 @@ pub enum MemorySpecial {
     Mounts,
     Meminfo,
     Uptime,
+    NetDev,
+    NetRoute,
 }
 
 /// 根与权威目录项持有 inode，inode 只弱指向本实例；外部引用保活本实例。
@@ -230,18 +232,17 @@ impl MemoryFs {
         )
     }
 
-    /// 在未发表的 dev/proc 根安装真实特殊节点，不向用户开放可信初始化权限。
+    /// 在未发表的 dev/proc 父目录安装真实特殊节点，不向用户开放可信初始化权限。
     pub(crate) fn initialize_special(
         self: &Arc<Self>,
+        parent: &InodeRef,
         name: &[u8],
         special: MemorySpecial,
         mode: u16,
         rdev: u64,
     ) -> Result<(), FsError> {
         let _rename = self.rename.lock();
-        if self.kind == MemoryFsKind::Tmpfs || self.index.lock().namespace_published {
-            return Err(FsError::InvalidOperation);
-        }
+        self.require_initialization_parent(parent)?;
         let kind = match (self.kind, special) {
             (
                 MemoryFsKind::Devfs,
@@ -253,7 +254,11 @@ impl MemoryFs {
             ) => InodeKind::Character,
             (
                 MemoryFsKind::Procfs,
-                MemorySpecial::Mounts | MemorySpecial::Meminfo | MemorySpecial::Uptime,
+                MemorySpecial::Mounts
+                | MemorySpecial::Meminfo
+                | MemorySpecial::Uptime
+                | MemorySpecial::NetDev
+                | MemorySpecial::NetRoute,
             ) => InodeKind::Regular,
             _ => return Err(FsError::InvalidOperation),
         };
@@ -268,8 +273,43 @@ impl MemoryFs {
             MemoryContent::Special(special),
             rdev,
         )?;
-        let root = self.root();
-        root.initialize_memory_child(name, &inode)
+        parent.initialize_memory_child(name, &inode)
+    }
+
+    /// 可信构造只在未发表的 dev/proc 实例创建目录，父编号与链接数沿共同 inode 协议。
+    pub(crate) fn initialize_directory(
+        self: &Arc<Self>,
+        parent: &InodeRef,
+        name: &[u8],
+        mode: u16,
+    ) -> Result<InodeRef, FsError> {
+        let _rename = self.rename.lock();
+        self.require_initialization_parent(parent)?;
+        let inode = self.allocate(
+            InodeMetadata::memory(InodeKind::Directory, 0x4000 | (mode & 0x0fff), 0, 0, 2, 0),
+            MemoryContent::Directory(SpinLock::new(MemoryDirectory {
+                parent: parent.number(),
+                next_cookie: 2,
+                entries: Vec::new(),
+            })),
+            0,
+        )?;
+        parent.initialize_memory_child(name, &inode)?;
+        Ok(inode)
+    }
+
+    /// 持 rename 锁时核可信初始化边界，拒绝已发表实例和其它实例的父节点。
+    fn require_initialization_parent(&self, parent: &InodeRef) -> Result<(), FsError> {
+        if self.kind == MemoryFsKind::Tmpfs
+            || self.index.lock().namespace_published
+            || parent.device() != self.device
+        {
+            return Err(FsError::InvalidOperation);
+        }
+        if parent.metadata_snapshot()?.kind != InodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(())
     }
 
     /// 睡眠分配锁保持弱槽检查与发表串行，短索引锁不跨堆申请。

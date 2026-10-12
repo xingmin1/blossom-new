@@ -12,6 +12,8 @@ TEST ?=
 ROOT ?= /dev/vda
 ROOT_MODE ?= ro
 INIT ?= /sbin/init
+NET ?= none
+NET_FORWARD ?=
 EXTRA_ROOT ?=
 IDENTITY ?= root
 IMAGE ?= build/$(if $(filter extra,$(IDENTITY)),extra,system)-$(ARCH).img
@@ -89,7 +91,7 @@ image:
 
 run debug: build
 	@case "$(RESUME)" in 0|1) ;; *) echo "RESUME 只支持 0 或 1"; exit 1;; esac
-	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(ROOT)" --root-mode "$(ROOT_MODE)" --init "$(INIT)" --work-dir "$(WORK_DIR)" $(if $(filter 1,$(RESUME)),--resume) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
+	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(ROOT)" --root-mode "$(ROOT_MODE)" --init "$(INIT)" --net "$(NET)" --net-forward "$(NET_FORWARD)" --work-dir "$(WORK_DIR)" $(if $(filter 1,$(RESUME)),--resume) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
 
 
 ifeq ($(PANIC),unwind)

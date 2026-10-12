@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+/sbin/ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+
+# proc 快照只列本域真实接口，按完整名称选择唯一以太网设备。
+while read -r interface counters; do
+    case "$interface" in
+        eth0:)
+            /sbin/ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+            /sbin/route add default gw 10.0.2.2 dev eth0
+            break
+            ;;
+    esac
+done < /proc/net/dev

@@ -31,6 +31,8 @@ pub(super) enum NetworkMode {
     LargeLoopback,
     NicTcp,
     NicUdp,
+    Control,
+    NicControl,
 }
 
 impl NetworkMode {
@@ -59,6 +61,8 @@ impl NetworkMode {
             Self::LargeLoopback => b"large-loopback",
             Self::NicTcp => b"nic-tcp",
             Self::NicUdp => b"nic-udp",
+            Self::Control => b"control",
+            Self::NicControl => b"nic-control",
         }
     }
 
@@ -88,6 +92,11 @@ impl UserOwner {
         self.prepare_tty(context, 4)?;
         if self.net.ktest_live_endpoints() != 0 {
             return Err(TestError("network user case inherited live endpoints"));
+        }
+        if matches!(mode, NetworkMode::Control | NetworkMode::NicControl) {
+            self.network_control =
+                Some((self.net.interface_snapshots(), self.net.route_snapshots()));
+            self.mount_network_proc(context)?;
         }
         let result = self.network_run(context, mode);
         if result.is_err() {
@@ -119,6 +128,81 @@ impl UserOwner {
             self.net.ktest_live_endpoints()
         ));
         result
+    }
+
+    /// 控制例在原磁盘已有目录安装真实 proc，用户发表前完成挂载准备。
+    fn mount_network_proc(&self, context: &TestContext<'_>) -> TestResult {
+        let mountpoint = checked(
+            context,
+            self.path
+                .vfs()
+                .resolve(self.path.context(), b"/plain", ResolveMode::Follow),
+        )?;
+        let procfs = checked(context, crate::fs::procfs::try_new(0o755))?;
+        checked(
+            context,
+            self.path.vfs().mount(
+                &mountpoint,
+                crate::fs::memfs::Filesystem::Memory(procfs),
+                AccessMode::ReadOnly,
+            ),
+        )
+    }
+
+    /// 原 quiesce 在用户 join/reap 后恢复本例修改的 flags 和默认项，恢复失败保留为清理错误。
+    pub(super) fn restore_network_control(&mut self, context: &TestContext<'_>) -> TestResult {
+        let Some((interfaces, routes)) = self.network_control else {
+            return Ok(());
+        };
+        for interface in interfaces.iter().flatten() {
+            let current = checked(context, self.net.interface_snapshot(interface.id))?;
+            if current.up != interface.up {
+                checked(
+                    context,
+                    self.net.set_interface_up(interface.id, interface.up),
+                )?;
+            }
+        }
+        let original = routes
+            .iter()
+            .flatten()
+            .find(|route| route.prefix_len == 0 && route.gateway.is_some())
+            .map(|route| (route.interface, route.gateway.unwrap()));
+        let current = self
+            .net
+            .route_snapshots()
+            .iter()
+            .flatten()
+            .find(|route| route.prefix_len == 0 && route.gateway.is_some())
+            .map(|route| (route.interface, route.gateway.unwrap()));
+        if current != original {
+            if let Some((interface, gateway)) = current {
+                checked(
+                    context,
+                    self.net.change_default_route(
+                        DefaultRouteRequest {
+                            interface: Some(interface),
+                            gateway,
+                        },
+                        false,
+                    ),
+                )?;
+            }
+            if let Some((interface, gateway)) = original {
+                checked(
+                    context,
+                    self.net.change_default_route(
+                        DefaultRouteRequest {
+                            interface: Some(interface),
+                            gateway,
+                        },
+                        true,
+                    ),
+                )?;
+            }
+        }
+        self.network_control = None;
+        Ok(())
     }
 
     /// 映像、真实文件描述符及协调 Task 均在发表用户之前准备，失败由原拥有析构。
@@ -153,7 +237,10 @@ impl UserOwner {
         } else {
             None
         };
-        let nic = matches!(mode, NetworkMode::NicTcp | NetworkMode::NicUdp);
+        let nic = matches!(
+            mode,
+            NetworkMode::NicTcp | NetworkMode::NicUdp | NetworkMode::NicControl
+        );
         let (first, second) = if nic {
             let (tcp, udp) = nic_ports()?.ok_or(TestError("network NIC ports are missing"))?;
             (usize::from(tcp), usize::from(udp))
@@ -165,18 +252,25 @@ impl UserOwner {
         };
         let (first_text, first_start) = decimal_fd(first);
         let (second_text, second_start) = decimal_fd(second);
-        let argv: [&[u8]; 4] = [
+        let argv: [&[u8]; 5] = [
             PROGRAM,
             mode.argument(),
-            &first_text[first_start..],
+            if mode == NetworkMode::Control {
+                b"/plain"
+            } else {
+                &first_text[first_start..]
+            },
             &second_text[second_start..],
+            b"/plain",
         ];
-        let arguments = Arguments::from_kernel(
-            PROGRAM,
-            &argv[..if nic || channels.is_some() { 4 } else { 2 }],
-            &[],
-        )
-        .map_err(|_| TestError("network user arguments failed"))?;
+        let count = match mode {
+            NetworkMode::Control => 3,
+            NetworkMode::NicControl => 5,
+            _ if nic || channels.is_some() => 4,
+            _ => 2,
+        };
+        let arguments = Arguments::from_kernel(PROGRAM, &argv[..count], &[])
+            .map_err(|_| TestError("network user arguments failed"))?;
         let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
             .map_err(|error| {
                 context.diagnostic(format_args!("network-user image-error={:?}", error));

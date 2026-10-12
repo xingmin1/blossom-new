@@ -592,6 +592,100 @@ class ResourceAndUARTTests(unittest.TestCase):
                     prepare_disks({"root"}, args, alias_dir)
                 self.assertEqual(source.read_bytes(), b"original disk")
 
+    def test_ordinary_network_arguments_preserve_disk_slots_and_resume_inputs(self):
+        """普通 CLI 把明确 NIC 与转发交给真实 exec，三盘和恢复内容保持原输入。"""
+        for arch in ("riscv64", "loongarch64"):
+            for net, resume in (("none", False), ("user", True)):
+                with self.subTest(arch=arch, net=net), tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    kernel = base / "kernel.elf"
+                    kernel.write_bytes(b"unchanged kernel input")
+                    sources = [(name, base / f"{name}.img") for name in ("root", "extra", "scratch")]
+                    work = base / "work"
+                    work.mkdir()
+                    for name, source in sources:
+                        source.write_bytes(f"source {name}".encode())
+                        (work / f"{name}.raw").write_bytes(f"resumed {name}".encode())
+                    recorded = base / "command.json"
+                    executable = base / "argument-recorder"
+                    executable.write_text(
+                        f"#!{sys.executable}\n"
+                        "import json,sys\nfrom pathlib import Path\n"
+                        f"Path({str(recorded)!r}).write_text(json.dumps(sys.argv[1:]))\n",
+                        encoding="utf-8")
+                    executable.chmod(0o700)
+                    forward = "tcp:127.0.0.1:43210-:4321" if net == "user" else ""
+                    command = [
+                        sys.executable, str(TOOLS / "run.py"), "--arch", arch,
+                        "--kernel", str(kernel), "--qemu", str(executable),
+                        "--image", str(sources[0][1]), "--extra-image", str(sources[1][1]),
+                        "--scratch-image", str(sources[2][1]), "--work-dir", str(work),
+                        "--root", "/dev/vdb", "--extra-root", "/dev/vda", "--root-mode", "rw",
+                        "--init", "/bin/custom-init", "--net", net, "--net-forward", forward,
+                        "--debug",
+                    ]
+                    if resume:
+                        command.append("--resume")
+                    if arch == "riscv64":
+                        command.append("--modern")
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = json.loads(recorded.read_text())
+                    devices = [arguments[index + 1] for index, value in enumerate(arguments)
+                               if value == "-device"]
+                    block_devices = [value for value in devices if value.startswith("virtio-blk-")]
+                    for index, device in enumerate(block_devices):
+                        slot = (f"bus=virtio-mmio-bus.{index}" if arch == "riscv64"
+                                else f"addr=0x{5 + 4 * index:x}")
+                        self.assertIn(slot, device)
+                        self.assertIn(f"drive=disk{index}", device)
+                    self.assertEqual(len(block_devices), 3)
+                    if net == "user":
+                        self.assertNotIn("-nic", arguments)
+                        self.assertEqual(arguments[arguments.index("-netdev") + 1],
+                                         f"user,id=net0,hostfwd={forward}")
+                        nic = ("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.3"
+                               if arch == "riscv64" else
+                               "virtio-net-pci,netdev=net0,addr=0x11,disable-legacy=on")
+                        self.assertEqual([value for value in devices if value.startswith("virtio-net-")],
+                                         [nic + ",mac=52:54:00:12:34:56"])
+                    else:
+                        self.assertEqual(arguments[arguments.index("-nic") + 1], "none")
+                        self.assertNotIn("-netdev", arguments)
+                    self.assertEqual(arguments[arguments.index("-append") + 1],
+                                     "rw root=/dev/vdb extra=/dev/vda init=/bin/custom-init")
+                    self.assertIn("-S", arguments)
+                    self.assertEqual(arguments[arguments.index("-gdb") + 1], "tcp:127.0.0.1:1234")
+                    for name, source in sources:
+                        self.assertEqual(source.read_bytes(), f"source {name}".encode())
+                        expected = f"{'resumed' if resume else 'source'} {name}".encode()
+                        self.assertEqual((work / f"{name}.raw").read_bytes(), expected)
+                    self.assertEqual(kernel.read_bytes(), b"unchanged kernel input")
+
+    def test_ordinary_forward_without_network_rejects_preserved_resume_disk(self):
+        """none 与明确转发冲突时返回真实错误，不替换恢复盘或修改源镜像。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            kernel = base / "kernel.elf"
+            kernel.write_bytes(b"kernel input")
+            source = base / "source.img"
+            source.write_bytes(b"source input")
+            work = base / "work"
+            work.mkdir()
+            disk = work / "root.raw"
+            disk.write_bytes(b"preserved resumed disk")
+            result = subprocess.run([
+                sys.executable, str(TOOLS / "run.py"), "--arch", "riscv64",
+                "--kernel", str(kernel), "--qemu", sys.executable, "--image", str(source),
+                "--work-dir", str(work), "--resume", "--net", "none",
+                "--net-forward", "tcp:127.0.0.1:43210-:4321",
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("host forwarding requires user networking", result.stderr)
+            self.assertEqual(source.read_bytes(), b"source input")
+            self.assertEqual(disk.read_bytes(), b"preserved resumed disk")
+            self.assertEqual(kernel.read_bytes(), b"kernel input")
+
     def test_vm_disks_live_until_process_wait_and_cleanup_partial_construction(self):
         """真实进程退出前保盘，隔离并行实例并清掉半复制，保留输入及原文日志。"""
         with tempfile.TemporaryDirectory() as temporary:
