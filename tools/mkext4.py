@@ -88,8 +88,8 @@ def write_pattern(path, length):
 
 
 
-def system_staging(directory, userland_root):
-    """首次复制已构建 bin/sbin/usr 和普通系统配置；已有 staging 不读取或安装任何输入。"""
+def system_staging(directory, userland_root, runtime_root, contest_boot=False):
+    """首次安装已构建系统树和两族运行库；已有 staging 不读取或重填任何输入。"""
     if directory.exists():
         if not directory.is_dir():
             raise ValueError("--staging must be a directory")
@@ -97,9 +97,12 @@ def system_staging(directory, userland_root):
     for name in ("bin", "sbin", "usr"):
         if not (userland_root / name).is_dir():
             raise ValueError(f"built userland directory missing: {userland_root / name}")
-    for name in ("bin/busybox", "bin/sh", "sbin/init", "bin/libc-smoke"):
+    for name in ("bin/busybox", "bin/sh", "sbin/init", "sbin/contest-run", "bin/libc-smoke"):
         if not (userland_root / name).is_file():
             raise ValueError(f"build the ordinary userland first: {userland_root / name}")
+    for name in ("musl/lib/libc.so", "glibc/lib/libc.so.6", "glibc/lib/libm.so.6"):
+        if not (runtime_root / name).is_file():
+            raise ValueError(f"prepare the matching runtime first: {runtime_root / name}")
     directory.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="system-staging-", dir=directory.parent) as temporary:
         tree = Path(temporary) / "root"
@@ -108,8 +111,15 @@ def system_staging(directory, userland_root):
         for name in ("bin", "sbin", "usr"):
             shutil.copytree(userland_root / name, tree / name, symlinks=True)
         shutil.copytree(ROOT / "userland" / "system" / "etc", tree / "etc", symlinks=True)
+        for family in ("musl", "glibc"):
+            shutil.copytree(runtime_root / family, tree / "opt/runtime" / family, symlinks=True)
+        if contest_boot:
+            (tree / "etc/inittab").write_text(
+                "::sysinit:/bin/sh /etc/init.d/rcS\n"
+                "::once:/sbin/contest-run /dev/vda\n"
+                "::shutdown:/bin/sh /etc/init.d/rcK\n", encoding="ascii")
         for name in ("dev", "proc", "run", "tmp", "var", "var/tmp", "root", "home",
-                     "usr/bin", "usr/sbin", "mnt", "mnt/extra"):
+                     "usr/bin", "usr/sbin", "mnt", "mnt/extra", "mnt/contest"):
             (tree / name).mkdir(parents=True, exist_ok=True)
             (tree / name).chmod(0o755)
         (tree / "tmp").chmod(0o1777)
@@ -171,6 +181,43 @@ def system_image(source, output, profile, size_mib, write_fixture=False, nearly_
             raise
         os.replace(image.with_suffix(".log"), output.with_suffix(".log"))
         os.replace(image, output)
+
+
+def delivery_image(args, output):
+    """在独立新树合成两根，制盘一次并复制一次辅助盘，准备齐四文件后再替换交付物。"""
+    inputs = (
+        ("riscv64", args.rv_userland_root, args.rv_runtime_root, args.rv_kernel, "kernel-rv"),
+        ("loongarch64", args.la_userland_root, args.la_runtime_root, args.la_kernel, "kernel-la"),
+    )
+    for arch, userland, runtime, kernel, _ in inputs:
+        if any(value is None for value in (userland, runtime, kernel)):
+            raise ValueError(f"delivery requires explicit kernel, userland and runtime inputs: {arch}")
+        if not kernel.is_file():
+            raise ValueError(f"built normal kernel missing: {kernel}")
+        with kernel.open("rb") as stream:
+            header = stream.read(20)
+        machine = 243 if arch == "riscv64" else 258
+        if (header[:6] != b"\x7fELF\x02\x01"
+                or len(header) != 20 or int.from_bytes(header[18:20], "little") != machine):
+            raise ValueError(f"normal kernel must be a matching ELF: {kernel}")
+    for name in ("kernel-rv", "kernel-la", "disk.img", "disk-la.img"):
+        target = ROOT / name
+        if target.is_symlink() or (target.exists() and (not target.is_file() or target.stat().st_nlink != 1)):
+            raise ValueError(f"delivery target must be an independent regular file: {target}")
+    with tempfile.TemporaryDirectory(prefix="delivery-", dir=output.parent) as temporary:
+        directory = Path(temporary)
+        source = directory / "source"
+        source.mkdir(mode=0o755)
+        for arch, userland, runtime, _, _ in inputs:
+            system_staging(source / arch, userland, runtime, contest_boot=True)
+        image = directory / "disk.img"
+        system_image(source, image, args.profile, args.size_mib)
+        for _, _, _, kernel, name in inputs:
+            shutil.copy2(kernel, directory / name)
+        shutil.copyfile(image, directory / "disk-la.img")
+        os.replace(image.with_suffix(".log"), output.with_suffix(".log"))
+        for name in ("kernel-rv", "kernel-la", "disk.img", "disk-la.img"):
+            os.replace(directory / name, ROOT / name)
 
 
 def write_staging(directory, arch):
@@ -402,15 +449,22 @@ def damaged_images(directory):
 
 
 def main(argv=None):
-    """普通系统盘只在无 source 的首次 staging 安装用户树，既有夹具保持独立生成。"""
+    """普通首树与双根交付共用制盘路径，明确 source 和既有 staging 始终只作输入。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", help="ordinary image output below build/; delivery uses fixed repository exports")
     parser.add_argument("--profile", choices=PROFILES, default="seed4k")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--arch", choices=("riscv64", "loongarch64"), default="riscv64")
     parser.add_argument("--staging", type=Path)
     parser.add_argument("--userland-root", type=Path,
                         help="built bin/sbin/usr input for a new ordinary staging tree")
+    parser.add_argument("--runtime-root", type=Path, help="matching prepared musl/glibc trees for a new staging")
+    parser.add_argument("--contest-boot", action="store_true", help="select contest-run in a new staging's ordinary inittab")
+    parser.add_argument("--delivery", action="store_true", help="build both roots in a fresh tree and export the four delivery files")
+    for arch in ("rv", "la"):
+        parser.add_argument(f"--{arch}-kernel", type=Path)
+        parser.add_argument(f"--{arch}-userland-root", type=Path)
+        parser.add_argument(f"--{arch}-runtime-root", type=Path)
     parser.add_argument("--identity", choices=("root", "extra"), default="root")
     parser.add_argument("--size-mib", type=int, default=256)
     parser.add_argument("--fixtures", action="store_true")
@@ -419,6 +473,12 @@ def main(argv=None):
     parser.add_argument("--nearly-full", action="store_true",
                         help="reserve real ordinary data blocks, leaving at most 128 free")
     args = parser.parse_args(argv)
+    if args.delivery:
+        if args.output is not None:
+            parser.error("--delivery uses fixed exports; omit --output")
+        args.output = str(ROOT / "build/delivery/disk.img")
+    elif args.output is None:
+        parser.error("--output is required for an ordinary image")
     if args.size_mib < 128:
         parser.error("--size-mib must be at least 128")
     if args.write_fixture and args.fixtures:
@@ -429,6 +489,8 @@ def main(argv=None):
         parser.error("--fixtures creates its own ordinary staging tree")
     if args.source is not None and args.staging is not None:
         parser.error("--source and --staging are mutually exclusive")
+    if args.delivery and (args.source is not None or args.staging is not None or args.fixtures or args.write_fixture):
+        parser.error("--delivery creates its own fresh dual-root source")
     if not args.fixtures and Path(args.output).suffix != ".img":
         parser.error("production --output must end in .img")
     try:
@@ -436,6 +498,10 @@ def main(argv=None):
         for binary in ("mke2fs", "debugfs", "e2fsck", "dumpe2fs"):
             if shutil.which(binary) is None:
                 raise ValueError(f"required tool missing: {binary}")
+        if args.delivery:
+            delivery_image(args, output)
+            print("valid exports=kernel-rv,kernel-la,disk.img,disk-la.img")
+            return
         if args.fixtures:
             output.mkdir()
             for profile in PROFILES:
@@ -448,7 +514,8 @@ def main(argv=None):
             if source is None:
                 directory = args.staging or ROOT / "build" / f"system-{args.arch}-{args.identity}"
                 userland_root = args.userland_root or ROOT / "build" / f"userland-{args.arch}"
-                source = system_staging(directory, userland_root)
+                runtime_root = args.runtime_root or ROOT / "build" / f"runtime-{args.arch}"
+                source = system_staging(directory, userland_root, runtime_root, args.contest_boot)
             if not source.is_dir():
                 raise ValueError("--source must be an existing directory")
             if args.write_fixture:

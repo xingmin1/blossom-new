@@ -11,6 +11,7 @@ OUTPUT ?= build/$(ARCH)/kernel.elf
 TEST ?=
 ROOT ?= /dev/vda
 ROOT_MODE ?= ro
+ROOTDIR ?= /
 INIT ?= /sbin/init
 NET ?= none
 NET_FORWARD ?=
@@ -22,6 +23,8 @@ SOURCE ?=
 EXTRA_IMAGE ?=
 SCRATCH_IMAGE ?=
 WORK_DIR ?= build/run-$(ARCH)
+CONTEST_IMAGE ?=
+CONTEST_BOOT ?= 0
 RESUME ?= 0
 LLVM_MC ?= llvm-mc
 USER_LD ?= rust-lld
@@ -30,6 +33,16 @@ MUSL_CROSS ?= $(ARCH)-linux-musl-
 MUSL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie
 USERLAND_BUILD ?= build/busybox-$(ARCH)
 USERLAND_ROOT ?= build/userland-$(ARCH)
+MUSL_LIBC ?=
+GLIBC_LIBDIR ?=
+RUNTIME_OUTPUT ?= build/runtime-$(ARCH)
+MUSL_LIBC_RV ?=
+MUSL_LIBC_LA ?=
+GLIBC_LIBDIR_RV ?=
+GLIBC_LIBDIR_LA ?=
+MUSL_CROSS_RV ?= riscv64-linux-musl-
+MUSL_CROSS_LA ?= loongarch64-linux-musl-
+SYSTEM_SCRIPTS := $(patsubst userland/system/sbin/%,$(USERLAND_ROOT)/sbin/%,$(wildcard userland/system/sbin/*))
 USERLAND_SCRIPTS := $(patsubst tests/user/scripts/%,$(USERLAND_ROOT)/test/scripts/%,$(wildcard tests/user/scripts/*))
 
 ifeq ($(ARCH),riscv64)
@@ -70,28 +83,47 @@ endif
 
 CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
 
-.PHONY: all kernel-rv kernel-la build image run debug clean
+.PHONY: all delivery-rv delivery-la kernel-rv kernel-la build image run contest debug clean runtime
 
-all: kernel-rv kernel-la
+all: delivery-rv delivery-la
+	python3 tools/mkext4.py --delivery --profile seed4k --size-mib 256 --rv-kernel build/delivery-riscv64/kernel.elf --la-kernel build/delivery-loongarch64/kernel.elf --rv-userland-root build/delivery-riscv64/userland --la-userland-root build/delivery-loongarch64/userland --rv-runtime-root build/runtime-riscv64 --la-runtime-root build/runtime-loongarch64
+
+delivery-rv:
+	$(MAKE) runtime ARCH=riscv64 RUNTIME_OUTPUT=build/runtime-riscv64 MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)"
+	$(MAKE) build userland ARCH=riscv64 FEATURES= PANIC=abort OUTPUT=build/delivery-riscv64/kernel.elf USERLAND_BUILD=build/delivery-riscv64/busybox USERLAND_ROOT=build/delivery-riscv64/userland MUSL_CROSS="$(MUSL_CROSS_RV)"
+
+delivery-la:
+	$(MAKE) runtime ARCH=loongarch64 RUNTIME_OUTPUT=build/runtime-loongarch64 MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)"
+	$(MAKE) build userland ARCH=loongarch64 FEATURES= PANIC=abort OUTPUT=build/delivery-loongarch64/kernel.elf USERLAND_BUILD=build/delivery-loongarch64/busybox USERLAND_ROOT=build/delivery-loongarch64/userland MUSL_CROSS="$(MUSL_CROSS_LA)"
 
 kernel-rv:
-	$(MAKE) build ARCH=riscv64 FEATURES= OUTPUT=build/riscv64/kernel.elf && cp build/riscv64/kernel.elf $@
+	$(MAKE) build ARCH=riscv64 FEATURES= PANIC=abort OUTPUT=build/riscv64/kernel.elf && cp build/riscv64/kernel.elf $@
 
 kernel-la:
-	$(MAKE) build ARCH=loongarch64 FEATURES= OUTPUT=build/loongarch64/kernel.elf && cp build/loongarch64/kernel.elf $@
+	$(MAKE) build ARCH=loongarch64 FEATURES= PANIC=abort OUTPUT=build/loongarch64/kernel.elf && cp build/loongarch64/kernel.elf $@
 
 build:
 	cd os && cargo build $(CARGO_ARGS)
 	mkdir -p $(dir $(OUTPUT))
 	cp os/target/$(TARGET)/$(MODE)/os "$(OUTPUT)"
 
-image:
-	@if [ -z "$(SOURCE)" ] && [ ! -e "$(STAGING)" ]; then $(MAKE) userland; fi
-	python3 tools/mkext4.py --arch $(ARCH) --output "$(IMAGE)" --identity $(IDENTITY) --profile seed4k --size-mib 256 $(if $(SOURCE),--source "$(SOURCE)",--staging "$(STAGING)" --userland-root "$(USERLAND_ROOT)")
+runtime:
+	python3 userland/runtime/prepare.py --arch $(ARCH) $(if $(MUSL_LIBC),--musl-libc "$(MUSL_LIBC)") $(if $(GLIBC_LIBDIR),--glibc-libdir "$(GLIBC_LIBDIR)") --output "$(RUNTIME_OUTPUT)"
 
-run debug: build
+image:
+	@if [ -z "$(SOURCE)" ] && [ ! -e "$(STAGING)" ]; then $(MAKE) runtime && $(MAKE) userland; fi
+	python3 tools/mkext4.py --arch $(ARCH) --output "$(IMAGE)" --identity $(IDENTITY) --profile seed4k --size-mib 256 $(if $(SOURCE),--source "$(SOURCE)",--staging "$(STAGING)" --userland-root "$(USERLAND_ROOT)" --runtime-root "$(RUNTIME_OUTPUT)") $(if $(filter 1,$(CONTEST_BOOT)),--contest-boot)
+
+contest: IMAGE = build/contest-system-$(ARCH).img
+contest: STAGING = build/contest-system-$(ARCH)
+contest: WORK_DIR = build/contest-run-$(ARCH)
+contest: CONTEST_BOOT := 1
+contest: image
+
+run debug contest: build
 	@case "$(RESUME)" in 0|1) ;; *) echo "RESUME 只支持 0 或 1"; exit 1;; esac
-	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(ROOT)" --root-mode "$(ROOT_MODE)" --init "$(INIT)" --net "$(NET)" --net-forward "$(NET_FORWARD)" --work-dir "$(WORK_DIR)" $(if $(filter 1,$(RESUME)),--resume) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
+	$(if $(filter contest,$@),@test -n "$(CONTEST_IMAGE)" || { echo "CONTEST_IMAGE is required"; exit 1; })
+	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(if $(filter contest,$@),/dev/vdb,$(ROOT))" --rootdir "$(ROOTDIR)" --root-mode "$(ROOT_MODE)" --init "$(INIT)" --net "$(NET)" --net-forward "$(NET_FORWARD)" --work-dir "$(WORK_DIR)" $(if $(filter contest,$@),--contest-image "$(CONTEST_IMAGE)") $(if $(filter 1,$(RESUME)),--resume) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
 
 
 ifeq ($(PANIC),unwind)
@@ -123,7 +155,7 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
 .PHONY: userland
-userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_ROOT)/bin/klog-read $(USERLAND_ROOT)/bin/ktrace-control $(USERLAND_ROOT)/bin/observation-smoke $(USERLAND_SCRIPTS)
+userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_ROOT)/bin/klog-read $(USERLAND_ROOT)/bin/ktrace-control $(USERLAND_ROOT)/bin/observation-smoke $(USERLAND_SCRIPTS) $(SYSTEM_SCRIPTS)
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
 
 $(USERLAND_ROOT)/bin/libc-smoke: tests/user/libc-smoke.c
@@ -147,6 +179,10 @@ $(USERLAND_ROOT)/bin/observation-smoke: tests/user/observation-smoke.c userland/
 	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
 $(USERLAND_ROOT)/test/scripts/%: tests/user/scripts/%
+	mkdir -p "$(dir $@)"
+	install -m 755 "$<" "$@"
+
+$(USERLAND_ROOT)/sbin/%: userland/system/sbin/%
 	mkdir -p "$(dir $@)"
 	install -m 755 "$<" "$@"
 

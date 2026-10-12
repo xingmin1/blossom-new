@@ -76,7 +76,7 @@ class VM:
                     command += ["-global", "virtio-mmio.force-legacy=false"]
             command += network_arguments(args.arch, "user" if self.net_user is not None else "none")
             ports = self.net_user.ports if self.net_user is not None else None
-            command += disk_arguments(disks, args, names, network_ports=ports)
+            command += disk_arguments(disks, args, names, network_ports=ports, rootdir="/")
             if "ap-freeze" in names and args.cpus >= 2:
                 endpoint = str(Path(self.socket_directory.name) / "gdb.sock")
                 command += ["-chardev", f"socket,id=ktest-gdb,path={endpoint},server=on,wait=off",

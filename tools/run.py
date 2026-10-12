@@ -48,7 +48,7 @@ def working_disks(sources, directory, resume):
 
 
 def qemu_arguments(args, disks):
-    """普通 stdio 运行按明确网络模式附 NIC，保留 init 与真实 restart，不启用测试协议。"""
+    """普通 stdio 运行保留明确的根视图、init、网络与真实 restart，不启用测试协议。"""
     command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
                "-kernel", str(args.kernel), "-m", args.memory, "-smp", str(args.cpus),
                "-display", "none", "-monitor", "none", "-serial", "stdio"]
@@ -59,20 +59,22 @@ def qemu_arguments(args, disks):
     if args.debug:
         command += ["-S", "-gdb", "tcp:127.0.0.1:1234"]
     return (command + network_arguments(args.arch, args.net, args.net_forward)
-            + disk_arguments(disks, args, set(), init=args.init))
+            + disk_arguments(disks, args, set(), init=args.init, rootdir=args.rootdir))
 
 
 def main(argv=None):
-    """核启动与网络输入并锁住工作目录，复制或恢复盘后以 QEMU 替换宿主进程。"""
+    """核启动输入并锁住工作目录，比赛盘固定先于系统盘，独占副本持锁到 QEMU exec。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=("riscv64", "loongarch64"), required=True)
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--cpus", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--memory")
     parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--contest-image", type=Path, help="original contest image; attach its writable copy before the system image")
     parser.add_argument("--extra-image", type=Path)
     parser.add_argument("--scratch-image", type=Path)
-    parser.add_argument("--root", default="/dev/vda", help="explicit guest root device; no fallback")
+    parser.add_argument("--root", help="explicit guest root device; defaults to vda normally and vdb with a contest image")
+    parser.add_argument("--rootdir", default="/", help="explicit guest root directory on the system volume")
     parser.add_argument("--root-mode", choices=("ro", "rw"), default="ro", help="guest root mount mode; independent of device read-only")
     parser.add_argument("--extra-root", help="explicit guest extra mount device; absent means no extra mount")
     parser.add_argument("--init", default="/sbin/init", help="explicit guest init path; empty or missing paths fail in the kernel")
@@ -83,14 +85,24 @@ def main(argv=None):
     parser.add_argument("--debug", action="store_true", help="pause with the local GDB endpoint")
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--qemu")
-    parser.add_argument("--read-only", choices=("root", "extra", "scratch"), action="append", default=[])
+    parser.add_argument("--read-only", choices=("root", "contest", "extra", "scratch"), action="append", default=[])
     parser.add_argument("--logical-block-size", type=int, choices=(512, 1024, 2048, 4096), default=512)
     args = parser.parse_args(argv)
     if args.modern and args.arch != "riscv64":
         parser.error("--modern is only valid for RISC-V MMIO")
+    if args.contest_image is not None:
+        if args.root not in (None, "/dev/vdb"):
+            parser.error("--contest-image requires the system root /dev/vdb")
+        if "contest" in args.read_only:
+            parser.error("the contest working disk must be writable")
+    args.root = args.root if args.root is not None else ("/dev/vdb" if args.contest_image is not None else "/dev/vda")
     args.memory = args.memory or ("512M" if args.arch == "riscv64" else "768M")
-    directory = args.work_dir or ROOT / "build" / f"run-{args.arch}"
-    sources = [("root", args.image)]
+    role = "contest-run" if args.contest_image is not None else "run"
+    directory = args.work_dir or ROOT / "build" / f"{role}-{args.arch}"
+    sources = []
+    if args.contest_image is not None:
+        sources.append(("contest", args.contest_image))
+    sources.append(("root", args.image))
     if args.extra_image is not None:
         sources.append(("extra", args.extra_image))
     if args.scratch_image is not None:
