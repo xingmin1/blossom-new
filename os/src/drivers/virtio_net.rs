@@ -29,7 +29,7 @@ use crate::{
     net::{stats::InterfaceStats, NetStack, NetStackRef},
     sync::{SleepMutex, SpinLock},
     time::{self, Duration},
-    timer,
+    timer, trace,
     workqueue::Work,
 };
 
@@ -452,19 +452,20 @@ impl VirtioNet {
         handled
     }
 
-    /// Work 的非重入票负责唯一消费者，TX 独立预算在前，RX 恰满时保下一轮空检查。
+    /// Work 独占消费者，按实际 used 完成数记录非零批次；原预算和 RX 恰满重检保持不变。
     fn progress(&self) -> Result<(), Error> {
         if self.state.lock().phase != Phase::Live {
             return Ok(());
         }
-        let mut completed = false;
+        let mut completed = 0;
         for _ in 0..TX_BUDGET {
             if !self.complete_tx()? {
                 break;
             }
-            completed = true;
+            completed += 1;
         }
-        if completed {
+        if 0 < completed {
+            trace::record(trace::Kind::NetTxCompleteBatch, 1, completed);
             if let Some(net) = self.net.upgrade() {
                 net.kick_egress();
                 #[cfg(feature = "ktest")]
@@ -490,6 +491,7 @@ impl VirtioNet {
             received += 1;
         }
         if 0 < received {
+            trace::record(trace::Kind::NetRxBatch, 1, received as u64);
             self.notify(true);
         }
         #[cfg(feature = "ktest")]

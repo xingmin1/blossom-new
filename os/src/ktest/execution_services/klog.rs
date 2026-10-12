@@ -6,6 +6,8 @@ use core::hint::black_box;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::fs::poll::{PollContext, PollMask, PollTable};
+use crate::fs::{FileRef, FsError, SeekFrom};
 use crate::klog::{self as log, Cursor, Level};
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, State, Task};
@@ -257,8 +259,28 @@ fn assert_numbered_body(message: &str, index: u64) {
     assert_eq!(message.as_bytes(), expected.as_bytes());
 }
 
-/// 慢 UART 导致真实 TX 等待，稳定输出跨覆盖继续，独立 cursor 精确报告缺口而不重放。
+/// 真正打开的 kmsg 每次交付完整文本记录，期望元数据来自同一已提交环记录。
+fn assert_kmsg_record(file: &FileRef, record: &log::Record) {
+    let mut bytes = [0u8; log::TEXT_CAPACITY * 4 + 96];
+    let length = file.read(&mut bytes).expect("kmsg read failed");
+    let mut expected = log::StackText::<{ log::TEXT_CAPACITY * 4 + 96 }>::new();
+    expected
+        .write_fmt(format_args!(
+            "6,{},{},-;{}\n",
+            record.seq,
+            record.monotonic_ns / 1000,
+            record.text()
+        ))
+        .unwrap();
+    assert_eq!(&bytes[..length], expected.as_bytes());
+}
+
+/// 慢 UART 导致真实 TX 等待；独立 kmsg 在同一停点读整记录并接受原 IPI 延期通知。
 fn test_uart() -> ::ktest::TestResult {
+    let kmsg = super::open_observation(b"/kmsg", 0x800).expect("kmsg open failed");
+    assert_eq!(kmsg.seek(SeekFrom::End(0)), Ok(0));
+    let notified = PollContext::try_new().expect("kmsg poll context failed");
+    let mut table = PollTable::new(notified.clone(), 1).expect("kmsg poll table failed");
     let business = crate::ktest::spawn_result_on(0, |_| Ok(business_worker())).unwrap();
     let received = console::received();
     let owner = scenario();
@@ -303,21 +325,55 @@ fn test_uart() -> ::ktest::TestResult {
     assert!(filled.zero_writes < partial.zero_writes);
     assert!(before.tx_interrupts < partial.tx_interrupts);
     assert!(before.wakes < partial.wakes);
+    assert_eq!(
+        kmsg.pollable().unwrap().poll(None).unwrap(),
+        PollMask::POLLIN | PollMask::POLLRDNORM
+    );
+    let saved = Cursor::from_sequence(held).read().unwrap().record;
+    assert_kmsg_record(&kmsg, &saved);
+    assert_eq!(kmsg.read(&mut [0u8; 1]), Err(FsError::WouldBlock));
+    assert_eq!(
+        kmsg.pollable().unwrap().poll(Some(&mut table)).unwrap(),
+        PollMask::default()
+    );
+    assert_eq!(table.len(), 1);
+    notified.clear_triggered();
     let mut slow = Cursor::from_sequence(held + 1);
     let mut fast = Cursor::from_sequence(held + 1);
     scenario().business_start.complete();
     assert_eq!(business.join().unwrap(), 126);
     assert_eq!(scenario().business.load(Ordering::Acquire), 4096);
     for index in 0..72u64 {
-        let sequence = crate::klog!(Level::Info, "X26 record={}", index);
+        let sequence = if index == 0 {
+            // 本核 IRQ-save 阻止原日志 IPI 执行，记录提交不能直接通知 poll 源。
+            let irq = crate::sync::IrqSaveGuard::new();
+            let sequence = crate::klog!(Level::Info, "X26 record={}", index);
+            assert!(!notified.triggered());
+            drop(irq);
+            until(|| notified.triggered(), "deferred kmsg poll notification");
+            sequence
+        } else {
+            crate::klog!(Level::Info, "X26 record={}", index)
+        };
         assert_eq!(sequence, held + index + 1);
+        assert_eq!(fast.available(), Some(0));
+        assert_eq!(fast.available(), Some(0));
         let read = fast.read().unwrap();
         assert_eq!(read.record.seq, sequence);
         assert_eq!(read.lost, 0);
         assert_numbered_body(read.record.text(), index);
+        assert_eq!(
+            kmsg.pollable().unwrap().poll(None).unwrap(),
+            PollMask::POLLIN | PollMask::POLLRDNORM
+        );
+        assert_kmsg_record(&kmsg, &read.record);
+        assert_eq!(kmsg.read(&mut [0u8; 1]), Err(FsError::WouldBlock));
+        assert_eq!(fast.available(), None);
         assert!(fast.read().is_none());
     }
     assert!(fast.read().is_none());
+    assert_eq!(slow.available(), Some(8));
+    assert_eq!(slow.available(), Some(8));
     let first = slow.read().unwrap();
     assert_eq!(first.lost, 8);
     assert_eq!(first.record.seq, held + 9);
@@ -336,6 +392,12 @@ fn test_uart() -> ::ktest::TestResult {
         (paused.seq, paused.offset, paused.length)
     );
     assert_eq!(log::testing::service_state(), Some(State::Blocked));
+    assert!(notified.triggered());
+    assert_eq!(
+        kmsg.pollable().unwrap().poll(None).unwrap(),
+        PollMask::default()
+    );
+    drop((table, notified, kmsg));
     log::testing::release_pause();
     let boundary = held + 73;
     log::testing::catch_up(boundary);
@@ -743,7 +805,7 @@ pub(crate) mod records {
 #[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "uart", "klog"), resources("uart"), isolation = "Case", timeout_ms = 45000)]
 pub(crate) mod uart {
     use super::*;
-    /// 同一个真实UART socket的TX背压、450P整行、精确lost与独立Task4096次业务前进。
+    /// 同一 UART 真背压时 kmsg 独立交付全文与延期通知，保留原450P、lost及4096次业务进度。
     #[test]
     fn socket_printer_backpressure(
         _: &mut ::ktest::TestContext<'_>,

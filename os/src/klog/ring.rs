@@ -93,6 +93,15 @@ impl Cursor {
         Self { next: sequence }
     }
 
+    /// 查询下一条的覆盖量，Some(0) 表示可读且未覆盖，None 表示尚无下一条；不推进或复制正文。
+    pub fn available(&self) -> Option<u64> {
+        let ring = RING.lock();
+        if ring.next <= self.next {
+            return None;
+        }
+        Some(self.next.max(ring.oldest()) - self.next)
+    }
+
     /// 在一个短锁内取得稳定副本并沿实际序号推进；空读不重放也不消费未来记录。
     ///
     /// lost 只描述此游标的槽覆盖，正文 truncated 与它互不替代。环内禁止调用

@@ -23,6 +23,7 @@ mod libc;
 mod lifecycle;
 mod namespace;
 mod network;
+mod observation;
 mod pipe;
 mod preparation;
 mod readahead;
@@ -133,6 +134,8 @@ struct UserOwner {
     running: Option<RunningProgram>,
     reserved: Option<ReservedDescriptor>,
     observer: Option<JoinHandle>,
+    /// 观测例负责停止自己开启的固定捕获，失败清理仍沿原用户 owning 边界。
+    observation_trace: bool,
     lifecycle_child: Option<JoinObserver>,
     /// 本例共享UART协议阶段的显式owner。
     tty_io: crate::fs::ktest::tty::UartStage,
@@ -1307,6 +1310,7 @@ impl Fixture<UserSuite> for UserOwner {
             reserved: None,
             observer: None,
             lifecycle_child: None,
+            observation_trace: false,
             tty_io: crate::fs::ktest::tty::UartStage::new(),
         })
     }
@@ -1331,6 +1335,10 @@ impl Fixture<UserSuite> for UserOwner {
             self.reap_children(context, true)?;
             self.lifecycle_child_left_stack()?;
         }
+        if self.observation_trace {
+            checked(context, crate::trace::stop())?;
+            self.observation_trace = false;
+        }
         self.restore_network_control(context)?;
         if self.tty_io.active() {
             return Err(TestError("TTY UART stage is still active at quiesce"));
@@ -1348,6 +1356,7 @@ impl Fixture<UserSuite> for UserOwner {
                 && self.network_control.is_none()
                 && self.reserved.is_none()
                 && self.observer.is_none()
+                && !self.observation_trace
                 && self.lifecycle_child.is_none()
                 && !self.tty_io.active(),
         );
@@ -1411,6 +1420,20 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
 #[ktest::suite(fixture = UserOwner, suite_resources = UserProgramSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
+
+    /// 普通只读日志验证独立 open、共享 dup、覆盖恢复和真实用户复制错误的消费点。
+    #[test]
+    #[ktest(tags("observation-user", "kmsg"))]
+    fn observation_kmsg(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.observation_mode(context, b"kmsg")
+    }
+
+    /// 普通 pipe 与 lo TCP 产生固定事件，用户 ioctl 冻结后核旧 OFD 字节独立。
+    #[test]
+    #[ktest(tags("observation-user", "trace", "network-user"))]
+    fn observation_trace(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.observation_mode(context, b"trace")
+    }
 
     /// 普通 ioctl 配置双族 lo，并通过实际 proc 打开验证旧快照和共享游标。
     #[test]

@@ -12,14 +12,32 @@ pub use printer::testing;
 pub(crate) use printer::wake_printer;
 pub use ring::{next_sequence, Cursor, ReadRecord, Record};
 
+use alloc::sync::Arc;
 use core::fmt;
 use core::sync::atomic::Ordering;
+use spin::Once;
 
+use crate::fs::poll::{PollMask, PollWaitHead};
 use crate::sync::IrqSaveGuard;
 use crate::task::TaskId;
 
 pub const CAPACITY: usize = 64;
 pub const TEXT_CAPACITY: usize = 512;
+
+static READER_SOURCE: Once<Arc<PollWaitHead>> = Once::new();
+
+/// 借用 BSP 预备并永久保活的读者通知源；初始化之前调用直接失败。
+pub(crate) fn reader_source() -> &'static Arc<PollWaitHead> {
+    READER_SOURCE
+        .get()
+        .expect("klog reader source not initialized")
+}
+
+/// 在日志 IPI 的延期点提示可读或覆盖；通知不消费记录，实际状态由各游标复查。
+pub(crate) fn wake_readers() {
+    reader_source()
+        .notify(PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLERR | PollMask::POLLPRI);
+}
 
 /// 固定的小值级别，不建立运行期过滤或动态目标配置。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

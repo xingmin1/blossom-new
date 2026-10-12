@@ -32,6 +32,7 @@ mod syscall;
 mod task;
 mod time;
 mod timer;
+mod trace;
 mod wait;
 mod workqueue;
 

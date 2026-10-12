@@ -19,6 +19,7 @@ use crate::mm::user_table::PagePermissions;
 use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::packet::OwnedPacket;
+use crate::net::route::InterfaceId;
 use crate::net::socket::SocketFile;
 use crate::net::table::TcpTuple;
 use crate::net::tcp::TcpEndpoint;
@@ -894,8 +895,9 @@ pub(crate) mod stack {
         Ok(())
     }
 
-    /// UDP 查找经真实 lo ingress 交付同记录的源、长度和数据，空消息仍可被领取。
+    /// UDP 经真实 lo ingress 交付全文及源，17 字节和空消息各计一包，双向 IP 字节精确累计 73。
     #[test]
+    #[ktest(tags("N28"))]
     fn udp_index_delivers_owned_and_zero_length_records(
         context: &mut TestContext<'_>,
         fixture: &mut StackOwner,
@@ -909,7 +911,8 @@ pub(crate) mod stack {
             }),
         )?;
         context.expect_eq(destination.address, AddressFamily::Ipv4.unspecified());
-        for payload in [&b"real UDP record"[..], &b""[..]] {
+        let before = operation(context, fixture.net.statistics(InterfaceId::Loopback))?;
+        for payload in [&b"real UDP record!!"[..], &b""[..]] {
             let packet = operation(
                 context,
                 OwnedPacket::try_from_udp(
@@ -941,6 +944,15 @@ pub(crate) mod stack {
             context.expect_eq(record.original_len, payload.len());
             context.expect_eq(&bytes[..record.copied], payload);
         }
+        let after = operation(context, fixture.net.statistics(InterfaceId::Loopback))?;
+        context.expect_eq(after.rx_bytes.wrapping_sub(before.rx_bytes), 73);
+        context.expect_eq(after.rx_packets.wrapping_sub(before.rx_packets), 2);
+        context.expect_eq(after.tx_bytes.wrapping_sub(before.tx_bytes), 73);
+        context.expect_eq(after.tx_packets.wrapping_sub(before.tx_packets), 2);
+        context.diagnostic(format_args!(
+            "network-stack lo-stats-before={:?} lo-stats-after={:?} payload-bytes=17 ip-bytes=73 packets=2",
+            before, after
+        ));
         let mut bytes = [0u8; 1];
         context.expect_eq(
             operation(

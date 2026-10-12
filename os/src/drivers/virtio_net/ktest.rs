@@ -8,7 +8,7 @@ use crate::mm::dma::MappedPages;
 use crate::net::{
     address::{AddressFamily, InetEndpoint, SocketAddress},
     packet::OwnedPacket,
-    route::EthernetConfig,
+    route::{EthernetConfig, InterfaceId},
     udp::UdpEndpoint,
     IoProgress, NetStack, NetStackOwner, NetStackRef,
 };
@@ -577,15 +577,21 @@ fn burst(fixture: &Owner, count: usize) -> TestResult {
 pub(crate) mod native {
     use super::*;
 
-    /// 唯一消费者停在 Entry；无应答帧仅靠真实 TX used 恢复固定槽与锁外空间通知。
+    /// 唯一消费者停在 Entry；42 字节 ARP 的真实 TX used 恢复槽并只计一次 Ethernet 完成，不含 VirtIO 头。
     #[test]
-    #[ktest(tags("N20"))]
+    #[ktest(tags("N20", "N28"))]
     fn tx_used_without_rx_or_new_send(
         context: &mut TestContext<'_>,
         fixture: &mut Owner,
     ) -> TestResult {
         let nic = fixture.nic();
         let before = nic.snapshot()?;
+        let stats_before = fixture
+            .net
+            .as_ref()
+            .unwrap()
+            .statistics(InterfaceId::Ethernet)
+            .map_err(|_| TestError("native TX statistics unavailable"))?;
         nic.observation.entry.arm();
         if !arp_reply(nic)? {
             return Err(TestError("native first ARP had no TX slot"));
@@ -606,6 +612,9 @@ pub(crate) mod native {
         context.expect_eq(held.tx.owned, 1);
         context.expect_eq(held.tx.heads, 1);
         context.expect_eq(held.tx_completed, before.tx_completed);
+        let stats_held = nic.statistics();
+        context.expect_eq(stats_held.tx_bytes, stats_before.tx_bytes);
+        context.expect_eq(stats_held.tx_packets, stats_before.tx_packets);
         nic.observation.entry.release();
         observe(
             || {
@@ -618,6 +627,22 @@ pub(crate) mod native {
             "native TX-only completion did not recover",
         )?;
         let after = nic.snapshot()?;
+        let stats_after = fixture
+            .net
+            .as_ref()
+            .unwrap()
+            .statistics(InterfaceId::Ethernet)
+            .map_err(|_| TestError("native completed TX statistics unavailable"))?;
+        context.expect_eq(after.tx_completed.wrapping_sub(before.tx_completed), 1);
+        context.expect_eq(stats_after.tx_bytes.wrapping_sub(stats_before.tx_bytes), 42);
+        context.expect_eq(
+            stats_after.tx_packets.wrapping_sub(stats_before.tx_packets),
+            1,
+        );
+        context.diagnostic(format_args!(
+            "network-nic tx-stats-before={:?} tx-stats-held={:?} tx-stats-after={:?} ethernet-bytes=42 virtio-header-bytes={} completions=1",
+            stats_before, stats_held, stats_after, nic.info().header_len
+        ));
         context.expect_eq(after.rx_completed, before.rx_completed);
         context.expect_eq(after.pending_tx, 0);
         context.expect_eq(after.tx.heads, 0);

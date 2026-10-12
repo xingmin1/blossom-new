@@ -15,7 +15,7 @@ use crate::fs::{
     background, writeback, DirectoryCursor, DirectoryEntry, FsError, InodeKind, InodeRef,
     InodeTime, Path, Pollable, Vfs, WriteAccess,
 };
-use crate::fs::{devfs, procfs};
+use crate::fs::{devfs, kmsg, ktrace, procfs};
 use crate::mm::space::{Mm, VmError};
 use crate::net::socket::SocketFile;
 use crate::sync::{SleepMutex, SpinLock};
@@ -545,6 +545,8 @@ pub fn open_path_with_flags(
             MemorySpecial::TtySerial | MemorySpecial::Console | MemorySpecial::ControllingTty => {
                 crate::fs::tty::open(path, flags, caller, special)
             }
+            MemorySpecial::Kmsg => kmsg::open(path, flags),
+            MemorySpecial::Ktrace => ktrace::open(path, flags),
             MemorySpecial::Mounts
             | MemorySpecial::Meminfo
             | MemorySpecial::Uptime

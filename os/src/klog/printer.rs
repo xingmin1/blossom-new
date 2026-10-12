@@ -1,10 +1,12 @@
 //! 独立普通任务逐字节推进稳定记录，等待源不依赖周期扫描。
 
+use alloc::sync::Arc;
 use core::alloc::AllocError;
 use core::fmt::Write;
 use core::pin::pin;
 
 use crate::console;
+use crate::fs::poll::PollWaitHead;
 use crate::task;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
@@ -12,15 +14,22 @@ use super::{Cursor, ReadRecord, StackText};
 
 static RECORD_WAIT: WaitQueue = WaitQueue::new();
 
-/// 在 BSP 开放中断与启动 AP 前准备唯一固定 CPU 的打印任务，再无分配发表。
+/// 在 BSP 开放中断与启动 AP 前一次准备读者源和打印任务，全部成功后无分配发表。
 pub fn initialize_service() -> Result<(), AllocError> {
+    assert!(
+        super::READER_SOURCE.get().is_none(),
+        "klog service initialized twice"
+    );
+    let reader_source = Arc::try_new(PollWaitHead::new())?;
     let prepared = task::prepare_kernel_on(0, run)?;
+    super::READER_SOURCE.call_once(|| reader_source);
     drop(prepared.publish());
     Ok(())
 }
 
-/// 只由已取走固定原因位的 IPI 分支通知，生产者不直接进入调度锁。
+/// 只由已取走原因位的 IPI 分支通知读者和打印者；读者通知不等待 UART 的打印进度。
 pub(crate) fn wake_printer() {
+    super::wake_readers();
     RECORD_WAIT.wake_one();
 }
 

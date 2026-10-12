@@ -8,8 +8,10 @@ pub(crate) mod ext4;
 mod file;
 mod file_table;
 mod inode;
+pub(crate) mod kmsg;
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
+pub(crate) mod ktrace;
 pub(crate) mod memfs;
 mod path;
 pub(crate) mod pipe;

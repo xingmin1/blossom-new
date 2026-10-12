@@ -9,7 +9,7 @@ use core::sync::atomic::Ordering;
 use crate::sync::{IrqSaveGuard, SpinLock};
 use crate::task::{ActiveWait, Placement, Resources, Scheduling, State, SwitchIntent, Task};
 use crate::wait::WaitId;
-use crate::{accounting, cpu, time};
+use crate::{accounting, cpu, time, trace};
 
 struct Scheduler {
     live_head: *const Task,
@@ -356,7 +356,7 @@ fn switch_out(intent: SwitchIntent) {
     unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
 }
 
-/// 同一等待轮次只有真正缺少通知时才阻塞，恢复后重新开启目的 CPU 的 IRQ。
+/// 同一等待轮次只有真正缺少通知时才阻塞，目的 CPU 恢复后记录本轮等待身份。
 pub(crate) fn park(id: WaitId) {
     assert_switchable();
     let worker = crate::task::current_worker();
@@ -374,6 +374,12 @@ pub(crate) fn park(id: WaitId) {
         // SAFETY: prepare_switch 已提交 SwitchingOut 且放锁，IRQ 关闭，两份 ctx 的执行权唯一。
         unsafe { crate::arch::switch_context(task_ctx, scheduler_ctx) };
         resume_task();
+        let task = crate::task::current_task_id().expect("resumed wait has no current task");
+        trace::record(
+            trace::Kind::WaitResume,
+            task.as_usize() as u64,
+            id.as_usize() as u64,
+        );
     }
     // 未提交的提前通知与实际恢复都归还同一进度贡献；yield 不经过此反馈。
     if let Some(worker) = worker {
@@ -602,6 +608,7 @@ pub fn run() -> ! {
             // SAFETY: 活 Task 不可被其他 CPU 摘离，身份为不可变字段。
             let id = unsafe { (*task).id().as_usize() };
             local.current_task_id.store(id, Ordering::Relaxed);
+            trace::record(trace::Kind::TaskDispatch, id as u64, 0);
             // SAFETY: 目标 Task 具有唯一 Running 执行权且由活登记保活，调度锁已释放。
             let mm = unsafe { (*task).user_thread() }.and_then(|user| user.mm());
             crate::mm::space::enter_current(mm);

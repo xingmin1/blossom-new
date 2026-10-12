@@ -4,6 +4,7 @@ mod klog;
 mod mixed;
 mod time;
 mod timer;
+mod trace;
 mod workqueue;
 
 use crate::sync::SpinLock;
@@ -127,6 +128,22 @@ pub(crate) fn reclaimed(expected: Baseline) -> TestResult {
         return Err(TestError("temporary execution metadata did not converge"));
     }
     Ok(())
+}
+
+/// 用独立只读 devfs 的真实名字和 inode 打开观测设备，返回的 Path 保活原挂载。
+pub(super) fn open_observation(
+    name: &[u8],
+    flags: u32,
+) -> Result<crate::fs::FileRef, crate::fs::FsError> {
+    use crate::block::AccessMode;
+    use crate::fs::{self, Filesystem, FsContext, InodeCache, ResolveMode, Vfs};
+
+    let fs = fs::devfs::try_new(0o755)?;
+    let cache = Arc::try_new(InodeCache::try_new(16)?).map_err(|_| fs::FsError::NoMemory)?;
+    let vfs = Vfs::try_new(Filesystem::Memory(fs), cache, 16, 1, AccessMode::ReadOnly)?;
+    let context = FsContext::new(vfs.root(), vfs.root())?;
+    let path = vfs.resolve(&context, name, ResolveMode::Follow)?;
+    fs::open_path_with_flags(&vfs, path, flags, fs::FileIoContext::Kernel)
 }
 
 /// 原WorkQueue只有一个关闭责任；Arc仅保活同一个域owner，不复制域或执行者。
@@ -338,7 +355,7 @@ fn owned_tail<T>(object: &Pin<Arc<T>>) -> TestResult {
 }
 
 /// 每个返回项都是宏生成的实际只读注册槽，不是手写case目录。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 7] {
+pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 8] {
     [
         time::cases::__ktest_anchor(),
         timer::cases::__ktest_anchor(),
@@ -347,5 +364,6 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 7] {
         klog::uart::__ktest_anchor(),
         klog::fatal::__ktest_anchor(),
         mixed::cases::__ktest_anchor(),
+        trace::cases::__ktest_anchor(),
     ]
 }

@@ -15,6 +15,11 @@ use crate::task::{self, Task};
 pub struct WaitId(usize);
 
 impl WaitId {
+    /// 返回本任务本轮等待的稳定序号，供实际恢复事件保存小值身份。
+    pub(crate) const fn as_usize(self) -> usize {
+        self.0
+    }
+
     /// 新任务从未使用的零序号仅作为下一次等待的初始值。
     pub(crate) const fn initial() -> Self {
         Self(0)

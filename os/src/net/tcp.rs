@@ -21,9 +21,9 @@ use crate::net::{
     PROTOCOL_BUDGET,
 };
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
-use crate::time;
 use crate::timer::{Timer, TimerKind};
 use crate::workqueue::Work;
+use crate::{time, trace};
 
 /// 输入在用户持有核心时保持拥有，立即回应未接受时也留在同一节点。
 struct Input {
@@ -109,6 +109,7 @@ pub struct TcpOperationGuard<'a> {
     core: Option<SleepMutexGuard<'a, TcpCore>>,
     mode: OperationMode,
     initial: Observation,
+    initial_trace_state: Option<State>,
 }
 
 impl Deref for TcpOperationGuard<'_> {
@@ -127,7 +128,7 @@ impl DerefMut for TcpOperationGuard<'_> {
 }
 
 impl Drop for TcpOperationGuard<'_> {
-    /// 在核心保护内发布连接事实，解锁后只通知新增方向；只读保护仅移交已有 Work 责任。
+    /// 核心保护内采实际修改后的状态，释放后记录变化并通知方向；只读保护仅移交已有 Work。
     fn drop(&mut self) {
         let notification = if self.mode == OperationMode::Modify {
             let core = self.core.as_deref().unwrap();
@@ -137,7 +138,12 @@ impl Drop for TcpOperationGuard<'_> {
         } else {
             PollMask::default()
         };
+        let state_change =
+            observed_state_change(self.initial_trace_state, self.core.as_deref().unwrap());
         drop(self.core.take());
+        if let Some(value) = state_change {
+            trace::record(trace::Kind::TcpState, self.endpoint.id, value);
+        }
         let owner_waiting = {
             let mut input = self.endpoint.input.lock();
             core::mem::take(&mut input.owner_waiting)
@@ -248,18 +254,24 @@ impl TcpEndpoint {
         self.operation(self.core.lock(), OperationMode::Observe)
     }
 
-    /// 本保护的前后事实用于识别真实修改，不因一次只读容量查询产生 ET 通知。
+    /// 本保护的前后事实用于通知；仅采集开启时保存真实修改操作的起始协议状态。
     fn operation<'a>(
         &'a self,
         core: SleepMutexGuard<'a, TcpCore>,
         mode: OperationMode,
     ) -> TcpOperationGuard<'a> {
         let initial = self.observation(&core);
+        let initial_trace_state = if mode == OperationMode::Modify && trace::enabled() {
+            Some(core.state())
+        } else {
+            None
+        };
         TcpOperationGuard {
             endpoint: self,
             core: Some(core),
             mode,
             initial,
+            initial_trace_state,
         }
     }
 
@@ -770,7 +782,7 @@ impl TcpEndpoint {
         let _ = self.work.get().unwrap().as_ref().queue();
     }
 
-    /// 先登记真实拥有责任；完成协议和方向计算、释放核心后才通知原持续源。
+    /// 先登记真实拥有责任；核心保护内采协议前后状态，释放后记录变化并通知原持续源。
     fn run(&self) {
         let Some(net) = self.stack.upgrade() else {
             return;
@@ -784,6 +796,7 @@ impl TcpEndpoint {
         };
         self.input.lock().owner_waiting = false;
         let previous = self.observation(&core);
+        let initial_trace_state = trace::enabled().then(|| core.state());
         let mut notification = None;
         let result = self.advance(&net, &mut core, &mut notification);
         let blocked = result == Err(FsError::WouldBlock);
@@ -811,7 +824,11 @@ impl TcpEndpoint {
             && deadline == ProtocolDeadline::Ingress
             && self.metadata.lock().engaged
             && !reply_pending;
+        let state_change = observed_state_change(initial_trace_state, &core);
         drop(core);
+        if let Some(value) = state_change {
+            trace::record(trace::Kind::TcpState, self.id, value);
+        }
         if !mask.is_empty() {
             self.source.notify(mask);
         }
@@ -1102,6 +1119,36 @@ impl TcpEndpoint {
     }
 }
 
+/// 只在采集开启的操作边界读取末状态，编码已观察到的变化，不补造中间协议状态。
+fn observed_state_change(previous: Option<State>, core: &TcpCore) -> Option<u64> {
+    let previous = previous?;
+    if !trace::enabled() {
+        return None;
+    }
+    let current = core.state();
+    if previous == current {
+        return None;
+    }
+    Some((trace_state_code(previous) << 8) | trace_state_code(current))
+}
+
+/// 固定事件文本使用独立于库枚举布局的协议状态码。
+fn trace_state_code(state: State) -> u64 {
+    match state {
+        State::Closed => 0,
+        State::Listen => 1,
+        State::SynSent => 2,
+        State::SynReceived => 3,
+        State::Established => 4,
+        State::FinWait1 => 5,
+        State::FinWait2 => 6,
+        State::CloseWait => 7,
+        State::Closing => 8,
+        State::LastAck => 9,
+        State::TimeWait => 10,
+    }
+}
+
 /// 表、退休队列或停止者的局部 Arc 保活节点，Work 本身不猜测业务 Arc 控制块。
 fn run_tcp(work: Pin<&Work>) {
     // SAFETY: context 来自构造期稳定 Arc；发表后真实表/退休/停止局部拥有一直覆盖 Work 全尾。
@@ -1109,9 +1156,10 @@ fn run_tcp(work: Pin<&Work>) {
     endpoint.run();
 }
 
-/// 硬中断只安排同一个普通 Work，不取得 SleepMutex 或运行协议。
+/// 精确期限在时间基准维护结束后到达，记录实际到期并安排同一普通 Work，不运行协议。
 fn tcp_expired(timer: Pin<&Timer>) {
     // SAFETY: Timer context 来自稳定节点 Arc；退休与根停止均先等本 Timer 全尾再释放节点。
     let endpoint = unsafe { &*(timer.context() as *const TcpEndpoint) };
+    trace::record(trace::Kind::ProtocolDeadline, endpoint.id, 0);
     endpoint.schedule();
 }
