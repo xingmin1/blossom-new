@@ -715,7 +715,7 @@ impl UdpEndpoint {
         }
     }
 
-    /// 后台先登记拥有责任；末 OFD 关门后仍提交已接纳 TX，暂满不自旋。
+    /// 后台先登记拥有责任；末 OFD 后继续提交或终结已接纳 TX，暂满不自旋。
     fn run(&self) {
         let Some(net) = self.stack.upgrade() else {
             return;
@@ -743,7 +743,7 @@ impl UdpEndpoint {
         let closed = state.closed;
         let ended = closed && !pending_tx;
         let binding = if ended {
-            // raw TX 已全部进入 Root；其后 packet/frame/DMA 持各自真实拥有。
+            // raw TX 已全部交给 Root 或以终结错误结束；已交包的后续 frame/DMA 仍持真实拥有。
             state.socket.close();
             state.binding.take()
         } else {
@@ -810,7 +810,7 @@ impl UdpEndpoint {
         }
     }
 
-    /// 首 TX record 与首 lease 同时提交，Root 未接纳时两者都留在原队列。
+    /// 队首 raw record 与 lease 同时结束；WouldBlock 保留二者，终结错误释放本条责任。
     fn dispatch(
         &self,
         net: &NetStackRef,
@@ -827,23 +827,36 @@ impl UdpEndpoint {
                 return Err(FsError::WouldBlock);
             }
             let mut context = UdpContextState::new(None, None);
-            let mut emitted = false;
+            let mut completed: Option<Result<(), FsError>> = None;
             state
                 .socket
                 .dispatch(&mut context, |_, _, (ip, udp, payload)| {
-                    let mut storage = Vec::new();
-                    storage
-                        .try_reserve_exact(payload.len())
-                        .map_err(|_| FsError::NoMemory)?;
-                    let packet =
-                        OwnedPacket::capture_udp(&ip, &udp, payload, storage).with_binding(lease);
-                    net.try_emit(packet).map_err(|(error, _packet)| error)?;
-                    emitted = true;
+                    let result = (|| {
+                        let mut storage = Vec::new();
+                        storage
+                            .try_reserve_exact(payload.len())
+                            .map_err(|_| FsError::NoMemory)?;
+                        let packet = OwnedPacket::capture_udp(&ip, &udp, payload, storage)
+                            .with_binding(lease);
+                        net.try_emit(packet).map_err(|(error, _packet)| error)
+                    })();
+                    if result == Err(FsError::WouldBlock) {
+                        return result;
+                    }
+                    // Ok 只提交本条 raw 消费；真实发送结果另存，错误不能冒充 Root 接纳。
+                    completed = Some(result);
                     Ok::<(), FsError>(())
                 })?;
-            assert!(emitted, "UDP lease has no corresponding TX record");
-            state.leases.pop_front();
+            let result = completed.expect("UDP lease has no corresponding TX record");
+            state
+                .leases
+                .pop_front()
+                .expect("UDP TX record has no matching lease");
             *notification |= PollMask::POLLOUT | PollMask::POLLWRNORM;
+            if let Err(error) = result {
+                state.error.get_or_insert(error);
+                *notification |= PollMask::POLLERR;
+            }
         }
         Ok(())
     }
