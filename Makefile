@@ -118,7 +118,9 @@ contest: IMAGE = build/contest-system-$(ARCH).img
 contest: STAGING = build/contest-system-$(ARCH)
 contest: WORK_DIR = build/contest-run-$(ARCH)
 contest: CONTEST_BOOT := 1
+ifneq ($(RESUME),1)
 contest: image
+endif
 
 run debug contest: build
 	@case "$(RESUME)" in 0|1) ;; *) echo "RESUME 只支持 0 或 1"; exit 1;; esac

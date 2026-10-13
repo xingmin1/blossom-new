@@ -1,0 +1,12 @@
+#!/bin/sh
+# 从显式工作根执行，检查 cwd 与 shell 易误拆分的原参数，不解释比赛评分正文。
+set -e
+expected_cwd=$1
+shift
+[ "$PWD" = "$expected_cwd" ]
+[ "$#" -eq 4 ]
+[ "$1" = 'two words' ]
+[ -z "$2" ]
+[ "$3" = '*' ]
+[ "$4" = ';not-eval' ]
+printf 'CONTEST_ARGV cwd=%s argc=%s\n' "$PWD" "$#"
