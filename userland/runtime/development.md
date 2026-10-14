@@ -34,10 +34,10 @@ make run ARCH=riscv64 IMAGE=build/system-riscv64.img ROOTDIR=/ RESUME=1
 `loongarch64` 同形使用自己的源树、镜像和工作目录。接口以根 [Makefile](../../Makefile)、[tools/mkext4.py](../../tools/mkext4.py)、[tools/run.py](../../tools/run.py) 为准：
 
 - `build` 只构建内核，默认 `OUTPUT=build/ARCH/kernel.elf`；`run` 构建后启动，不隐含 `image`。
-- `image` 的 `IMAGE` 是**制盘输出**（普通输出须在 `build/` 下且以 `.img` 结尾），会生成并替换该文件；`run` 的 `IMAGE` 是**已有来源盘输入**。不要把需保留的输入盘交给 `image IMAGE=...`。
+- `image` 的 `IMAGE` 是**自有系统根 FS 的制盘输出**（普通输出须在 `build/` 下且以 `.img` 结尾），会生成并替换该文件；`run` 的 `IMAGE` 是**已有来源盘输入**。禁止把官方测试输入、导出的测试树或测试工作盘传给 `image` / `tools/mkext4.py`；不要把输入盘路径当制盘输出。
 - `SOURCE` 是已有目录输入，不是镜像或运行工作盘。未指定 SOURCE 且 STAGING 不存在时，`image` 才构建静态 userland、准备 runtime，并安装普通 bin/sbin/usr、[系统配置](../system/etc/inittab) 和 `/opt/runtime/{musl,glibc}`；库来源可传 `MUSL_LIBC`、`GLIBC_LIBDIR`。已有 SOURCE 或 STAGING 不重填、不自动升级；新内容由调用者修改自有源树或选择新 STAGING。
-- fresh（默认 `RESUME=0`）由 run.py 把来源盘复制为 WORK_DIR 中的独立 `root.raw` 等工作盘，只把副本交 QEMU；源盘不被运行改写。`RESUME=1` 只使用同一 WORK_DIR 的已有工作盘，保留修改，不复制、不制盘；缺盘报错，不自动转 fresh。来源文件仍须存在。锁一直持有到真实 QEMU exec/退出。
-- 普通根默认 RO；明确 `ROOT_MODE=rw` 才可正常写盘，extra 固定 RO。恢复时保持原盘角色及 WORK_DIR；不调用 `image` 或 fresh 去“修复”需保留的工作状态。
+- fresh（默认 `RESUME=0`）由 run.py 把来源盘复制为 WORK_DIR 中的独立 `root.raw` 等工作盘，只把副本交 QEMU；源盘不被运行改写。`RESUME=1` 只使用同一 WORK_DIR 的已有工作盘，保留当前连续运行的修改，不复制、不制盘；缺盘报错，不自动转 fresh。来源文件仍须存在。锁一直持有到真实 QEMU exec/退出。
+- 普通根默认 RO；明确 `ROOT_MODE=rw` 才可正常写盘，extra 固定 RO。当前连续运行恢复时保持原盘角色及 WORK_DIR；不调用 `image` 或 fresh 去“修复”工作状态。运行关闭并确认 QEMU 退出后及时删除工作盘；本轮来源与临时系统盘使用完也删除，不为历史记录或可复现保留镜像备份，保留命令、摘要、日志和原报告即可。
 
 ## 普通单根与 all 双根
 
@@ -64,9 +64,25 @@ all 使用独立 `build/delivery-ARCH/` 与新双根临时树，制盘一次，�
 
 ## 比赛盘与同一个客体 runner
 
+### 官方测试盘来源
+
+测试盘只使用官方发布资产，自有系统根 FS 才允许制盘。当前选择依据是官方[测试仓库 README](https://github.com/oscomp/testsuits-for-oskernel/blob/pre-2025/README.md) 的整盘 ext4、无分区表与辅助根 FS 说明，以及 [pre-20250615 Release API](https://api.github.com/repos/oscomp/testsuits-for-oskernel/releases/tags/pre-20250615) 的两份资产：
+
+| 架构 | 官方下载 URL | 发布的压缩包 SHA-256 |
+|---|---|---|
+| riscv64 | https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/sdcard-rv.img.xz | `2b59aee4d26681b2d78a8faa615ac216f723a8ea157544e7867bbc8c77aac087` |
+| loongarch64 | https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/sdcard-la.img.xz | `3cbeae1095d788cd8255e4929bcc6dace96dbe4999b6eaec003ae6fe2cdba42b` |
+
+下载时核资产名、版本与压缩包 SHA-256，解包为对应 `sdcard-rv.img` / `sdcard-la.img` raw 整盘。**解包不是制盘**；`CONTEST_IMAGE` 只接匹配架构、已解包的官方 raw 测试盘，不能传 `.xz`、自制重打包盘或注入版。禁止用 `mkext4` / `mke2fs -d` 重制测试输入，禁止为评分给测试盘或工作副本注入/替换程序、脚本、运行库、链接或断言；测试本身的正常写入保留在当前临时副本。
+
+此前命名为 `original` / `prepared` 的本地重制和注入盘不能改称官方资产；旧日志、SHA 和失败保留原身份，仅作故障线索，不作为本轮官方得分。成功解包不证明原测试、shell、库或决赛用例存在，也不证明已运行通过；以盘内实际目录与原程序/判题器为准。下载源与运行副本只保留至本轮使用结束，不保历史盘或复现备份。
+
+以下示例要求自有 `/srv/system-rv` 保留控制 shell，不自动执行固定 selector；本轮将通过下面明确 root/cwd/argv 的普通命令入口运行原测试，不部署程序或运行库到测试工作根。它仍需原盘自身的 shell、解释器和库；缺失时记录真实输入边界，不通过补装取得“官方盘通过”。
+
+
 ```sh
-make contest ARCH=riscv64 CONTEST_IMAGE=/srv/contest-rv.img
-make contest ARCH=riscv64 CONTEST_IMAGE=/srv/contest-rv.img RESUME=1
+make contest ARCH=riscv64 SOURCE=/srv/system-rv CONTEST_IMAGE=build/sdcard-rv.img
+make contest ARCH=riscv64 SOURCE=/srv/system-rv CONTEST_IMAGE=build/sdcard-rv.img RESUME=1
 ```
 
 fresh contest 保留 `image` 前置；`RESUME=1` 跳过该前置，仍执行 build 和原参数/缺盘检查，不重新制作系统镜像。默认系统镜像、staging、工作目录分别为 `build/contest-system-ARCH.img`、`build/contest-system-ARCH`、`build/contest-run-ARCH`，可显式改 IMAGE/STAGING/SOURCE/OUTPUT/WORK_DIR。比赛工作副本固定 `/dev/vda` 且 RW，系统副本 `/dev/vdb`；fresh 复制成 `contest.raw` 与 `root.raw`，不把来源比赛盘直接交给 QEMU 写入。只有首次 contest staging 才配置自动 runner；明确 SOURCE 或已有 staging 的配置保持原样。
@@ -79,7 +95,7 @@ fresh contest 保留 `image` 前置；`RESUME=1` 跳过该前置，仍执行 bui
 /sbin/contest-run /dev/vda dynamic:clock_gettime dynamic:stat
 ```
 
-固定模式按原族准备匹配库，保留原脚本、ELF、DSO、cwd 与正文；`runtest` 必须同时满足原 START/END、`Pass!`、返回1和无对应 FAIL，不能把普通返回0当成该协议成功。原组内部失败、信号、超时及未运行不改签为 Pass，也不实现全部 LTP/libctest 或评分平台。真实 wait、清理与 sync 后，固定模式保持原自然 poweroff。
+**当前边界：**固定模式的 `prepare_family` 仍会从系统 `/opt/runtime` 复制库到测试工作根，删除/替换同名库和链接，并设置固定族环境；原脚本、ELF、测试 DSO 与正文保持不变，也不能据此称输入未注入。该模式尚未修改，不能用于本轮未注入官方盘的正式评分。其既有 `runtest` 分类要求原 START/END、`Pass!`、返回1和无对应 FAIL，普通返回0不等于此协议成功；原组内失败、信号、超时及未运行不改签为 Pass，不宣称全部 LTP/libctest 或评分平台兼容。固定模式仍在真实 wait、清理与 sync 后自然 poweroff。
 
 ### 明确 root/cwd/argv 的普通命令
 
@@ -90,20 +106,31 @@ fresh contest 保留 `image` 前置；`RESUME=1` 跳过该前置，仍执行 bui
 /sbin/contest-run /dev/vda --root /musl --cwd / -- ./runtest.exe -w entry-dynamic.exe stat
 ```
 
-调用前，工作根的 `/bin/sh` 必须由**盘自身提供**，或由调用者在自有来源树中明确安装当前匹配架构的静态 BusyBox 并建立可在该根内解析的 sh 链接。当前 [BusyBox 配置](../busybox.config) 未启 prefer-applets/standalone，不能假设 chroot 后仍能用系统盘 shell。该要求即使命令本身为静态 ELF 也成立；runner 不自动安装 shell、不覆盖盘内库，缺 shell、解释器、库或命令保留真实失败。
+命令、脚本解释器与动态库必须由目标 root 自身提供；只有调用者显式选择 shell 命令或脚本解释器时才需要相应 shell。静态 ELF 不要求目标 root 有 `/bin/sh`。缺命令、解释器或库保留真实失败，不得补装到官方测试盘后当原盘得分。普通命令模式不自动安装 shell、不猜 `/busybox`、不覆盖盘内库。
 
-父进程在系统根挂工作盘，子进程真实 chroot、chdir 后 exec；CWD 与完整 argv 作为位置参数传递，使用 `"$@"`，不拼接、不 eval。普通模式不复制两族 runtime、不强设固定族 LD_LIBRARY_PATH、不截取正文做分类；stdout/stderr 继承调用者，非零或信号状态按真实父 wait 保留，不套用 selector 的 Pass/return1 协议。
+父进程在系统根挂工作盘，真实子进程先从自有系统根装载静态 `/sbin/contest-exec ROOT CWD COMMAND [ARG...]`，再依次执行 `chroot(ROOT)`、`chdir(CWD)`、`execvp(COMMAND, argv)`；helper 不部署到测试盘。runner 使用 `"$@"`，helper 直接传递原 argv，空字符串、空格、UTF-8 和特殊字符均不拼接、不 eval；CWD 在换根后解析。普通模式不复制两族 runtime、不强设固定族 LD_LIBRARY_PATH、不截取正文做分类；stdout/stderr 继承调用者，非零或信号状态按真实父 wait 保留，不套用 selector 的 Pass/return1 协议。helper 参数不足、换根或换目录失败返回125，exec 缺文件返回127、其它 exec 失败返回126，并输出真实 errno 诊断。
+
+helper 与现有 userland 一同构建，也可单独构建；例如为自有 RV 系统来源树准备它：
+
+```sh
+make build/userland-riscv64/sbin/contest-exec ARCH=riscv64 \
+  USERLAND_ROOT=build/userland-riscv64 MUSL_CROSS=riscv64-linux-musl-
+install -m 755 build/userland-riscv64/sbin/contest-exec /srv/system-rv/sbin/contest-exec
+install -m 755 userland/system/sbin/contest-run /srv/system-rv/sbin/contest-run
+```
+
+LA 使用 `ARCH=loongarch64`、`USERLAND_ROOT=build/userland-loongarch64`、目标 `build/userland-loongarch64/sbin/contest-exec` 和匹配的 `MUSL_CROSS=loongarch64-linux-musl-`。既有 SOURCE/staging 不会由 `make image` 自动补装 helper，须显式更新自有来源树后再制自有系统盘；官方测试盘保持原文件。
 
 手动命令需要保留控制 shell 的系统配置，不能让默认 contest inittab 先运行固定列表并关机。可用上面的自有普通 SOURCE 启动两盘，配置不会因 contest 被重填：
 
 ```sh
 make contest ARCH=riscv64 SOURCE=/srv/system-rv \
-  IMAGE=build/command-system-rv.img CONTEST_IMAGE=/srv/contest-rv.img
+  IMAGE=build/command-system-rv.img CONTEST_IMAGE=build/sdcard-rv.img
 ```
 
 两种模式共用 devfs/proc/tmpfs 的取得记录、父等待与反序卸载（tmp/proc/dev，再 ext4），失败也清理并 sync；不强制或 lazy 卸载。命令结果与 cleanup 分别报告：原命令非零优先保留，原命令成功而 cleanup 失败才由 runner 返回非零。普通命令结束**返回调用者，不关机**，可继续下一次调用；最后由控制者执行正常 `sync`/`poweroff`。
 
-参数和 cwd 的最小消费者为 [tests/user/scripts/contest-argv](../../tests/user/scripts/contest-argv)。将它放入自有工作根的 `/tests` 后，可实际调用：
+参数和 cwd 的最小消费者为 [tests/user/scripts/contest-argv](../../tests/user/scripts/contest-argv)。以下只适用于自有非评分工作根，不能把该脚本放入官方测试输入；将它放入自有工作根的 `/tests` 后，可实际调用：
 
 ```sh
 /sbin/contest-run /dev/vda --root / --cwd /tests -- \
@@ -114,6 +141,6 @@ make contest ARCH=riscv64 SOURCE=/srv/system-rv \
 
 ## 新盘与能力边界
 
-同一受支持整盘 ext4 中改变文件、目录、根位置或只保留一个族，只需选择上述目录与程序，不改内核。新普通盘优先使用当前 mkext4 的 seed4k 配置；既有支持还有所选 legacy1k 等格式，不能据此声称任意 ext4 feature 均受支持。磁盘内的 loader、库和程序必须匹配架构/ABI，不修改原 PT_INTERP、ELF 或 DSO 来掩盖缺失。
+同一受支持整盘 ext4 的**自有根 FS**中改变文件、目录、根位置或只保留一个族，只需选择上述目录与程序，不改内核。新自有系统盘优先使用当前 mkext4 的 seed4k 配置；该制盘建议不适用于官方测试输入。既有支持还有所选 legacy1k 等格式，不能据此声称任意 ext4 feature 均受支持。磁盘内的 loader、库和程序必须匹配架构/ABI，不修改原 PT_INTERP、ELF 或 DSO 来掩盖缺失。
 
 当前没有分区表/`/dev/vda2`、VFAT、用户 RTC 设备/ioctl ABI，不把这些失败归咎于 runner 的 root 选择。教学内核按真实盘面处理，普通镜像不创建 journal，不实现 journal 校验/replay、崩溃恢复引擎或恶意坏盘加固；正常 sync/工作副本 RESUME 不等于恢复功能。LA NX 运行暂缓非 Pass，AT_RANDOM 为非加密教学字节；不外推全部 Linux ABI、PTY/namespace、全比赛或线上评测通过。

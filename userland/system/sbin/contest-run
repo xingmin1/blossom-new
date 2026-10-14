@@ -200,12 +200,11 @@ prepare_family() {
     prepare_root
 }
 
-# 背景子取消父清理；普通命令由盘内 shell 换目录后直接 exec，参数只经位置参数传递。
+# /// 背景子取消父清理；普通命令由系统根的静态执行器换根、换目录后原样 exec。
 execute_child() {
     trap - EXIT
     if [ "$mode" = command ]; then
-        exec /bin/busybox chroot "$root" /bin/sh -c \
-            'cd "$1" || exit "$?"; shift; exec "$@"' contest-run "$cwd" "$@"
+        exec /sbin/contest-exec "$root" "$cwd" "$@"
     fi
     export LD_LIBRARY_PATH=/lib
     export PATH=/bin:/

@@ -157,7 +157,7 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
 .PHONY: userland
-userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_ROOT)/bin/klog-read $(USERLAND_ROOT)/bin/ktrace-control $(USERLAND_ROOT)/bin/observation-smoke $(USERLAND_SCRIPTS) $(SYSTEM_SCRIPTS)
+userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_ROOT)/bin/klog-read $(USERLAND_ROOT)/bin/ktrace-control $(USERLAND_ROOT)/bin/observation-smoke $(USERLAND_ROOT)/sbin/contest-exec $(USERLAND_SCRIPTS) $(SYSTEM_SCRIPTS)
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
 
 $(USERLAND_ROOT)/bin/libc-smoke: tests/user/libc-smoke.c
@@ -179,6 +179,10 @@ $(USERLAND_ROOT)/bin/ktrace-control: tests/user/ktrace-control.c userland/includ
 $(USERLAND_ROOT)/bin/observation-smoke: tests/user/observation-smoke.c userland/include/blossom-trace.h
 	mkdir -p "$(dir $@)"
 	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
+
+$(USERLAND_ROOT)/sbin/contest-exec: userland/runtime/contest-exec.c
+	mkdir -p "$(dir $@)"
+	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) "$<" -o "$@"
 
 $(USERLAND_ROOT)/test/scripts/%: tests/user/scripts/%
 	mkdir -p "$(dir $@)"
