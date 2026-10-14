@@ -21,7 +21,7 @@ pub use mmu::{
 };
 pub(crate) use signal::SIGNAL_MIN_STACK;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
-pub use user::{run_user, signal_return_code, UserContext};
+pub use user::{run_user, signal_return_code, FpRegister, UserContext};
 
 #[cfg(feature = "ktest")]
 pub(crate) use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
@@ -351,14 +351,39 @@ pub fn read_counter() -> u64 {
     }
     value
 }
-/// 读取只读 CPUCFG 参数；本模块仅选择计数器频率的配置项。
-fn cpucfg(index: usize) -> u64 {
+/// 读取只读 CPUCFG 参数，供计数器频率与用户扩展能力选择使用。
+pub(crate) fn cpucfg(index: usize) -> u64 {
     let value: usize;
-    // SAFETY: CPUCFG4/5 是本架构有效的只读配置项，不访问普通内存。
+    // SAFETY: CPUCFG 是架构只读配置指令，不访问普通内存或改变特权状态。
     unsafe {
         asm!("cpucfg {value}, {index}", value = out(reg) value, index = in(reg) index, options(nomem, nostack));
     }
     value as u64 & 0xffff_ffff
+}
+
+/// 返回用户现场完整支持的 EUEN 位；扩展依赖必须同时存在于实际 CPU。
+pub(crate) fn user_euen() -> usize {
+    let config = cpucfg(2);
+    if config & 1 == 0 {
+        return 0;
+    }
+    if config & (1 << 6) == 0 {
+        return 1;
+    }
+    if config & (1 << 7) == 0 {
+        return 3;
+    }
+    7
+}
+
+/// 给出实际启用的每寄存器 u64 lane 数，零表示 CPU 没有浮点扩展。
+pub(crate) fn user_fp_lanes() -> usize {
+    match user_euen() {
+        7 => 4,
+        3 => 2,
+        1 => 1,
+        _ => 0,
+    }
 }
 /// 仅资源发现前从 CPUCFG4/5 取得实际 counter 频率，不作为运行期读数路径。
 pub fn boot_counter_frequency() -> u64 {

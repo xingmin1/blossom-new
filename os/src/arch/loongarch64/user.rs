@@ -6,11 +6,18 @@ use core::mem::offset_of;
 use super::{csr_read, handle_hardware_interrupt, irq_enabled};
 use crate::arch::{UserAccess, UserTrap};
 
-#[repr(C, align(16))]
+/// FP、LSX 与 LASX 共享同一组寄存器，最宽槽同时保证真实 32 字节对齐。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(32))]
+pub struct FpRegister {
+    pub lanes: [u64; 4],
+}
+
+#[repr(C, align(32))]
 pub struct UserContext {
     pub gpr: [usize; 32],
     pub pc: usize,
-    pub fpr: [u64; 32],
+    pub fpr: [FpRegister; 32],
     pub fcsr: usize,
     /// FCC0–7 各占一个字节，与浮点条件寄存器 ABI 一致。
     pub fcc: usize,
@@ -25,7 +32,7 @@ impl UserContext {
         let mut context = Self {
             gpr: [0; 32],
             pc,
-            fpr: [0; 32],
+            fpr: [FpRegister { lanes: [0; 4] }; 32],
             fcsr: 0,
             fcc: 0,
             estat: 0,
@@ -36,7 +43,7 @@ impl UserContext {
         context
     }
 
-    /// 派生私有整数与浮点现场，FCC按用户ABI复制，不继承内核续接或异常CSR。
+    /// 派生完整整数与最宽浮点现场，FCC 按用户 ABI 复制，不继承内核续接或异常 CSR。
     pub(crate) fn fork(&self) -> Self {
         Self {
             gpr: self.gpr,

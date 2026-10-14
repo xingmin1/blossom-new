@@ -1,8 +1,9 @@
-//! 用户栈上的整数现场与单个 FPU 扩展记录；内核续接和特权 CSR 不进入用户帧。
+//! 用户栈保存 CPU 实际支持的最宽浮点扩展；内核续接和特权 CSR 不进入用户帧。
 
 use core::convert::TryInto;
 
 use crate::arch::loongarch64::user::UserContext;
+use crate::arch::loongarch64::user_fp_lanes;
 use crate::arch::{UserAccess, USER_ADDRESS_END};
 use crate::mm::space::{Mm, VmError};
 use crate::task::signal::{
@@ -10,6 +11,7 @@ use crate::task::signal::{
     SS_DISABLE, UNBLOCKABLE,
 };
 
+/// 保持用户 ABI 的最小备用栈；最大 LASX 帧连同对齐消耗仍小于此容量。
 pub(crate) const SIGNAL_MIN_STACK: usize = 4096;
 
 const INFO_SIZE: usize = 128;
@@ -21,20 +23,80 @@ const REGISTERS: usize = MCONTEXT + 8;
 const FLAGS: usize = REGISTERS + 32 * 8;
 const EXTCONTEXT: usize = MCONTEXT + 272;
 const SCTX_INFO_SIZE: usize = 16;
-const FPU_CONTEXT_SIZE: usize = 272;
-const FPU_RECORD_SIZE: usize = SCTX_INFO_SIZE + FPU_CONTEXT_SIZE;
-const FRAME_SIZE: usize = EXTCONTEXT + FPU_RECORD_SIZE + SCTX_INFO_SIZE;
+const MAX_BODY_SIZE: usize = 32 * 4 * 8 + 16;
+const MAX_FRAME_SIZE: usize = EXTCONTEXT + SCTX_INFO_SIZE + MAX_BODY_SIZE + 16 + SCTX_INFO_SIZE;
+const _: () = assert!(MAX_FRAME_SIZE < SIGNAL_MIN_STACK);
 const FPU_MAGIC: u32 = 0x4650_5501;
+const LSX_MAGIC: u32 = 0x5358_0001;
+const LASX_MAGIC: u32 = 0x4153_5801;
 const SC_USED_FP: u32 = 1;
 const SC_ADDRERR_RD: u32 = 1 << 30;
 const SC_ADDRERR_WR: u32 = 1 << 31;
+
+/// 描述一个互斥的浮点扩展 body；寄存器连续存放，FCC/FCSR 紧随有效 lanes。
+struct FpLayout {
+    lanes: usize,
+}
+
+impl FpLayout {
+    /// 按真实 CPU 能力选择完整保存宽度，无 FP 时仅生成 END。
+    fn current() -> Self {
+        Self {
+            lanes: user_fp_lanes(),
+        }
+    }
+
+    /// 从用户 magic 选择受支持的 ABI，不接受未知或本 CPU 无法恢复的扩展。
+    fn decode(magic: u32) -> Result<Self, VmError> {
+        let lanes = match magic {
+            FPU_MAGIC => 1,
+            LSX_MAGIC => 2,
+            LASX_MAGIC => 4,
+            _ => return Err(VmError::InvalidRange),
+        };
+        if user_fp_lanes() < lanes {
+            return Err(VmError::InvalidRange);
+        }
+        Ok(Self { lanes })
+    }
+
+    /// 返回该互斥扩展的用户 ABI magic。
+    fn magic(&self) -> u32 {
+        match self.lanes {
+            1 => FPU_MAGIC,
+            2 => LSX_MAGIC,
+            4 => LASX_MAGIC,
+            _ => 0,
+        }
+    }
+
+    /// 返回寄存器之后 FCC 的字节偏移。
+    fn registers_size(&self) -> usize {
+        32 * self.lanes * 8
+    }
+
+    /// 返回含尾部 ABI padding 的具体 body 大小。
+    fn body_size(&self) -> usize {
+        self.registers_size() + 16
+    }
+
+    /// LASX body 需 32 字节对齐，其余扩展沿记录头的 16 字节边界。
+    fn alignment(&self) -> usize {
+        if self.lanes == 4 {
+            32
+        } else {
+            16
+        }
+    }
+}
 
 impl UserContext {
     /// 在普通任务中完整写入用户帧后改变 handler 现场；逐页 uaccess 可缺页或处理 COW。
     /// 调用者不得持有 siglock、IRQ guard 或用户现场借用外的短锁。
     pub(crate) fn setup_signal(&mut self, mm: &Mm, args: &SignalFrameArgs) -> Result<(), VmError> {
-        let sp = frame_address(self.gpr[3], args)?;
-        let mut bytes = [0u8; FRAME_SIZE];
+        let layout = FpLayout::current();
+        let (sp, frame_size, record_size) = frame_address(self.gpr[3], args, &layout)?;
+        let mut bytes = [0u8; MAX_FRAME_SIZE];
         args.info.encode(&mut bytes[..INFO_SIZE]);
         put_u64(&mut bytes, STACK, args.altstack.base as u64);
         put_u32(&mut bytes, STACK + 8, args.altstack.flags);
@@ -44,23 +106,34 @@ impl UserContext {
         for (index, register) in self.gpr.iter().enumerate().skip(1) {
             put_u64(&mut bytes, REGISTERS + index * 8, *register as u64);
         }
-        put_u32(&mut bytes, FLAGS, context_flags(args));
-        put_u32(&mut bytes, EXTCONTEXT, FPU_MAGIC);
-        put_u32(&mut bytes, EXTCONTEXT + 4, FPU_RECORD_SIZE as u32);
-        let fpu = EXTCONTEXT + SCTX_INFO_SIZE;
-        for (index, register) in self.fpr.iter().enumerate() {
-            put_u64(&mut bytes, fpu + index * 8, *register);
+        put_u32(&mut bytes, FLAGS, context_flags(args, layout.lanes != 0));
+        if layout.lanes != 0 {
+            put_u32(&mut bytes, EXTCONTEXT, layout.magic());
+            put_u32(&mut bytes, EXTCONTEXT + 4, record_size as u32);
+            let body = EXTCONTEXT + SCTX_INFO_SIZE;
+            for (index, register) in self.fpr.iter().enumerate() {
+                for lane in 0..layout.lanes {
+                    put_u64(
+                        &mut bytes,
+                        body + (index * layout.lanes + lane) * 8,
+                        register.lanes[lane],
+                    );
+                }
+            }
+            put_u64(&mut bytes, body + layout.registers_size(), self.fcc as u64);
+            put_u32(
+                &mut bytes,
+                body + layout.registers_size() + 8,
+                self.fcsr as u32,
+            );
         }
-        put_u64(&mut bytes, fpu + 256, self.fcc as u64);
-        put_u32(&mut bytes, fpu + 264, self.fcsr as u32);
-        // 清零缓冲同时初始化所有 ABI padding、uc_flags/link 和最终 magic=0/size=0。
-        let progress = mm.copyout(sp, &bytes);
+        // 清零缓冲同时初始化全部 ABI padding、uc_flags/link 和最终 magic=0/size=0。
+        let progress = mm.copyout(sp, &bytes[..frame_size]);
         if let Some(error) = progress.error {
             return Err(error);
         }
         assert_eq!(
-            progress.copied,
-            bytes.len(),
+            progress.copied, frame_size,
             "successful signal frame copy is incomplete"
         );
         self.gpr[1] = args.trampoline;
@@ -73,7 +146,7 @@ impl UserContext {
     }
 
     /// 从当前用户 SP 解码完整候选；任何复制或记录错误都不修改当前现场及信号状态。
-    /// 完整验证成功后若 FCSR 有已启用异常，先将清除 cause 的值回写用户帧；回写失败仍不提交候选。
+    /// 完整验证成功后若 FCSR 有已启用异常，先回写清除 cause 的原槽，失败仍不提交候选。
     pub(crate) fn restore_signal(&self, mm: &Mm) -> Result<SignalFrameRestore, VmError> {
         let sp = self.gpr[3];
         if sp & 15 != 0 {
@@ -86,35 +159,57 @@ impl UserContext {
             return Err(VmError::InvalidRange);
         }
         let altstack = decode_altstack(&bytes);
-        // new 清除异常 CSR 与 kernel_sp；恢复只写用户整数、PC 和浮点字段。
+        // new 清除异常 CSR 与 kernel_sp；用户帧只提供整数、PC 和扩展寄存器。
         let mut context = Self::new(get_u64(&bytes, MCONTEXT) as usize, 0);
         for (index, register) in context.gpr.iter_mut().enumerate().skip(1) {
             *register = get_u64(&bytes, REGISTERS + index * 8) as usize;
         }
         let magic = get_u32(&bytes, EXTCONTEXT);
         let size = get_u32(&bytes, EXTCONTEXT + 4) as usize;
-        match magic {
-            0 if size == 0 && flags & SC_USED_FP == 0 => {}
-            FPU_MAGIC if FPU_RECORD_SIZE <= size && size & 15 == 0 => {
-                let record = sp.checked_add(EXTCONTEXT).ok_or(VmError::InvalidRange)?;
-                let end = record.checked_add(size).ok_or(VmError::InvalidRange)?;
-                let mut fpu = [0u8; FPU_CONTEXT_SIZE];
-                copyin_exact(mm, record + SCTX_INFO_SIZE, &mut fpu)?;
-                let mut terminator = [0u8; SCTX_INFO_SIZE];
-                copyin_exact(mm, end, &mut terminator)?;
-                // 只有实际保存的 FPU 记录可恢复；重复 FPU、LSX/LASX/LBT 或未知 magic 均失败。
-                if get_u32(&terminator, 0) != 0 || get_u32(&terminator, 4) != 0 {
-                    return Err(VmError::InvalidRange);
-                }
-                for (index, register) in context.fpr.iter_mut().enumerate() {
-                    *register = get_u64(&fpu, index * 8);
-                }
-                context.fcc = get_u64(&fpu, 256) as usize;
-                context.fcsr = get_u32(&fpu, 264) as usize;
+        let mut fcsr_address = None;
+        if magic == 0 {
+            if size != 0 || flags & SC_USED_FP != 0 {
+                return Err(VmError::InvalidRange);
             }
-            _ => return Err(VmError::InvalidRange),
+        } else {
+            let layout = FpLayout::decode(magic)?;
+            let record = sp.checked_add(EXTCONTEXT).ok_or(VmError::InvalidRange)?;
+            let body = record
+                .checked_add(SCTX_INFO_SIZE)
+                .ok_or(VmError::InvalidRange)?;
+            if size < SCTX_INFO_SIZE + layout.body_size()
+                || size & 15 != 0
+                || body & (layout.alignment() - 1) != 0
+            {
+                return Err(VmError::InvalidRange);
+            }
+            let end = record.checked_add(size).ok_or(VmError::InvalidRange)?;
+            let frame_end = end
+                .checked_add(SCTX_INFO_SIZE)
+                .ok_or(VmError::InvalidRange)?;
+            if USER_ADDRESS_END < frame_end {
+                return Err(VmError::InvalidRange);
+            }
+            let mut fp = [0u8; MAX_BODY_SIZE];
+            copyin_exact(mm, body, &mut fp[..layout.body_size()])?;
+            // 合法放大记录的 padding 也完整访问，不能跳过用户声明但未映射的帧范围。
+            copyin_padding(mm, body + layout.body_size(), end)?;
+            let mut terminator = [0u8; SCTX_INFO_SIZE];
+            copyin_exact(mm, end, &mut terminator)?;
+            // 当前 ABI 只持一个互斥 FP/LSX/LASX 记录，重复和其它扩展不能覆盖候选。
+            if get_u32(&terminator, 0) != 0 || get_u32(&terminator, 4) != 0 {
+                return Err(VmError::InvalidRange);
+            }
+            for (index, register) in context.fpr.iter_mut().enumerate() {
+                for lane in 0..layout.lanes {
+                    register.lanes[lane] = get_u64(&fp, (index * layout.lanes + lane) * 8);
+                }
+            }
+            context.fcc = get_u64(&fp, layout.registers_size()) as usize;
+            context.fcsr = get_u32(&fp, layout.registers_size() + 8) as usize;
+            fcsr_address = Some(body + layout.registers_size() + 8);
         }
-        let pending_signal = restore_fcsr_pending(mm, sp, &mut context)?;
+        let pending_signal = restore_fcsr_pending(mm, fcsr_address, &mut context)?;
         Ok(SignalFrameRestore {
             context,
             mask: get_u64(&bytes, MASK) & !UNBLOCKABLE,
@@ -124,8 +219,12 @@ impl UserContext {
     }
 }
 
-/// 选择普通栈或备用栈顶部并检查整个含扩展记录的帧，不让嵌套帧越过备用栈底。
-fn frame_address(sp: usize, args: &SignalFrameArgs) -> Result<usize, VmError> {
+/// 从栈顶先分配 END，再对齐具体 body 并分配记录头；精确检查实际完整帧的备用栈范围。
+fn frame_address(
+    sp: usize,
+    args: &SignalFrameArgs,
+    layout: &FpLayout,
+) -> Result<(usize, usize, usize), VmError> {
     let stack = args.altstack;
     let nested = stack.on_stack(sp);
     let use_altstack = args.action.flags & SA_ONSTACK != 0
@@ -140,17 +239,31 @@ fn frame_address(sp: usize, args: &SignalFrameArgs) -> Result<usize, VmError> {
     } else {
         sp
     };
-    let address = (top & !15)
-        .checked_sub(FRAME_SIZE)
+    let top_aligned = top & !15;
+    let end = top_aligned
+        .checked_sub(SCTX_INFO_SIZE)
         .ok_or(VmError::InvalidRange)?;
-    if USER_ADDRESS_END < top || ((nested || use_altstack) && address <= stack.base) {
+    let record = if layout.lanes == 0 {
+        end
+    } else {
+        let body = end
+            .checked_sub(layout.body_size())
+            .ok_or(VmError::InvalidRange)?
+            & !(layout.alignment() - 1);
+        body.checked_sub(SCTX_INFO_SIZE)
+            .ok_or(VmError::InvalidRange)?
+    };
+    let address = record
+        .checked_sub(EXTCONTEXT)
+        .ok_or(VmError::InvalidRange)?;
+    if USER_ADDRESS_END < top || ((nested || use_altstack) && address < stack.base) {
         return Err(VmError::InvalidRange);
     }
-    Ok(address)
+    Ok((address, top_aligned - address, end - record))
 }
 
-/// eager FPU 保存真实浮点记录；PageFault 的 trap 是公共访问判别，不是硬件异常号。
-fn context_flags(args: &SignalFrameArgs) -> u32 {
+/// 标记实际保存的浮点扩展及故障方向，公共访问判别不当作硬件异常号。
+fn context_flags(args: &SignalFrameArgs, used_fp: bool) -> u32 {
     let direction = match args.info.payload {
         SignalPayload::Fault { trap, .. } if trap == UserAccess::Write as usize => SC_ADDRERR_WR,
         SignalPayload::Fault { trap, .. }
@@ -160,7 +273,7 @@ fn context_flags(args: &SignalFrameArgs) -> u32 {
         }
         _ => 0,
     };
-    SC_USED_FP | direction
+    u32::from(used_fp) | direction
 }
 
 /// 完整解码备用栈原始候选；是否可替换登记由信号状态所有者按恢复后的 SP 判断。
@@ -175,7 +288,7 @@ fn decode_altstack(bytes: &[u8]) -> AltStack {
 /// 将帧中已启用的浮点异常 cause 清除并回写原槽，成功后请求内核生成的同步 SIGFPE。
 fn restore_fcsr_pending(
     mm: &Mm,
-    sp: usize,
+    address: Option<usize>,
     context: &mut UserContext,
 ) -> Result<Option<SignalInfo>, VmError> {
     let fcsr = context.fcsr as u32;
@@ -184,10 +297,10 @@ fn restore_fcsr_pending(
         return Ok(None);
     }
     let cleared = fcsr & !enabled;
-    let address = sp
-        .checked_add(EXTCONTEXT + SCTX_INFO_SIZE + 264)
-        .ok_or(VmError::InvalidRange)?;
-    let progress = mm.copyout(address, &cleared.to_le_bytes());
+    let progress = mm.copyout(
+        address.expect("pending FCSR requires an FP record"),
+        &cleared.to_le_bytes(),
+    );
     if let Some(error) = progress.error {
         return Err(error);
     }
@@ -197,6 +310,17 @@ fn restore_fcsr_pending(
     );
     context.fcsr = cleared as usize;
     Ok(Some(SignalInfo::kernel(8)))
+}
+
+/// 完整访问扩展记录尾部 padding，复用固定小缓冲且不为用户 size 分配内核存储。
+fn copyin_padding(mm: &Mm, mut address: usize, end: usize) -> Result<(), VmError> {
+    let mut bytes = [0u8; 128];
+    while address < end {
+        let count = (end - address).min(bytes.len());
+        copyin_exact(mm, address, &mut bytes[..count])?;
+        address += count;
+    }
+    Ok(())
 }
 
 /// 完整复制后才允许解码；跨页、缺页和 COW 的访问责任由正式 Mm 入口承担。

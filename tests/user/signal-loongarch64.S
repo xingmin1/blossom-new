@@ -1,72 +1,84 @@
 .text
 
-.macro FP_LOAD
-    fld.d $f0, $t1, 0
-    fld.d $f1, $t1, 8
-    fld.d $f2, $t1, 16
-    fld.d $f3, $t1, 24
-    fld.d $f4, $t1, 32
-    fld.d $f5, $t1, 40
-    fld.d $f6, $t1, 48
-    fld.d $f7, $t1, 56
-    fld.d $f8, $t1, 64
-    fld.d $f9, $t1, 72
-    fld.d $f10, $t1, 80
-    fld.d $f11, $t1, 88
-    fld.d $f12, $t1, 96
-    fld.d $f13, $t1, 104
-    fld.d $f14, $t1, 112
-    fld.d $f15, $t1, 120
-    fld.d $f16, $t1, 128
-    fld.d $f17, $t1, 136
-    fld.d $f18, $t1, 144
-    fld.d $f19, $t1, 152
-    fld.d $f20, $t1, 160
-    fld.d $f21, $t1, 168
-    fld.d $f22, $t1, 176
-    fld.d $f23, $t1, 184
-    fld.d $f24, $t1, 192
-    fld.d $f25, $t1, 200
-    fld.d $f26, $t1, 208
-    fld.d $f27, $t1, 216
-    fld.d $f28, $t1, 224
-    fld.d $f29, $t1, 232
-    fld.d $f30, $t1, 240
-    fld.d $f31, $t1, 248
+# /// 读取实际用户向量能力，返回 lanes、寄存器区字节数及互斥帧 magic。
+.macro FP_WIDTH
+    li.d $t0, 2
+    cpucfg $t0, $t0
+    li.d $t6, 1
+    li.d $t8, 0x46505501
+    andi $t7, $t0, 0x40
+    beqz $t7, .Lfp_width_done\@
+    li.d $t6, 2
+    li.d $t8, 0x53580001
+    andi $t7, $t0, 0x80
+    beqz $t7, .Lfp_width_done\@
+    li.d $t6, 4
+    li.d $t8, 0x41535801
+.Lfp_width_done\@:
+    slli.d $t7, $t6, 8
 .endm
+
+# /// 按具体架构宽度装载全部重叠寄存器，原标量 CPU 仍只执行 fld.d。
+.macro FP_LOAD
+    FP_WIDTH
+    li.d $t0, 4
+    beq $t6, $t0, .Lfp_load_lasx\@
+    li.d $t0, 2
+    beq $t6, $t0, .Lfp_load_lsx\@
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        fld.d $f\n, $t1, \n*8
+    .endr
+    b .Lfp_load_done\@
+.Lfp_load_lsx\@:
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        vld $vr\n, $t1, \n*16
+    .endr
+    b .Lfp_load_done\@
+.Lfp_load_lasx\@:
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        xvld $xr\n, $t1, \n*32
+    .endr
+.Lfp_load_done\@:
+.endm
+
+# /// 将全部实际 lanes 写入独立输出，供 signal 和 fork 返回后的整数断言消费。
 .macro FP_STORE
-    fst.d $f0, $t1, 0
-    fst.d $f1, $t1, 8
-    fst.d $f2, $t1, 16
-    fst.d $f3, $t1, 24
-    fst.d $f4, $t1, 32
-    fst.d $f5, $t1, 40
-    fst.d $f6, $t1, 48
-    fst.d $f7, $t1, 56
-    fst.d $f8, $t1, 64
-    fst.d $f9, $t1, 72
-    fst.d $f10, $t1, 80
-    fst.d $f11, $t1, 88
-    fst.d $f12, $t1, 96
-    fst.d $f13, $t1, 104
-    fst.d $f14, $t1, 112
-    fst.d $f15, $t1, 120
-    fst.d $f16, $t1, 128
-    fst.d $f17, $t1, 136
-    fst.d $f18, $t1, 144
-    fst.d $f19, $t1, 152
-    fst.d $f20, $t1, 160
-    fst.d $f21, $t1, 168
-    fst.d $f22, $t1, 176
-    fst.d $f23, $t1, 184
-    fst.d $f24, $t1, 192
-    fst.d $f25, $t1, 200
-    fst.d $f26, $t1, 208
-    fst.d $f27, $t1, 216
-    fst.d $f28, $t1, 224
-    fst.d $f29, $t1, 232
-    fst.d $f30, $t1, 240
-    fst.d $f31, $t1, 248
+    FP_WIDTH
+    li.d $t0, 4
+    beq $t6, $t0, .Lfp_store_lasx\@
+    li.d $t0, 2
+    beq $t6, $t0, .Lfp_store_lsx\@
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        fst.d $f\n, $t1, \n*8
+    .endr
+    b .Lfp_store_done\@
+.Lfp_store_lsx\@:
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        vst $vr\n, $t1, \n*16
+    .endr
+    b .Lfp_store_done\@
+.Lfp_store_lasx\@:
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        xvst $xr\n, $t1, \n*32
+    .endr
+.Lfp_store_done\@:
+.endm
+
+# /// 比较真正寄存器 store 的全部有效 lanes，不以内核或帧初值替代往返行为。
+.macro FP_CHECK code
+    la.local $t1, .Lfp_output
+    FP_STORE
+    la.local $t1, .Lfp_values
+    la.local $t2, .Lfp_output
+    slli.d $t3, $t6, 5
+.Lfp_check_loop\@:
+    ld.d $t4, $t1, 0
+    ld.d $t5, $t2, 0
+    EQ $t4, $t5, \code
+    addi.d $t1, $t1, 8
+    addi.d $t2, $t2, 8
+    addi.d $t3, $t3, -1
+    bnez $t3, .Lfp_check_loop\@
 .endm
 
 .macro FCC_INIT
@@ -726,7 +738,7 @@ _start:
     li.d $s8, 200
     b .Lexit
 
-# /// 处理函数使用自己的栈区，sigreturn恢复全部32个FP及FCSR并采用用户修改的PC/SP。
+# /// 处理函数改写硬件寄存器，sigreturn 恢复全部实际 lanes、FCC/FCSR 和用户修改的 PC/SP。
 .Lframe:
     ACTION 10, .Ledit_frame, 4, 0, 54
     la.local $t1, .Lfp_values
@@ -735,6 +747,38 @@ _start:
     movgr2fcsr $fcsr0, $t0
     FCC_INIT
     li.d $tp, 0x12345000
+    # 全部 lanes 在实际用户计算、timer 抢占及显式让出之后保持原值。
+    li.d $a0, 1
+    la.local $a1, .Lclock_a
+    SC 113
+    OK 59
+    la.local $t1, .Lclock_a
+    ld.d $s6, $t1, 0
+    li.d $t0, 1000000000
+    mul.d $s6, $s6, $t0
+    ld.d $t2, $t1, 8
+    add.d $s6, $s6, $t2
+.Lframe_compute:
+    li.d $t0, 65536
+1:
+    addi.d $t0, $t0, -1
+    bnez $t0, 1b
+    FP_CHECK 59
+    li.d $a0, 1
+    la.local $a1, .Lclock_b
+    SC 113
+    OK 59
+    la.local $t1, .Lclock_b
+    ld.d $t2, $t1, 0
+    li.d $t0, 1000000000
+    mul.d $t2, $t2, $t0
+    ld.d $t3, $t1, 8
+    add.d $t2, $t2, $t3
+    sub.d $t2, $t2, $s6
+    li.d $t0, 50000000
+    bltu $t2, $t0, .Lframe_compute
+    SC 124
+    FP_CHECK 59
     SEND 10, 55
     li.d $s8, 56
     b .Lexit
@@ -745,22 +789,30 @@ _start:
     CHECK $r21, 0x76543000, 222
     SC 172
     EQ $a0, $s0, 221
-    la.local $t1, .Lfp_output
-    FP_STORE
-    la.local $t1, .Lfp_values
-    la.local $t2, .Lfp_output
-    li.d $t3, 32
-1:
-    ld.d $t4, $t1, 0
-    ld.d $t5, $t2, 0
-    EQ $t4, $t5, 59
-    addi.d $t1, $t1, 8
-    addi.d $t2, $t2, 8
-    addi.d $t3, $t3, -1
-    bnez $t3, 1b
+    FP_CHECK 59
     movfcsr2gr $t2, $fcsr0
     CHECK $t2, 0x100, 60
     FCC_CHECK
+    # 真正 fork 的子进程再次消费所有硬件 lanes，父等待原退出值后继续帧异常检查。
+    li.d $a0, 17
+    move $a1, $zero
+    move $a2, $zero
+    move $a3, $zero
+    move $a4, $zero
+    SC 220
+    beqz $a0, .Lframe_fork_child
+    li.d $s8, 224
+    blt $a0, $zero, .Lexit
+    move $s5, $a0
+    la.local $a1, .Lfp_output
+    move $a2, $zero
+    move $a3, $zero
+    SC 260
+    EQ $a0, $s5, 225
+    la.local $t1, .Lfp_output
+    ld.w $t2, $t1, 0
+    CHECK $t2, 0, 226
+    FP_CHECK 229
     # sigreturn帧启用已有cause后，SIGFPE必须在下一条用户指令前到达。
     ACTION 8, .Lfpe_pending, 4, 0, 183
     ACTION 10, .Linject_fcsr, 4, 0, 184
@@ -772,6 +824,13 @@ _start:
     movfcsr2gr $t2, $fcsr0
     CHECK $t2, 0x101, 187
     movgr2fcsr $fcsr0, $zero
+    b .Lpass
+# /// 子进程在独立 Mm 中消费 fork 复制后的全部硬件寄存器并报告原退出状态。
+.Lframe_fork_child:
+    FP_CHECK 227
+    FCC_CHECK
+    movfcsr2gr $t2, $fcsr0
+    CHECK $t2, 0x100, 228
     b .Lpass
 
 # /// 匿名私有altstack先触页再fork；child内核frame copyout必须COW而父整页保持图样。
@@ -1498,6 +1557,7 @@ _start:
     st.w $t2, $s2, 12
     jr $ra
 
+# /// 校验具体扩展头、全部 lanes、尾部对齐与 END，再破坏硬件现场供 sigreturn 恢复。
 .Ledit_frame:
     CHECK $a0, 10, 145
     ld.w $t2, $a1, 0
@@ -1506,21 +1566,42 @@ _start:
     CHECK $t2, 0, 176
     ld.w $t2, $a1, 16
     EQ $t2, $s0, 177
-    ld.w $t2, $a2, 728
+    FP_WIDTH
+    addi.d $t1, $a2, 464
+    add.d $t1, $t1, $t7
+    ld.w $t2, $t1, 8
     CHECK $t2, 0x100, 178
-    ld.d $t2, $a2, 720
+    ld.d $t2, $t1, 0
     CHECK $t2, 0x0100010001000100, 223
     ld.w $t2, $a2, 448
-    CHECK $t2, 0x46505501, 179
-    ld.w $t2, $a2, 452
-    CHECK $t2, 288, 180
-    ld.w $t2, $a2, 736
+    EQ $t2, $t8, 179
+    ld.wu $t2, $a2, 452
+    addi.d $t3, $t7, 32
+    li.d $s8, 180
+    bltu $t2, $t3, .Lexit
+    sub.d $t4, $t2, $t3
+    beqz $t4, 2f
+    CHECK $t6, 4, 180
+    CHECK $t4, 16, 180
+2:
+    addi.d $t1, $a2, 448
+    add.d $t1, $t1, $t2
+    ld.w $t2, $t1, 0
     CHECK $t2, 0, 181
-    ld.w $t2, $a2, 740
+    ld.w $t2, $t1, 4
     CHECK $t2, 0, 181
     addi.d $t1, $a2, 464
+    # body 对齐必须是 max(16, lanes*8)，LASX 的头本身仍只需 16 字节。
+    li.d $t0, 16
+    li.d $t3, 4
+    bne $t6, $t3, 3f
+    li.d $t0, 32
+3:
+    addi.d $t0, $t0, -1
+    and $t2, $t1, $t0
+    CHECK $t2, 0, 181
     la.local $t2, .Lfp_values
-    li.d $t3, 32
+    slli.d $t3, $t6, 5
 1:
     ld.d $t4, $t1, 0
     ld.d $t5, $t2, 0
@@ -1537,7 +1618,8 @@ _start:
     # 用户r21与内核CpuLocal/KS0各自保存，修改此字段不能污染下一次kernel入口。
     li.d $t1, 0x76543000
     st.d $t1, $a2, 352
-    la.local $t1, .Lfp_output
+    # handler独立零图样必须改变每个有效lane，观测输出不能作为破坏来源。
+    la.local $t1, .Lfp_clobber
     FP_LOAD
     li.d $t0, 0
     movgr2fcsr $fcsr0, $t0
@@ -1595,7 +1677,9 @@ _start:
 
 # /// 原frame与再次递送frame的cause均必须清零，siginfo保存内核生成的SIGFPE事实。
 .Linject_fcsr:
-    addi.d $t1, $a2, 728
+    FP_WIDTH
+    addi.d $t1, $a2, 472
+    add.d $t1, $t1, $t7
     st.d $t1, $s2, 40
     li.d $t0, 0x01000101
     st.w $t0, $t1, 0
@@ -1616,7 +1700,10 @@ _start:
     ld.d $t1, $s2, 40
     ld.w $t2, $t1, 0
     CHECK $t2, 0x101, 192
-    ld.w $t2, $a2, 728
+    FP_WIDTH
+    addi.d $t1, $a2, 472
+    add.d $t1, $t1, $t7
+    ld.w $t2, $t1, 0
     CHECK $t2, 0x101, 193
     li.d $t0, 1
     st.w $t0, $s2, 48
@@ -1669,7 +1756,7 @@ _start:
 .Lold_stack: .zero 24
 .Lfile_path: .asciz "/test/data.bin"
 .Lfault_file_path: .asciz "/test/io-data.bin"
-.balign 16
+.balign 32
 .Lfp_values:
     .quad 0x3ff0000000000000
     .quad 0x3ff0000000010001
@@ -1703,10 +1790,16 @@ _start:
     .quad 0x3ff00000001d001d
     .quad 0x3ff00000001e001e
     .quad 0x3ff00000001f001f
+    .set fp_lane, 32
+    .rept 96
+        .quad 0x8190000000000000 + fp_lane
+        .set fp_lane, fp_lane + 1
+    .endr
 
 .bss
-.balign 16
-.Lfp_output: .zero 256
+.balign 32
+.Lfp_output: .zero 1024
+.Lfp_clobber: .zero 1024
 .Lnew_stack: .zero 16384
 .Lnew_stack_top:
 .Lchild_stack: .zero 16384

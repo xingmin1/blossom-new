@@ -1,5 +1,33 @@
 .text
 
+# /// 按共享最宽槽访问整组寄存器，标量和 LSX 只触及实际支持的低 lanes。
+.macro LA_FP_REGS insn, prefix
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        \insn $\prefix\()\n, $sp, {fpr}+\n*32
+    .endr
+.endm
+
+# /// 用户消费者从独立输入加载实际高 lanes 并写回结果，浮点循环不依赖内核初值。
+.macro LA_PROBE_VECTOR
+    li.w $t0, 2
+    cpucfg $t0, $t0
+    andi $t1, $t0, 0x80
+    bnez $t1, .Lprobe_lasx\@
+    andi $t1, $t0, 0x40
+    beqz $t1, .Lprobe_scalar\@
+    vld $vr31, $a6, 96
+    vst $vr31, $a6, 128
+    b .Lprobe_vector_done\@
+.Lprobe_lasx\@:
+    xvld $xr31, $a6, 96
+    xvst $xr31, $a6, 128
+    b .Lprobe_vector_done\@
+.Lprobe_scalar\@:
+    fld.d $f31, $a6, 96
+    fst.d $f31, $a6, 128
+.Lprobe_vector_done\@:
+.endm
+
 # 本次普通 Rust 调用的 160 字节续接帧，保持 16 字节 ABI 对齐。
 .balign 64
 .global la_run_user
@@ -42,40 +70,33 @@ la_run_user:
     la.abs $t0, la_user_trap
     csrwr $t0, 12
     move $sp, $a0
-    li.w $t0, 1
-    csrwr $t0, 2
-    fld.d $f0, $sp, {fpr}+0*8
-    fld.d $f1, $sp, {fpr}+1*8
-    fld.d $f2, $sp, {fpr}+2*8
-    fld.d $f3, $sp, {fpr}+3*8
-    fld.d $f4, $sp, {fpr}+4*8
-    fld.d $f5, $sp, {fpr}+5*8
-    fld.d $f6, $sp, {fpr}+6*8
-    fld.d $f7, $sp, {fpr}+7*8
-    fld.d $f8, $sp, {fpr}+8*8
-    fld.d $f9, $sp, {fpr}+9*8
-    fld.d $f10, $sp, {fpr}+10*8
-    fld.d $f11, $sp, {fpr}+11*8
-    fld.d $f12, $sp, {fpr}+12*8
-    fld.d $f13, $sp, {fpr}+13*8
-    fld.d $f14, $sp, {fpr}+14*8
-    fld.d $f15, $sp, {fpr}+15*8
-    fld.d $f16, $sp, {fpr}+16*8
-    fld.d $f17, $sp, {fpr}+17*8
-    fld.d $f18, $sp, {fpr}+18*8
-    fld.d $f19, $sp, {fpr}+19*8
-    fld.d $f20, $sp, {fpr}+20*8
-    fld.d $f21, $sp, {fpr}+21*8
-    fld.d $f22, $sp, {fpr}+22*8
-    fld.d $f23, $sp, {fpr}+23*8
-    fld.d $f24, $sp, {fpr}+24*8
-    fld.d $f25, $sp, {fpr}+25*8
-    fld.d $f26, $sp, {fpr}+26*8
-    fld.d $f27, $sp, {fpr}+27*8
-    fld.d $f28, $sp, {fpr}+28*8
-    fld.d $f29, $sp, {fpr}+29*8
-    fld.d $f30, $sp, {fpr}+30*8
-    fld.d $f31, $sp, {fpr}+31*8
+    # EUEN 只取 CPUCFG2 中具有完整依赖的 FP/LSX/LASX 能力。
+    li.w $t0, 2
+    cpucfg $t0, $t0
+    andi $t1, $t0, 1
+    beqz $t1, .Lrestore_euen
+    andi $t2, $t0, 0x40
+    beqz $t2, .Lrestore_euen
+    ori $t1, $t1, 2
+    andi $t2, $t0, 0x80
+    beqz $t2, .Lrestore_euen
+    ori $t1, $t1, 4
+.Lrestore_euen:
+    csrwr $t1, 2
+    csrrd $t0, 2
+    andi $t1, $t0, 4
+    bnez $t1, .Lrestore_lasx
+    andi $t1, $t0, 2
+    bnez $t1, .Lrestore_lsx
+    beqz $t0, .Lrestore_fp_done
+    LA_FP_REGS fld.d, f
+    b .Lrestore_fp_control
+.Lrestore_lsx:
+    LA_FP_REGS vld, vr
+    b .Lrestore_fp_control
+.Lrestore_lasx:
+    LA_FP_REGS xvld, xr
+.Lrestore_fp_control:
     ld.d $t0, $sp, {fcsr}
     movgr2fcsr $fcsr0, $t0
     ld.d $t0, $sp, {fcc}
@@ -95,6 +116,7 @@ la_run_user:
     movgr2cf $fcc6, $t1
     bstrpick.d $t1, $t0, 63, 56
     movgr2cf $fcc7, $t1
+.Lrestore_fp_done:
     ld.d $t0, $sp, {pc}
     csrwr $t0, 6
     # 特权和 IRQ 状态只由内核常量构造，用户寄存器不参与 PRMD。
@@ -184,38 +206,20 @@ la_user_trap:
     st.d $t0, $sp, {estat}
     csrrd $t0, 7
     st.d $t0, $sp, {badv}
-    fst.d $f0, $sp, {fpr}+0*8
-    fst.d $f1, $sp, {fpr}+1*8
-    fst.d $f2, $sp, {fpr}+2*8
-    fst.d $f3, $sp, {fpr}+3*8
-    fst.d $f4, $sp, {fpr}+4*8
-    fst.d $f5, $sp, {fpr}+5*8
-    fst.d $f6, $sp, {fpr}+6*8
-    fst.d $f7, $sp, {fpr}+7*8
-    fst.d $f8, $sp, {fpr}+8*8
-    fst.d $f9, $sp, {fpr}+9*8
-    fst.d $f10, $sp, {fpr}+10*8
-    fst.d $f11, $sp, {fpr}+11*8
-    fst.d $f12, $sp, {fpr}+12*8
-    fst.d $f13, $sp, {fpr}+13*8
-    fst.d $f14, $sp, {fpr}+14*8
-    fst.d $f15, $sp, {fpr}+15*8
-    fst.d $f16, $sp, {fpr}+16*8
-    fst.d $f17, $sp, {fpr}+17*8
-    fst.d $f18, $sp, {fpr}+18*8
-    fst.d $f19, $sp, {fpr}+19*8
-    fst.d $f20, $sp, {fpr}+20*8
-    fst.d $f21, $sp, {fpr}+21*8
-    fst.d $f22, $sp, {fpr}+22*8
-    fst.d $f23, $sp, {fpr}+23*8
-    fst.d $f24, $sp, {fpr}+24*8
-    fst.d $f25, $sp, {fpr}+25*8
-    fst.d $f26, $sp, {fpr}+26*8
-    fst.d $f27, $sp, {fpr}+27*8
-    fst.d $f28, $sp, {fpr}+28*8
-    fst.d $f29, $sp, {fpr}+29*8
-    fst.d $f30, $sp, {fpr}+30*8
-    fst.d $f31, $sp, {fpr}+31*8
+    csrrd $t0, 2
+    andi $t1, $t0, 4
+    bnez $t1, .Lsave_lasx
+    andi $t1, $t0, 2
+    bnez $t1, .Lsave_lsx
+    beqz $t0, .Lsave_fp_done
+    LA_FP_REGS fst.d, f
+    b .Lsave_fp_control
+.Lsave_lsx:
+    LA_FP_REGS vst, vr
+    b .Lsave_fp_control
+.Lsave_lasx:
+    LA_FP_REGS xvst, xr
+.Lsave_fp_control:
     movfcsr2gr $t0, $fcsr0
     st.d $t0, $sp, {fcsr}
     movcf2gr $t0, $fcc0
@@ -234,6 +238,7 @@ la_user_trap:
     movcf2gr $t1, $fcc7
     bstrins.d $t0, $t1, 63, 56
     st.d $t0, $sp, {fcc}
+.Lsave_fp_done:
     csrwr $zero, 2
     ld.d $sp, $sp, {kernel_sp}
     ld.d $tp, $sp, 8
@@ -372,6 +377,7 @@ la_user_loop_entry:
     fcmp.clt.d $fcc7, $f1, $f0
     movcf2gr $t0, $fcc7
     st.d $t0, $a6, 56
+    LA_PROBE_VECTOR
 la_user_loop_spin:
     b la_user_loop_spin
 
