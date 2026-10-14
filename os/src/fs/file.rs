@@ -8,6 +8,7 @@ use crate::arch;
 use crate::block::{AccessMode, BlockError};
 use crate::fs::epoll::{EpollFile, WatchHead};
 use crate::fs::memfs::MemorySpecial;
+use crate::fs::pipe::PipeEnd;
 #[cfg(feature = "ktest")]
 use crate::fs::readahead::ReadaheadSnapshot;
 use crate::fs::readahead::ReadaheadState;
@@ -18,7 +19,7 @@ use crate::fs::{
 use crate::fs::{devfs, kmsg, ktrace, procfs};
 use crate::mm::space::{Mm, VmError};
 use crate::net::socket::SocketFile;
-use crate::sync::{SleepMutex, SpinLock};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::task::UserThread;
 
 /// 共享一个打开实例及其位置；最后引用释放该实例持有的路径。
@@ -419,6 +420,16 @@ pub trait FileLike: Send + Sync {
         None
     }
 
+    /// 只借用实际普通文件打开实例，跨文件传输不从属性或名字推断对象。
+    fn inode_file(&self) -> Option<&InodeFile> {
+        None
+    }
+
+    /// 只借用实际匿名管道端点，其它流没有管道页环能力。
+    fn pipe_end(&self) -> Option<&PipeEnd> {
+        None
+    }
+
     /// 可持久监测的OFD保留反向watch，最后释放先同步撤登记再结束其源拥有。
     fn watch_head(&self) -> Option<&Arc<WatchHead>> {
         None
@@ -439,6 +450,9 @@ pub trait FileLike: Send + Sync {
 
     /// 只改变支持的可变状态位，不修改访问模式与打开时路径约束。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError>;
+
+    /// 原子修改此 OFD 的非阻塞位，保留追加状态与全部不可变打开位。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError>;
 
     /// 在表锁与共享位置锁外截断普通可写文件，保持原位置；本操作可能等待真实 I/O。
     fn truncate(&self, new_size: u64) -> Result<(), FsError>;
@@ -551,7 +565,8 @@ pub fn open_path_with_flags(
             | MemorySpecial::Meminfo
             | MemorySpecial::Uptime
             | MemorySpecial::NetDev
-            | MemorySpecial::NetRoute => procfs::open(path, flags, special, vfs, caller),
+            | MemorySpecial::NetRoute
+            | MemorySpecial::Interrupts => procfs::open(path, flags, special, vfs, caller),
         };
     }
     match kind {
@@ -626,6 +641,11 @@ pub fn open_path_with_flags(
 }
 
 impl FileLike for InodeFile {
+    /// 传输调用者借用本打开实例，原 FileRef 继续承担完整寿命。
+    fn inode_file(&self) -> Option<&InodeFile> {
+        Some(self)
+    }
+
     /// 普通文件的显式字节位置由同一inode维护，不依赖共享游标或访问模式。
     fn positioned_io(&self) -> bool {
         true
@@ -701,6 +721,11 @@ impl FileLike for InodeFile {
     /// 更新同一 OFD 的可变状态，dup 的所有引用观察相同状态。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 复制引用共享同一非阻塞位，不读取或回写其它状态的旧快照。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
 
     /// 借用此 OFD 的原写拥有改变文件大小，不重新检查当前凭据、不消费位置或追加状态。
@@ -829,6 +854,56 @@ impl FileLike for InodeFile {
     }
 }
 
+impl InodeFile {
+    /// 在取得任何管道环之前锁住本 OFD 的隐式位置，调用者按稳定对象地址排序。
+    pub(crate) fn transfer_cursor(&self) -> SleepMutexGuard<'_, u64> {
+        self.cursor.lock()
+    }
+
+    /// 传输先核打开写拥有及当前挂载权限，追加目标由上层按 syscall 错误语义拒绝。
+    pub(crate) fn transfer_check_write(&self) -> Result<(), FsError> {
+        require_write(self.flags())?;
+        self.path.check_writable()
+    }
+
+    /// 只执行原 inode 写循环并返回实际接受量；调用者随后提交位置并在锁外完成同步。
+    pub(crate) fn transfer_write_at(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        append_error: FsError,
+    ) -> Result<usize, FsError> {
+        self.transfer_check_write()?;
+        if self.flags() & O_APPEND != 0 {
+            return Err(append_error);
+        }
+        check_write_range(offset, bytes.len())?;
+        let access = self
+            .write_access
+            .as_ref()
+            .expect("writable OFD has no write access");
+        let (start, accepted) =
+            access.write_from(offset, false, &mut WriteBuffer::kernel(bytes))?;
+        assert_eq!(start, offset);
+        Ok(accepted)
+    }
+
+    /// 位置和管道环释放后履行真实接受范围的同步及脏节流义务，不撤回已接受数据。
+    pub(crate) fn transfer_finish(
+        &self,
+        flags: u32,
+        start: u64,
+        accepted: usize,
+    ) -> Result<(), FsError> {
+        let result = sync_written(self, flags, start, accepted);
+        let inode = self.path.inode()?;
+        if 0 < accepted && !inode.is_memory() {
+            background::balance_dirty_pages(inode);
+        }
+        result
+    }
+}
+
 /// 仅对真实正接受量执行同步，O_SYNC 同时包含 O_DSYNC，失败返回原错误而非假正前缀。
 fn sync_written(file: &InodeFile, flags: u32, start: u64, bytes: usize) -> Result<(), FsError> {
     if bytes == 0 || flags & O_DSYNC == 0 {
@@ -894,6 +969,11 @@ impl FileLike for DirectoryFile {
     /// 目录状态与描述符属性分离，不改变枚举位置。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 只改变同一目录 OFD 的非阻塞位，不影响枚举位置与打开约束。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
 
     /// 目录描述符不提供普通文件截断，错误不改变枚举位置。
@@ -1008,6 +1088,16 @@ pub(crate) fn set_status_flags(flags: &AtomicU32, raw: u32) -> Result<(), FsErro
     let _ = flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
         Some((old & !MUTABLE_FLAGS) | (raw & MUTABLE_FLAGS))
     });
+    Ok(())
+}
+
+/// 单次原子读改写只修改非阻塞位，与其它状态更新共享同一原子对象。
+pub(crate) fn set_nonblocking(flags: &AtomicU32, enabled: bool) -> Result<(), FsError> {
+    if enabled {
+        flags.fetch_or(O_NONBLOCK, Ordering::Relaxed);
+    } else {
+        flags.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
+    }
     Ok(())
 }
 

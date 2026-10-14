@@ -2416,7 +2416,7 @@ pub(crate) mod programs {
         fixture.signal_suspend_restart_mask(context)
     }
 
-    /// 两架构逐个FP寄存器、FCSR/FCC和用户修改PC/SP由目标ISA验证。
+    /// 逐个 FP/向量寄存器、FCSR/FCC 和用户修改 PC/SP 经信号往返，LA 还必须经历真实用户 timer。
     #[test]
     fn signal_frame_registers_and_edited_context(
         context: &mut TestContext<'_>,
@@ -2425,6 +2425,13 @@ pub(crate) mod programs {
         fixture.prepare(context)?;
         let event = fixture.run_named(context, b"/test/bin/user-signal", b"f", false, 0)?;
         context.expect_eq(event.status, 0);
+        #[cfg(target_arch = "loongarch64")]
+        context.expect(
+            0 < event.user_timer_interrupts,
+            file!(),
+            line!(),
+            format_args!("full vector state did not cross a user timer interrupt"),
+        );
         Ok(())
     }
 

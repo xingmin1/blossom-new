@@ -1,7 +1,8 @@
 //! 有界外部 IRQ domain、共享 action 与同步注销；处理者在全部短锁之外执行。
 
 use crate::arch;
-use crate::boot::{BootInfo, MAX_INTERRUPT_SOURCES};
+use crate::boot::{BootInfo, MAX_CPUS, MAX_INTERRUPT_SOURCES};
+use crate::cpu;
 use crate::klog::Level;
 use crate::sync::SpinLock;
 use core::hint::spin_loop;
@@ -62,8 +63,8 @@ struct Descriptor {
     count: usize,
     handling: bool,
     reported: bool,
-    #[cfg(feature = "ktest")]
-    dispatch_count: usize,
+    interrupts: [usize; MAX_CPUS],
+    observed: bool,
 }
 
 impl Descriptor {
@@ -75,8 +76,8 @@ impl Descriptor {
             count: 0,
             handling: false,
             reported: false,
-            #[cfg(feature = "ktest")]
-            dispatch_count: 0,
+            interrupts: [0; MAX_CPUS],
+            observed: false,
         }
     }
 
@@ -92,6 +93,27 @@ impl Descriptor {
 
 static SOURCES: [SpinLock<Descriptor>; MAX_INTERRUPT_SOURCES] =
     [const { SpinLock::new(Descriptor::empty()) }; MAX_INTERRUPT_SOURCES];
+
+/// 单个外部源的逐核真实 claim 快照；观察记录在同步注销后仍然保留。
+pub(crate) struct SourceSnapshot {
+    pub(crate) interrupts: [usize; MAX_CPUS],
+    pub(crate) observed: bool,
+}
+
+/// 返回已发布的真实控制器源上界，尚未初始化时没有可观察的外部源。
+pub(crate) fn source_count() -> u32 {
+    SOURCE_COUNT.load(Ordering::Acquire)
+}
+
+/// 在单个源短锁内复制计数与观察事实，不把 descriptor 或锁移交给渲染者。
+pub(crate) fn source_snapshot(source: u32) -> Option<SourceSnapshot> {
+    let number = map_source(source).ok()?;
+    let descriptor = SOURCES[number.0 as usize].lock();
+    Some(SourceSnapshot {
+        interrupts: descriptor.interrupts,
+        observed: descriptor.observed,
+    })
+}
 
 /// 只在串行设备准备验收中数真实 action，包括尚未 enable 的登记，不推断全线状态。
 #[cfg(feature = "ktest")]
@@ -109,9 +131,13 @@ pub(crate) fn test_action_count(number: IrqNumber) -> usize {
 pub(crate) mod testing {
     use super::{IrqNumber, IrqRegistration, RegistrationState, SOURCES};
 
-    /// 读取此源在真实控制器成功 claim 后记录的分派次数，不推断任一设备 ISR。
+    /// 汇总此源的逐核真实 claim 次数，不推断任一设备 ISR 或共享 action 数。
     pub(crate) fn dispatch_count(number: IrqNumber) -> usize {
-        SOURCES[number.0 as usize].lock().dispatch_count
+        SOURCES[number.0 as usize]
+            .lock()
+            .interrupts
+            .iter()
+            .fold(0usize, |total, &count| total.wrapping_add(count))
     }
 
     /// 在同一 descriptor 临界区开放两个不同的 Live action，最后一次复查硬件屏蔽。
@@ -294,10 +320,11 @@ pub unsafe fn register(
     let count = descriptor.count;
     descriptor.order[count] = slot;
     descriptor.count += 1;
+    descriptor.observed = true;
     Ok(registration)
 }
 
-/// 有界消费本核真实 claim；同线所有准入 action 都运行，不把首个 false 当作处理完成。
+/// 有界消费本核真实 claim；每源每次 claim 只计一次，同线所有准入 action 都运行。
 pub fn handle_external() {
     for _ in 0..64 {
         let Some(source) = arch::external_claim() else {
@@ -311,10 +338,9 @@ pub fn handle_external() {
             arch::external_mask(source);
             assert!(!descriptor.handling, "IRQ source routed to concurrent CPUs");
             descriptor.handling = true;
-            #[cfg(feature = "ktest")]
-            {
-                descriptor.dispatch_count += 1;
-            }
+            let owner = cpu::current().id;
+            descriptor.interrupts[owner] = descriptor.interrupts[owner].wrapping_add(1);
+            descriptor.observed = true;
             // 取得执行引用与准入检查不可拆锁，注销不能在快照与计数之间释放 context。
             for index in 0..descriptor.count {
                 let slot = descriptor.order[index];

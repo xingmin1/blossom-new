@@ -19,6 +19,7 @@ pub(crate) mod poll;
 pub(crate) mod procfs;
 pub(crate) mod readahead;
 pub(crate) mod system;
+pub(crate) mod transfer;
 pub(crate) mod tty;
 mod types;
 pub(crate) mod writeback;
@@ -29,6 +30,7 @@ pub use file::{
     open_path, open_path_with_flags, stat_path, DirectoryFile, FileIoContext, FileLike, FileRef,
     FileStat, InodeFile, SeekFrom,
 };
+pub(crate) use file::{set_nonblocking, set_status_flags};
 pub use file::{ReadBuffer, UserIoVector, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
 pub(crate) use inode::{

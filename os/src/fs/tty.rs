@@ -703,6 +703,11 @@ impl FileLike for TtyFile {
         crate::fs::file::set_status_flags(&self.flags, raw)
     }
 
+    /// 只原子修改 TTY OFD 的非阻塞位，不改变终端状态和追加位。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        crate::fs::file::set_nonblocking(&self.flags, enabled)
+    }
+
     /// TTY 不能截断。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)

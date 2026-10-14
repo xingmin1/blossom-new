@@ -31,8 +31,6 @@ use crate::task::time::UserTime;
 use crate::task::{self, JoinHandle, Placement, PreparedTask, Task};
 use crate::wait::{WaitMode, Waiter};
 
-const USER_DESCRIPTOR_CAPACITY: usize = 128;
-
 /// 当前用户的不可变凭据；目录和文件权限判断使用真实 inode uid/gid/mode。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Credentials {
@@ -61,6 +59,9 @@ pub(crate) struct UserRuntime {
 }
 
 impl UserRuntime {
+    /// 普通用户表的固定容量，也是多路复用快照必须覆盖的最大编号范围。
+    pub(crate) const DESCRIPTOR_CAPACITY: usize = 1024;
+
     /// 在普通任务锁外准备运行资源并持已有网络域引用，失败不发表用户身份。
     pub(crate) fn try_new(
         vfs: Arc<Vfs>,
@@ -68,7 +69,7 @@ impl UserRuntime {
         credentials: Credentials,
         net: NetStackRef,
     ) -> Result<Self, crate::fs::FsError> {
-        let files = FileTable::try_new(USER_DESCRIPTOR_CAPACITY)?;
+        let files = FileTable::try_new(Self::DESCRIPTOR_CAPACITY)?;
         let files = Arc::try_new(files).map_err(|_| crate::fs::FsError::NoMemory)?;
         let fs = Arc::try_new(SleepMutex::new(UserFs { vfs, context }))
             .map_err(|_| crate::fs::FsError::NoMemory)?;

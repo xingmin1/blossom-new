@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::fs::file::{require_read, require_write, set_status_flags, stat_path};
+use crate::fs::file::{require_read, require_write, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
@@ -135,6 +135,11 @@ impl FileLike for NullFile {
         set_status_flags(&self.flags, raw)
     }
 
+    /// 原子修改共享 OFD 的非阻塞位，保留访问模式和追加状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
+    }
+
     /// 字符设备没有普通文件长度，不能截断。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
@@ -233,6 +238,11 @@ impl FileLike for ZeroFile {
     /// 复制描述符观察相同的可变状态位。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 原子修改共享 OFD 的非阻塞位，保留访问模式和追加状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
 
     /// 零设备没有可修改的文件长度。

@@ -22,6 +22,20 @@ unsafe impl Send for Scheduler {}
 
 static SCHED_LOCK: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
+/// 在原活登记锁内统计已发表且尚未离栈退出的执行者，不计私有准备对象或旧观察引用。
+pub(crate) fn live_task_count() -> usize {
+    let scheduler = SCHED_LOCK.lock();
+    let mut task = scheduler.live_head;
+    let mut count = 0;
+    while !task.is_null() {
+        count += 1;
+        // SAFETY: 活链的每个节点由调度器持有强引用；同一调度锁排除发表、摘离和归还，
+        // 此处只读取 live_next，不访问正在执行的寄存器现场或资源。
+        task = unsafe { (*(*task).scheduling.get()).live_next };
+    }
+    count
+}
+
 /// 归属与一次测试迁核目标使用同一准入判断，队列选择和 idle 重检不能分歧。
 fn allowed_on(data: &Scheduling, owner: usize) -> bool {
     let allowed = match data.placement {

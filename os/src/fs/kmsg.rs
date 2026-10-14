@@ -6,7 +6,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::fs::epoll::WatchHead;
-use crate::fs::file::{require_read, set_status_flags, stat_path};
+use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable, Pollable};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
@@ -228,6 +228,11 @@ impl FileLike for KmsgFile {
     /// 只改变现行公共状态位，不改变只读访问模式。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 只原子修改本日志 OFD 的非阻塞位，不改变记录游标和追加状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
 
     /// 只读日志节点不允许截断环中记录。

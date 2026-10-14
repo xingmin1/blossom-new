@@ -6,7 +6,8 @@ use core::fmt::{self, Write};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::fs::file::{require_read, set_status_flags, stat_path};
+use crate::boot::MAX_CPUS;
+use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
@@ -14,7 +15,7 @@ use crate::fs::{
 };
 use crate::net::NetStack;
 use crate::sync::SleepMutex;
-use crate::{accounting, cpu, mm, time};
+use crate::{accounting, cpu, irq, mm, time};
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024;
 
@@ -79,6 +80,7 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     fs.initialize_special(&root, b"mounts", MemorySpecial::Mounts, 0o444, 0)?;
     fs.initialize_special(&root, b"meminfo", MemorySpecial::Meminfo, 0o444, 0)?;
     fs.initialize_special(&root, b"uptime", MemorySpecial::Uptime, 0o444, 0)?;
+    fs.initialize_special(&root, b"interrupts", MemorySpecial::Interrupts, 0o444, 0)?;
     let net = fs.initialize_directory(&root, b"net", 0o555)?;
     fs.initialize_special(&net, b"dev", MemorySpecial::NetDev, 0o444, 0)?;
     fs.initialize_special(&net, b"route", MemorySpecial::NetRoute, 0o444, 0)?;
@@ -110,6 +112,7 @@ pub fn open(
         }
         MemorySpecial::Meminfo => meminfo()?,
         MemorySpecial::Uptime => uptime()?,
+        MemorySpecial::Interrupts => interrupts()?,
         MemorySpecial::NetDev | MemorySpecial::NetRoute => {
             let runtime = match caller {
                 FileIoContext::User(thread) => thread.runtime().ok_or(FsError::InvalidOperation)?,
@@ -133,6 +136,56 @@ pub fn open(
         flags: AtomicU32::new(flags),
     })
     .map_err(|_| FsError::NoMemory)?)
+}
+
+/// 固定本次 online CPU 列，逐行复制实际计数；源锁外有界渲染，不承诺跨核同时冻结。
+fn interrupts() -> Result<Vec<u8>, FsError> {
+    let mut online = [false; MAX_CPUS];
+    for (owner, column) in online.iter_mut().enumerate().take(cpu::count()) {
+        *column = cpu::get(owner).online.load(Ordering::Acquire);
+    }
+    let mut text = SnapshotText::try_new()?;
+    let result = (|| {
+        text.write_str("     ")?;
+        for (owner, &is_online) in online.iter().enumerate() {
+            if is_online {
+                write!(text, "CPU{:<8}", owner)?;
+            }
+        }
+        text.write_char('\n')?;
+        for (number, label) in [(0, "timer"), (1, "IPI")] {
+            write!(text, "{:>3}: ", number)?;
+            for (owner, &is_online) in online.iter().enumerate() {
+                if is_online {
+                    let local = cpu::get(owner);
+                    let count = if number == 0 {
+                        local.timer_interrupts.load(Ordering::Relaxed)
+                    } else {
+                        local.ipi_interrupts.load(Ordering::Relaxed)
+                    };
+                    write!(text, "{:10} ", count)?;
+                }
+            }
+            writeln!(text, "{}", label)?;
+        }
+        for source in 0..irq::source_count() {
+            let Some(snapshot) = irq::source_snapshot(source) else {
+                continue;
+            };
+            if !snapshot.observed {
+                continue;
+            }
+            write!(text, "{:>3}: ", source + 2)?;
+            for (owner, &is_online) in online.iter().enumerate() {
+                if is_online {
+                    write!(text, "{:10} ", snapshot.interrupts[owner])?;
+                }
+            }
+            writeln!(text, "external source {}", source)?;
+        }
+        Ok(())
+    })();
+    text.finish(result)
 }
 
 /// 先复制接口和 Root 提供的计数，再锁外格式化；未监测的 FIFO、frame、压缩、组播、碰撞及硬件 TX 错误为零。
@@ -304,6 +357,11 @@ impl FileLike for SnapshotFile {
     /// 只改变公共协议允许的状态，不改变只读访问模式。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 只原子修改本快照 OFD 的非阻塞位，不改变快照位置和追加状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
 
     /// 动态信息不能截断。

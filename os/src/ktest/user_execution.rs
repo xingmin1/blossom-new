@@ -5,6 +5,8 @@ use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::{self, UserAccess, UserContext, UserTrap};
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::{user_fp_lanes, FpRegister};
 use crate::ktest::execution_core::{baseline, until, Baseline};
 use crate::ktest::execution_services::SuiteBaseline;
 use crate::ktest::{prepare_result, ChildHandle, ChildToken};
@@ -318,17 +320,42 @@ fn image(offset: usize, slot: usize) -> Result<(Mm, UserContext, usize), TestErr
     context.gpr[TP] = 0x5100 + slot;
     context.gpr[GP] = 0x6100 + slot;
     context.gpr[A6] = DATA;
-    context.fpr = core::array::from_fn(|index| 0x3ff0000000000000 + (slot * 32 + index) as u64);
-    context.fpr[0] = if slot == 0 {
+    let mut scalar: [u64; 32] =
+        core::array::from_fn(|index| 0x3ff0000000000000 + (slot * 32 + index) as u64);
+    scalar[0] = if slot == 0 {
         0x3ff4000000000000
     } else {
         0x4020000000000000
     };
-    context.fpr[1] = if slot == 0 {
+    scalar[1] = if slot == 0 {
         0x4004000000000000
     } else {
         0x4030000000000000
     };
+    #[cfg(target_arch = "riscv64")]
+    {
+        context.fpr = scalar;
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let lanes = user_fp_lanes();
+        context.fpr = core::array::from_fn(|index| FpRegister {
+            lanes: core::array::from_fn(|lane| {
+                if lane == 0 {
+                    scalar[index]
+                } else if lane < lanes {
+                    0x7180 + (slot * 128 + index * 4 + lane) as u64
+                } else {
+                    0
+                }
+            }),
+        });
+        for lane in 0..4 {
+            let value = 0x8190 + (slot * 4 + lane) as u64;
+            let progress = mm.copyout(DATA + 96 + lane * 8, &value.to_le_bytes());
+            assert_eq!((progress.copied, progress.error), (8, None));
+        }
+    }
     Ok((mm, context, data))
 }
 
@@ -386,7 +413,10 @@ fn check_probe(words: [u64; 8], slot: usize, fcsr: usize) {
 #[derive(PartialEq, Eq)]
 struct Registers {
     gpr: [usize; 32],
+    #[cfg(target_arch = "riscv64")]
     fpr: [u64; 32],
+    #[cfg(target_arch = "loongarch64")]
+    fpr: [FpRegister; 32],
     fcsr: usize,
     #[cfg(target_arch = "loongarch64")]
     fcc: usize,
@@ -497,8 +527,25 @@ pub(crate) mod entry {
                     let fcc = user.context().fcc;
                     assert_eq!((fcc >> 24) & 0xff, 1);
                     assert_eq!((fcc >> 56) & 0xff, 0);
+                    let context = user.context();
+                    for lane in 0..user_fp_lanes() {
+                        let expected = 0x8190 + (slot * 4 + lane) as u64;
+                        assert_eq!(context.fpr[31].lanes[lane], expected);
+                        let mut bytes = [0u8; 8];
+                        let progress = user.mm().unwrap().copyin(&mut bytes, DATA + 128 + lane * 8);
+                        assert_eq!((progress.copied, progress.error), (8, None));
+                        assert_eq!(u64::from_le_bytes(bytes), expected);
+                    }
                 }
                 let saved = Registers::read(&user);
+                // fork 从真正执行过的完整现场派生，再让复制结果经过同一硬件进入/退出路径。
+                let copied = user.context().fork();
+                *user.context() = copied;
+                interrupted(&user, cpu::current().id);
+                assert!(
+                    Registers::read(&user) == saved,
+                    "copied user registers changed"
+                );
                 let id = task::current_task().id();
                 for target in (0..cpu::count()).chain(0..cpu::count()) {
                     if stop.load(Ordering::Acquire) || token.stop_requested() {
@@ -518,6 +565,11 @@ pub(crate) mod entry {
                 user.context().pc = CODE + arch::exit_offset();
                 assert_eq!(event(&user, &token, &stop)?, UserTrap::Syscall);
                 assert_eq!(user.context().gpr[A0], 43);
+                assert_eq!(
+                    user.context().fpr,
+                    saved.fpr,
+                    "user FP lanes changed across syscall"
+                );
                 Ok(43)
             })?;
         }

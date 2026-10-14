@@ -399,8 +399,104 @@ _start:
     CLOSE s1, 34
     JMP .Lpass
 
-# /// 满64KiB返回EAGAIN；释放一页后大向量只接受一页，部分uaccess故障保留已消费/提交前缀。
+# /// FIONBIO只改共享OFD的非阻塞位；其后满管道、向量和uaccess前缀仍走原行为。
 .Lnonblock:
+    MOV a0, s0
+    SC 23
+    CHECK a0, 2, 186
+    MOV s2, a0
+    MOV a0, s2
+    LI a1, 1
+    SC 25
+    OK 187
+    MOV a0, s0
+    LI a1, 4
+    LI a2, 0x400
+    SC 25
+    OK 188
+    MOV a0, s2
+    LI a1, 3
+    SC 25
+    CHECK a0, 0x400, 189
+    MOV a0, s2
+    LI a1, 0x5421
+    LA a2, .Lnonblock_on
+    SC 29
+    OK 190
+    MOV a0, s0
+    LI a1, 3
+    SC 25
+    CHECK a0, 0xc00, 191
+    MOV a0, s0
+    LA a1, .Lout
+    LI a2, 1
+    SC 63
+    CHECK a0, -11, 192
+    MOV a0, s0
+    LI a1, 0x5421
+    LI a2, 0x45000000
+    SC 29
+    CHECK a0, -14, 193
+    # 两字节零前缀可读，余下两字节越过真实映射末端；不能按部分int提交清位。
+    ADDI t1, s6, 2047
+    ADDI t1, t1, 2047
+    SB zero, t1, 0
+    SB zero, t1, 1
+    MOV a0, s2
+    LI a1, 0x5421
+    MOV a2, t1
+    SC 29
+    CHECK a0, -14, 194
+    MOV a0, s2
+    LI a1, 3
+    SC 25
+    CHECK a0, 0xc00, 195
+    LI a0, -1
+    LI a1, 0x5421
+    LI a2, 0x45000000
+    SC 29
+    CHECK a0, -9, 196
+    MOV a0, s0
+    LI a1, 0
+    LI a2, 0
+    SC 29
+    CHECK a0, -25, 197
+    MOV a0, s0
+    LI a1, 0x5421
+    LA a2, .Lnonblock_off
+    SC 29
+    OK 198
+    MOV a0, s2
+    LI a1, 3
+    SC 25
+    CHECK a0, 0x400, 199
+    MOV a0, s1
+    LI a1, 3
+    SC 25
+    CHECK a0, 0x801, 200
+    MOV a0, s0
+    LI a1, 1
+    SC 25
+    CHECK a0, 1, 201
+    MOV a0, s2
+    LI a1, 0x5421
+    LA a2, .Lnonblock_on
+    SC 29
+    OK 202
+    MOV a0, s0
+    LI a1, 3
+    SC 25
+    CHECK a0, 0xc00, 203
+    MOV a0, s2
+    LI a1, 4
+    LI a2, 0x800
+    SC 25
+    OK 204
+    MOV a0, s0
+    LI a1, 3
+    SC 25
+    CHECK a0, 0x800, 205
+    CLOSE s2, 206
     LI s4, 16
 .Lfill:
     WRITE s1, .Lpage, 4096, 35
@@ -740,7 +836,7 @@ _start:
     CLOSE s1, 119
     JMP .Lpass
 
-# /// EFAULT没有发表任何新fd；剩一槽时第二预留失败会退回首槽，随后原dup可使用它。
+# /// EFAULT不发表fd；真实耗尽后释放一槽，核第二预留失败归还首槽，再复用最后两槽。
 .Lreservation:
     LI a0, 0x45000000
     LI a1, 0
@@ -758,30 +854,36 @@ _start:
 .Lfill_table:
     MOV a0, s0
     SC 23
+    LI t0, -24
+    BEQ a0, t0, .Ltable_full
     FD 123
     ADDI s2, s2, 1
     EQ a0, s2, 124
-    LI t0, 126
-    BNE s2, t0, .Lfill_table
+    JMP .Lfill_table
+.Ltable_full:
+    MOV a0, s2
+    SC 57
+    OK 123
     LA a0, .Lfds
     LI a1, 0
     SC 59
     CHECK a0, -24, 125
-    LI a0, 127
+    MOV a0, s2
     LI a1, 1
     LI a2, 0
     SC 25
     CHECK a0, -9, 126
     MOV a0, s0
     SC 23
-    CHECK a0, 127, 127
+    EQ a0, s2, 127
     MOV a0, s0
     SC 23
     CHECK a0, -24, 128
-    LI a0, 127
+    MOV a0, s2
     SC 57
     OK 129
-    LI a0, 126
+    ADDI s3, s2, -1
+    MOV a0, s3
     SC 57
     OK 130
     LA a0, .Lfds
@@ -790,9 +892,9 @@ _start:
     OK 131
     LA t1, .Lfds
     LW t2, t1, 0
-    CHECK t2, 126, 132
+    EQ t2, s3, 132
     LW t2, t1, 4
-    CHECK t2, 127, 133
+    EQ t2, s2, 133
     LI a0, 0x45000000
     LI a1, 1
     SC 59
@@ -877,6 +979,8 @@ _start:
     .quad PIPE_USER_END-0x7ffff000, 0x7ffff000, PIPE_USER_END-4096, 8192
 .Lpipe_mask: .quad 0x1000
 .Lzero_time: .quad 0, 0
+.Lnonblock_on: .word -1
+.Lnonblock_off: .word 0
 .Loversize_vectors:
 .rept 17
     .quad .Lpage, 4096

@@ -6,7 +6,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::fs::epoll::WatchHead;
 use crate::fs::file::{
-    FileIoContext, FileLike, FileRef, FileStat, ReadBuffer, SeekFrom, WriteBuffer,
+    set_nonblocking, set_status_flags, FileIoContext, FileLike, FileRef, FileStat, InodeFile,
+    ReadBuffer, SeekFrom, WriteBuffer,
 };
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable, PollWaitHead, Pollable};
 use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path};
@@ -19,7 +20,6 @@ pub const PIPE_CAPACITY: usize = 16 * PIPE_BUF;
 const SLOTS: usize = 16;
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u32 = 0o2000000;
-const O_APPEND: u32 = 0o2000;
 const SPACE_SHIFT: u32 = 17;
 const BYTE_MASK: u64 = (1 << SPACE_SHIFT) - 1;
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
@@ -108,6 +108,45 @@ impl<const N: usize> PipeBuffer<N> {
             self.tail = (self.tail + 1) % N;
             self.used -= 1;
         }
+    }
+
+    /// 借用最早槽已经发表的初始化前缀；调用者必须在借用结束后才消费或移动该槽。
+    fn front(&mut self, limit: usize) -> &[u8] {
+        if self.is_empty() {
+            return &[];
+        }
+        let slot = self.slots[self.tail].as_mut().unwrap();
+        let count = limit.min(slot.length);
+        // SAFETY: 本槽仍独占原页，offset 和 length 只覆盖已提交字节；
+        // 返回借用受 ring 的独占借用限制，持有 ring 睡眠锁期间不能写槽或归页。
+        unsafe {
+            core::slice::from_raw_parts(
+                slot.pages.as_mut_ptr().cast::<u8>().add(slot.offset),
+                count,
+            )
+        }
+    }
+
+    /// 完整前槽直接转移原页拥有；部分槽复制到目标后仅消费目标真正接受的前缀。
+    fn splice_into(&mut self, target: &mut Self, limit: usize) -> Result<usize, FsError> {
+        assert!(!self.is_empty());
+        assert!(0 < target.empty_slot_capacity());
+        let length = self.slots[self.tail].as_ref().unwrap().length;
+        if length <= limit {
+            let slot = self.slots[self.tail].take().unwrap();
+            self.tail = (self.tail + 1) % N;
+            self.used -= 1;
+            self.bytes -= length;
+            assert!(target.slots[target.head].is_none());
+            target.slots[target.head] = Some(slot);
+            target.head = (target.head + 1) % N;
+            target.used += 1;
+            target.bytes += length;
+            return Ok(length);
+        }
+        let accepted = target.append(&mut WriteBuffer::kernel(self.front(limit)))?;
+        self.consume(accepted);
+        Ok(accepted)
     }
 
     /// 在调用者的睡眠锁内复制输入到末页或新槽；调用前必须有真实空间。
@@ -228,7 +267,8 @@ impl Pipe {
     }
 }
 
-struct PipeEnd {
+/// 管道打开实例私有持有原页环和方向，借用能力不增加端点数量。
+pub struct PipeEnd {
     pipe: Arc<Pipe>,
     read: bool,
     flags: AtomicU32,
@@ -302,6 +342,234 @@ impl PipeEnd {
         }
         Self::progress(count, FsError::BrokenPipe)
     }
+
+    /// 比较实际管道页环身份，读写两端属于同一 pipe 时也返回相同。
+    pub(crate) fn same_pipe(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pipe, &other.pipe)
+    }
+
+    /// 合并本次 splice 标志和实际管道 OFD 状态，不读取普通文件的 NONBLOCK。
+    fn splice_nonblocking(&self, requested: bool) -> bool {
+        requested || self.flags() & O_NONBLOCK != 0
+    }
+
+    /// 文件位置已经在环之前固定；先按明确位置读取，再按实际发表量报告源进度。
+    pub(crate) fn splice_from_file(
+        &self,
+        file: &InodeFile,
+        offset: u64,
+        length: usize,
+        nonblocking: bool,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        if self.read {
+            return Err(FsError::BadFd);
+        }
+        let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
+        let mut interrupted = false;
+        let mut copied = 0;
+        let mut scratch = [0u8; PIPE_BUF];
+        loop {
+            if let Some((context, _)) = &waiting {
+                context.clear_triggered();
+            }
+            {
+                let mut ring = self.pipe.ring.lock();
+                if !self.pipe.reader_open.load(Ordering::Acquire) {
+                    return self.broken_pipe(caller, copied);
+                }
+                while copied < length && 0 < ring.empty_slot_capacity() {
+                    let room = if ring.merge_space() == 0 {
+                        PIPE_BUF
+                    } else {
+                        ring.merge_space()
+                    };
+                    let request = (length - copied).min(room);
+                    let read = match file.read_at(offset + copied as u64, &mut scratch[..request]) {
+                        Ok(read) => read,
+                        Err(error) => return Self::progress(copied, error),
+                    };
+                    if read == 0 {
+                        return Ok(copied);
+                    }
+                    if !self.pipe.reader_open.load(Ordering::Acquire) {
+                        return self.broken_pipe(caller, copied);
+                    }
+                    let result = ring.append(&mut WriteBuffer::kernel(&scratch[..read]));
+                    self.pipe
+                        .publish(&ring, result.as_ref().is_ok_and(|count| 0 < *count), false);
+                    let accepted = match result {
+                        Ok(accepted) => accepted,
+                        Err(error) => return Self::progress(copied, error),
+                    };
+                    copied += accepted;
+                    if accepted < read || read < request {
+                        return Ok(copied);
+                    }
+                }
+                if 0 < copied || copied == length {
+                    return Ok(copied);
+                }
+                if self.splice_nonblocking(nonblocking) {
+                    return Err(FsError::WouldBlock);
+                }
+                if interrupted {
+                    return Err(FsError::Interrupted);
+                }
+            }
+            if let Some((context, _)) = &waiting {
+                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                    == WaitResult::Interrupted;
+            } else {
+                waiting = Some(self.prepare_wait()?);
+            }
+        }
+    }
+
+    /// 目标 inode 接受前缀之后才消费源槽；文件同步由调用者在位置和环锁外完成。
+    pub(crate) fn splice_to_file(
+        &self,
+        file: &InodeFile,
+        offset: u64,
+        length: usize,
+        nonblocking: bool,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        if !self.read {
+            return Err(FsError::BadFd);
+        }
+        let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
+        let mut interrupted = false;
+        let mut copied = 0;
+        loop {
+            if crate::fs::transfer::interruption_pending(caller) {
+                return Self::progress(copied, FsError::Interrupted);
+            }
+            if let Some((context, _)) = &waiting {
+                context.clear_triggered();
+            }
+            {
+                let mut ring = self.pipe.ring.lock();
+                while copied < length && !ring.is_empty() {
+                    if crate::fs::transfer::interruption_pending(caller) {
+                        return Self::progress(copied, FsError::Interrupted);
+                    }
+                    let bytes = ring.front(length - copied);
+                    let expected = bytes.len();
+                    let result = file.transfer_write_at(
+                        offset + copied as u64,
+                        bytes,
+                        FsError::InvalidOperation,
+                    );
+                    let accepted = match result {
+                        Ok(accepted) => accepted,
+                        Err(error) => return Self::progress(copied, error),
+                    };
+                    ring.consume(accepted);
+                    copied += accepted;
+                    self.pipe.publish(&ring, false, 0 < accepted);
+                    if accepted < expected {
+                        return Ok(copied);
+                    }
+                }
+                if 0 < copied || copied == length || !self.pipe.writer_open.load(Ordering::Acquire)
+                {
+                    return Ok(copied);
+                }
+                if self.splice_nonblocking(nonblocking) {
+                    return Err(FsError::WouldBlock);
+                }
+                if interrupted {
+                    return Err(FsError::Interrupted);
+                }
+            }
+            if let Some((context, _)) = &waiting {
+                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                    == WaitResult::Interrupted;
+            } else {
+                waiting = Some(self.prepare_wait()?);
+            }
+        }
+    }
+
+    /// 按真实 pipe 地址锁住两个环，等待前释放两环；整槽只移动一次原页拥有。
+    pub(crate) fn splice_to_pipe(
+        &self,
+        target: &Self,
+        length: usize,
+        nonblocking: bool,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        if !self.read || target.read {
+            return Err(FsError::BadFd);
+        }
+        if self.same_pipe(target) {
+            return Err(FsError::InvalidOperation);
+        }
+        let mut waiting: Option<(bool, Arc<PollContext>, PollTable)> = None;
+        let mut interrupted = false;
+        loop {
+            if let Some((_, context, _)) = &waiting {
+                context.clear_triggered();
+            }
+            let wait_input = {
+                let (mut input, mut output) = if Arc::as_ptr(&self.pipe) < Arc::as_ptr(&target.pipe)
+                {
+                    let input = self.pipe.ring.lock();
+                    let output = target.pipe.ring.lock();
+                    (input, output)
+                } else {
+                    let output = target.pipe.ring.lock();
+                    let input = self.pipe.ring.lock();
+                    (input, output)
+                };
+                let mut copied = 0;
+                while copied < length {
+                    if !target.pipe.reader_open.load(Ordering::Acquire) {
+                        return target.broken_pipe(caller, copied);
+                    }
+                    if input.is_empty() || output.empty_slot_capacity() == 0 {
+                        break;
+                    }
+                    let result = input.splice_into(&mut output, length - copied);
+                    let accepted = match result {
+                        Ok(accepted) => accepted,
+                        Err(error) => return Self::progress(copied, error),
+                    };
+                    copied += accepted;
+                    self.pipe.publish(&input, false, 0 < accepted);
+                    target.pipe.publish(&output, 0 < accepted, false);
+                }
+                if 0 < copied || copied == length {
+                    return Ok(copied);
+                }
+                if input.is_empty() && !self.pipe.writer_open.load(Ordering::Acquire) {
+                    return Ok(0);
+                }
+                if self.splice_nonblocking(nonblocking) || target.splice_nonblocking(nonblocking) {
+                    return Err(FsError::WouldBlock);
+                }
+                if interrupted {
+                    return Err(FsError::Interrupted);
+                }
+                input.is_empty()
+            };
+            // 登记只覆盖当前真正阻塞的端点；下一次锁内重扫后才允许 park。
+            if waiting
+                .as_ref()
+                .is_some_and(|(input, _, _)| *input == wait_input)
+            {
+                let (_, context, _) = waiting.as_ref().unwrap();
+                interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
+                    == WaitResult::Interrupted;
+            } else {
+                drop(waiting.take());
+                let end = if wait_input { self } else { target };
+                let (context, table) = end.prepare_wait()?;
+                waiting = Some((wait_input, context, table));
+            }
+        }
+    }
 }
 
 impl Pollable for PipeEnd {
@@ -336,6 +604,11 @@ impl Pollable for PipeEnd {
 }
 
 impl FileLike for PipeEnd {
+    /// 跨文件传输借用本实际端点，字段及原页拥有仍由端点私有维护。
+    fn pipe_end(&self) -> Option<&PipeEnd> {
+        Some(self)
+    }
+
     /// 先交付现有尾部，只消费 copyout 的实际差量；空且写 OFD 已结束才返回 EOF。
     fn read_into(
         &self,
@@ -412,13 +685,13 @@ impl FileLike for PipeEnd {
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire)
     }
-    /// 只保存 Linux 可变状态位，访问模式保持不变。
+    /// 同一原子读改写提交可变状态位，保留端点访问模式与不可变打开位。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
-        self.flags.store(
-            (if self.read { 0 } else { 1 }) | (raw & (O_APPEND | O_NONBLOCK)),
-            Ordering::Release,
-        );
-        Ok(())
+        set_status_flags(&self.flags, raw)
+    }
+    /// 只原子修改端点 OFD 的非阻塞位，dup 与 fork 共享原状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
     /// 流不能截断。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {

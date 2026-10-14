@@ -21,6 +21,7 @@ const EXCLUSIVE: u32 = 0o200;
 const CLOEXEC: u32 = 0x8_0000;
 const DIRECTORY: u32 = 0x1_0000;
 const NOFOLLOW: u32 = 0x2_0000;
+const FIONBIO: u32 = 0x5421;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_EACCESS: u32 = 0x200;
@@ -44,7 +45,7 @@ const OPENAT_SUPPORTED: u32 = 0o3
     | 0o400
     | CLOEXEC;
 const MAX_PATH_BYTES: usize = 4096;
-const MAX_RW_COUNT: usize = 0x7fff_f000;
+pub(super) const MAX_RW_COUNT: usize = 0x7fff_f000;
 pub(super) const MAX_IOV_COUNT: usize = 1024;
 
 /// 只接受两个管道打开位；两个原预留槽在完整 copyout 成功后才分别发表。
@@ -69,6 +70,89 @@ pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
     reader_slot.publish(reader, descriptor_flags);
     writer_slot.publish(writer, descriptor_flags);
     Ok(0)
+}
+
+/// 完整读取目标 loff_t 字节；负值留给共同范围检查，不能把部分 copyin 解释为位置。
+fn transfer_offset(mm: &Mm, address: usize) -> Result<Option<u64>, Errno> {
+    if address == 0 {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 8];
+    copyin(mm, &mut bytes, address)?;
+    Ok(Some(i64::from_le_bytes(bytes) as u64))
+}
+
+/// 显式位置只写回完整目标 loff_t，失败不撤回已经复制的数据或隐式位置。
+fn store_transfer_offset(mm: &Mm, address: usize, offset: Option<u64>) -> Result<(), Errno> {
+    if let Some(offset) = offset {
+        copyout(mm, address, &offset.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// 先取得两份真实 OFD 拥有，再导入显式位置；成功正前缀同时推进两端位置。
+pub(super) fn copy_file_range(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let runtime = user.runtime().expect("copy_file_range has no runtime");
+    let source = runtime.files.lookup(descriptor(raw[0])?)?;
+    let target = runtime.files.lookup(descriptor(raw[2])?)?;
+    let mm = user.mm().expect("copy_file_range has no MM");
+    let mut source_offset = transfer_offset(&mm, raw[1])?;
+    let mut target_offset = transfer_offset(&mm, raw[3])?;
+    if raw[5] as u32 != 0 || (raw[4] as isize) < 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let accepted = fs::transfer::copy_file_range(
+        &source,
+        source_offset.as_mut(),
+        &target,
+        target_offset.as_mut(),
+        raw[4].min(MAX_RW_COUNT),
+        FileIoContext::User(user),
+    )?;
+    if 0 < accepted {
+        // 两个 copyback 都按真实进度尝试，第一端故障不阻止第二端更新。
+        let input = store_transfer_offset(&mm, raw[1], source_offset);
+        let output = store_transfer_offset(&mm, raw[3], target_offset);
+        input.and(output)?;
+    }
+    Ok(accepted as isize)
+}
+
+/// 管道端显式位置在任何用户解引用前返回 ESPIPE；原页传输只消费目标接受量。
+pub(super) fn splice(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    // 空 splice 与目标 ABI 一致，不取得 fd 或访问位置指针。
+    if raw[4] == 0 {
+        return Ok(0);
+    }
+    let flags = raw[5] as u32;
+    if flags & !15 != 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let runtime = user.runtime().expect("splice has no runtime");
+    let source = runtime.files.lookup(descriptor(raw[0])?)?;
+    let target = runtime.files.lookup(descriptor(raw[2])?)?;
+    if (source.pipe_end().is_some() && raw[1] != 0) || (target.pipe_end().is_some() && raw[3] != 0)
+    {
+        return Err(Errno::IllegalSeek);
+    }
+    let mm = user.mm().expect("splice has no MM");
+    let mut target_offset = transfer_offset(&mm, raw[3])?;
+    let mut source_offset = transfer_offset(&mm, raw[1])?;
+    if (raw[4] as isize) < 0 {
+        return Err(Errno::InvalidArgument);
+    }
+    let accepted = fs::transfer::splice(
+        &source,
+        source_offset.as_mut(),
+        &target,
+        target_offset.as_mut(),
+        raw[4].min(MAX_RW_COUNT),
+        flags,
+        FileIoContext::User(user),
+    )?;
+    store_transfer_offset(&mm, raw[3], target_offset)?;
+    store_transfer_offset(&mm, raw[1], source_offset)?;
+    Ok(accepted as isize)
 }
 
 /// 一次读取目标 16 字节 iovec 数组，小请求借原栈快照，大请求才分配有限拥有。
@@ -485,11 +569,19 @@ pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.write_at_from(raw[3] as u64, &mut source, FileIoContext::User(user))? as isize)
 }
 
-/// 在表锁外向原 OFD 传递真实调用线程，设备自行解释命令与用户参数。
+/// 先取得原强 OFD，再在表锁外处理共同状态命令或原设备控制。
 pub(super) fn ioctl(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("ioctl has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
-    Ok(file.ioctl(raw[1] as u32, raw[2], FileIoContext::User(user))? as isize)
+    let command = raw[1] as u32;
+    if command == FIONBIO {
+        let mm = user.mm().expect("ioctl has no MM");
+        let mut bytes = [0u8; 4];
+        copyin(&mm, &mut bytes, raw[2])?;
+        file.set_nonblocking(i32::from_le_bytes(bytes) != 0)?;
+        return Ok(0);
+    }
+    Ok(file.ioctl(command, raw[2], FileIoContext::User(user))? as isize)
 }
 
 /// lookup 取得原强 OFD 后在表锁外同步全文件，独立打开与 dup 保持各自观察归属。

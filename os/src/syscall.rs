@@ -14,7 +14,9 @@ pub(crate) mod time;
 use alloc::vec::Vec;
 
 use crate::arch::UserContext;
+use crate::fs::ReadBuffer;
 use crate::klog;
+use crate::random;
 use crate::sched;
 use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::task::UserThread;
@@ -153,13 +155,15 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if matches!(request.number, 198..=212 | 242) {
         return net::dispatch(user, request);
     }
-    if matches!(request.number, 29 | 63..=66) {
+    if matches!(request.number, 29 | 63..=66 | 76 | 285) {
         let result = match request.number {
             29 => file::ioctl(user, raw),
             63 => file::read(user, raw),
             64 => file::write(user, raw),
             65 => file::readv(user, raw),
             66 => file::writev(user, raw),
+            76 => file::splice(user, raw),
+            285 => file::copy_file_range(user, raw),
             _ => unreachable!(),
         };
         return match result {
@@ -226,6 +230,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
                 identity.tid()
             } as isize)
         }
+        179 => system::sysinfo(user, &raw),
         214 => Ok(memory::brk(user, raw[0])),
         215 => memory::munmap(user, raw),
         220 => task::clone(user, request),
@@ -235,11 +240,48 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         227 => memory::msync(user, raw),
         260 => return task::wait4(user, request),
         276 => file::renameat2(user, raw),
+        278 => getrandom(user, raw),
         291 => file::statx(user, raw),
         439 => file::faccessat(user, raw, raw[3] as u32),
         _ => Err(Errno::NoSyscall),
     };
     Outcome::Return(result.unwrap_or_else(Errno::result))
+}
+
+/// 交付显式允许的非安全随机字节，地址故障只返回真正写入的前缀。
+fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    const GRND_NONBLOCK: u32 = 1;
+    const GRND_RANDOM: u32 = 2;
+    const GRND_INSECURE: u32 = 4;
+    let flags = raw[2] as u32;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
+        || flags & (GRND_RANDOM | GRND_INSECURE) == (GRND_RANDOM | GRND_INSECURE)
+    {
+        return Err(Errno::InvalidArgument);
+    }
+    // 现有字节来源没有安全熵；安全请求不得消费非安全初始化数据。
+    if flags & GRND_INSECURE == 0 {
+        return Err(if flags & GRND_NONBLOCK != 0 {
+            Errno::Again
+        } else {
+            Errno::NoSyscall
+        });
+    }
+    let mm = user.mm().expect("getrandom has no MM");
+    let mut target = ReadBuffer::user(&mm, raw[0], raw[1].min(file::MAX_RW_COUNT))?;
+    let mut bytes = [0; 256];
+    while target.copied() < target.len() {
+        let count = bytes.len().min(target.len() - target.copied());
+        random::fill_insecure(&mut bytes[..count]);
+        if let Err(error) = target.push(&bytes[..count]) {
+            return if target.copied() == 0 {
+                Err(error.into())
+            } else {
+                Ok(target.copied() as isize)
+            };
+        }
+    }
+    Ok(target.copied() as isize)
 }
 
 /// 从同一记录环读取有界的最后完整正文；不清环、不移动打印者或 kmsg 的游标。

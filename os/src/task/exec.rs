@@ -15,8 +15,8 @@ use crate::mm::space::{Mm, VmError};
 use crate::mm::uaccess::CStringError;
 use crate::mm::user_table::{PagePermissions, PageTableError};
 use crate::mm::{alloc_pages, PAGE_SIZE};
+use crate::random;
 use crate::task::Credentials;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const MAX_ARGUMENT_BYTES: usize = 32768;
 pub(crate) const MAX_ARGUMENT_COUNT: usize = 128;
@@ -56,8 +56,6 @@ const RWX: PagePermissions = PagePermissions {
     write: true,
     execute: true,
 };
-
-static EXEC_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// 格式、参数预算和实际文件、VM、分配失败保持可区分。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1243,22 +1241,11 @@ fn stack_random(mm: &Mm, cursor: &mut usize, bottom: usize) -> Result<usize, Exe
         .checked_sub(16)
         .filter(|address| bottom <= *address)
         .ok_or(ExecError::ArgumentsTooBig)?;
-    // ponytail: 教学字节源没有安全熵承诺；需要密钥或安全随机时须另实现真实熵源。
-    let seed = arch::read_counter() ^ EXEC_NONCE.fetch_add(1, Ordering::Relaxed);
     let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&mix_random_word(seed).to_le_bytes());
-    bytes[8..]
-        .copy_from_slice(&mix_random_word(seed.wrapping_add(0x9e37_79b9_7f4a_7c15)).to_le_bytes());
+    random::fill_insecure(&mut bytes);
     copyout_exact(mm, address, &bytes)?;
     *cursor = address;
     Ok(address)
-}
-
-/// 固定整数混合只扩散初始化种子的位，不增加熵或密码学保证。
-fn mix_random_word(mut word: u64) -> u64 {
-    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    word ^ (word >> 31)
 }
 
 /// 初始栈整数以目标小端机器字序列写入，不创建指向已映射用户页的 Rust 引用。
@@ -1293,15 +1280,11 @@ fn hwcap() -> usize {
         | (1 << (b'C' - b'A'))
 }
 
-/// CPUCFG 为基础能力，只声明实际存在且完整保存的 FPU，不声明 LSX/LASX。
+/// 仅声明实际 CPU 存在且用户入口、复制与信号路径完整保存的浮点和向量扩展。
 #[cfg(target_arch = "loongarch64")]
 fn hwcap() -> usize {
-    let config: usize;
-    // SAFETY: CPUCFG2 是只读的架构能力项，指令不访问普通内存或改变特权状态。
-    unsafe {
-        core::arch::asm!("cpucfg {value}, {index}", value = out(reg) config, index = in(reg) 2usize, options(nomem, nostack));
-    }
-    1 | ((config & 1) << 3)
+    let euen = crate::arch::user_euen();
+    1 | ((euen & 1) << 3) | ((euen & 2) << 3) | ((euen & 4) << 3)
 }
 
 /// 将已经验证的 ELF 访问位转换为现有 Mm 的权限值。

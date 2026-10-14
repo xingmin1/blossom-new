@@ -2,6 +2,7 @@
 
 use crate::fs::ext4::{codec as ext4_codec, BlockMapping};
 use crate::fs::ktest::*;
+use crate::fs::{InodeMetadata, InodeTime};
 
 /// 小输入只构造格式字段，解码、CRC、特性判定全部使用生产函数。
 fn super_bytes() -> [u8; 1024] {
@@ -14,6 +15,7 @@ fn super_bytes() -> [u8; 1024] {
         (36, 8192),
         (40, 64),
         (76, 1),
+        (84, 11),
         (96, 2),
     ] {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -154,6 +156,80 @@ pub(crate) mod codec {
             ext4_codec::decode_super(&original, 512).err(),
             Some(FsError::Corrupt),
         );
+        Ok(())
+    }
+    /// root 与 index 的尾保留字节可以非零，修改它们仍必须通过完整 CRC 校验。
+    #[test]
+    #[ktest(tags("B12"))]
+    fn dx_tail_reserved_bytes_keep_crc_contract(context: &mut TestContext<'_>) -> TestResult {
+        let mut geometry = checked(
+            context,
+            ext4_codec::decode_super(&super_bytes(), 1024 * 1024),
+        )?;
+        geometry.features_compat |= 0x20;
+        geometry.features_ro_compat |= ext4_codec::METADATA_CSUM;
+        let time = InodeTime {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        let inode = InodeMetadata {
+            number: 2,
+            kind: InodeKind::Directory,
+            mode: 0o40755,
+            size: 3072,
+            uid: 0,
+            gid: 0,
+            links: 2,
+            blocks: 6,
+            rdev: 0,
+            atime: time,
+            mtime: time,
+            ctime: time,
+            generation: 0,
+            flags: ext4_codec::INDEX,
+            checksum_seed: 0x1357_2468,
+            fast_symlink: false,
+            file_acl: 0,
+            extra_isize: 0,
+        };
+        for (logical, expected) in [
+            (0, ext4_codec::DirectoryLayout::Root),
+            (2, ext4_codec::DirectoryLayout::Index),
+        ] {
+            let mut bytes = [0u8; 1024];
+            let offset = if logical == 0 {
+                ext4_codec::put32(&mut bytes, 0, 2);
+                ext4_codec::put16(&mut bytes, 4, 12);
+                bytes[6..9].copy_from_slice(&[1, 2, b'.']);
+                ext4_codec::put32(&mut bytes, 12, 1);
+                ext4_codec::put16(&mut bytes, 16, 1012);
+                bytes[18..22].copy_from_slice(&[2, 2, b'.', b'.']);
+                bytes[28..30].copy_from_slice(&[1, 8]);
+                32
+            } else {
+                ext4_codec::put16(&mut bytes, 4, 1024);
+                8
+            };
+            let tail = bytes.len() - 8;
+            ext4_codec::put16(&mut bytes, offset, ((tail - offset) / 8) as u16);
+            ext4_codec::put16(&mut bytes, offset + 2, 1);
+            ext4_codec::put32(&mut bytes, offset + 4, 1);
+            ext4_codec::put32(&mut bytes, tail, 0x89ab_cdef);
+            let checksum = checked(
+                context,
+                ext4_codec::dx_checksum(inode.checksum_seed, &bytes, offset + 8, tail),
+            )?;
+            ext4_codec::put32(&mut bytes, tail + 4, checksum);
+            context.expect_eq(
+                ext4_codec::verify_directory(&geometry, &inode, logical, &bytes, logical != 0),
+                Ok(expected),
+            );
+            bytes[tail] ^= 1;
+            context.expect_eq(
+                ext4_codec::verify_directory(&geometry, &inode, logical, &bytes, logical != 0),
+                Err(FsError::Checksum),
+            );
+        }
         Ok(())
     }
 }

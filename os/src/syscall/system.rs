@@ -1,5 +1,7 @@
 //! 系统身份、挂载、同步与关机准入消费当前用户的真实 MM、VFS、凭据和身份图。
 
+use core::convert::TryFrom;
+
 use crate::block::AccessMode;
 use crate::fs::memfs::{FilesystemStat, MemoryFs, MemoryFsKind};
 use crate::fs::system::device_index;
@@ -9,6 +11,7 @@ use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::syscall::Outcome;
 use crate::task::process::{RootRole, ShutdownOperation};
 use crate::task::UserThread;
+use crate::{mm, sched, time};
 
 const PATH_LIMIT: usize = 4096;
 const MS_RDONLY: usize = 1;
@@ -29,6 +32,37 @@ static UTS_NAME: [u8; UTS_FIELD_LEN * 6] = uname_bytes();
 pub(super) fn uname(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let mm = user.mm().expect("uname has no MM");
     copyout(&mm, raw[0], &UTS_NAME)?;
+    Ok(0)
+}
+
+/// 交付 LP64 sysinfo 的实际 RAM、运行时间及活执行者快照，复制期间不持调度或 MM 锁。
+pub(super) fn sysinfo(user: &UserThread, raw: &[usize; 6]) -> SysResult {
+    let memory = mm::stats();
+    let elapsed = time::now().as_nanos();
+    let uptime =
+        u64::try_from(elapsed.div_ceil(1_000_000_000)).expect("sysinfo uptime exceeds Linux long");
+    let fields = [
+        uptime,
+        0,
+        0,
+        0,
+        (memory.present_pages - memory.reserved_pages - memory.metadata_pages) as u64,
+        (memory.buddy_free_pages + memory.pcp_cached_pages) as u64,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut bytes = [0u8; 112];
+    for (index, value) in fields.iter().enumerate() {
+        bytes[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    // ABI: procs 位于80，两个high字段位于88/96，mem_unit位于104；显式填零全部padding。
+    // 没有 swap 或 highmem；共享页、buffer 和 load average 尚无独立统计来源。
+    bytes[80..82].copy_from_slice(&(sched::live_task_count() as u16).to_le_bytes());
+    bytes[104..108].copy_from_slice(&(mm::PAGE_SIZE as u32).to_le_bytes());
+    let mm = user.mm().expect("sysinfo has no MM");
+    copyout(&mm, raw[0], &bytes)?;
     Ok(0)
 }
 

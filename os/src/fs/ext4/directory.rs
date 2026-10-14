@@ -615,9 +615,7 @@ fn verify_dx(
     }
     if tail_len != 0 {
         let tail = offset + limit * 8;
-        if codec::le32(data, tail)? != 0 {
-            return Err(FsError::Corrupt);
-        }
+        // dx 尾的保留字节只参与 CRC，读取时不赋予零值约束。
         codec::verify_dx_checksum(inode, data, offset + count * 8, tail)?;
     }
     Ok(())

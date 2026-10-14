@@ -21,7 +21,6 @@ use smoltcp::socket::tcp::CongestionControl;
 
 pub const TCP_BUFFER_LEN: usize = 128 * 1024;
 const O_RDWR: u32 = 2;
-const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u32 = 0o2000000;
 const MSG_PEEK: u32 = 0x2;
@@ -285,11 +284,9 @@ impl SocketFile {
         self.flags.load(Ordering::Acquire)
     }
 
-    /// 沿文件对象已有规则保存可变状态位，descriptor 的 CLOEXEC 不进入 OFD。
+    /// 同一原子读改写提交可变状态位，descriptor 的 CLOEXEC 不进入 OFD。
     pub fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
-        self.flags
-            .store(O_RDWR | (raw & (O_APPEND | O_NONBLOCK)), Ordering::Release);
-        Ok(())
+        crate::fs::set_status_flags(&self.flags, raw)
     }
 
     /// 地址族、mapped 与 scope 在进入真实绑定前集中正规化。
@@ -977,6 +974,11 @@ impl FileLike for SocketFile {
     /// F_SETFL 修改原 OFD 状态，不改变双向访问模式。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         SocketFile::set_status_flags(self, raw)
+    }
+
+    /// 只原子修改 socket OFD 的非阻塞位，不改变访问模式和追加位。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        crate::fs::set_nonblocking(&self.flags, enabled)
     }
 
     /// 网络流没有文件长度可截断。

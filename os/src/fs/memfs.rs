@@ -132,6 +132,7 @@ pub enum MemorySpecial {
     Mounts,
     Meminfo,
     Uptime,
+    Interrupts,
     NetDev,
     NetRoute,
 }
@@ -316,6 +317,7 @@ impl MemoryFs {
                 MemorySpecial::Mounts
                 | MemorySpecial::Meminfo
                 | MemorySpecial::Uptime
+                | MemorySpecial::Interrupts
                 | MemorySpecial::NetDev
                 | MemorySpecial::NetRoute,
             ) => InodeKind::Regular,

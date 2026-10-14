@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::fs::file::{require_read, set_status_flags, stat_path};
+use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
     ReadBuffer, SeekFrom, WriteBuffer,
@@ -147,6 +147,11 @@ impl FileLike for TraceFile {
     /// 只改变公共协议允许的状态，不改变只读模式。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+
+    /// 只原子修改本快照 OFD 的非阻塞位，不改变快照内容和追加状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
 
     /// 只读快照不能截断生产记录或本实例文本。

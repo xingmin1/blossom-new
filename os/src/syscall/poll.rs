@@ -1,6 +1,7 @@
 //! poll/select 和事件对象共用原文件表、持续源与逐页 uaccess，用户结构仅按目标字节布局解码。
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use crate::arch;
@@ -10,12 +11,13 @@ use crate::fs::{DescriptorFlags, FileRef, FileTable, FsError};
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::{time as time_abi, Outcome, Request, Restart};
-use crate::task::UserThread;
+use crate::task::{UserRuntime, UserThread};
 use crate::time::{self, Duration, MonotonicInstant};
 use crate::wait::WaitMode;
 
-const DESCRIPTORS: usize = 128;
+const DESCRIPTORS: usize = UserRuntime::DESCRIPTOR_CAPACITY;
 const POLLFD_SIZE: usize = 8;
+const INLINE_POLL_BYTES: usize = 128 * POLLFD_SIZE;
 const SET_BYTES: usize = DESCRIPTORS / 8;
 const EVENT_SIZE: usize = 16;
 const CLOEXEC: u32 = 0x80000;
@@ -51,7 +53,7 @@ enum Interests<'a> {
 struct RegisteredPoll {
     context: Arc<PollContext>,
     _table: PollTable,
-    _files: [Option<FileRef>; DESCRIPTORS],
+    _files: Vec<FileRef>,
 }
 
 /// 五个 raw 入口只保存本次参数；临时 mask 的收尾由各自 syscall 返回协议决定。
@@ -130,7 +132,7 @@ fn ppoll(user: &UserThread, request: Request) -> Outcome {
     finish_select(user, &mm, request, timeout, result)
 }
 
-/// 容量是当前原表的槽数；有界栈快照全初始化，nfds=0 不访问数组地址。
+/// 容量沿当前表；小数组保留栈快照，大数组按实际跨度准备，nfds=0 不访问用户数组。
 fn core_ppoll(
     user: &UserThread,
     mm: &Mm,
@@ -146,8 +148,18 @@ fn core_ppoll(
     if runtime.files.capacity() < nfds {
         return Err(Errno::InvalidArgument);
     }
-    let mut snapshot = [0u8; DESCRIPTORS * POLLFD_SIZE];
-    let bytes = &mut snapshot[..nfds * POLLFD_SIZE];
+    let length = nfds * POLLFD_SIZE;
+    let mut inline = [0u8; INLINE_POLL_BYTES];
+    let mut allocated = Vec::new();
+    let bytes = if length <= inline.len() {
+        &mut inline[..length]
+    } else {
+        allocated
+            .try_reserve_exact(length)
+            .map_err(|_| Errno::NoMemory)?;
+        allocated.resize(length, 0);
+        allocated.as_mut_slice()
+    };
     copyin(mm, bytes, address)?;
     let result = wait_fds(user, &runtime.files, &mut Interests::Poll(bytes), deadline);
     // 中断也交付本轮 revents；数组交付错误优先于等待结果，timeout 收尾另行处理。
@@ -330,18 +342,22 @@ fn query(file: &FileRef) -> Result<PollMask, FsError> {
 }
 
 impl RegisteredPoll {
-    /// 确定需等待后一次预备有限 table，先登记全部实际源，再由等待循环重新观察。
+    /// 确定需等待后按实际参与数预备源登记与OFD拥有，失败析构先撤登记再释放文件。
     fn prepare(files: &FileTable, interests: &Interests<'_>) -> Result<Self, Errno> {
         let participating = (0..interests.len())
             .filter(|index| interests.descriptor(*index).is_some())
             .count();
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(participating)
+            .map_err(|_| Errno::NoMemory)?;
         let context = PollContext::try_new()?;
         let sink: Arc<dyn PollNotify> = context.clone();
         let table = PollTable::new(sink, participating * 2)?;
         let mut registered = Self {
             context,
             _table: table,
-            _files: [const { None }; DESCRIPTORS],
+            _files: retained,
         };
         for index in 0..interests.len() {
             let Some(fd) = interests.descriptor(index) else {
@@ -353,8 +369,8 @@ impl RegisteredPoll {
                 Err(error) => return Err(error.into()),
             };
             // 文件先进入保活集合，失败析构仍先同步撤 table，再最后 put 这些 OFD。
-            registered._files[index] = Some(file);
-            let file = registered._files[index].as_ref().unwrap();
+            registered._files.push(file);
+            let file = registered._files.last().unwrap();
             if let Some(provider) = file.pollable() {
                 provider.poll(Some(&mut registered._table))?;
             }

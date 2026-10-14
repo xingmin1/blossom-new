@@ -6,7 +6,8 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::fs::file::{
-    set_status_flags, FileIoContext, FileLike, FileRef, FileStat, ReadBuffer, SeekFrom, WriteBuffer,
+    set_nonblocking, set_status_flags, FileIoContext, FileLike, FileRef, FileStat, ReadBuffer,
+    SeekFrom, WriteBuffer,
 };
 use crate::fs::poll::{PollMask, PollNotify, PollTable, PollWaitHead, Pollable};
 use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path};
@@ -901,6 +902,10 @@ impl FileLike for EpollFile {
     /// 沿共同 fcntl 状态位边界更新，不改访问模式。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
+    }
+    /// 只原子修改事件 OFD 的非阻塞位，复制描述符观察同一状态。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
     }
     /// 事件对象没有可截断内容。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {

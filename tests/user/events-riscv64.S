@@ -341,7 +341,29 @@ _start:
     LI a4, 999
     SC 73
     OK 18
-    POLL 129, .Lzero_time, -22, 19
+
+# /// 大数组的末项仍参与就绪查询，负 fd 项的 revents 必须清零。
+    LA t1, .Lpollfds
+    LI t2, 129
+    LI t3, -1
+    LI t4, 4
+.Lmany_pollfd_init:
+    SW t3, t1, 0
+    SH t4, t1, 4
+    SH t3, t1, 6
+    ADDI t1, t1, 8
+    ADDI t2, t2, -1
+    BNE t2, zero, .Lmany_pollfd_init
+    ADDI t1, t1, -8
+    SW s1, t1, 0
+    POLL 129, .Lzero_time, 1, 201
+    LA t1, .Lpollfds
+    LH t2, t1, 6
+    CHECK t2, 0, 202
+    ADDI t1, t1, 1024
+    LH t2, t1, 6
+    CHECK t2, 4, 203
+
     POLL -1, .Lzero_time, -22, 20
     LI a0, EVENT_USER_END
     LI a1, 1
@@ -443,14 +465,34 @@ _start:
     LI a5, 0
     SC 72
     CHECK a0, -14, 37
+    CLOSE s4, 39
+
+# /// 显式选择高编号空槽，fdset 的末个机器字必须被读取并交付结果。
+    MOV a0, s3
+    LI a1, 0
+    LI a2, 192
+    SC 25
+    CHECK a0, 192, 204
+    MOV s5, a0
     LA t1, .Lsets
-    LI t2, 8
-    SD t2, t1, 0
+    SD zero, t1, 0
     SD zero, t1, 8
     SD zero, t1, 16
-    SD zero, t1, 32
-    SELECT 0x7fffffff, 1, 38
-    CLOSE s4, 39
+    LI t2, 1
+    SD t2, t1, 24
+    LI a0, 193
+    MOV a1, t1
+    LI a2, 0
+    LI a3, 0
+    LA a4, .Lzero_time
+    LI a5, 0
+    SC 72
+    CHECK a0, 1, 205
+    LA t1, .Lsets
+    LD t2, t1, 24
+    CHECK t2, 1, 206
+    CLOSE s5, 207
+
     LI a0, 0x45000000
     LI a1, 4096
     SC 215
@@ -1095,7 +1137,7 @@ _start:
 .bss
 .balign 16
 .Lfds: .space 8
-.Lpollfds: .space 1024
+.Lpollfds: .space 129 * 8
 .Lsets: .space 48
 .Levent: .space 16
 .Loutput: .space 48

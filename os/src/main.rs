@@ -25,6 +25,7 @@ mod ktest;
 mod mm;
 mod net;
 mod platform;
+mod random;
 mod sched;
 mod storage;
 mod sync;
