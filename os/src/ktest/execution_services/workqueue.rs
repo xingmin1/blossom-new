@@ -1556,6 +1556,109 @@ fn test_owner() {
     drop((owner, queue));
 }
 
+/// 持续投递后继票，只有同 CPU 的普通 peer 停止业务源后才确认结束；回调不睡眠或让出。
+fn continuous_requeue_callback(work: Pin<&Work>) {
+    let owner = scenario();
+    if owner.stop.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: catch 外 fixture 持有 Probe，Entry 地址固定；Work 关闭与 peer join 前不清除拥有，
+    // 本借用仅用于当前回调，不逃逸到节点或控制者退出以后。
+    let (probe, _) = unsafe { context(work.context()) };
+    if probe.callbacks.fetch_add(1, Ordering::AcqRel) == 0 {
+        probe.gates[0].complete();
+    }
+    if probe.source.load(Ordering::Acquire) {
+        let queued = work.queue();
+        if !owner.stop.load(Ordering::Acquire) {
+            assert_eq!(queued, Ok(true));
+        }
+    } else {
+        probe.consumed.fetch_add(1, Ordering::AcqRel);
+        probe.gates[1].complete();
+    }
+}
+
+/// 同 CPU 的普通 peer 必须从连续回调中获得执行权，并等生产源停止被真实回调确认。
+fn test_continuous_peer_progress() -> ::ktest::TestResult {
+    let queue = new_queue(WorkQueueConfig {
+        max_active: 1,
+        ordered: false,
+        reclaim: false,
+    });
+    let probe = Probe::new();
+    let work = probe.work(&queue, 0, 0, continuous_requeue_callback);
+    let peer_probe = probe.clone();
+    let peer = crate::ktest::spawn_result_on(0, move |_| {
+        peer_probe.gates[0].wait();
+        if scenario().stop.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        assert!(peer_probe.source.swap(false, Ordering::AcqRel));
+        Ok(0)
+    })?;
+    assert!(work.as_ref().queue().unwrap());
+    assert_eq!(peer.join()?, 0);
+    probe.gates[1].wait();
+    work.as_ref().close_sync();
+    queue.close_sync();
+    assert_eq!(probe.consumed.load(Ordering::Acquire), 1);
+    probe.clear();
+    unique_work(&work);
+    drop((work, queue, probe));
+    Ok(())
+}
+
+/// 首轮只投递未关联后继并请求真实调度；回调不阻塞，让出发生在生产票尾。
+fn handoff_callback(work: Pin<&Work>) {
+    if scenario().stop.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: fixture 保活固定 Probe 与 Entry，两个 Work 同步关闭前不清除拥有；
+    // 借用只用于当前回调，不存入其它异步对象。
+    let (probe, index) = unsafe { context(work.context()) };
+    assert_eq!(cpu::current().id, 0);
+    assert_eq!(probe.counts[index].fetch_add(1, Ordering::AcqRel), 0);
+    if index == 0 {
+        assert!(probe.next_work(1).as_ref().queue().unwrap());
+        cpu::kick(0, cpu::KICK_RESCHEDULE);
+        spin_until(
+            || cpu::current().need_resched.load(Ordering::Relaxed),
+            "callback handoff reschedule request",
+        );
+    } else {
+        assert_eq!(index, 1);
+        probe.gates[1].complete();
+    }
+}
+
+/// 已完成的普通 worker 让出后仍能领取未关联票，不为这次交接额外分配 Task 或栈。
+fn test_callback_handoff() {
+    let queue = new_queue(WorkQueueConfig {
+        max_active: 1,
+        ordered: false,
+        reclaim: false,
+    });
+    let probe = Probe::new();
+    let first = probe.work(&queue, 0, 0, handoff_callback);
+    let next = probe.work(&queue, 1, 0, handoff_callback);
+    wait_services_blocked();
+    let created = testing::pool_stats(0).created;
+    assert!(first.as_ref().queue().unwrap());
+    probe.gates[1].wait();
+    first.as_ref().close_sync();
+    next.as_ref().close_sync();
+    queue.close_sync();
+    assert_eq!(probe.counts[0].load(Ordering::Acquire), 1);
+    assert_eq!(probe.counts[1].load(Ordering::Acquire), 1);
+    probe.clear();
+    unique_work(&first);
+    unique_work(&next);
+    drop((first, next, queue, probe));
+    wait_services_blocked();
+    assert_eq!(testing::pool_stats(0).created, created);
+}
+
 /// 原closed-domain移交必须自行撤pending和归票，任何D同步清理都晚于这些断言。
 fn test_rejected_transfer() {
     let probe = Probe::new();
@@ -1997,6 +2100,27 @@ pub(crate) mod cases {
     ) -> ::ktest::TestResult {
         fixture.fixed(|| {
             test_owner();
+            Ok(())
+        })
+    }
+
+    /// 连续 self-requeue 不能阻止同 CPU 的普通 peer 关闭真实生产源。
+    #[test]
+    fn continuous_requeue_peer(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(test_continuous_peer_progress)
+    }
+
+    /// 未关联后继在票尾调度后由现有 worker 领取，不增加执行者或栈分配。
+    #[test]
+    fn callback_handoff_reuses_worker(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(|| {
+            test_callback_handoff();
             Ok(())
         })
     }

@@ -7,7 +7,8 @@ use core::cell::UnsafeCell;
 use core::pin::Pin;
 use core::ptr;
 #[cfg(feature = "ktest")]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 
 use super::{Domain, RemovedTicket, Work, STATE_LOCK};
 use crate::cpu;
@@ -102,6 +103,8 @@ struct WorkerState {
     callback: bool,
     contributing: bool,
     idle: bool,
+    /// 已归还完成票并准备让出，恢复后的下一次 claim 清除此状态。
+    ready_to_claim: bool,
     join: Option<JoinHandle>,
     reserved_work: *const Work,
     reservation_open: bool,
@@ -145,6 +148,7 @@ impl Worker {
                 callback: false,
                 contributing: false,
                 idle: false,
+                ready_to_claim: false,
                 join: None,
                 reserved_work: reservation.map_or(ptr::null(), |(_, work)| work),
                 reservation_open: reservation.is_some(),
@@ -437,9 +441,8 @@ pub(super) fn notify(cpu: usize) {
                 }
                 cursor = (*worker.state.get()).next;
             }
-            let eligible = !candidate(state.head, ptr::null(), None, true).is_null();
             let manager =
-                selected.is_none() && eligible && state.nr_running == 0 && !state.create_failed;
+                selected.is_none() && !state.create_failed && need_to_create_worker(state);
             if manager {
                 state.manager_requested = true;
             }
@@ -733,23 +736,26 @@ pub(super) fn initialize() -> Result<(), AllocError> {
     Ok(())
 }
 
-/// 只在有无进度准入票且没有可执行空闲 worker 时承担创建责任。
+/// 只在无贡献进度且没有现有执行者能承接合法未关联票时承担创建责任。
 ///
 /// # Safety
 /// 调用者必须持 STATE_LOCK，state 必须来自本 CPU 永久池，链上节点由现存拥有票与池引用保活。
 unsafe fn need_to_create_worker(state: &PoolState) -> bool {
-    // SAFETY: 调用者持统一状态锁，队列、关联身份和 worker idle 位在整个判断期间保持有效。
+    // SAFETY: 调用者持统一状态锁，队列、关联身份和 worker 可用状态在整个判断期间保持有效。
     unsafe {
         if state.nr_running != 0 || candidate(state.head, ptr::null(), None, true).is_null() {
             return false;
         }
         let mut cursor = state.workers_head;
         while !cursor.is_null() {
-            let worker = &*cursor;
-            if (*worker.state.get()).idle && !candidate(state.head, cursor, None, true).is_null() {
-                return false;
+            let role = &*(*cursor).state.get();
+            if role.idle || role.ready_to_claim {
+                let work = candidate(state.head, cursor, None, true);
+                if !work.is_null() && (role.idle || (*(*work).state.get()).assigned.is_null()) {
+                    return false;
+                }
             }
-            cursor = (*worker.state.get()).next;
+            cursor = role.next;
         }
         true
     }
@@ -807,7 +813,7 @@ fn manager(cpu: usize) -> i32 {
             reap_retired(cpu);
             let needed = {
                 let _lock = STATE_LOCK.lock();
-                // SAFETY: 每次创建前在同锁内复查准入、实际进度和可执行 idle；队列拥有票始终保留。
+                // SAFETY: 每次创建前在同锁内复查准入、实际进度和可接票执行者；队列拥有票始终保留。
                 unsafe {
                     let state = &mut *pool(cpu).state.get();
                     let needed = need_to_create_worker(state);
@@ -859,6 +865,7 @@ fn manager(cpu: usize) -> i32 {
 unsafe fn claim(worker: &Worker, domain: Option<&Domain>) -> Option<RemovedTicket> {
     // SAFETY: 调用者持 STATE_LOCK，返回拥有票保活 Work 和可选 DelayedWork 直到锁外尾部。
     unsafe {
+        (*worker.state.get()).ready_to_claim = false;
         let state = &*pool(worker.cpu).state.get();
         let raw = candidate(
             state.head,
@@ -971,7 +978,7 @@ unsafe fn retire(worker: &Worker) -> bool {
     }
 }
 
-/// callback 真实执行在锁外；空闲 worker 登记复查，动态余量正常返回而非泄漏 Task。
+/// callback 在锁外执行，归还真实票后响应调度请求；空闲者复查登记，动态余量正常退休。
 fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
     #[cfg(feature = "ktest")]
     {
@@ -1029,6 +1036,16 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             drop(ticket);
             #[cfg(feature = "ktest")]
             testing::pause(worker.cpu, testing::PausePoint::Finished);
+            // 连续后继票不能独占 CPU；交接期间仅真实可领取的未关联票免于额外创建执行者。
+            if cpu::current().need_resched.load(Ordering::Relaxed) {
+                {
+                    let _lock = STATE_LOCK.lock();
+                    // SAFETY: 本服务独占 worker 执行，回调与运行票均已结束，测试停点已返回；
+                    // 可用状态只由此处与下一次锁下 claim 修改，不能把停点阻塞当成可接票。
+                    unsafe { (*worker.state.get()).ready_to_claim = true };
+                }
+                crate::sched::cond_resched();
+            }
             continue;
         }
         let (retired, stop) = {
