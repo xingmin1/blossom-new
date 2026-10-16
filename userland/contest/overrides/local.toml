@@ -1,0 +1,5 @@
+# 只调整已选 ID；轮次沿用基本 ID，不增加新的选择。
+[[override]]
+id = "basic:musl:mmap"
+timeout_sec = 120
+repeat = 2

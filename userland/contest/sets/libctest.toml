@@ -1,0 +1,15 @@
+# 原脚本提供 selector 目录，执行仍保留 ./runtest.exe -w entry-VARIANT.exe NAME。
+# 盘内 loader 和 DSO 必须由该输入提供；配置不复制系统库覆盖它们。
+[[step]]
+kind = "libctest"
+roots = ["musl", "glibc"]
+variant = "dynamic"
+catalog = "/run-dynamic.sh"
+include = ["argv", "env", "clock_gettime", "stat"]
+
+[[step]]
+kind = "libctest"
+roots = ["musl", "glibc"]
+variant = "static"
+catalog = "/run-static.sh"
+include = ["argv", "env", "clock_gettime", "stat"]

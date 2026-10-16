@@ -1,0 +1,16 @@
+# 使用本项目随系统盘安装的真实静态程序，可独立演示多文件与原样 argv。
+# 不需要占位 ELF；实际比赛盘的清单另在下方 files 中明确加入。
+files = ["onsite/final.toml", "onsite/shell.toml"]
+override_files = ["overrides/onsite.toml"]
+finish = "return"
+
+[defaults]
+timeout_sec = 60
+repeat = 1
+hooks = false
+
+[roots.system]
+path = "/"
+cwd = "/"
+mounts = []
+env = { PATH = "/bin:/usr/bin:/sbin:/usr/sbin" }

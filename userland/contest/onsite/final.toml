@@ -1,0 +1,8 @@
+# 该 argv 对应仓库实际安装的 libc-smoke 正常入口，不经过 Shell 拆词。
+[[step]]
+kind = "exec"
+id = "onsite:libc"
+root = "system"
+program = "/bin/libc-smoke"
+args = ["stage7"]
+arch = ["riscv64", "loongarch64"]

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 
@@ -18,6 +19,7 @@ PROFILES = {
 PATTERN_SIZE = 65573
 DIRECTORY_ENTRIES = 12000
 DEEP_EXTENTS = 1500
+CONTEST_CONFIG = ROOT / "userland/contest"
 
 
 def output_path(value, replace=False):
@@ -87,9 +89,38 @@ def write_pattern(path, length):
             stream.write(pattern(offset, min(65536, length - offset)))
 
 
+def contest_plan_path(plan):
+    """入口必须来自完整配置树，返回保留目录层次的客体绝对路径。"""
+    selected = (plan or CONTEST_CONFIG / "plan.toml").resolve()
+    try:
+        relative = selected.relative_to(CONTEST_CONFIG.resolve())
+    except ValueError:
+        raise ValueError("--contest-plan must be inside userland/contest") from None
+    if not selected.is_file() or any(character in str(relative) for character in "\r\n\x00"):
+        raise ValueError("--contest-plan must name an existing configuration file")
+    return "/etc/contest/" + relative.as_posix()
 
-def system_staging(directory, userland_root, runtime_root, contest_boot=False):
-    """首次安装已构建系统树和两族运行库；已有 staging 不读取或重填任何输入。"""
+
+def contest_staging(directory, userland_root, runtime_root, plan=None):
+    """重新生成项目管理的比赛树；普通 staging 和显式 SOURCE 不调用此更新路径。"""
+    absolute = Path(os.path.abspath(directory))
+    if (ROOT / "build" not in absolute.parents
+            or any(parent.is_symlink() for parent in (absolute, *absolute.parents))
+            or (absolute.exists() and not absolute.is_dir())):
+        raise ValueError("managed contest staging must be a directory below repository build/")
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="contest-staging-", dir=absolute.parent) as temporary:
+        tree = Path(temporary) / "root"
+        system_staging(tree, userland_root, runtime_root, contest_boot=True, contest_plan=plan)
+        if absolute.exists():
+            shutil.rmtree(absolute)
+        os.rename(tree, absolute)
+    return absolute
+
+
+
+def system_staging(directory, userland_root, runtime_root, contest_boot=False, contest_plan=None):
+    """首次安装系统树、运行库和完整配置；已有普通 staging 不读取或重填输入。"""
     if directory.exists():
         if not directory.is_dir():
             raise ValueError("--staging must be a directory")
@@ -113,11 +144,16 @@ def system_staging(directory, userland_root, runtime_root, contest_boot=False):
         shutil.copytree(ROOT / "userland" / "system" / "etc", tree / "etc", symlinks=True)
         for family in ("musl", "glibc"):
             shutil.copytree(runtime_root / family, tree / "opt/runtime" / family, symlinks=True)
+        shutil.copytree(CONTEST_CONFIG, tree / "etc/contest", symlinks=True)
         if contest_boot:
+            selected = contest_plan_path(contest_plan)
+            command_line = "/sbin/contest-run /dev/vda"
+            if selected != "/etc/contest/plan.toml":
+                command_line += " --plan " + shlex.quote(selected)
             (tree / "etc/inittab").write_text(
                 "::sysinit:/bin/sh /etc/init.d/rcS\n"
-                "::once:/sbin/contest-run /dev/vda\n"
-                "::shutdown:/bin/sh /etc/init.d/rcK\n", encoding="ascii")
+                f"::once:{command_line}\n"
+                "::shutdown:/bin/sh /etc/init.d/rcK\n", encoding="utf-8")
         for name in ("dev", "proc", "run", "tmp", "var", "var/tmp", "root", "home",
                      "usr/bin", "usr/sbin", "mnt", "mnt/extra", "mnt/contest"):
             (tree / name).mkdir(parents=True, exist_ok=True)
@@ -184,7 +220,7 @@ def system_image(source, output, profile, size_mib, write_fixture=False, nearly_
 
 
 def delivery_image(args, output):
-    """在独立新树合成两根，制盘一次并复制一次辅助盘，准备齐四文件后再替换交付物。"""
+    """在新树合成两根和完整计划，准备齐四文件后再替换交付物。"""
     inputs = (
         ("riscv64", args.rv_userland_root, args.rv_runtime_root, args.rv_kernel, "kernel-rv"),
         ("loongarch64", args.la_userland_root, args.la_runtime_root, args.la_kernel, "kernel-la"),
@@ -209,7 +245,7 @@ def delivery_image(args, output):
         source = directory / "source"
         source.mkdir(mode=0o755)
         for arch, userland, runtime, _, _ in inputs:
-            system_staging(source / arch, userland, runtime, contest_boot=True)
+            system_staging(source / arch, userland, runtime, contest_boot=True, contest_plan=args.contest_plan)
         image = directory / "disk.img"
         system_image(source, image, args.profile, args.size_mib)
         for _, _, _, kernel, name in inputs:
@@ -460,6 +496,8 @@ def main(argv=None):
                         help="built bin/sbin/usr input for a new ordinary staging tree")
     parser.add_argument("--runtime-root", type=Path, help="matching prepared musl/glibc trees for a new staging")
     parser.add_argument("--contest-boot", action="store_true", help="select contest-run in a new staging's ordinary inittab")
+    parser.add_argument("--managed-contest", action="store_true", help="regenerate the project-managed contest staging tree")
+    parser.add_argument("--contest-plan", type=Path, help="entry file inside the complete userland/contest tree")
     parser.add_argument("--delivery", action="store_true", help="build both roots in a fresh tree and export the four delivery files")
     for arch in ("rv", "la"):
         parser.add_argument(f"--{arch}-kernel", type=Path)
@@ -491,6 +529,10 @@ def main(argv=None):
         parser.error("--source and --staging are mutually exclusive")
     if args.delivery and (args.source is not None or args.staging is not None or args.fixtures or args.write_fixture):
         parser.error("--delivery creates its own fresh dual-root source")
+    if args.managed_contest and (args.source is not None or args.fixtures or args.write_fixture):
+        parser.error("--managed-contest cannot modify explicit source or fixture trees")
+    if args.contest_plan is not None and not (args.contest_boot or args.managed_contest or args.delivery):
+        parser.error("--contest-plan requires a contest staging or delivery")
     if not args.fixtures and Path(args.output).suffix != ".img":
         parser.error("production --output must end in .img")
     try:
@@ -515,7 +557,10 @@ def main(argv=None):
                 directory = args.staging or ROOT / "build" / f"system-{args.arch}-{args.identity}"
                 userland_root = args.userland_root or ROOT / "build" / f"userland-{args.arch}"
                 runtime_root = args.runtime_root or ROOT / "build" / f"runtime-{args.arch}"
-                source = system_staging(directory, userland_root, runtime_root, args.contest_boot)
+                if args.managed_contest:
+                    source = contest_staging(directory, userland_root, runtime_root, args.contest_plan)
+                else:
+                    source = system_staging(directory, userland_root, runtime_root, args.contest_boot, args.contest_plan)
             if not source.is_dir():
                 raise ValueError("--source must be an existing directory")
             if args.write_fixture:

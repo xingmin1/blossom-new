@@ -1,0 +1,22 @@
+# 固定 pre-2025 盘的实际目录；只读取盘内原程序和库，不执行补库。
+# 缺少某个来源直接报错，应按收到的盘修改本计划，不切换备用来源。
+files = ["sets/basic.toml", "sets/libctest.toml"]
+override_files = ["overrides/local.toml"]
+finish = "poweroff"
+
+[defaults]
+timeout_sec = 60
+repeat = 1
+hooks = false
+
+[roots.musl]
+path = "/mnt/contest/musl"
+cwd = "/"
+mounts = ["dev", "proc", "tmp"]
+env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }
+
+[roots.glibc]
+path = "/mnt/contest/glibc"
+cwd = "/"
+mounts = ["dev", "proc", "tmp"]
+env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }

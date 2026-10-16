@@ -20,8 +20,12 @@ def regular_file(path):
         raise ValueError(f"not a regular file: {path}")
 
 
-def working_disks(sources, directory, resume):
-    """鲜运行原子换入独立副本；恢复只用已有工作盘，不重新读取源内容。"""
+def working_disks(sources, directory, resume, refresh_system=False):
+    """持工作锁时制作副本；恢复只在明确刷新时原子替换系统盘。"""
+    if refresh_system and not resume:
+        raise ValueError("system refresh requires resume")
+    if refresh_system and not any(name == "root" for name, _ in sources):
+        raise ValueError("system refresh requires a root disk")
     disks = [(name, directory / f"{name}.raw") for name, _ in sources]
     for _, source in sources:
         regular_file(source)
@@ -34,17 +38,40 @@ def working_disks(sources, directory, resume):
                 raise ValueError(f"working disk aliases another file: {target}")
         elif resume:
             raise ValueError(f"resume disk missing: {target}")
-    if not resume:
+    copies = [(source, target) for (name, source), (_, target) in zip(sources, disks)
+              if not resume or (refresh_system and name == "root")]
+    if copies:
         with tempfile.TemporaryDirectory(prefix="fresh-", dir=directory) as temporary:
             prepared = []
-            for (name, source), (_, target) in zip(sources, disks):
-                copy = Path(temporary) / f"{name}.raw"
+            for source, target in copies:
+                copy = Path(temporary) / target.name
                 with source.open("rb") as input_stream, copy.open("xb") as output_stream:
                     shutil.copyfileobj(input_stream, output_stream, 1024 * 1024)
                 prepared.append((copy, target))
             for copy, target in prepared:
                 os.replace(copy, target)
     return disks
+
+
+def clean_work_directory(directory):
+    """沿启动的同一锁删除明确的工作盘；保留锁 inode，避免并发清理绕过互斥。"""
+    if not directory.exists():
+        return
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("work directory must be an ordinary directory")
+    with (directory / ".lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        targets = [directory / f"{name}.raw" for name in ("root", "contest", "extra", "scratch")]
+        for target in targets:
+            if target.is_symlink():
+                raise ValueError(f"working disk is a symbolic link: {target}")
+            if target.exists():
+                regular_file(target)
+                if target.stat().st_nlink != 1:
+                    raise ValueError(f"working disk aliases another file: {target}")
+        for target in targets:
+            if target.exists():
+                target.unlink()
 
 
 def qemu_arguments(args, disks):
@@ -63,13 +90,13 @@ def qemu_arguments(args, disks):
 
 
 def main(argv=None):
-    """核启动输入并锁住工作目录，比赛盘固定先于系统盘，独占副本持锁到 QEMU exec。"""
+    """核启动输入并锁住工作目录；工作清理也取得同一非阻塞锁。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arch", choices=("riscv64", "loongarch64"), required=True)
-    parser.add_argument("--kernel", type=Path, required=True)
+    parser.add_argument("--arch", choices=("riscv64", "loongarch64"))
+    parser.add_argument("--kernel", type=Path)
     parser.add_argument("--cpus", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--memory")
-    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--image", type=Path)
     parser.add_argument("--contest-image", type=Path, help="original contest image; attach its writable copy before the system image")
     parser.add_argument("--extra-image", type=Path)
     parser.add_argument("--scratch-image", type=Path)
@@ -81,6 +108,8 @@ def main(argv=None):
     parser.add_argument("--net", choices=("none", "user"), default="none")
     parser.add_argument("--net-forward", default="", help="explicit QEMU user-network hostfwd rule")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--refresh-system", action="store_true", help="with resume, replace only root.raw from the current system image")
+    parser.add_argument("--work-clean", action="store_true", help="remove known working disks under their existing lock")
     parser.add_argument("--modern", action="store_true")
     parser.add_argument("--debug", action="store_true", help="pause with the local GDB endpoint")
     parser.add_argument("--work-dir", type=Path)
@@ -88,6 +117,20 @@ def main(argv=None):
     parser.add_argument("--read-only", choices=("root", "contest", "extra", "scratch"), action="append", default=[])
     parser.add_argument("--logical-block-size", type=int, choices=(512, 1024, 2048, 4096), default=512)
     args = parser.parse_args(argv)
+    if args.work_clean:
+        if args.work_dir is None:
+            parser.error("--work-clean requires --work-dir")
+        if args.resume or args.refresh_system:
+            parser.error("--work-clean cannot resume or refresh disks")
+        try:
+            clean_work_directory(args.work_dir)
+        except (ValueError, OSError) as error:
+            parser.exit(1, f"run: {error}\n")
+        return
+    if args.arch is None or args.kernel is None or args.image is None:
+        parser.error("--arch, --kernel and --image are required to run")
+    if args.refresh_system and not args.resume:
+        parser.error("--refresh-system requires --resume")
     if args.modern and args.arch != "riscv64":
         parser.error("--modern is only valid for RISC-V MMIO")
     if args.contest_image is not None:
@@ -115,9 +158,9 @@ def main(argv=None):
         directory.mkdir(parents=True, exist_ok=True)
         with (directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            disks = working_disks(sources, directory, args.resume)
+            disks = working_disks(sources, directory, args.resume, args.refresh_system)
             command = qemu_arguments(args, disks)
-            print(f"run work-dir={directory.resolve()} resume={int(args.resume)}", flush=True)
+            print(f"run work-dir={directory.resolve()} resume={int(args.resume)} refresh-system={int(args.refresh_system)}", flush=True)
             os.set_inheritable(lock.fileno(), True)
             os.execvp(command[0], command)
     except (ValueError, OSError) as error:

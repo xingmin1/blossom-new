@@ -1,0 +1,7 @@
+# 命令由实际 /bin/sh 解释，空参数、空格和管道保留在原文本中。
+[[step]]
+kind = "shell"
+id = "onsite:shell-argv"
+root = "system"
+shell = "/bin/sh"
+command = '''MODE=onsite /bin/printf '<%s>\n' '' 'value with spaces' | /bin/cat'''

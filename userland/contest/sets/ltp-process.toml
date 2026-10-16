@@ -1,0 +1,12 @@
+# 本文件默认不被任何 plan 引用。收到含此原清单的盘后再加入 files。
+# roots 必须在入口中声明；不可因清单缺失退到 testcases/bin 遍历。
+[[step]]
+kind = "ltp"
+roots = ["musl", "glibc"]
+suite = "syscalls"
+source = "runtest"
+catalog = "/ltp/runtest/syscalls"
+shell = "/bin/sh"
+include = ["fork01", "fork02", "waitpid*", "execve*"]
+exclude = ["execve05"]
+arch = ["riscv64", "loongarch64"]

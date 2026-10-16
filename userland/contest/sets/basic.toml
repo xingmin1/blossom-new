@@ -1,0 +1,8 @@
+# basic 的 ELF 位于各族 root 的 /basic；工作目录也为 /basic。
+# 只选原盘确有的名称，不把 Completed 声明成正式判题器 Pass。
+[[step]]
+kind = "basic"
+roots = ["musl", "glibc"]
+directory = "/basic"
+include = ["brk", "getpid", "mmap", "pipe", "read"]
+arch = ["riscv64", "loongarch64"]
