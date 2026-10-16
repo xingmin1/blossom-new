@@ -1603,14 +1603,15 @@ _start:
     bgez a0, 991f
     j .Lexit
 991:
-    li t1, 512
-    bltu s0, t1, 991f
-    j .Lexit
-991:
-    slli t1, s0, 3
+    # /// 先消费真实 EMFILE，再按原表尾检查非负 fd 的四字节 int 存储槽。
+    slli t1, s0, 2
     lla t2, .Lns_fd_table
     add t1, t1, t2
-    sd a0, 0(t1)
+    lla t2, .Lns_fd_table_end
+    bltu t1, t2, 991f
+    j .Lexit
+991:
+    sw a0, 0(t1)
     addi s0, s0, 1
     j .Lns_fill_fds
 .Lns_fds_full:
@@ -1624,10 +1625,10 @@ _start:
     li s1, 0
 .Lns_close_fds:
     bgeu s1, s0, .Lns_fds_closed
-    slli t1, s1, 3
+    slli t1, s1, 2
     lla t2, .Lns_fd_table
     add t1, t1, t2
-    ld a0, 0(t1)
+    lw a0, 0(t1)
     SC 57
     EXPECT 0, 360
     addi s1, s1, 1
@@ -3211,4 +3212,5 @@ _start:
 .Lns_stack_a: .space 16384
 .Lns_stack_b: .space 16384
 .Lns_fd_table: .space 4096
+.Lns_fd_table_end:
 .Lns_cross_fds: .space 16

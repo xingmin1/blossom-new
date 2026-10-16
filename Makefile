@@ -44,6 +44,10 @@ MUSL_CROSS_RV ?= riscv64-linux-musl-
 MUSL_CROSS_LA ?= loongarch64-linux-musl-
 SYSTEM_SCRIPTS := $(patsubst userland/system/sbin/%,$(USERLAND_ROOT)/sbin/%,$(wildcard userland/system/sbin/*))
 USERLAND_SCRIPTS := $(patsubst tests/user/scripts/%,$(USERLAND_ROOT)/test/scripts/%,$(wildcard tests/user/scripts/*))
+LIBC_SOURCES := tests/user/libc-smoke.c $(addprefix tests/user/libc/,common.c lifecycle.c script.c file.c system.c limits.c file_time.c clock.c socket_timeout.c)
+LIBC_HEADERS := tests/user/libc/common.h tests/user/libc/fp.h
+NETWORK_SOURCES := tests/user/network-smoke.c $(addprefix tests/user/network/,common.c tcp.c udp.c unix.c options.c ipv6.c peer.c control.c)
+NETWORK_HEADERS := tests/user/network/common.h
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -160,19 +164,19 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_ROOT)/bin/klog-read $(USERLAND_ROOT)/bin/ktrace-control $(USERLAND_ROOT)/bin/observation-smoke $(USERLAND_ROOT)/sbin/contest-exec $(USERLAND_SCRIPTS) $(SYSTEM_SCRIPTS)
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
 
-$(USERLAND_ROOT)/bin/libc-smoke: tests/user/libc-smoke.c
+$(USERLAND_ROOT)/bin/libc-smoke: $(LIBC_SOURCES) $(LIBC_HEADERS)
 	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) "$<" -o "$@"
+	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) $(LIBC_SOURCES) -o "$@"
 
-$(USERLAND_ROOT)/bin/network-smoke: tests/user/network-smoke.c
+$(USERLAND_ROOT)/bin/network-smoke: $(NETWORK_SOURCES) $(NETWORK_HEADERS)
 	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) "$<" -o "$@"
+	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) $(NETWORK_SOURCES) -o "$@"
 
-$(USERLAND_ROOT)/bin/klog-read: tests/user/klog-read.c userland/include/blossom-trace.h
+$(USERLAND_ROOT)/bin/klog-read: userland/tools/klog-read.c userland/include/blossom-trace.h
 	mkdir -p "$(dir $@)"
 	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
-$(USERLAND_ROOT)/bin/ktrace-control: tests/user/ktrace-control.c userland/include/blossom-trace.h
+$(USERLAND_ROOT)/bin/ktrace-control: userland/tools/ktrace-control.c userland/include/blossom-trace.h
 	mkdir -p "$(dir $@)"
 	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
