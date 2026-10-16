@@ -13,7 +13,7 @@ use crate::net::packet::zeroed_bytes;
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::UnixEndpoint;
-use crate::net::{IoProgress, MessageResult, NetStackRef};
+use crate::net::{IoProgress, MessageResult, NetStackRef, UnixSocketType};
 use crate::time::{self, MonotonicInstant};
 use crate::wait::WaitResult;
 use core::time::Duration;
@@ -128,6 +128,7 @@ impl SocketFile {
     /// 完整准备真实匿名 pair 的两个 OFD，任一分配失败关闭尚未发表的两侧。
     pub fn try_new_unix_pair(
         net: NetStackRef,
+        kind: UnixSocketType,
         flags: u32,
         uid: u32,
         gid: u32,
@@ -135,7 +136,7 @@ impl SocketFile {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
-        let [first, second] = net.try_new_unix_pair()?;
+        let [first, second] = net.try_new_unix_pair(kind)?;
         let first = match Self::allocate(net.clone(), Endpoint::Unix(first), flags, uid, gid) {
             Ok(first) => first,
             Err(error) => {
@@ -216,7 +217,17 @@ impl SocketFile {
     pub fn socket_type(&self) -> u32 {
         match &self.endpoint {
             Endpoint::Udp(_) => 2,
-            Endpoint::Tcp(_) | Endpoint::Unix(_) => 1,
+            Endpoint::Tcp(_) => 1,
+            Endpoint::Unix(endpoint) => endpoint.socket_type() as u32,
+        }
+    }
+
+    /// UDP 与有序 UNIX 记录共享逐消息复制和截断语义。
+    fn is_message_oriented(&self) -> bool {
+        match &self.endpoint {
+            Endpoint::Udp(_) => true,
+            Endpoint::Unix(endpoint) => endpoint.socket_type() == UnixSocketType::SeqPacket,
+            Endpoint::Tcp(_) => false,
         }
     }
 
@@ -425,7 +436,7 @@ impl SocketFile {
         }
     }
 
-    /// 流交付连续前缀，UDP 领取同条消息及元数据；TRUNC 只允许用于 UDP。
+    /// 流交付连续前缀，消息端点领取同条记录及元数据，支持 PEEK 和 TRUNC。
     /// 每次入口固定接收期限，实际交付和非阻塞结果先于等待控制结果。
     pub fn receive(
         &self,
@@ -435,7 +446,7 @@ impl SocketFile {
     ) -> Result<MessageResult, FsError> {
         let allowed = MSG_DONTWAIT
             | MSG_PEEK
-            | if matches!(&self.endpoint, Endpoint::Udp(_)) {
+            | if self.is_message_oriented() {
                 MSG_TRUNC
             } else {
                 0
@@ -443,7 +454,7 @@ impl SocketFile {
         if flags & !allowed != 0 {
             return Err(FsError::Unsupported);
         }
-        if target.copied() == target.len() && !matches!(&self.endpoint, Endpoint::Udp(_)) {
+        if target.copied() == target.len() && !self.is_message_oriented() {
             return Ok(Self::stream_result(0));
         }
         let deadline = self.deadline(true);
@@ -471,7 +482,7 @@ impl SocketFile {
         }
     }
 
-    /// 单次数据面查询保留流的正交付前缀，UDP fault 不转换成部分消息成功。
+    /// 单次数据面查询保留流的正前缀，消息复制 fault 不转换成部分记录成功。
     fn receive_once(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -480,6 +491,9 @@ impl SocketFile {
         let start = target.copied();
         let result = match &self.endpoint {
             Endpoint::Tcp(endpoint) => endpoint.receive(target, peek),
+            Endpoint::Unix(endpoint) if endpoint.socket_type() == UnixSocketType::SeqPacket => {
+                return endpoint.receive_record(target, peek);
+            }
             Endpoint::Unix(endpoint) => endpoint.receive(target, peek),
             Endpoint::Udp(endpoint) => return endpoint.receive(target, peek),
         };
@@ -493,7 +507,7 @@ impl SocketFile {
         }
     }
 
-    /// 锁外准备同一流前缀或完整 UDP 消息，返回协议实际接受量。
+    /// 锁外准备同一流前缀或完整消息，返回协议实际接受量。
     /// 两种发送共用入口时的期限快照，消息准备和就绪唤醒都不重新计时。
     pub fn send(
         &self,
@@ -521,6 +535,9 @@ impl SocketFile {
                 return self.send_datagram(endpoint, source, destination, flags, caller, deadline);
             }
             Endpoint::Unix(_) if destination.is_some() => return Err(FsError::AlreadyConnected),
+            Endpoint::Unix(endpoint) if endpoint.socket_type() == UnixSocketType::SeqPacket => {
+                return self.send_record(endpoint, source, flags, caller, deadline);
+            }
             Endpoint::Tcp(_) | Endpoint::Unix(_) => {}
         }
         let mut prefix = [0u8; STREAM_PREFIX_LEN];
@@ -598,6 +615,60 @@ impl SocketFile {
                 IoProgress::Ready(count) => return Ok(count),
                 IoProgress::Blocked => {}
                 IoProgress::Eof => unreachable!("datagram send returned receive EOF"),
+            }
+            if self.nonblocking(flags) {
+                return Err(FsError::WouldBlock);
+            }
+            let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
+            if let Some((context, _)) = &waiting {
+                interrupted = context
+                    .park_until(matches!(caller, FileIoContext::User(_)), deadline)
+                    == WaitResult::Interrupted;
+            } else {
+                waiting = Some(self.prepare_wait()?);
+            }
+        }
+    }
+
+    /// 完整 copyin 一次，等待期间保留同份 Vec，只有方向真正接纳才移交其拥有。
+    fn send_record(
+        &self,
+        endpoint: &Arc<UnixEndpoint>,
+        source: &mut WriteBuffer<'_>,
+        flags: u32,
+        caller: FileIoContext<'_>,
+        deadline: Result<Option<MonotonicInstant>, FsError>,
+    ) -> Result<usize, FsError> {
+        let length = source.len() - source.copied();
+        if endpoint.send_capacity() < length {
+            return Err(FsError::MessageTooLarge);
+        }
+        let mut payload = zeroed_bytes(length)?;
+        if source.pull(&mut payload)? < length {
+            // 部分 copyin 的首个 fault 保存在 WriteBuffer，整条记录不得提交。
+            source.pull(&mut [])?;
+            unreachable!("incomplete UNIX record copy has no stored error");
+        }
+        let mut payload = Some(payload);
+        let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
+        let mut interrupted = false;
+        loop {
+            if let Some((context, _)) = &waiting {
+                context.clear_triggered();
+            }
+            match endpoint.send_record(&mut payload) {
+                Ok(IoProgress::Ready(count)) => return Ok(count),
+                Ok(IoProgress::Blocked) => {}
+                Ok(IoProgress::Eof) => unreachable!("record send returned receive EOF"),
+                Err(FsError::BrokenPipe) => {
+                    if flags & MSG_NOSIGNAL == 0 {
+                        if let FileIoContext::User(user) = caller {
+                            user.send_kernel_signal(13);
+                        }
+                    }
+                    return Err(FsError::BrokenPipe);
+                }
+                Err(error) => return Err(error),
             }
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);

@@ -8,6 +8,7 @@ use crate::net::address::{
     AddressFamily, SocketAddress, AF_INET, AF_INET6, AF_UNIX, MAX_ADDRESS_LEN,
 };
 use crate::net::socket::SocketFile;
+use crate::net::UnixSocketType;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::file::{import_vectors, MAX_IOV_COUNT};
 use crate::syscall::{Outcome, Request, Restart};
@@ -17,6 +18,7 @@ use smoltcp::socket::tcp::CongestionControl;
 
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
+const SOCK_SEQPACKET: u32 = 5;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_MAX: u32 = 11;
 const SOCK_NONBLOCK: u32 = 0o4000;
@@ -174,9 +176,11 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if family != i32::from(AF_UNIX) {
         return Err(Errno::AddressFamilyNotSupported);
     }
-    if kind != SOCK_STREAM {
-        return Err(Errno::SocketTypeNotSupported);
-    }
+    let kind = match kind {
+        SOCK_STREAM => UnixSocketType::Stream,
+        SOCK_SEQPACKET => UnixSocketType::SeqPacket,
+        _ => return Err(Errno::SocketTypeNotSupported),
+    };
     if protocol != 0 {
         return Err(Errno::ProtocolNotSupported);
     }
@@ -185,6 +189,7 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let second_slot = runtime.files.reserve()?;
     let [first, second] = SocketFile::try_new_unix_pair(
         runtime.net,
+        kind,
         flags,
         runtime.credentials.uid,
         runtime.credentials.gid,
@@ -447,11 +452,12 @@ fn recvmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     output_message_field(&mm, raw[1], 48, &message.flags.to_ne_bytes())?;
     output_message_field(&mm, raw[1], 40, &0u64.to_ne_bytes())?;
-    let count = if socket.socket_type() == SOCK_DGRAM && flags & MSG_TRUNC != 0 {
-        message.original_len
-    } else {
-        message.copied
-    };
+    let count =
+        if matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET) && flags & MSG_TRUNC != 0 {
+            message.original_len
+        } else {
+            message.copied
+        };
     Ok(count as isize)
 }
 
@@ -476,7 +482,7 @@ fn output_name(
     }
     Ok(length)
 }
-/// 接收消费真实消息；输入 TRUNC 只选择 UDP 返回原长，名称仍来自该记录。
+/// 接收消费真实消息；输入 TRUNC 选择报文原长，名称仍来自同条记录。
 fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mm = user.mm().expect("recvfrom has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2])?;
@@ -490,7 +496,9 @@ fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
         output_address(&mm, raw[4], raw[5], message.source)?;
     }
     let socket = file.socket().expect("checked socket capability");
-    let count = if socket.socket_type() == SOCK_DGRAM && raw[3] as u32 & MSG_TRUNC != 0 {
+    let count = if matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET)
+        && raw[3] as u32 & MSG_TRUNC != 0
+    {
         message.original_len
     } else {
         message.copied

@@ -1,6 +1,8 @@
-//! 匿名 UNIX 流由两条独立方向拥有字节；根只保活 pair，不反持端点或打开对象。
+//! 匿名 UNIX pair 由两条独立方向拥有字节流或有序记录，根不反持端点或打开对象。
 
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::fs::pipe::{PipeBuffer, PIPE_BUF};
@@ -8,10 +10,20 @@ use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::SocketAddress;
 use crate::net::socket::SocketTimeouts;
-use crate::net::{EndpointSlot, IoProgress, NetStack, NetStackRef};
+use crate::net::{EndpointSlot, IoProgress, MessageResult, NetStack, NetStackRef};
 use crate::sync::{SleepMutex, SpinLock};
 
 const STREAM_CAPACITY: usize = 4 * PIPE_BUF;
+const RECORD_CAPACITY: usize = 32;
+const MSG_TRUNC: u32 = 0x20;
+
+/// 匿名 pair 的真实传输类型，数值与 socket ABI 一致。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum UnixSocketType {
+    Stream = 1,
+    SeqPacket = 5,
+}
 const SPACE_SHIFT: u32 = 15;
 const BYTES_MASK: usize = (1 << SPACE_SHIFT) - 1;
 const SPACE_MASK: usize = BYTES_MASK << SPACE_SHIFT;
@@ -32,28 +44,79 @@ struct Direction {
 }
 
 struct DirectionState {
-    ring: PipeBuffer<4>,
+    buffer: DirectionBuffer,
     sender_closed: bool,
     receiver_closed: bool,
 }
 
+/// 流保留原页 FIFO，记录方向仅在创建时准备有限队列槽。
+enum DirectionBuffer {
+    Stream(PipeBuffer<4>),
+    SeqPacket {
+        records: VecDeque<Vec<u8>>,
+        charge: usize,
+    },
+}
+
+impl DirectionBuffer {
+    /// 返回可读占用；记录数使空消息也能发布读就绪。
+    fn readable(&self) -> usize {
+        match self {
+            Self::Stream(ring) => ring.len(),
+            Self::SeqPacket { records, .. } => records.len(),
+        }
+    }
+
+    /// 记录槽与字节预算共同限制接纳，空消息仍占一个字节额度。
+    fn space(&self) -> usize {
+        match self {
+            Self::Stream(ring) => ring.space(),
+            Self::SeqPacket { records, charge } if records.len() < RECORD_CAPACITY => {
+                STREAM_CAPACITY - charge
+            }
+            Self::SeqPacket { .. } => 0,
+        }
+    }
+
+    /// 放弃本方向全部未读拥有，恢复对应存储的空状态。
+    fn clear(&mut self) {
+        match self {
+            Self::Stream(ring) => ring.clear(),
+            Self::SeqPacket { records, charge } => {
+                records.clear();
+                *charge = 0;
+            }
+        }
+    }
+}
+
 impl Direction {
-    /// 准备空的四槽原页 FIFO，数据页只在发送真实提交时按需申请。
-    fn new() -> Self {
-        Self {
+    /// 流不预分配数据页，记录方向只预留有限消息槽，准备失败不发表 pair。
+    fn new(kind: UnixSocketType) -> Result<Self, FsError> {
+        let buffer = match kind {
+            UnixSocketType::Stream => DirectionBuffer::Stream(PipeBuffer::new()),
+            UnixSocketType::SeqPacket => {
+                let mut records = VecDeque::new();
+                records
+                    .try_reserve_exact(RECORD_CAPACITY)
+                    .map_err(|_| FsError::NoMemory)?;
+                DirectionBuffer::SeqPacket { records, charge: 0 }
+            }
+        };
+        Ok(Self {
             state: SleepMutex::new(DirectionState {
-                ring: PipeBuffer::new(),
+                buffer,
                 sender_closed: false,
                 receiver_closed: false,
             }),
             snapshot: AtomicUsize::new(STREAM_CAPACITY << SPACE_SHIFT),
-        }
+        })
     }
 
-    /// 持方向保护同时发布字节、真实空间及关闭位，poll 不等正在交付的方向。
+    /// 持方向保护发布可读占用、真实空间及关闭位，poll 不等待数据交付。
     fn publish(&self, state: &DirectionState) {
-        let snapshot = state.ring.len()
-            | (state.ring.space() << SPACE_SHIFT)
+        let snapshot = state.buffer.readable()
+            | (state.buffer.space() << SPACE_SHIFT)
             | if state.sender_closed {
                 SENDER_CLOSED
             } else {
@@ -68,10 +131,11 @@ impl Direction {
     }
 }
 
-/// 两个端点共享字节与持续源；弱域归属不形成根到打开对象的强引用环。
+/// 两个端点共享方向存储与持续源；弱域归属不形成根到打开对象的强引用环。
 pub struct UnixPair {
     id: u64,
     net: Weak<NetStack>,
+    kind: UnixSocketType,
     /// 下标是生产侧，接收侧为另一个下标。
     directions: [Direction; 2],
     sources: [Arc<PollWaitHead>; 2],
@@ -94,13 +158,15 @@ impl UnixPair {
     /// 完整准备两个方向 FIFO、持续源及节点；根只在全部成功后取得 pair 拥有。
     pub fn try_new(
         net: &NetStackRef,
+        kind: UnixSocketType,
         ids: [u64; 2],
         slots: [EndpointSlot; 2],
     ) -> Result<(Arc<Self>, [Arc<UnixEndpoint>; 2]), FsError> {
         let pair = Arc::try_new(Self {
             id: ids[0],
+            kind,
             net: Arc::downgrade(net),
-            directions: [Direction::new(), Direction::new()],
+            directions: [Direction::new(kind)?, Direction::new(kind)?],
             sources: [
                 Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
                 Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
@@ -137,7 +203,7 @@ impl UnixPair {
         self.id
     }
 
-    /// 从真实 FIFO 的字节、物理空间和关闭快照查询就绪，不获取睡眠锁或通知。
+    /// 从真实方向存储的占用、空间和关闭快照查询就绪，不获取睡眠锁或通知。
     fn mask(&self, side: usize) -> PollMask {
         let incoming = self.directions[1 - side].snapshot.load(Ordering::Acquire);
         let outgoing = self.directions[side].snapshot.load(Ordering::Acquire);
@@ -176,11 +242,11 @@ impl UnixPair {
         let (changed, reset) = {
             let mut state = direction.state.lock();
             let was_closed = state.sender_closed || state.receiver_closed;
-            let reset = discard && !state.ring.is_empty();
+            let reset = discard && state.buffer.readable() != 0;
             state.sender_closed |= close_sender;
             state.receiver_closed |= close_receiver;
             if discard {
-                state.ring.clear();
+                state.buffer.clear();
             }
             if reset {
                 self.errors[sender]
@@ -248,6 +314,11 @@ impl UnixEndpoint {
         self.id
     }
 
+    /// 两侧始终使用创建 pair 时确定的同一种传输语义。
+    pub fn socket_type(&self) -> UnixSocketType {
+        self.pair.kind
+    }
+
     /// 比较真实弱域归属，不以地址族或匿名名称猜测网络域。
     pub fn belongs_to(&self, net: &NetStackRef) -> bool {
         Weak::ptr_eq(&self.pair.net, &Arc::downgrade(net))
@@ -261,7 +332,10 @@ impl UnixEndpoint {
         if target.copied() == target.len() {
             return Ok(IoProgress::Ready(0));
         }
-        if state.ring.is_empty() {
+        let DirectionBuffer::Stream(ring) = &mut state.buffer else {
+            unreachable!("record receive uses complete messages");
+        };
+        if ring.is_empty() {
             if let Some(error) = self.pair.errors[self.side].lock().take() {
                 return Err(error);
             }
@@ -271,14 +345,15 @@ impl UnixEndpoint {
                 IoProgress::Blocked
             });
         }
-        let space = state.ring.space();
+        let space = ring.space();
         let before = target.copied();
-        let result = state.ring.receive(target, peek);
+        let result = ring.receive(target, peek);
         let copied = target.copied() - before;
         if !peek && 0 < copied {
             direction.publish(&state);
         }
-        let writable = !state.sender_closed && !state.receiver_closed && space < state.ring.space();
+        let writable =
+            !state.sender_closed && !state.receiver_closed && space < state.buffer.space();
         drop(state);
         if !peek && writable {
             self.pair.sources[1 - self.side].notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
@@ -300,10 +375,13 @@ impl UnixEndpoint {
         if source.is_empty() {
             return Ok(IoProgress::Ready(0));
         }
+        let DirectionBuffer::Stream(ring) = &mut state.buffer else {
+            unreachable!("record send uses owned messages");
+        };
         let mut source = WriteBuffer::kernel(source);
         let mut accepted = 0;
-        while source.copied() < source.len() && 0 < state.ring.space() {
-            match state.ring.append(&mut source) {
+        while source.copied() < source.len() && 0 < ring.space() {
+            match ring.append(&mut source) {
                 Ok(count) => {
                     assert!(0 < count, "UNIX copyin made no progress");
                     accepted += count;
@@ -323,6 +401,87 @@ impl UnixEndpoint {
         drop(state);
         self.pair.sources[1 - self.side].notify(PollMask::POLLIN | PollMask::POLLRDNORM);
         Ok(IoProgress::Ready(accepted))
+    }
+
+    /// 只在完整记录可接纳时移动同份 payload，等待期间调用者保留原拥有。
+    pub fn send_record(&self, payload: &mut Option<Vec<u8>>) -> Result<IoProgress, FsError> {
+        let direction = &self.pair.directions[self.side];
+        let mut state = direction.state.lock();
+        self.check_open()?;
+        if state.sender_closed || state.receiver_closed {
+            return Err(FsError::BrokenPipe);
+        }
+        if let Some(error) = self.pair.errors[self.side].lock().take() {
+            return Err(error);
+        }
+        let length = payload
+            .as_ref()
+            .expect("UNIX record already submitted")
+            .len();
+        if STREAM_CAPACITY < length {
+            return Err(FsError::MessageTooLarge);
+        }
+        let needed = length.max(1);
+        if state.buffer.space() < needed {
+            return Ok(IoProgress::Blocked);
+        }
+        let DirectionBuffer::SeqPacket { records, charge } = &mut state.buffer else {
+            unreachable!("stream send uses byte prefixes");
+        };
+        records.push_back(payload.take().expect("UNIX record already submitted"));
+        *charge += needed;
+        direction.publish(&state);
+        drop(state);
+        self.pair.sources[1 - self.side].notify(PollMask::POLLIN | PollMask::POLLRDNORM);
+        Ok(IoProgress::Ready(length))
+    }
+
+    /// 接收一条有序记录；PEEK 保留拥有，短复制或 fault 消费整条并归还其额度。
+    pub fn receive_record(
+        &self,
+        target: &mut ReadBuffer<'_>,
+        peek: bool,
+    ) -> Result<Option<MessageResult>, FsError> {
+        let direction = &self.pair.directions[1 - self.side];
+        let mut state = direction.state.lock();
+        self.check_open()?;
+        if state.buffer.readable() == 0 {
+            if let Some(error) = self.pair.errors[self.side].lock().take() {
+                return Err(error);
+            }
+            return Ok(
+                (state.sender_closed || state.receiver_closed).then_some(MessageResult {
+                    copied: 0,
+                    original_len: 0,
+                    source: None,
+                    flags: 0,
+                }),
+            );
+        }
+        let writable = !state.sender_closed && !state.receiver_closed;
+        let DirectionBuffer::SeqPacket { records, charge } = &mut state.buffer else {
+            unreachable!("stream receive uses byte prefixes");
+        };
+        let payload = records.front().expect("UNIX readable record");
+        let original_len = payload.len();
+        let copied = target.push(payload);
+        if !peek {
+            *charge -= original_len.max(1);
+            records.pop_front();
+            direction.publish(&state);
+        }
+        drop(state);
+        if !peek && writable {
+            self.pair.sources[1 - self.side].notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
+        }
+        copied.map(|copied| {
+            Some(MessageResult {
+                copied,
+                original_len,
+                source: None,
+                flags: if copied < original_len { MSG_TRUNC } else { 0 },
+            })
+        })
     }
 
     /// 指定方向关闭保留已有 incoming；任一路径均先释放一方向再取得另一方向。

@@ -12,6 +12,8 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
+pub use crate::net::unix::UnixSocketType;
+
 use ::core::convert::TryFrom;
 use ::core::mem::ManuallyDrop;
 use ::core::pin::Pin;
@@ -1077,11 +1079,14 @@ impl NetStack {
     }
 
     /// 在同一准入内准备两份节点额度和身份，完整 pair 成功后才交根表拥有。
-    pub fn try_new_unix_pair(self: &NetStackRef) -> Result<[Arc<UnixEndpoint>; 2], FsError> {
+    pub fn try_new_unix_pair(
+        self: &NetStackRef,
+        kind: UnixSocketType,
+    ) -> Result<[Arc<UnixEndpoint>; 2], FsError> {
         let _admission = self.admission()?;
         let slots = [self.claim_endpoint_slot()?, self.claim_endpoint_slot()?];
         let ids = [self.allocate_identity(), self.allocate_identity()];
-        let (pair, endpoints) = UnixPair::try_new(self, ids, slots)?;
+        let (pair, endpoints) = UnixPair::try_new(self, kind, ids, slots)?;
         self.tables.insert_unix(pair)?;
         Ok(endpoints)
     }
