@@ -1,0 +1,17 @@
+[package]
+name = "blossom-contest-run"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "contest_run"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "=1.0.217", features = ["derive"] }
+toml = "=0.8.19"
+libc = "=0.2.169"
+glob = "=0.3.2"
+
+[profile.release]
+panic = "abort"
