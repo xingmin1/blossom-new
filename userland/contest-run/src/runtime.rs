@@ -1,5 +1,6 @@
 //! 实际挂载拥有、系统根准备与不改变输入的有限 ELF 诊断。
 
+use crate::execute::run_steps;
 use crate::model::{CommandSpec, RootSpec};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CString, OsString};
@@ -66,6 +67,42 @@ impl Mounts {
         Ok(())
     }
 
+    /// 系统根命令先执行；只挂载配置明确请求的 dev/proc/tmp。
+    pub fn prepare_root(
+        &mut self,
+        root: &RootSpec,
+        timeout: Duration,
+        outputs: [RawFd; 2],
+    ) -> Result<(), String> {
+        if !root.path.is_dir() {
+            return Err(format!("root is not a directory: {}", root.path.display()));
+        }
+        let errors = run_steps(
+            None,
+            Path::new("/"),
+            &root.prepare,
+            &BTreeMap::new(),
+            timeout,
+            outputs,
+            true,
+        );
+        if let Some(error) = errors.into_iter().next() {
+            return Err(format!("root prepare: {error}"));
+        }
+        for name in &root.mounts {
+            let filesystem = match name.as_str() {
+                "dev" => "devfs",
+                "proc" => "proc",
+                "tmp" => "tmpfs",
+                _ => return Err(format!("unsupported root mount: {name}")),
+            };
+            let target = rooted_path(&root.path, Path::new("/"), Path::new(name))
+                .map_err(|error| format!("mount target {name}: {error}"))?;
+            self.mount(Path::new(filesystem), &target, filesystem, false)
+                .map_err(|error| format!("mount {}: {error}", target.display()))?;
+        }
+        Ok(())
+    }
 }
 
 /// 将路径逐组件限制在目标根；绝对 symlink 从目标根重新开始，最多跟随四十次。
