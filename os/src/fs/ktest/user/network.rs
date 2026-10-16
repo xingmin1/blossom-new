@@ -90,12 +90,16 @@ impl UserOwner {
         mode: NetworkMode,
     ) -> TestResult {
         self.prepare_tty(context, 4)?;
-        if self.net.ktest_live_endpoints() != 0 {
+        let net = self
+            .net
+            .as_ref()
+            .ok_or(TestError("network suite has no network"))?
+            .clone();
+        if net.ktest_live_endpoints() != 0 {
             return Err(TestError("network user case inherited live endpoints"));
         }
         if matches!(mode, NetworkMode::Control | NetworkMode::NicControl) {
-            self.network_control =
-                Some((self.net.interface_snapshots(), self.net.route_snapshots()));
+            self.network_control = Some((net.interface_snapshots(), net.route_snapshots()));
             self.mount_network_proc(context)?;
         }
         let result = self.network_run(context, mode);
@@ -107,12 +111,12 @@ impl UserOwner {
             self.reap_children(context, true)?;
         }
         let observer_result = self.observer.take().map(|observer| observer.join());
-        if self.net.ktest_has_held_syn() {
-            checked(context, self.net.ktest_release_syn())?;
+        if net.ktest_has_held_syn() {
+            checked(context, net.ktest_release_syn())?;
         }
-        checked(context, self.net.ktest_clear_packet_control())?;
+        checked(context, net.ktest_clear_packet_control())?;
         network_until(
-            || self.net.ktest_live_endpoints() == 0,
+            || net.ktest_live_endpoints() == 0,
             "network user protocols did not retire",
             30,
         )?;
@@ -125,7 +129,7 @@ impl UserOwner {
         context.diagnostic(format_args!(
             "network-user mode={:?} live_endpoints={} protocols_retired=1",
             mode,
-            self.net.ktest_live_endpoints()
+            net.ktest_live_endpoints()
         ));
         result
     }
@@ -154,13 +158,14 @@ impl UserOwner {
         let Some((interfaces, routes)) = self.network_control else {
             return Ok(());
         };
+        let net = self
+            .net
+            .as_ref()
+            .ok_or(TestError("network control lost its network"))?;
         for interface in interfaces.iter().flatten() {
-            let current = checked(context, self.net.interface_snapshot(interface.id))?;
+            let current = checked(context, net.interface_snapshot(interface.id))?;
             if current.up != interface.up {
-                checked(
-                    context,
-                    self.net.set_interface_up(interface.id, interface.up),
-                )?;
+                checked(context, net.set_interface_up(interface.id, interface.up))?;
             }
         }
         let original = routes
@@ -168,8 +173,7 @@ impl UserOwner {
             .flatten()
             .find(|route| route.prefix_len == 0 && route.gateway.is_some())
             .map(|route| (route.interface, route.gateway.unwrap()));
-        let current = self
-            .net
+        let current = net
             .route_snapshots()
             .iter()
             .flatten()
@@ -179,7 +183,7 @@ impl UserOwner {
             if let Some((interface, gateway)) = current {
                 checked(
                     context,
-                    self.net.change_default_route(
+                    net.change_default_route(
                         DefaultRouteRequest {
                             interface: Some(interface),
                             gateway,
@@ -191,7 +195,7 @@ impl UserOwner {
             if let Some((interface, gateway)) = original {
                 checked(
                     context,
-                    self.net.change_default_route(
+                    net.change_default_route(
                         DefaultRouteRequest {
                             interface: Some(interface),
                             gateway,
@@ -207,6 +211,11 @@ impl UserOwner {
 
     /// 映像、真实文件描述符及协调 Task 均在发表用户之前准备，失败由原拥有析构。
     fn network_run(&mut self, context: &mut TestContext<'_>, mode: NetworkMode) -> TestResult {
+        let net = self
+            .net
+            .as_ref()
+            .ok_or(TestError("network suite has no network"))?
+            .clone();
         let credentials = if mode == NetworkMode::Identity {
             Credentials {
                 uid: 1000,
@@ -288,7 +297,7 @@ impl UserOwner {
         let coordinator = if let Some((reader, writer, _, _)) = channels {
             let user = prepared.user();
             let graph = self.graph().clone();
-            let net = self.net.clone();
+            let net = net.clone();
             Some(
                 task::prepare_kernel(move || {
                     let result = coordinate(mode, &reader, &writer, &graph, &user, &net);
@@ -311,8 +320,8 @@ impl UserOwner {
             None
         };
         match mode {
-            NetworkMode::Connect => checked(context, self.net.ktest_hold_syn(45204))?,
-            NetworkMode::Signal => checked(context, self.net.ktest_hold_syn(45214))?,
+            NetworkMode::Connect => checked(context, net.ktest_hold_syn(45204))?,
+            NetworkMode::Signal => checked(context, net.ktest_hold_syn(45214))?,
             _ => {}
         }
         let join = prepared

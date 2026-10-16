@@ -125,10 +125,11 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
         _ => return Err(Errno::SocketTypeNotSupported),
     }
     let runtime = user.runtime().expect("socket has no runtime");
+    let net = runtime.net.ok_or(Errno::NetworkUnreachable)?;
     let reservation = runtime.files.reserve()?;
     let file: FileRef = if kind == SOCK_STREAM {
         SocketFile::try_new_tcp(
-            runtime.net,
+            net,
             family,
             flags,
             runtime.credentials.uid,
@@ -136,7 +137,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
         )?
     } else {
         SocketFile::try_new_udp(
-            runtime.net,
+            net,
             family,
             flags,
             runtime.credentials.uid,
@@ -185,10 +186,11 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
         return Err(Errno::ProtocolNotSupported);
     }
     let runtime = user.runtime().expect("socketpair has no runtime");
+    let net = runtime.net.ok_or(Errno::NetworkUnreachable)?;
     let first_slot = runtime.files.reserve()?;
     let second_slot = runtime.files.reserve()?;
     let [first, second] = SocketFile::try_new_unix_pair(
-        runtime.net,
+        net,
         kind,
         flags,
         runtime.credentials.uid,

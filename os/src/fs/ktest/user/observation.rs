@@ -13,10 +13,15 @@ impl UserOwner {
         mode: &[u8],
     ) -> TestResult {
         self.prepare_tty(context, 4)?;
-        if self.net.ktest_live_endpoints() != 0 {
-            return Err(TestError(
-                "observation case inherited live network endpoints",
-            ));
+        if let Some(net) = &self.net {
+            if net.ktest_live_endpoints() != 0 {
+                return Err(TestError(
+                    "observation case inherited live network endpoints",
+                ));
+            }
+        }
+        if mode == b"trace" && self.net.is_none() {
+            return Err(TestError("observation trace suite has no network"));
         }
         self.observation_trace = mode == b"trace";
         let result = self.observation_run(context, mode);
@@ -32,16 +37,18 @@ impl UserOwner {
             checked(context, crate::trace::stop())?;
             self.observation_trace = false;
         }
-        let end = time::now()
-            .checked_add(time::Duration::from_secs(30))
-            .ok_or(TestError(
-                "observation protocol retirement deadline overflow",
-            ))?;
-        while self.net.ktest_live_endpoints() != 0 {
-            if end <= time::now() {
-                return Err(TestError("observation loopback protocols did not retire"));
+        if let Some(net) = &self.net {
+            let end = time::now()
+                .checked_add(time::Duration::from_secs(30))
+                .ok_or(TestError(
+                    "observation protocol retirement deadline overflow",
+                ))?;
+            while net.ktest_live_endpoints() != 0 {
+                if end <= time::now() {
+                    return Err(TestError("observation loopback protocols did not retire"));
+                }
+                timer::sleep(time::Duration::from_millis(1));
             }
-            timer::sleep(time::Duration::from_millis(1));
         }
         if let Some(status) = observer_status {
             context.expect_eq(status, 0);

@@ -57,8 +57,12 @@ impl UserOwner {
             &[b"--runtime-socket-timeouts"],
             Credentials::ROOT,
         );
+        let net = self
+            .net
+            .as_ref()
+            .ok_or(TestError("socket timeout suite has no network"))?;
         network_until(
-            || self.net.ktest_live_endpoints() == 0,
+            || net.ktest_live_endpoints() == 0,
             "runtime socket protocols did not retire",
             30,
         )?;

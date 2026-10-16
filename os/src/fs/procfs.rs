@@ -118,10 +118,11 @@ pub fn open(
                 FileIoContext::User(thread) => thread.runtime().ok_or(FsError::InvalidOperation)?,
                 FileIoContext::Kernel => return Err(FsError::InvalidOperation),
             };
+            let net = runtime.net.as_ref().ok_or(FsError::NetworkUnreachable)?;
             if special == MemorySpecial::NetDev {
-                net_dev(&runtime.net)?
+                net_dev(net)?
             } else {
-                net_route(&runtime.net)?
+                net_route(net)?
             }
         }
         _ => return Err(FsError::InvalidOperation),

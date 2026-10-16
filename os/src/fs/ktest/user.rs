@@ -1,4 +1,4 @@
-//! 普通磁盘 ELF 复用原设备/路径夹具；用户 wait 与真实离栈 join 分别完成后才释放根。
+//! 用户 ELF 按普通、网络、串口业务共享具体 suite 资源；每例 wait、离栈 join 与资源归还保持独立。
 
 use crate::fs::ext4::codec;
 use crate::fs::ktest::path::PathOwner;
@@ -48,22 +48,46 @@ struct ReservedDescriptor {
     join: JoinHandle,
 }
 
-/// 所有真实用户运行资源在首例基线前共享同一设备库存与网络域。
+/// 普通用户与文件测试只共享一次发现的设备库存。
 struct UserSuite {
-    net_owner: Option<NetStackOwner>,
     inventory: DeviceInventory,
-    net: NetStackRef,
 }
 
 impl Fixture for UserSuite {
-    /// 整组只发现一次设备；成对服务端口选择真实 NIC，没有 token 时明确构造 lo。
+    /// 稳定库存先于 case 基线准备，不启动网络或串口接收。
+    fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
+        let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
+        Ok(Self { inventory })
+    }
+
+    /// case 的任务和路径结束后停止原库存。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        <DeviceInventory as Fixture>::quiesce(&mut self.inventory, context)
+    }
+
+    /// 消费同一库存，保留原设备资源归还检查。
+    fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
+        <DeviceInventory as Fixture>::tear_down(self.inventory, context)
+    }
+}
+
+/// 网络业务在整组基线前持有唯一网络 owner，普通文件测试不构造此组合。
+struct NetworkSuite {
+    resources: UserSuite,
+    net_owner: Option<NetStackOwner>,
+}
+
+impl Fixture for NetworkSuite {
+    /// 成对服务端口选择真实 NIC；没有端口时显式构造 lo。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let ports = network::nic_ports()?;
-        let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
+        let resources = <UserSuite as Fixture>::set_up(context, &())?;
         let net_owner = if ports.is_some() {
             // SAFETY: 框架串行分派 suite，前组已同步停止 NIC；本组是所选设备唯一构造者。
-            // 库存来自一次真实 discover，永久强序映射有效，库存保留到网络 owner 完整停止之后。
-            let owner = checked(context, unsafe { NetStack::try_new_nic(&inventory) })?;
+            // 库存来自一次真实 discover，永久强序映射有效，并保留到网络 owner 完整停止之后。
+            let owner = checked(context, unsafe {
+                NetStack::try_new_nic(&resources.inventory)
+            })?;
             checked(
                 context,
                 owner.stack().configure_ethernet(EthernetConfig {
@@ -76,35 +100,34 @@ impl Fixture for UserSuite {
         } else {
             checked(context, NetStack::try_new_lo())?
         };
-        let net = Arc::clone(net_owner.stack());
+        crate::workqueue::testing::wait_services_blocked();
         Ok(Self {
+            resources,
             net_owner: Some(net_owner),
-            inventory,
-            net,
         })
     }
 
-    /// 所有 case 已停止用户生产后，先完成网络回调全尾再停止原设备库存。
+    /// 用户与协议拥有结束后先停止网络回调全尾，再停止库存。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         drop(self.net_owner.take());
-        <DeviceInventory as Fixture>::quiesce(&mut self.inventory, context)
+        <UserSuite as Fixture>::quiesce(&mut self.resources, context)
     }
 
-    /// 唯一网络 owner 移出后消费原库存，失败设置与未进入 quiesce 的路径也结束真实网络。
+    /// 未进入 quiesce 的路径也先结束真实网络，再消费库存。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         drop(self.net_owner.take());
-        <DeviceInventory as Fixture>::tear_down(self.inventory, context)
+        <UserSuite as Fixture>::tear_down(self.resources, context)
     }
 }
 
-/// 用户程序整组共享设备库存、网络域与串口 TTY 接收附着，case 独立拥有路径和用户任务。
-struct UserProgramSuite {
+/// 串口业务在整组基线前附着真实 TTY 接收，不启动网络。
+struct SerialSuite {
     resources: UserSuite,
     serial: SerialTtyOwner,
 }
 
-impl Fixture for UserProgramSuite {
-    /// 共享资源与真实 TTY 接收均在首例基线前准备，case 不承担整组准备开销。
+impl Fixture for SerialSuite {
+    /// 共享库存与真实接收在首例基线前准备，console 输出不要求此附着。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let resources = <UserSuite as Fixture>::set_up(context, &())?;
         let serial = SerialTtyOwner::attach()?;
@@ -112,13 +135,13 @@ impl Fixture for UserProgramSuite {
         Ok(Self { resources, serial })
     }
 
-    /// 全部 case 的任务、OFD 与 raw 阶段结束后先恢复 Raw，再停止共同网络与原设备责任。
+    /// 用户图、OFD 与 raw 阶段结束后先恢复 Raw，再停止库存。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()?;
         <UserSuite as Fixture>::quiesce(&mut self.resources, context)
     }
 
-    /// 串口已停止后消费共同网络与原库存，不重新发现设备或销毁常驻 TTY 服务。
+    /// 不销毁常驻 TTY 服务；确认串口停止后消费原库存。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()?;
         <UserSuite as Fixture>::tear_down(self.resources, context)
@@ -127,7 +150,7 @@ impl Fixture for UserProgramSuite {
 
 struct UserOwner {
     path: PathOwner,
-    net: NetStackRef,
+    net: Option<NetStackRef>,
     /// 控制例保存修改前的小值，用户异常退出后仍由原 fixture 恢复共享域。
     network_control: Option<([Option<InterfaceSnapshot>; 2], [Option<RouteSnapshot>; 3])>,
     metadata_before: MetadataStats,
@@ -1320,12 +1343,12 @@ impl UserOwner {
 }
 
 impl Fixture<UserSuite> for UserOwner {
-    /// 每例保留原设备清理责任并共享整组网络域，路径、身份与映像仍在正文准备。
+    /// 每例保留原设备清理责任；普通路径与身份不取得无关网络。
     fn set_up(context: &mut TestContext<'_>, suite: &UserSuite) -> Result<Self, TestError> {
         let metadata_before = metadata_stats();
         Ok(Self {
             path: <PathOwner as Fixture<DeviceInventory>>::set_up(context, &suite.inventory)?,
-            net: suite.net.clone(),
+            net: None,
             network_control: None,
             metadata_before,
             graph: None,
@@ -1398,18 +1421,43 @@ impl Fixture<UserSuite> for UserOwner {
     }
 }
 
-impl Fixture<UserProgramSuite> for UserOwner {
-    /// 用户程序借组合中同一库存与网络域，原拥有者继续承担每例清理。
-    fn set_up(context: &mut TestContext<'_>, suite: &UserProgramSuite) -> Result<Self, TestError> {
-        <Self as Fixture<UserSuite>>::set_up(context, &suite.resources)
+impl Fixture<NetworkSuite> for UserOwner {
+    /// 借同一库存并保活整组真实网络，停止责任仍由 suite owner 承担。
+    fn set_up(context: &mut TestContext<'_>, suite: &NetworkSuite) -> Result<Self, TestError> {
+        let mut owner = <Self as Fixture<UserSuite>>::set_up(context, &suite.resources)?;
+        owner.net = Some(Arc::clone(
+            suite
+                .net_owner
+                .as_ref()
+                .expect("network suite stopped")
+                .stack(),
+        ));
+        Ok(owner)
     }
 
-    /// 用户图、文件和 raw 阶段仍按原 case 顺序停止，接收附着保留至最后一例结束。
+    /// 网络恢复在原用户 wait、join 和 reap 之后执行。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         <Self as Fixture<UserSuite>>::quiesce(self, context)
     }
 
-    /// 消费原每例拥有并保留完整 MM 与任务元数据断言。
+    /// 保留完整 MM 与任务元数据断言，不重置网络统计。
+    fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
+        <Self as Fixture<UserSuite>>::tear_down(self, context)
+    }
+}
+
+impl Fixture<SerialSuite> for UserOwner {
+    /// 串口整组持有接收附着，每例仍只建立自己的路径与用户图。
+    fn set_up(context: &mut TestContext<'_>, suite: &SerialSuite) -> Result<Self, TestError> {
+        <Self as Fixture<UserSuite>>::set_up(context, &suite.resources)
+    }
+
+    /// 用户图、文件和 raw 阶段按原 case 顺序停止。
+    fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        <Self as Fixture<UserSuite>>::quiesce(self, context)
+    }
+
+    /// 每例先归还自身资源，接收附着保留至最后一例结束。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         <Self as Fixture<UserSuite>>::tear_down(self, context)
     }
@@ -1417,12 +1465,14 @@ impl Fixture<UserProgramSuite> for UserOwner {
 
 /// 父入口只保留原生 suite 宏的真实锚点。
 pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
+    core::hint::black_box(network_programs::__ktest_anchor());
+    core::hint::black_box(serial_programs::__ktest_anchor());
     programs::__ktest_anchor()
 }
 
 /// 可写消费者仍注册在原文件测试目录，不构造另一运行入口。
 pub(crate) fn write_anchor() -> &'static ::ktest::SuiteSlot {
-    write::writes::__ktest_anchor()
+    write::anchor()
 }
 
 /// 新名字空间消费者沿唯一 user ELF 锚点进入现有具名测试目录。
@@ -1440,7 +1490,7 @@ pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
     background::anchor()
 }
 
-#[ktest::suite(fixture = UserOwner, suite_resources = UserProgramSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
+#[ktest::suite(fixture = UserOwner, suite_resources = UserSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
 
@@ -1514,208 +1564,6 @@ pub(crate) mod programs {
     #[ktest(tags("observation-user", "kmsg"))]
     fn observation_kmsg(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.observation_mode(context, b"kmsg")
-    }
-
-    /// 普通 pipe 与 lo TCP 产生固定事件，用户 ioctl 冻结后核旧 OFD 字节独立。
-    #[test]
-    #[ktest(tags("observation-user", "trace", "network-user"))]
-    fn observation_trace(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.observation_mode(context, b"trace")
-    }
-
-    /// 普通 ioctl 配置双族 lo，并通过实际 proc 打开验证旧快照和共享游标。
-    #[test]
-    #[ktest(tags("network-user", "network-control", "fs-proc"))]
-    fn network_control(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Control)
-    }
-
-    /// 删除并恢复默认路由后沿原 TCP peer 完成真实 NIC 全文业务。
-    #[test]
-    #[ktest(
-        tags(
-            "network-user",
-            "network-control",
-            "network-nic",
-            "network-nic-tcp",
-            "fs-proc"
-        ),
-        resources("net-user")
-    )]
-    fn network_nic_control(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::NicControl)
-    }
-
-    /// 普通 TCP 经实际 NIC 与宿主核验双向全文、短前缀、半关闭和真实地址。
-    #[test]
-    #[ktest(
-        tags("network-user", "network-nic", "network-nic-tcp"),
-        resources("net-user")
-    )]
-    fn network_nic_tcp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::NicTcp)
-    }
-
-    /// 同一普通 UDP socket 经实际 NIC 消费三条完整响应并拒绝超 MTU 消息。
-    #[test]
-    #[ktest(
-        tags("network-user", "network-nic", "network-nic-udp"),
-        resources("net-user")
-    )]
-    fn network_nic_udp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::NicUdp)
-    }
-
-    /// 普通用户身份创建 socket，并核验共享 OFD 与独立描述符 flags。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_identity(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Identity)
-    }
-
-    /// 同一监听 OFD 的别名连续接受已完成握手的连接，每次得到新 OFD。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_listener(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Listener)
-    }
-
-    /// 真实 SYN 等待与拒绝分别产生非阻塞连接结果，SO_ERROR 按一次消费核验。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_connect(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Connect)
-    }
-
-    /// 普通流读取核验完整字节、PEEK、短前缀与数据后的 FIN 和 EOF。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_stream(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Stream)
-    }
-
-    /// 发送空间用尽后观察真实用户阻塞，再由接收及后台 ACK 恢复进度。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_backpressure(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Backpressure)
-    }
-
-    /// 真实半关闭保留接收方向，并区分 SIGPIPE 与 MSG_NOSIGNAL。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_half_close(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::HalfClose)
-    }
-
-    /// 地址容量、用户复制错误与 fd 满分别核验真实 accept 的领取和发表。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_address(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Address)
-    }
-
-    /// 信号打断真实 read 和 connect 等待，并沿原重启与 poll 绝对期限消费结果。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_signal(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Signal)
-    }
-
-    /// 同一 socket 身份在原 epoll 中核验触发方式、修改、删除和 fd 复用。
-    #[test]
-    #[ktest(tags("network-user", "network-tcp"))]
-    fn network_epoll(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Epoll)
-    }
-
-    /// 同一 UDP OFD 的消息目的、默认 peer、来源与断连接都由普通 C 核验。
-    #[test]
-    #[ktest(tags("network-user", "network-udp"))]
-    fn network_udp_address(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::UdpAddress)
-    }
-
-    /// 普通消息入口区分零长消费、短消息丢尾与 PEEK/TRUNC。
-    #[test]
-    #[ktest(tags("network-user", "network-udp"))]
-    fn network_udp_message(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::UdpMessage)
-    }
-
-    /// 匿名 UNIX 双向流跨真实环容量，共享 OFD 和末关闭错误仍沿原用户拥有。
-    #[test]
-    #[ktest(tags("network-user", "network-unix"))]
-    fn network_unix_pair(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::UnixPair)
-    }
-
-    /// 目标消息头与向量跨段消费核验真实接受前缀及用户故障后的后继。
-    #[test]
-    #[ktest(tags("network-user", "network-message"))]
-    fn network_message_vector(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.network_mode(context, NetworkMode::MessageVector)
-    }
-
-    /// 复用策略、监听冲突、实际 UDP 选择和 TCP child 继承由普通 syscall 核验。
-    #[test]
-    #[ktest(tags("network-user", "network-options"))]
-    fn network_socket_options(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.network_mode(context, NetworkMode::SocketOptions)
-    }
-
-    /// 普通 IPv6 TCP 握手、名称容量、双向全文与半关闭沿真实用户 fork 和 reap。
-    #[test]
-    #[ktest(tags("network-user", "network-ipv6", "network-tcp"))]
-    fn network_ipv6_tcp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Ipv6Tcp)
-    }
-
-    /// 两个 ::1 UDP 目的与默认 peer、大 lo 消息和 LP64 向量由普通 syscall 核验。
-    #[test]
-    #[ktest(tags("network-user", "network-ipv6", "network-udp"))]
-    fn network_ipv6_udp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Ipv6Udp)
-    }
-
-    /// 双面监听共用同一 OFD，映射名称、端口冲突及 V6ONLY 隔离由普通连接核验。
-    #[test]
-    #[ktest(tags("network-user", "network-ipv6"))]
-    fn network_ipv6_mapped(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::Ipv6Mapped)
-    }
-
-    /// TCP 发送满后恢复，UDP 单消息按预算接纳，缩小不丢两者已接受的数据。
-    #[test]
-    #[ktest(tags("network-user", "network-buffer"))]
-    fn network_buffer_budget(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.network_mode(context, NetworkMode::BufferBudget)
-    }
-
-    /// 双族真实连接查询 MSS、Reno 及开关，非 TCP 请求和选项容量保正式 ABI 错误。
-    #[test]
-    #[ktest(tags("network-user", "network-options"))]
-    fn network_protocol_options(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.network_mode(context, NetworkMode::ProtocolOptions)
-    }
-
-    /// 大 lo UDP 保单条消息、全文及来源，分别核两族协议上界与下一字节拒绝。
-    #[test]
-    #[ktest(tags("network-user", "network-large"))]
-    fn network_large_loopback(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.network_mode(context, NetworkMode::LargeLoopback)
     }
 
     /// 真实 ELF 的边缘、BSS、参数和缓存私有性由 loader 与实际用户指令共同验证。
@@ -1909,122 +1757,6 @@ pub(crate) mod programs {
     ) -> TestResult {
         fixture.events_abi(context, b"f")
     }
-    /// 普通用户raw模式逐字节交付UART输入输出，跨write保留UTF-8与二进制值。
-    #[test]
-    #[ktest(tags("T19", "user-tty"), resources("uart"), timeout_ms = 90000)]
-    fn tty_raw_bytes_utf8_and_binary(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"r")
-    }
-
-    /// 真实canonical行规程执行编辑键、短读、EOF token和零长边界。
-    #[test]
-    #[ktest(tags("T20", "user-tty"), resources("uart"), timeout_ms = 90000)]
-    fn tty_canonical_edit_and_eof(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"c")
-    }
-
-    /// 用户read真实验证四种VMIN/VTIME组合的总期限与首字节后间隔期限。
-    #[test]
-    #[ktest(tags("T21", "user-tty"), resources("uart"), timeout_ms = 120000)]
-    fn tty_vmin_vtime_read_deadlines(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"v")
-    }
-
-    /// 用户read与poll分别验证MIN门槛和可读谓词，空立即read不伪造poll ready。
-    #[test]
-    #[ktest(tags("T22", "user-tty"), resources("uart"), timeout_ms = 90000)]
-    fn tty_poll_uses_independent_predicate(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"p")
-    }
-
-    /// host实际发字节时用户没有read，唯一UART Work仍消费IRQ并输出真实echo。
-    #[test]
-    #[ktest(tags("T23", "user-tty"), resources("uart"), timeout_ms = 90000)]
-    fn tty_irq_echo_without_reader(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"e")
-    }
-
-    /// 用户输出经ONLCR只转换一次，宿主真实背压并等到硬件TEMT。
-    #[test]
-    #[ktest(tags("T24", "user-tty"), resources("uart"), timeout_ms = 120000)]
-    fn tty_output_crlf_backpressure_and_drain(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"o")
-    }
-
-    /// 用户36字节termios结构与跨页故障、setter无半更新和W/F提交沿raw ioctl验证。
-    #[test]
-    #[ktest(tags("T25", "user-tty"), resources("uart"), timeout_ms = 90000)]
-    fn tty_termios_copy_fault_and_setter(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"t")
-    }
-
-    /// Ctrl-S期间用户write真实阻塞，后续RX Ctrl-Q经原Work恢复且续传字节有序。
-    #[test]
-    #[ktest(tags("T26", "user-tty"), resources("uart"), timeout_ms = 120000)]
-    fn tty_software_flow_control_resume(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.tty_abi(context, b"x")
-    }
-
-    /// 真实前后台组通过普通wait消费TTIN、TTOU、输入信号与孤儿HUP/CONT事件。
-    #[test]
-    #[ktest(
-        min_cpus = 2,
-        tags("T27", "user-tty", "user-jobs"),
-        resources("uart"),
-        timeout_ms = 120000
-    )]
-    fn jobs_front_background_signals(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.jobs_front_background_signals(context)
-    }
-
-    /// 三种打开身份、exec继承、leader挂断和同号新PGID沿真实OFD及用户生命周期验证。
-    #[test]
-    #[ktest(
-        min_cpus = 2,
-        tags("T28", "user-tty", "user-jobs"),
-        resources("uart"),
-        timeout_ms = 120000
-    )]
-    fn jobs_open_hangup_identity(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.jobs_open_hangup_identity(context)
-    }
-
-    /// 完整winsize变更只向当时前台组发送WINCH，实际sigtimedwait区分相同值与copy故障。
-    #[test]
-    #[ktest(min_cpus = 2, tags("T29", "user-tty", "user-jobs"), timeout_ms = 90000)]
-    fn jobs_winsize_changes(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
-        fixture.jobs_winsize_changes(context)
-    }
 
     /// 普通 C 经真实 uname/chroot 系统调用核字节故障、旧 cwd/FD 和独立父子根。
     #[test]
@@ -2053,19 +1785,6 @@ pub(crate) mod programs {
         credentials: Credentials,
     ) -> TestResult {
         fixture.runtime_file_times(context, credentials)
-    }
-
-    /// 原生 C 核 socket 的真实有限等待、共享选项、child 继承与信号重启差异。
-    #[test]
-    #[ktest(
-        tags("runtime-socket-timeouts", "user-libc", "user-network"),
-        timeout_ms = 120000
-    )]
-    fn runtime_socket_timeouts(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.runtime_socket_timeouts(context)
     }
 
     /// 原生 C 从硬件 UTC 核日期字段和绝对睡眠，单调与 CPU 账保持各自语义。
@@ -2685,5 +2404,344 @@ pub(crate) mod programs {
     ) -> TestResult {
         fixture.prepare(context)?;
         fixture.cancel_inflight_file_read(context)
+    }
+}
+
+#[ktest::suite(fixture = UserOwner, suite_resources = NetworkSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
+pub(crate) mod network_programs {
+    use super::*;
+    /// 普通 pipe 与 lo TCP 产生固定事件，用户 ioctl 冻结后核旧 OFD 字节独立。
+    #[test]
+    #[ktest(tags("observation-user", "trace", "network-user"))]
+    fn observation_trace(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.observation_mode(context, b"trace")
+    }
+
+    /// 普通 ioctl 配置双族 lo，并通过实际 proc 打开验证旧快照和共享游标。
+    #[test]
+    #[ktest(tags("network-user", "network-control", "fs-proc"))]
+    fn network_control(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Control)
+    }
+
+    /// 删除并恢复默认路由后沿原 TCP peer 完成真实 NIC 全文业务。
+    #[test]
+    #[ktest(
+        tags(
+            "network-user",
+            "network-control",
+            "network-nic",
+            "network-nic-tcp",
+            "fs-proc"
+        ),
+        resources("net-user")
+    )]
+    fn network_nic_control(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::NicControl)
+    }
+
+    /// 普通 TCP 经实际 NIC 与宿主核验双向全文、短前缀、半关闭和真实地址。
+    #[test]
+    #[ktest(
+        tags("network-user", "network-nic", "network-nic-tcp"),
+        resources("net-user")
+    )]
+    fn network_nic_tcp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::NicTcp)
+    }
+
+    /// 同一普通 UDP socket 经实际 NIC 消费三条完整响应并拒绝超 MTU 消息。
+    #[test]
+    #[ktest(
+        tags("network-user", "network-nic", "network-nic-udp"),
+        resources("net-user")
+    )]
+    fn network_nic_udp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::NicUdp)
+    }
+
+    /// 普通用户身份创建 socket，并核验共享 OFD 与独立描述符 flags。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_identity(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Identity)
+    }
+
+    /// 同一监听 OFD 的别名连续接受已完成握手的连接，每次得到新 OFD。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_listener(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Listener)
+    }
+
+    /// 真实 SYN 等待与拒绝分别产生非阻塞连接结果，SO_ERROR 按一次消费核验。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_connect(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Connect)
+    }
+
+    /// 普通流读取核验完整字节、PEEK、短前缀与数据后的 FIN 和 EOF。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_stream(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Stream)
+    }
+
+    /// 发送空间用尽后观察真实用户阻塞，再由接收及后台 ACK 恢复进度。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_backpressure(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Backpressure)
+    }
+
+    /// 真实半关闭保留接收方向，并区分 SIGPIPE 与 MSG_NOSIGNAL。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_half_close(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::HalfClose)
+    }
+
+    /// 地址容量、用户复制错误与 fd 满分别核验真实 accept 的领取和发表。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_address(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Address)
+    }
+
+    /// 信号打断真实 read 和 connect 等待，并沿原重启与 poll 绝对期限消费结果。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_signal(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Signal)
+    }
+
+    /// 同一 socket 身份在原 epoll 中核验触发方式、修改、删除和 fd 复用。
+    #[test]
+    #[ktest(tags("network-user", "network-tcp"))]
+    fn network_epoll(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Epoll)
+    }
+
+    /// 同一 UDP OFD 的消息目的、默认 peer、来源与断连接都由普通 C 核验。
+    #[test]
+    #[ktest(tags("network-user", "network-udp"))]
+    fn network_udp_address(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::UdpAddress)
+    }
+
+    /// 普通消息入口区分零长消费、短消息丢尾与 PEEK/TRUNC。
+    #[test]
+    #[ktest(tags("network-user", "network-udp"))]
+    fn network_udp_message(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::UdpMessage)
+    }
+
+    /// 匿名 UNIX 双向流跨真实环容量，共享 OFD 和末关闭错误仍沿原用户拥有。
+    #[test]
+    #[ktest(tags("network-user", "network-unix"))]
+    fn network_unix_pair(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::UnixPair)
+    }
+
+    /// 目标消息头与向量跨段消费核验真实接受前缀及用户故障后的后继。
+    #[test]
+    #[ktest(tags("network-user", "network-message"))]
+    fn network_message_vector(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::MessageVector)
+    }
+
+    /// 复用策略、监听冲突、实际 UDP 选择和 TCP child 继承由普通 syscall 核验。
+    #[test]
+    #[ktest(tags("network-user", "network-options"))]
+    fn network_socket_options(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::SocketOptions)
+    }
+
+    /// 普通 IPv6 TCP 握手、名称容量、双向全文与半关闭沿真实用户 fork 和 reap。
+    #[test]
+    #[ktest(tags("network-user", "network-ipv6", "network-tcp"))]
+    fn network_ipv6_tcp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Ipv6Tcp)
+    }
+
+    /// 两个 ::1 UDP 目的与默认 peer、大 lo 消息和 LP64 向量由普通 syscall 核验。
+    #[test]
+    #[ktest(tags("network-user", "network-ipv6", "network-udp"))]
+    fn network_ipv6_udp(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Ipv6Udp)
+    }
+
+    /// 双面监听共用同一 OFD，映射名称、端口冲突及 V6ONLY 隔离由普通连接核验。
+    #[test]
+    #[ktest(tags("network-user", "network-ipv6"))]
+    fn network_ipv6_mapped(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::Ipv6Mapped)
+    }
+
+    /// TCP 发送满后恢复，UDP 单消息按预算接纳，缩小不丢两者已接受的数据。
+    #[test]
+    #[ktest(tags("network-user", "network-buffer"))]
+    fn network_buffer_budget(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.network_mode(context, NetworkMode::BufferBudget)
+    }
+
+    /// 双族真实连接查询 MSS、Reno 及开关，非 TCP 请求和选项容量保正式 ABI 错误。
+    #[test]
+    #[ktest(tags("network-user", "network-options"))]
+    fn network_protocol_options(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::ProtocolOptions)
+    }
+
+    /// 大 lo UDP 保单条消息、全文及来源，分别核两族协议上界与下一字节拒绝。
+    #[test]
+    #[ktest(tags("network-user", "network-large"))]
+    fn network_large_loopback(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.network_mode(context, NetworkMode::LargeLoopback)
+    }
+    /// 原生 C 核 socket 的真实有限等待、共享选项、child 继承与信号重启差异。
+    #[test]
+    #[ktest(
+        tags("runtime-socket-timeouts", "user-libc", "user-network"),
+        timeout_ms = 120000
+    )]
+    fn runtime_socket_timeouts(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.runtime_socket_timeouts(context)
+    }
+}
+
+#[ktest::suite(fixture = UserOwner, suite_resources = SerialSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
+pub(crate) mod serial_programs {
+    use super::*;
+    /// 普通用户raw模式逐字节交付UART输入输出，跨write保留UTF-8与二进制值。
+    #[test]
+    #[ktest(tags("T19", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_raw_bytes_utf8_and_binary(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"r")
+    }
+
+    /// 真实canonical行规程执行编辑键、短读、EOF token和零长边界。
+    #[test]
+    #[ktest(tags("T20", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_canonical_edit_and_eof(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"c")
+    }
+
+    /// 用户read真实验证四种VMIN/VTIME组合的总期限与首字节后间隔期限。
+    #[test]
+    #[ktest(tags("T21", "user-tty"), resources("uart"), timeout_ms = 120000)]
+    fn tty_vmin_vtime_read_deadlines(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"v")
+    }
+
+    /// 用户read与poll分别验证MIN门槛和可读谓词，空立即read不伪造poll ready。
+    #[test]
+    #[ktest(tags("T22", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_poll_uses_independent_predicate(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"p")
+    }
+
+    /// host实际发字节时用户没有read，唯一UART Work仍消费IRQ并输出真实echo。
+    #[test]
+    #[ktest(tags("T23", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_irq_echo_without_reader(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"e")
+    }
+
+    /// 用户输出经ONLCR只转换一次，宿主真实背压并等到硬件TEMT。
+    #[test]
+    #[ktest(tags("T24", "user-tty"), resources("uart"), timeout_ms = 120000)]
+    fn tty_output_crlf_backpressure_and_drain(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"o")
+    }
+
+    /// 用户36字节termios结构与跨页故障、setter无半更新和W/F提交沿raw ioctl验证。
+    #[test]
+    #[ktest(tags("T25", "user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_termios_copy_fault_and_setter(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"t")
+    }
+
+    /// Ctrl-S期间用户write真实阻塞，后续RX Ctrl-Q经原Work恢复且续传字节有序。
+    #[test]
+    #[ktest(tags("T26", "user-tty"), resources("uart"), timeout_ms = 120000)]
+    fn tty_software_flow_control_resume(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"x")
+    }
+
+    /// 真实前后台组通过普通wait消费TTIN、TTOU、输入信号与孤儿HUP/CONT事件。
+    #[test]
+    #[ktest(
+        min_cpus = 2,
+        tags("T27", "user-tty", "user-jobs"),
+        resources("uart"),
+        timeout_ms = 120000
+    )]
+    fn jobs_front_background_signals(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.jobs_front_background_signals(context)
+    }
+
+    /// 三种打开身份、exec继承、leader挂断和同号新PGID沿真实OFD及用户生命周期验证。
+    #[test]
+    #[ktest(
+        min_cpus = 2,
+        tags("T28", "user-tty", "user-jobs"),
+        resources("uart"),
+        timeout_ms = 120000
+    )]
+    fn jobs_open_hangup_identity(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.jobs_open_hangup_identity(context)
+    }
+
+    /// 完整winsize变更只向当时前台组发送WINCH，实际sigtimedwait区分相同值与copy故障。
+    #[test]
+    #[ktest(min_cpus = 2, tags("T29", "user-tty", "user-jobs"), timeout_ms = 90000)]
+    fn jobs_winsize_changes(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        fixture.jobs_winsize_changes(context)
     }
 }

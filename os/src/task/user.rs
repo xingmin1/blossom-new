@@ -48,26 +48,26 @@ pub(crate) struct UserFs {
     pub(crate) context: FsContext,
 }
 
-/// 文件、FS、信号与网络各保留明确拥有；派生程序继续共享同一网络域。
+/// 文件、FS、信号各保留明确拥有；可选网络引用随派生程序共享。
 #[derive(Clone)]
 pub(crate) struct UserRuntime {
     pub(crate) files: Arc<FileTable>,
     pub(crate) fs: Arc<SleepMutex<UserFs>>,
     pub(crate) credentials: Credentials,
     pub(crate) sighand: Arc<Sighand>,
-    pub(crate) net: NetStackRef,
+    pub(crate) net: Option<NetStackRef>,
 }
 
 impl UserRuntime {
     /// 普通用户表的固定容量，也是多路复用快照必须覆盖的最大编号范围。
     pub(crate) const DESCRIPTOR_CAPACITY: usize = 1024;
 
-    /// 在普通任务锁外准备运行资源并持已有网络域引用，失败不发表用户身份。
+    /// 在普通任务锁外准备运行资源；无网络夹具显式传入 None，失败不发表用户身份。
     pub(crate) fn try_new(
         vfs: Arc<Vfs>,
         context: FsContext,
         credentials: Credentials,
-        net: NetStackRef,
+        net: Option<NetStackRef>,
     ) -> Result<Self, crate::fs::FsError> {
         let files = FileTable::try_new(Self::DESCRIPTOR_CAPACITY)?;
         let files = Arc::try_new(files).map_err(|_| crate::fs::FsError::NoMemory)?;
@@ -110,7 +110,7 @@ impl UserRuntime {
         Ok(())
     }
 
-    /// 按三个独立共享轴复制运行资源，网络域始终共享；所有分配在短锁外。
+    /// 按三个独立共享轴复制运行资源；可选网络引用保持原值，所有分配在短锁外。
     pub(crate) fn try_fork(
         self,
         share_files: bool,

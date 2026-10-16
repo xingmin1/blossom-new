@@ -329,7 +329,7 @@ unsafe fn init_filesystems(
         Arc::clone(&vfs),
         context.clone(),
         task::Credentials::ROOT,
-        Arc::clone(net_owner.stack()),
+        Some(Arc::clone(net_owner.stack())),
     )?;
     runtime.install_console()?;
     let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
