@@ -15,6 +15,7 @@ mod block;
 mod boot;
 mod cache;
 mod console;
+mod contest_hooks;
 mod cpu;
 mod drivers;
 mod fs;

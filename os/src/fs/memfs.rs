@@ -129,6 +129,7 @@ pub enum MemorySpecial {
     ControllingTty,
     Kmsg,
     Ktrace,
+    TestHook,
     Mounts,
     Meminfo,
     Uptime,
@@ -310,7 +311,8 @@ impl MemoryFs {
                 | MemorySpecial::Console
                 | MemorySpecial::ControllingTty
                 | MemorySpecial::Kmsg
-                | MemorySpecial::Ktrace,
+                | MemorySpecial::Ktrace
+                | MemorySpecial::TestHook,
             ) => InodeKind::Character,
             (
                 MemoryFsKind::Procfs,

@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::contest_hooks;
 use crate::fs::file::{require_read, require_write, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{
@@ -23,7 +24,13 @@ pub struct ZeroFile {
     flags: AtomicU32,
 }
 
-/// 建立独立未发表的 devfs，在真实根下安装固定字符设备与只读观测节点。
+/// 控制设备只接受完整单条写消息，不保存命令、输入游标或全局 Hook 状态。
+pub struct TestHookFile {
+    path: Path,
+    flags: AtomicU32,
+}
+
+/// 建立独立未发表的 devfs，在真实根下安装固定字符设备、观测节点与 root 写控制节点。
 pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     let fs = MemoryFs::try_new(MemoryFsKind::Devfs, root_mode)?;
     let root = fs.root();
@@ -34,14 +41,15 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     fs.initialize_special(&root, b"tty", MemorySpecial::ControllingTty, 0o666, 0x500)?;
     fs.initialize_special(&root, b"kmsg", MemorySpecial::Kmsg, 0o444, 0x10b)?;
     fs.initialize_special(&root, b"ktrace", MemorySpecial::Ktrace, 0o444, 0xf001)?;
+    fs.initialize_special(&root, b"testhook", MemorySpecial::TestHook, 0o200, 0xf002)?;
     Ok(fs)
 }
 
-/// 从 inode 的实际特殊角色建立 OFD，调用者已经完成公共打开标志和访问检查。
+/// 从 inode 的实际特殊角色建立 OFD；控制节点只允许 root 只写打开，O_TRUNC 沿字符设备语义忽略。
 pub fn open(
     path: Path,
     flags: u32,
-    _caller: FileIoContext<'_>,
+    caller: FileIoContext<'_>,
     special: MemorySpecial,
 ) -> Result<FileRef, FsError> {
     match special {
@@ -55,7 +63,76 @@ pub fn open(
             flags: AtomicU32::new(flags),
         })
         .map_err(|_| FsError::NoMemory)?),
+        MemorySpecial::TestHook => {
+            if flags & 0o3 != 0o1 {
+                return Err(FsError::InvalidOperation);
+            }
+            require_hook_control(caller)?;
+            Ok(Arc::try_new(TestHookFile {
+                path,
+                flags: AtomicU32::new(flags),
+            })
+            .map_err(|_| FsError::NoMemory)?)
+        }
         _ => Err(FsError::InvalidOperation),
+    }
+}
+
+/// 与追踪控制使用相同的本次 uid 权限，检查结束后不保留 runtime 的拥有快照。
+fn require_hook_control(caller: FileIoContext<'_>) -> Result<(), FsError> {
+    if let FileIoContext::User(user) = caller {
+        let runtime = user.runtime().ok_or(FsError::InvalidOperation)?;
+        if runtime.credentials.uid != 0 {
+            return Err(FsError::NotPermitted);
+        }
+    }
+    Ok(())
+}
+
+/// 将一次请求完整复制到调用者的局部数组；任何故障均返回错误，不接受正前缀。
+/// 空消息及超过 512 字节的消息返回 InvalidOperation，均不访问输入地址。
+fn copy_hook_message(
+    source: &mut WriteBuffer<'_>,
+    bytes: &mut [u8; 512],
+) -> Result<usize, FsError> {
+    let length = source.len();
+    if length == 0 || bytes.len() < length {
+        return Err(FsError::InvalidOperation);
+    }
+    let mut copied = 0;
+    while copied < length {
+        let count = source.pull(&mut bytes[copied..length])?;
+        if count == 0 {
+            return Err(FsError::InvalidOperation);
+        }
+        copied += count;
+    }
+    Ok(length)
+}
+
+/// 只解析内核拥有的完整消息；一次校验命令、结尾和 ID 后才调用可能睡眠的专属操作。
+fn dispatch_hook_message(message: &[u8]) -> Result<(), FsError> {
+    let command = message
+        .strip_suffix(b"\n")
+        .ok_or(FsError::InvalidOperation)?;
+    let (before, case) = if let Some(case) = command.strip_prefix(b"before ") {
+        (true, case)
+    } else if let Some(case) = command.strip_prefix(b"after ") {
+        (false, case)
+    } else {
+        return Err(FsError::InvalidOperation);
+    };
+    if case.is_empty()
+        || case
+            .iter()
+            .any(|byte| *byte == 0 || byte.is_ascii_whitespace())
+    {
+        return Err(FsError::InvalidOperation);
+    }
+    if before {
+        contest_hooks::before(case)
+    } else {
+        contest_hooks::after(case)
     }
 }
 
@@ -296,5 +373,109 @@ impl FileLike for ZeroFile {
         caller: FileIoContext<'_>,
     ) -> Result<usize, FsError> {
         self.write_from(source, caller)
+    }
+}
+
+impl FileLike for TestHookFile {
+    /// 控制节点没有可读数据，空读同样拒绝描述符的读权限。
+    fn read_into(
+        &self,
+        _target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        Err(FsError::BadFd)
+    }
+
+    /// 控制消息没有显式位置，拒绝按位置读取。
+    fn read_at_into(
+        &self,
+        _offset: u64,
+        _target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        Err(FsError::IllegalSeek)
+    }
+
+    /// 真实路径保活设备 inode 与挂载，不按路径字符串重新选择操作。
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    /// 控制节点不提供文件映射。
+    fn mapping_inode(&self) -> Option<&InodeRef> {
+        None
+    }
+
+    /// 复制描述符共享打开实例的原子状态位。
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// 只更新公共状态位，不改变控制节点的只写访问模式。
+    fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
+        set_status_flags(&self.flags, raw)
+    }
+
+    /// 非阻塞状态沿共同 OFD 协议保存，不改变具体操作的睡眠契约。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
+    }
+
+    /// 控制节点不提供普通文件截断。
+    fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
+    }
+
+    /// 控制操作不伪造文件同步能力。
+    fn sync_range(&self, _range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
+    }
+
+    /// 消息之间没有字节游标，不能定位或重放旧命令。
+    fn seek(&self, _from: SeekFrom) -> Result<u64, FsError> {
+        Err(FsError::IllegalSeek)
+    }
+
+    /// 属性使用实际字符设备身份、节点权限和 rdev。
+    fn stat(&self) -> Result<FileStat, FsError> {
+        stat_path(&self.path)
+    }
+
+    /// 控制设备不提供目录读取。
+    fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 控制设备不提供目录项回调。
+    fn for_each_dirent(
+        &self,
+        _emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
+    ) -> Result<(), FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 普通 Task 在完整复制、结束输入访问并校验后执行一次操作；只返回完整长度或错误。
+    /// 输入故障和语法错误不产生副作用，操作失败保留子系统原错误，不返回可重试的短写。
+    fn write_from(
+        &self,
+        source: &mut WriteBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        require_write(self.flags())?;
+        require_hook_control(caller)?;
+        let mut bytes = [0; 512];
+        let length = copy_hook_message(source, &mut bytes)?;
+        dispatch_hook_message(&bytes[..length])?;
+        Ok(length)
+    }
+
+    /// 按位置写不执行控制操作，也不消费输入。
+    fn write_at_from(
+        &self,
+        _offset: u64,
+        _source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        Err(FsError::IllegalSeek)
     }
 }
