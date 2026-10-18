@@ -264,7 +264,7 @@ impl UserOwner {
             },
         )?;
         context.diagnostic(format_args!(
-            "script-exec scripts=no-option,option,chain1 errors=eloop,enoent,eacces,enoexec,e2big base-abi=busybox"
+            "script-exec scripts=no-option,option,chain1,no-exec errors=eloop,enoent,enoexec,e2big mode0644=executed base-abi=busybox"
         ));
         Ok(())
     }

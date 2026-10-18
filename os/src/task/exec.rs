@@ -1,15 +1,17 @@
 //! 磁盘主映像与真实 ELF 解释器在同一私有 Mm 中准备，文件整页同源，边缘页先初始化。
 
+mod elf;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cmp::{max, min};
 use core::convert::{TryFrom, TryInto};
+
+use self::elf::{page_end, Elf, ELF_HEADER_BYTES, INTERP_DYN_BASE, MAIN_DYN_BASE};
 
 use crate::arch::{self, UserContext};
 use crate::block::BlockError;
 use crate::fs::{
-    self, ExecAccess, FileIoContext, FileRef, FsContext, FsError, InodeKind, ReadBuffer,
-    ResolveMode, Vfs,
+    self, ExecAccess, FileIoContext, FileRef, FsContext, FsError, ReadBuffer, ResolveMode, Vfs,
 };
 use crate::mm::space::{Mm, VmError};
 use crate::mm::uaccess::CStringError;
@@ -22,25 +24,8 @@ pub(crate) const MAX_ARGUMENT_BYTES: usize = 32768;
 pub(crate) const MAX_ARGUMENT_COUNT: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 pub(crate) const DEFAULT_STACK_BYTES: u64 = 8 * 1024 * 1024;
-const LOAD_LIMIT: usize = arch::USER_STACK_TOP - DEFAULT_STACK_BYTES as usize - PAGE_SIZE;
-const MAX_IMAGE_PAGES: usize = 16384;
-const MAX_IMAGE_SPAN: usize = 256 * 1024 * 1024;
-const ELF_HEADER_BYTES: usize = 64;
 const SCRIPT_HEADER_BYTES: usize = 256;
 const MAX_INTERPRETER_DEPTH: usize = 5;
-const PHDR_BYTES: usize = 56;
-const PT_LOAD: u32 = 1;
-const PT_DYNAMIC: u32 = 2;
-const PT_INTERP: u32 = 3;
-const ET_EXEC: u16 = 2;
-const ET_DYN: u16 = 3;
-const MAIN_DYN_BASE: usize = 0x2000_0000;
-const INTERP_DYN_BASE: usize = 0x3000_0000;
-const PT_PHDR: u32 = 6;
-const PT_TLS: u32 = 7;
-const PF_R: u32 = 4;
-const PF_W: u32 = 2;
-const PF_X: u32 = 1;
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -325,7 +310,7 @@ pub(crate) fn prepare(
     credentials: Credentials,
     stack_limit: u64,
 ) -> Result<LoadedImage, ExecError> {
-    let (mut file, mut access) = open_executable(vfs, context, args.filename(), credentials)?;
+    let (mut file, mut access) = open_executable(vfs, context, args.filename())?;
     for depth in 0..=MAX_INTERPRETER_DEPTH {
         let mut header = [0; SCRIPT_HEADER_BYTES];
         read_prefix(&file, 0, &mut header[..ELF_HEADER_BYTES])?;
@@ -348,35 +333,24 @@ pub(crate) fn prepare(
         )?;
         let (interpreter, optional) = script_interpreter(&header)?;
         args.prepend_interpreter(interpreter, optional, depth == 0)?;
-        let next = open_executable(vfs, context, &args.argv[0], credentials)?;
+        let next = open_executable(vfs, context, &args.argv[0])?;
         // 新文件已经取得写排斥，接替后才放掉上一个脚本的文件与执行写占用。
         (file, access) = next;
     }
     Err(ExecError::TooManyInterpreters)
 }
 
-/// 每层解释器都使用同一凭据与路径规则，首读前取得真实普通 inode 的执行写占用。
+/// 沿当前 root/cwd 取得真实可映射文件，首读前保留原 inode 的执行写占用。
 fn open_executable(
     vfs: &Vfs,
     context: &FsContext,
     pathname: &[u8],
-    credentials: Credentials,
 ) -> Result<(FileRef, ExecAccess), ExecError> {
-    let path = vfs.resolve_from(
-        context,
-        context.cwd(),
-        pathname,
-        ResolveMode::Follow,
-        Some((credentials.uid, credentials.gid)),
-    )?;
-    if path.inode()?.metadata_snapshot()?.kind != InodeKind::Regular {
-        return Err(ExecError::File(FsError::Permission));
-    }
-    path.check_access(credentials.uid, credentials.gid, 1)?;
+    let path = vfs.resolve_from(context, context.cwd(), pathname, ResolveMode::Follow, None)?;
     let file = fs::open_path(vfs, path)?;
     let access = file
         .mapping_inode()
-        .ok_or(ExecError::Format)?
+        .ok_or(ExecError::File(FsError::Permission))?
         .deny_writes()?;
     Ok((file, access))
 }
@@ -473,16 +447,15 @@ fn load_elf(
     credentials: Credentials,
     stack_limit: u64,
 ) -> Result<LoadedImage, ExecError> {
-    let elf = Elf::read(&file, header, MAIN_DYN_BASE)?;
+    let mut elf = Elf::read(&file, header, MAIN_DYN_BASE)?;
     let interpreter = if let Some(pathname) = &elf.interp {
-        let (file, access) = open_executable(vfs, fs_context, pathname, credentials)?;
+        let (file, access) = open_executable(vfs, fs_context, pathname)?;
         let mut header = [0; ELF_HEADER_BYTES];
         read_exact(&file, 0, &mut header)?;
         let image = Elf::read(&file, &header, INTERP_DYN_BASE)?;
         if image.interp.is_some() {
             return Err(ExecError::Format);
         }
-        validate_images(&elf, &image)?;
         Some((file, access, image))
     } else {
         None
@@ -493,12 +466,23 @@ fn load_elf(
         interpreter.as_ref().map(|(_, _, image)| image),
     )?;
     let mut mm = Mm::try_new()?;
-    map_segments(&mut mm, &file, &elf.segments)?;
-    let (entry, base) = if let Some((file, _, image)) = &interpreter {
-        map_segments(&mut mm, file, &image.segments)?;
-        (image.entry, image.bias)
+    elf::map_images(
+        &mut mm,
+        &file,
+        &mut elf,
+        interpreter.as_ref().map(|(file, _, image)| (file, image)),
+    )?;
+    let (entry, base) = interpreter
+        .as_ref()
+        .map_or((elf.entry, 0), |(_, _, image)| (image.entry, image.bias));
+    let stack_permissions = if elf.executable_stack
+        || interpreter
+            .as_ref()
+            .is_some_and(|(_, _, image)| image.executable_stack)
+    {
+        RWX
     } else {
-        (elf.entry, 0)
+        RW
     };
     map_return_page(&mut mm)?;
     let sp = make_stack(
@@ -509,6 +493,7 @@ fn load_elf(
         credentials.uid,
         credentials.gid,
         bottom,
+        stack_permissions,
     )?;
     let heap = page_end(elf.end)?;
     mm.set_heap(heap, heap)?;
@@ -519,449 +504,6 @@ fn load_elf(
     }
     let mm = Arc::try_new(mm).map_err(|_| ExecError::NoMemory)?;
     Ok(LoadedImage { mm, context })
-}
-
-/// 只保存装载所需的有界元数据，不创建完整文件的第二数据源。
-struct Elf {
-    kind: u16,
-    max_align: usize,
-    interp: Option<Vec<u8>>,
-    bias: usize,
-    segments: Vec<Segment>,
-    entry: usize,
-    phdr: usize,
-    phnum: usize,
-    end: usize,
-}
-
-/// LOAD 的字节区间与文件前缀在校验后均不会回绕。
-struct Segment {
-    start: usize,
-    file_end: usize,
-    end: usize,
-    offset: u64,
-    flags: u32,
-}
-
-/// 程序头按固定小端字节解码，不借用磁盘字节为任意 Rust 结构体。
-struct ProgramHeader {
-    kind: u32,
-    flags: u32,
-    offset: u64,
-    address: usize,
-    filesz: usize,
-    memsz: usize,
-    align: usize,
-}
-
-impl ProgramHeader {
-    /// 读取已知完整的 ELF64 PHDR；目标为 64 位，所有偏移由固定布局给出。
-    fn decode(bytes: &[u8]) -> Self {
-        Self {
-            kind: word32(bytes, 0),
-            flags: word32(bytes, 4),
-            offset: word64(bytes, 8),
-            address: word64(bytes, 16) as usize,
-            filesz: word64(bytes, 32) as usize,
-            memsz: word64(bytes, 40) as usize,
-            align: word64(bytes, 48) as usize,
-        }
-    }
-
-    /// 任何参与装载的文件跨度及地址跨度都在执行映射前检查。
-    fn validate(&self, size: u64) -> Result<(), ExecError> {
-        let file_end = self
-            .offset
-            .checked_add(self.filesz as u64)
-            .ok_or(ExecError::Format)?;
-        self.address
-            .checked_add(self.memsz)
-            .ok_or(ExecError::Format)?;
-        if size < file_end || (1 < self.align && !self.align.is_power_of_two()) {
-            return Err(ExecError::Format);
-        }
-        Ok(())
-    }
-
-    /// 未偏移 LOAD 只校验源跨度和声明同余，用户范围在统一偏移确定后检查。
-    fn segment(&self) -> Result<Segment, ExecError> {
-        if self.memsz < self.filesz
-            || self.flags & !7 != 0
-            || self.address & (PAGE_SIZE - 1) != self.offset as usize & (PAGE_SIZE - 1)
-            || (1 < self.align
-                && self.address & (self.align - 1) != self.offset as usize & (self.align - 1))
-        {
-            return Err(ExecError::Format);
-        }
-        let end = self
-            .address
-            .checked_add(self.memsz)
-            .ok_or(ExecError::Format)?;
-        #[cfg(target_arch = "riscv64")]
-        if self.flags & PF_W != 0 && self.flags & PF_R == 0 {
-            return Err(ExecError::Format);
-        }
-        Ok(Segment {
-            start: self.address,
-            file_end: self
-                .address
-                .checked_add(self.filesz)
-                .ok_or(ExecError::Format)?,
-            end,
-            offset: self.offset,
-            flags: self.flags,
-        })
-    }
-}
-
-impl Elf {
-    /// 首部、程序头和模板复用同一文件，先收集真实对齐再为全部地址施加统一偏移。
-    fn read(
-        file: &FileRef,
-        header: &[u8; ELF_HEADER_BYTES],
-        dyn_base: usize,
-    ) -> Result<Self, ExecError> {
-        let stat = file.stat()?;
-        if stat.kind != InodeKind::Regular {
-            return Err(ExecError::File(FsError::IsDirectory));
-        }
-        validate_header(header, stat.size)?;
-        let entry = word64(header, 24) as usize;
-        let phoff = word64(header, 32);
-        let phnum = word16(header, 56) as usize;
-        let table_bytes = phnum * PHDR_BYTES;
-        let mut table = Vec::new();
-        table
-            .try_reserve_exact(table_bytes)
-            .map_err(|_| ExecError::NoMemory)?;
-        table.resize(table_bytes, 0);
-        read_exact(file, phoff, &mut table)?;
-        let mut segments = Vec::new();
-        segments
-            .try_reserve_exact(phnum)
-            .map_err(|_| ExecError::NoMemory)?;
-        let mut declared_phdr = None;
-        let mut tls = None;
-        let mut interp = None;
-        let mut max_align = PAGE_SIZE;
-        for bytes in table.chunks_exact(PHDR_BYTES) {
-            let ph = ProgramHeader::decode(bytes);
-            if ph.kind == 0 {
-                continue;
-            }
-            ph.validate(stat.size)?;
-            match ph.kind {
-                PT_LOAD => {
-                    max_align = max(max_align, ph.align);
-                    let segment = ph.segment()?;
-                    if segment.start != segment.end {
-                        segments.push(segment);
-                    }
-                }
-                PT_INTERP => {
-                    if interp.is_some() {
-                        return Err(ExecError::Format);
-                    }
-                    interp = Some(read_interpreter(file, &ph)?);
-                }
-                // 动态表由用户解释器消费，内核只校验程序头描述的文件与地址跨度。
-                PT_DYNAMIC => {}
-                5 => return Err(ExecError::Format),
-                PT_TLS => {
-                    if tls.is_some()
-                        || ph.memsz < ph.filesz
-                        || (1 < ph.align
-                            && ph.address & (ph.align - 1) != ph.offset as usize & (ph.align - 1))
-                    {
-                        return Err(ExecError::Format);
-                    }
-                    tls = Some(ph);
-                }
-                PT_PHDR => {
-                    if declared_phdr.is_some()
-                        || ph.offset != phoff
-                        || ph.filesz != table_bytes
-                        || ph.memsz != table_bytes
-                        || ph.flags & PF_R == 0
-                        || ph.flags & !7 != 0
-                        || (1 < ph.align
-                            && ph.address & (ph.align - 1) != ph.offset as usize & (ph.align - 1))
-                    {
-                        return Err(ExecError::Format);
-                    }
-                    declared_phdr = Some(ph.address);
-                }
-                // 当前用户栈只有 RW；可执行栈要求不能被忽略。
-                0x6474_e551 if ph.flags & PF_X != 0 => return Err(ExecError::Format),
-                _ => {}
-            }
-        }
-        segments.sort_unstable_by_key(|segment| segment.start);
-        let phdr = find_phdr(&segments, phoff, table_bytes, declared_phdr)?;
-        if let Some(tls) = tls {
-            // libc 自行分配 TLS 零尾；这里只要求非零模板确由可读 LOAD 的原文件前缀提供。
-            if !source_covered(&segments, tls.address, tls.offset, tls.filesz, true) {
-                return Err(ExecError::Format);
-            }
-        }
-        let mut elf = Self {
-            kind: word16(header, 16),
-            max_align,
-            interp,
-            bias: 0,
-            segments,
-            entry,
-            phdr,
-            phnum,
-            end: 0,
-        };
-        elf.relocate(dyn_base)?;
-        Ok(elf)
-    }
-
-    /// 地址偏移按最大 LOAD 对齐取整，所有加法检查后才校验实际用户页范围与入口。
-    fn relocate(&mut self, dyn_base: usize) -> Result<(), ExecError> {
-        self.bias = if self.kind == ET_DYN {
-            dyn_base
-                .checked_add(self.max_align - 1)
-                .ok_or(ExecError::Format)?
-                & !(self.max_align - 1)
-        } else {
-            0
-        };
-        for segment in &mut self.segments {
-            segment.start = segment
-                .start
-                .checked_add(self.bias)
-                .ok_or(ExecError::Format)?;
-            segment.file_end = segment
-                .file_end
-                .checked_add(self.bias)
-                .ok_or(ExecError::Format)?;
-            segment.end = segment
-                .end
-                .checked_add(self.bias)
-                .ok_or(ExecError::Format)?;
-            if segment.start < PAGE_SIZE || LOAD_LIMIT < page_end(segment.end)? {
-                return Err(ExecError::Format);
-            }
-        }
-        self.entry = self.entry.checked_add(self.bias).ok_or(ExecError::Format)?;
-        self.phdr = self.phdr.checked_add(self.bias).ok_or(ExecError::Format)?;
-        self.end = validate_segments(&self.segments, self.entry)?;
-        Ok(())
-    }
-}
-
-/// 解释器路径保留原始字节；必须完整终止且不包含截断路径或内嵌 NUL。
-fn read_interpreter(file: &FileRef, ph: &ProgramHeader) -> Result<Vec<u8>, ExecError> {
-    if ph.filesz < 2 || MAX_PATH_BYTES < ph.filesz {
-        return Err(ExecError::Format);
-    }
-    let mut pathname = Vec::new();
-    pathname
-        .try_reserve_exact(ph.filesz)
-        .map_err(|_| ExecError::NoMemory)?;
-    pathname.resize(ph.filesz, 0);
-    read_exact(file, ph.offset, &mut pathname)?;
-    if pathname.pop() != Some(0) || pathname.contains(&0) {
-        return Err(ExecError::Format);
-    }
-    Ok(pathname)
-}
-
-/// 两文件不能占用同一硬件页，即使其有效字节区间在该页内互不相交。
-fn validate_images(main: &Elf, interpreter: &Elf) -> Result<(), ExecError> {
-    for left in &main.segments {
-        for right in &interpreter.segments {
-            if page_start(left.start) < page_end(right.end)?
-                && page_start(right.start) < page_end(left.end)?
-            {
-                return Err(ExecError::Format);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 校验执行类别、目标、ABI 与全部元数据跨度；扩展 section/PHDR 编号不在支持范围。
-fn validate_header(header: &[u8; ELF_HEADER_BYTES], size: u64) -> Result<(), ExecError> {
-    #[cfg(target_arch = "riscv64")]
-    const MACHINE: u16 = 243;
-    #[cfg(target_arch = "loongarch64")]
-    const MACHINE: u16 = 258;
-    let phnum = word16(header, 56) as usize;
-    let phoff = word64(header, 32);
-    let phbytes = phnum.checked_mul(PHDR_BYTES).ok_or(ExecError::Format)?;
-    let phend = phoff.checked_add(phbytes as u64).ok_or(ExecError::Format)?;
-    if header[..7] != *b"\x7fELF\x02\x01\x01"
-        || !matches!(header[7], 0 | 3)
-        || header[8] != 0
-        || !matches!(word16(header, 16), ET_EXEC | ET_DYN)
-        || word16(header, 18) != MACHINE
-        || word32(header, 20) != 1
-        || word16(header, 52) as usize != ELF_HEADER_BYTES
-        || word16(header, 54) as usize != PHDR_BYTES
-        || phnum == 0
-        || PAGE_SIZE < phbytes
-        || phoff < ELF_HEADER_BYTES as u64
-        || size < phend
-        || !supported_flags(word32(header, 48))
-    {
-        return Err(ExecError::Format);
-    }
-    let shoff = word64(header, 40);
-    let shnum = word16(header, 60) as u64;
-    let shstr = word16(header, 62) as u64;
-    if shnum == 0 {
-        if shoff != 0 || shstr != 0 {
-            return Err(ExecError::Format);
-        }
-    } else {
-        let shend = shoff.checked_add(shnum * 64).ok_or(ExecError::Format)?;
-        if shoff < ELF_HEADER_BYTES as u64
-            || size < shend
-            || word16(header, 58) != 64
-            || shnum <= shstr
-        {
-            return Err(ExecError::Format);
-        }
-    }
-    Ok(())
-}
-
-/// RV64GC 支持 soft/single/double ABI，不支持 RVE、quad 或需额外平台保证的 TSO。
-#[cfg(target_arch = "riscv64")]
-fn supported_flags(flags: u32) -> bool {
-    flags & !7 == 0 && flags & 6 != 6
-}
-
-/// LA64 接受 LP64 soft/single/double 和已定义的对象 ABI v0/v1，拒绝 ILP32。
-#[cfg(target_arch = "loongarch64")]
-fn supported_flags(flags: u32) -> bool {
-    flags & !0x47 == 0 && matches!(flags & 7, 1..=3)
-}
-
-/// 对排序后的 LOAD 检查实际页数、跨度、入口权限及所有真实字节重叠。
-fn validate_segments(segments: &[Segment], entry: usize) -> Result<usize, ExecError> {
-    let first = segments.first().ok_or(ExecError::Format)?;
-    let mut end = first.start;
-    let mut pages = 0;
-    let mut previous_page_end = page_start(first.start);
-    let mut executable_entry = false;
-    for (index, segment) in segments.iter().enumerate() {
-        end = max(end, segment.end);
-        let stop = page_end(segment.end)?;
-        let start = max(page_start(segment.start), previous_page_end);
-        if start < stop {
-            pages += (stop - start) / PAGE_SIZE;
-        }
-        previous_page_end = max(previous_page_end, stop);
-        executable_entry |= segment.start <= entry
-            && entry < segment.end
-            && segment.flags & (PF_R | PF_X) == (PF_R | PF_X);
-        for earlier in &segments[..index] {
-            validate_overlap(earlier, segment)?;
-        }
-    }
-    #[cfg(target_arch = "riscv64")]
-    let entry_aligned = entry & 1 == 0;
-    #[cfg(target_arch = "loongarch64")]
-    let entry_aligned = entry & 3 == 0;
-    if MAX_IMAGE_PAGES < pages
-        || MAX_IMAGE_SPAN < end - first.start
-        || !executable_entry
-        || !entry_aligned
-    {
-        return Err(ExecError::Format);
-    }
-    Ok(end)
-}
-
-/// 同一字节只能同时指向同一文件位置，或同时属于零尾；页边缘互不重叠可以组合。
-fn validate_overlap(left: &Segment, right: &Segment) -> Result<(), ExecError> {
-    let start = max(left.start, right.start);
-    let end = min(left.end, right.end);
-    if end <= start {
-        return Ok(());
-    }
-    let left_file_end = max(start, min(end, left.file_end));
-    let right_file_end = max(start, min(end, right.file_end));
-    if left_file_end != right_file_end
-        || (start < left_file_end
-            && left.offset + (start - left.start) as u64
-                != right.offset + (start - right.start) as u64)
-    {
-        return Err(ExecError::Format);
-    }
-    Ok(())
-}
-
-/// PHDR 必须全部在可读文件字节中且保持原文件偏移，允许多个相邻 LOAD 共同覆盖。
-fn find_phdr(
-    segments: &[Segment],
-    offset: u64,
-    length: usize,
-    declared: Option<usize>,
-) -> Result<usize, ExecError> {
-    if let Some(address) = declared {
-        if source_covered(segments, address, offset, length, true) {
-            return Ok(address);
-        }
-        return Err(ExecError::Format);
-    }
-    for segment in segments {
-        let address = if segment.offset <= offset {
-            segment
-                .start
-                .checked_add((offset - segment.offset) as usize)
-        } else {
-            segment
-                .start
-                .checked_sub((segment.offset - offset) as usize)
-        };
-        if let Some(address) = address {
-            if source_covered(segments, address, offset, length, true) {
-                return Ok(address);
-            }
-        }
-    }
-    Err(ExecError::Format)
-}
-
-/// 验证整个区间由同一位置关系的文件字节覆盖，不把页内零填充当作有效 PHDR。
-fn source_covered(
-    segments: &[Segment],
-    address: usize,
-    offset: u64,
-    length: usize,
-    readable: bool,
-) -> bool {
-    let Some(end) = address.checked_add(length) else {
-        return false;
-    };
-    let Some(_) = offset.checked_add(length as u64) else {
-        return false;
-    };
-    let mut cursor = address;
-    while cursor < end {
-        let mut stop = cursor;
-        for segment in segments {
-            if segment.start <= cursor
-                && cursor < segment.file_end
-                && (!readable || segment.flags & PF_R != 0)
-                && segment.offset + (cursor - segment.start) as u64
-                    == offset + (cursor - address) as u64
-            {
-                stop = max(stop, min(end, segment.file_end));
-            }
-        }
-        if stop == cursor {
-            return false;
-        }
-        cursor = stop;
-    }
-    true
 }
 
 /// 沿真实正前缀读到缓冲尾或 EOF，返回实际字节数，未读取部分保持调用者的初始化值。
@@ -993,122 +535,6 @@ fn read_exact(file: &FileRef, offset: u64, bytes: &mut [u8]) -> Result<(), ExecE
     Ok(())
 }
 
-/// 每个 VA 页只提交一次；连续完整文件页合为一个 VMA，边缘和零尾使用独占原页。
-fn map_segments(mm: &mut Mm, file: &FileRef, segments: &[Segment]) -> Result<(), ExecError> {
-    let mut cursor = page_start(segments[0].start);
-    for segment in segments {
-        cursor = max(cursor, page_start(segment.start));
-        let stop = page_end(segment.end)?;
-        while cursor < stop {
-            let (flags, source) = page_plan(segments, cursor).expect("LOAD page has no source");
-            let permissions = permissions(flags);
-            if let Some(offset) = source {
-                let mut end = cursor + PAGE_SIZE;
-                while let Some((next_flags, Some(next_offset))) = page_plan(segments, end) {
-                    if next_flags != flags || next_offset != offset + (end - cursor) as u64 {
-                        break;
-                    }
-                    end += PAGE_SIZE;
-                }
-                mm.map_file(
-                    cursor,
-                    end - cursor,
-                    permissions,
-                    RWX,
-                    Arc::clone(file),
-                    offset,
-                    true,
-                )?;
-                cursor = end;
-            } else {
-                map_edge(mm, file, segments, cursor, permissions)?;
-                cursor += PAGE_SIZE;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 合并所有段在一个硬件页上的权限，只在整页同源且无空洞或 BSS 时返回文件页位置。
-fn page_plan(segments: &[Segment], base: usize) -> Option<(u32, Option<u64>)> {
-    let end = base + PAGE_SIZE;
-    let mut flags = 0;
-    let mut present = false;
-    let mut source = None;
-    for segment in segments {
-        if segment.start < end && base < segment.end {
-            present = true;
-            flags |= segment.flags;
-        }
-        if segment.start <= base && base < segment.file_end {
-            source = Some(segment.offset + (base - segment.start) as u64);
-        }
-    }
-    if !present {
-        return None;
-    }
-    source = source.filter(|offset| {
-        offset & (PAGE_SIZE as u64 - 1) == 0
-            && source_covered(segments, base, *offset, PAGE_SIZE, false)
-    });
-    Some((flags, source))
-}
-
-/// 完整清零未映射的候选页，然后每个有效文件字节只填一次；空洞和所有 BSS 保持零。
-fn map_edge(
-    mm: &mut Mm,
-    file: &FileRef,
-    segments: &[Segment],
-    base: usize,
-    current: PagePermissions,
-) -> Result<(), ExecError> {
-    let mut pages = alloc_pages(0, true).ok_or(ExecError::NoMemory)?;
-    {
-        // SAFETY: 新 order0 页由 pages 独占且已完整清零，尚无任何用户、硬件或设备映射；
-        // 切片只存在于本次文件填充，全部访问结束后才消费 pages 安装用户映射。
-        let bytes =
-            unsafe { core::slice::from_raw_parts_mut(pages.as_mut_ptr().cast::<u8>(), PAGE_SIZE) };
-        fill_edge(file, segments, base, bytes)?;
-    }
-    // SAFETY: 候选页全部初始化为零或精确读取的文件字节，填充切片已经结束；
-    // mm 尚未共享或发表，pages 为唯一 order0 拥有，之后只由 Mm 管理用户内容。
-    unsafe { mm.map_owned(base, pages, current, RWX) }?;
-    Ok(())
-}
-
-/// 按虚拟字节位置填入文件前缀，预检过的同源重叠不会重复读取或覆盖边缘内容。
-fn fill_edge(
-    file: &FileRef,
-    segments: &[Segment],
-    base: usize,
-    bytes: &mut [u8],
-) -> Result<(), ExecError> {
-    let end = base + PAGE_SIZE;
-    let mut cursor = base;
-    while cursor < end {
-        let mut source: Option<&Segment> = None;
-        let mut next = end;
-        for segment in segments {
-            if segment.start <= cursor && cursor < segment.file_end {
-                if source.is_none_or(|previous| previous.file_end < segment.file_end) {
-                    source = Some(segment);
-                }
-            } else if cursor < segment.start && segment.start < segment.file_end {
-                next = min(next, segment.start);
-            }
-        }
-        if let Some(segment) = source {
-            let stop = min(end, segment.file_end);
-            let offset = segment.offset + (cursor - segment.start) as u64;
-            read_exact(file, offset, &mut bytes[cursor - base..stop - base])?;
-            cursor = stop;
-        } else {
-            cursor = next;
-        }
-    }
-    Ok(())
-}
-
 /// 返回页仅承载真实信号 ABI 指令，固定 RX，不宣称为 vDSO。
 fn map_return_page(mm: &mut Mm) -> Result<(), ExecError> {
     let code = arch::signal_return_code();
@@ -1127,7 +553,7 @@ fn map_return_page(mm: &mut Mm) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// 将本次 soft 向下取整到基本页；整个栈与未映射 guard 必须位于两映像之上、返回页之下。
+/// 将本次 soft 向下取整到基本页，只检查真实栈及 guard 与映像页的冲突。
 fn stack_bottom(
     stack_limit: u64,
     main: &Elf,
@@ -1150,8 +576,9 @@ fn stack_bottom(
     {
         return Err(ExecError::Vm(VmError::InvalidRange));
     }
-    let image_end = max(main.end, interpreter.map_or(0, |image| image.end));
-    if guard < page_end(image_end)? {
+    if main.overlaps(guard, arch::USER_STACK_TOP)
+        || interpreter.is_some_and(|image| image.overlaps(guard, arch::USER_STACK_TOP))
+    {
         return Err(ExecError::Vm(VmError::Occupied));
     }
     Ok(bottom)
@@ -1166,8 +593,14 @@ fn make_stack(
     uid: u32,
     gid: u32,
     bottom: usize,
+    stack_permissions: PagePermissions,
 ) -> Result<usize, ExecError> {
-    mm.map_anonymous(bottom, arch::USER_STACK_TOP - bottom, RW, RWX)?;
+    mm.map_anonymous(
+        bottom,
+        arch::USER_STACK_TOP - bottom,
+        stack_permissions,
+        RWX,
+    )?;
     let mut cursor = arch::USER_STACK_TOP;
     let execfn = stack_string(mm, &mut cursor, &args.filename, bottom)?;
     let mut pointers = [0usize; MAX_ARGUMENT_COUNT];
@@ -1176,8 +609,8 @@ fn make_stack(
     }
     let random = stack_random(mm, &mut cursor, bottom)?;
     let auxv = [
-        (3, elf.phdr),
-        (4, PHDR_BYTES),
+        (3, elf.phdr.unwrap_or(0)),
+        (4, elf.phent),
         (5, elf.phnum),
         (6, PAGE_SIZE),
         (7, interpreter_base),
@@ -1288,41 +721,4 @@ fn hwcap() -> usize {
 fn hwcap() -> usize {
     let euen = crate::arch::user_euen();
     1 | ((euen & 1) << 3) | ((euen & 2) << 3) | ((euen & 4) << 3)
-}
-
-/// 将已经验证的 ELF 访问位转换为现有 Mm 的权限值。
-fn permissions(flags: u32) -> PagePermissions {
-    PagePermissions {
-        read: flags & PF_R != 0,
-        write: flags & PF_W != 0,
-        execute: flags & PF_X != 0,
-    }
-}
-
-/// 页下界只用于已校验的非负用户地址。
-fn page_start(address: usize) -> usize {
-    address & !(PAGE_SIZE - 1)
-}
-
-/// checked 页上界避免未可信长度在对齐时回绕。
-fn page_end(address: usize) -> Result<usize, ExecError> {
-    Ok(address
-        .checked_add(PAGE_SIZE - 1)
-        .ok_or(ExecError::Format)?
-        & !(PAGE_SIZE - 1))
-}
-
-/// 解码已知完整头中固定位置的小端 16 位字段。
-fn word16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
-}
-
-/// 解码已知完整头中固定位置的小端 32 位字段。
-fn word32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-/// 解码已知完整头中固定位置的小端 64 位字段。
-fn word64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }

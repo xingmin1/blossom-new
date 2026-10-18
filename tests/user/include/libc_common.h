@@ -94,7 +94,7 @@ int run_body(const char *executable);
 /// 以真实 AT_EXECFN 和环境核对脚本每层形成的拥有式 argv。
 int check_script_argv(int argc, char **argv);
 
-/// 真实消费解释器深度、缺失、权限、格式和参数预算错误。
+/// 消费解释器深度、缺失、格式和参数预算错误，并核对0644脚本的正常执行。
 int script_errors(void);
 
 /// 核对 root 与非 root 两种真实凭据，并用 fchdir 恢复实际 cwd。

@@ -85,6 +85,36 @@ pub(crate) mod programs {
         layout::run(context, fixture)
     }
 
+    /// 0644固定映像实际从页零或0x100进入，跨页程序头和未消费元数据不阻断执行。
+    #[test]
+    #[case("page_zero", 0)]
+    #[case("low_vendor_phdr", 0x100)]
+    #[ktest(tags("elf-direct-load"), min_cpus = 2)]
+    fn direct_elf_low_entry(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        entry: usize,
+    ) -> TestResult {
+        layout::direct_low(context, fixture, entry)
+    }
+
+    /// 大BSS和远端LOAD只按实际用户触页驻留，仍由原fixture消费退出与全部资源。
+    #[test]
+    #[ktest(tags("elf-direct-load"), min_cpus = 2)]
+    fn direct_elf_sparse_bss(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+        layout::direct_sparse(context, fixture)
+    }
+
+    /// 合法重叠LOAD的文件后写与BSS清零由用户指令及完整内存字节共同消费。
+    #[test]
+    #[ktest(tags("elf-direct-load"), min_cpus = 2)]
+    fn direct_elf_overlapping_segments(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        layout::direct_overlap(context, fixture)
+    }
+
     /// OOM、坏参数和未发表归还之后仍正常运行原真实程序。
     #[test]
     fn failed_preparation_keeps_original_program(

@@ -5,8 +5,10 @@ use core::cmp::min;
 use core::convert::{TryFrom, TryInto};
 use core::fmt::Debug;
 
+use crate::block::AccessMode;
 use crate::fs::ktest::user::{UserOwner, PROGRAM};
-use crate::fs::FileRef;
+use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind};
+use crate::fs::{open_path_with_flags, FileIoContext, FileRef, ResolveMode};
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::space::Mm;
 use crate::mm::{FolioRef, PAGE_SIZE};
@@ -501,6 +503,414 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
     assert_ne!(
         event.task_id, coordinator,
         "user ELF ran as the kernel coordinator Task"
+    );
+    Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(include_str!(
+    "../../../../../tests/user/elf/direct-riscv64.S"
+));
+#[cfg(target_arch = "loongarch64")]
+core::arch::global_asm!(include_str!(
+    "../../../../../tests/user/elf/direct-loongarch64.S"
+));
+
+extern "C" {
+    static user_elf_direct_start: u8;
+    static user_elf_direct_end: u8;
+}
+
+struct DirectSegment<'a> {
+    start: usize,
+    flags: u32,
+    bytes: &'a [u8],
+    memsz: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ByteCheck {
+    address: usize,
+    expected: u8,
+}
+
+const DIRECT_PATH: &[u8] = b"/plain/direct";
+const DIRECT_STATUS: i32 = 37 << 8;
+const DIRECT_DATA: usize = 0x20000;
+const LARGE_BSS: usize = 64 * 1024 * 1024 + PAGE_SIZE;
+const DISTANT_DATA: usize = 0x12000000;
+
+/// 把普通裸程序及其字节检查表写入映像，程序检查旧值、写入0x7e并读回后才退出37。
+fn direct_payload(checks: &[ByteCheck]) -> Result<Vec<u8>, TestError> {
+    let start = core::ptr::addr_of!(user_elf_direct_start);
+    let end = core::ptr::addr_of!(user_elf_direct_end) as usize;
+    // SAFETY: 两个汇编链接符号界定同一永久只读片段，片段内字节已初始化，且end在start之后；
+    // 这里只读取内核静态字节，随后复制到真实文件，不借用用户映射内容。
+    let code = unsafe { core::slice::from_raw_parts(start, end - start as usize) };
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(code.len() + 8 + checks.len() * 16)
+        .map_err(|_| TestError("NoMemory: direct ELF payload"))?;
+    bytes.extend_from_slice(code);
+    bytes.extend_from_slice(&(checks.len() as u64).to_le_bytes());
+    for check in checks {
+        bytes.extend_from_slice(&(check.address as u64).to_le_bytes());
+        bytes.extend_from_slice(&[check.expected, 0x7e, 0, 0, 0, 0, 0, 0]);
+    }
+    Ok(bytes)
+}
+
+/// 生成实际ELF64文件；扩展实例的程序头跨页，vendor头与节表字段均不参与LOAD。
+fn direct_elf(
+    entry: usize,
+    segments: &[DirectSegment<'_>],
+    extended: bool,
+) -> Result<Vec<u8>, TestError> {
+    let phent = if extended { 64 } else { 56 };
+    let phnum = if extended { 80 } else { segments.len() };
+    let size = 8192
+        + segments
+            .iter()
+            .map(|segment| segment.bytes.len())
+            .sum::<usize>();
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| TestError("NoMemory: direct ELF file"))?;
+    bytes.resize(size, 0);
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    #[cfg(target_arch = "riscv64")]
+    bytes[18..20].copy_from_slice(&243u16.to_le_bytes());
+    #[cfg(target_arch = "loongarch64")]
+    bytes[18..20].copy_from_slice(&258u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&(entry as u64).to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&(phent as u16).to_le_bytes());
+    bytes[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+    if extended {
+        bytes[7] = 0x61;
+        bytes[8] = 3;
+        bytes[40..48].copy_from_slice(&0x400000u64.to_le_bytes());
+        bytes[48..52].copy_from_slice(&0x10000000u32.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&1u16.to_le_bytes());
+        for index in segments.len()..phnum {
+            let base = 64 + index * phent;
+            bytes[base..base + 4].copy_from_slice(&0x70000001u32.to_le_bytes());
+            bytes[base + 8..base + 16].copy_from_slice(&0x800000u64.to_le_bytes());
+            bytes[base + 32..base + 40].copy_from_slice(&16u64.to_le_bytes());
+        }
+    }
+    let mut offset = 8192;
+    for (index, segment) in segments.iter().enumerate() {
+        let base = 64 + index * phent;
+        bytes[base..base + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[base + 4..base + 8].copy_from_slice(&segment.flags.to_le_bytes());
+        for (field, value) in [
+            (8, offset),
+            (16, segment.start),
+            (32, segment.bytes.len()),
+            (40, segment.memsz),
+            (48, 1),
+        ] {
+            bytes[base + field..base + field + 8].copy_from_slice(&(value as u64).to_le_bytes());
+        }
+        bytes[offset..offset + segment.bytes.len()].copy_from_slice(segment.bytes);
+        offset += segment.bytes.len();
+    }
+    Ok(bytes)
+}
+
+/// 沿已有内存文件测试的挂载与写入方式准备0644文件，写OFD关闭后才调用正式exec入口。
+fn prepare_direct(
+    context: &TestContext<'_>,
+    fixture: &mut UserOwner,
+    bytes: &[u8],
+) -> Result<LoadedImage, TestError> {
+    fixture.prepare(context)?;
+    let vfs = fixture.path.vfs();
+    let fs_context = fixture.path.context();
+    let covered = checked(
+        context,
+        "direct ELF mountpoint lookup failed",
+        0,
+        vfs.resolve(fs_context, b"/plain", ResolveMode::Follow),
+    )?;
+    let memory = checked(
+        context,
+        "direct ELF tmpfs preparation failed",
+        0,
+        MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o755),
+    )?;
+    checked(
+        context,
+        "direct ELF tmpfs mount failed",
+        0,
+        vfs.mount(&covered, Filesystem::Memory(memory), AccessMode::ReadWrite),
+    )?;
+    let file = checked(
+        context,
+        "direct ELF creation failed",
+        0,
+        vfs.open_with(
+            fs_context,
+            fs_context.cwd(),
+            DIRECT_PATH,
+            (0, 0),
+            Some((0o644, 0)),
+            true,
+            false,
+            |path, _| open_path_with_flags(vfs, path, 2, FileIoContext::Kernel),
+        ),
+    )?;
+    assert_eq!(
+        checked(
+            context,
+            "direct ELF write failed",
+            0,
+            file.write_at(0, bytes)
+        )?,
+        bytes.len(),
+        "direct ELF short write"
+    );
+    assert_eq!(
+        checked(context, "direct ELF stat failed", 0, file.stat())?.mode & 0o777,
+        0o644,
+        "direct ELF file mode"
+    );
+    drop(file);
+    fixture.load_named(context, DIRECT_PATH, b"raw")
+}
+
+/// 从真实初始栈遍历argv/envp后消费auxv，不使用旧三程序头夹具的布局解析器。
+fn verify_direct_auxv(
+    context: &TestContext<'_>,
+    image: &LoadedImage,
+    entry: usize,
+    phent: usize,
+    phnum: usize,
+) -> TestResult {
+    #[cfg(target_arch = "riscv64")]
+    let sp = image.context.gpr[2];
+    #[cfg(target_arch = "loongarch64")]
+    let sp = image.context.gpr[3];
+    let argc = stack_word(context, &image.mm, sp)?;
+    let mut cursor = sp + (argc + 2) * 8;
+    while stack_word(context, &image.mm, cursor)? != 0 {
+        cursor += 8;
+    }
+    cursor += 8;
+    let required = [(3, 0), (4, phent), (5, phnum), (9, entry)];
+    let mut found = [false; 4];
+    for _ in 0..32 {
+        let kind = stack_word(context, &image.mm, cursor)?;
+        let value = stack_word(context, &image.mm, cursor + 8)?;
+        if kind == 0 {
+            assert_eq!(found, [true; 4], "direct ELF missing auxv");
+            return Ok(());
+        }
+        if let Some(index) = required.iter().position(|(expected, _)| *expected == kind) {
+            assert!(!found[index], "direct ELF duplicate auxv");
+            found[index] = true;
+            assert_eq!(value, required[index].1, "direct ELF auxv kind={kind}");
+        }
+        cursor += 16;
+    }
+    Err(TestError("direct ELF auxv lacks AT_NULL"))
+}
+
+/// 发表普通用户Task并消费真实wait及离栈join；用户检查过的每个字节须仍保留写入结果。
+fn execute_direct(
+    context: &mut TestContext<'_>,
+    fixture: &mut UserOwner,
+    image: LoadedImage,
+    checks: &[ByteCheck],
+) -> TestResult {
+    let mm = image.mm.clone();
+    fixture.start(context, image)?;
+    let event = fixture.wait(context)?;
+    assert_eq!(event.status, DIRECT_STATUS, "direct ELF actual user exit");
+    for check in checks {
+        let mut actual = [0];
+        read_mm(context, &mm, check.address, &mut actual)?;
+        assert_eq!(
+            actual,
+            [0x7e],
+            "direct ELF user store at {:#x}",
+            check.address
+        );
+    }
+    Ok(())
+}
+
+/// 页零与0x100入口由0644文件实际执行；扩展实例同时消费跨页PHDR和未映射PHDR的auxv。
+pub(super) fn direct_low(
+    context: &mut TestContext<'_>,
+    fixture: &mut UserOwner,
+    entry: usize,
+) -> TestResult {
+    let payload = direct_payload(&[])?;
+    let extended = entry == 0x100;
+    let bytes = direct_elf(
+        entry,
+        &[DirectSegment {
+            start: entry,
+            flags: if extended { 0x10000005 } else { 5 },
+            bytes: &payload,
+            memsz: payload.len(),
+        }],
+        extended,
+    )?;
+    let image = prepare_direct(context, fixture, &bytes)?;
+    assert_eq!(image.context.pc, entry, "direct ELF low entry");
+    let mut actual = [0; 16];
+    read_mm(context, &image.mm, entry, &mut actual)?;
+    assert_eq!(&actual, &payload[..16], "direct ELF low instruction bytes");
+    verify_direct_auxv(
+        context,
+        &image,
+        entry,
+        if extended { 64 } else { 56 },
+        if extended { 80 } else { 1 },
+    )?;
+    execute_direct(context, fixture, image, &[])
+}
+
+/// 只检查硬件叶而不触发缺页，统计大BSS的实际驻留页。
+fn bss_resident(mm: &Mm) -> usize {
+    (DIRECT_DATA..DIRECT_DATA + LARGE_BSS)
+        .step_by(PAGE_SIZE)
+        .filter(|address| mm.mapping(*address).is_some())
+        .count()
+}
+
+/// 超过旧加载量与跨度的正常映像只访问三个BSS页和一个远端文件页，未触页必须保持不驻留。
+pub(super) fn direct_sparse(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+    let checks = [
+        ByteCheck {
+            address: DIRECT_DATA,
+            expected: 0,
+        },
+        ByteCheck {
+            address: DIRECT_DATA + 32 * 1024 * 1024,
+            expected: 0,
+        },
+        ByteCheck {
+            address: DIRECT_DATA + LARGE_BSS - 1,
+            expected: 0,
+        },
+        ByteCheck {
+            address: DISTANT_DATA,
+            expected: 0x7b,
+        },
+    ];
+    let payload = direct_payload(&checks)?;
+    let bytes = direct_elf(
+        0x10000,
+        &[
+            DirectSegment {
+                start: 0x10000,
+                flags: 5,
+                bytes: &payload,
+                memsz: payload.len(),
+            },
+            DirectSegment {
+                start: DIRECT_DATA,
+                flags: 6,
+                bytes: &[],
+                memsz: LARGE_BSS,
+            },
+            DirectSegment {
+                start: DISTANT_DATA,
+                flags: 6,
+                bytes: &[0x7b],
+                memsz: PAGE_SIZE,
+            },
+        ],
+        false,
+    )?;
+    let image = prepare_direct(context, fixture, &bytes)?;
+    let mm = image.mm.clone();
+    assert_eq!(bss_resident(&mm), 0, "large BSS was eagerly populated");
+    assert!(
+        mm.mapping(0x8000000).is_none(),
+        "sparse ELF hole was populated"
+    );
+    execute_direct(context, fixture, image, &checks)?;
+    assert_eq!(
+        bss_resident(&mm),
+        3,
+        "large BSS residency differs from actual touches"
+    );
+    assert!(
+        mm.mapping(0x8000000).is_none(),
+        "sparse ELF hole became resident"
+    );
+    Ok(())
+}
+
+/// 后段文件和BSS覆盖都按原声明顺序生成独立预期，并逐字节核对跨页结果。
+pub(super) fn direct_overlap(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
+    let addresses = [
+        0x207ff, 0x20800, 0x2100f, 0x21010, 0x2102f, 0x21030, 0x2104f, 0x21050, 0x2181f, 0x21820,
+        0x2187f, 0x21880,
+    ];
+    let mut expected = [0x11; 2 * PAGE_SIZE + 128];
+    expected[0x800..0x1820].fill(0x22);
+    expected[0x1820..0x1880].fill(0);
+    expected[0x1010..0x1030].fill(0x33);
+    expected[0x1030..0x1050].fill(0);
+    let checks = addresses.map(|address| ByteCheck {
+        address,
+        expected: expected[address - DIRECT_DATA],
+    });
+    let payload = direct_payload(&checks)?;
+    let bytes = direct_elf(
+        0x10000,
+        &[
+            DirectSegment {
+                start: 0x10000,
+                flags: 5,
+                bytes: &payload,
+                memsz: payload.len(),
+            },
+            DirectSegment {
+                start: DIRECT_DATA,
+                flags: 4,
+                bytes: &[0x11; 2 * PAGE_SIZE + 128],
+                memsz: expected.len(),
+            },
+            DirectSegment {
+                start: DIRECT_DATA + 0x800,
+                flags: 6,
+                bytes: &[0x22; PAGE_SIZE + 32],
+                memsz: PAGE_SIZE + 128,
+            },
+            DirectSegment {
+                start: DIRECT_DATA + 0x1010,
+                flags: 4,
+                bytes: &[0x33; 32],
+                memsz: 64,
+            },
+        ],
+        false,
+    )?;
+    let image = prepare_direct(context, fixture, &bytes)?;
+    let mm = image.mm.clone();
+    let mut actual = [0; 2 * PAGE_SIZE + 128];
+    read_mm(context, &mm, DIRECT_DATA, &mut actual)?;
+    assert_eq!(actual, expected, "overlapping LOAD file/BSS precedence");
+    execute_direct(context, fixture, image, &checks)?;
+    for address in addresses {
+        expected[address - DIRECT_DATA] = 0x7e;
+    }
+    read_mm(context, &mm, DIRECT_DATA, &mut actual)?;
+    assert_eq!(
+        actual, expected,
+        "overlapping LOAD user stores changed other bytes"
     );
     Ok(())
 }

@@ -26,6 +26,11 @@ int check_script_argv(int argc, char **argv)
         for (int i = 0; i < argc; ++i)
             if (strcmp(argv[i], expected[i]) != 0)
                 return fail("chain argv");
+    } else if (strcmp(execfn, "/test/scripts/no-exec") == 0) {
+        if (argc != 3 || strcmp(argv[1], "/test/scripts/no-exec") != 0 ||
+            strcmp(argv[2], "tail") != 0)
+            return fail("0644 script argv");
+        return EXEC_CHILD_STATUS;
     } else {
         return fail("script AT_EXECFN");
     }
@@ -50,7 +55,33 @@ static int failed_exec(const char *path, int expected, const char *label,
     return EXIT_SUCCESS;
 }
 
-/// 真实消费解释器深度、缺失、权限、格式和参数预算错误。
+/// 子进程真正执行0644脚本，父进程消费退出值后继续检查其余失败与旧映像状态。
+static int non_executable_script(void)
+{
+    const char *path = "/test/scripts/no-exec";
+    struct stat metadata;
+    if (stat(path, &metadata) != 0 || (metadata.st_mode & 0777) != 0644)
+        return fail("0644 script mode");
+    pid_t child = fork();
+    if (child < 0)
+        return fail("0644 script fork");
+    if (child == 0) {
+        char *const args[] = { (char *)path, (char *)"tail", NULL };
+        char *const env[] = { (char *)"BLOSSOM_SCRIPT=stage7", NULL };
+        execve(path, args, env);
+        _exit(127);
+    }
+    int status;
+    pid_t reaped;
+    do {
+        reaped = waitpid(child, &status, 0);
+    } while (reaped < 0 && errno == EINTR);
+    if (reaped != child || !WIFEXITED(status) || WEXITSTATUS(status) != EXEC_CHILD_STATUS)
+        return fail("0644 script exit");
+    return EXIT_SUCCESS;
+}
+
+/// 真实消费0644脚本成功，以及解释器深度、缺失、格式和参数预算错误。
 int script_errors(void)
 {
     const char *execfn = (const char *)(uintptr_t)getauxval(AT_EXECFN);
@@ -62,7 +93,7 @@ int script_errors(void)
         result = failed_exec("/test/scripts/missing-interpreter", ENOENT,
                              "missing-interpreter", saved);
     if (result == EXIT_SUCCESS)
-        result = failed_exec("/test/scripts/no-exec", EACCES, "no-exec", saved);
+        result = non_executable_script();
     if (result == EXIT_SUCCESS)
         result = failed_exec("/test/scripts/non-script", ENOEXEC, "non-script", saved);
     static char *large_argv[129];
