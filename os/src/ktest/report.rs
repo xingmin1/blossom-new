@@ -181,7 +181,7 @@ pub(crate) fn result(
     }
     super::control_write(format_args!("\n"));
 }
-/// 报告完成后按实际平台停止本轮观察，QEMU 真实关闭，板卡停机不冒充物理断电。
+/// 输出完整 Suite 终态后通过 QEMU 测试设备结束本次运行。
 pub(crate) fn complete(name: &str, passed: bool) -> ! {
     write(format_args!(
         "{} 1 {}\n# KTEST complete\n",

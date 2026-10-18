@@ -15,10 +15,9 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 from ktest.catalog import HostError, require, select, invocations, batches
-from ktest.resources import regular_file, hash_file, resource_names
-from ktest.boot import elf_layout
-from ktest.runner import CANCELLED, discover, execute, config, validate_transport_resources
-from ktest.board import SerialPort, validate_arguments as validate_board_arguments
+from ktest.resources import regular_file, hash_file, resource_names, validate_resources
+from ktest.boot import validate_test_kernel_layout
+from ktest.runner import CANCELLED, discover, execute, config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,16 +58,10 @@ def shard_value(value):
 
 
 def arguments(argv=None):
-    """共用选择和报告；板只增加明确串口与本地 reset/reload 输入。"""
-    parser = argparse.ArgumentParser(description=__doc__)
+    """只为两种架构的 QEMU 定义测试、资源与报告参数，不接受缩写。"""
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("command", choices=("list", "run"))
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
-    parser.add_argument("--platform", choices=("qemu-virt", "visionfive2", "ls2k1000la"), default="qemu-virt")
-    parser.add_argument("--serial", type=Path, help="exclusive physical board serial tty")
-    parser.add_argument("--baud", type=natural, help="board serial baud (default: 115200)")
-    parser.add_argument("--loader", type=Path, help="explicit executable that resets, reloads and boots the board")
-    parser.add_argument("--loader-arg", action="append", default=[], help="literal loader argument; use = for leading dashes")
-    parser.add_argument("--bootargs", default="", help="additional board firmware boot arguments")
     parser.add_argument("--cpus", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--memory")
     parser.add_argument("--mode", choices=("debug", "release"), default="debug")
@@ -123,10 +116,6 @@ def arguments(argv=None):
         if separator != "=" or name not in ("root", "extra", "scratch") or not path or name in args.disks:
             parser.error("--disk requires unique root|extra|scratch=PATH")
         args.disks[name] = Path(path).resolve()
-    try:
-        validate_board_arguments(args)
-    except (HostError, OSError) as error:
-        parser.error(str(error))
     return args
 
 
@@ -148,7 +137,7 @@ def terminate_group(process):
 
 
 def fixed_kernel(args, directory):
-    """固定独占 ELF 并核对应平台布局，目录与装载始终消费同一副本。"""
+    """固定独占测试 ELF 并核对 QEMU 布局，目录与装载始终消费同一副本。"""
     kernel = directory / "kernel.elf"
     if args.kernel is not None:
         source = args.kernel.resolve()
@@ -159,8 +148,6 @@ def fixed_kernel(args, directory):
         command = ["make", "ktest-build", f"ARCH={args.arch}", f"CPUS={args.cpus}",
                    f"MEMORY={args.memory}", f"MODE={args.mode}", f"PANIC={args.panic}",
                    f"OUTPUT={kernel}"]
-        if args.platform != "qemu-virt":
-            command.append(f"PLATFORM={args.platform}")
         (directory / "build-command.json").write_text(json.dumps(command) + "\n", encoding="utf-8")
         with (directory / "build.log").open("xb") as log:
             process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
@@ -172,7 +159,7 @@ def fixed_kernel(args, directory):
         require(status == 0, f"ktest-build failed: {status}")
     regular_file(kernel)
     require(not kernel.is_symlink() and kernel.stat().st_nlink == 1, "fixed ELF must be an independent file")
-    layout = elf_layout(kernel, args.arch, args.platform)
+    layout = validate_test_kernel_layout(kernel, args.arch)
     (directory / "elf-layout.json").write_text(json.dumps(layout, indent=2) + "\n", encoding="utf-8")
     kernel.chmod(0o400)
     return kernel, hash_file(kernel)
@@ -199,7 +186,7 @@ def export_reports(directory, report):
                                   + bool(report.get("error"))),
                        skipped=str(sum(r["status"] == "Skip" for r in results)))
     properties = ET.SubElement(suite, "properties")
-    for name in ("elf_sha256", "seed", "arch", "cpus", "mode", "panic", "platform"):
+    for name in ("elf_sha256", "seed", "arch", "cpus", "mode", "panic"):
         ET.SubElement(properties, "property", name=name, value=str(report.get(name, "")))
     for row in results:
         case = ET.SubElement(suite, "testcase", name=row["name"], classname=str(row["suite"]))
@@ -220,7 +207,7 @@ def export_reports(directory, report):
 
 
 def main(argv=None):
-    """同次目录和运行持有板端口或独立 VM；只释放宿主拥有的资源与固定副本。"""
+    """同次目录和运行拥有独立 VM；只释放宿主资源与固定 ELF 副本。"""
     args = arguments(argv)
     CANCELLED.clear()
     try:
@@ -232,18 +219,11 @@ def main(argv=None):
     report = dict(version=1, command=sys.argv if argv is None else argv, seed=args.seed,
                   memory=args.memory, jobs=args.jobs, isolation=args.isolation,
                   **config(args), results=[], report_dir=str(directory))
-    report["platform"] = args.platform
-    if args.platform != "qemu-virt":
-        report["board"] = dict(serial=str(args.serial.resolve()), baud=args.baud,
-                               loader=str(args.loader), bootargs=args.bootargs)
-    board_serial = None
     kernel = directory / "kernel.elf"
     try:
         kernel, digest = fixed_kernel(args, directory)
         report["elf_sha256"] = digest
         report["kernel"] = str(kernel)
-        if args.platform != "qemu-virt":
-            board_serial = args.board_serial = SerialPort(args.serial, args.baud)
         catalog_dir = directory / "catalog"
         catalog_dir.mkdir()
         catalog = discover(args, kernel, catalog_dir)
@@ -262,7 +242,7 @@ def main(argv=None):
             items = invocations(selected, args)
             groups = batches(items, args)
             for group in groups:
-                validate_transport_resources(resource_names(catalog.suites[group[0].case["suite"]], group), args)
+                validate_resources(resource_names(catalog.suites[group[0].case["suite"]], group), args)
             report["resources"] = {name: str(path) for name, path in args.disks.items()}
             report["results"] = execute(args, kernel, catalog, groups, directory)
             report["exit_code"] = exit_status(report["results"])
@@ -271,13 +251,6 @@ def main(argv=None):
         report["error"] = str(error) or "host run interrupted"
         report["exit_code"] = 2
     finally:
-        # 板端口只结束宿主观察，不把超时/取消写成 guest 已清理或物理断电。
-        if board_serial is not None:
-            try:
-                board_serial.close()
-            except OSError as error:
-                report.setdefault("error", f"board serial cleanup failed: {error}")
-                report["exit_code"] = 2
         # discover/execute 已释放其宿主资源；只删本次独占输入。
         try:
             kernel.unlink(missing_ok=True)

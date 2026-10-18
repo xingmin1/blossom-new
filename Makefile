@@ -90,17 +90,25 @@ $(error Unsupported ARCH/PLATFORM combination: $(ARCH)/$(PLATFORM))
 endif
 ifneq ($(PLATFORM),qemu-virt)
 ifneq ($(filter run debug contest,$(MAKECMDGOALS)),)
-$(error run/debug/contest require PLATFORM=qemu-virt; board-image only generates offline files)
+$(error run/debug/contest require PLATFORM=qemu-virt; package-board-boot-images only generates offline files)
+endif
+ifneq ($(filter ktest-build ktest-list ktest,$(MAKECMDGOALS)),)
+$(error ktest-build/ktest-list/ktest require PLATFORM=qemu-virt)
+endif
+ifneq ($(findstring ktest,$(FEATURES)),)
+$(error Kernel test features require PLATFORM=qemu-virt)
 endif
 endif
 ifeq ($(PLATFORM),qemu-virt)
-ifneq ($(filter board-image,$(MAKECMDGOALS)),)
-$(error board-image requires PLATFORM=visionfive2 or PLATFORM=ls2k1000la)
+ifneq ($(filter package-board-boot-images,$(MAKECMDGOALS)),)
+$(error package-board-boot-images requires PLATFORM=visionfive2 or PLATFORM=ls2k1000la)
 endif
 endif
 
 KERNEL_TARGET_DIR := $(if $(filter qemu-virt,$(PLATFORM)),os/target,build/$(PLATFORM)/target)
-KTEST_TARGET_DIR := $(if $(filter qemu-virt,$(PLATFORM)),build/ktest-target,build/$(PLATFORM)/ktest-target)
+ifeq ($(PLATFORM),qemu-virt)
+KTEST_TARGET_DIR := build/ktest-target
+endif
 
 ifneq ($(words $(CPUS)),1)
 $(error CPUS 必须是一个核数)
@@ -136,7 +144,7 @@ endif
 
 CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
 
-.PHONY: all delivery-rv delivery-la kernel-rv kernel-la build board-image image run contest debug clean runtime runner work-clean help
+.PHONY: all delivery-rv delivery-la kernel-rv kernel-la build package-board-boot-images image run contest debug clean runtime runner work-clean help
 
 all: delivery-rv delivery-la
 	python3 tools/mkext4.py --delivery --contest-plan "$(CONTEST_PLAN)" --profile seed4k --size-mib 256 --rv-kernel build/delivery-riscv64/kernel.elf --la-kernel build/delivery-loongarch64/kernel.elf --rv-userland-root build/delivery-riscv64/userland --la-userland-root build/delivery-loongarch64/userland --rv-runtime-root build/runtime-riscv64 --la-runtime-root build/runtime-loongarch64
@@ -160,8 +168,8 @@ build:
 	mkdir -p "$(dir $(OUTPUT))"
 	cp "$(KERNEL_TARGET_DIR)/$(TARGET)/$(MODE)/os" "$(OUTPUT)"
 
-board-image: build
-	python3 tools/board.py --arch $(ARCH) --platform $(PLATFORM) --kernel "$(OUTPUT)" --output "$(BOARD_OUTPUT)" $(if $(RAMDISK),--ramdisk "$(RAMDISK)") $(if $(OS_DTB),--dtb "$(OS_DTB)") $(if $(BOARD_ROOT),--root "$(BOARD_ROOT)") --root-mode "$(ROOT_MODE)" --init "$(INIT)"
+package-board-boot-images: build
+	python3 tools/package_board_boot_images.py --arch $(ARCH) --target-platform $(PLATFORM) --kernel-elf "$(OUTPUT)" --output-directory "$(BOARD_OUTPUT)" $(if $(RAMDISK),--root-ext4-image "$(RAMDISK)") $(if $(OS_DTB),--os-dtb "$(OS_DTB)") $(if $(BOARD_ROOT),--root-device "$(BOARD_ROOT)") --root-mode "$(ROOT_MODE)" --init-program "$(INIT)"
 
 runner:
 	cd userland/contest-run && env -u CARGO_ENCODED_RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(abspath $(RUNNER_TARGET_DIR))" RUSTFLAGS="$(RUNNER_FLAGS)" cargo build --release --locked --offline --target $(RUNNER_TARGET)
@@ -207,10 +215,10 @@ ktest-build:
 	cp "$(KTEST_TARGET_DIR)/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
 
 ktest-list:
-	python3 tools/ktest.py list --arch $(ARCH) --platform $(PLATFORM) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 ktest:
-	python3 tools/ktest.py run --arch $(ARCH) --platform $(PLATFORM) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 .PHONY: user-tests
 user-tests: $(USER_OUTPUTS)
@@ -278,7 +286,7 @@ help:
 	  'build ARCH=riscv64|loongarch64 PLATFORM=qemu-virt Kernel only (MODE=debug|release).' \
 	  '  Board combinations: riscv64/visionfive2, loongarch64/ls2k1000la.' \
 	  '  Board Cargo/output directories are separate from official QEMU kernels.' \
-	  'board-image PLATFORM=... BOARD_ROOT=/dev/...  Offline raw/uImage/boot.env.' \
+	  'package-board-boot-images PLATFORM=... BOARD_ROOT=/dev/...  Offline raw/uImage/boot.env.' \
 	  '  RAMDISK=<raw-ext4> defaults BOARD_ROOT=/dev/ram0; OS_DTB=<OS-dtb> is optional.' \
 	  '  BOARD_OUTPUT selects the artifact directory; no board or media operations.' \
 	  '  SOURCE remains the image input; IMAGE is the volume output; OUTPUT is the ELF.' \
@@ -292,6 +300,6 @@ help:
 	  '  RESUME=1                         Keep all existing working disks.' \
 	  '  RESUME=1 REFRESH_SYSTEM=1         Replace only root.raw under the work lock.' \
 	  'all                               Export kernel-rv/kernel-la/disk.img/disk-la.img.' \
-	  'ktest-list / ktest TEST=...         Existing named kernel tests.' \
+	  'ktest-list / ktest TEST=...         Named kernel tests; PLATFORM=qemu-virt only.' \
 	  'clean                             Rebuildable outputs only; keep disks and reports.' \
 	  'work-clean WORK_DIR=...            Remove known working disks under their lock.'

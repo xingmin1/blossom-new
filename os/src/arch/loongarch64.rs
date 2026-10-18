@@ -674,20 +674,11 @@ pub fn emergency_shutdown() -> ! {
     ged_action(0, 0x34)
 }
 
-/// catalog 或具名测试已输出完整结果后停止板观察，不把常规完成当成致命错误。
+/// QEMU 的 catalog、Boot 或 Thread 测试结束后直接请求 GED 断电。
+/// 测试构建只允许 QEMU；早期退出不要求其它核上线或生产服务初始化。
 #[cfg(feature = "ktest")]
 pub fn test_shutdown() -> ! {
-    if crate::platform::current() == crate::boot::Platform::QemuVirt {
-        ged_action(0, 0x34);
-    }
-    let _stop = if crate::cpu::current().online.load(Ordering::Acquire) {
-        Some(crate::cpu::stop_other_online_cpus())
-    } else {
-        None
-    };
-    disable_stop_sources();
-    crate::console::board_stop();
-    permanent_idle()
+    ged_action(0, 0x34)
 }
 
 /// 关闭本核可唤醒源，发布永久确认后只执行 IDLE；只供已完成 CSD 的停核 IPI 使用。

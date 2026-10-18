@@ -1,4 +1,4 @@
-"""共用 UART 协议与绝对期限，分别拥有 QEMU 进程或有限板观察生命周期。"""
+"""QEMU 测试生命周期：真实 UART 协议、绝对期限与宿主资源回收。"""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import errno
@@ -31,11 +31,11 @@ class DeadlineExpired(RuntimeError):
 
 
 class VMExited(RuntimeError):
-    """UART 已关闭或具体 transport 已到不可继续的观察终点。"""
+    """QEMU 已退出或其 UART socket 已关闭。"""
 
 
-class UART:
-    """共享串口协议和 raw 阶段；具体 transport 独占其端点与终结责任。"""
+class VM:
+    """每个实例有独立 UART socket、工作盘和进程组，不使用 stdio 后备。"""
 
 
     def check(self, deadline):
@@ -47,7 +47,7 @@ class UART:
             require(self.debugger.poll() in (None, 0), "AP freeze GDB failed; inspect ap-freeze-gdb.log")
 
     def receive(self, deadline, limit=65536):
-        """逐块落盘原文；真实 EOF 与进程/板停止诊断分别判断。"""
+        """逐块落盘原文；UART EOF 后仍由调用者确认 QEMU 真实退出。"""
         while True:
             self.check(deadline)
             readable, _, _ = select.select([self.serial], [], [], max(0, min(0.1, deadline - time.monotonic())))
@@ -327,9 +327,6 @@ class UART:
         if peer is not None:
             peer.verify(deadline)
 
-class VM(UART):
-    """每个实例有独立串口 socket、工作盘和进程组，不使用 stdio 后备。"""
-
     def __init__(self, args, kernel, directory, names):
         """独占盘和 live peer 在启动前准备，QEMU 真正 wait 后才释放。"""
         self.args = args
@@ -437,32 +434,15 @@ class VM(UART):
             self.disk_directory.cleanup()
 
 
-def transport(args, kernel, directory, names):
-    """只在明确平台选择处替换装载/端点，QEMU 调用和测试替换点保持原样。"""
-    if getattr(args, "platform", "qemu-virt") == "qemu-virt":
-        return VM(args, kernel, directory, names)
-    from .board import Board
-    return Board(args, kernel, directory, names)
-
-
-def validate_transport_resources(names, args):
-    """选择同一资源声明的真实承载方，不让 QEMU 外部控制冒充板输入。"""
-    if getattr(args, "platform", "qemu-virt") == "qemu-virt":
-        validate_resources(names, args)
-    else:
-        from .board import validate_resources as validate_board_resources
-        validate_board_resources(names, args)
-
-
 def config(args):
     """发现与运行共享同一个实际配置。"""
     return dict(arch=args.arch, cpus=args.cpus, mode=args.mode, panic=args.panic)
 
 
 def discover(args, kernel, directory):
-    """从实际 transport 读取注册 JSONL，目录不执行 fixture。"""
+    """从实际 QEMU UART 读取注册 JSONL，目录不执行 fixture。"""
     catalog = Catalog(config(args))
-    vm = transport(args, kernel, directory, set())
+    vm = VM(args, kernel, directory, set())
     deadline = time.monotonic() + args.startup_timeout
     try:
         vm.handshake(config(args), b"catalog\n", deadline)
@@ -501,22 +481,13 @@ def looks_control(value):
 
 
 def finish_vm(vm, deadline, parser=None, catalog=False):
-    """final 后继续解析，QEMU 等真实退出，板等停止诊断并观察完整清理窗口。"""
+    """final 后继续解析尾文，并在原绝对期限内确认 QEMU 自行退出成功。"""
     while True:
         try:
             line = vm.line(deadline)
         except VMExited:
             fragment = bytes(vm.buffer).decode("utf-8", errors="replace").rstrip("\r")
             require(not looks_control(fragment), "partial control record at EOF")
-            if getattr(vm, "terminal", None) is not None:
-                require(getattr(vm, "observed_until_deadline", False),
-                        "board UART closed before terminal observation completed")
-                require(vm.terminal == "success" and vm.terminal_scope == "all-online",
-                        "board lacks all-online successful stop after final")
-                vm.verify_resources(deadline)
-                return
-            require(getattr(getattr(vm, "args", None), "platform", "qemu-virt") == "qemu-virt",
-                    "board UART closed without a stop decision")
             while vm.process.poll() is None:
                 vm.check(deadline)
                 time.sleep(min(0.01, max(0, deadline - time.monotonic())))
@@ -573,11 +544,8 @@ def execute_batch(args, kernel, catalog, items, directory):
         setup_deadline = case_deadline = cleanup_deadline = None
         try:
             names = resource_names(suite, pending)
-            validate_transport_resources(names, args)
-            if getattr(args, "platform", "qemu-virt") != "qemu-virt":
-                from .board import validate_cases
-                validate_cases(pending)
-            vm = transport(args, kernel, current, names)
+            validate_resources(names, args)
+            vm = VM(args, kernel, current, names)
             vm.execution_uart = ExecutionUART(args.cpus, current)
             vm.handshake(config(args), run_command(pending, args.seed), deadline)
             while not parser.complete:
@@ -607,9 +575,6 @@ def execute_batch(args, kernel, catalog, items, directory):
                 elif event == "body":
                     setup_deadline = None
                     vm.execution_uart.body = True
-                elif event == "fatal" and getattr(args, "platform", "qemu-virt") != "qemu-virt":
-                    setup_deadline = case_deadline = None
-                    cleanup_deadline = deadline = now + args.cleanup_timeout
                 elif event in ("quiesce", "join", "cleanup"):
                     setup_deadline = None
                     if cleanup_deadline is None:
@@ -629,19 +594,15 @@ def execute_batch(args, kernel, catalog, items, directory):
                     deadline = cleanup_deadline
             finish_vm(vm, cleanup_deadline or time.monotonic() + args.cleanup_timeout, parser)
             if parser.case_abort is not None:
-                # 完整 outer/complete 与实际 transport 终点后才确认明确的中止 Error。
+                # 完整 outer/complete 与 QEMU 真实退出后才确认明确的中止 Error。
                 parser.results[parser.active] = dict(status="Error", reason=parser.case_abort["reason"],
                                                      case_abort=parser.case_abort)
                 parser.active = None
         except DeadlineExpired as error:
             external = ("Timeout", str(error))
         except VMExited as error:
-            board_terminal = (getattr(vm, "terminal", None)
-                              if getattr(vm, "observed_until_deadline", False) else None)
-            board = getattr(args, "platform", "qemu-virt") != "qemu-virt"
-            terminated = (board_terminal is not None if board else
-                          vm is not None and vm.process.poll() is not None)
-            if (not board and parser.active is not None and parser.case_abort is None
+            terminated = vm is not None and vm.process.poll() is not None
+            if (parser.active is not None and parser.case_abort is None
                     and parser.fatal is not None and not terminated):
                 try:
                     vm.process.wait(timeout=max(0, min(args.cleanup_timeout, effective - time.monotonic())))
@@ -652,10 +613,10 @@ def execute_batch(args, kernel, catalog, items, directory):
             fragment = bytes(vm.buffer).decode("utf-8", errors="replace").rstrip("\r")
             if looks_control(fragment):
                 infrastructure = "partial control record at EOF"
-            elif case is not None and not board_terminal and effective <= time.monotonic():
+            elif case is not None and effective <= time.monotonic():
                 external = ("Timeout", "absolute host deadline expired")
             else:
-                # fatal 的不可返回终点必须由真实自行退出或板停止决策提供；
+                # fatal 的不可返回终点必须由 QEMU 真实自行退出提供；
                 # close()、UART EOF 和宿主超时都不能证明后继尚未开始。
                 fatal_matches = (case is not None and parser.phase == "body"
                                  and parser.fatal is not None
@@ -663,9 +624,7 @@ def execute_batch(args, kernel, catalog, items, directory):
                                  and (case["fatal_message"] is None or parser.fatal_message_seen))
                 safe_suffix = (case is not None and parser.case_abort is None
                                and parser.fatal is not None and terminated
-                               and ((board_terminal == "failure" and vm.terminal_scope == "current-cpu"
-                                     and vm.loaded and len(pending) == 1 and fatal_matches)
-                                    if board else vm.process.returncode == 0)
+                               and vm.process.returncode == 0
                                and not vm.buffer.strip())
                 if safe_suffix:
                     try:
@@ -679,10 +638,8 @@ def execute_batch(args, kernel, catalog, items, directory):
                         infrastructure = str(resource_error)
                         safe_suffix = False
                 if safe_suffix and fatal_matches:
-                    terminal = ("board stop scope=current-cpu reason=failure" if board else
-                                f"QEMU={vm.process.returncode}")
                     parser.results[parser.active] = dict(
-                        status="Pass", reason=f"expected fatal: {parser.fatal}; {terminal}")
+                        status="Pass", reason=f"expected fatal: {parser.fatal}; QEMU={vm.process.returncode}")
                     parser.active = None
                 else:
                     external = external or ("Crash", str(error))

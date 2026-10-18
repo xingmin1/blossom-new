@@ -257,7 +257,7 @@ fn dw_apb() -> bool {
         })
 }
 
-/// 已停其它核和本核事件后关闭 UART 中断并输出末尾诊断；返回后不得再启动任何输出者。
+/// 已停其它核和本核事件后关闭 UART 中断并排空末尾停止诊断；不确认物理断电，返回后不得再启动输出者。
 pub(crate) fn board_stop() {
     let platform = match crate::platform::current() {
         crate::boot::Platform::QemuVirt => return,
@@ -268,7 +268,7 @@ pub(crate) fn board_stop() {
     write_register(IER, 0);
     PortWriter
         .write_fmt(format_args!(
-            "# diagnostic: board-stop platform={} reason=success scope=all-online\n",
+            "Board {}: other online CPUs stopped; local event sources disabled.\n",
             platform
         ))
         .expect("board stop diagnostic failed");
@@ -277,7 +277,7 @@ pub(crate) fn board_stop() {
     }
 }
 
-/// 当前核的事件源已经关闭时输出有界致命终点；不等待端口锁，也不声称其它核或设备已停止。
+/// 当前核的事件源已关闭时输出有界致命停止诊断；不等待端口锁，也不声称其它核或设备已停止。
 pub(crate) fn board_stop_current_cpu() {
     let platform = match crate::platform::current() {
         crate::boot::Platform::QemuVirt => return,
@@ -286,7 +286,7 @@ pub(crate) fn board_stop_current_cpu() {
     };
     write_register(IER, 0);
     let _ = emergency_writer().write_fmt(format_args!(
-        "# diagnostic: board-stop platform={} reason=failure scope=current-cpu\n",
+        "Board {}: fatal stop on current CPU; other CPUs and devices may remain active.\n",
         platform
     ));
 }

@@ -2,10 +2,15 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// 校验架构与平台组合，生成唯一装载常量及链接段并登记 Cargo 重建条件。
+/// 校验架构、平台与测试功能组合，生成唯一装载常量及链接段并登记 Cargo 重建条件。
 fn main() {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture is missing");
     let platform = env::var("BLOSSOM_PLATFORM").unwrap_or_else(|_| "qemu-virt".into());
+    let testing = env::var_os("CARGO_FEATURE_KTEST").is_some();
+    assert!(
+        !testing || platform == "qemu-virt",
+        "kernel tests require BLOSSOM_PLATFORM=qemu-virt"
+    );
     let (identity, physical, virtual_start, direct, mmio, ram_base): (u8, u64, u64, u64, u64, u64) =
         match (arch.as_str(), platform.as_str()) {
             ("riscv64", "qemu-virt") => (
@@ -61,7 +66,6 @@ fn main() {
     );
     fs::write(output.join("platform-layout.ld"), layout)
         .expect("platform linker layout cannot be written");
-    let testing = env::var_os("CARGO_FEATURE_KTEST").is_some();
     let sections = if testing {
         r#"
   . = ALIGN(8);

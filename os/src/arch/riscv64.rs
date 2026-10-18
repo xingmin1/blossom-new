@@ -848,22 +848,11 @@ pub fn emergency_shutdown() -> ! {
     system_reset(0)
 }
 
-/// 已完成 catalog 或具名测试后停止板观察，保留原结果而不伪造物理 poweroff。
+/// QEMU 的 catalog、Boot 或 Thread 测试结束后直接请求 SBI 断电。
+/// 测试构建只允许 QEMU；早期退出不要求其它核上线或生产服务初始化。
 #[cfg(feature = "ktest")]
 pub fn test_shutdown() -> ! {
-    if crate::platform::current() == crate::boot::Platform::QemuVirt {
-        system_reset(0);
-    }
-    let _stop = if crate::cpu::current().online.load(Ordering::Acquire) {
-        Some(crate::cpu::stop_other_online_cpus())
-    } else {
-        None
-    };
-    disable_stop_sources();
-    crate::console::board_stop();
-    loop {
-        wait_for_interrupt();
-    }
+    system_reset(0)
 }
 
 /// 永久停核确认发生在本核事件已关闭以后；确认对象仅承载一次停止事实。
