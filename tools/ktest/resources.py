@@ -4,6 +4,9 @@ import hashlib
 from pathlib import Path
 import shutil
 import stat
+from qemu_command import (build_block_backend_arguments,
+                          build_user_network_backend_arguments)
+
 from .catalog import require
 
 RESOURCES = {"uart", "scratch", "root", "extra", "ap-freeze", "virtio-access-platform", "net-user"}
@@ -101,3 +104,60 @@ def prepare_disks(names, args, directory):
         disks.append((name, target))
     return disks
 
+
+
+def build_test_network_arguments(architecture, network_mode, host_forward_rule):
+    """测试 NIC 固定占用槽3及测试 MAC，生产命令不消费这些布局。"""
+    if network_mode == "none":
+        if host_forward_rule:
+            raise ValueError("host forwarding requires user networking")
+        return ["-nic", "none"]
+    if network_mode != "user":
+        raise ValueError(f"unsupported network mode: {network_mode}")
+    if architecture == "riscv64":
+        device = "virtio-net-device,netdev=net0,bus=virtio-mmio-bus.3"
+    elif architecture == "loongarch64":
+        device = "virtio-net-pci,netdev=net0,addr=0x11,disable-legacy=on"
+    else:
+        raise ValueError(f"unsupported network architecture: {architecture}")
+    return (build_user_network_backend_arguments("net0", host_forward_rule)
+            + ["-device", device + ",mac=52:54:00:12:34:56"])
+
+
+def build_test_disk_arguments(disks, *, architecture, read_only_roles,
+                              logical_block_size, virtio_access_platform,
+                              root_device, root_mode, extra_root_device,
+                              network_peer_ports=None):
+    """按逻辑盘序生成测试槽位和启动参数，peer 端口来自同一 VM 的实际资源。"""
+    command = []
+    for index, (role, path) in enumerate(disks):
+        slot = index + int(3 <= index)
+        drive_id = f"disk{index}"
+        command += build_block_backend_arguments(drive_id, path, role in read_only_roles)
+        if architecture == "riscv64":
+            device = f"virtio-blk-device,drive={drive_id},bus=virtio-mmio-bus.{slot}"
+        elif architecture == "loongarch64":
+            device = f"virtio-blk-pci,drive={drive_id},addr=0x{5 + 4 * slot:x}"
+        else:
+            raise ValueError(f"unsupported disk architecture: {architecture}")
+        device += f",logical_block_size={logical_block_size},physical_block_size={logical_block_size}"
+        if virtio_access_platform:
+            device += ",iommu_platform=on"
+            if architecture == "loongarch64":
+                device += ",disable-legacy=on"
+        command += ["-device", device]
+    if root_device is None:
+        index = next((index for index, (role, _) in enumerate(disks) if role == "root"), None)
+        if index is not None:
+            root_device = f"/dev/vd{chr(ord('a') + index)}"
+    bootargs = [root_mode, "rootdir=/"]
+    if root_device is not None:
+        bootargs.append(f"root={root_device}")
+    if extra_root_device is not None:
+        bootargs.append(f"extra={extra_root_device}")
+    if network_peer_ports is not None:
+        tcp, udp = network_peer_ports
+        if not (1 <= tcp <= 65535 and 1 <= udp <= 65535):
+            raise ValueError("network peer ports must be in 1..65535")
+        bootargs += [f"ktest-net-tcp={tcp}", f"ktest-net-udp={udp}"]
+    return command + ["-append", " ".join(bootargs)]

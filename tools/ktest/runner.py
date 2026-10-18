@@ -13,15 +13,13 @@ import tempfile
 import time
 import threading
 
-from storage import disk_arguments, network_arguments
-
 from . import ap_freeze, boot
 from .catalog import Catalog, HostError, require, run_command
 from .protocol import KTAP, ready
 from .execution_uart import ExecutionUART
 from .net_user import NetUserPeer
-from .resources import (crc32c_update, prepare_disks,
-                        resource_names, validate_resources)
+from .resources import (build_test_disk_arguments, build_test_network_arguments,
+                        crc32c_update, prepare_disks, resource_names, validate_resources)
 
 CANCELLED = threading.Event()
 
@@ -364,9 +362,15 @@ class VM:
                 command += ["-bios", "default"]
                 if args.modern:
                     command += ["-global", "virtio-mmio.force-legacy=false"]
-            command += network_arguments(args.arch, "user" if self.net_user is not None else "none")
+            command += build_test_network_arguments(
+                args.arch, "user" if self.net_user is not None else "none", None)
             ports = self.net_user.ports if self.net_user is not None else None
-            command += disk_arguments(disks, args, names, network_ports=ports, rootdir="/")
+            command += build_test_disk_arguments(
+                disks, architecture=args.arch, read_only_roles=args.read_only,
+                logical_block_size=args.logical_block_size,
+                virtio_access_platform="virtio-access-platform" in names,
+                root_device=args.root, root_mode=args.root_mode,
+                extra_root_device=args.extra_root, network_peer_ports=ports)
             if "ap-freeze" in names and args.cpus >= 2:
                 endpoint = str(Path(self.socket_directory.name) / "gdb.sock")
                 command += ["-chardev", f"socket,id=ktest-gdb,path={endpoint},server=on,wait=off",

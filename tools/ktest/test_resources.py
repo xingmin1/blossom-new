@@ -1,11 +1,9 @@
 """宿主 resources 回归；运行 python3 -m unittest discover -s tools/ktest。"""
 
 import errno
-import fcntl
 import hashlib
 import json
 from pathlib import Path
-import select as select_io
 import subprocess
 import sys
 import tempfile
@@ -17,14 +15,13 @@ from host_helpers import TOOLS, options
 from ktest.catalog import HostError
 from ktest.resources import aliases, prepare_disks, validate_resources
 from ktest.runner import VM
-from run import working_disks
 
 
 class RootModeInputTests(unittest.TestCase):
     """真实宿主入口在资源准备前拒绝非法根挂载模式。"""
 
     def test_invalid_mode_is_rejected_without_replacing_work_disks(self):
-        """命令行和 Make 拒绝未知或多 token 值，已有恢复盘与源文件必须保留。"""
+        """ktest CLI 拒绝未知或多 token 值，已有工作盘与源文件保持不变。"""
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             source = base / "source.img"
@@ -34,9 +31,6 @@ class RootModeInputTests(unittest.TestCase):
             disk = work / "root.raw"
             disk.write_bytes(b"preserved working disk")
             commands = [
-                [sys.executable, str(TOOLS / "run.py"), "--arch", "riscv64",
-                 "--kernel", str(base / "missing.elf"), "--image", str(source),
-                 "--work-dir", str(work)],
                 [sys.executable, str(TOOLS / "ktest.py"), "list", "--arch", "riscv64",
                  "--report-dir", str(base / "report")],
                 [sys.executable, str(TOOLS / "ktest.py"), "run", "--arch", "riscv64",
@@ -48,11 +42,6 @@ class RootModeInputTests(unittest.TestCase):
                         result = subprocess.run(command + ["--root-mode", mode],
                                                 capture_output=True, text=True)
                         self.assertEqual(result.returncode, 2)
-                with self.subTest(command="make", mode=mode):
-                    result = subprocess.run(["make", "--no-print-directory", "-n", "run",
-                                             f"ROOT_MODE={mode}"], cwd=TOOLS.parent,
-                                            capture_output=True, text=True)
-                    self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(source.read_bytes(), b"original source")
                 self.assertEqual(disk.read_bytes(), b"preserved working disk")
                 self.assertFalse((base / "report").exists())
@@ -90,30 +79,6 @@ class ResourceTests(unittest.TestCase):
                 with self.assertRaises(HostError):
                     prepare_disks({"root"}, args, alias_dir)
                 self.assertEqual(source.read_bytes(), b"original disk")
-
-    def test_ordinary_forward_without_network_rejects_preserved_resume_disk(self):
-        """none 与明确转发冲突时返回真实错误，不替换恢复盘或修改源镜像。"""
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            kernel = base / "kernel.elf"
-            kernel.write_bytes(b"kernel input")
-            source = base / "source.img"
-            source.write_bytes(b"source input")
-            work = base / "work"
-            work.mkdir()
-            disk = work / "root.raw"
-            disk.write_bytes(b"preserved resumed disk")
-            result = subprocess.run([
-                sys.executable, str(TOOLS / "run.py"), "--arch", "riscv64",
-                "--kernel", str(kernel), "--qemu", sys.executable, "--image", str(source),
-                "--work-dir", str(work), "--resume", "--net", "none",
-                "--net-forward", "tcp:127.0.0.1:43210-:4321",
-            ], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("host forwarding requires user networking", result.stderr)
-            self.assertEqual(source.read_bytes(), b"source input")
-            self.assertEqual(disk.read_bytes(), b"preserved resumed disk")
-            self.assertEqual(kernel.read_bytes(), b"kernel input")
 
     def test_vm_disks_live_until_process_wait_and_cleanup_partial_construction(self):
         """真实进程退出前保盘，隔离并行实例并清掉半复制，保留输入及原文日志。"""
@@ -221,103 +186,6 @@ class ResourceTests(unittest.TestCase):
             working = Path(next(a.split("file=", 1)[1] for a in command if a.startswith("if=none,")))
             self.assertFalse(working.parent.exists())
             self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_hash)
-
-    def test_ordinary_fresh_resume_and_system_refresh_preserve_disk_ownership(self):
-        """真实副本从 fresh 到 resume，再仅刷新系统盘，比赛数据和源文件保持独立。"""
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            work = base / "work"
-            work.mkdir()
-            sources = []
-            source_contents = {}
-            for name in ("contest", "root", "extra", "scratch"):
-                source = base / f"{name}.img"
-                source_contents[name] = f"source {name}".encode("ascii")
-                source.write_bytes(source_contents[name])
-                sources.append((name, source))
-            with (work / ".lock").open("a+b") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                disks = working_disks(sources, work, False)
-                self.assertEqual([name for name, _ in disks],
-                                 ["contest", "root", "extra", "scratch"])
-                working_contents = {}
-                for (name, source), (_, target) in zip(sources, disks):
-                    self.assertEqual(target.read_bytes(), source_contents[name])
-                    self.assertFalse(target.samefile(source))
-                    working_contents[name] = f"guest {name}".encode("ascii")
-                    target.write_bytes(working_contents[name])
-                for name, source in sources:
-                    source_contents[name] = f"updated source {name}".encode("ascii")
-                    source.write_bytes(source_contents[name])
-                self.assertEqual(working_disks(sources, work, True), disks)
-                self.assertEqual({name: path.read_bytes() for name, path in disks},
-                                 working_contents)
-                self.assertEqual(working_disks(sources, work, True, refresh_system=True), disks)
-                working_contents["root"] = source_contents["root"]
-                self.assertEqual({name: path.read_bytes() for name, path in disks},
-                                 working_contents)
-                with self.assertRaises(ValueError):
-                    working_disks(sources, work, False, refresh_system=True)
-                self.assertEqual({name: path.read_bytes() for name, path in disks},
-                                 working_contents)
-                self.assertEqual({name: path.read_bytes() for name, path in sources},
-                                 source_contents)
-
-    def test_work_clean_cli_refuses_live_lock_then_removes_only_owned_disks(self):
-        """持锁子进程存活时清理失败，真实 wait 后只移除四个工作盘并保原锁 inode。"""
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            work = base / "work"
-            work.mkdir()
-            contents = {}
-            for name in ("contest.raw", "root.raw", "extra.raw", "scratch.raw",
-                         "unrelated.img", "other.raw", "uart.log"):
-                contents[name] = f"preserve {name}".encode("ascii")
-                (work / name).write_bytes(contents[name])
-            source = base / "source.img"
-            source.write_bytes(b"original input")
-            script = (
-                "import fcntl,sys\n"
-                "with open(sys.argv[1],'a+b') as lock:\n"
-                " fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
-                " print('locked',flush=True)\n"
-                " sys.stdin.buffer.read(1)\n"
-            )
-            process = subprocess.Popen(
-                [sys.executable, "-c", script, str(work / ".lock")],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            command = [sys.executable, str(TOOLS / "run.py"),
-                       "--work-clean", "--work-dir", str(work)]
-            try:
-                readable, _, _ = select_io.select([process.stdout], [], [], 2)
-                self.assertTrue(readable, "lock holder did not become ready")
-                self.assertEqual(process.stdout.readline(), b"locked\n")
-                self.assertIsNone(process.poll())
-                lock_inode = (work / ".lock").stat().st_ino
-                result = subprocess.run(command, capture_output=True, text=True, timeout=2)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertEqual({name: (work / name).read_bytes() for name in contents},
-                                 contents)
-                self.assertIsNone(process.poll())
-                self.assertEqual((work / ".lock").stat().st_ino, lock_inode)
-                process.stdin.write(b"G")
-                process.stdin.flush()
-                self.assertEqual(process.wait(timeout=2), 0)
-            finally:
-                process.stdin.close()
-                if process.poll() is None:
-                    process.terminate()
-                process.wait(timeout=2)
-                process.stdout.close()
-                process.stderr.close()
-            result = subprocess.run(command, capture_output=True, text=True, timeout=2)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            for name in ("contest.raw", "root.raw", "extra.raw", "scratch.raw"):
-                self.assertFalse((work / name).exists())
-            for name in ("unrelated.img", "other.raw", "uart.log"):
-                self.assertEqual((work / name).read_bytes(), contents[name])
-            self.assertEqual((work / ".lock").stat().st_ino, lock_inode)
-            self.assertEqual(source.read_bytes(), b"original input")
 
 
 if __name__ == "__main__":

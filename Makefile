@@ -8,6 +8,7 @@ KERNEL_CARGO_TARGET_DIR ?= build/kernel/$(ARCH)/$(TARGET_PLATFORM)/target
 KTEST_CARGO_TARGET_DIR ?= build/ktest-target
 KTEST_PANIC_STRATEGY ?= unwind
 KTEST_ARGS ?=
+QEMU_ARGS ?=
 TEST ?=
 CPUS ?= 4
 MEMORY ?= $(if $(filter riscv64,$(ARCH)),512M,768M)
@@ -111,7 +112,7 @@ $(error KTEST_PANIC_STRATEGY must be unwind or abort)
 endif
 
 .PHONY: all build-kernel build-guest-userland prepare-guest-runtime-libraries assemble-root-filesystem create-ext4-image build-qemu-artifacts package-board-boot-images
-.PHONY: build-contest-runner user-tests ktest-build ktest-list ktest clean help
+.PHONY: build-contest-runner user-tests ktest-build ktest-list ktest run-qemu clean-build-artifacts clean-qemu-working-disks help
 
 all:
 	$(MAKE) build-qemu-artifacts ARCH=riscv64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_RV)" MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)" ROOTFS_OUTPUT_DIR=build/rootfs/riscv64 GUEST_USERLAND_OUTPUT_DIR=build/userland-riscv64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-riscv64 BUSYBOX_BUILD_DIR=build/busybox-riscv64
@@ -143,6 +144,12 @@ create-ext4-image:
 
 package-board-boot-images: build-kernel
 	python3 tools/package_board_boot_images.py --arch $(ARCH) --target-platform $(TARGET_PLATFORM) --kernel-elf "$(KERNEL_ELF_OUTPUT)" --output-directory "$(BOARD_BOOT_IMAGES_OUTPUT_DIR)" $(if $(BOARD_ROOT_EXT4_IMAGE),--root-ext4-image "$(BOARD_ROOT_EXT4_IMAGE)") $(if $(BOARD_OS_DTB),--os-dtb "$(BOARD_OS_DTB)") $(if $(BOARD_ROOT_DEVICE),--root-device "$(BOARD_ROOT_DEVICE)") --root-mode "$(BOARD_ROOT_MODE)" --init-program "$(BOARD_INIT_PROGRAM)"
+
+run-qemu:
+	python3 tools/run_qemu.py --arch "$(ARCH)" $(QEMU_ARGS)
+
+clean-qemu-working-disks:
+	python3 tools/working_disks.py clean --arch "$(ARCH)" $(QEMU_ARGS)
 
 build-contest-runner:
 	cd userland/contest-run && env -u RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" CARGO_ENCODED_RUSTFLAGS="$$(printf '%s\037' '-Ctarget-feature=+crt-static' '-Crelocation-model=static' '-Clink-self-contained=yes' '-Clink-arg=-no-pie' $(if $(RUNNER_SYSROOT),'--sysroot' "$(call absolute-path,$(RUNNER_SYSROOT))"); printf '%s' "-Clinker=$(if $(findstring /,$(RUNNER_LINKER)),$(call absolute-path,$(RUNNER_LINKER)),$(RUNNER_LINKER))")" cargo build --bin contest-run --release --locked --offline --target $(RUNNER_TARGET)
@@ -202,7 +209,7 @@ $(call make-path,$(BUSYBOX_BUILD_DIR)/.config): userland/busybox.config
 	cp "$<" "$@"
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" oldconfig
 
-clean:
+clean-build-artifacts:
 	cd os && CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" cargo clean
 	cd userland/contest-run && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" cargo clean --offline
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" clean
@@ -230,7 +237,11 @@ help:
 	  'package-board-boot-images           Build board kernel and generate offline boot files.' \
 	  '  BOARD_BOOT_IMAGES_OUTPUT_DIR, BOARD_ROOT_EXT4_IMAGE, BOARD_OS_DTB,' \
 	  '  BOARD_ROOT_DEVICE, BOARD_ROOT_MODE and BOARD_INIT_PROGRAM map directly to packaging.' \
+	  'run-qemu ARCH=...                   Run existing inputs; QEMU_ARGS passes CLI options unchanged.' \
+	  '  tools/run_qemu.py --help lists session, disk, network and debugger options.' \
+	  'clean-qemu-working-disks ARCH=...   Remove inactive root.raw/contest.raw under their lock.' \
+	  '  QEMU_ARGS may select --working-disk-dir; keep sources, directory and unrelated files.' \
 	  'user-tests                         Build the existing raw user ELF programs.' \
 	  'ktest-build / ktest-list / ktest     QEMU only; KERNEL_BUILD_PROFILE, KTEST_PANIC_STRATEGY.' \
 	  '  TEST selects a glob; KTEST_ARGS passes other Host options; CPUS/MEMORY are VM-only.' \
-	  'clean                              Rebuildable compiler outputs only; keep disks and reports.'
+	  'clean-build-artifacts              Rebuildable compiler outputs only; keep disks and reports.'
