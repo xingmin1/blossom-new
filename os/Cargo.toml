@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+crc = { version = "=3.4.0", default-features = false }
 fdt = { path = "../dependency/fdt" }
+gpt_disk_io = { version = "=0.17.0", default-features = false }
+gpt_disk_types = { version = "=0.16.1", default-features = false }
 rlibc = "1.0.0"
 spin = "0.7"
 virtio-drivers = { path = "../dependency/virtio-drivers", default-features = false, features = ["alloc"] }
