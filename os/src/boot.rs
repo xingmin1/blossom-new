@@ -7,11 +7,22 @@ pub const MAX_MEMORY_REGIONS: usize = 8;
 pub const MAX_RESERVED_REGIONS: usize = 24;
 pub const MAX_VIRTIO_MMIO: usize = 8;
 /// 所选控制器的 source 表容量，PLIC 包含保留的零号源。
-pub const MAX_INTERRUPT_SOURCES: usize = if cfg!(target_arch = "riscv64") {
+pub const MAX_INTERRUPT_SOURCES: usize = if cfg!(blossom_platform = "visionfive2") {
+    137
+} else if cfg!(target_arch = "riscv64") {
     96
 } else {
     64
 };
+
+/// 构建目标选定的平台身份，运行期不根据固件内容猜测板型。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Platform {
+    #[default]
+    QemuVirt,
+    VisionFive2,
+    Ls2k1000la,
+}
 
 /// 半开物理地址区间。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,6 +60,185 @@ pub struct InterruptResources {
     pub plic_contexts: [usize; MAX_CPUS],
 }
 
+/// UART 的访问几何和输入时钟；可编程时钟由实际 provider 引用描述。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UartResources {
+    pub reg_io_width: u32,
+    pub reg_shift: u32,
+    pub clock_frequency: Option<u64>,
+    pub clocks: DeviceClocks,
+    pub baud: u32,
+    pub dw_apb: bool,
+}
+
+/// 时钟或复位控制器中的一个具名绑定项。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceReference {
+    pub provider: Region,
+    pub id: u32,
+}
+
+/// 时钟引用及该设备实际要求的父源与频率。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClockResource {
+    pub reference: ResourceReference,
+    pub parent: Option<ResourceReference>,
+    pub rate: Option<u64>,
+}
+
+/// 所选设备使用的有界时钟表，顺序保持 clock-names 的绑定顺序。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceClocks {
+    pub entries: [ClockResource; 8],
+    pub count: usize,
+    pub assigned: [ClockResource; 8],
+    pub assigned_count: usize,
+}
+
+/// 引脚复用值及同组电气设置，数值沿实际 pinctrl 绑定保留。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PinResource {
+    pub provider: Region,
+    pub mux: u32,
+    pub pull_up: bool,
+    pub bias_disable: bool,
+    pub drive_strength: Option<u32>,
+    pub input_enable: Option<bool>,
+    pub schmitt_enable: Option<bool>,
+    pub slew_rate: Option<u32>,
+}
+
+/// 原生设备初始化需要的时钟、复位与引脚资源。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceSetup {
+    pub clocks: DeviceClocks,
+    pub resets: [ResourceReference; 3],
+    pub reset_count: usize,
+    pub pins: [PinResource; 16],
+    pub pin_count: usize,
+}
+
+/// LIOINTC 每组的主寄存器、每核状态和真实父 cause。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LioIntcResources {
+    pub registers: Region,
+    pub isr: [Region; 2],
+    pub parent_interrupt: u32,
+    pub parent_map: [u32; 4],
+}
+
+/// 固件树声明的 syscon 电源动作。
+#[derive(Clone, Copy, Debug)]
+pub struct SysconAction {
+    pub registers: Region,
+    pub offset: u32,
+    pub mask: u32,
+    pub value: u32,
+}
+
+/// SD 控制器与卡接口资源，DMA mask 只约束本设备。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MmcResources {
+    pub registers: Region,
+    pub interrupt_source: u32,
+    pub setup: DeviceSetup,
+    pub syscon: Region,
+    pub sysreg: [u32; 3],
+    pub bus_width: u32,
+    pub max_frequency: u32,
+    pub fifo_depth: u32,
+    pub data_offset: u32,
+    pub dma_coherent: bool,
+    pub dma_mask: u64,
+}
+
+/// 原生 PCI 功能身份；BAR 必须在唯一 PCI 枚举后解析。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PciFunctionResource {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub interrupt_source: u32,
+    pub dma_coherent: bool,
+}
+
+/// AHCI 的直接 MMIO 或 PCI 身份，PCI 资源由唯一库存解析 BAR 后补全。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AhciResources {
+    pub registers: Region,
+    pub pci: Option<PciFunctionResource>,
+    pub interrupt_source: u32,
+    pub dma_coherent: bool,
+    pub dma_mask: Option<u64>,
+    pub ports_implemented: Option<u32>,
+}
+
+/// GMAC 的 MMIO 或 PCI 身份，以及实际 PHY 与时钟配置。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GmacResources {
+    pub registers: Region,
+    pub pci: Option<PciFunctionResource>,
+    pub interrupt_source: u32,
+    pub setup: DeviceSetup,
+    pub syscon: Region,
+    pub sysreg: [u32; 2],
+    pub mac_address: Option<[u8; 6]>,
+    pub phy_address: u32,
+    pub phy_mode: PhyMode,
+    pub rx_delay_ps: Option<u32>,
+    pub tx_delay_ps: Option<u32>,
+    pub phy_tx_clock_adjust: bool,
+    pub phy_tx_inverted: [bool; 3],
+    pub phy_clock_drive_ua: Option<u32>,
+    pub phy_data_drive_ua: Option<u32>,
+    pub tx_use_rgmii_clock: bool,
+    pub dma_coherent: bool,
+    pub dma_mask: u64,
+}
+
+/// 所选 MAC 支持的实际板接口模式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PhyMode {
+    #[default]
+    Rgmii,
+    RgmiiId,
+    RgmiiRxid,
+    RgmiiTxid,
+    Rmii,
+}
+
+/// JH7110 所选 PLL 的真实输入频率与寄存器窗口，供设备动作读取当前时钟树。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BoardClockInputs {
+    pub oscillator_hz: Option<u64>,
+    pub pll_registers: Region,
+}
+
+/// 板级独有资源；QEMU 不创建虚假的原生设备。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BoardResources {
+    pub clock_inputs: BoardClockInputs,
+    pub ccache: Region,
+    pub cache_line_size: usize,
+    pub liointc: [LioIntcResources; 2],
+    pub pmc: Region,
+    pub rtc_setup: DeviceSetup,
+    pub reboot: Option<SysconAction>,
+    pub poweroff: Option<SysconAction>,
+    pub mmc: Option<MmcResources>,
+    pub ahci: Option<AhciResources>,
+    pub gmac: Option<GmacResources>,
+}
+
+/// PCI host 的实际配置访问协议，缺 host 时不构造 CAM。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PciConfiguration {
+    #[default]
+    Absent,
+    Ecam,
+    Loongson,
+}
+
 /// 已选 PCI host 提供的总线地址到物理窗口映射。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PciRange {
@@ -75,6 +265,8 @@ pub struct PciIntxRoute {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PciResources {
     pub configuration: Region,
+    pub kind: PciConfiguration,
+    pub configuration_extended: Region,
     pub ranges: [PciRange; 4],
     pub range_count: usize,
     pub bus_start: u32,
@@ -118,7 +310,8 @@ impl PciResources {
 /// 一次解析完成、由 BSP 发布的启动资源快照。
 #[derive(Clone, Copy, Debug)]
 pub struct BootInfo {
-    pub raw_args: [usize; 3],
+    pub platform: Platform,
+    pub raw_args: [usize; 4],
     pub bsp_hardware_id: usize,
     pub cpu_count: usize,
     pub hardware_ids: [usize; MAX_CPUS],
@@ -127,6 +320,9 @@ pub struct BootInfo {
     pub reserved_count: usize,
     pub reserved: [Region; MAX_RESERVED_REGIONS],
     pub dtb: Region,
+    pub initrd: Option<Region>,
+    pub uart: UartResources,
+    pub board: BoardResources,
     pub interrupts: InterruptResources,
     /// 唯一启用 RTC 的物理寄存器区间，运行期只用于 BSP 初始日历采样。
     pub rtc: Region,
@@ -140,8 +336,9 @@ pub struct BootInfo {
 
 impl BootInfo {
     /// 创建仅供边界解析填充的空快照；计数决定哪些数组槽位有效。
-    pub fn empty(raw_args: [usize; 3], bsp_hardware_id: usize) -> Self {
+    pub fn empty(raw_args: [usize; 4], bsp_hardware_id: usize) -> Self {
         Self {
+            platform: crate::platform::current(),
             raw_args,
             bsp_hardware_id,
             cpu_count: 0,
@@ -151,6 +348,9 @@ impl BootInfo {
             reserved_count: 0,
             reserved: [Region::default(); MAX_RESERVED_REGIONS],
             dtb: Region::default(),
+            initrd: None,
+            uart: UartResources::default(),
+            board: BoardResources::default(),
             interrupts: InterruptResources::default(),
             rtc: Region::default(),
             pci: PciResources::default(),

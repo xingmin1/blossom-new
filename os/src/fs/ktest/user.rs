@@ -741,7 +741,10 @@ impl UserOwner {
         let marker = image.context.gpr[3] - 8;
         let mm = Arc::clone(&image.mm);
         let disk = self.path.owner.disk()?.clone();
-        let legacy = matches!(disk.identity(), VirtioIdentity::Mmio { version: 1, .. });
+        let legacy = matches!(
+            disk.identity(),
+            DiskIdentity::Virtio(VirtioIdentity::Mmio { version: 1, .. })
+        );
         let first_used = block::tests::used_index(&disk, legacy);
         let before = disk.test_snapshot();
         disk.test_suspend_completions();

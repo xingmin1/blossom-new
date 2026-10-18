@@ -1,15 +1,33 @@
-//! QEMU virt 的一次性无堆资源发现；输入结构验证完成后才交给 fdt 解析。
+//! 固件的一次性无堆资源发现，公共 FDT 真相与平台设备绑定分别拥有职责。
 
 use crate::boot::{
-    BootInfo, PciIntxRoute, PciRange, Region, VirtioMmioResource, MAX_CPUS, MAX_INTERRUPT_SOURCES,
-    MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO,
+    BootInfo, PciConfiguration, PciIntxRoute, PciRange, Platform, Region, VirtioMmioResource,
+    MAX_CPUS, MAX_INTERRUPT_SOURCES, MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO,
 };
 use fdt::{node::FdtNode, Fdt};
 
+mod ls2k1000la;
+mod resources;
+mod visionfive2;
+
+/// 返回构建时已验证的平台选择，不读取固件或重新识别板型。
+pub const fn current() -> Platform {
+    if cfg!(blossom_platform = "visionfive2") {
+        Platform::VisionFive2
+    } else if cfg!(blossom_platform = "ls2k1000la") {
+        Platform::Ls2k1000la
+    } else {
+        Platform::QemuVirt
+    }
+}
 #[cfg(target_arch = "riscv64")]
 pub const EARLY_UART_BASE: usize = 0x1000_0000;
 #[cfg(target_arch = "loongarch64")]
-pub const EARLY_UART_BASE: usize = 0x1fe0_01e0;
+pub const EARLY_UART_BASE: usize = if cfg!(blossom_platform = "ls2k1000la") {
+    0x1fe2_0000
+} else {
+    0x1fe0_01e0
+};
 
 const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
 type Node<'a> = FdtNode<'a, 'a>;
@@ -271,8 +289,34 @@ fn regions(
 /// 验证当前资源所在总线是物理恒等映射，不隐式猜测地址转换。
 fn identity_address<'a>(tree: &'a Fdt<'a>, mut node: Node<'a>) -> Result<(), &'static str> {
     while let Some(bus) = parent(tree, node) {
-        if bus.name != "/" && !bus.property("ranges").is_some_and(|p| p.value.is_empty()) {
-            return Err("FDT resource parent bus is not identity mapped");
+        if bus.name != "/" {
+            let ranges = property(bus, "ranges")?;
+            if !ranges.is_empty() {
+                let ancestor = parent(tree, bus).ok_or("FDT bus has no parent")?;
+                let child_cells = bus.cell_sizes().address_cells;
+                let parent_cells = ancestor.cell_sizes().address_cells;
+                let size_cells = bus.cell_sizes().size_cells;
+                let stride = (child_cells + parent_cells + size_cells) * 4;
+                if child_cells != parent_cells || stride == 0 || ranges.len() % stride != 0 {
+                    return Err("FDT bus ranges format is unsupported");
+                }
+                for resource in regions(node)? {
+                    let resource = resource?;
+                    let mut covered = false;
+                    for range in ranges.chunks_exact(stride) {
+                        let width = child_cells * 4;
+                        let start = cells(&range[..width])?;
+                        if start != cells(&range[width..width * 2])? {
+                            return Err("FDT resource bus is not identity mapped");
+                        }
+                        let window = Region::from_size(start, cells(&range[width * 2..])?)?;
+                        covered |= window.start <= resource.start && resource.end <= window.end;
+                    }
+                    if !covered {
+                        return Err("FDT resource is outside its bus windows");
+                    }
+                }
+            }
         }
         node = bus;
     }
@@ -302,7 +346,7 @@ fn irq(node: Node<'_>, controller: Node<'_>) -> Result<u32, &'static str> {
 /// 将完整 DTB 转为一份资源快照，保留 BSP 身份及全部实际 RAM/保留区。
 fn discover_tree(
     bytes: &[u8],
-    raw_args: [usize; 3],
+    raw_args: [usize; 4],
     bsp: usize,
     dtb_address: usize,
 ) -> Result<BootInfo, &'static str> {
@@ -312,7 +356,9 @@ fn discover_tree(
     info.dtb = Region::from_size(dtb_address, tree.total_size())?;
     info.reserve(info.dtb)?;
     #[cfg(target_arch = "loongarch64")]
-    info.reserve(Region::from_size(0, 0x10_0000)?)?;
+    if current() == Platform::QemuVirt {
+        info.reserve(Region::from_size(0, 0x10_0000)?)?;
+    }
     for reservation in tree.memory_reservations() {
         info.reserve(Region::from_size(
             reservation.address() as usize,
@@ -362,6 +408,20 @@ fn discover_tree(
     {
         return Err("runtime DTB is outside the described RAM");
     }
+    if info.platform != Platform::QemuVirt {
+        let kernel = crate::boot::kernel_region();
+        let ram = info.memory[..info.memory_count]
+            .iter()
+            .find(|ram| ram.start <= kernel.start && kernel.end <= ram.end)
+            .ok_or("kernel load region is outside actual RAM")?;
+        // 固件及其交接数据位于同一低 RAM 段、内核装载地址之前，不能在接管 MM 后复用。
+        if ram.start < kernel.start {
+            info.reserve(Region {
+                start: ram.start,
+                end: kernel.start,
+            })?;
+        }
+    }
     let cpus = tree.find_node("/cpus").ok_or("FDT cpus node is missing")?;
     if !matches!(number(cpus, "#address-cells")?, 1 | 2) || number(cpus, "#size-cells")? != 0 {
         return Err("FDT CPU reg cell format is invalid");
@@ -375,6 +435,9 @@ fn discover_tree(
             return Err("FDT CPU reg is empty, truncated, or contains multiple IDs");
         }
         let id = cells(reg)?;
+        if current() == Platform::VisionFive2 && compatible(node, "sifive,s7") {
+            continue;
+        }
         if info.hardware_ids[..info.cpu_count].contains(&id) {
             return Err("FDT CPU hardware IDs are duplicated");
         }
@@ -406,46 +469,18 @@ fn discover_tree(
         .find_node("/chosen")
         .ok_or("FDT chosen node is missing")?;
     discover_bootargs(chosen, &mut info)?;
-    let stdout =
-        cstr(property(chosen, "stdout-path").map_err(|_| "FDT chosen stdout-path is missing")?)?;
-    let path = stdout
-        .split(':')
-        .next()
-        .ok_or("FDT stdout-path is invalid")?;
-    let uart = tree.find_node(path).ok_or("FDT stdout-path has no UART")?;
-    if !enabled(uart) || !compatible(uart, "ns16550a") {
-        return Err("FDT chosen UART is not an enabled ns16550a");
-    }
+    discover_initrd(chosen, &mut info)?;
+    let uart = resources::stdout_uart(&tree, chosen)?;
     info.interrupts.uart = single_region(&tree, uart)?;
     if info.interrupts.uart.start != EARLY_UART_BASE {
         return Err("FDT chosen UART differs from the early UART");
     }
-    let controller = interrupt_parent(&tree, uart)?;
-    info.interrupts.uart_source = irq(uart, controller)?;
-    info.interrupts.controller = single_region(&tree, controller)?;
-    #[cfg(target_arch = "riscv64")]
-    discover_plic(&tree, cpus, controller, &mut info)?;
-    #[cfg(target_arch = "loongarch64")]
-    {
-        require_controller(controller, "loongson,pch-pic-1.0", 2)?;
-        info.interrupts.source_count = MAX_INTERRUPT_SOURCES as u32;
-        if word(property(uart, "interrupts")?, 4)? != 4 || 64 <= info.interrupts.uart_source {
-            return Err("FDT UART is not a supported PCH-PIC level-high source");
-        }
-        let extioi = interrupt_parent(&tree, controller)?;
-        require_controller(extioi, "loongson,ls2k2000-eiointc", 1)?;
-        // EXTIOI 的 reg 是 IOCSR 地址，不能加入普通 MMIO 映射。
-        info.interrupts.parent_controller = single_region(&tree, extioi)?;
-        let root = interrupt_parent(&tree, extioi)?;
-        require_controller(root, "loongson,cpu-interrupt-controller", 1)?;
-        info.interrupts.root_interrupt = irq(extioi, root)?;
-        if 8 <= info.interrupts.root_interrupt {
-            return Err("FDT EXTIOI CPU root interrupt exceeds the supported range");
-        }
+    resources::discover_uart(&tree, chosen, uart, &mut info)?;
+    match current() {
+        Platform::QemuVirt => discover_qemu(&tree, cpus, uart, &mut info)?,
+        Platform::VisionFive2 => visionfive2::discover(&tree, cpus, uart, &mut info)?,
+        Platform::Ls2k1000la => ls2k1000la::discover(&tree, uart, &mut info)?,
     }
-    discover_pci(&tree, controller, &mut info)?;
-    discover_virtio_mmio(&tree, controller, &mut info)?;
-    discover_rtc(&tree, &mut info)?;
     Ok(info)
 }
 
@@ -459,7 +494,7 @@ pub(crate) fn ktest_validate(bytes: &[u8]) -> Result<(), &'static str> {
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_discover_tree(
     bytes: &[u8],
-    raw_args: [usize; 3],
+    raw_args: [usize; 4],
     bsp: usize,
     dtb_address: usize,
 ) -> Result<crate::boot::BootInfo, &'static str> {
@@ -484,6 +519,67 @@ fn discover_bootargs(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'stat
     Ok(())
 }
 
+/// 标准 initrd 属性必须成对出现，完整 RAM 范围在 buddy 建立前保留。
+fn discover_initrd(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
+    let start = chosen.property("linux,initrd-start");
+    let end = chosen.property("linux,initrd-end");
+    let (start, end) = match (start, end) {
+        (None, None) => return Ok(()),
+        (Some(start), Some(end)) => (cells(start.value)?, cells(end.value)?),
+        _ => return Err("FDT initrd requires both start and end"),
+    };
+    if start == 0 || end <= start {
+        return Err("FDT initrd range is invalid");
+    }
+    let region = Region { start, end };
+    if !info.memory[..info.memory_count]
+        .iter()
+        .any(|ram| ram.start <= start && end <= ram.end)
+        || region.overlaps(info.dtb)
+        || region.overlaps(crate::boot::kernel_region())
+    {
+        return Err("FDT initrd is outside RAM or overlaps boot data");
+    }
+    info.reserve(region)?;
+    info.initrd = Some(region);
+    Ok(())
+}
+
+/// QEMU 的 PCH/PLIC、VirtIO、ECAM 与 RTC 绑定不参与真实板的固件解释。
+fn discover_qemu(
+    tree: &Fdt<'_>,
+    cpus: Node<'_>,
+    uart: Node<'_>,
+    info: &mut BootInfo,
+) -> Result<(), &'static str> {
+    let controller = interrupt_parent(tree, uart)?;
+    info.interrupts.uart_source = irq(uart, controller)?;
+    info.interrupts.controller = single_region(tree, controller)?;
+    #[cfg(target_arch = "riscv64")]
+    discover_plic(tree, cpus, controller, info)?;
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let _ = cpus;
+        require_controller(controller, "loongson,pch-pic-1.0", 2)?;
+        info.interrupts.source_count = MAX_INTERRUPT_SOURCES as u32;
+        if word(property(uart, "interrupts")?, 4)? != 4 || 64 <= info.interrupts.uart_source {
+            return Err("FDT UART is not a supported PCH-PIC level-high source");
+        }
+        let extioi = interrupt_parent(tree, controller)?;
+        require_controller(extioi, "loongson,ls2k2000-eiointc", 1)?;
+        info.interrupts.parent_controller = single_region(tree, extioi)?;
+        let root = interrupt_parent(tree, extioi)?;
+        require_controller(root, "loongson,cpu-interrupt-controller", 1)?;
+        info.interrupts.root_interrupt = irq(extioi, root)?;
+        if 8 <= info.interrupts.root_interrupt {
+            return Err("FDT EXTIOI CPU root interrupt exceeds the supported range");
+        }
+    }
+    discover_pci(tree, controller, info)?;
+    discover_virtio_mmio(tree, controller, info)?;
+    discover_rtc(tree, info)
+}
+
 /// 验证新增设备物理窗口不覆盖 RAM、已有控制器或先前登记的设备窗口。
 fn device_region(region: Region, info: &BootInfo) -> Result<(), &'static str> {
     if info.memory[..info.memory_count]
@@ -493,6 +589,21 @@ fn device_region(region: Region, info: &BootInfo) -> Result<(), &'static str> {
         || info.interrupts.controller.overlaps(region)
         || info.rtc.overlaps(region)
         || info.pci.configuration.overlaps(region)
+        || info.pci.configuration_extended.overlaps(region)
+        || info.board.ccache.overlaps(region)
+        || info.board.pmc.overlaps(region)
+        || info
+            .board
+            .mmc
+            .is_some_and(|device| device.registers.overlaps(region))
+        || info
+            .board
+            .ahci
+            .is_some_and(|device| device.registers.overlaps(region))
+        || info
+            .board
+            .gmac
+            .is_some_and(|device| device.registers.overlaps(region))
         || info.pci.ranges[..info.pci.range_count]
             .iter()
             .any(|old| old.cpu.overlaps(region))
@@ -591,6 +702,7 @@ fn discover_pci(
     let configuration = single_region(tree, host)?;
     device_region(configuration, info)?;
     info.pci.configuration = configuration;
+    info.pci.kind = PciConfiguration::Ecam;
     if number(host, "#address-cells")? != 3 || number(host, "#size-cells")? != 2 {
         return Err("FDT PCI ranges cell format is invalid");
     }
@@ -716,7 +828,12 @@ fn discover_plic(
     plic: Node<'_>,
     info: &mut BootInfo,
 ) -> Result<(), &'static str> {
-    require_controller(plic, "riscv,plic0", 1)?;
+    let binding = if current() == Platform::VisionFive2 {
+        "sifive,plic-1.0.0"
+    } else {
+        "riscv,plic0"
+    };
+    require_controller(plic, binding, 1)?;
     let sources = number(plic, "riscv,ndev")?;
     if info.interrupts.uart_source == 0 || sources < info.interrupts.uart_source {
         return Err("FDT UART source exceeds the PLIC capacity");
@@ -731,6 +848,9 @@ fn discover_plic(
             continue;
         }
         let id = cells(property(cpu, "reg")?)?;
+        if current() == Platform::VisionFive2 && compatible(cpu, "sifive,s7") {
+            continue;
+        }
         let logical = info.hardware_ids[..info.cpu_count]
             .iter()
             .position(|old| *old == id)
@@ -796,20 +916,26 @@ fn discover_plic(
     Ok(())
 }
 
-/// 从所选 QEMU 引导协议读取唯一 DTB 和实际命令行，返回完整的无堆启动资源快照。
+/// 从所选平台的显式固件交接读取唯一 DTB 和命令行，返回完整无堆资源快照。
 ///
 /// # Safety
 /// 固件必须提供至少可读的 FDT 头部及头部所声明的完整存储范围；本函数检查内容边界，
 /// 不能验证任意物理指针是否实际可读。调用时 BSP 必须已建立对应 RAM 访问映射；
-/// LA 的 a1 是命令行物理地址，当前 BootInfo 容量内的字节必须由固件保留且可读。
+/// QEMU LA 的 a1 命令行须在快照容量内可读；板固件须满足 UHI/bootm/go 的显式参数
+/// 契约，其中 go 的 argv[1] 必须是最多 18 字节、NUL 结尾的可读十六进制 DTB 地址。
 pub unsafe fn discover(
-    raw_args: [usize; 3],
+    raw_args: [usize; 4],
     bsp_hardware_id: usize,
 ) -> Result<BootInfo, &'static str> {
     #[cfg(target_arch = "riscv64")]
     let physical = raw_args[1];
     #[cfg(target_arch = "loongarch64")]
-    let physical: usize = 0x10_0000;
+    let physical: usize = if current() == Platform::QemuVirt {
+        0x10_0000
+    } else {
+        // SAFETY: 固件调用者保证所选 UHI/bootm/go 参数及其引用的有界 argv 可读。
+        unsafe { ls2k1000la::dtb_address(raw_args)? }
+    };
     if physical == 0 || physical % 8 != 0 || physical.checked_add(40).is_none() {
         return Err("firmware DTB physical address is zero or unaligned");
     }
@@ -832,6 +958,9 @@ pub unsafe fn discover(
     #[cfg(target_arch = "loongarch64")]
     {
         let mut info = info;
+        if current() != Platform::QemuVirt {
+            return Ok(info);
+        }
         // LA 直接装载协议把命令行放在 a1 指向的低 RAM，不写入 DTB /chosen。
         let command = crate::arch::phys_to_virt(raw_args[1]) as *const u8;
         for index in 0..info.bootargs.len() {

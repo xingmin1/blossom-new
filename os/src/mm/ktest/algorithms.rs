@@ -9,7 +9,7 @@ use crate::mm::{
 
 /// 构造原区间边界输入，所有用例各持一份独立 BootMemory。
 fn ranges() -> BootMemory {
-    let mut info = BootInfo::empty([0; 3], 0);
+    let mut info = BootInfo::empty([0; 4], 0);
     info.memory_count = 5;
     info.memory[..5].copy_from_slice(&[
         Region {
@@ -155,7 +155,7 @@ mod boot_ranges {
     /// 两片未对齐且相邻的字节 RAM 共同覆盖一页，metadata 居中切分 free。
     #[test]
     fn adjacent_byte_fragments() {
-        let mut info = BootInfo::empty([0; 3], 0);
+        let mut info = BootInfo::empty([0; 4], 0);
         info.memory_count = 2;
         info.memory[0] = Region {
             start: PAGE_SIZE,
@@ -194,7 +194,7 @@ mod boot_ranges {
     #[case("reserved_count", 3)]
     #[case("empty_region", 4)]
     fn input_rejection(kind: usize) {
-        let mut info = BootInfo::empty([0; 3], 0);
+        let mut info = BootInfo::empty([0; 4], 0);
         info.memory_count = 1;
         info.memory[0] = Region {
             start: 0,
@@ -223,7 +223,7 @@ mod boot_ranges {
     /// 每次成功申请消费一个固定 metadata 额度，超限不改已分配页。
     #[test]
     fn metadata_capacity() {
-        let mut info = BootInfo::empty([0; 3], 0);
+        let mut info = BootInfo::empty([0; 4], 0);
         info.memory_count = 1;
         info.memory[0] = Region {
             start: 0,
@@ -353,6 +353,46 @@ mod controlled_buddy {
             assert!(!zone.allocate(5, 1));
             assert_eq!(zone.free(), 4);
             for index in 0..5 {
+                zone.release(index);
+            }
+            assert_eq!(zone.free(), 14);
+        });
+    }
+    /// 可达窗口在原大块内选择右子块，拒绝越界后仍按原阶完整合并。
+    #[test]
+    fn constrained_split_merge() {
+        buddy::with_test_zone(false, |zone| {
+            assert!(zone.allocate_in(0, 2, 9, 20));
+            assert_eq!(zone.block(0), (12, 2));
+            assert_eq!(zone.free(), 1020);
+            assert!(!zone.allocate_in(1, 2, 13, 19));
+            assert_eq!(zone.free(), 1020);
+            assert!(zone.allocate_in(1, 2, 16, 20));
+            assert_eq!(zone.block(1), (16, 2));
+            zone.release(0);
+            zone.release(1);
+            assert!(zone.allocate(0, 10));
+            assert_eq!(zone.block(0), (0, 10));
+            zone.release(0);
+            assert_eq!(zone.free(), 1024);
+        });
+    }
+
+    /// 受限选择跳过保留页和 section 孔洞，不因存在高地址空页越过 mask。
+    #[test]
+    fn constrained_reserved_and_holes() {
+        buddy::with_test_zone(true, |zone| {
+            assert!(!zone.allocate_in(0, 2, 0, 16));
+            assert_eq!(zone.free(), 14);
+            for index in 0..12 {
+                assert!(zone.allocate_in(index, 0, 0, 16));
+                let (head, order) = zone.block(index);
+                assert!(head < 16 && ![3, 7, 11, 15].contains(&head));
+                assert_eq!(order, 0);
+            }
+            assert!(!zone.allocate_in(12, 0, 0, 16));
+            assert_eq!(zone.free(), 2);
+            for index in 0..12 {
                 zone.release(index);
             }
             assert_eq!(zone.free(), 14);

@@ -672,7 +672,6 @@ pub(super) mod cases {
                 context,
                 volume
                     .claim()
-                    .disk()
                     .read_exact_at(*physical * block as u64, &mut device_bytes[..block])
                     .map_err(FsError::Io),
             )?;

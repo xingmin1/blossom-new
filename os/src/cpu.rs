@@ -18,7 +18,6 @@ pub const STACK_SIZE: usize = 64 * 1024;
 pub(crate) const KICK_RESCHEDULE: usize = 1 << 0;
 pub(crate) const KICK_TIMER_REPROGRAM: usize = 1 << 1;
 pub(crate) const KICK_LOG_PRINTER: usize = 1 << 2;
-#[cfg(target_arch = "loongarch64")]
 const KICK_STOP: usize = 1 << 3;
 
 /// 链接期保留的独立启动栈，不由旧页分配器申请。
@@ -120,7 +119,6 @@ pub struct CpuLocal {
     pub(crate) idle: AtomicBool,
     kick_reasons: AtomicUsize,
     /// 永久停机的完成确认；只发布一次，不作为 CPU 恢复或 online 的替代状态。
-    #[cfg(target_arch = "loongarch64")]
     stopped: AtomicBool,
     #[cfg(feature = "ktest")]
     test_idle_pause: AtomicUsize,
@@ -176,7 +174,6 @@ impl CpuLocal {
             need_resched: AtomicBool::new(false),
             idle: AtomicBool::new(false),
             kick_reasons: AtomicUsize::new(0),
-            #[cfg(target_arch = "loongarch64")]
             stopped: AtomicBool::new(false),
             #[cfg(feature = "ktest")]
             test_idle_pause: AtomicUsize::new(0),
@@ -421,7 +418,6 @@ pub fn handle_ipi() {
             (*request).done.store(true, Ordering::Release);
         }
     }
-    #[cfg(target_arch = "loongarch64")]
     if reasons & KICK_STOP != 0 {
         crate::arch::stop_current_cpu(&local.stopped);
     }
@@ -487,18 +483,14 @@ pub(crate) fn kick(target: usize, reason: usize) {
     }
 }
 
-/// 与 IPI 消费分支保持同一有效原因集合，永久停核仅用于有该协议的架构。
+/// 与 IPI 消费分支保持同一有效原因集合，永久停核沿同一个跨核协议。
 fn kick_mask() -> usize {
-    let mask = KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER;
-    #[cfg(target_arch = "loongarch64")]
-    let mask = mask | KICK_STOP;
-    mask
+    KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER | KICK_STOP
 }
 
 /// 在生命周期停止生产者后永久停稳其它 online 核，返回的 guard 固定协调核直到整机动作。
 /// 调用者不得持业务锁，所有用户已离栈、FS 已退休且不再有必须继续运行的 CSD 责任；
 /// 本核必须能服务 IPI，CPU 集合不得继续上线，返回后不能恢复普通执行或重用停稳确认。
-#[cfg(target_arch = "loongarch64")]
 pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
     assert!(crate::arch::irq_enabled(), "CPU stop requires IRQ enabled");
     let guard = crate::sync::PreemptGuard::new();

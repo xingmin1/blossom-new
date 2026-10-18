@@ -1,0 +1,883 @@
+//! SD 单命令控制器；原 progress Work 睡眠等待 IRQ，payload 仅经 CPU 回调访问。
+//! 命令/IDMAC 实现已改为原页拥有、可失败初始化及确认停止，许可与来源见 sdmmc/LICENSE。
+
+mod protocol;
+mod registers;
+
+use alloc::sync::Arc;
+use core::mem::ManuallyDrop;
+use core::pin::{pin, Pin};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::block::{BlkOperation, BlockError, IoResult, QueueLimits};
+use crate::boot::{self, MmcResources};
+use crate::drivers::{board_setup, mmio_region_address};
+use crate::irq::{self, IrqNumber};
+use crate::mm::dma::{CoherentDma, DmaDirection, DmaDomain};
+use crate::sync::{SleepMutex, SpinLock};
+use crate::time::{self, Duration, MonotonicInstant};
+use crate::timer::{self, Timer, TimerKind};
+use crate::wait::{WaitNode, WaitQueue, Waiter, Waker};
+
+use protocol::{Descriptor, BOUNCE_BYTES, DESCRIPTORS, DESC_BYTES};
+use registers::*;
+
+const COMMAND_MS: u64 = 2000;
+const PROGRAM_MS: u64 = 10_000;
+const RESET_MS: u64 = 500;
+
+/// 设备真正访问的两块原页；原 Bio 页不建立此设备的 DMA 映射。
+struct Memory {
+    bounce: CoherentDma,
+    descriptors: CoherentDma,
+}
+
+/// 卡协议状态仅由可睡命令执行者修改。
+#[derive(Clone, Copy)]
+struct Card {
+    rca: u32,
+    block_addressed: bool,
+}
+
+/// 单硬件通道与八软件完成槽由共同 Disk 管理；本对象只拥有硬件及固定控制内存。
+pub(crate) struct Sdmmc {
+    regs: Registers,
+    resources: MmcResources,
+    irq: IrqNumber,
+    input_frequency: AtomicU64,
+    memory: ManuallyDrop<Memory>,
+    command: SleepMutex<Option<Card>>,
+    registers: SpinLock<()>,
+    events: AtomicU32,
+    waiters: WaitQueue,
+    capacity: AtomicU64,
+    readonly: AtomicBool,
+    published: AtomicBool,
+    stopping: AtomicBool,
+    // 0 为运行，1 等接口/IDMAC reset，2 等第二次 FIFO reset，3 为已确认停止。
+    reset_stage: AtomicU32,
+    dma_live: AtomicBool,
+}
+
+impl Sdmmc {
+    /// 在普通可睡任务中预备稳定 Arc、bounce 和 IDMAC 原页后初始化卡，返回时 IRQ 输出关闭。
+    /// 仅真实 CDETECT 无卡返回 None；资源、识别与停止失败不解释为介质缺失。
+    ///
+    /// # Safety
+    /// 资源来自唯一启动快照；寄存器、syscon、clock/reset/pin 已映射且本设备独占。
+    /// 调用者必须在 publish 前登记保活本对象的 IRQ action，之后按共同 Disk 停止协议使用。
+    pub(crate) unsafe fn prepare(
+        resources: &MmcResources,
+    ) -> Result<Option<Arc<Self>>, BlockError> {
+        let base =
+            mmio_region_address(resources.registers).map_err(|_| BlockError::InvalidRange)?;
+        let span = resources
+            .registers
+            .end
+            .checked_sub(resources.registers.start)
+            .ok_or(BlockError::InvalidRange)?;
+        if base % 8 != 0
+            || span < 0x208
+            || !(resources.bus_width == 1 || resources.bus_width == 4)
+            || resources.fifo_depth < 2
+            || 4096 < resources.fifo_depth
+            || resources.max_frequency == 0
+            || resources.setup.clocks.count != 2
+        {
+            return Err(BlockError::Unsupported);
+        }
+        let irq =
+            irq::map_source(resources.interrupt_source).map_err(|_| BlockError::InvalidRange)?;
+        let domain = DmaDomain::new(
+            resources.dma_mask.min(u32::MAX as u64),
+            0,
+            usize::MAX,
+            0,
+            boot::info().board.cache_line_size,
+            resources.dma_coherent,
+        )?;
+        let memory = Memory {
+            bounce: CoherentDma::allocate(domain, BOUNCE_BYTES)?,
+            descriptors: CoherentDma::allocate(domain, 4096)?,
+        };
+        let controller = Arc::try_new(Self {
+            regs: Registers(base),
+            resources: *resources,
+            irq,
+            input_frequency: AtomicU64::new(0),
+            memory: ManuallyDrop::new(memory),
+            command: SleepMutex::new(None),
+            registers: SpinLock::new(()),
+            events: AtomicU32::new(0),
+            waiters: WaitQueue::new(),
+            capacity: AtomicU64::new(0),
+            readonly: AtomicBool::new(false),
+            published: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            reset_stage: AtomicU32::new(0),
+            dma_live: AtomicBool::new(false),
+        })
+        .map_err(|_| BlockError::NoMemory)?;
+        // SAFETY: 调用者保证规范化 provider 的独占映射，全部可失败分配已完成。
+        unsafe { board_setup::apply_setup(&resources.setup) }
+            .map_err(|_| BlockError::Unsupported)?;
+        // SAFETY: apply_setup 已成功，时钟 provider 映射由 prepare 的调用契约保活。
+        let frequency = unsafe { board_setup::clock_rate(&resources.setup.clocks.entries[1]) }
+            .map_err(|_| BlockError::Unsupported)?;
+        controller
+            .input_frequency
+            .store(frequency, Ordering::Release);
+        // 初始化只执行命令与八字节 SCR PIO，尚未向硬件发表任何本对象的页地址。
+        match controller.initialize() {
+            Ok(true) => Ok(Some(controller)),
+            outcome => {
+                controller.request_reset();
+                if !controller.wait_reset(deadline(RESET_MS)) {
+                    // 强引用保留同一拥有者；不能让准备错误析构可能仍被硬件使用的内存。
+                    let _retained = Arc::into_raw(controller);
+                    panic!("SDMMC initialization stop is unconfirmed");
+                }
+                outcome.map(|_| None)
+            }
+        }
+    }
+
+    /// 返回真实卡容量及单硬件命令、八软件回调槽的共同限额。
+    pub(crate) fn limits(&self) -> QueueLimits {
+        QueueLimits {
+            capacity_sectors: self.capacity.load(Ordering::Acquire),
+            max_bytes: BOUNCE_BYTES,
+            max_segments: 32,
+            max_segment_bytes: BOUNCE_BYTES as u32,
+            logical_block_size: 512,
+            dma_boundary_mask: u64::MAX,
+            readonly: self.readonly.load(Ordering::Acquire),
+            flush: true,
+            queue_depth: 1,
+            tag_count: 8,
+        }
+    }
+
+    /// 返回已核当前 IRQ domain 的真实设备源。
+    pub(crate) fn interrupt(&self) -> IrqNumber {
+        self.irq
+    }
+
+    /// IRQ action 已登记并保活控制器后开放输出；不重新识别卡或分配内存。
+    pub(crate) fn publish(&self) -> Result<(), BlockError> {
+        if self.stopping.load(Ordering::Acquire) || self.capacity.load(Ordering::Acquire) == 0 {
+            return Err(BlockError::NotReady);
+        }
+        if self.published.swap(true, Ordering::AcqRel) {
+            return Err(BlockError::Busy);
+        }
+        self.set_interrupts(true);
+        Ok(())
+    }
+
+    /// ISR 只认领本设备使能的原因，先记录 W1C 结果再锁外唤醒，不访问数据或可睡锁。
+    pub(crate) fn acknowledge(&self) -> bool {
+        let events = {
+            let _guard = self.registers.lock();
+            let controller = self.regs.read(MINTSTS) & IRQ_MASK;
+            let dma = self.regs.read(IDSTS) & self.regs.read(IDINTEN) & IDMAC_IRQ;
+            if controller == 0 && dma == 0 {
+                return false;
+            }
+            self.regs.write(RINTSTS, controller);
+            self.regs.write(IDSTS, dma);
+            let events = controller
+                | if dma & 3 != 0 { IDMAC_DONE } else { 0 }
+                | if dma & IDMAC_ERRORS != 0 {
+                    IDMAC_ERROR
+                } else {
+                    0
+                };
+            self.events.fetch_or(events, Ordering::Release);
+            events
+        };
+        if events != 0 {
+            self.waiters.wake_all();
+        }
+        true
+    }
+
+    /// 队列短锁及 ISR 均可调用；停止开始后不得重新打开输出。
+    pub(crate) fn set_interrupts(&self, enabled: bool) {
+        let _guard = self.registers.lock();
+        let enabled = enabled && !self.stopping.load(Ordering::Acquire);
+        self.regs
+            .update(CTRL, INT_ENABLE, if enabled { INT_ENABLE } else { 0 });
+    }
+
+    /// 武装后复查 mailbox 与硬件原因，关闭登记前完成的窗口。
+    pub(crate) fn arm_and_check(&self) -> bool {
+        self.set_interrupts(true);
+        self.acknowledge();
+        self.events.load(Ordering::Acquire) != 0
+    }
+
+    /// 原 progress Work 锁外执行一次请求；Write 交权前、Read 收权后才调用一次 CPU transfer。
+    ///
+    /// # Safety
+    /// 回调只复制本次全部原 payload，不能睡眠、分配或重入控制器；bytes 必须匹配 payload。
+    /// Core 保活本对象到所有 IRQ/Work 停止，StopUnconfirmed 时保留完整槽和后端拥有。
+    pub(crate) unsafe fn execute(
+        &self,
+        operation: BlkOperation,
+        sector: u64,
+        bytes: usize,
+        transfer: impl FnOnce(*mut u8) -> Result<usize, BlockError>,
+    ) -> IoResult {
+        let state = self.command.lock();
+        if !self.published.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+            return failed(BlockError::QueueStopped);
+        }
+        let card = state.expect("initialized SD card is missing");
+        let result = if operation == BlkOperation::Flush {
+            if sector != 0 || bytes != 0 {
+                Err(BlockError::InvalidRange)
+            } else {
+                self.wait_card(card, deadline(PROGRAM_MS), true).map(|_| 0)
+            }
+        } else {
+            self.transfer(card, operation, sector, bytes, transfer)
+        };
+        match result {
+            Ok(completed) => IoResult {
+                completed,
+                error: if completed == bytes {
+                    None
+                } else {
+                    Some(BlockError::ShortIo)
+                },
+            },
+            Err(error) => {
+                // 失败请求不重放；全控制器 reset 终止后续准入并证明没有活 DMA。
+                self.request_reset();
+                if self.wait_reset(deadline(RESET_MS)) {
+                    failed(if error == BlockError::StopUnconfirmed {
+                        BlockError::DeviceFault
+                    } else {
+                        error
+                    })
+                } else {
+                    failed(BlockError::StopUnconfirmed)
+                }
+            }
+        }
+    }
+
+    /// 拒绝后续命令并发出真实控制器/IDMAC reset，不在短队列锁内等待。
+    pub(crate) fn request_reset(&self) {
+        let _guard = self.registers.lock();
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.regs.write(IDINTEN, 0);
+        self.regs.write(INTMASK, 0);
+        self.regs
+            .update(CTRL, INT_ENABLE | DMA_ENABLE | USE_IDMAC, RESET);
+        self.regs.update(BMOD, BMOD_ENABLE, BMOD_RESET);
+        self.reset_stage.store(1, Ordering::Release);
+        self.waiters.wake_all();
+    }
+
+    /// 每次只推进一次有界 MMIO 阶段，确认 reset、DMA_REQ 和第二次 FIFO reset 后才允许归页。
+    pub(crate) fn reset_complete(&self) -> bool {
+        let _guard = self.registers.lock();
+        match self.reset_stage.load(Ordering::Acquire) {
+            1 => {
+                if self.regs.read(CTRL) & RESET != 0
+                    || self.regs.read(BMOD) & BMOD_RESET != 0
+                    || self.regs.read(STATUS) & DMA_REQ != 0
+                {
+                    return false;
+                }
+                self.regs.update(CTRL, 0, FIFO_RESET);
+                self.reset_stage.store(2, Ordering::Release);
+                false
+            }
+            2 => {
+                if self.regs.read(CTRL) & FIFO_RESET != 0 {
+                    return false;
+                }
+                self.regs.write(DBADDR, 0);
+                self.regs.write(IDSTS, IDMAC_IRQ);
+                self.regs.write(RINTSTS, u32::MAX);
+                self.events.store(0, Ordering::Release);
+                self.dma_live.store(false, Ordering::Release);
+                self.reset_stage.store(3, Ordering::Release);
+                true
+            }
+            3 => true,
+            _ => false,
+        }
+    }
+
+    /// 锁外等待已经发出的 reset；这只检查硬件停止，不消费完成或补救遗失 IRQ。
+    fn wait_reset(&self, until: MonotonicInstant) -> bool {
+        loop {
+            if self.reset_complete() {
+                return true;
+            }
+            if until <= time::now() {
+                return false;
+            }
+            timer::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// 初始化阶段使用真实单调期限轮询；运行期命令完成不调用此路径。
+    fn poll(
+        &self,
+        until: MonotonicInstant,
+        mut condition: impl FnMut() -> bool,
+    ) -> Result<(), BlockError> {
+        while !condition() {
+            if until <= time::now() {
+                return Err(BlockError::DeviceFault);
+            }
+            core::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    /// 识别期命令可轮询完成；只有 CMD8 的真实响应超时用于识别旧 SDSC。
+    fn command_polled(
+        &self,
+        index: u32,
+        argument: u32,
+        flags: u32,
+    ) -> Result<[u32; 4], BlockError> {
+        self.poll(deadline(COMMAND_MS), || self.regs.read(CMD) & START == 0)?;
+        self.regs.write(RINTSTS, u32::MAX);
+        self.regs.write(CMDARG, argument);
+        self.regs.write(CMD, START | HOLD | index | flags);
+        self.poll(deadline(COMMAND_MS), || {
+            self.regs.read(RINTSTS) & (CMD_DONE | ERRORS) != 0
+        })?;
+        let status = self.regs.read(RINTSTS);
+        self.regs.write(RINTSTS, status);
+        if status & ERRORS != 0 {
+            if status & ERRORS == RESPONSE_TIMEOUT {
+                return Err(BlockError::NotReady);
+            }
+            return Err(BlockError::Io);
+        }
+        Ok(self.regs.response())
+    }
+
+    /// 关卡时钟、提交除数、重新开钟的三个 update-clock 均确认 START 已清除。
+    fn clock(&self, target: u32) -> Result<(), BlockError> {
+        if target == 0 {
+            return Err(BlockError::InvalidRange);
+        }
+        let input = self.input_frequency.load(Ordering::Acquire);
+        if input == 0 {
+            return Err(BlockError::Unsupported);
+        }
+        let divisor = if input <= target as u64 {
+            0
+        } else {
+            (input + 2 * target as u64 - 1) / (2 * target as u64)
+        };
+        if 255 < divisor {
+            return Err(BlockError::Unsupported);
+        }
+        self.regs.write(CLKENA, 0);
+        self.update_clock()?;
+        self.regs.write(CLKSRC, 0);
+        self.regs.write(CLKDIV, divisor as u32);
+        self.update_clock()?;
+        self.regs.write(CLKENA, 1);
+        self.update_clock()
+    }
+
+    /// update-clock 是无 CMD_DONE 的控制动作，仅用于尚未发表的识别期。
+    fn update_clock(&self) -> Result<(), BlockError> {
+        self.regs
+            .write(CMD, START | HOLD | WAIT_DATA | UPDATE_CLOCK);
+        self.poll(deadline(COMMAND_MS), || self.regs.read(CMD) & START == 0)?;
+        if self.regs.read(RINTSTS) & ERRORS != 0 {
+            return Err(BlockError::Io);
+        }
+        Ok(())
+    }
+
+    /// 识别 SD、解析实际容量并完成 SCR/受支持总线宽度与默认速度配置；false 只表示 CDETECT 无卡。
+    fn initialize(&self) -> Result<bool, BlockError> {
+        self.regs.write(CTRL, RESET);
+        self.regs.write(BMOD, BMOD_RESET);
+        self.poll(deadline(RESET_MS), || {
+            self.regs.read(CTRL) & RESET == 0 && self.regs.read(BMOD) & BMOD_RESET == 0
+        })?;
+        let hcon = self.regs.read(HCON);
+        // 仅实现内部 DMA 的 32 位地址格式；64 位 IDMAC 寄存器布局不同。
+        if hcon & (1 << 27) != 0 || (hcon >> 16) & 3 != 0 {
+            return Err(BlockError::Unsupported);
+        }
+        if self.regs.read(CDETECT) & 1 != 0 {
+            return Ok(false);
+        }
+        self.regs.write(INTMASK, 0);
+        self.regs.write(IDINTEN, 0);
+        self.regs.write(PWREN, 1);
+        self.regs.write(CTYPE, 0);
+        self.regs.write(UHS, 0);
+        self.regs.write(TMOUT, u32::MAX);
+        let depth = self.resources.fifo_depth;
+        self.regs
+            .write(FIFOTH, ((depth / 2 - 1) << 16) | (depth / 2));
+        self.clock(400_000)?;
+        self.command_polled(0, 0, INITIALIZE)?;
+        let version2 = match self.command_polled(8, 0x1aa, RESPONSE | CRC) {
+            Ok(response) if response[0] & 0xfff == 0x1aa => true,
+            Err(BlockError::NotReady) => false,
+            _ => return Err(BlockError::Unsupported),
+        };
+        let until = deadline(COMMAND_MS);
+        let ocr = loop {
+            let app = self.command_polled(55, 0, RESPONSE | CRC)?[0];
+            protocol::check_r1(app)?;
+            if app & (1 << 5) == 0 {
+                return Err(BlockError::Unsupported);
+            }
+            let ocr = self.command_polled(
+                41,
+                0x00ff_8000 | if version2 { 1 << 30 } else { 0 },
+                RESPONSE,
+            )?[0];
+            if ocr & 0x00ff_8000 == 0 {
+                return Err(BlockError::Unsupported);
+            }
+            if ocr & (1 << 31) != 0 {
+                break ocr;
+            }
+            if until <= time::now() {
+                return Err(BlockError::NotReady);
+            }
+            timer::sleep(Duration::from_millis(10));
+        };
+        self.command_polled(2, 0, RESPONSE | LONG | CRC)?;
+        let r6 = self.command_polled(3, 0, RESPONSE | CRC)?[0];
+        if r6 & 0xe000 != 0 || r6 >> 16 == 0 {
+            return Err(BlockError::Io);
+        }
+        let card = Card {
+            rca: r6 & 0xffff_0000,
+            block_addressed: ocr & (1 << 30) != 0,
+        };
+        let csd = protocol::csd_bits(self.command_polled(9, card.rca, RESPONSE | LONG | CRC)?);
+        let sectors = protocol::capacity(csd, card.block_addressed)?;
+        protocol::check_r1(self.command_polled(7, card.rca, RESPONSE | CRC)?[0])?;
+        self.wait_card(card, deadline(PROGRAM_MS), false)?;
+        if !card.block_addressed {
+            protocol::check_r1(self.command_polled(16, 512, RESPONSE | CRC | WAIT_DATA)?[0])?;
+        }
+        self.app_polled(card)?;
+        let scr = self.scr()?;
+        if scr >> 60 != 0 || scr & (1 << 48) == 0 {
+            return Err(BlockError::Unsupported);
+        }
+        if self.resources.bus_width == 4 && scr & (1 << 50) != 0 {
+            self.app_polled(card)?;
+            protocol::check_r1(self.command_polled(6, 2, RESPONSE | CRC | WAIT_DATA)?[0])?;
+            self.regs.write(CTYPE, 1);
+        }
+        self.clock(protocol::transfer_frequency(csd)?.min(self.resources.max_frequency))?;
+        self.wait_card(card, deadline(PROGRAM_MS), false)?;
+        self.readonly.store(
+            self.regs.read(WRTPRT) & 1 != 0 || csd & ((1 << 13) | (1 << 12)) != 0,
+            Ordering::Release,
+        );
+        self.capacity.store(sectors, Ordering::Release);
+        *self.command.lock() = Some(card);
+        self.regs.write(RINTSTS, u32::MAX);
+        self.regs.write(IDSTS, IDMAC_IRQ);
+        self.regs.write(INTMASK, IRQ_MASK);
+        Ok(true)
+    }
+
+    /// 检查 APP_CMD 已被卡接受，避免将 ACMD 当作普通命令继续执行。
+    fn app_polled(&self, card: Card) -> Result<(), BlockError> {
+        let response = protocol::check_r1(self.command_polled(55, card.rca, RESPONSE | CRC)?[0])?;
+        if response & (1 << 5) == 0 {
+            return Err(BlockError::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// 初始化唯一小数据 PIO：八字节 SCR 按线路大端解释，FIFO 支持实际 HCON 数据宽度。
+    fn scr(&self) -> Result<u64, BlockError> {
+        let version = self.regs.read(VERID) & 0xffff;
+        let offset = if self.resources.data_offset != 0 {
+            self.resources.data_offset as usize
+        } else if 0x240a <= version {
+            0x200
+        } else {
+            0x100
+        };
+        let width = match (self.regs.read(HCON) >> 7) & 7 {
+            0 => 2,
+            1 => 4,
+            2 => 8,
+            _ => return Err(BlockError::Unsupported),
+        };
+        if offset % width != 0
+            || self.resources.registers.end - self.resources.registers.start < offset + width
+        {
+            return Err(BlockError::InvalidRange);
+        }
+        self.regs.write(BLKSIZ, 8);
+        self.regs.write(BYTCNT, 8);
+        self.regs.write(RINTSTS, u32::MAX);
+        self.regs.write(CMDARG, 0);
+        self.regs
+            .write(CMD, START | HOLD | RESPONSE | CRC | DATA | WAIT_DATA | 51);
+        let until = deadline(COMMAND_MS);
+        let mut bytes = [0u8; 8];
+        let mut copied = 0;
+        let mut seen = 0;
+        loop {
+            let status = self.regs.read(RINTSTS);
+            seen |= status;
+            if status & ERRORS != 0 {
+                return Err(BlockError::Io);
+            }
+            while width
+                <= protocol::fifo_readable_bytes(
+                    self.regs.read(STATUS),
+                    width,
+                    bytes.len() - copied,
+                )
+            {
+                let pointer = self.regs.0 + offset;
+                // SAFETY: offset 和实际宽度已核窗口与对齐；仅初始化独占控制器访问 FIFO，八字节输出有界。
+                let word = unsafe {
+                    match width {
+                        2 => (pointer as *const u16).read_volatile() as u64,
+                        4 => (pointer as *const u32).read_volatile() as u64,
+                        8 => (pointer as *const u64).read_volatile(),
+                        _ => unreachable!(),
+                    }
+                };
+                bytes[copied..copied + width].copy_from_slice(&word.to_le_bytes()[..width]);
+                copied += width;
+            }
+            self.regs.write(RINTSTS, status);
+            if seen & (CMD_DONE | DATA_OVER) == CMD_DONE | DATA_OVER && copied == 8 {
+                protocol::check_r1(self.regs.read(RESP0))?;
+                return Ok(u64::from_be_bytes(bytes));
+            }
+            if until <= time::now() {
+                return Err(BlockError::DeviceFault);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// 以同一绝对期限发出 CMD13，卡 ready/TRAN 与物理 DAT busy 分别检查。
+    fn wait_card(
+        &self,
+        card: Card,
+        until: MonotonicInstant,
+        interrupt: bool,
+    ) -> Result<(), BlockError> {
+        loop {
+            if until <= time::now() {
+                return Err(BlockError::Io);
+            }
+            let response = if interrupt {
+                self.command_irq(13, card.rca, RESPONSE | CRC, CMD_DONE, until)?
+            } else {
+                self.command_polled(13, card.rca, RESPONSE | CRC)?
+            };
+            let response = protocol::check_r1(response[0])?;
+            if protocol::ready(response) && self.regs.read(STATUS) & DATA_BUSY == 0 {
+                return Ok(());
+            }
+            // CMD13 的每次回复来自 IRQ；间隔只限制卡状态命令密度，不探测数据完成。
+            timer::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// 命令代次在同一短锁内清旧原因、开放 mailbox 并敲门，ISR 不会把旧原因归到新命令。
+    fn command_irq(
+        &self,
+        index: u32,
+        argument: u32,
+        flags: u32,
+        required: u32,
+        until: MonotonicInstant,
+    ) -> Result<[u32; 4], BlockError> {
+        {
+            let _guard = self.registers.lock();
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(BlockError::QueueStopped);
+            }
+            if self.regs.read(CMD) & START != 0 {
+                return Err(BlockError::DeviceFault);
+            }
+            self.regs.write(RINTSTS, u32::MAX);
+            self.regs.write(IDSTS, IDMAC_IRQ);
+            self.events.store(0, Ordering::Release);
+            self.regs.update(CTRL, 0, INT_ENABLE);
+            if flags & DATA != 0 {
+                // 清旧原因先于 DMA 启动；提前完成的 IDMAC IRQ 与 CMD_DONE 属于同一代。
+                self.dma_live.store(true, Ordering::Release);
+                self.regs.write(
+                    DBADDR,
+                    self.memory.descriptors.region().device.value() as u32,
+                );
+                self.regs.write(IDINTEN, IDMAC_IRQ);
+                self.regs.update(CTRL, 0, USE_IDMAC | DMA_ENABLE);
+                self.regs.write(BMOD, BMOD_ENABLE | 2);
+            }
+            self.regs.write(CMDARG, argument);
+            self.regs.write(CMD, START | HOLD | flags | index);
+            if flags & DATA != 0 {
+                self.regs.write(PLDMND, 1);
+            }
+        }
+        let mut observed = 0;
+        loop {
+            observed |= self.events.swap(0, Ordering::AcqRel);
+            if observed & (ERRORS | IDMAC_ERROR) != 0 {
+                return Err(BlockError::Io);
+            }
+            if observed & CMD_DONE != 0 {
+                protocol::check_r1(self.regs.read(RESP0))?;
+            }
+            if observed & required == required {
+                return Ok(self.regs.response());
+            }
+            if until <= time::now() {
+                return Err(BlockError::Io);
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(BlockError::QueueStopped);
+            }
+            self.wait_event(until);
+        }
+    }
+
+    /// 在真实 IRQ 源与一次绝对期限同时登记；撤等待后同步取消 timer 才允许栈退出。
+    fn wait_event(&self, until: MonotonicInstant) {
+        let waiter = Waiter::new();
+        let mut node = pin!(WaitNode::new(waiter.waker()));
+        let waker = pin!(waiter.waker());
+        let timer = pin!(Timer::new(
+            crate::cpu::current().id,
+            TimerKind::Precise,
+            timeout,
+            waker.as_ref().get_ref() as *const Waker as usize
+        ));
+        // SAFETY: self 借用与固定栈节点保活到登记撤销，任何退出都先析构 registration。
+        let registration = unsafe { self.waiters.register(node.as_mut()) };
+        // SAFETY: timer/Waker 均固定，结束 active wait 后 cancel_sync 确认回调尾部才退栈。
+        unsafe { timer.as_ref().arm_borrowed(until) }.expect("SDMMC deadline timer rejected");
+        // mailbox 复查覆盖 ISR 先于登记、及登记后先于 park 的两种到达。
+        if self.events.load(Ordering::Acquire) == 0
+            && time::now() < until
+            && !self.stopping.load(Ordering::Acquire)
+        {
+            waiter.park();
+        }
+        drop(registration);
+        drop(waiter);
+        timer.as_ref().cancel_sync();
+    }
+
+    /// 数据只走固定 IDMAC 链，卡停止/持久完成与 DMA 静止分别证明后才交还 CPU。
+    fn transfer(
+        &self,
+        card: Card,
+        operation: BlkOperation,
+        sector: u64,
+        bytes: usize,
+        transfer: impl FnOnce(*mut u8) -> Result<usize, BlockError>,
+    ) -> Result<usize, BlockError> {
+        if bytes == 0 || BOUNCE_BYTES < bytes || bytes % 512 != 0 {
+            return Err(BlockError::InvalidRange);
+        }
+        if self.capacity.load(Ordering::Acquire)
+            < sector
+                .checked_add((bytes / 512) as u64)
+                .ok_or(BlockError::InvalidRange)?
+        {
+            return Err(BlockError::InvalidRange);
+        }
+        let write = operation == BlkOperation::Write;
+        if write && self.readonly.load(Ordering::Acquire) {
+            return Err(BlockError::ReadOnly);
+        }
+        let argument = protocol::address(sector, card.block_addressed)?;
+        self.wait_card(card, deadline(PROGRAM_MS), true)?;
+        let bounce = self.memory.bounce.region();
+        let descriptors = self.memory.descriptors.region();
+        let mut callback = Some(transfer);
+        if write {
+            let copied = callback.take().unwrap()(bounce.cpu.as_ptr())?;
+            if copied != bytes {
+                return Err(BlockError::ShortIo);
+            }
+        }
+        // SAFETY: SleepMutex 独占唯一硬件通道，上一请求已真实停止 DMA 并收权；本次尚未发表地址。
+        let table = unsafe { &mut *descriptors.cpu.as_ptr().cast::<[Descriptor; DESCRIPTORS]>() };
+        let used = protocol::descriptors(
+            table,
+            descriptors.device.value(),
+            bounce.device.value(),
+            bytes,
+        )?;
+        // SAFETY: CPU 描述符写入和 Write 回调已结束；两 owner 独占完整页/cacheline，设备尚未获权。
+        unsafe {
+            self.memory.bounce.sync_for_device(
+                0,
+                BOUNCE_BYTES,
+                if write {
+                    DmaDirection::ToDevice
+                } else {
+                    DmaDirection::FromDevice
+                },
+            )?;
+            self.memory
+                .descriptors
+                .sync_for_device(0, DESC_BYTES, DmaDirection::Bidirectional)?;
+        }
+        {
+            let _guard = self.registers.lock();
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(BlockError::QueueStopped);
+            }
+            self.regs.write(BLKSIZ, 512);
+            self.regs.write(BYTCNT, bytes as u32);
+        }
+        let multiple = 512 < bytes;
+        let index = match (write, multiple) {
+            (false, false) => 17,
+            (false, true) => 18,
+            (true, false) => 24,
+            (true, true) => 25,
+        };
+        let data = self
+            .command_irq(
+                index,
+                argument,
+                RESPONSE | CRC | DATA | WAIT_DATA | if write { WRITE } else { 0 },
+                CMD_DONE | DATA_OVER | IDMAC_DONE,
+                deadline(PROGRAM_MS),
+            )
+            .and_then(|response| protocol::check_r1(response[0]).map(|_| ()));
+        let transferred = (self.regs.read(TBBCNT), self.regs.read(TCBCNT));
+        // 无论数据成功与否，多块都尝试 CMD12；错误不触发未知写重放。
+        let card_stop = if multiple {
+            self.command_irq(12, 0, RESPONSE | CRC | STOP, CMD_DONE, deadline(COMMAND_MS))
+                .and_then(|response| protocol::check_r1(response[0]).map(|_| ()))
+        } else {
+            Ok(())
+        };
+        let stop = self.stop_dma(deadline(RESET_MS));
+        data?;
+        card_stop?;
+        stop?;
+        self.wait_card(card, deadline(PROGRAM_MS), true)?;
+        if transferred != (bytes as u32, bytes as u32) {
+            return Err(BlockError::ShortIo);
+        }
+        // SAFETY: stop_dma 确认接口和 IDMAC 静止，无设备别名；控制页整体收权后才能读取 OWN。
+        unsafe {
+            self.memory
+                .descriptors
+                .sync_for_cpu(0, DESC_BYTES, DmaDirection::Bidirectional)?;
+        }
+        // SAFETY: 控制页已收权，原 owner 保活；只读取本次有界描述符。
+        let table = unsafe { &*descriptors.cpu.as_ptr().cast::<[Descriptor; DESCRIPTORS]>() };
+        if table[..used]
+            .iter()
+            .any(|descriptor| descriptor.control & protocol::OWN != 0)
+        {
+            return Err(BlockError::DeviceFault);
+        }
+        // SAFETY: stop_dma 已证明设备结束访问，bounce 全区独占，Read 在同步完成前不交给回调。
+        unsafe {
+            self.memory.bounce.sync_for_cpu(
+                0,
+                BOUNCE_BYTES,
+                if write {
+                    DmaDirection::ToDevice
+                } else {
+                    DmaDirection::FromDevice
+                },
+            )?;
+        }
+        if !write {
+            let copied = callback.take().unwrap()(bounce.cpu.as_ptr())?;
+            if bytes < copied {
+                return Err(BlockError::InvalidRange);
+            }
+            return Ok(copied);
+        }
+        Ok(bytes)
+    }
+
+    /// 停止内部 DMA 并确认真实 reset 与 DMA_REQ 解除，保留卡控制器以执行 CMD13。
+    fn stop_dma(&self, until: MonotonicInstant) -> Result<(), BlockError> {
+        {
+            let _guard = self.registers.lock();
+            self.regs.write(IDINTEN, 0);
+            self.regs.update(CTRL, USE_IDMAC | DMA_ENABLE, DMA_RESET);
+            self.regs.update(BMOD, BMOD_ENABLE, BMOD_RESET);
+        }
+        loop {
+            {
+                let _guard = self.registers.lock();
+                if self.regs.read(CTRL) & DMA_RESET == 0
+                    && self.regs.read(BMOD) & BMOD_RESET == 0
+                    && self.regs.read(STATUS) & DMA_REQ == 0
+                {
+                    self.regs.write(DBADDR, 0);
+                    self.dma_live.store(false, Ordering::Release);
+                    return Ok(());
+                }
+            }
+            if until <= time::now() {
+                return Err(BlockError::StopUnconfirmed);
+            }
+            timer::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for Sdmmc {
+    /// 只有确认没有活 DMA 才归还原页；未确认时 ManuallyDrop 保留整个控制/传输拥有者。
+    fn drop(&mut self) {
+        if !self.dma_live.load(Ordering::Acquire) {
+            // SAFETY: 尚未发表 DMA 地址或已完成真实停止；最后 Arc 无活动使用者，唯一析构原页一次。
+            unsafe { ManuallyDrop::drop(&mut self.memory) };
+        }
+    }
+}
+
+/// 构造绝对期限，不能用循环次数或饱和值替代真实硬件时间。
+fn deadline(milliseconds: u64) -> MonotonicInstant {
+    time::now()
+        .checked_add(Duration::from_millis(milliseconds))
+        .expect("SDMMC deadline overflow")
+}
+
+/// 精确定时器只通知原 Waiter；栈 Waker 保活到同步取消的真实尾部。
+fn timeout(timer: Pin<&Timer>) {
+    // SAFETY: wait_event 固定并保活 Waker，cancel_sync 返回前不会释放回调上下文。
+    let waker = unsafe { &*(timer.context() as *const Waker) };
+    waker.notify();
+}
+
+/// SD 不报告无法确认的部分写前缀，首错由共同 Bio 原样保存。
+fn failed(error: BlockError) -> IoResult {
+    IoResult {
+        completed: 0,
+        error: Some(error),
+    }
+}

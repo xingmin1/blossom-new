@@ -730,12 +730,20 @@ pub(crate) mod reads {
                 TestError("prefix original-page DMA preparation failed")
             })?;
             context.expect_eq(
-                mapped.segment().address.value(),
+                mapped
+                    .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                    .expect("QEMU fixture page exceeds DMA domain")
+                    .address
+                    .value(),
                 original.as_ref().unwrap().phys_addr() as u64,
             );
             memory.push(mapped);
         }
-        let sector = first_block * block_size as u64 / SECTOR_BYTES;
+        let sector = checked(context, inode.disk_volume())?
+            .view()
+            .absolute_byte(first_block * block_size as u64, 2 * PAGE_SIZE)
+            .map_err(|_| TestError("prefix read escapes filesystem view"))?
+            / SECTOR_BYTES;
         // SAFETY: 两份 FolioRead 各持唯一原页内容锁并附原 inode，CPU 未借用未初始化内容。
         // 设备只读入已经核实的连续文件块；同一 Bio 接管两原 DMA 映射，真实 used 后才收权。
         // 无回调和裸别名，claim 与 invalidate 保提交来源，后续由原完成者发表每页结果。

@@ -2,9 +2,9 @@
 
 use core::convert::TryFrom;
 
+use crate::block::partition::DeviceSelector;
 use crate::block::AccessMode;
 use crate::fs::memfs::{FilesystemStat, MemoryFs, MemoryFsKind};
-use crate::fs::system::device_index;
 use crate::fs::{devfs, procfs, Ext4Volume, Filesystem, Path, ResolveMode};
 use crate::storage::Storage;
 use crate::syscall::error::{copyout, Errno, SysResult};
@@ -193,10 +193,10 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
                 return Err(Errno::InvalidArgument);
             }
             let source = source.as_deref().ok_or(Errno::NoDevice)?;
-            let index = device_index(source).map_err(|_| Errno::NoDevice)?;
+            let selector = DeviceSelector::parse(source).map_err(|_| Errno::NoDevice)?;
             let storage = Storage::get().ok_or(Errno::NoDevice)?;
-            let disk = storage.disk(index).ok_or(Errno::NoDevice)?;
-            let volume = Ext4Volume::open(disk, requested_mode, 64)?;
+            let view = storage.lookup(selector).ok_or(Errno::NoDevice)?;
+            let volume = Ext4Volume::open(view, requested_mode, 64)?;
             (Filesystem::Ext4(volume), requested_mode)
         }
         b"tmpfs" => {

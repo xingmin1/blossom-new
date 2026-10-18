@@ -1,10 +1,10 @@
 //! 真实网络队列、原 Work 停点和同库存设备的具名消费者。
 
 use super::{Phase, SlotState, VirtioNet};
-use crate::block::{Bio, BioAllocator, BlkOperation, Disk, DiskRef, IoResult};
+use crate::block::{Bio, BioAllocator, BlkOperation, Disk, DiskIdentity, DiskRef, IoResult};
 use crate::fs::{FsError, PollMask, ReadBuffer};
 use crate::ktest::execution_services::{baseline, Baseline, SuiteBaseline};
-use crate::mm::dma::MappedPages;
+use crate::mm::dma::{DmaDomain, MappedPages};
 use crate::net::{
     address::{AddressFamily, InetEndpoint, SocketAddress},
     packet::OwnedPacket,
@@ -170,7 +170,7 @@ struct Snapshot {
     returned: bool,
 }
 /// 统计同锁内的真实固定槽、页与独立 head 表，并核一一归属。
-fn pool(slots: &[super::Slot], heads: &[Option<usize>]) -> Result<Pool, Error> {
+fn pool(slots: &[super::Slot], heads: &[Option<usize>], domain: DmaDomain) -> Result<Pool, Error> {
     let mut result = Pool {
         count: slots.len(),
         free: 0,
@@ -191,7 +191,11 @@ fn pool(slots: &[super::Slot], heads: &[Option<usize>]) -> Result<Pool, Error> {
         }
         result.pages += usize::from(slot.page.is_some());
         if let Some(page) = &slot.page {
-            result.addresses[index] = page.segment().address.value();
+            result.addresses[index] = page
+                .segment(domain)
+                .map_err(super::dma_protocol)?
+                .address
+                .value();
             result.device_pages += usize::from(page.is_device_owned());
             if page.is_device_owned() != (slot.state == SlotState::DeviceOwned) {
                 return Err(Error::IoError);
@@ -236,8 +240,8 @@ impl VirtioNet {
         };
         let (rx, tx, pending_rx, pending_tx, status) = if let Some(inner) = state.inner.as_ref() {
             (
-                pool(&inner.rx, &inner.rx_heads),
-                pool(&inner.tx, &inner.tx_heads),
+                pool(&inner.rx, &inner.rx_heads, inner.domain),
+                pool(&inner.tx, &inner.tx_heads, inner.domain),
                 inner.driver.pending_rx_used(),
                 inner.driver.pending_tx_used(),
                 Some(inner.driver.status()),
@@ -396,7 +400,7 @@ impl Fixture<Inventory> for Owner {
     }
 }
 impl Owner {
-    /// 独占同库存硬件，prepare/start 返回前由生产 Root 保存完整停止责任。
+    /// 独占同库存硬件，生产 Root 保存停止责任；本 fixture 只接受真实 VirtIO 变体。
     fn prepare(&mut self, inventory: &DeviceInventory) -> TestResult {
         // SAFETY: suite 串行分派，前例和本例旧 NIC 已停止并释放全部强拥有；库存及完整永久映射有效。
         let owner = unsafe { NetStack::try_new_nic(inventory) }
@@ -418,7 +422,13 @@ impl Owner {
             port: 0,
         })
         .map_err(|_| TestError("native UDP bind failed"))?;
-        self.nic = owner.stack().nic().cloned();
+        self.nic = Some(
+            owner
+                .stack()
+                .ktest_virtio_nic()
+                .cloned()
+                .ok_or(TestError("native fixture requires a VirtIO NIC"))?,
+        );
         self.net = Some(Arc::clone(owner.stack()));
         self.udp = Some(udp);
         *self.owner.lock() = Some(owner);
@@ -1152,11 +1162,11 @@ impl Owner {
             {
                 context.expect_eq(
                     disk.identity(),
-                    VirtioIdentity::Mmio {
+                    DiskIdentity::Virtio(VirtioIdentity::Mmio {
                         physical: candidate.registers.start,
                         version: candidate.version,
                         vendor_id: candidate.vendor_id,
-                    },
+                    }),
                 );
                 context.expect_eq(self.disk_sources[index], Some(candidate.interrupt));
             }
@@ -1181,12 +1191,12 @@ impl Owner {
         {
             for (index, disk) in self.disks.iter().enumerate() {
                 match disk.identity() {
-                    VirtioIdentity::Pci {
+                    DiskIdentity::Virtio(VirtioIdentity::Pci {
                         bus,
                         device,
                         function,
                         ..
-                    } => context.expect_eq((bus, device, function), (0, 5 + index as u8 * 4, 0)),
+                    }) => context.expect_eq((bus, device, function), (0, 5 + index as u8 * 4, 0)),
                     _ => return Err(TestError("native LA disk is not PCI")),
                 }
                 let device = inventory

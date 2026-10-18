@@ -428,7 +428,7 @@ pub(super) mod cases {
         context.expect_eq(inode.mapping().cached_folio(2).is_none(), true);
         bytes_at(context, &file, 0, &[0x82; PAGE_SIZE])?;
         for target in targets.iter().copied().take(PAGE_SIZE / block) {
-            disk_block_bytes(context, &disk, target, &[0x82; PAGE_SIZE][..block])?;
+            disk_block_bytes(context, volume.claim(), target, &[0x82; PAGE_SIZE][..block])?;
         }
         context.diagnostic(format_args!("W33 dirty-original-Work page-none={} heap-none={} original-physical={:#x} dirty-before={} stats={:?} domain-before={:?} domain-after={:?} IO-data-submitted={} IO-completed={} retained-original-pin=1 actual-freed=0 real-NoMemory={:?} independent-disk-bytes={}",
             allocation.0, allocation.1, original, dirty_mask, stats, before_domain, after_domain,
@@ -615,13 +615,21 @@ pub(super) mod cases {
         stats.freed_file
     }
 
-    /// 普通 Read Bio 从设备读取准确 FS 块，构造错误保原原因，全部 DMA 收权后逐字节核验独立输入。
+    /// 普通 Read Bio 从本卷准确块范围读回，真实 DMA 全尾后逐字节核验独立输入。
     fn disk_block_bytes(
         context: &mut TestContext<'_>,
-        disk: &DiskRef,
+        claim: &crate::block::FsClaim,
         byte: u64,
         expected: &[u8],
     ) -> TestResult {
+        let disk = claim.disk();
+        let byte = checked(
+            context,
+            claim
+                .view()
+                .absolute_byte(byte, expected.len())
+                .map_err(FsError::from),
+        )?;
         let pages = mm::alloc_pages(0, true).ok_or(TestError("W33 disk readback page OOM"))?;
         let mapped = MappedPages::new(pages, 0, expected.len(), BufferDirection::DeviceToDriver)
             .map_err(|_| TestError("W33 disk readback mapping failed"))?;
@@ -638,7 +646,7 @@ pub(super) mod cases {
                 .map_err(FsError::from),
         )?;
         let completion = bio.completion();
-        disk.submit_bio(bio);
+        claim.submit_bio(bio);
         let result = completion.wait();
         let memory = checked(context, completion.take_memory().map_err(FsError::from))?;
         if result
@@ -949,7 +957,7 @@ pub(super) mod cases {
             for part in 0..PAGE_SIZE / block {
                 disk_block_bytes(
                     context,
-                    &disk,
+                    volume.claim(),
                     targets[index][part],
                     &expected[part * block..(part + 1) * block],
                 )?;

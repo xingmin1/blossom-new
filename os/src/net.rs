@@ -36,8 +36,7 @@ use smoltcp::wire::{
 use spin::Once;
 
 use crate::cpu;
-use crate::drivers::virtio::VirtioInitError;
-use crate::drivers::virtio_net::VirtioNet;
+use crate::drivers::net_device::{NetDevice, NetDeviceError};
 use crate::drivers::DeviceInventory;
 use crate::fs::FsError;
 use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
@@ -64,7 +63,7 @@ pub(crate) const PROTOCOL_BUDGET: usize = 16;
 const ETHERNET_FRAME_CAPACITY: usize = 1514;
 const INTERFACE_WORKSPACE_CAPACITY: usize = 65536;
 
-/// 控制和数据共享一份预备帧，领取期间占用事实禁止接口再取得 TxToken。
+/// 每份预备帧独占自己的编码存储，领取期间不得再交出该槽的 TxToken。
 struct FrameSlot {
     bytes: Vec<u8>,
     len: usize,
@@ -87,6 +86,13 @@ impl FrameSlot {
     fn available(&self) -> bool {
         self.len == 0 && !self.in_flight
     }
+}
+
+/// 锁外提交期间记录帧的原槽，输入应答不取得普通输出的 binding 或队列完成责任。
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EthernetFrameSource {
+    IngressReply,
+    Egress,
 }
 
 /// 软件介质只借当前 RX 前缀，配对 TX 的预备帧负责控制回应的拥有。
@@ -161,10 +167,11 @@ impl Device for FrameDevice<'_> {
     }
 }
 
-/// 每接口只持库状态和预备帧；lo 输入后备允许完整 IP 回流同时保活控制应答。
+/// 每接口持同一库状态；Ethernet 输入应答与普通输出各有一份预备帧。
 struct InterfaceState {
     iface: Interface,
     frame: FrameSlot,
+    ingress_reply: Option<FrameSlot>,
     loopback_rx: Vec<u8>,
     medium: Medium,
     up: bool,
@@ -173,7 +180,7 @@ struct InterfaceState {
 }
 
 impl InterfaceState {
-    /// 先 fallible 准备所有大存储，再构造库的小接口对象。
+    /// 发表前 fallible 准备全部存储；仅 Ethernet 另备一帧输入应答，lo 保持原有工作区。
     fn try_new(medium: Medium, hardware: HardwareAddress, seed: u64) -> Result<Self, FsError> {
         let capacity = if medium == Medium::Ip {
             LOOPBACK_MTU
@@ -181,6 +188,11 @@ impl InterfaceState {
             ETHERNET_FRAME_CAPACITY
         };
         let mut frame = FrameSlot::try_new(capacity)?;
+        let ingress_reply = if medium == Medium::Ethernet {
+            Some(FrameSlot::try_new(ETHERNET_FRAME_CAPACITY)?)
+        } else {
+            None
+        };
         let buffers =
             InterfaceBuffers::try_new(INTERFACE_WORKSPACE_CAPACITY, INTERFACE_WORKSPACE_CAPACITY)
                 .map_err(|error| match error {
@@ -215,6 +227,7 @@ impl InterfaceState {
         Ok(Self {
             iface,
             frame,
+            ingress_reply,
             loopback_rx,
             medium,
             up: medium == Medium::Ip,
@@ -226,6 +239,15 @@ impl InterfaceState {
     /// 只有管理状态为 up 且原帧和分片器空闲时接纳下一份输出。
     fn dispatch_ready(&self) -> bool {
         self.up && self.frame.available() && !self.iface.fragmentation_pending()
+    }
+
+    /// Ethernet 输入只等待自己的配对应答空槽，普通输出和未交完的尾片不阻止接收。
+    fn ethernet_ingress_ready(&self) -> bool {
+        self.up
+            && self
+                .ingress_reply
+                .as_ref()
+                .is_some_and(FrameSlot::available)
     }
 
     /// IPv4 地址始终从库 CIDR 读取，不在接口元数据保存副本。
@@ -546,7 +568,7 @@ pub struct NetStack {
     queue: Once<WorkQueue>,
     ingress: Once<Pin<Arc<Work>>>,
     reaper: Once<Pin<Arc<Work>>>,
-    nic: Once<Arc<VirtioNet>>,
+    nic: Once<NetDevice>,
     ethernet: Once<SleepMutex<Option<InterfaceState>>>,
     interface_timer: Once<Pin<Arc<Timer>>>,
     timer_control: SpinLock<()>,
@@ -564,18 +586,21 @@ impl NetStack {
         Self::try_new_base()
     }
 
-    /// 在普通任务完整准备根、库接口和 NIC，真实 start 成功才交付服务拥有者。
+    /// 在普通任务完整准备根、库接口和平台指定的实际 NIC，start 成功才交付服务拥有者。
     ///
-    /// 调用者须独占所选库存设备，并保证实际完整强序设备映射和库存覆盖全部消费者寿命。
+    /// # Safety
+    /// 调用者须独占所选库存设备及板 MAC、PHY 和设置资源，并保证全部设备窗口永久有效。
+    /// 库存须与本次启动资源同源，Root 在发表前保存设备，直到同步停止确认后才释放。
     pub unsafe fn try_new_nic(inventory: &DeviceInventory) -> Result<NetStackOwner, FsError> {
         let owner = Self::try_new_base()?;
         let net = owner.stack();
-        // SAFETY: 唯一设备及永久完整映射义务由本 unsafe 构造的调用者承担，Root 从发表前保活 NIC。
-        let nic = unsafe { VirtioNet::prepare(net, inventory, 0) }.map_err(network_device_error)?;
+        // SAFETY: 调用者承担同源库存、独占硬件与永久映射义务，原 Root 从发表前保活设备。
+        let nic =
+            unsafe { NetDevice::prepare(net, inventory) }.map_err(NetDeviceError::into_fs_error)?;
         net.nic.call_once(|| nic);
         let ethernet = InterfaceState::try_new(
             Medium::Ethernet,
-            HardwareAddress::Ethernet(EthernetAddress(net.nic.get().unwrap().info().mac)),
+            HardwareAddress::Ethernet(EthernetAddress(net.nic.get().unwrap().mac_address())),
             net.seed,
         )?;
         net.ethernet.call_once(|| SleepMutex::new(Some(ethernet)));
@@ -583,7 +608,7 @@ impl NetStack {
             .get()
             .unwrap()
             .start()
-            .map_err(network_device_error)?;
+            .map_err(NetDeviceError::into_fs_error)?;
         Ok(owner)
     }
 
@@ -789,9 +814,10 @@ impl NetStack {
         }
     }
 
-    /// 借用根实际拥有的 NIC，身份、队列及 IRQ 查询由同一设备值提供。
-    pub(crate) fn nic(&self) -> Option<&Arc<VirtioNet>> {
-        self.nic.get()
+    /// 专用测试只借实际 VirtIO 变体的原 Arc，不把板 GMAC 当成 VirtIO 观察对象。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_virtio_nic(&self) -> Option<&Arc<crate::drivers::virtio_net::VirtioNet>> {
+        self.nic.get()?.ktest_virtio()
     }
 
     /// 返回当前 eth0 完整配置副本，不主动推进设备或协议。
@@ -1573,7 +1599,7 @@ impl NetStack {
         }
     }
 
-    /// 输入借同一 holder 后备，前一 loan 尚未归还时只在接口锁外准备新 Vec。
+    /// 输入借同一 holder 后备；Ethernet 仅核自己的应答槽，缺后备时在接口锁外准备 Vec。
     fn take_ingress_storage(&self, id: InterfaceId) -> Result<(CaptureStorage, Vec<u8>), FsError> {
         let capture = {
             let interface = self.interface(id).ok_or(FsError::NotConnected)?.lock();
@@ -1584,7 +1610,7 @@ impl NetStack {
             if !state.up {
                 return Err(FsError::NetworkUnreachable);
             }
-            if id == InterfaceId::Ethernet && !state.dispatch_ready() {
+            if id == InterfaceId::Ethernet && !state.ethernet_ingress_ready() {
                 return Err(FsError::WouldBlock);
             }
             state.capture.clone()
@@ -1719,21 +1745,36 @@ impl NetStack {
         Ok(true)
     }
 
-    /// NIC 满时归还同一预备帧且保持占用，控制输入不能覆盖此责任。
-    fn transmit_ethernet_frame(&self) -> Result<Option<bool>, VirtioInitError> {
+    /// 输入应答先于普通输出交 NIC；满槽或错误恢复同一份帧，只有普通输出结束自己的 binding。
+    fn transmit_ethernet_frame(&self) -> Result<Option<bool>, FsError> {
         let Some(ethernet) = self.ethernet.get() else {
             return Ok(None);
         };
-        let (bytes, len) = {
+        let (bytes, len, source) = {
             let mut ethernet = ethernet.lock();
             let Some(state) = ethernet.as_mut() else {
                 return Ok(None);
             };
-            if !state.up || state.frame.len == 0 || state.frame.in_flight || self.is_stopping() {
+            if !state.up || self.is_stopping() {
                 return Ok(None);
             }
-            state.frame.in_flight = true;
-            (::core::mem::take(&mut state.frame.bytes), state.frame.len)
+            let source = if state
+                .ingress_reply
+                .as_ref()
+                .is_some_and(|reply| 0 < reply.len && !reply.in_flight)
+            {
+                EthernetFrameSource::IngressReply
+            } else if 0 < state.frame.len && !state.frame.in_flight {
+                EthernetFrameSource::Egress
+            } else {
+                return Ok(None);
+            };
+            let frame = match source {
+                EthernetFrameSource::IngressReply => state.ingress_reply.as_mut().unwrap(),
+                EthernetFrameSource::Egress => &mut state.frame,
+            };
+            frame.in_flight = true;
+            (::core::mem::take(&mut frame.bytes), frame.len, source)
         };
         let accepted = self
             .nic
@@ -1745,12 +1786,16 @@ impl NetStack {
             let state = ethernet
                 .as_mut()
                 .expect("Ethernet workspace released before NIC tail");
-            state.frame.bytes = bytes;
-            state.frame.in_flight = false;
+            let frame = match source {
+                EthernetFrameSource::IngressReply => state.ingress_reply.as_mut().unwrap(),
+                EthernetFrameSource::Egress => &mut state.frame,
+            };
+            frame.bytes = bytes;
+            frame.in_flight = false;
             if matches!(accepted, Ok(true)) {
-                state.frame.len = 0;
-                state.frame.destination = None;
-                if !state.iface.fragmentation_pending() {
+                frame.len = 0;
+                frame.destination = None;
+                if source == EthernetFrameSource::Egress && !state.iface.fragmentation_pending() {
                     (state.binding.take(), true)
                 } else {
                     (None, false)
@@ -1763,7 +1808,7 @@ impl NetStack {
         if finished {
             self.finish_interface_egress(InterfaceId::Ethernet);
         }
-        accepted.map(Some)
+        accepted.map(Some).map_err(NetDeviceError::into_fs_error)
     }
 
     /// 只推进库已有余片，TxToken 空槽事实是唯一正常发送提交条件。
@@ -1921,7 +1966,7 @@ impl NetStack {
         }
     }
 
-    /// 预算尾只重排能继续消费的事实，真实 TX 满只等 completion。
+    /// 预算尾包含已编码的输入应答；真实 TX 满仍只等 completion，不因待发帧忙重排。
     fn actionable_egress(
         &self,
         blocked: [bool; 2],
@@ -1940,7 +1985,13 @@ impl NetStack {
         if !tx_full
             && self.ethernet.get().is_some_and(|ethernet| {
                 ethernet.lock().as_ref().is_some_and(|state| {
-                    state.up && (0 < state.frame.len || state.iface.fragmentation_pending())
+                    state.up
+                        && (state
+                            .ingress_reply
+                            .as_ref()
+                            .is_some_and(|reply| 0 < reply.len)
+                            || 0 < state.frame.len
+                            || state.iface.fragmentation_pending())
                 })
             })
         {
@@ -2021,7 +2072,7 @@ impl NetStack {
         }
     }
 
-    /// RX 只借收权 DMA 前缀；库完成捕获后解接口锁再 enqueue 和安排 Work。
+    /// RX 借收权 DMA 前缀与独立应答槽，库捕获后解接口锁再交端点，不占用普通输出帧。
     pub(crate) fn receive_ethernet(&self, frame: &[u8]) -> Result<(), FsError> {
         if self.is_stopping() {
             return Err(FsError::NotConnected);
@@ -2038,9 +2089,13 @@ impl NetStack {
                 Some(state) if !self.is_stopping() => {
                     if !state.up {
                         Err(FsError::NetworkUnreachable)
-                    } else if state.dispatch_ready() {
+                    } else if state.ethernet_ingress_ready() {
+                        let reply = state
+                            .ingress_reply
+                            .as_mut()
+                            .expect("Ethernet ingress reply storage missing");
                         let mut device = FrameDevice {
-                            frame: &mut state.frame,
+                            frame: reply,
                             input: Some(frame),
                             medium: state.medium,
                         };
@@ -2049,8 +2104,8 @@ impl NetStack {
                             &mut device,
                             &mut collector,
                         );
-                        if 0 < state.frame.len {
-                            state.frame.destination = state.iface.last_transmit_destination();
+                        if 0 < reply.len {
+                            reply.destination = state.iface.last_transmit_destination();
                         }
                         Ok(())
                     } else {
@@ -2085,7 +2140,7 @@ impl NetStack {
     }
 
     /// 先关生产与全部协议回调，随后确认 NIC 停止；错误保留原根和 IRQ 上下文。
-    fn stop_sync(&self) -> Result<(), VirtioInitError> {
+    fn stop_sync(&self) -> Result<(), FsError> {
         {
             let _admission = self.admission.lock();
             let mut egress = self.egress.lock();
@@ -2119,7 +2174,7 @@ impl NetStack {
             pair.stop_sync();
         }
         if let Some(nic) = self.nic.get() {
-            nic.stop_sync()?;
+            nic.stop_sync().map_err(NetDeviceError::into_fs_error)?;
         }
         let loopback = self.loopback.lock().take();
         let ethernet = self
@@ -2230,13 +2285,5 @@ fn dispatch_error(error: DispatchError) -> FsError {
         DispatchError::NoRoute => FsError::NetworkUnreachable,
         DispatchError::NeighborPending | DispatchError::Exhausted => FsError::WouldBlock,
         DispatchError::PacketTooLarge => FsError::MessageTooLarge,
-    }
-}
-
-/// 文件层保实际内存不足，其余设备初始化失败统一交原设备 I/O 错误，不回退 lo。
-fn network_device_error(error: VirtioInitError) -> FsError {
-    match error {
-        VirtioInitError::NoMemory { .. } => FsError::NoMemory,
-        _ => FsError::DeviceIo,
     }
 }

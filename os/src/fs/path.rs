@@ -1588,7 +1588,7 @@ impl Vfs {
         Ok(text)
     }
 
-    /// 同一短表锁检查父挂载、覆盖点、不同实例占用的实际 Disk 和固定预算。
+    /// 同一短表锁检查父挂载、覆盖点、不同实例占用的实际视图和固定预算。
     fn check_mount(
         &self,
         mounts: &[Arc<Mount>],
@@ -1602,11 +1602,7 @@ impl Vfs {
             .iter()
             .any(|mount| match (&mount.filesystem, filesystem) {
                 (Filesystem::Ext4(mounted), Filesystem::Ext4(candidate)) => {
-                    !Arc::ptr_eq(mounted, candidate)
-                        && core::ptr::eq(
-                            mounted.disk().as_ref().get_ref(),
-                            candidate.disk().as_ref().get_ref(),
-                        )
+                    !Arc::ptr_eq(mounted, candidate) && mounted.view().same_range(candidate.view())
                 }
                 _ => false,
             });

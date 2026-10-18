@@ -4,14 +4,14 @@
 pub(crate) mod ktest_prepare;
 
 use crate::{
-    boot::Region,
+    boot::{Platform, Region},
     drivers::{
         mmio_region_address,
         pci::{PciDevice, PciInventory},
         MmioBlockCandidate, ProbeError,
     },
     irq::IrqNumber,
-    mm::dma::{CoherentDma, DmaError, KernelHal},
+    mm::dma::{CoherentDma, DmaDomain, DmaError, KernelHal},
     task,
 };
 use core::convert::TryFrom;
@@ -107,6 +107,27 @@ pub enum VirtioIdentity {
         vendor_id: u16,
         device_id: u16,
     },
+}
+
+/// 仅为已经确认 coherent 恒等 DMA 的 QEMU virt 选择设备域；实体板组合须另行实现。
+pub(crate) fn qemu_dma_domain() -> Result<DmaDomain, VirtioInitError> {
+    if crate::platform::current() != Platform::QemuVirt {
+        return Err(ProbeError::Resource("VirtIO DMA is supported only on QEMU virt").into());
+    }
+    Ok(DmaDomain::qemu_coherent())
+}
+
+/// 运行期协议错误保留原 DMA 诊断，再转换为库能表达的对应失败类别。
+pub(crate) fn dma_protocol(error: DmaError) -> Error {
+    crate::klog!(crate::klog::Level::Error, "VirtIO DMA failed: {:?}", error);
+    match error {
+        DmaError::NoMemory => Error::NoMemory,
+        DmaError::InvalidRange
+        | DmaError::AddressLimit
+        | DmaError::InvalidDomain
+        | DmaError::Alignment => Error::InvalidParam,
+        DmaError::CacheMaintenance(_) => Error::IoError,
+    }
 }
 
 /// 在普通 Task 中构造同一次库存的 MMIO 传输，不协商特性或发表队列。
@@ -236,6 +257,7 @@ impl VirtioDevice {
         identity: VirtioIdentity,
         interrupt: IrqNumber,
     ) -> Result<Self, VirtioInitError> {
+        let domain = qemu_dma_domain()?;
         if transport.device_type() != DeviceType::Block {
             return Err(ProbeError::Resource("selected VirtIO device is not block").into());
         }
@@ -246,12 +268,12 @@ impl VirtioDevice {
         KernelHal::dma_barrier();
         let info = VirtIOBlk::<KernelHal, SomeTransport<'static>>::negotiate(&mut transport)?;
         let layout = RingLayout::new(info.queue_depth, transport.requires_legacy_layout())?;
-        let ring = CoherentDma::allocate(layout.byte_len())
+        let ring = CoherentDma::allocate(domain, layout.byte_len())
             .map_err(|error| VirtioInitError::dma_prepare(error, transport.get_status()))?;
         let pdu_size = usize::from(info.tag_count)
             .checked_mul(PDU_STRIDE)
             .ok_or(Error::InvalidParam)?;
-        let pdu = CoherentDma::allocate(pdu_size)
+        let pdu = CoherentDma::allocate(domain, pdu_size)
             .map_err(|error| VirtioInitError::dma_prepare(error, transport.get_status()))?;
         // SAFETY: 原 ring owner 存活，真实 coherent CPU/DMA 同一页，尚未交设备访问。
         let queue = unsafe { VirtQueue::<KernelHal>::new(layout, ring.region()) }

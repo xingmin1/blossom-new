@@ -24,7 +24,7 @@ impl PathOwner {
         self.owner.cache().ktest_set_load_hook(None);
         let volume = checked(
             context,
-            Ext4Volume::open(self.owner.disk()?.clone(), mode, 64),
+            Ext4Volume::open(BlockView::whole(self.owner.disk()?.clone()), mode, 64),
         )?;
         let vfs = Arc::try_new(checked(
             context,
@@ -277,15 +277,28 @@ pub(crate) mod walk {
     ) -> TestResult {
         let volume = checked(
             context,
-            Ext4Volume::open(fixture.owner.disk()?.clone(), AccessMode::ReadWrite, 64),
+            Ext4Volume::open(
+                BlockView::whole(fixture.owner.disk()?.clone()),
+                AccessMode::ReadWrite,
+                64,
+            ),
         )?;
         let reopened = checked(
             context,
-            Ext4Volume::open(fixture.owner.disk()?.clone(), AccessMode::ReadWrite, 64),
+            Ext4Volume::open(
+                BlockView::whole(fixture.owner.disk()?.clone()),
+                AccessMode::ReadWrite,
+                64,
+            ),
         )?;
         context.expect_eq(Arc::ptr_eq(&volume, &reopened), true);
         context.expect_eq(
-            Ext4Volume::open(fixture.owner.disk()?.clone(), AccessMode::ReadOnly, 64).err(),
+            Ext4Volume::open(
+                BlockView::whole(fixture.owner.disk()?.clone()),
+                AccessMode::ReadOnly,
+                64,
+            )
+            .err(),
             Some(FsError::Busy),
         );
         let ro = checked(
@@ -488,7 +501,7 @@ pub(crate) mod mounts {
             .ok_or(TestError("path extra Disk absent"))?;
         let volume = checked(
             context,
-            Ext4Volume::open(disk.clone(), AccessMode::ReadOnly, 64),
+            Ext4Volume::open(BlockView::whole(disk.clone()), AccessMode::ReadOnly, 64),
         )?;
         checked(
             context,

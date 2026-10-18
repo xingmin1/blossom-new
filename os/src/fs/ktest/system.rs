@@ -1,10 +1,11 @@
 //! 明确启动盘选择、普通系统树读取与未挂原盘写入的真实消费者。
 
+use crate::block::partition::{self, DeviceName, DeviceSelector};
 use crate::block::{Bio, BioAllocator, BioMemory, BlkOperation, IoResult};
 use crate::fs::ext4::crc::crc32c;
 use crate::fs::ktest::*;
 use crate::fs::system::{boot_devices, mount_disks, read_summary, BootDevices, FileSummary};
-use crate::mm::dma::{DmaError, MappedPages};
+use crate::mm::dma::MappedPages;
 use virtio_drivers::BufferDirection;
 
 const ROOT_FILES: [&[u8]; 5] = [
@@ -29,25 +30,56 @@ struct SystemOwner {
     files: Option<Arc<FileTable>>,
 }
 
+/// 真实 fixture 库存只附着 VirtIO，其他设备名不能被解释为同编号的测试盘。
+fn fixture_index(selector: DeviceSelector) -> usize {
+    match selector.device {
+        DeviceName::Virtio(index) => usize::from(index),
+        _ => usize::MAX,
+    }
+}
+
+/// 原整盘测试明确构造无分区选择，避免把分区编号与库存槽混用。
+fn whole_selector(index: u8) -> DeviceSelector {
+    DeviceSelector {
+        device: DeviceName::Virtio(index),
+        partition: None,
+    }
+}
+
 impl SystemOwner {
     /// 仅借原拥有者已经启动的槽，缺选中槽保留 MissingRoot，不猜其它磁盘。
-    fn selected(&self, selection: BootDevices<'_>) -> Result<(DiskRef, Option<DiskRef>), FsError> {
-        let root = self
+    fn selected(
+        &self,
+        selection: BootDevices<'_>,
+    ) -> Result<(BlockView, Option<BlockView>), FsError> {
+        let root = self.selected_view(selection.root)?;
+        let extra = selection
+            .extra
+            .map(|selector| self.selected_view(selector))
+            .transpose()?;
+        Ok((root, extra))
+    }
+
+    /// 分区选择沿生产解析取得相对整盘的实际范围，缺项保留 MissingRoot。
+    fn selected_view(&self, selector: DeviceSelector) -> Result<BlockView, FsError> {
+        let disk = self
             .owner
             .disks
-            .get(selection.root)
+            .get(fixture_index(selector))
             .ok_or(FsError::MissingRoot)?;
-        let extra = match selection.extra {
-            Some(index) => Some(
-                self.owner
-                    .disks
-                    .get(index)
-                    .ok_or(FsError::MissingRoot)?
-                    .clone(),
-            ),
-            None => None,
+        let whole = BlockView::whole(disk.clone());
+        let Some(number) = selector.partition else {
+            return Ok(whole);
         };
-        Ok((root.clone(), extra))
+        let partition = partition::discover(&whole)?
+            .into_iter()
+            .find(|partition| partition.number == number)
+            .ok_or(FsError::MissingRoot)?;
+        Ok(BlockView::new(
+            disk.clone(),
+            partition.start_sector,
+            partition.sectors,
+        )?)
     }
 
     /// 正文按永久命令行的根权限与目录构造卷和视图，返回的路径字节仍借 BootInfo。
@@ -79,7 +111,7 @@ impl SystemOwner {
             )?
             .disk()
             .identity(),
-            self.owner.disks[selection.root].identity(),
+            self.owner.disks[fixture_index(selection.root)].identity(),
         );
         context.expect_eq(fs_context.root().filesystem().mode(), selection.root_mode);
         let writable = match selection.root_mode {
@@ -96,11 +128,11 @@ impl SystemOwner {
             context.expect_eq(extra.check_writable(), Err(FsError::ReadOnly));
         }
         context.diagnostic(format_args!(
-            "fs-system-selection root={} extra={:?} mode={:?} identity={:?}",
+            "fs-system-selection root={:?} extra={:?} mode={:?} identity={:?}",
             selection.root,
             selection.extra,
             selection.root_mode,
-            self.owner.disks[selection.root].identity()
+            self.owner.disks[fixture_index(selection.root)].identity()
         ));
         self.vfs = Some(vfs);
         self.context = Some(fs_context);
@@ -320,12 +352,7 @@ fn raw_bio(disk: &Disk, operation: BlkOperation) -> Result<Bio, BlockError> {
         } else {
             BufferDirection::DeviceToDriver
         };
-        let mut mapped =
-            MappedPages::new(pages, 0, bytes, direction).map_err(|error| match error {
-                DmaError::NoMemory => BlockError::NoMemory,
-                DmaError::InvalidRange => BlockError::InvalidRange,
-                DmaError::AddressLimit => BlockError::Unsupported,
-            })?;
+        let mut mapped = MappedPages::new(pages, 0, bytes, direction).map_err(BlockError::from)?;
         if operation == BlkOperation::Write {
             for (index, byte) in mapped.bytes_mut().iter_mut().enumerate() {
                 byte.write((index as u8).wrapping_mul(13).wrapping_add(71));
@@ -435,7 +462,7 @@ pub(crate) mod arguments {
             let selected = checked(context, boot_devices(bytes))?;
             context.expect_eq(
                 (selected.root, selected.extra, selected.root_mode),
-                (root, extra, mode),
+                (whole_selector(root), extra.map(whole_selector), mode),
             );
         }
         for (bytes, rootdir) in [
@@ -479,7 +506,6 @@ pub(crate) mod arguments {
             b"root=".as_slice(),
             b"root=/dev/vdaa",
             b"root=/dev/vdA",
-            b"root=/dev/vda1",
             b"root=UUID=abc",
             b"root=/dev/vda root=",
             b"root=/dev/vda extra=",
@@ -538,7 +564,7 @@ pub(crate) mod root {
             checked(context, checked(context, file.inode())?.disk_volume())?
                 .disk()
                 .identity(),
-            fixture.owner.disks[selected.root].identity(),
+            fixture.owner.disks[fixture_index(selected.root)].identity(),
         );
         drop(parent_file);
         drop(file);
@@ -679,7 +705,7 @@ pub(crate) mod dual {
             checked(context, checked(context, second.inode())?.disk_volume())?
                 .disk()
                 .identity(),
-            fixture.owner.disks[extra].identity(),
+            fixture.owner.disks[fixture_index(extra)].identity(),
         );
         let first_inode = checked(context, first.inode())?;
         let second_inode = checked(context, second.inode())?;
@@ -741,7 +767,7 @@ pub(crate) mod unselected {
         fixture: &mut SystemOwner,
     ) -> TestResult {
         let selection = checked(context, boot_devices(crate::boot::info().bootargs()))?;
-        context.expect_eq(selection.root, 0);
+        context.expect_eq(selection.root, whole_selector(0));
         context.expect_eq(selection.extra, None);
         let before = fixture.owner.disks[1].test_snapshot().submitted;
         fixture.prepare(context)?;
@@ -766,10 +792,10 @@ pub(crate) mod scratch {
         let extra = selection.extra.ok_or(TestError(
             "system scratch requires explicit extra boot argument",
         ))?;
-        if selection.root == 2 || extra == 2 {
+        if fixture_index(selection.root) == 2 || fixture_index(extra) == 2 {
             return Err(TestError("system scratch slot cannot be mounted"));
         }
-        for index in [selection.root, extra] {
+        for index in [fixture_index(selection.root), fixture_index(extra)] {
             let disk = &fixture.owner.disks[index];
             if disk.limits().readonly {
                 return Err(TestError(
@@ -864,7 +890,7 @@ pub(crate) mod missing {
         fixture: &mut SystemOwner,
     ) -> TestResult {
         let selection = checked(context, boot_devices(crate::boot::info().bootargs()))?;
-        if selection.root < fixture.owner.disks.len() {
+        if fixture_index(selection.root) < fixture.owner.disks.len() {
             return Err(TestError(
                 "system missing case requires absent selected root boot slot",
             ));
@@ -882,7 +908,7 @@ pub(crate) mod missing {
             true,
         );
         context.diagnostic(format_args!(
-            "fs-system-missing actual-root={} error=MissingRoot disk-fs-submissions=0",
+            "fs-system-missing actual-root={:?} error=MissingRoot disk-fs-submissions=0",
             selection.root
         ));
         Ok(())

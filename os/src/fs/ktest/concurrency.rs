@@ -5,7 +5,10 @@ use crate::fs::ktest::*;
 /// 唯一 root 的真实 used.idx 前进才构成设备完成证据，不制造 used 元素。
 fn used(fixture: &Owner, target: u16) -> TestResult {
     let disk = fixture.disk()?;
-    let legacy = matches!(disk.identity(), VirtioIdentity::Mmio { version: 1, .. });
+    let legacy = matches!(
+        disk.identity(),
+        DiskIdentity::Virtio(VirtioIdentity::Mmio { version: 1, .. })
+    );
     until("filesystem real used did not progress", || {
         block::tests::used_index(disk, legacy) == target
     })
@@ -14,7 +17,10 @@ fn used(fixture: &Owner, target: u16) -> TestResult {
 /// 当前仍由 fixture 保活的真实硬件 ring 只读标量。
 fn used_index(fixture: &Owner) -> Result<u16, TestError> {
     let disk = fixture.disk()?;
-    let legacy = matches!(disk.identity(), VirtioIdentity::Mmio { version: 1, .. });
+    let legacy = matches!(
+        disk.identity(),
+        DiskIdentity::Virtio(VirtioIdentity::Mmio { version: 1, .. })
+    );
     Ok(block::tests::used_index(disk, legacy))
 }
 

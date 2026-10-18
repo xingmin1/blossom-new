@@ -181,14 +181,14 @@ pub(crate) fn result(
     }
     super::control_write(format_args!("\n"));
 }
-/// 正常完成后真实关闭 VM，不能用 park 冒充退出。
+/// 报告完成后按实际平台停止本轮观察，QEMU 真实关闭，板卡停机不冒充物理断电。
 pub(crate) fn complete(name: &str, passed: bool) -> ! {
     write(format_args!(
         "{} 1 {}\n# KTEST complete\n",
         if passed { "ok" } else { "not ok" },
         name
     ));
-    crate::arch::emergency_shutdown()
+    crate::arch::test_shutdown()
 }
 /// 明确保存独立 SuiteError；未开始项由宿主记 NotRun，不伪造 case 结果。
 pub(crate) fn suite_error(name: &str, stage: &str, failure: Failure) -> ! {

@@ -7,18 +7,19 @@ use core::marker::PhantomPinned;
 use core::pin::{pin, Pin};
 use core::ptr;
 
-use virtio_drivers::device::blk::{decode_status, prepare_pdu, PDU_STRIDE, STATUS_OFFSET};
-use virtio_drivers::transport::{DeviceStatus, InterruptStatus};
-use virtio_drivers::{DmaRegion, Error, Hal, MappedSegment};
+use crate::block::backend::{virtio_limits, Backend, SlotControl, WorkTarget};
+use virtio_drivers::Hal;
 
 use crate::block::bio::{BioArc, BioInner};
 #[cfg(feature = "ktest")]
 use crate::block::SECTOR_BYTES;
-use crate::block::{AccessMode, Bio, BlkOperation, BlockError, FsClaim, QueueLimits, MAX_BATCH};
-use crate::cache::MetadataCache;
-use crate::drivers::virtio::{VirtioDevice, VirtioIdentity, VirtioInitError};
+use crate::block::{
+    AccessMode, Bio, BlkOperation, BlockError, DiskIdentity, FsClaim, QueueLimits, MAX_BATCH,
+};
+use crate::cache::MetadataPages;
+use crate::drivers::virtio::VirtioDevice;
 use crate::irq::{self, IrqRegistration};
-use crate::mm::dma::KernelHal;
+use crate::mm::dma::{DmaDomain, KernelHal, PayloadRange};
 use crate::sync::{SleepMutex, SpinLock};
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 use crate::workqueue::{Work, WorkQueue};
@@ -43,12 +44,13 @@ pub(super) enum QueuePhase {
 pub(super) enum SlotState {
     Free,
     Preparing,
-    Submitted { head: u16 },
+    Submitted,
+    Executing,
     Finishing,
 }
 
 pub(super) struct QueueState {
-    pub(super) device: Option<VirtioDevice>,
+    pub(super) device: Option<Backend>,
     pub(super) phase: QueuePhase,
     pub(super) failure: Option<BlockError>,
     pub(super) generators: usize,
@@ -59,7 +61,9 @@ pub(super) struct QueueState {
     pub(super) pending_notify: bool,
     pub(super) mounts: usize,
     pub(super) slot_states: Vec<SlotState>,
-    pub(super) heads: Vec<Option<u16>>,
+    pub(super) claim_head: *const crate::block::stop::FsClaimInner,
+    pub(super) raw_writers: *const BioInner,
+    pub(super) slot_writes: Vec<Option<(u64, u64)>>,
     #[cfg(feature = "ktest")]
     counters: TestSnapshot,
     #[cfg(feature = "ktest")]
@@ -99,14 +103,14 @@ pub(super) struct RequestPart {
 }
 
 struct SlotResources {
-    sg: Vec<MappedSegment>,
+    sg: Vec<PayloadRange>,
     parts: [Option<RequestPart>; MAX_BATCH],
     part_count: usize,
     operation: BlkOperation,
     sector: u64,
     bytes: usize,
-    used_len: u32,
     forced_error: Option<BlockError>,
+    completion: Option<crate::block::IoResult>,
     #[cfg(feature = "ktest")]
     ktest_read_prefix: Option<(usize, BlockError)>,
     configured: bool,
@@ -117,10 +121,10 @@ pub(super) struct SlotStorage {
     pub(super) completion_work: Option<Pin<Arc<Work>>>,
     pub(super) tag: u16,
     pub(super) disk: *const Disk,
-    pdu: DmaRegion,
+    control: SlotControl,
 }
 
-// SAFETY: resources 仅由 Preparing guard 或真实 Submitted→Finishing 的唯一认领者访问；
+// SAFETY: resources 只由 Preparing guard、唯一 Executing Work 或真实完成的 Finishing 认领者访问；
 // 固定 Vec 不再增长，context 在登记前写定，Work 与 IRQ 尾部结束前 Disk owner 保活。
 unsafe impl Send for SlotStorage {}
 // SAFETY: 同一槽的两个独占访问期由 queue 状态转换隔开；不向外提供共享资源引用。
@@ -136,13 +140,14 @@ pub struct Disk {
     pub(super) available: WaitQueue,
     pub(super) quiescent: WaitQueue,
     pub(super) limits: QueueLimits,
-    pub(super) identity: VirtioIdentity,
-    metadata_cache: SpinLock<Weak<MetadataCache>>,
+    pub(super) identity: DiskIdentity,
+    pub(super) domain: Option<DmaDomain>,
+    metadata_cache: SpinLock<Weak<MetadataPages>>,
     pub(super) _pinned: PhantomPinned,
 }
 
-// SAFETY: 所有设备/ring 状态只在 queue 锁中访问；槽资源使用独占状态协议，
-// 固定裸 context 的寿命由显式 stop 的 IRQ 注销与 Work close_sync 共同终止。
+// SAFETY: 协议元数据由 queue 锁串行，原生命令由唯一 progress Work 和控制器内部锁串行；
+// 固定 context 的寿命由显式 stop、执行尾、IRQ 注销及 Work close_sync 共同终止。
 unsafe impl Send for Disk {}
 // SAFETY: 安全接口不暴露 DMA 引用；跨 Task 的准备和完成只访问分别认领的槽。
 unsafe impl Sync for Disk {}
@@ -226,7 +231,7 @@ pub(super) struct StopTestState {
 impl Disk {
     /// 在普通 Task 中完整准备固定表与全部 Work；此时硬件尚不知道任何队列地址。
     pub fn prepare(device: VirtioDevice, workqueue: &WorkQueue) -> Result<DiskRef, BlockError> {
-        let limits = QueueLimits::from_info(device.info())?;
+        let limits = virtio_limits(device.info())?;
         Self::prepare_with_limits(
             device,
             workqueue,
@@ -246,7 +251,7 @@ impl Disk {
         max_segment_bytes: u32,
         dma_boundary_mask: u64,
     ) -> Result<DiskRef, BlockError> {
-        let mut limits = QueueLimits::from_info(device.info())?;
+        let mut limits = virtio_limits(device.info())?;
         if max_bytes < limits.logical_block_size as usize
             || limits.max_bytes < max_bytes
             || max_bytes % limits.logical_block_size as usize != 0
@@ -280,7 +285,7 @@ impl Disk {
         observation: &mut Option<(u16, crate::drivers::virtio::TestPrepareSnapshot)>,
     ) -> Result<DiskRef, BlockError> {
         assert!(observation.is_none(), "stale SG preparation observation");
-        let limits = QueueLimits::from_info(device.info())?;
+        let limits = virtio_limits(device.info())?;
         Self::prepare_with_limits(device, workqueue, limits, Some(observation))
     }
 
@@ -289,7 +294,7 @@ impl Disk {
         device: VirtioDevice,
         workqueue: &WorkQueue,
         limits: QueueLimits,
-        #[cfg(feature = "ktest")] mut observation: Option<
+        #[cfg(feature = "ktest")] observation: Option<
             &mut Option<(u16, crate::drivers::virtio::TestPrepareSnapshot)>,
         >,
     ) -> Result<DiskRef, BlockError> {
@@ -297,30 +302,86 @@ impl Disk {
             !device.requires_reset(),
             "preparing an already published disk"
         );
-        let identity = device.identity();
-        let pdu = device.control_regions().1;
+        let backend = Backend::virtio(
+            device,
+            limits,
+            #[cfg(feature = "ktest")]
+            observation,
+        )?;
+        Self::prepare_backend(backend, workqueue, limits)
+    }
+
+    /// 让唯一 RAM 磁盘访问专用范围，不转移原范围的归还权或创建 DMA 控制区。
+    ///
+    /// # Safety
+    /// region 须覆盖完整、独占且直接映射有效的 RAM。来源可以是 MM 接管前保留的 initrd，
+    /// 或调用者持有的独占原页；原页拥有者必须保活到本 Disk 真实 stop、Work/IRQ 及全部
+    /// CPU 复制尾部结束。发表期间调用者和固件不得访问该范围，也不得将其映射给用户或
+    /// 其他设备；只持有原页而保留冲突的 CPU 裸别名不能满足此契约。
+    pub unsafe fn prepare_ram(
+        region: crate::boot::Region,
+        workqueue: &WorkQueue,
+    ) -> Result<DiskRef, BlockError> {
+        let limits = Backend::ram_limits(region)?;
+        Self::prepare_backend(Backend::ram(region)?, workqueue, limits)
+    }
+
+    /// 用同一固定请求核心准备真实 SD，原 payload 只交 CPU 复制访问期；无卡不建立 Disk。
+    ///
+    /// # Safety
+    /// 资源来自唯一快照，控制器及其 clock/reset/pin/syscon 完整永久映射且由调用者独占；
+    /// 外部 owner 必须保本 Disk 到 IRQ、命令、Work 和真实停止全部结束。
+    pub(crate) unsafe fn prepare_sdmmc(
+        resources: &crate::boot::MmcResources,
+        workqueue: &WorkQueue,
+    ) -> Result<Option<DiskRef>, BlockError> {
+        // SAFETY: 调用者传递真实资源独占、映射和 IRQ/停止的完整寿命义务。
+        let Some((backend, limits)) = (unsafe { Backend::sdmmc(resources) }?) else {
+            return Ok(None);
+        };
+        Self::prepare_backend(backend, workqueue, limits).map(Some)
+    }
+
+    /// 用真实 AHCI 地址域准备直接原页请求；真实无介质不建立 Disk，身份仍取同一库存。
+    ///
+    /// # Safety
+    /// ABAR、IRQ、DMA 范围须来自唯一资源解析，固件已退出且完整强序映射永久有效；
+    /// 调用者独占本端口，保本 Disk 到全部 DMA、IRQ、Work 和真实停止尾部结束。
+    pub(crate) unsafe fn prepare_ahci(
+        resources: &crate::boot::AhciResources,
+        workqueue: &WorkQueue,
+    ) -> Result<Option<DiskRef>, BlockError> {
+        // SAFETY: 调用者证明解析后的真实功能资源和完整拥有寿命。
+        let Some((backend, limits)) = (unsafe { Backend::ahci(resources) }?) else {
+            return Ok(None);
+        };
+        Self::prepare_backend(backend, workqueue, limits).map(Some)
+    }
+
+    /// 构造协议无关的固定软件槽和预留完成任务，所有 fallible 准备先于硬件发表。
+    fn prepare_backend(
+        backend: Backend,
+        workqueue: &WorkQueue,
+        limits: QueueLimits,
+    ) -> Result<DiskRef, BlockError> {
+        let identity = backend.identity();
+        let domain = backend.domain();
         let mut slots = Vec::new();
         let mut slot_states = Vec::new();
-        let mut heads = Vec::new();
+        let mut slot_writes = Vec::new();
         slots
             .try_reserve_exact(usize::from(limits.tag_count))
             .map_err(|_| BlockError::NoMemory)?;
         slot_states
             .try_reserve_exact(usize::from(limits.tag_count))
             .map_err(|_| BlockError::NoMemory)?;
-        heads
-            .try_reserve_exact(usize::from(limits.queue_depth))
+        slot_writes
+            .try_reserve_exact(usize::from(limits.tag_count))
             .map_err(|_| BlockError::NoMemory)?;
         for tag in 0..limits.tag_count {
             let mut sg = Vec::new();
-            sg.try_reserve_exact(limits.max_segments).map_err(|_| {
-                #[cfg(feature = "ktest")]
-                if let Some(output) = observation.as_deref_mut() {
-                    // 此时前三张固定表已成功，device 尚未移入 Disk，未登记 IRQ 或发表队列。
-                    *output = Some((tag, device.test_prepare_snapshot()));
-                }
-                BlockError::NoMemory
-            })?;
+            sg.try_reserve_exact(limits.max_segments)
+                .map_err(|_| BlockError::NoMemory)?;
             slots.push(SlotStorage {
                 resources: UnsafeCell::new(SlotResources {
                     sg,
@@ -329,8 +390,8 @@ impl Disk {
                     operation: BlkOperation::Read,
                     sector: 0,
                     bytes: 0,
-                    used_len: 0,
                     forced_error: None,
+                    completion: None,
                     #[cfg(feature = "ktest")]
                     ktest_read_prefix: None,
                     configured: false,
@@ -338,14 +399,14 @@ impl Disk {
                 completion_work: None,
                 tag,
                 disk: ptr::null(),
-                pdu,
+                control: backend.slot_control(tag),
             });
             slot_states.push(SlotState::Free);
+            slot_writes.push(None);
         }
-        heads.resize(usize::from(limits.queue_depth), None);
         let disk = Arc::try_new(Self {
             queue: SpinLock::new(QueueState {
-                device: Some(device),
+                device: Some(backend),
                 phase: QueuePhase::Prepared,
                 failure: None,
                 generators: 0,
@@ -356,7 +417,9 @@ impl Disk {
                 pending_notify: false,
                 mounts: 0,
                 slot_states,
-                heads,
+                claim_head: ptr::null(),
+                raw_writers: ptr::null(),
+                slot_writes,
                 #[cfg(feature = "ktest")]
                 counters: TestSnapshot::default(),
                 #[cfg(feature = "ktest")]
@@ -380,6 +443,7 @@ impl Disk {
             quiescent: WaitQueue::new(),
             limits,
             identity,
+            domain,
             metadata_cache: SpinLock::new(Weak::new()),
             _pinned: PhantomPinned,
         })
@@ -422,12 +486,13 @@ impl Disk {
                 .expect("prepared disk has no device")
                 .interrupt()
         };
-        // SAFETY: 私有构造器返回 pinned Arc；外部 owner 必须显式 stop 后才释放。
-        // callback 有固定预算，不调用同线 token 或睡眠；同步注销结束其 context 寿命。
-        let registration =
-            unsafe { irq::register(number, irq_callback, self as *const Self as *mut ()) }
-                .map_err(|_| BlockError::Busy)?;
-        *self.irq.lock() = Some(registration);
+        if let Some(number) = number {
+            // SAFETY: 私有构造器返回 pinned Arc，外部 owner 显式 stop 并同步注销后才释放。
+            let registration =
+                unsafe { irq::register(number, irq_callback, self as *const Self as *mut ()) }
+                    .map_err(|_| BlockError::Busy)?;
+            *self.irq.lock() = Some(registration);
+        }
         let result = {
             let mut q = self.queue.lock();
             let result = q
@@ -437,11 +502,14 @@ impl Disk {
                 .publish();
             match result {
                 Ok(()) => {
+                    let backend = q.device.as_mut().expect("published disk has no backend");
+                    if backend.uses_work() {
+                        backend.set_interrupts(true);
+                    }
                     q.phase = QueuePhase::Live;
                     Ok(())
                 }
                 Err(error) => {
-                    let error = initialization_error(error);
                     q.failure = Some(error);
                     q.phase = QueuePhase::Faulting;
                     Err(error)
@@ -449,17 +517,15 @@ impl Disk {
             }
         };
         if result.is_ok() {
-            self.irq
-                .lock()
-                .as_ref()
-                .expect("registered disk has no IRQ")
-                .enable();
+            if let Some(registration) = self.irq.lock().as_ref() {
+                registration.enable();
+            }
         }
         result
     }
 
     /// 返回 Bio 构造时绑定的真实设备身份。
-    pub fn identity(&self) -> VirtioIdentity {
+    pub fn identity(&self) -> DiskIdentity {
         self.identity
     }
 
@@ -469,7 +535,7 @@ impl Disk {
     }
 
     /// 取得本磁盘尚存活的共同元数据缓存；不在块层构造或解析文件系统。
-    pub(crate) fn metadata_cache(&self) -> Option<Arc<MetadataCache>> {
+    pub(crate) fn metadata_cache(&self) -> Option<Arc<MetadataPages>> {
         self.metadata_cache.lock().upgrade()
     }
 
@@ -477,8 +543,8 @@ impl Disk {
     /// 未采用的候选仍归调用方，旧弱引用在锁外释放。
     pub(crate) fn intern_metadata_cache(
         &self,
-        candidate: &Arc<MetadataCache>,
-    ) -> Arc<MetadataCache> {
+        candidate: &Arc<MetadataPages>,
+    ) -> Arc<MetadataPages> {
         let retired = {
             let mut slot = self.metadata_cache.lock();
             if let Some(existing) = slot.upgrade() {
@@ -493,8 +559,8 @@ impl Disk {
     /// 析构者只摘自身 payload 身份的弱槽，复用后的新登记保持不变；返回的 Weak 须锁外释放。
     pub(crate) fn unregister_metadata_cache(
         &self,
-        identity: *const MetadataCache,
-    ) -> Option<Weak<MetadataCache>> {
+        identity: *const MetadataPages,
+    ) -> Option<Weak<MetadataPages>> {
         let mut slot = self.metadata_cache.lock();
         if slot.as_ptr() == identity {
             Some(core::mem::take(&mut *slot))
@@ -517,13 +583,25 @@ impl Disk {
     }
 
     /// 普通生成者或其独立完成 Work 在真实回调尾部归还同一 accepted 责任。
-    pub(super) fn finish_generation_tail(&self, operation: BlkOperation) {
+    pub(super) fn finish_generation_tail(&self, bio: &BioInner) {
         {
             let mut q = self.queue.lock();
             assert!(q.generators != 0, "block generator tail ended twice");
             q.generators -= 1;
-            if operation == BlkOperation::Write {
+            if bio.operation() == BlkOperation::Write {
                 q.writer_generators -= 1;
+                let mut link = &mut q.raw_writers as *mut *const BioInner;
+                // SAFETY: accepted 生成者保活整条链，所有链接只在此 queue 锁下修改。
+                unsafe {
+                    while !(*link).is_null() {
+                        if ptr::eq(*link, bio) {
+                            *link = *bio.raw_writer_next.get();
+                            *bio.raw_writer_next.get() = ptr::null();
+                            break;
+                        }
+                        link = (*(*link)).raw_writer_next.get();
+                    }
+                }
             }
         }
         self.quiescent.wake_all();
@@ -549,14 +627,26 @@ impl Disk {
             let error = if !matches!(q.phase, QueuePhase::Live) {
                 Some(q.stopped_error())
             } else if bio.inner.target() != self.identity
-                || claim.is_some_and(|claim| !ptr::eq(&**claim.disk(), &**self))
+                || claim.is_some_and(|claim| {
+                    !ptr::eq(&**claim.disk(), &**self)
+                        || (bio.inner.operation() != BlkOperation::Flush
+                            && !claim
+                                .view()
+                                .contains_bytes(bio.inner.sector() * 512, bio.inner.len()))
+                })
             {
                 Some(BlockError::InvalidRange)
             } else if bio.inner.operation() == BlkOperation::Write
                 && (self.limits.readonly
                     || match claim {
                         Some(claim) => claim.mode() != AccessMode::ReadWrite,
-                        None => 0 < q.mounts,
+                        None => crate::block::stop::mounted_write_conflicts(
+                            &q,
+                            (
+                                bio.inner.sector(),
+                                bio.inner.sector() + (bio.inner.len() / 512) as u64,
+                            ),
+                        ),
                     })
             {
                 Some(BlockError::ReadOnly)
@@ -569,12 +659,22 @@ impl Disk {
             q.generators += 1;
             if bio.inner.operation() == BlkOperation::Write {
                 q.writer_generators += 1;
+                if claim.is_none() {
+                    // SAFETY: 本 Bio 尚未发表，accepted 生成者保活到同锁摘链；不在锁内增加 Arc。
+                    unsafe {
+                        *bio.inner.raw_writer_next.get() = q.raw_writers;
+                    }
+                    q.raw_writers = &*bio.inner;
+                }
             }
+        }
+        if let Err(error) = bio.inner.begin() {
+            self.finish_generation_tail(&bio.inner);
+            return Err((bio, error));
         }
         if let Some(claim) = claim {
             bio.inner.retain_fs_claim(claim);
         }
-        bio.inner.begin();
         Ok(ActiveBio {
             bio: bio.inner,
             offset: 0,
@@ -634,11 +734,15 @@ impl Disk {
                 return;
             }
             q.pending_notify = false;
-            let driver = q.device.as_ref().expect("live disk has no device").driver();
-            if !driver.should_notify() {
+            let backend = q.device.as_ref().expect("live disk has no device");
+            if backend.uses_work() {
+                drop(q);
+                self.queue_progress();
                 return;
             }
-            let notification = driver.notification();
+            let Some(notification) = backend.notification() else {
+                return;
+            };
             q.notify_active += 1;
             notification
         };
@@ -657,7 +761,7 @@ impl Disk {
         self.quiescent.wake_all();
     }
 
-    /// 关闭发布和通知认领，只修改本 queue flags，不屏蔽共享中断线。
+    /// 关闭发表和通知认领；原生命令仍执行时保留 IRQ，由执行尾或真实 reset 关闭。
     pub(super) fn mark_fault(&self, error: BlockError) {
         let claimed = {
             let mut q = self.queue.lock();
@@ -668,9 +772,14 @@ impl Disk {
                 q.failure = Some(error);
                 q.phase = QueuePhase::Faulting;
                 q.pending_notify = false;
+                let executing = q
+                    .slot_states
+                    .iter()
+                    .any(|state| *state == SlotState::Executing);
                 if let Some(device) = q.device.as_mut() {
-                    // SAFETY: queue 锁串行后端，原控制区与全部在途 owner 仍保活，未交换 driver。
-                    unsafe { device.driver_mut() }.set_interrupts(false);
+                    if !device.uses_work() || !executing {
+                        device.set_interrupts(false);
+                    }
                 }
                 true
             } else {
@@ -693,37 +802,126 @@ impl Disk {
 
     /// 本设备真实 ISR 决定共享线处理归属，配置变更与 NEEDS_RESET 都进入故障停机。
     fn interrupt(&self) -> bool {
-        let (status, fault, live) = {
+        let (cause, live) = {
             let mut q = self.queue.lock();
             let live = q.accepts_children();
             let Some(device) = q.device.as_mut() else {
                 return false;
             };
-            let status = device.ack_interrupt();
-            let fault = live
-                && (device
-                    .status()
-                    .intersects(DeviceStatus::DEVICE_NEEDS_RESET | DeviceStatus::FAILED)
-                    || status.contains(InterruptStatus::CONFIG));
+            let cause = device.acknowledge();
             #[cfg(feature = "ktest")]
             {
-                // 复用本次 ack 返回的真实 ISR；统计与快照同受 queue 锁保护。
                 q.counters.irq_calls += 1;
-                if status.contains(InterruptStatus::QUEUE) {
+                if cause.completion {
                     q.counters.irq_queue += 1;
-                } else if status.is_empty() {
+                } else if !cause.claimed {
                     q.counters.irq_empty += 1;
                 }
             }
-            (status, fault, live)
+            (cause, live)
         };
-        if fault {
+        if live && cause.fault {
             self.request_retire(BlockError::DeviceFault);
         }
-        if live && status.contains(InterruptStatus::QUEUE) && !fault {
+        if live && cause.completion && !cause.fault {
             self.drain_used();
         }
-        !status.is_empty() || fault
+        cause.claimed || cause.fault
+    }
+
+    /// 唯一 progress Work 在锁外执行 RAM 复制或一个真实原生命令，ISR 保持稳态 IRQ。
+    fn progress_requests(&self) {
+        crate::sched::assert_switchable();
+        for _ in 0..IRQ_BUDGET {
+            let (tag, target) = {
+                let mut q = self.queue.lock();
+                if !q.accepts_children() {
+                    return;
+                }
+                let backend = q.device.as_mut().expect("live disk has no backend");
+                let Some(tag) = backend.next_work_request() else {
+                    return;
+                };
+                let target = backend
+                    .work_target()
+                    .expect("queued Work request has no execution target");
+                assert_eq!(q.slot_states[usize::from(tag)], SlotState::Submitted);
+                q.slot_states[usize::from(tag)] = SlotState::Executing;
+                (tag, target)
+            };
+            // SAFETY: Submitted→Executing 唯一认领固定槽；stop 等执行尾部，IRQ 只操作 mailbox，
+            // 不读取或修改本槽；原 parts 保 accepted payload 及实际 FS 占用。
+            let resources = unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
+            let native = !matches!(&target, WorkTarget::Ram(_));
+            let result = match target {
+                WorkTarget::Ram(region) => {
+                    let start = region.start + (resources.sector * 512) as usize;
+                    // SAFETY: RAM 范围独占且不与 payload 重叠，正式限额已核完整物理范围；
+                    // child 保来源到复制结束，此唯一 Work 不并行复制同一 RAM 通道。
+                    unsafe {
+                        copy_cpu_parts(resources, crate::arch::phys_to_virt(start) as *mut u8)
+                    }
+                }
+                WorkTarget::Sdmmc(controller) => {
+                    // SAFETY: 原 payload 在 CPU 复制期，child 保所有来源；bounce 由控制器独占，
+                    // 回调只复制有界 parts，不分配、睡眠或反调设备，全部 IRQ 保持启用。
+                    unsafe {
+                        controller.execute(
+                            resources.operation,
+                            resources.sector,
+                            resources.bytes,
+                            |bounce| {
+                                let result = copy_cpu_parts(resources, bounce);
+                                match result.error {
+                                    Some(error) => Err(error),
+                                    None => Ok(result.completed),
+                                }
+                            },
+                        )
+                    }
+                }
+                WorkTarget::Ahci(controller) => {
+                    // SAFETY: Bio 已按该控制器唯一 domain 交权，SG 只引用 accepted 原范围；
+                    // Executing 和 controller Arc 保全部 owning 到硬件停止确认，CPU 不访问内容。
+                    unsafe {
+                        controller.execute(
+                            resources.operation,
+                            resources.sector,
+                            resources.bytes,
+                            &resources.sg,
+                        )
+                    }
+                }
+            };
+            if result.error == Some(BlockError::StopUnconfirmed) {
+                let mut q = self.queue.lock();
+                assert_eq!(q.slot_states[usize::from(tag)], SlotState::Executing);
+                q.failure = Some(BlockError::StopUnconfirmed);
+                q.phase = QueuePhase::Quarantined;
+                q.pending_notify = false;
+                drop(q);
+                // 停止未确认时不移出 parts、不完成 Bio、不收 payload；原后端仍在永久拥有槽。
+                self.available.wake_all();
+                self.quiescent.wake_all();
+                return;
+            }
+            resources.completion = Some(result);
+            {
+                let mut q = self.queue.lock();
+                assert_eq!(q.slot_states[usize::from(tag)], SlotState::Executing);
+                q.slot_states[usize::from(tag)] = SlotState::Finishing;
+            }
+            self.quiescent.wake_all();
+            self.available.wake_all();
+            if native {
+                if let Some(error) = result.error {
+                    self.request_retire(error);
+                }
+            }
+            // execute 已归还硬件通道，再分派可能等待同盘 Read 的可睡完成者。
+            self.dispatch_slot(tag);
+        }
+        self.queue_progress();
     }
 
     /// 最多消费八个真实 used；重装并复查后由预建 Work 接续，不依赖下一次 IRQ。
@@ -737,6 +935,13 @@ impl Disk {
             if !q.accepts_children() {
                 return;
             }
+            if q.device
+                .as_ref()
+                .expect("live disk has no backend")
+                .uses_work()
+            {
+                return;
+            }
             #[cfg(feature = "ktest")]
             if q.test_paused {
                 return;
@@ -745,43 +950,28 @@ impl Disk {
             if q.ktest_stop.pause_used {
                 return;
             }
-            // SAFETY: 全部 ring 操作只在 queue 锁内；控制页在 stop 全尾部结束前不释放。
-            unsafe {
-                q.device
+            q.device
+                .as_mut()
+                .expect("live disk has no device")
+                .set_interrupts(false);
+            while count < IRQ_BUDGET {
+                let used = q
+                    .device
                     .as_mut()
                     .expect("live disk has no device")
-                    .driver_mut()
-            }
-            .set_interrupts(false);
-            while count < IRQ_BUDGET {
-                // SAFETY: 此短借用结束后才访问 head 表，不留跨锁 driver 引用。
-                let used = unsafe {
-                    q.device
-                        .as_mut()
-                        .expect("live disk has no device")
-                        .driver_mut()
-                }
-                .pop_used();
+                    .pop_completion();
                 match used {
-                    Ok(Some(used)) => {
-                        let Some(tag) = q.heads.get(usize::from(used.head)).copied().flatten()
-                        else {
-                            fault = Some(BlockError::DeviceFault);
-                            break;
-                        };
-                        if q.slot_states[usize::from(tag)]
-                            != (SlotState::Submitted { head: used.head })
-                        {
+                    Ok(Some((tag, result))) => {
+                        if q.slot_states.get(usize::from(tag)) != Some(&SlotState::Submitted) {
                             fault = Some(BlockError::DeviceFault);
                             break;
                         }
-                        q.heads[usize::from(used.head)] = None;
                         q.slot_states[usize::from(tag)] = SlotState::Finishing;
                         // SAFETY: Submitted→Finishing 唯一认领，真实 used 已结束本槽设备访问；
                         // queue 锁保持槽不可复用，仅写本轮完成元数据，不访问 payload 内容。
                         let resources =
                             unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
-                        resources.used_len = used.len;
+                        resources.completion = Some(result);
                         #[cfg(feature = "ktest")]
                         if let Some((kind, error, prefix)) = q.ktest_completion_error {
                             if kind.matches(resources) {
@@ -833,14 +1023,11 @@ impl Disk {
                 }
             }
             if fault.is_none() {
-                // SAFETY: 同一锁内重装真实 flags 与 used 复查；无借用越过此临界区。
-                continuation = unsafe {
-                    q.device
-                        .as_mut()
-                        .expect("live disk has no device")
-                        .driver_mut()
-                }
-                .enable_interrupts_and_recheck();
+                continuation = q
+                    .device
+                    .as_mut()
+                    .expect("live disk has no device")
+                    .arm_and_check();
                 #[cfg(feature = "ktest")]
                 if continuation {
                     q.counters.budget_continuations += 1;
@@ -890,7 +1077,7 @@ impl Disk {
         let slot = &self.slots[usize::from(tag)];
         // SAFETY: 本函数由唯一完成认领者或其专用 Work 调用；Finishing 阻止 prepare/reuse。
         let resources = unsafe { &mut *slot.resources.get() };
-        let (completed, error) = completion_result(slot, resources);
+        let (completed, error) = completion_result(resources);
         if error == Some(BlockError::DeviceFault) {
             self.mark_fault(BlockError::DeviceFault);
         }
@@ -911,6 +1098,7 @@ impl Disk {
         resources.part_count = 0;
         resources.configured = false;
         resources.forced_error = None;
+        resources.completion = None;
         #[cfg(feature = "ktest")]
         {
             resources.ktest_read_prefix = None;
@@ -923,6 +1111,7 @@ impl Disk {
             q.active_slots -= 1;
             if writing {
                 q.writing_slots -= 1;
+                q.slot_writes[usize::from(tag)] = None;
             }
             #[cfg(feature = "ktest")]
             {
@@ -946,8 +1135,7 @@ impl Disk {
             let claimed = {
                 let mut q = self.queue.lock();
                 assert_eq!(q.phase, QueuePhase::DmaStopped);
-                if let SlotState::Submitted { head } = q.slot_states[index] {
-                    q.heads[usize::from(head)] = None;
+                if q.slot_states[index] == SlotState::Submitted {
                     q.slot_states[index] = SlotState::Finishing;
                     // SAFETY: 真实 reset 已确认并屏障，本次转换唯一认领，设备不能再访问。
                     unsafe {
@@ -1092,14 +1280,10 @@ impl Disk {
         let mut q = self.queue.lock();
         assert!(q.accepts_children(), "pausing a stopped disk");
         q.test_paused = true;
-        // SAFETY: queue 锁串行真实 flags，设备和控制页均保活，不改变 DMA owner。
-        unsafe {
-            q.device
-                .as_mut()
-                .expect("live disk has no device")
-                .driver_mut()
-        }
-        .set_interrupts(false);
+        q.device
+            .as_mut()
+            .expect("live disk has no device")
+            .set_interrupts(false);
     }
 
     /// 恢复 queue 完成并重派已收 used 的暂留 slot，再用预建 Work 接续其他真实 used。
@@ -1112,14 +1296,10 @@ impl Disk {
                 core::mem::replace(&mut q.ktest_held_file_writeback_slots, [None; MAX_BATCH]);
             q.ktest_hold_file_writeback_page = None;
             let pending = if q.accepts_children() {
-                // SAFETY: 后端只在 queue 锁内借用，reset 使用同锁且控制区仍有效。
-                unsafe {
-                    q.device
-                        .as_mut()
-                        .expect("live disk has no device")
-                        .driver_mut()
-                }
-                .enable_interrupts_and_recheck()
+                q.device
+                    .as_mut()
+                    .expect("live disk has no device")
+                    .arm_and_check()
             } else {
                 false
             };
@@ -1146,8 +1326,10 @@ impl Disk {
         let mut q = self.queue.lock();
         assert_eq!(q.phase, QueuePhase::Live);
         q.ktest_stop.pause_used = true;
-        // SAFETY: 原控制区保活且同一 queue 锁串行 driver，仅关闭此 queue 通知。
-        unsafe { q.device.as_mut().expect("live stop fixture").driver_mut() }.set_interrupts(false);
+        q.device
+            .as_mut()
+            .expect("live stop fixture")
+            .set_interrupts(false);
     }
 
     /// 撤销本例暂停并交原进度 Work 消费真实 used；故障阶段仍不收未确认 DMA。
@@ -1210,7 +1392,7 @@ impl ActiveBio<'_> {
         let deferred = BioInner::finish_generation(&self.bio, error, Some(self.disk));
         self.finished = true;
         if !deferred {
-            self.disk.finish_generation_tail(self.bio.operation());
+            self.disk.finish_generation_tail(&self.bio);
         }
         // 延后完成由 BioState 继续保活；同步完成在 accepted 队列尾后才解除本引用。
         drop(self.fs_claim.take());
@@ -1247,12 +1429,12 @@ impl PreparingSlot<'_> {
     }
 
     /// 借用当前准备中的小 SG 元数据，不借 DMA payload。
-    pub(super) fn sg(&self) -> &[MappedSegment] {
+    pub(super) fn sg(&self) -> &[PayloadRange] {
         &self.resources().sg
     }
 
     /// SG capacity 已在 prepare 完整预留，调用者不得 reserve 或超出 limits 增长。
-    pub(super) fn sg_mut(&mut self) -> &mut Vec<MappedSegment> {
+    pub(super) fn sg_mut(&mut self) -> &mut Vec<PayloadRange> {
         &mut self.resources_mut().sg
     }
 
@@ -1323,14 +1505,13 @@ impl PreparingSlot<'_> {
             return Err(BlockError::InvalidRange);
         }
         let slot = &self.disk.slots[usize::from(self.tag)];
-        // SAFETY: Preparing 独占 tag，真实 PDU 原 owner 保活；范围/能力由 Bio 与拆分入口验证。
-        unsafe { prepare_pdu(slot.pdu, self.tag, operation, sector) }.map_err(BlockError::from)?;
+        slot.control.prepare(operation, sector)?;
         let resources = self.resources_mut();
         resources.operation = operation;
         resources.sector = sector;
         resources.bytes = bytes;
-        resources.used_len = 0;
         resources.forced_error = None;
+        resources.completion = None;
         #[cfg(feature = "ktest")]
         {
             resources.ktest_read_prefix = None;
@@ -1375,40 +1556,42 @@ impl PreparingSlot<'_> {
                 return Err(q.stopped_error());
             }
             assert_eq!(q.slot_states[usize::from(tag)], SlotState::Preparing);
-            if q.device
+            if !q
+                .device
                 .as_ref()
                 .expect("live disk has no device")
-                .driver()
-                .available_descriptors()
-                < resources.sg.len() + 2
+                .can_submit(resources.sg.len())
             {
                 return Ok(false);
             }
             for part in resources.parts.iter().flatten() {
                 part.bio.register_child(part.offset, part.length);
             }
-            // SAFETY: tag 独占且 PDU 已准备，父 memory 在 admission 交权并由 parts 保活；
-            // queue 锁保护 ring 和 reset，后端只借当前调用，未移出或交换。
-            let result = unsafe {
-                q.device
-                    .as_mut()
-                    .expect("live disk has no device")
-                    .driver_mut()
-                    .submit(tag, resources.operation, &resources.sg)
-            };
-            if let Ok(head) = result {
+            let result = q.device.as_mut().expect("live disk has no device").submit(
+                tag,
+                resources.operation,
+                resources.bytes,
+                &resources.sg,
+            );
+            if result.is_ok() {
                 for part in resources.parts.iter().flatten() {
                     part.bio.accept_child(part.offset, part.length);
                 }
-                assert!(
-                    q.heads[usize::from(head)].is_none(),
-                    "submitted head is already owned"
-                );
-                q.heads[usize::from(head)] = Some(tag);
-                q.slot_states[usize::from(tag)] = SlotState::Submitted { head };
+                q.slot_states[usize::from(tag)] = SlotState::Submitted;
                 q.pending_notify = true;
                 if resources.operation == BlkOperation::Write {
                     q.writing_slots += 1;
+                    if resources
+                        .parts
+                        .iter()
+                        .flatten()
+                        .any(|part| part._fs_claim.is_none())
+                    {
+                        q.slot_writes[usize::from(tag)] = Some((
+                            resources.sector,
+                            resources.sector + (resources.bytes / 512) as u64,
+                        ));
+                    }
                 }
                 #[cfg(feature = "ktest")]
                 {
@@ -1419,7 +1602,7 @@ impl PreparingSlot<'_> {
                         if let Some((physical, offset)) = part.bio.ktest_folio_origin(part.offset) {
                             q.ktest_folio_dma = Some((
                                 physical,
-                                segment.address.value(),
+                                segment.physical as u64,
                                 offset,
                                 segment.length as usize,
                             ));
@@ -1450,15 +1633,7 @@ impl PreparingSlot<'_> {
         match result {
             Ok(_) => Ok(true),
             Err(error) => {
-                let fault = matches!(
-                    error,
-                    Error::QueueFull | Error::DeviceNeedsReset | Error::WrongToken
-                );
-                let error = if fault {
-                    BlockError::DeviceFault
-                } else {
-                    BlockError::from(error)
-                };
+                let fault = error == BlockError::DeviceFault;
                 let resources = self.resources();
                 for part in resources.parts.iter().flatten() {
                     BioInner::finish_child(&part.bio, part.offset, part.length, 0, Some(error));
@@ -1498,61 +1673,25 @@ impl Drop for PreparingSlot<'_> {
     }
 }
 
-/// 状态成功仍须核 writable used 长度，Read 正前缀按 merged parts 的逻辑次序分配。
-fn completion_result(slot: &SlotStorage, resources: &SlotResources) -> (usize, Option<BlockError>) {
+/// 协议后端归一真实完成，受控前缀只在成功的真实请求上生效。
+fn completion_result(resources: &SlotResources) -> (usize, Option<BlockError>) {
     if let Some(error) = resources.forced_error {
         return (0, Some(error));
     }
-    KernelHal::dma_read_barrier();
-    // SAFETY: Finishing 来自真实 used；tag 不可重用，设备已结束本 PDU 的写入，原控制页保活。
-    let status = unsafe {
-        ptr::read_volatile(
-            slot.pdu
-                .cpu
-                .as_ptr()
-                .add(usize::from(slot.tag) * PDU_STRIDE + STATUS_OFFSET),
-        )
-    };
-    if let Err(error) = decode_status(status) {
-        return (0, Some(BlockError::from(error)));
-    }
-    let used = resources.used_len as usize;
-    match resources.operation {
-        BlkOperation::Read => {
-            let expected = resources.bytes + 1;
-            if used == expected {
-                #[cfg(feature = "ktest")]
-                if let Some((completed, error)) = resources.ktest_read_prefix {
-                    assert!(
-                        completed < resources.bytes,
-                        "controlled prefix has no failed tail"
-                    );
-                    return (completed, Some(error));
-                }
-                (resources.bytes, None)
-            } else if used < expected {
-                (used.saturating_sub(1), Some(BlockError::ShortIo))
-            } else {
-                (0, Some(BlockError::DeviceFault))
-            }
-        }
-        BlkOperation::Write | BlkOperation::Flush => {
-            if used == 1 {
-                (resources.bytes, None)
-            } else {
-                (0, Some(BlockError::DeviceFault))
-            }
+    let result = resources
+        .completion
+        .expect("finishing slot has no normalized result");
+    #[cfg(feature = "ktest")]
+    if result.error.is_none() && resources.operation == BlkOperation::Read {
+        if let Some((completed, error)) = resources.ktest_read_prefix {
+            assert!(
+                completed < resources.bytes,
+                "controlled prefix has no failed tail"
+            );
+            return (completed, Some(error));
         }
     }
-}
-
-/// 真实初始化失败只保实际协议错误，可能发表 DMA 的 owner 始终留在 Disk。
-fn initialization_error(error: VirtioInitError) -> BlockError {
-    match error {
-        VirtioInitError::Protocol(error) => error.into(),
-        VirtioInitError::NoMemory { .. } => BlockError::NoMemory,
-        _ => BlockError::DeviceFault,
-    }
+    (result.completed, result.error)
 }
 
 /// IRQ context 来自 pinned Disk，注销同步返回前由外部控制 owner 保活。
@@ -1568,14 +1707,21 @@ unsafe fn irq_callback(context: *mut ()) -> bool {
 fn progress_callback(work: Pin<&Work>) {
     // SAFETY: 外部 stop 在关闭此 Work 的全部票尾部后才释放 pinned Disk。
     let disk = unsafe { &*(work.context() as *const Disk) };
-    let phase = disk.queue.lock().phase;
+    let (phase, uses_work) = {
+        let q = disk.queue.lock();
+        (q.phase, q.device.as_ref().is_some_and(Backend::uses_work))
+    };
     if matches!(
         phase,
         QueuePhase::Faulting | QueuePhase::Resetting | QueuePhase::DmaStopped
     ) {
         let _ = disk.fault_reset();
     } else if matches!(phase, QueuePhase::Live | QueuePhase::Draining) {
-        disk.drain_used();
+        if uses_work {
+            disk.progress_requests();
+        } else {
+            disk.drain_used();
+        }
     }
 }
 
@@ -1587,4 +1733,34 @@ fn completion_callback(work: Pin<&Work>) {
     // SAFETY: disk context 构造时写定，Work 关闭同步返回前 Disk 不释放。
     let disk = unsafe { &*slot.disk };
     disk.finish_slot(tag);
+}
+
+/// 一个已认领 child 的全部 parts 复制到连续 CPU 范围，错误保已完整复制的连续前缀。
+///
+/// # Safety
+/// 调用者须独占覆盖 resources.bytes 的连续范围，且它不与任何原 payload 重叠。
+/// 原 child 与 CPU 访问期保活到函数返回，唯一 progress Work 串行化通道和相交范围。
+unsafe fn copy_cpu_parts(resources: &SlotResources, pointer: *mut u8) -> crate::block::IoResult {
+    let mut copied = 0;
+    for part in resources.parts.iter().flatten() {
+        if part.length == 0 {
+            continue;
+        }
+        // SAFETY: 计划范围已由 parts 总长度验证，原 child 未结束且对应 CPU 访问期仍有效；
+        // 目标/源连续范围由调用者独占，固定槽资源不被 IRQ 或另一个 Work 访问。
+        if let Err(error) = unsafe {
+            part.bio
+                .copy_cpu(part.offset, part.length, pointer.add(copied))
+        } {
+            return crate::block::IoResult {
+                completed: copied,
+                error: Some(error),
+            };
+        }
+        copied += part.length;
+    }
+    crate::block::IoResult {
+        completed: copied,
+        error: None,
+    }
 }

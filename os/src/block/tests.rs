@@ -9,7 +9,7 @@ pub(crate) fn used_index(disk: &Disk, legacy: bool) -> u16 {
     let device = queue.device.as_ref().expect("live controlled disk");
     let layout = virtio_drivers::queue::RingLayout::new(disk.limits.queue_depth, legacy)
         .expect("controlled real ring layout");
-    let ring = device.control_regions().0;
+    let ring = device.test_virtio().control_regions().0;
     crate::arch::dma_read_barrier();
     // SAFETY: 同一 queue 锁防止停止与释放；used.idx 是真实布局的对齐 u16，
     // coherent 设备拥有该字节，此处仅 volatile 读取，不创建 DMA 区的 Rust 引用。

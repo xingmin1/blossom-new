@@ -25,6 +25,82 @@ fn super_bytes() -> [u8; 1024] {
     bytes
 }
 
+/// 只向显式 scratch 的有界页片段写入格式输入，真实 Bio 完成后才释放原页。
+fn write_view_fixture(disk: &DiskRef, byte: u64, bytes: &[u8]) -> Result<(), FsError> {
+    use crate::block::{Bio, BioAllocator, BlkOperation};
+    use crate::mm::dma::MappedPages;
+    use virtio_drivers::BufferDirection;
+
+    let pages = mm::alloc_pages(0, true).ok_or(FsError::NoMemory)?;
+    let mut mapped = MappedPages::new(pages, 0, bytes.len(), BufferDirection::DriverToDevice)
+        .map_err(|_| FsError::NoMemory)?;
+    for (destination, byte) in mapped.bytes_mut().iter_mut().zip(bytes) {
+        destination.write(*byte);
+    }
+    let mut memory = Vec::new_in(BioAllocator::Heap);
+    memory.try_reserve_exact(1).map_err(|_| FsError::NoMemory)?;
+    memory.push(mapped);
+    // SAFETY: 独占页的完整映射范围已初始化，无裸别名或回调；memory 移入唯一 Bio，
+    // completion 全尾前没有 CPU 借用，真实设备收权后才领取并释放原页。
+    let bio = unsafe { Bio::try_new(disk, BlkOperation::Write, byte / 512, memory, 0, None) }?;
+    let completion = bio.completion();
+    disk.submit_bio(bio);
+    let result = completion.wait();
+    drop(completion.take_memory()?);
+    if let Some(error) = result.error {
+        return Err(error.into());
+    }
+    if result.completed != bytes.len() {
+        return Err(BlockError::ShortIo.into());
+    }
+    Ok(())
+}
+
+/// 建立无日志小卷的主元数据及单块普通文件，格式与文件内容均由生产路径读取。
+fn format_view_fixture(view: &BlockView, log_block: u32) -> Result<(), FsError> {
+    let size = 1024usize << log_block;
+    let start = view.absolute_byte(0, 64 * size)?;
+    let mut page = [0u8; mm::PAGE_SIZE];
+    let mut superblock = super_bytes();
+    for (offset, value) in [
+        (4, 64u32),
+        (20, u32::from(log_block == 0)),
+        (24, log_block),
+        (28, log_block),
+        (32, 64),
+        (36, 64),
+    ] {
+        superblock[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    page[0] = 0x52;
+    page[1024..2048].copy_from_slice(&superblock);
+    let descriptor = (u64::from(log_block == 0) + 1) * size as u64;
+    let mut group = [0u8; 32];
+    for (offset, pointer) in [(0, 5u32), (4, 6), (8, 7)] {
+        group[offset..offset + 4].copy_from_slice(&pointer.to_le_bytes());
+    }
+    if descriptor < mm::PAGE_SIZE as u64 {
+        page[descriptor as usize..descriptor as usize + group.len()].copy_from_slice(&group);
+    }
+    write_view_fixture(view.disk(), start, &page)?;
+    if mm::PAGE_SIZE as u64 <= descriptor {
+        page.fill(0);
+        page[..group.len()].copy_from_slice(&group);
+        write_view_fixture(view.disk(), start + descriptor, &page)?;
+    }
+    page.fill(0);
+    let inode = 11 * 128;
+    page[inode..inode + 2].copy_from_slice(&0x81a4u16.to_le_bytes());
+    page[inode + 4..inode + 8].copy_from_slice(&(size as u32).to_le_bytes());
+    page[inode + 26..inode + 28].copy_from_slice(&1u16.to_le_bytes());
+    page[inode + 28..inode + 32].copy_from_slice(&(size as u32 / 512).to_le_bytes());
+    page[inode + 40..inode + 44].copy_from_slice(&32u32.to_le_bytes());
+    write_view_fixture(view.disk(), start + 7 * size as u64, &page)?;
+    page.fill(0x61 + log_block as u8);
+    write_view_fixture(view.disk(), start + 32 * size as u64, &page[..size])?;
+    Ok(())
+}
+
 /// 只验证外部组件名，不把字节名转成 UTF-8 或造路径层。
 fn indexed_name(index: usize) -> [u8; 191] {
     let mut name = [b'n'; 191];
@@ -40,7 +116,11 @@ fn indexed_name(index: usize) -> [u8; 191] {
 
 /// 被拒挂载仍由 typed fixture 保持原 Disk，原错误不落入假零或 NotFound。
 fn open_error(context: &mut TestContext<'_>, fixture: &Owner, expected: FsError) -> TestResult {
-    let result = Ext4Volume::open(fixture.disk()?.clone(), AccessMode::ReadOnly, 64);
+    let result = Ext4Volume::open(
+        BlockView::whole(fixture.disk()?.clone()),
+        AccessMode::ReadOnly,
+        64,
+    );
     context.expect_eq(result.err(), Some(expected));
     context.diagnostic(format_args!(
         "ext4-reject error={:?} hardware-EIO-covered=0",
@@ -531,7 +611,11 @@ pub(crate) mod identity {
         let first_volume = fixture.open(context)?;
         let second_volume = checked(
             context,
-            Ext4Volume::open(fixture.disks[1].clone(), AccessMode::ReadOnly, 64),
+            Ext4Volume::open(
+                BlockView::whole(fixture.disks[1].clone()),
+                AccessMode::ReadOnly,
+                64,
+            ),
         )?;
         let first = fixture.file(context, &first_volume, b"pattern")?;
         let hard = fixture.file(context, &first_volume, b"hardlink")?;
@@ -552,6 +636,231 @@ pub(crate) mod identity {
             false,
         );
         Ok(())
+    }
+
+    /// 同盘相邻非页对齐卷共用物理预算，独立 canonical、脏范围、扫描、授权和 WB 错误。
+    #[test]
+    #[ktest(
+        tags("block-view", "fs-sync"),
+        resources("scratch"),
+        timeout_ms = 60000
+    )]
+    fn adjacent_views_keep_one_physical_cache_and_separate_volume_state(
+        context: &mut TestContext<'_>,
+        fixture: &mut Owner,
+    ) -> TestResult {
+        fixture.disk()?;
+        let disk = fixture
+            .disks
+            .get(2)
+            .ok_or(TestError("view boundary scratch disk missing"))?
+            .clone();
+        if disk.limits().logical_block_size != 512 || disk.limits().readonly {
+            return Err(TestError(
+                "view boundary fixture requires writable 512-byte scratch",
+            ));
+        }
+        let first_view = checked(
+            context,
+            BlockView::new(disk.clone(), 1, 128).map_err(FsError::from),
+        )?;
+        let second_view = checked(
+            context,
+            BlockView::new(disk.clone(), 129, 512).map_err(FsError::from),
+        )?;
+        checked(context, format_view_fixture(&first_view, 0))?;
+        checked(context, format_view_fixture(&second_view, 2))?;
+        let last_byte = checked(
+            context,
+            first_view
+                .absolute_byte(63 * 1024, 1024)
+                .map_err(FsError::from),
+        )?;
+        checked(context, write_view_fixture(&disk, last_byte, &[0x31; 1024]))?;
+        let first = checked(
+            context,
+            Ext4Volume::open(first_view.clone(), AccessMode::ReadWrite, 64),
+        )?;
+        let second = checked(
+            context,
+            Ext4Volume::open(second_view.clone(), AccessMode::ReadWrite, 64),
+        )?;
+        let first_inode = checked(context, fixture.cache().iget(&first, 12))?;
+        let second_inode = checked(context, fixture.cache().iget(&second, 12))?;
+        first.writeback_domain().stop_sync();
+        second.writeback_domain().stop_sync();
+        let result = (|| {
+            let reopened = checked(
+                context,
+                Ext4Volume::open(first_view.clone(), AccessMode::ReadWrite, 64),
+            )?;
+            context.expect_eq(Arc::ptr_eq(&first, &reopened), true);
+            context.expect_eq(first.device() != second.device(), true);
+            context.expect_eq(first_inode.ptr_eq(&second_inode), false);
+            context.expect_eq(
+                (first.geometry().block_size, second.geometry().block_size),
+                (1024, 4096),
+            );
+            let mut data = [0u8; mm::PAGE_SIZE];
+            context.expect_eq(
+                checked(context, first_inode.read_at(0, &mut data[..1024]))?,
+                1024,
+            );
+            context.expect_eq(data[..1024].iter().all(|byte| *byte == 0x61), true);
+            context.expect_eq(checked(context, second_inode.read_at(0, &mut data))?, 4096);
+            context.expect_eq(data.iter().all(|byte| *byte == 0x63), true);
+            let first_cache = first.metadata_cache();
+            let second_cache = second.metadata_cache();
+            context.expect_eq(Arc::ptr_eq(first_cache, second_cache), false);
+            context.expect_eq(
+                Arc::ptr_eq(
+                    &first_cache.reserve().unwrap(),
+                    &second_cache.reserve().unwrap(),
+                ),
+                true,
+            );
+            context.expect_eq(
+                crate::cache::MetadataCache::shared(second.claim(), 63).err(),
+                Some(BlockError::Busy),
+            );
+            let first_zero = checked(
+                context,
+                first_cache.get(0, 4096, None).map_err(FsError::from),
+            )?;
+            let second_zero = checked(
+                context,
+                second_cache.get(0, 4096, None).map_err(FsError::from),
+            )?;
+            context.expect_eq(
+                first_zero.folio().phys_addr() != second_zero.folio().phys_addr(),
+                true,
+            );
+            let last = checked(
+                context,
+                first_cache.get(63, 1024, None).map_err(FsError::from),
+            )?;
+            context.expect_eq(
+                checked(
+                    context,
+                    last.with_read(|bytes| bytes.iter().all(|byte| *byte == 0x31))
+                        .map_err(FsError::from),
+                )?,
+                true,
+            );
+            context.expect_eq(
+                last.update(second.claim(), |_| ()).err(),
+                Some(BlockError::InvalidRange),
+            );
+            context.expect_eq(
+                first.require_write(second.claim()),
+                Err(FsError::InvalidOperation),
+            );
+            context.expect_eq(
+                first_inode.update_metadata(second.claim(), |_| ()).err(),
+                Some(FsError::InvalidOperation),
+            );
+            checked(
+                context,
+                last.update(first.claim(), |bytes| bytes.fill(0xa1))
+                    .map_err(FsError::from),
+            )?;
+            checked(
+                context,
+                second_zero
+                    .update(second.claim(), |bytes| bytes[0] = 0xa2)
+                    .map_err(FsError::from),
+            )?;
+            let boundary = 65536;
+            context.expect_eq(first_cache.page_mask(boundary), 0x01);
+            context.expect_eq(second_cache.page_mask(boundary), 0xfe);
+            let mut from_first = [None];
+            let mut from_second = [None];
+            first_cache.select_range(
+                boundary,
+                boundary + 1,
+                crate::cache::FolioMark::Dirty,
+                &mut from_first,
+            );
+            second_cache.select_range(
+                boundary,
+                boundary + 1,
+                crate::cache::FolioMark::Dirty,
+                &mut from_second,
+            );
+            context.expect_eq(
+                from_first[0].as_ref().unwrap().1.phys_addr(),
+                from_second[0].as_ref().unwrap().1.phys_addr(),
+            );
+            first_cache.mark_to_write_range(0, u64::MAX);
+            second_cache.mark_to_write_range(0, u64::MAX);
+            first_cache.set_to_write(boundary, false);
+            from_first[0] = None;
+            from_second[0] = None;
+            first_cache.select_range(
+                boundary,
+                boundary + 1,
+                crate::cache::FolioMark::ToWrite,
+                &mut from_first,
+            );
+            second_cache.select_range(
+                boundary,
+                boundary + 1,
+                crate::cache::FolioMark::ToWrite,
+                &mut from_second,
+            );
+            context.expect_eq(from_first[0].is_none(), true);
+            context.expect_eq(from_second[0].is_some(), true);
+            let first_domain = first.writeback_domain();
+            let second_domain = second.writeback_domain();
+            let first_context =
+                first_domain.metadata_io_context(first_domain.snapshot().stop_sequence);
+            let second_context =
+                second_domain.metadata_io_context(second_domain.snapshot().stop_sequence);
+            first_domain.stop_sync();
+            context.expect_eq(first_context.check(), Err(BlockError::NotReady));
+            context.expect_eq(second_context.check(), Ok(()));
+            let mut first_error = first_cache.sample_wb_error();
+            let mut second_error = second_cache.sample_wb_error();
+            disk.test_fail_next_metadata(BlockError::Io);
+            context.expect_eq(
+                crate::fs::writeback::sync_metadata(&first),
+                Err(FsError::Io(BlockError::Io)),
+            );
+            context.expect_eq(disk.test_completion_error_pending(), false);
+            context.expect_eq(
+                first_cache.check_and_advance_wb_error(&mut first_error),
+                Err(FsError::Io(BlockError::Io)),
+            );
+            context.expect_eq(
+                second_cache.check_and_advance_wb_error(&mut second_error),
+                Ok(()),
+            );
+            context.expect_eq(first_cache.has_dirty_or_writeback(), false);
+            context.expect_eq(second_cache.has_dirty_or_writeback(), true);
+            context.expect_eq(
+                checked(
+                    context,
+                    second_zero
+                        .with_read(|bytes| bytes[0])
+                        .map_err(FsError::from),
+                )?,
+                0xa2,
+            );
+            context.expect_eq(
+                checked(
+                    context,
+                    last.with_read(|bytes| bytes.iter().all(|byte| *byte == 0xa1))
+                        .map_err(FsError::from),
+                )?,
+                true,
+            );
+            Ok(())
+        })();
+        let first_sync = checked(context, crate::fs::writeback::sync_metadata(&first));
+        let second_sync = checked(context, crate::fs::writeback::sync_metadata(&second));
+        first.writeback_domain().activate();
+        second.writeback_domain().activate();
+        result.and(first_sync).and(second_sync)
     }
 }
 
@@ -765,7 +1074,11 @@ pub(crate) mod bad_group {
     #[test]
     #[ktest(tags("B12"))]
     fn group_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
-        match Ext4Volume::open(fixture.disk()?.clone(), AccessMode::ReadOnly, 64) {
+        match Ext4Volume::open(
+            BlockView::whole(fixture.disk()?.clone()),
+            AccessMode::ReadOnly,
+            64,
+        ) {
             Err(error) => {
                 context.expect_eq(error, FsError::Checksum);
                 context.diagnostic(format_args!("ext4-group-checksum rejected-at=open"));

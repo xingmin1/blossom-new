@@ -4,13 +4,14 @@ use alloc::sync::Arc;
 use core::pin::{pin, Pin};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use virtio_drivers::MappedSegment;
+use core::cell::UnsafeCell;
 
 use crate::block::{BioAllocator, BioMemory};
-use crate::block::{BlkOperation, BlockError, Disk, DiskRef, EndIo, FsClaim, IoResult};
-use crate::drivers::virtio::VirtioIdentity;
+use crate::block::{
+    BlkOperation, BlockError, Disk, DiskIdentity, DiskRef, EndIo, FsClaim, IoResult,
+};
 use crate::fs::background::WritebackDomain;
-use crate::mm::dma::MappedPages;
+use crate::mm::dma::{DmaDomain, MappedPages, PayloadRange};
 use crate::sched;
 use crate::sync::SpinLock;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
@@ -54,7 +55,9 @@ struct BioState {
 
 /// 不可变范围与常数完成账本分开；队列 part 只强拥有此对象。
 pub(super) struct BioInner {
-    target: VirtioIdentity,
+    target: DiskIdentity,
+    domain: Option<DmaDomain>,
+    pub(super) raw_writer_next: UnsafeCell<*const BioInner>,
     operation: BlkOperation,
     sector: u64,
     len: usize,
@@ -65,6 +68,12 @@ pub(super) struct BioInner {
     ready: AtomicBool,
     waiters: WaitQueue,
 }
+
+// SAFETY: raw_writer_next 只在目标 Disk.queue 锁下读写，accepted 生成者保活链节点；
+// 其余可变状态由 state 锁保护，来源外部访问期由每个 child 的原账本结束。
+unsafe impl Send for BioInner {}
+// SAFETY: 共享引用不访问 payload，裸链的同步和寿命遵循同一个物理队列锁。
+unsafe impl Sync for BioInner {}
 
 /// 所有父、子请求及观察者同时携带原 allocator 拥有。
 pub(super) type BioArc = Arc<BioInner, BioAllocator>;
@@ -132,9 +141,14 @@ impl Bio {
                 operation,
                 sector,
                 len,
-                memory.iter().map(MappedPages::segment),
+                memory.iter().map(MappedPages::range),
                 attributes,
             )?;
+            if let Some(domain) = disk.domain {
+                for mapped in &memory {
+                    mapped.segment(domain).map_err(BlockError::from)?;
+                }
+            }
             let allocator = memory.allocator().control();
             let mut uninit = Arc::<BioInner, BioAllocator>::try_new_uninit_in(allocator)
                 .map_err(|_| BlockError::NoMemory)?;
@@ -142,6 +156,8 @@ impl Bio {
                 .expect("new bio has another owner")
                 .write(BioInner {
                     target: disk.identity(),
+                    domain: disk.domain,
+                    raw_writer_next: UnsafeCell::new(core::ptr::null()),
                     operation,
                     sector,
                     len,
@@ -305,7 +321,7 @@ impl BioCompletion {
 
 impl BioInner {
     /// 返回构造时固定的完整设备身份，不强拥有设备。
-    pub(super) fn target(&self) -> VirtioIdentity {
+    pub(super) fn target(&self) -> DiskIdentity {
         self.target
     }
 
@@ -330,13 +346,67 @@ impl BioInner {
     }
 
     /// 从唯一原拥有者复制一份有界 DMA 元数据，不导出页借用。
-    pub(super) fn segment(&self, index: usize) -> Option<MappedSegment> {
+    pub(super) fn segment(&self, index: usize) -> Option<PayloadRange> {
         self.state
             .lock()
             .memory
             .as_ref()?
             .get(index)
-            .map(MappedPages::segment)
+            .map(MappedPages::range)
+    }
+
+    /// 已登记 child 在锁外执行 CPU 复制，短锁只取得原页的有界裸地址计划。
+    ///
+    /// # Safety
+    /// 调用者持本 child 的唯一完成责任和目标 RAM 的独占复制通道，ram
+    /// 覆盖 length 字节且不与原 payload 重叠；child 完成前不得结束 CPU 访问期。
+    pub(super) unsafe fn copy_cpu(
+        &self,
+        offset: usize,
+        length: usize,
+        ram: *mut u8,
+    ) -> Result<(), BlockError> {
+        let mut index = 0;
+        let mut base = 0;
+        let mut copied = 0;
+        while copied < length {
+            let (plan, part_len, next_base) = {
+                let state = self.state.lock();
+                assert_eq!(state.phase, Phase::Active);
+                let mapped = state
+                    .memory
+                    .as_ref()
+                    .expect("CPU copy lost original memory")
+                    .get(index)
+                    .ok_or(BlockError::InvalidRange)?;
+                let end = base + mapped.len();
+                if end <= offset + copied {
+                    index += 1;
+                    base = end;
+                    continue;
+                }
+                let within = offset + copied - base;
+                let part_len = (mapped.len() - within).min(length - copied);
+                // SAFETY: 已登记 child 未完成，memory 不会移出；计划只含本 child 的范围，
+                // 单一复制通道排斥重叠访问，执行时不再借用 MappedPages。
+                let plan =
+                    unsafe { mapped.cpu_copy_range(within, part_len) }.map_err(BlockError::from)?;
+                (plan, part_len, end)
+            };
+            // SAFETY: 完整 RAM 范围独占且长度已核实；child 保原页和 CPU 访问期到返回。
+            unsafe {
+                match self.operation {
+                    BlkOperation::Read => plan.copy_from(ram.add(copied)),
+                    BlkOperation::Write => plan.copy_to(ram.add(copied)),
+                    BlkOperation::Flush => unreachable!("Flush has no CPU payload"),
+                }
+            }
+            .map_err(BlockError::from)?;
+            copied += part_len;
+            base = next_base;
+            index += 1;
+        }
+        Ok(())
     }
 
     /// 按父 payload 次序投影到实际原 folio，支持一个 Bio 内的多个原映射。
@@ -400,10 +470,10 @@ impl BioInner {
         state.writeback_domain = Some(domain.clone());
     }
 
-    /// 已接受 FS 来源在交权前保存共享占用，拒绝的 Bio 从不取得该责任。
+    /// 已接受 FS 来源在任何 child 发表之前保留共享占用，拒绝的 Bio 不取得该责任。
     pub(super) fn retain_fs_claim(&self, claim: &FsClaim) {
         let mut state = self.state.lock();
-        assert_eq!(state.phase, Phase::New);
+        assert_eq!(state.phase, Phase::Active);
         assert!(state.fs_claim.is_none());
         state.fs_claim = Some(claim.clone());
     }
@@ -414,7 +484,7 @@ impl BioInner {
     }
 
     /// 唯一 admission 在普通 Task 中建立生成者义务，再锁外交整个原 memory 给设备。
-    pub(super) fn begin(&self) {
+    pub(super) fn begin(&self) -> Result<(), BlockError> {
         sched::assert_switchable();
         let mut memory = {
             let mut state = self.state.lock();
@@ -427,15 +497,50 @@ impl BioInner {
                 .take()
                 .expect("bio memory missing at admission")
         };
+        let mut started = 0;
+        let mut failure = None;
         for mapped in &mut memory {
-            // SAFETY: 构造保证初始化及来源的 CPU/共享 WB 协议；唯一 admission
-            // 尚未发表 child，原拥有者保存在此父，全部 child 和生成者结束前不能收权。
-            unsafe { mapped.begin_device_access() };
+            // SAFETY: 唯一 admission 尚未发表 child；来源初始化和 CPU 别名义务由构造保证。
+            let result = unsafe {
+                match self.domain {
+                    Some(domain) => mapped.begin_device_access(domain),
+                    None => {
+                        mapped.begin_cpu_access();
+                        Ok(())
+                    }
+                }
+            };
+            if let Err(error) = result {
+                failure = Some(BlockError::from(error));
+                break;
+            }
+            started += 1;
+        }
+        if failure.is_some() {
+            for mapped in &mut memory[..started] {
+                // SAFETY: 尚无任何 child 或硬件引用，所有已开始访问可以立即归还。
+                unsafe {
+                    if self.domain.is_some() {
+                        mapped
+                            .finish_device_access()
+                            .expect("unpublished DMA ownership rollback failed");
+                    } else {
+                        mapped.finish_cpu_access();
+                    }
+                }
+            }
         }
         let mut state = self.state.lock();
         assert_eq!(state.phase, Phase::Beginning);
         state.memory = Some(memory);
+        if let Some(error) = failure {
+            state.phase = Phase::New;
+            state.remaining = 0;
+            state.generating = false;
+            return Err(error);
+        }
         state.phase = Phase::Active;
+        Ok(())
     }
 
     /// 按父逻辑次序在 avail 发表前登记一个 child，不分配完整 child 列表。
@@ -611,7 +716,15 @@ impl BioInner {
             for mapped in &mut memory {
                 // SAFETY: remaining 已归零并唯一移出 memory；已发表 child 只在真实 used
                 // 或确认 reset 后结束，未发表 child 没有设备引用，生成者也已结束。
-                unsafe { mapped.finish_device_access() };
+                unsafe {
+                    if bio.domain.is_some() {
+                        mapped
+                            .finish_device_access()
+                            .expect("completed DMA cache synchronization failed");
+                    } else {
+                        mapped.finish_cpu_access();
+                    }
+                };
             }
         }
         if queue_task && bio.needs_task() {
@@ -713,7 +826,7 @@ fn finalizer_callback(work: Pin<&Work>) {
     let bio = ticket.into_arc();
     let claim = bio.finalize(memory, result);
     if let Some(owner) = owner {
-        owner.finish_generation_tail(bio.operation());
+        owner.finish_generation_tail(&bio);
     }
     drop(claim);
 }

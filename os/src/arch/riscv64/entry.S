@@ -17,7 +17,11 @@ __primary_entry_phys:
     csrci sstatus, 2
     csrw satp, zero
     csrw sscratch, zero
-    // a0/a1/a2 保持固件原始值；启动构表只使用临时寄存器。
+    // 清 BSS 与构表只使用临时寄存器，四个固件参数留在 callee-saved 寄存器。
+    mv s0, a0
+    mv s1, a1
+    mv s2, a2
+    mv s3, a3
     address t0, __bss_phys_start
     address t1, __bss_phys_end
 1:  bgeu t0, t1, 2f
@@ -119,6 +123,10 @@ rv_primary_high:
     li t0, {stack_size}
     add sp, sp, t0
     mv tp, zero
+    mv a0, s0
+    mv a1, s1
+    mv a2, s2
+    mv a3, s3
     tail primary_main
 rv_secondary_high:
     .option push

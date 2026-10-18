@@ -19,7 +19,7 @@ pub(crate) mod vma;
 pub use anon::AnonPageRef;
 pub(crate) use bootmem::PAGE_SIZE;
 pub use folio::{FolioRead, FolioRef, FolioWriteback};
-pub use frame_allocator::{alloc_pages, OwnedPages};
+pub use frame_allocator::{alloc_pages, alloc_pages_in, OwnedPages};
 #[cfg(feature = "ktest")]
 pub(crate) use heap_allocator::allocation_attempts;
 pub use pcp::drain_all_pages;

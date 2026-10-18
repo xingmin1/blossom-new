@@ -133,6 +133,16 @@ pub(crate) mod mapping {
         }
     }
 
+    /// 非一致维护必须拒绝未知机制与不完整 cacheline，不能把内存屏障记为 cache flush。
+    #[test]
+    fn dma_cache_boundary() {
+        assert!(arch::dma_cache_flush(1, 64).is_err());
+        assert!(arch::dma_cache_flush(usize::MAX & !63, 64).is_err());
+        if boot::info().platform != boot::Platform::VisionFive2 {
+            assert!(arch::dma_cache_flush(0, 0).is_err());
+        }
+    }
+
     /// 单个真实应急 writer 的预算场景，不把可控LSR输入冒称硬件输入。
     #[test]
     #[case("stalled", 0u8)]

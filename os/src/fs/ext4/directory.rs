@@ -48,7 +48,7 @@ fn forget_unpublished_images(
         let Some(buffer) = buffer else {
             continue;
         };
-        buffer.folio().wait_writeback();
+        buffer.wait_writeback();
         // SAFETY: 该缓存窗口经同步 metadata_block 读入，wait_writeback 再等完该页 WB；
         // 当前 reservation 仍持物理块，旧目录根和其他读者都不能引用此准确窗口。
         unsafe { buffer.forget(volume.claim()) }.expect("unpublished directory block invalidation");

@@ -1,0 +1,246 @@
+//! AHCI 强序寄存器访问；端口窗口只由已经解析的 ABAR 派生。
+
+use crate::arch;
+use crate::block::BlockError;
+use crate::boot::Region;
+use crate::time::{self, Duration};
+use core::hint::spin_loop;
+use core::ptr;
+
+pub(super) const CAP: usize = 0x00;
+pub(super) const GHC: usize = 0x04;
+pub(super) const HOST_IS: usize = 0x08;
+pub(super) const PI: usize = 0x0c;
+pub(super) const VERSION: usize = 0x10;
+pub(super) const CAP2: usize = 0x24;
+pub(super) const BOHC: usize = 0x28;
+pub(super) const CLB: usize = 0x00;
+pub(super) const CLBU: usize = 0x04;
+pub(super) const FB: usize = 0x08;
+pub(super) const FBU: usize = 0x0c;
+pub(super) const PORT_IS: usize = 0x10;
+pub(super) const IE: usize = 0x14;
+pub(super) const CMD: usize = 0x18;
+pub(super) const TFD: usize = 0x20;
+pub(super) const SIG: usize = 0x24;
+pub(super) const SSTS: usize = 0x28;
+pub(super) const SCTL: usize = 0x2c;
+pub(super) const SERR: usize = 0x30;
+pub(super) const SACT: usize = 0x34;
+pub(super) const CI: usize = 0x38;
+pub(super) const FBS: usize = 0x40;
+pub(super) const AE: u32 = 1 << 31;
+pub(super) const HOST_IE: u32 = 1 << 1;
+pub(super) const ST: u32 = 1;
+pub(super) const FRE: u32 = 1 << 4;
+pub(super) const FR: u32 = 1 << 14;
+pub(super) const CR: u32 = 1 << 15;
+pub(super) const TASK_BUSY: u32 = 0x80 | 0x08;
+pub(super) const TASK_ERROR: u32 = 0x01 | 0x20;
+pub(super) const COMPLETION: u32 = 0x2f;
+pub(super) const ERROR: u32 = (1 << 30)
+    | (1 << 29)
+    | (1 << 28)
+    | (1 << 27)
+    | (1 << 26)
+    | (1 << 24)
+    | (1 << 22)
+    | (1 << 6)
+    | (1 << 4);
+pub(super) const INTERRUPTS: u32 = COMPLETION | ERROR;
+
+#[derive(Clone, Copy)]
+pub(super) struct Host {
+    base: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Port {
+    host: Host,
+    index: u32,
+}
+
+impl Host {
+    /// 建立永久强序窗口；资源必须已经是实际 ABAR，不能传 PCI 配置身份。
+    ///
+    /// # Safety
+    /// 调用者独占控制器，整个物理窗口已永久映射为设备内存，固件不再并发访问。
+    pub(super) unsafe fn new(region: Region) -> Result<Self, BlockError> {
+        let len = region
+            .end
+            .checked_sub(region.start)
+            .ok_or(BlockError::InvalidRange)?;
+        if region.start == 0 || region.start % 4 != 0 || len < 0x100 {
+            return Err(BlockError::InvalidRange);
+        }
+        let base = arch::mmio_address(region.start);
+        base.checked_add(len).ok_or(BlockError::InvalidRange)?;
+        Ok(Self { base, len })
+    }
+
+    /// 在已核对的永久设备窗口内执行一个小端寄存器读取。
+    pub(super) fn read(self, offset: usize) -> u32 {
+        assert!(offset % 4 == 0 && offset <= self.len - 4);
+        // SAFETY: new 的调用契约保住完整设备映射；偏移和对齐在本次访问前已检查。
+        u32::from_le(unsafe { ptr::read_volatile((self.base + offset) as *const u32) })
+    }
+
+    /// 写入设备寄存器；协议序列由拥有者的短锁或准备期独占保证。
+    pub(super) fn write(self, offset: usize, value: u32) {
+        assert!(offset % 4 == 0 && offset <= self.len - 4);
+        // SAFETY: new 保证永久可写设备映射，偏移在完整窗口内且满足 u32 对齐。
+        unsafe { ptr::write_volatile((self.base + offset) as *mut u32, value.to_le()) };
+    }
+
+    /// 从 CAP 限定的端口号取得完整的 128 字节端口窗口。
+    pub(super) fn port(self, index: u32) -> Result<Port, BlockError> {
+        if 32 <= index || self.len < 0x100 + (index as usize + 1) * 0x80 {
+            return Err(BlockError::InvalidRange);
+        }
+        Ok(Port { host: self, index })
+    }
+
+    /// 完成固件所有权交接并恢复复位前真实 CAP/PI，不制造不存在的端口。
+    pub(super) fn initialize(self, firmware_ports: Option<u32>) -> Result<(u32, u32), BlockError> {
+        self.write(GHC, (self.read(GHC) | AE) & !HOST_IE);
+        if self.read(GHC) & AE == 0 {
+            return Err(BlockError::DeviceFault);
+        }
+        let cap = self.read(CAP);
+        if cap == u32::MAX {
+            return Err(BlockError::DeviceFault);
+        }
+        let last_port = cap & 0x1f;
+        self.port(last_port)?;
+        let legal = u32::MAX >> (31 - last_port);
+        let actual = self.read(PI);
+        let ports = match firmware_ports {
+            Some(ports) if ports != 0 && ports & !legal == 0 => {
+                if actual != 0 && actual != ports {
+                    return Err(BlockError::InvalidRange);
+                }
+                ports
+            }
+            Some(_) => return Err(BlockError::InvalidRange),
+            None if actual != 0 && actual & !legal == 0 => actual,
+            None => return Err(BlockError::NotReady),
+        };
+        if 0x0001_0200 <= self.read(VERSION) && self.read(CAP2) & 1 != 0 {
+            self.write(BOHC, self.read(BOHC) | (1 << 1));
+            if !poll(Duration::from_secs(2), || {
+                self.read(BOHC) & (1 | (1 << 4)) == 0
+            }) {
+                return Err(BlockError::Busy);
+            }
+        }
+        self.write(GHC, AE | 1);
+        if !poll(Duration::from_secs(1), || self.read(GHC) & 1 == 0) {
+            return Err(BlockError::DeviceFault);
+        }
+        self.write(GHC, AE);
+        self.write(CAP, cap);
+        self.write(PI, ports);
+        if self.read(GHC) & AE == 0 || self.read(PI) != ports {
+            return Err(BlockError::DeviceFault);
+        }
+        for index in 0..=last_port {
+            if ports & (1 << index) == 0 {
+                continue;
+            }
+            let port = self.port(index)?;
+            port.write(IE, 0);
+            if !port.stop_polled() {
+                return Err(BlockError::StopUnconfirmed);
+            }
+            port.clear_pending();
+        }
+        Ok((cap, ports))
+    }
+}
+
+impl Port {
+    /// 读取本端口寄存器；端口边界由 Host::port 一次验证。
+    pub(super) fn read(self, offset: usize) -> u32 {
+        assert!(offset < 0x80);
+        self.host.read(0x100 + self.index as usize * 0x80 + offset)
+    }
+
+    /// 写入本端口寄存器，不将端口状态与 host 状态混用。
+    pub(super) fn write(self, offset: usize, value: u32) {
+        assert!(offset < 0x80);
+        self.host
+            .write(0x100 + self.index as usize * 0x80 + offset, value);
+    }
+
+    /// 确认链路已经协商为活动 SATA 设备，ATAPI 与端口倍增器不进入本驱动。
+    pub(super) fn connected(self) -> bool {
+        self.read(SSTS) & 0xf0f == 0x103 && self.read(SIG) == 0x0000_0101
+    }
+
+    /// 保留板固件的链路速度，取消低功耗入口并请求设备上电旋转。
+    pub(super) fn power_up(self, cap: u32) {
+        let mut command = self.read(CMD);
+        command &= !((0xf << 28) | (1 << 26) | (1 << 27));
+        command |= (1 << 28) | (1 << 2);
+        if cap & (1 << 27) != 0 {
+            command |= 1 << 1;
+        }
+        self.write(CMD, command);
+        self.write(SCTL, (self.read(SCTL) & !(0xf << 8)) | (3 << 8));
+        if cap & (1 << 16) != 0 {
+            self.write(FBS, 0);
+        }
+        let _ = self.read(CMD);
+    }
+
+    /// 按 W1C 应答本端口的错误和中断，再应答对应 host 位。
+    pub(super) fn clear_pending(self) {
+        self.write(SERR, self.read(SERR));
+        self.write(PORT_IS, self.read(PORT_IS));
+        self.ack_host();
+    }
+
+    /// 只清本端口的 host 状态，不认领共享线上其它端口的原因。
+    pub(super) fn ack_host(self) {
+        self.host.write(HOST_IS, 1 << self.index);
+    }
+
+    /// 只在准备期轮询停止；ST、CR、FRE、FR 的先后顺序不能合并。
+    pub(super) fn stop_polled(self) -> bool {
+        self.write(IE, 0);
+        self.write(CMD, self.read(CMD) & !ST);
+        if !poll(Duration::from_millis(500), || self.read(CMD) & CR == 0) {
+            return false;
+        }
+        self.write(CMD, self.read(CMD) & !FRE);
+        poll(Duration::from_secs(1), || self.read(CMD) & FR == 0)
+    }
+
+    /// 开放 host 的全局中断位，端口屏蔽仍由本叶单独控制。
+    pub(super) fn enable_host_irq(self) {
+        self.host.write(GHC, self.host.read(GHC) | AE | HOST_IE);
+        let _ = self.host.read(GHC);
+    }
+}
+
+/// 准备期的有限寄存器等待不创建任务、定时器或运行期轮询路径。
+pub(super) fn poll(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = time::now()
+        .checked_add(timeout)
+        .expect("AHCI deadline overflow");
+    loop {
+        if ready() {
+            return true;
+        }
+        if deadline <= time::now() {
+            return false;
+        }
+        spin_loop();
+    }
+}
+
+/// SATA DET=0 明确表示未检测到设备；链路建立中和 PHY 离线必须保留真实错误。
+pub(super) fn media_absent(status: u32) -> bool {
+    status & 0xf == 0
+}

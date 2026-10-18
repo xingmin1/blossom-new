@@ -147,6 +147,7 @@ pub(crate) struct WritebackDomain {
     state: SpinLock<State>,
     stop: SleepMutex<()>,
     source: Option<Arc<BioReserve>>,
+    metadata_sequence: AtomicU64,
     scratch: SpinLock<Option<Box<writeback::WbStorage>>>,
     dirty_pages: AtomicUsize,
     writeback_pages: AtomicUsize,
@@ -284,7 +285,11 @@ pub(crate) fn initialize() -> Result<(), FsError> {
 impl WritebackDomain {
     /// 卷发表前准备全部控制对象；context 只定位本域，接受异步工作时另交真实卷票。
     pub(crate) fn try_new(volume: &Arc<Ext4Volume>) -> Result<Arc<Self>, FsError> {
-        let source = volume.metadata_cache().reserve();
+        let source = if volume.mode() == crate::block::AccessMode::ReadWrite {
+            volume.metadata_cache().reserve()
+        } else {
+            None
+        };
         let scratch = match &source {
             Some(source) => Some(
                 Box::try_new(writeback::WbStorage::try_reserved(source.clone())?)
@@ -314,6 +319,7 @@ impl WritebackDomain {
             }),
             stop: SleepMutex::new(()),
             source,
+            metadata_sequence: AtomicU64::new(0),
             scratch: SpinLock::new(scratch),
             dirty_pages: AtomicUsize::new(0),
             writeback_pages: AtomicUsize::new(0),
@@ -334,7 +340,7 @@ impl WritebackDomain {
         Ok(domain)
     }
 
-    /// 同时捕获域与来源旧边界，再在所有 FS 业务锁外等待唯一 scratch 和完整 lane。
+    /// 捕获本卷停止边界，再在所有 FS 业务锁外等待 scratch 和共用来源中的完整 lane。
     pub(crate) fn borrow_storage(self: &Arc<Self>) -> Result<WbStorageLease, FsError> {
         sched::assert_switchable();
         let source = self.source.as_ref().ok_or(FsError::ReadOnly)?;
@@ -343,8 +349,10 @@ impl WritebackDomain {
             if !state.active || state.stopping || state.halted {
                 return Err(FsError::Io(BlockError::QueueStopped));
             }
-            // 停止先写此 state，再推进 source；domain→source 只读捕获不可能得到旧域+新源。
-            (state.stop_sequence, source.metadata_io_context().boundary())
+            (
+                state.stop_sequence,
+                self.metadata_sequence.load(Ordering::Acquire),
+            )
         };
         loop {
             if self.storage_stopped(boundary) {
@@ -388,12 +396,13 @@ impl WritebackDomain {
         state.stop_sequence != boundary || !state.active || state.stopping || state.halted
     }
 
-    /// ctx 借域原源，旧 sequence 来自本次借用而不是此处重新采样。
+    /// ctx 借本卷的停止序列与物理来源，另一卷的停止不推进此序列。
     pub(crate) fn metadata_io_context(&self, boundary: u64) -> MetadataIoContext<'_> {
-        MetadataIoContext::from_boundary(
+        MetadataIoContext::for_view(
             self.source
                 .as_ref()
                 .expect("read-only domain has no reserved metadata source"),
+            &self.metadata_sequence,
             boundary,
         )
     }
@@ -589,12 +598,13 @@ impl WritebackDomain {
             state.active = false;
             state.stopping = true;
             state.stop_sequence += 1;
+            self.metadata_sequence.fetch_add(1, Ordering::Release);
             ACTIVE_BANDWIDTH.fetch_sub(state.contribution, Ordering::Relaxed);
             state.contribution = 0;
         }
         self.waiters.wake_all();
         if let Some(source) = &self.source {
-            source.wake_stopped();
+            source.notify_available();
         }
         self.work().cancel_sync();
         self.wait_storage_returned();

@@ -159,6 +159,42 @@ impl<'a> Zone<'a> {
         Some(Block { head, order })
     }
 
+    /// 在同一自由链中选择完全落入 PFN 窗口的原阶块，失败不摘取或丢弃任何页。
+    fn allocate_in(&mut self, order: usize, start: usize, end: usize) -> Option<Block> {
+        if MAX_ORDER < order || end <= start {
+            return None;
+        }
+        let count = 1usize << order;
+        for found in order..=MAX_ORDER {
+            let mut head = self.heads[found];
+            while head != NONE {
+                let first = head.max(start).checked_add(count - 1)? & !(count - 1);
+                let block_end = head + (1usize << found);
+                if first < end && count <= end - first && first + count <= block_end {
+                    self.remove(head, found);
+                    let mut chosen = head;
+                    let mut split = found;
+                    while order < split {
+                        split -= 1;
+                        let right = chosen + (1usize << split);
+                        if first < right {
+                            self.insert(right, split);
+                        } else {
+                            self.insert(chosen, split);
+                            chosen = right;
+                        }
+                    }
+                    return Some(Block {
+                        head: chosen,
+                        order,
+                    });
+                }
+                head = self.link(head).next;
+            }
+        }
+        None
+    }
+
     /// 归还原连续块，只与同一描述符锁域中的同阶真实自由头合并。
     ///
     /// # Safety
@@ -210,6 +246,14 @@ pub(crate) fn allocate(order: usize) -> Option<Block> {
         .expect("buddy is not initialized")
         .lock()
         .allocate(order)
+}
+
+/// 在原 zone 一次选择可达连续页，不使用 PCP 或反复分配再丢弃的搜索。
+pub(crate) fn allocate_in(order: usize, start: usize, end: usize) -> Option<Block> {
+    ZONE.get()
+        .expect("buddy is not initialized")
+        .lock()
+        .allocate_in(order, start, end)
 }
 
 /// 在一份 zone guard 下逐项摘取独立零阶块，不足 count 时保留已成功取得的块。
@@ -288,6 +332,18 @@ impl TestZone<'_, '_> {
     pub(crate) fn allocate(&mut self, index: usize, order: usize) -> bool {
         assert!(self.blocks[index].is_none());
         self.blocks[index] = self.zone.allocate(order);
+        self.blocks[index].is_some()
+    }
+    /// 登记生产受限选择算法返回的唯一块，用于边界与归还断言。
+    pub(crate) fn allocate_in(
+        &mut self,
+        index: usize,
+        order: usize,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        assert!(self.blocks[index].is_none());
+        self.blocks[index] = self.zone.allocate_in(order, start, end);
         self.blocks[index].is_some()
     }
     /// 返回仍 live 块的身份和原阶，不复制其归还权。

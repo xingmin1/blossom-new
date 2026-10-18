@@ -18,7 +18,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Once;
 
 use crate::block::{
-    AccessMode, BlockError, Disk, DiskRef, FsClaim, IoResult, MetadataIoContext, SECTOR_BYTES,
+    AccessMode, BlockError, BlockView, Disk, DiskRef, FsClaim, IoResult, MetadataIoContext,
+    SECTOR_BYTES,
 };
 use crate::cache::{BufferRef, MetadataCache};
 use crate::fs::background::WritebackDomain;
@@ -172,18 +173,18 @@ pub struct Ext4Volume {
 static NEXT_DEVICE: AtomicU32 = AtomicU32::new(1);
 
 impl Ext4Volume {
-    /// 普通任务在 Disk 共同域中取得唯一卷；活卷的不同权限请求明确拒绝。
+    /// 普通任务按实际 BlockView 取得唯一卷；活卷的不同权限请求明确拒绝。
     /// RO Mount 可直接使用同一个 RW 卷，卷模式不替代挂载视图权限。
-    /// 同 Disk 活缓存的容量须完全相同；不同活 inode 缓存域由真实 token 明确拒绝。
+    /// 同盘所有活视图共享同一页预算，不同卷保留独立 canonical inode 域。
     /// 卷反向只存 Weak，外部文件页保 inode，元数据页保 cache；两者保持原占用。
     /// 加载失败不发表卷弱引用，局部 claim 与候选按 RAII 退出，不取消外部旧拥有。
     /// 候选在锁外完成元数据与回写准备，弱索引短锁只负责双查和发表。
     pub fn open(
-        disk: DiskRef,
+        view: BlockView,
         mode: AccessMode,
         metadata_capacity: usize,
     ) -> Result<Arc<Self>, FsError> {
-        let claim = Disk::claim_fs(&disk, mode)?;
+        let claim = Disk::claim_fs(&view, mode)?;
         let metadata = MetadataCache::shared(&claim, metadata_capacity)?;
         let existing = metadata.filesystem.lock().upgrade();
         if let Some(volume) = existing {
@@ -192,7 +193,7 @@ impl Ext4Volume {
             }
             return Ok(volume);
         }
-        let capacity = disk
+        let capacity = view
             .limits()
             .capacity_sectors
             .checked_mul(SECTOR_BYTES)
@@ -202,7 +203,7 @@ impl Ext4Volume {
         let geometry = superblock
             .with_read(|data| codec::decode_super(codec::bytes(data, 1024, 1024)?, capacity))??;
         drop(superblock);
-        let logical = disk.limits().logical_block_size as usize;
+        let logical = view.limits().logical_block_size as usize;
         if geometry.block_size % logical != 0 {
             return Err(FsError::Unsupported);
         }
@@ -217,7 +218,7 @@ impl Ext4Volume {
                     next.checked_add(1)
                 })
                 .map_err(|_| FsError::NoMemory)?,
-            disk,
+            disk: view.disk().clone(),
             metadata: metadata.clone(),
             geometry,
             claim,
@@ -429,6 +430,11 @@ impl Ext4Volume {
         &self.disk
     }
 
+    /// 借用本卷的真实范围，文件块号只在提交 IO 时换算为物理地址。
+    pub fn view(&self) -> &BlockView {
+        self.claim.view()
+    }
+
     /// 设置仅验收镜像使用的真实分段收权观察点；回调在卷锁之外执行。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_segment_hook(&self, hook: Option<SegmentHook>) {
@@ -567,7 +573,7 @@ impl Ext4Volume {
             };
             match targets[offset / size] {
                 Some(disk_byte) => {
-                    read = self.disk.fill_folio_range(disk_byte, read, offset, size)?;
+                    read = self.claim.fill_folio_range(disk_byte, read, offset, size)?;
                     #[cfg(feature = "ktest")]
                     {
                         let hook = self.segment_hook.lock().clone();
@@ -669,15 +675,12 @@ impl Ext4Volume {
         Ok(result)
     }
 
-    /// 核实当次挂载能力属于同一真实 Disk，并且卷和挂载都授予写许可。
+    /// 核实当次挂载能力属于同一真实视图，并且卷和挂载都授予写许可。
     pub(crate) fn require_write(&self, claim: &FsClaim) -> Result<(), FsError> {
         if claim.mode() != AccessMode::ReadWrite || self.mode() != AccessMode::ReadWrite {
             return Err(FsError::ReadOnly);
         }
-        if !core::ptr::eq(
-            claim.disk().as_ref().get_ref(),
-            self.disk.as_ref().get_ref(),
-        ) {
+        if !claim.view().same_range(self.claim.view()) {
             return Err(FsError::InvalidOperation);
         }
         Ok(())

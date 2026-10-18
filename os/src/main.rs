@@ -51,7 +51,7 @@ static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// # Safety
 /// 调用者须满足 primary_main 的 BSP、映射和固件参数约束。
 #[inline(never)]
-unsafe fn initialize_boot(arguments: [usize; 3]) {
+unsafe fn initialize_boot(arguments: [usize; 4]) {
     console::initialize();
     let hardware_id = arch::boot_hardware_id(arguments);
     // SAFETY: BSP 汇编保留实际固件参数并建立 DTB 访问映射；本核为唯一解析者。
@@ -83,12 +83,13 @@ unsafe fn initialize_boot(arguments: [usize; 3]) {
 /// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
 /// 汇编已建立内核/RAM/早期 UART 映射、独占启动栈，并清理普通 BSS。
 /// 原始参数遵守固件协议，DTB 头部及声明的完整存储范围可读且不覆盖内核；
-/// LA 的 a1 命令行在 BootInfo 容量内可读，并由固件低 RAM 保留区保护。
+/// QEMU LA 的 a1 命令行在快照容量内可读；板固件的 UHI/bootm/go 参数及引用的
+/// argv 与地址字符串须遵守对应 ABI，原始四参数在 BSS 清理前已被保存。
 #[no_mangle]
-pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize) -> ! {
+pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> ! {
     // 引导构造帧先真实返回，避免 LTO 把大数组留在 Boot 展开的 64KiB 栈上。
     // SAFETY: BSP 汇编满足本入口的独占状态、实际映射和固件参数约束。
-    unsafe { initialize_boot([arg0, arg1, arg2]) };
+    unsafe { initialize_boot([arg0, arg1, arg2, arg3]) };
     #[cfg(feature = "ktest")]
     let test_command = {
         let command = ktest::early();
@@ -151,13 +152,15 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     cpu::publish_online();
 
     early_println!(
-        "BOOT arch={} cpus={} bsp={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
+        "BOOT arch={} platform={:?} cpus={} bsp={} args={:#x},{:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
         arch::NAME,
+        resources.platform,
         resources.cpu_count,
         resources.bsp_hardware_id,
         resources.raw_args[0],
         resources.raw_args[1],
         resources.raw_args[2],
+        resources.raw_args[3],
         resources.dtb.start,
         resources.dtb.end
     );
@@ -223,24 +226,25 @@ fn enter_scheduler() -> ! {
     sched::run()
 }
 
-/// 在普通任务栈一次发现并保活设备库存，等待用户、网络和文件系统退休后执行硬件动作。
+/// 在普通任务栈一次解析启动选择并发现设备；等待用户、网络和文件系统退休后执行硬件动作。
 #[cfg(not(feature = "ktest"))]
 fn init() -> i32 {
     let inventory = drivers::discover().expect("device resource discovery failed");
     report_device_resources(&inventory);
-    let has_block = !inventory.mmio_blocks.is_empty()
-        || inventory.pci.devices().iter().any(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
-    assert!(
-        has_block,
-        "filesystem boot initialization failed: {:?}",
-        fs::FsError::MissingRoot
-    );
+    let selected =
+        fs::system::boot_devices(boot::info().bootargs()).expect("boot device selection failed");
     // SAFETY: init 是本次唯一发现后全部块设备的唯一准备者；启动页表的完整强序映射永久有效。
     // 固定 Storage 表在发表前持全部 owner，库存保留到用户、网络和文件系统全部结束。
-    let storage =
-        unsafe { storage::Storage::initialize(&inventory) }.expect("storage initialization failed");
+    // initrd 已完整保留并永久直映；本轮唯一 Storage 取得其字节拥有，固件及其他设备
+    // 不再访问该区间，用户映射不包含这些保留页，拥有持续到 RAM Disk 停止全尾结束。
+    let storage = unsafe {
+        storage::Storage::initialize(
+            &inventory,
+            selected.root.device,
+            selected.extra.map(|selector| selector.device),
+        )
+    }
+    .expect("storage initialization failed");
     crate::klog!(
         klog::Level::Info,
         "STORAGE online devices={}",
@@ -248,8 +252,8 @@ fn init() -> i32 {
     );
     // SAFETY: 库存来自上述唯一发现，Storage 只拥有块设备，网络候选仍由 init 独占。
     // 库存保留到本调用结束，启动页表的完整强序设备映射在全部消费者和停止尾部期间永久有效。
-    let operation =
-        unsafe { init_filesystems(storage, &inventory) }.expect("system lifecycle failed");
+    let operation = unsafe { init_filesystems(storage, &inventory, selected) }
+        .expect("system lifecycle failed");
     drop(inventory);
     match operation {
         task::process::ShutdownOperation::Halt => arch::halt(),
@@ -258,23 +262,23 @@ fn init() -> i32 {
     }
 }
 
-/// 普通系统沿已选目录视图启动磁盘 PID1，共享网络域；用户全部退出后结束网络并同步退休文件系统。
+/// 复用初始化 Storage 前解析的目录和设备选择启动 PID1；用户退出后结束网络并同步退休文件系统。
 ///
 /// # Safety
-/// inventory 须来自初始化 storage 的同一次唯一发现，调用者仍独占其中的网络设备。
-/// 库存与完整永久强序设备映射须覆盖本次用户、网络和文件系统的全部寿命。
+/// inventory 须来自初始化 storage 的同一次唯一发现，调用者仍独占其中的网络设备及板 MAC、PHY 和设置资源。
+/// 库存、启动资源与完整永久强序设备映射须覆盖本次用户、网络和文件系统的全部寿命。
 #[cfg(not(feature = "ktest"))]
 unsafe fn init_filesystems(
     storage: &storage::Storage,
     inventory: &drivers::DeviceInventory,
+    selected: fs::system::BootDevices<'_>,
 ) -> Result<task::process::ShutdownOperation, task::ProgramError> {
-    let selected = fs::system::boot_devices(boot::info().bootargs())?;
     let root = storage
-        .disk(selected.root)
+        .lookup(selected.root)
         .ok_or(fs::FsError::MissingRoot)?;
     let extra = selected
         .extra
-        .map(|index| storage.disk(index).ok_or(fs::FsError::MissingRoot))
+        .map(|selector| storage.lookup(selector).ok_or(fs::FsError::MissingRoot))
         .transpose()?;
     let inodes = Arc::try_new(fs::InodeCache::try_new(64)?).map_err(|_| fs::FsError::NoMemory)?;
     let inode_eviction = inodes.watch();
@@ -297,12 +301,8 @@ unsafe fn init_filesystems(
         selected.extra,
         selected.root_mode
     );
-    let has_network = !inventory.mmio_networks.is_empty()
-        || inventory.pci.devices().iter().any(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1000 | 0x1041)
-        });
-    let net_owner = if has_network {
-        // SAFETY: 调用者传递同一次库存、网络设备独占和完整永久映射义务。
+    let net_owner = if drivers::net_device::NetDevice::has_candidate(inventory) {
+        // SAFETY: 调用者传递同次库存、启动资源、网络及板设置独占和完整永久映射义务。
         // 原 NetStackOwner 在发表前保活 NIC，用户全部 join/reap 后才同步停止；失败不改用 lo。
         unsafe { net::NetStack::try_new_nic(inventory) }?
     } else {

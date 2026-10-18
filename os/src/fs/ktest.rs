@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::block::{self, AccessMode, BlockError, Disk, DiskRef};
+use crate::block::{self, AccessMode, BlockError, BlockView, Disk, DiskIdentity, DiskRef};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::Ext4Volume;
@@ -816,7 +816,11 @@ impl Owner {
     fn open(&self, context: &TestContext<'_>) -> Result<Arc<Ext4Volume>, TestError> {
         checked(
             context,
-            Ext4Volume::open(self.disk()?.clone(), AccessMode::ReadOnly, 64),
+            Ext4Volume::open(
+                BlockView::whole(self.disk()?.clone()),
+                AccessMode::ReadOnly,
+                64,
+            ),
         )
     }
 

@@ -56,6 +56,30 @@ fn same_resources(
     expected: &boot::BootInfo,
 ) {
     context.expect_eq(actual.cpu_count, expected.cpu_count);
+    context.expect_eq(actual.platform, expected.platform);
+    context.expect_eq(actual.initrd, expected.initrd);
+    context.expect_eq(actual.uart.reg_io_width, expected.uart.reg_io_width);
+    context.expect_eq(actual.uart.reg_shift, expected.uart.reg_shift);
+    context.expect_eq(actual.uart.clock_frequency, expected.uart.clock_frequency);
+    context.expect_eq(actual.uart.baud, expected.uart.baud);
+    context.expect_eq(actual.uart.dw_apb, expected.uart.dw_apb);
+    context.expect_eq(
+        actual.interrupts.source_count,
+        expected.interrupts.source_count,
+    );
+    context.expect_eq(actual.board.ccache, expected.board.ccache);
+    context.expect_eq(actual.board.cache_line_size, expected.board.cache_line_size);
+    for (left, right) in actual
+        .board
+        .liointc
+        .iter()
+        .zip(expected.board.liointc.iter())
+    {
+        context.expect_eq(left.registers, right.registers);
+        context.expect_eq(left.isr, right.isr);
+        context.expect_eq(left.parent_interrupt, right.parent_interrupt);
+        context.expect_eq(left.parent_map, right.parent_map);
+    }
     context.expect_eq(actual.hardware_ids, expected.hardware_ids);
     context.expect_eq(actual.memory, expected.memory);
     context.expect_eq(actual.memory_count, expected.memory_count);
@@ -87,6 +111,9 @@ fn same_resources(
     context.expect_eq(actual.counter_frequency, expected.counter_frequency);
 }
 
+// 平台选择发生在 suite 注册展开前，公共测试和 QEMU RTC 测试保持原模块路径。
+macro_rules! firmware_cases {
+    ($($qemu_rtc:tt)*) => {
 #[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware"), timeout_ms = 10000)]
 pub(crate) mod cases {
     use super::*;
@@ -105,14 +132,14 @@ pub(crate) mod cases {
             context.expect_eq(live.raw_args[0], live.bsp_hardware_id);
             context.expect_eq(live.raw_args[1], live.dtb.start);
         }
-        #[cfg(target_arch = "loongarch64")]
-        context.expect_eq(live.dtb.start, 0x10_0000);
+        assert_eq!(arch::boot_hardware_id(live.raw_args), live.bsp_hardware_id);
         context.diagnostic(format_args!(
-            "firmware bsp={} args={:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
+            "firmware bsp={} args={:#x},{:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
             live.bsp_hardware_id,
             live.raw_args[0],
             live.raw_args[1],
             live.raw_args[2],
+            live.raw_args[3],
             live.dtb.start,
             live.dtb.end
         ));
@@ -130,6 +157,12 @@ pub(crate) mod cases {
             .any(|r| r.start <= kernel.start && kernel.end <= r.end));
         assert!(live.reserved[..live.reserved_count].contains(&kernel));
         assert!(live.reserved[..live.reserved_count].contains(&live.dtb));
+        if let Some(initrd) = live.initrd {
+            assert!(live.reserved[..live.reserved_count].contains(&initrd));
+            assert!(live.memory[..live.memory_count]
+                .iter()
+                .any(|ram| ram.start <= initrd.start && initrd.end <= ram.end));
+        }
         assert!(parsed.reserved[..parsed.reserved_count]
             .iter()
             .all(|r| live.reserved[..live.reserved_count].contains(r)));
@@ -165,52 +198,40 @@ pub(crate) mod cases {
         }
     }
 
-    /// RTC 缺失、窗口损坏或覆盖 RAM 均由实际资源发现拒绝，不生成日历默认值。
+    /// 板资源消费真实 CPU、控制器和 UART 描述，不把硬件编号当成逻辑数组下标。
     #[test]
-    #[case("missing", 0u8)]
-    #[case("unaligned", 1u8)]
-    #[case("short_window", 2u8)]
-    #[case("ram_overlap", 3u8)]
-    fn rtc_resource_rejection(_: &mut TestContext<'_>, fixture: &mut Dtb, mode: u8) {
+    fn platform_resources(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let live = boot::info();
-        #[cfg(target_arch = "riscv64")]
-        let binding = "google,goldfish-rtc";
-        #[cfg(target_arch = "loongarch64")]
-        let binding = "loongson,ls7a-rtc";
-        let (offset, length) = {
-            let tree = fdt::Fdt::new(fixture.bytes).expect("actual DTB invalid");
-            let rtc = tree.find_compatible(&[binding]).expect("actual RTC absent");
-            let property = rtc
-                .property(if mode == 0 { "compatible" } else { "reg" })
-                .expect("actual RTC resource absent");
-            (
-                property.value.as_ptr() as usize - fixture.bytes.as_ptr() as usize,
-                property.value.len(),
-            )
-        };
-        if mode == 0 {
-            fixture.bytes[offset] = b'x';
-        } else {
-            assert_eq!(
-                length, 16,
-                "fixed virt RTC reg is not two address and two size cells"
-            );
-            match mode {
-                1 => fixture.bytes[offset + 7] |= 1,
-                2 => fixture.bytes[offset + 8..offset + 16].copy_from_slice(&4u64.to_be_bytes()),
-                3 => fixture.bytes[offset..offset + 8]
-                    .copy_from_slice(&(live.memory[0].start as u64).to_be_bytes()),
-                _ => unreachable!(),
+        let parsed = parse(fixture.bytes, live.bsp_hardware_id);
+        same_resources(context, &parsed, live);
+        for (logical, hardware) in live.hardware_ids[..live.cpu_count].iter().enumerate() {
+            context.expect_eq(crate::cpu::get(logical).hardware_id, *hardware);
+            assert!(!live.hardware_ids[..logical].contains(hardware));
+        }
+        match live.platform {
+            boot::Platform::VisionFive2 => {
+                assert!(live.hardware_ids[..live.cpu_count]
+                    .iter()
+                    .all(|id| (1..=4).contains(id)));
+                context.expect_eq(live.board.cache_line_size, 64);
+                context.expect_eq(live.uart.reg_io_width, 4);
+                context.expect_eq(live.uart.reg_shift, 2);
+                assert!(live.uart.dw_apb);
+                assert!(live.interrupts.source_count <= boot::MAX_INTERRUPT_SOURCES as u32);
+            }
+            boot::Platform::Ls2k1000la => {
+                assert!(live.hardware_ids[..live.cpu_count].iter().all(|id| *id < 2));
+                for (bank, resource) in live.board.liointc.iter().enumerate() {
+                    context.expect_eq(resource.parent_interrupt, bank as u32 + 2);
+                    assert!(0x38 <= resource.registers.end - resource.registers.start);
+                }
+            }
+            boot::Platform::QemuVirt => {
+                assert_eq!(live.board.ccache, boot::Region::default());
             }
         }
-        assert!(platform::ktest_discover_tree(
-            fixture.bytes,
-            live.raw_args,
-            live.bsp_hardware_id,
-            live.dtb.start
-        )
-        .is_err());
     }
+    $($qemu_rtc)*
 
     /// 所有不完整前缀都必须由生产边界验证拒绝。
     #[test]
@@ -278,3 +299,58 @@ pub(crate) mod cases {
         same_resources(context, &actual, &original);
     }
 }
+    };
+}
+
+#[cfg(blossom_platform = "qemu-virt")]
+firmware_cases! {
+    /// RTC 缺失、窗口损坏或覆盖 RAM 均由实际资源发现拒绝，不生成日历默认值。
+    #[test]
+    #[case("missing", 0u8)]
+    #[case("unaligned", 1u8)]
+    #[case("short_window", 2u8)]
+    #[case("ram_overlap", 3u8)]
+    fn rtc_resource_rejection(_: &mut TestContext<'_>, fixture: &mut Dtb, mode: u8) {
+        let live = boot::info();
+        #[cfg(target_arch = "riscv64")]
+        let binding = "google,goldfish-rtc";
+        #[cfg(target_arch = "loongarch64")]
+        let binding = "loongson,ls7a-rtc";
+        let (offset, length) = {
+            let tree = fdt::Fdt::new(fixture.bytes).expect("actual DTB invalid");
+            let rtc = tree.find_compatible(&[binding]).expect("actual RTC absent");
+            let property = rtc
+                .property(if mode == 0 { "compatible" } else { "reg" })
+                .expect("actual RTC resource absent");
+            (
+                property.value.as_ptr() as usize - fixture.bytes.as_ptr() as usize,
+                property.value.len(),
+            )
+        };
+        if mode == 0 {
+            fixture.bytes[offset] = b'x';
+        } else {
+            assert_eq!(
+                length, 16,
+                "fixed virt RTC reg is not two address and two size cells"
+            );
+            match mode {
+                1 => fixture.bytes[offset + 7] |= 1,
+                2 => fixture.bytes[offset + 8..offset + 16].copy_from_slice(&4u64.to_be_bytes()),
+                3 => fixture.bytes[offset..offset + 8]
+                    .copy_from_slice(&(live.memory[0].start as u64).to_be_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        assert!(platform::ktest_discover_tree(
+            fixture.bytes,
+            live.raw_args,
+            live.bsp_hardware_id,
+            live.dtb.start
+        )
+        .is_err());
+    }
+}
+
+#[cfg(not(blossom_platform = "qemu-virt"))]
+firmware_cases! {}

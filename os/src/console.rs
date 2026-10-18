@@ -2,9 +2,21 @@
 
 use crate::sync::SpinLock;
 use crate::wait::WaitQueue;
+use core::convert::TryFrom;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use spin::Once;
+
+struct PortResources {
+    base: usize,
+    width: u32,
+    shift: u32,
+    baud_base: u32,
+    dw_apb: bool,
+}
+
+static RESOURCES: Once<PortResources> = Once::new();
 
 const DATA: usize = 0;
 const IER: usize = 1;
@@ -153,22 +165,130 @@ impl RxState {
     }
 }
 
-/// 取得当前平台固定 UART 的字节寄存器地址，Rust 执行入口始终保留其映射。
-fn register(offset: usize) -> *mut u8 {
-    (crate::arch::mmio_address(crate::platform::EARLY_UART_BASE) + offset) as *mut u8
+/// 固件资源发表前仅使用编译平台的早期 UART 几何；正常路径消费同一设备快照。
+fn register(offset: usize) -> (usize, u32) {
+    if let Some(resource) = RESOURCES.get() {
+        return (
+            crate::arch::mmio_address(resource.base) + (offset << resource.shift),
+            resource.width,
+        );
+    }
+    let shift = if cfg!(blossom_platform = "visionfive2") {
+        2
+    } else {
+        0
+    };
+    let width = if cfg!(blossom_platform = "visionfive2") {
+        4
+    } else {
+        1
+    };
+    (
+        crate::arch::mmio_address(crate::platform::EARLY_UART_BASE) + (offset << shift),
+        width,
+    )
 }
 
-/// 读取字节寄存器；仅使用本模块定义的硬件偏移。
+/// 按资源声明的访问宽度读取寄存器；窄 UART 数据位保留低八位。
 fn read_register(offset: usize) -> u8 {
-    // SAFETY: 入口建立并永久保留选定 UART 映射；offset 来自有效 u8 寄存器常量，
-    // 普通访问由 PORT 串行化，故障路径只读取/写入同一硬件字节端口。
-    unsafe { register(offset).read_volatile() }
+    let (address, width) = register(offset);
+    // SAFETY: 早期编译资源与已验证 DT 资源指向同一永久 UART 映射；
+    // 宽度仅为 1/4，四字节模式的基址和 stride 均对齐，offset 来自有效寄存器编号。
+    unsafe {
+        match width {
+            1 => (address as *const u8).read_volatile(),
+            4 => (address as *const u32).read_volatile() as u8,
+            _ => unreachable!(),
+        }
+    }
 }
 
-/// 写入硬件字节寄存器，不缓存或复制设备状态。
+/// 按 UART 真实总线宽度写入寄存器，不把四字节设备拆成字节访问。
 fn write_register(offset: usize, value: u8) {
-    // SAFETY: 选定 UART 映射永久有效，offset 是本模块的字节寄存器，u8 无额外对齐。
-    unsafe { register(offset).write_volatile(value) };
+    let (address, width) = register(offset);
+    // SAFETY: 寄存器范围、对齐和永久映射与 read_register 相同；
+    // 普通访问由 PORT 串行，故障路径不建立设备内存引用。
+    unsafe {
+        match width {
+            1 => (address as *mut u8).write_volatile(value),
+            4 => (address as *mut u32).write_volatile(u32::from(value)),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// BSP 在资源和永久映射建立后一次发表 UART 几何与实际输入时钟。
+pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
+    assert!(
+        RESOURCES.get().is_none(),
+        "UART resources already configured"
+    );
+    assert_eq!(info.interrupts.uart.start, crate::platform::EARLY_UART_BASE);
+    assert!(matches!(info.uart.reg_io_width, 1 | 4));
+    let baud_base = if info.platform == crate::boot::Platform::QemuVirt {
+        if cfg!(target_arch = "riscv64") {
+            399_193
+        } else {
+            115_200
+        }
+    } else {
+        let clock = info
+            .uart
+            .clock_frequency
+            .expect("UART input clock rate is unavailable");
+        u32::try_from(clock / 16).expect("UART baud base exceeds u32")
+    };
+    assert!(0 < baud_base, "UART input clock is zero");
+    RESOURCES.call_once(|| PortResources {
+        base: info.interrupts.uart.start,
+        width: info.uart.reg_io_width,
+        shift: info.uart.reg_shift,
+        baud_base,
+        dw_apb: info.uart.dw_apb,
+    });
+}
+
+/// 判断当前串口是否具有 DesignWare 的 USR 与 busy-detect 语义。
+fn dw_apb() -> bool {
+    RESOURCES
+        .get()
+        .map_or(cfg!(blossom_platform = "visionfive2"), |resource| {
+            resource.dw_apb
+        })
+}
+
+/// 已停其它核和本核事件后关闭 UART 中断并输出末尾诊断；返回后不得再启动任何输出者。
+pub(crate) fn board_stop() {
+    let platform = match crate::platform::current() {
+        crate::boot::Platform::QemuVirt => return,
+        crate::boot::Platform::VisionFive2 => "visionfive2",
+        crate::boot::Platform::Ls2k1000la => "ls2k1000la",
+    };
+    let _port = PORT.lock();
+    write_register(IER, 0);
+    PortWriter
+        .write_fmt(format_args!(
+            "# diagnostic: board-stop platform={} reason=success scope=all-online\n",
+            platform
+        ))
+        .expect("board stop diagnostic failed");
+    while read_register(LSR) & TRANSMITTER_EMPTY == 0 {
+        spin_loop();
+    }
+}
+
+/// 当前核的事件源已经关闭时输出有界致命终点；不等待端口锁，也不声称其它核或设备已停止。
+pub(crate) fn board_stop_current_cpu() {
+    let platform = match crate::platform::current() {
+        crate::boot::Platform::QemuVirt => return,
+        crate::boot::Platform::VisionFive2 => "visionfive2",
+        crate::boot::Platform::Ls2k1000la => "ls2k1000la",
+    };
+    write_register(IER, 0);
+    let _ = emergency_writer().write_fmt(format_args!(
+        "# diagnostic: board-stop platform={} reason=failure scope=current-cpu\n",
+        platform
+    ));
 }
 
 /// 等待真实 TX 空位后写一个字节，保持输出顺序。
@@ -406,16 +526,12 @@ pub fn disable_interrupts() {
     write_register(IER, 0);
 }
 
-/// 返回本平台固定 QEMU 串口的实际 baudbase；RV 取 virt.c 传给 serial_mm_init 的 399193，LA 取同位置的 115200，不从 FDT 时钟除 16 推算。
+/// 返回硬件资源的真实 baudbase；QEMU 的 serial_mm_init 参数不等同 DT 时钟除十六。
 pub fn baud_base() -> u32 {
-    #[cfg(target_arch = "riscv64")]
-    {
-        399_193
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        115_200
-    }
+    RESOURCES
+        .get()
+        .expect("UART resources not configured")
+        .baud_base
 }
 
 /// 只读真实 LSR 的 TEMT 位；不用时钟延时代替硬件发送空标志。
@@ -549,8 +665,19 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     let (produced, notify_tx) = {
         let mut port = PORT.lock();
         let first_interrupt = read_register(IIR) & 0x0f;
+        if first_interrupt == 7 && dw_apb() {
+            let _ = read_register(0x1f);
+            return true;
+        }
         if first_interrupt & 1 != 0 {
             return false;
+        }
+        if first_interrupt == 0x0c && dw_apb() && read_register(LSR) & DATA_READY == 0 {
+            let _ = read_register(DATA);
+            return true;
+        }
+        if first_interrupt == 0 {
+            let _ = read_register(6);
         }
         let mut produced = 0;
         #[cfg(feature = "ktest")]

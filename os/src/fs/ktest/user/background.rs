@@ -396,11 +396,14 @@ fn unchanged_metadata_writeback(
         let first = bytes[0];
         bytes[..1].copy_from_slice(&[first]);
     })?;
+    if PAGE_SIZE < buffer.offset() + size {
+        return Err(FsError::InvalidOperation);
+    }
     let mut content = buffer.folio().lock_content();
     // SAFETY: 真实 metadata 窗口已读入且同字节更新建立 Dirty；内容锁排斥修改，
     // 此终身 metadata 页没有用户映射，凭证沿原 FsClaim/Bio 全尾收权。
-    let writeback =
-        unsafe { content.begin_writeback(0, size)? }.ok_or(FsError::InvalidOperation)?;
+    let writeback = unsafe { content.begin_writeback(buffer.offset(), size)? }
+        .ok_or(FsError::InvalidOperation)?;
     Ok(writeback.with_writeback_domain(volume.writeback_domain(), false))
 }
 
@@ -423,7 +426,10 @@ fn reserved_metadata_bio(
         Bio::try_new(
             volume.claim().disk(),
             BlkOperation::Write,
-            block * volume.geometry().block_size as u64 / 512,
+            volume.view().absolute_byte(
+                block * volume.geometry().block_size as u64,
+                volume.geometry().block_size,
+            )? / 512,
             memory,
             0,
             None,
@@ -486,11 +492,15 @@ pub(crate) mod waves {
             .clone();
         let host = checked(
             context,
-            Ext4Volume::open(root_disk, AccessMode::ReadOnly, 64),
+            Ext4Volume::open(BlockView::whole(root_disk), AccessMode::ReadOnly, 64),
         )?;
         let volume = checked(
             context,
-            Ext4Volume::open(extra_disk.clone(), AccessMode::ReadWrite, 64),
+            Ext4Volume::open(
+                BlockView::whole(extra_disk.clone()),
+                AccessMode::ReadWrite,
+                64,
+            ),
         )?;
         fixture.write.cold_volume = Some(volume.clone());
         if volume.geometry().block_size != PAGE_SIZE {
@@ -650,7 +660,7 @@ pub(crate) mod waves {
         let disk = fixture.write.user.path.owner.disk()?.clone();
         let volume = checked(
             context,
-            Ext4Volume::open(disk.clone(), AccessMode::ReadWrite, 64),
+            Ext4Volume::open(BlockView::whole(disk.clone()), AccessMode::ReadWrite, 64),
         )?;
         fixture.write.cold_volume = Some(volume.clone());
         let cache = Arc::try_new(checked(context, InodeCache::try_new(4))?)
@@ -664,7 +674,7 @@ pub(crate) mod waves {
             .reserve()
             .ok_or(TestError("source stop has no reserve"))?;
         fixture.source = Some(source.clone());
-        let old_context = source.metadata_io_context();
+        let old_context = domain.metadata_io_context(domain.snapshot().stop_sequence);
         let cold_block = volume.geometry().blocks_count - 1;
         context.expect_eq(
             checked(
@@ -940,7 +950,7 @@ pub(crate) mod waves {
         let disk = fixture.write.user.path.owner.disk()?.clone();
         let volume = checked(
             context,
-            Ext4Volume::open(disk.clone(), AccessMode::ReadWrite, 64),
+            Ext4Volume::open(BlockView::whole(disk.clone()), AccessMode::ReadWrite, 64),
         )?;
         fixture.write.cold_volume = Some(volume.clone());
         if volume.geometry().block_size != PAGE_SIZE {
@@ -1406,7 +1416,7 @@ pub(crate) mod waves {
         let volume = checked(
             context,
             Ext4Volume::open(
-                fixture.write.user.path.owner.disk()?.clone(),
+                BlockView::whole(fixture.write.user.path.owner.disk()?.clone()),
                 AccessMode::ReadWrite,
                 64,
             ),

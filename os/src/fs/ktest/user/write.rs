@@ -398,7 +398,7 @@ impl WriteOwner {
         let volume = checked(
             context,
             Ext4Volume::open(
-                self.user.path.owner.disk()?.clone(),
+                BlockView::whole(self.user.path.owner.disk()?.clone()),
                 AccessMode::ReadWrite,
                 64,
             ),
@@ -1116,7 +1116,7 @@ fn prepare_unlinked_original_writeback(
         // 同源共享 W 并完成全 CPU CSD，返回凭证随后由原 FsClaim/Bio 全尾收权。
         if let Some(writeback) = unsafe { content.begin_writeback(offset, block_size)? } {
             ranges.push((
-                target,
+                volume.view().absolute_byte(target, block_size)?,
                 writeback.with_writeback_domain(volume.writeback_domain(), false),
             ));
         }

@@ -154,7 +154,9 @@ fn bio(
     };
     let mapped = MappedPages::new(pages, 0, unit, direction)
         .map_err(|_| TestError("scratch original page mapping failed"))?;
-    let original = mapped.segment();
+    let original = mapped
+        .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+        .expect("QEMU fixture mapping must be reachable");
     let mut memory = Vec::new_in(BioAllocator::Heap);
     memory
         .try_reserve_exact(1)
@@ -315,7 +317,9 @@ impl Owner {
             .map_err(|_| TestError("original Bio page not reclaimable"))?;
         context.expect_eq(memory.len(), 1);
         if let Some(mapped) = memory.first() {
-            let segment = mapped.segment();
+            let segment = mapped
+                .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                .expect("QEMU fixture mapping must be reachable");
             context.expect_eq(
                 (segment.address, segment.length, segment.direction),
                 (original.address, original.length, original.direction),
@@ -516,13 +520,15 @@ impl Owner {
             (1, 0),
         );
         context.expect_eq(q.active_slots, 1);
-        context.expect_eq(q.heads.iter().flatten().count(), 1);
+        context.expect_eq(q.device.as_ref().unwrap().test_inflight(), 1);
         context.expect_eq(
-            q.device.as_ref().map(VirtioDevice::requires_reset),
+            q.device
+                .as_ref()
+                .map(|backend| backend.test_virtio().requires_reset()),
             Some(true),
         );
         let controls = q.device.as_ref().map(|device| {
-            let (ring, pdu) = device.control_regions();
+            let (ring, pdu) = device.test_virtio().control_regions();
             (ring.device.value(), ring.len, pdu.device.value(), pdu.len)
         });
         context.expect_eq(controls, Some(self.controls));

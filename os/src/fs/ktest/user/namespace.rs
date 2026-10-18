@@ -1136,7 +1136,10 @@ fn cold_reopen_namespace(
     context.expect_eq(weak_volume.upgrade().is_none(), true);
     context.expect_eq(weak_metadata.upgrade().is_none(), true);
 
-    let volume = checked(context, Ext4Volume::open(disk, AccessMode::ReadWrite, 64))?;
+    let volume = checked(
+        context,
+        Ext4Volume::open(BlockView::whole(disk), AccessMode::ReadWrite, 64),
+    )?;
     let cache = Arc::try_new(checked(context, InodeCache::try_new(64))?)
         .map_err(|_| TestError("cold namespace cache owner OOM"))?;
     fixture.user.path.owner.cache = Some(cache.clone());

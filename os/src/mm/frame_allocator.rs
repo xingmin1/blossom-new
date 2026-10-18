@@ -90,3 +90,24 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
     }
     Some(pages)
 }
+
+/// 从原 buddy 的物理半开窗口取得完整连续块，清零发生在 zone 锁退出之后。
+/// 窗口两端向内取整，不自动排空 PCP、不睡眠或调用另一分配器。
+pub fn alloc_pages_in(
+    order: usize,
+    zeroed: bool,
+    physical_start: usize,
+    physical_end: usize,
+) -> Option<OwnedPages> {
+    let start = physical_start.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
+    let end = physical_end / PAGE_SIZE;
+    let block = buddy::allocate_in(order, start, end)?;
+    let mut pages = OwnedPages { block };
+    if zeroed {
+        let len = pages.len();
+        // SAFETY: 原 buddy 已摘下且唯一移交完整连续块，全部 zone 锁已释放；
+        // 本拥有者独占 len 字节，启动 MM 已建立永久可写 RAM 直映。
+        unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0, len) };
+    }
+    Some(pages)
+}

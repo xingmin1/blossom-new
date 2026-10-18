@@ -1,10 +1,6 @@
 OUTPUT_ARCH(riscv)
 ENTRY(__primary_entry_phys)
-__kernel_phys_start = 0x80200000;
-__kernel_virt_start = 0xffffffff80000000;
-__direct_base = 0xffffffd600000000;
-__mmio_base = 0xffffffc000000000;
-__phys_ram_base = 0x80000000;
+INCLUDE platform-layout.ld
 PHDRS { boot PT_LOAD FLAGS(5); text PT_LOAD FLAGS(5); rodata PT_LOAD FLAGS(4); data PT_LOAD FLAGS(6); }
 SECTIONS {
   . = __kernel_phys_start;

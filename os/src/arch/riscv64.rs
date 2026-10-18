@@ -12,6 +12,7 @@ use core::{
 };
 
 mod mmu;
+mod rtc;
 mod signal;
 mod uaccess;
 mod user;
@@ -21,6 +22,7 @@ pub use mmu::{
     user_leaf_entry, user_leaf_mkclean, user_leaf_permissions, user_table_entry,
     SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS, USER_STACK_TOP,
 };
+pub use rtc::board_rtc_calendar;
 pub(crate) use signal::SIGNAL_MIN_STACK;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 #[cfg(feature = "ktest")]
@@ -165,8 +167,40 @@ pub(super) fn dma_barrier() {
     unsafe { asm!("fence iorw, iorw", options(nostack)) };
 }
 
+/// 对完整隔离的 64B 物理行执行 ccache clean+invalidate，未知机制不返回成功。
+pub fn dma_cache_flush(physical: usize, length: usize) -> Result<(), &'static str> {
+    let info = crate::boot::info();
+    if info.platform != crate::boot::Platform::VisionFive2 {
+        return Err("RISC-V noncoherent DMA cache maintenance is unsupported");
+    }
+    if info.board.cache_line_size != 64 || (physical | length) & 63 != 0 {
+        return Err("ccache DMA range is not cacheline aligned");
+    }
+    let end = physical
+        .checked_add(length)
+        .ok_or("ccache DMA range overflows")?;
+    let resource = info.board.ccache;
+    if resource.start & 7 != 0 || resource.end - resource.start < 0x208 {
+        return Err("ccache FLUSH64 register is unavailable");
+    }
+    if !info.memory[..info.memory_count]
+        .iter()
+        .any(|ram| ram.start <= physical && end <= ram.end)
+    {
+        return Err("ccache DMA range is outside RAM");
+    }
+    dma_barrier();
+    for line in (physical..end).step_by(64) {
+        // SAFETY: 已验证完整 FLUSH64 窗口和八字节对齐，最终页表永久映射 ccache；
+        // 每次写入 RV64 完整 PA，调用者的 DMA owner 已隔离整行并串行 CPU/设备访问。
+        unsafe { ((mmio_address(resource.start) + 0x200) as *mut u64).write_volatile(line as u64) };
+    }
+    dma_barrier();
+    Ok(())
+}
+
 /// 从固件原始参数取得真实 BSP hart ID。
-pub fn boot_hardware_id(args: [usize; 3]) -> usize {
+pub fn boot_hardware_id(args: [usize; 4]) -> usize {
     args[0]
 }
 /// 将实际 RAM 物理地址转换成直映地址；只计算地址，不证明该地址已经映射。
@@ -248,7 +282,7 @@ struct BootMapping {
     flags: usize,
 }
 
-const MAX_BOOT_MAPPINGS: usize = 1 + MAX_MEMORY_REGIONS + 3 + MAX_VIRTIO_MMIO + 1 + 4;
+const MAX_BOOT_MAPPINGS: usize = 1 + MAX_MEMORY_REGIONS + 3 + MAX_VIRTIO_MMIO + 1 + 4 + 16;
 
 /// 在建表之前核对页边界、canonical VA 和所有实际映射的虚拟范围不重叠。
 fn add_mapping(
@@ -296,6 +330,9 @@ fn add_device_mapping(
     count: &mut usize,
     region: Region,
 ) {
+    if region.start == region.end {
+        return;
+    }
     let physical = Region {
         start: region.start & !4095,
         end: region
@@ -304,6 +341,13 @@ fn add_device_mapping(
             .expect("MMIO page rounding overflows")
             & !4095,
     };
+    if mappings[..*count].iter().any(|mapping| {
+        mapping.virtual_start == mmio_address(mapping.physical.start)
+            && mapping.physical.start <= physical.start
+            && physical.end <= mapping.physical.end
+    }) {
+        return;
+    }
     add_mapping(
         mappings,
         count,
@@ -311,6 +355,30 @@ fn add_device_mapping(
         physical,
         0xc6,
     );
+}
+
+/// 设备使用的时钟、复位与引脚控制器只按真实 provider 建立 MMIO，不生成虚构窗口。
+fn add_setup_mappings(
+    mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
+    count: &mut usize,
+    setup: &crate::boot::DeviceSetup,
+) {
+    for region in setup.clocks.entries[..setup.clocks.count]
+        .iter()
+        .chain(setup.clocks.assigned[..setup.clocks.assigned_count].iter())
+        .flat_map(|clock| [Some(clock.reference), clock.parent])
+        .flatten()
+        .map(|reference| reference.provider)
+        .chain(
+            setup.resets[..setup.reset_count]
+                .iter()
+                .map(|reference| reference.provider),
+        )
+        .chain(setup.pins[..setup.pin_count].iter().map(|pin| pin.provider))
+        .filter(|region| region.start < region.end)
+    {
+        add_device_mapping(mappings, count, region);
+    }
 }
 
 /// 按实际 2MiB/4KiB 叶项计算唯一 L1/L0 表数，64页不足时在写表前明确失败。
@@ -342,7 +410,7 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
 ///
 /// # Safety
 /// 只能由关闭 IRQ 的 BSP 在使用 bootstrap 表且 AP 尚未释放时调用一次。
-/// info 描述真实 QEMU RAM/设备，RAM 覆盖当前栈、CpuLocal、页表池及全部内核资源；
+/// info 描述真实 RAM/设备，RAM 覆盖当前栈、CpuLocal、页表池及全部内核资源；
 /// 不得与其他页表访问并发。IO ranges 不作为内存或 DMA RAM 映射。
 pub unsafe fn finish_boot_mappings(info: &BootInfo) {
     let kernel = Region {
@@ -375,13 +443,50 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             0xc6,
         );
     }
-    for region in [info.interrupts.uart, info.interrupts.controller, info.rtc] {
+    for region in [
+        info.interrupts.uart,
+        info.interrupts.controller,
+        info.rtc,
+        info.board.ccache,
+        info.board.pmc,
+        info.board.clock_inputs.pll_registers,
+    ]
+    .iter()
+    .copied()
+    .filter(|region| region.start < region.end)
+    {
         add_device_mapping(&mut mappings, &mut count, region);
+    }
+    for reference in info.uart.clocks.entries[..info.uart.clocks.count]
+        .iter()
+        .chain(info.uart.clocks.assigned[..info.uart.clocks.assigned_count].iter())
+        .flat_map(|clock| [Some(clock.reference), clock.parent])
+        .flatten()
+    {
+        if reference.provider.start < reference.provider.end {
+            add_device_mapping(&mut mappings, &mut count, reference.provider);
+        }
+    }
+    add_setup_mappings(&mut mappings, &mut count, &info.board.rtc_setup);
+    if let Some(mmc) = info.board.mmc {
+        add_device_mapping(&mut mappings, &mut count, mmc.registers);
+        add_device_mapping(&mut mappings, &mut count, mmc.syscon);
+        add_setup_mappings(&mut mappings, &mut count, &mmc.setup);
+    }
+    if let Some(gmac) = info.board.gmac {
+        add_device_mapping(&mut mappings, &mut count, gmac.registers);
+        add_device_mapping(&mut mappings, &mut count, gmac.syscon);
+        add_setup_mappings(&mut mappings, &mut count, &gmac.setup);
+    }
+    if let Some(ahci) = info.board.ahci {
+        add_device_mapping(&mut mappings, &mut count, ahci.registers);
     }
     for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
         add_device_mapping(&mut mappings, &mut count, resource.registers);
     }
-    add_device_mapping(&mut mappings, &mut count, info.pci.configuration);
+    if info.pci.configuration.start < info.pci.configuration.end {
+        add_device_mapping(&mut mappings, &mut count, info.pci.configuration);
+    }
     for range in &info.pci.ranges[..info.pci.range_count] {
         if matches!(range.flags & 0x0300_0000, 0x0200_0000 | 0x0300_0000) {
             add_device_mapping(&mut mappings, &mut count, range.cpu);
@@ -410,6 +515,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         RV_FINAL_SATP = (8usize << 60) | (virt_to_phys(table(0) as usize) >> 12);
         asm!("fence rw, rw", "csrw satp, {0}", "sfence.vma", in(reg) RV_FINAL_SATP, options(nostack));
     }
+    crate::console::configure_resources(info);
 }
 /// 安装本核唯一 CpuLocal 基址，随后 trap 与普通代码共享该对象。
 ///
@@ -617,7 +723,7 @@ fn claim_offset() -> usize {
 /// 初始化所有合法源的 priority，并将固定路由只保留在实际 BSP 的 S context。
 ///
 /// # Safety
-/// info 是已发布的实际 QEMU PLIC 描述，设备窗口已映射；source_count 不超过 1024，
+/// info 是已发布的实际 PLIC 描述，设备窗口已映射；source_count 不超过 1024，
 /// 所有 S context 的 enable/threshold/claim 槽完整落在窗口内。
 /// BSP 必须关闭 IRQ 且 AP 尚未释放，不能与 claim/complete 或 enable 访问并发。
 pub unsafe fn external_init(info: &BootInfo) {
@@ -691,22 +797,91 @@ pub unsafe fn external_complete(source: u32) {
 }
 /// 用户与 FS 生命周期已停稳后请求 SBI SRST poweroff，拒绝固件错误和异常返回。
 pub fn shutdown() -> ! {
+    let _stop = if crate::platform::current() == crate::boot::Platform::VisionFive2 {
+        Some(crate::cpu::stop_other_online_cpus())
+    } else {
+        None
+    };
+    if crate::platform::current() == crate::boot::Platform::VisionFive2 {
+        disable_stop_sources();
+    }
+    crate::console::board_stop();
     system_reset(0)
 }
 
-/// 所选固件平台的 HALT 与 poweroff 使用同一整机停止动作，调用前生命周期必须停稳。
+/// 板 HALT 在其它核确认停止后永久等待；QEMU 保留原 SBI 整机停止行为。
 pub fn halt() -> ! {
-    shutdown()
+    if crate::platform::current() == crate::boot::Platform::QemuVirt {
+        shutdown();
+    }
+    let _stop = crate::cpu::stop_other_online_cpus();
+    disable_stop_sources();
+    crate::console::board_stop();
+    loop {
+        wait_for_interrupt();
+    }
 }
 
 /// 用户与 FS 生命周期已停稳后请求 SBI SRST cold restart，拒绝固件错误和异常返回。
 pub fn restart() -> ! {
+    let _stop = if crate::platform::current() == crate::boot::Platform::VisionFive2 {
+        Some(crate::cpu::stop_other_online_cpus())
+    } else {
+        None
+    };
+    if crate::platform::current() == crate::boot::Platform::VisionFive2 {
+        disable_stop_sources();
+    }
+    crate::console::board_stop();
     system_reset(1)
 }
 
-/// 早期或致命错误仅请求固件 poweroff，不等待 AP、CSD 或文件生命周期。
+/// 板致命错误关闭当前核事件后永久停核，只发布 current-cpu 终点，不等待故障 AP/CSD。
 pub fn emergency_shutdown() -> ! {
+    if crate::platform::current() == crate::boot::Platform::VisionFive2 {
+        disable_stop_sources();
+        crate::console::board_stop_current_cpu();
+        loop {
+            wait_for_interrupt();
+        }
+    }
     system_reset(0)
+}
+
+/// 已完成 catalog 或具名测试后停止板观察，保留原结果而不伪造物理 poweroff。
+#[cfg(feature = "ktest")]
+pub fn test_shutdown() -> ! {
+    if crate::platform::current() == crate::boot::Platform::QemuVirt {
+        system_reset(0);
+    }
+    let _stop = if crate::cpu::current().online.load(Ordering::Acquire) {
+        Some(crate::cpu::stop_other_online_cpus())
+    } else {
+        None
+    };
+    disable_stop_sources();
+    crate::console::board_stop();
+    loop {
+        wait_for_interrupt();
+    }
+}
+
+/// 永久停核确认发生在本核事件已关闭以后；确认对象仅承载一次停止事实。
+pub(crate) fn stop_current_cpu(stopped: &AtomicBool) -> ! {
+    disable_stop_sources();
+    stopped.store(true, Ordering::Release);
+    loop {
+        wait_for_interrupt();
+    }
+}
+
+/// 永久停止前关闭本核 timer、全局 IRQ 和中断使能源，不再恢复执行上下文。
+fn disable_stop_sources() {
+    irq_save();
+    disable_timer();
+    // SAFETY: S-mode 可清本核 sie；调用者决定永久停止，不再依赖 IRQ 返回或调度。
+    unsafe { asm!("csrw sie, zero", options(nostack)) };
+    dma_barrier();
 }
 
 /// 使用 SRST 的明确 reset type 和无故障 reason；成功动作不得返回内核。

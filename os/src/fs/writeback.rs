@@ -445,6 +445,7 @@ fn prepare_file_page(
         // 原页使用 coherent ToDevice，之后的原始写另记 Dirty，不导出 Rust 内容切片；
         // 返回凭证移入唯一父 Bio，设备及生成者全尾前始终保活 inode 和原页。
         if let Some(writeback) = unsafe { content.begin_writeback(offset, size)? } {
+            let target = volume.view().absolute_byte(target, size)?;
             storage
                 .ranges
                 .push((target, writeback.with_writeback_domain(domain, background)));
@@ -469,7 +470,7 @@ fn prepare_metadata_page(
             folio.lock_content()
         }
     };
-    let mut pending = folio.dirty_sectors();
+    let mut pending = folio.dirty_sectors() & volume.metadata_cache().page_mask(byte_offset);
     while pending != 0 {
         let start = pending.trailing_zeros() as usize;
         let count = (pending >> start).trailing_ones() as usize;

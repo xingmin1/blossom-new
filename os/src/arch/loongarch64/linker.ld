@@ -1,8 +1,6 @@
 OUTPUT_ARCH(loongarch)
 ENTRY(__primary_entry)
-__direct_base = 0x9000000000000000;
-__mmio_base = 0x8000000000000000;
-__kernel_phys_start = 0x90000000;
+INCLUDE platform-layout.ld
 PHDRS {
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);
@@ -10,7 +8,6 @@ PHDRS {
 }
 SECTIONS {
     . = __direct_base + __kernel_phys_start;
-    __kernel_virt_start = .;
     .text : AT(ADDR(.text) - __direct_base) {
         PROVIDE(__executable_start = .);
         KEEP(*(.text.entry))

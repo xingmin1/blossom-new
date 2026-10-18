@@ -18,13 +18,13 @@ use virtio_drivers::{
 
 use crate::{
     drivers::{
-        virtio::{VirtioIdentity, VirtioInitError},
+        virtio::{dma_protocol, qemu_dma_domain, VirtioIdentity, VirtioInitError},
         DeviceInventory, ProbeError,
     },
     irq::{self, IrqNumber, IrqRegistration},
     mm::{
         self,
-        dma::{CoherentDma, KernelHal, MappedPages},
+        dma::{CoherentDma, DmaDomain, KernelHal, MappedPages},
     },
     net::{stats::InterfaceStats, NetStack, NetStackRef},
     sync::{SleepMutex, SpinLock},
@@ -66,6 +66,7 @@ struct Slot {
 /// 控制视图在原页之前析构；外层 ManuallyDrop 保住失败时的全部拥有。
 struct Inner {
     driver: ManuallyDrop<Driver>,
+    domain: DmaDomain,
     rx_ring: ManuallyDrop<CoherentDma>,
     tx_ring: ManuallyDrop<CoherentDma>,
     rx: Vec<Slot>,
@@ -136,6 +137,7 @@ impl VirtioNet {
     ) -> Result<Arc<Self>, VirtioInitError> {
         crate::sched::assert_switchable();
         assert_eq!(cpu, 0, "NIC progress must use CPU0");
+        let domain = qemu_dma_domain()?;
         // SAFETY: 调用者承担真实库存、永久映射与独占硬件义务，选择不重新枚举资源。
         let (mut transport, identity, interrupt) = unsafe { select_transport(inventory) }?;
         if transport.device_type() != DeviceType::Network {
@@ -148,7 +150,7 @@ impl VirtioNet {
         KernelHal::dma_barrier();
         let info = Driver::negotiate(&mut transport)?;
         let status = transport.get_status();
-        let inner = prepare_inner(transport, info)?;
+        let inner = prepare_inner(transport, info, domain)?;
         let nic = Arc::try_new(Self {
             state: SpinLock::new(State {
                 phase: Phase::Prepared,
@@ -243,6 +245,7 @@ impl VirtioNet {
 
     /// 锁内认领固定槽，锁外纯编码，再在共同队列锁内交权、提交与安装唯一 head。
     /// writer 不得分配、uaccess、睡眠或反调协议；false 仅为真实槽满且不会调用 writer。
+    /// 映射、交权或提交失败均保留原槽页，设备访问只由真实 used 或确认 reset 结束。
     pub fn try_transmit(
         &self,
         frame_len: usize,
@@ -291,21 +294,43 @@ impl VirtioNet {
                 2 <= inner.driver.available_tx_descriptors(),
                 "TX preparation lost reserved descriptors"
             );
-            let slot = &mut inner.tx[prepared.slot];
-            assert!(slot.state == SlotState::Preparing && slot.page.is_none());
-            slot.page = prepared.page.take();
-            slot.frame_len = frame_len;
-            slot.state = SlotState::DeviceOwned;
-            let page = slot.page.as_mut().unwrap();
-            // SAFETY: writer 的 CPU 别名已结束，整映射首次清零，头每次全零；
-            // 页已移回固定原槽且受共同队列锁保护，reset/used 前绝不释放。
-            unsafe { page.begin_device_access() };
-            // SAFETY: 此映射方向为 ToDevice，长度是本次真实帧长，原槽保活完整访问期；
-            // 队列锁排除 used 消费，head 表在解锁前安装，两个 SG 只引用本页。
-            let result =
-                unsafe { inner.driver.submit_tx(page.segment(), frame_len) }.and_then(|head| {
-                    install_head(&mut inner.tx, &mut inner.tx_heads, prepared.slot, head)
-                });
+            let domain = inner.domain;
+            let segment = {
+                let slot = &mut inner.tx[prepared.slot];
+                assert!(slot.state == SlotState::Preparing && slot.page.is_none());
+                slot.page = prepared.page.take();
+                slot.frame_len = frame_len;
+                slot.state = SlotState::Free;
+                let page = slot.page.as_mut().unwrap();
+                match page.segment(domain).map_err(dma_protocol) {
+                    Ok(segment) => {
+                        // SAFETY: writer 的 CPU 别名已结束，整映射首次清零，头每次全零；
+                        // 页已移回固定原槽且受共同队列锁保护，reset/used 前绝不释放。
+                        match unsafe { page.begin_device_access(domain) }.map_err(dma_protocol) {
+                            Ok(()) => {
+                                slot.state = SlotState::DeviceOwned;
+                                Ok(segment)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            let result = match segment {
+                Ok(segment) => {
+                    // SAFETY: 此映射方向为 ToDevice，长度是本次真实帧长，原槽保活完整访问期；
+                    // 队列锁排除 used 消费，head 表在解锁前安装，两个 SG 只引用本页。
+                    let head = unsafe { inner.driver.submit_tx(segment, frame_len) };
+                    match head {
+                        Ok(head) => {
+                            install_head(&mut inner.tx, &mut inner.tx_heads, prepared.slot, head)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 state.failure = Some(error);
                 state.phase = Phase::Faulted;
@@ -405,23 +430,26 @@ impl VirtioNet {
         self.observation
             .unregistered
             .store(true, core::sync::atomic::Ordering::Release);
-        let mut owner = {
+        let owner = {
             let mut state = self.state.lock();
+            let inner: &mut Inner = state.inner.as_mut().unwrap();
+            let status = inner.driver.status();
+            for slot in inner.rx.iter_mut().chain(inner.tx.iter_mut()) {
+                let page = slot
+                    .page
+                    .as_mut()
+                    .expect("NIC CPU owner missing after all tails");
+                if page.is_device_owned() {
+                    // SAFETY: 所有 CPU producer/通知与 Work 已退出，真实 status0 和完整屏障
+                    // 证明设备结束全部范围访问，己 IRQ 已同步注销；此页只由当前原槽拥有。
+                    unsafe { page.finish_device_access() }
+                        .map_err(|error| VirtioInitError::dma_prepare(error, status))?;
+                }
+            }
+            // 同步失败时 Inner 仍在原设备中，活动页不随错误返回析构或提前归还。
             state.must_reset = false;
             state.inner.take().unwrap()
         };
-        let inner: &mut Inner = &mut owner;
-        for slot in inner.rx.iter_mut().chain(inner.tx.iter_mut()) {
-            let page = slot
-                .page
-                .as_mut()
-                .expect("NIC CPU owner missing after all tails");
-            if page.is_device_owned() {
-                // SAFETY: 所有 CPU producer/通知与 Work 已退出，真实 status0 和完整屏障
-                // 证明设备结束全部范围访问，己 IRQ 已同步注销；此页只由当前原槽拥有。
-                unsafe { page.finish_device_access() };
-            }
-        }
         // driver/queue 的安全 CPU 入口先结束，再释放 CPU-owned payload 与两 ring。
         drop(ManuallyDrop::into_inner(owner));
         #[cfg(feature = "ktest")]
@@ -554,7 +582,7 @@ impl VirtioNet {
         }
         // SAFETY: shadow 和独立 head 表共同确认本轮唯一链完成，只有此链引用本页；
         // 队列锁串行收权，TX used.len 不改变真实本轮提交长度或归页证明。
-        unsafe { page.finish_device_access() };
+        unsafe { page.finish_device_access() }.map_err(dma_protocol)?;
         inner.tx_heads[usize::from(used.head)] = None;
         slot.head = None;
         slot.state = SlotState::Free;
@@ -591,7 +619,7 @@ impl VirtioNet {
         }
         // SAFETY: 真实 shadow/head 表确认本轮唯一 RX 链完成，used 长度在提交范围内；
         // 页仍由原槽独占，后续解析只读取此实际前缀，设备不可再写直到重投。
-        unsafe { page.finish_device_access() };
+        unsafe { page.finish_device_access() }.map_err(dma_protocol)?;
         inner.rx_heads[usize::from(used.head)] = None;
         slot.head = None;
         slot.state = SlotState::Processing;
@@ -653,13 +681,14 @@ impl VirtioNet {
             return Ok(());
         }
         let page = slot.page.as_mut().unwrap();
-        slot.state = SlotState::DeviceOwned;
+        let segment = page.segment(inner.domain).map_err(dma_protocol)?;
         // SAFETY: receive_ethernet 已返回，没有解析借用跨重投；同一页归回唯一原槽，
         // 队列锁保原页直到下轮真实 used 或 reset，方向固定 FromDevice。
-        unsafe { page.begin_device_access() };
+        unsafe { page.begin_device_access(inner.domain) }.map_err(dma_protocol)?;
+        slot.state = SlotState::DeviceOwned;
         // SAFETY: 原映射覆盖完整头与1514帧范围，两个SG只引用本原页；
         // 同锁安装新 head 后 IRQ/Work 才能消费，本轮 CPU 内容借用已结束。
-        let head = unsafe { inner.driver.submit_rx(page.segment()) }?;
+        let head = unsafe { inner.driver.submit_rx(segment) }?;
         install_head(&mut inner.rx, &mut inner.rx_heads, index, head)
     }
 
@@ -755,22 +784,25 @@ impl Drop for PreparingTx<'_> {
 fn prepare_inner(
     transport: SomeTransport<'static>,
     info: NetInfo,
+    domain: DmaDomain,
 ) -> Result<Inner, VirtioInitError> {
     let status = transport.get_status();
     let legacy = transport.requires_legacy_layout();
     let rx_layout = RingLayout::new(info.rx_depth, legacy)?;
     let tx_layout = RingLayout::new(info.tx_depth, legacy)?;
-    let rx_ring = CoherentDma::allocate(rx_layout.byte_len())
+    let rx_ring = CoherentDma::allocate(domain, rx_layout.byte_len())
         .map_err(|error| VirtioInitError::dma_prepare(error, status))?;
-    let tx_ring = CoherentDma::allocate(tx_layout.byte_len())
+    let tx_ring = CoherentDma::allocate(domain, tx_layout.byte_len())
         .map_err(|error| VirtioInitError::dma_prepare(error, status))?;
     let rx = prepare_pool(
+        domain,
         info.rx_depth,
         info.header_len,
         BufferDirection::DeviceToDriver,
         status,
     )?;
     let tx = prepare_pool(
+        domain,
         info.tx_depth,
         info.header_len,
         BufferDirection::DriverToDevice,
@@ -790,6 +822,7 @@ fn prepare_inner(
     let driver = unsafe { Driver::new(transport, info, rx_queue, tx_queue) }?;
     Ok(Inner {
         driver: ManuallyDrop::new(driver),
+        domain,
         rx_ring: ManuallyDrop::new(rx_ring),
         tx_ring: ManuallyDrop::new(tx_ring),
         rx,
@@ -801,6 +834,7 @@ fn prepare_inner(
 
 /// 普通任务一次申请最多32零填原页，各映射只覆盖本头与最大合法帧。
 fn prepare_pool(
+    domain: DmaDomain,
     depth: u16,
     header_len: usize,
     direction: BufferDirection,
@@ -817,6 +851,8 @@ fn prepare_pool(
     for _ in 0..count {
         let pages = mm::alloc_pages(0, true).ok_or(VirtioInitError::NoMemory { status })?;
         let page = MappedPages::new(pages, 0, len, direction)
+            .map_err(|error| VirtioInitError::dma_prepare(error, status))?;
+        page.segment(domain)
             .map_err(|error| VirtioInitError::dma_prepare(error, status))?;
         slots.push(Slot {
             state: SlotState::Free,
@@ -845,13 +881,14 @@ fn publish_rx(inner: &mut Inner) -> Result<bool, Error> {
     for index in 0..inner.rx.len() {
         let slot = &mut inner.rx[index];
         let page = slot.page.as_mut().ok_or(Error::IoError)?;
-        slot.state = SlotState::DeviceOwned;
+        let segment = page.segment(inner.domain).map_err(dma_protocol)?;
         // SAFETY: 固定池页已完整清零且无 CPU 别名，原槽保全访问期；
         // 调用者共同队列锁覆盖 submit 与 head 表安装，外层已承担 reset 责任。
-        unsafe { page.begin_device_access() };
+        unsafe { page.begin_device_access(inner.domain) }.map_err(dma_protocol)?;
+        slot.state = SlotState::DeviceOwned;
         // SAFETY: FromDevice 映射覆盖本头和1514帧，两个SG均在此原页内；
         // 原槽已拥有页，任何失败都保到确认 reset，不从错误返回猜未发表。
-        let head = unsafe { inner.driver.submit_rx(page.segment()) }?;
+        let head = unsafe { inner.driver.submit_rx(segment) }?;
         install_head(&mut inner.rx, &mut inner.rx_heads, index, head)?;
     }
     let pending = inner.driver.enable_interrupts_and_recheck();

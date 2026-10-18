@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::alloc::{AllocError, Allocator, Layout};
 use core::pin::pin;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::block::bio::BioInner;
 use crate::block::{BlockError, MAX_BATCH};
@@ -131,17 +132,30 @@ pub(crate) struct BioReserve {
 pub(crate) struct MetadataIoContext<'a> {
     reserve: &'a Arc<BioReserve>,
     boundary: u64,
+    view: Option<(&'a AtomicU64, u64)>,
 }
 
 impl<'a> MetadataIoContext<'a> {
     /// 已捕获的轮边界可由同一 storage 重建借用，禁止改采后继 activate 的当前值。
     pub(crate) fn from_boundary(reserve: &'a Arc<BioReserve>, boundary: u64) -> Self {
-        Self { reserve, boundary }
+        Self {
+            reserve,
+            boundary,
+            view: None,
+        }
     }
 
-    /// 返回原入口捕获的值，storage 只保存此值和本源的真实强拥有。
-    pub(crate) fn boundary(self) -> u64 {
-        self.boundary
+    /// 保留本卷的单调停止边界，另一卷退休不会取消同物理来源上的当前业务。
+    pub(crate) fn for_view(
+        reserve: &'a Arc<BioReserve>,
+        sequence: &'a AtomicU64,
+        boundary: u64,
+    ) -> Self {
+        Self {
+            reserve,
+            boundary: reserve.state.lock().stop_sequence,
+            view: Some((sequence, boundary)),
+        }
     }
 
     /// 核同一真实源，跨 cache 的数值相同不能替代身份。
@@ -152,7 +166,12 @@ impl<'a> MetadataIoContext<'a> {
     /// 开始内容读入前重查旧边界；已接受 IO 不由此检查撤销。
     pub(crate) fn check(self) -> Result<(), BlockError> {
         let state = self.reserve.state.lock();
-        if !state.ready || state.stop_sequence != self.boundary {
+        if !state.ready
+            || state.stop_sequence != self.boundary
+            || self
+                .view
+                .is_some_and(|(sequence, boundary)| sequence.load(Ordering::Acquire) != boundary)
+        {
             Err(BlockError::NotReady)
         } else {
             Ok(())
@@ -470,11 +489,6 @@ impl BioReserve {
     pub(crate) fn notify_available(&self) {
         self.available.wake_all();
     }
-    /// 停止先发表新边界再唤醒旧构造等待，不永久关闭可再次激活的来源。
-    pub(crate) fn wake_stopped(&self) {
-        self.state.lock().stop_sequence += 1;
-        self.available.wake_all();
-    }
 
     /// 在 FS 业务锁外预定至少一份完整 WB 单元，不为凑满而保未提交对象。
     pub(crate) fn acquire_wb_lane(
@@ -514,7 +528,11 @@ impl BioReserve {
         assert!(context.belongs_to(self), "foreign metadata IO context");
         self.wait_available(|| {
             let mut state = self.state.lock();
-            if state.stop_sequence != context.boundary {
+            if state.stop_sequence != context.boundary
+                || context.view.is_some_and(|(sequence, boundary)| {
+                    sequence.load(Ordering::Acquire) != boundary
+                })
+            {
                 return Err(BlockError::NotReady);
             }
             if !state.ready {

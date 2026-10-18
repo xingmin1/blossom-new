@@ -11,7 +11,12 @@ use crate::{
     task,
 };
 
+pub(crate) mod ahci;
+pub(crate) mod board_setup;
+pub(crate) mod dwmac;
+pub(crate) mod net_device;
 pub mod pci;
+pub(crate) mod sdmmc;
 pub mod virtio;
 pub mod virtio_net;
 

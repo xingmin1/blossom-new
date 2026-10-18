@@ -740,7 +740,7 @@ pub(crate) mod mounts {
             .ok_or(TestError("file extra Disk absent"))?;
         let volume = checked(
             context,
-            Ext4Volume::open(disk.clone(), AccessMode::ReadOnly, 64),
+            Ext4Volume::open(BlockView::whole(disk.clone()), AccessMode::ReadOnly, 64),
         )?;
         checked(
             context,

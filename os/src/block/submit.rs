@@ -4,18 +4,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 
-use virtio_drivers::{BufferDirection, MappedSegment};
+use virtio_drivers::BufferDirection;
 
 use crate::block::bio::BioInner;
 use crate::block::disk::{ActiveBio, PreparingSlot};
+#[cfg(feature = "ktest")]
+use crate::block::DiskIdentity;
 use crate::block::{
     Bio, BioAllocator, BioCompletion, BioLane, BioLease, BioMemory, BlkOperation, BlockError, Disk,
     DiskRef, FsClaim, IoResult, QueueLimits, MAX_BATCH, SECTOR_BYTES,
 };
-#[cfg(feature = "ktest")]
-use crate::drivers::virtio::VirtioIdentity;
 use crate::fs::background::WritebackDomain;
-use crate::mm::dma::{DmaError, MappedPages};
+use crate::mm::dma::{MappedPages, PayloadRange};
 use crate::mm::{alloc_pages, FolioRead, FolioWriteback, PAGE_SIZE};
 #[cfg(feature = "ktest")]
 use crate::sync::SpinLock;
@@ -66,7 +66,7 @@ struct GenerationPlan {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadBatchSnapshot {
     pub sequence: u64,
-    pub disk: VirtioIdentity,
+    pub disk: DiskIdentity,
     pub bios: usize,
     pub multi_page_bios: usize,
     pub pages: usize,
@@ -125,8 +125,7 @@ impl ReadBatchObservation {
                     .inner
                     .segment(index)
                     .expect("read batch DMA segment missing")
-                    .address
-                    .value();
+                    .physical as u64;
                 observed.snapshot.captured_pages += 1;
             }
         }
@@ -171,6 +170,68 @@ impl FsClaim {
     /// 显式 FS 批次沿同一原 Bio 准入、有限合并及 split 路径，不另建提交引擎。
     pub fn submit_batch(&self, bios: impl IntoIterator<Item = Bio>) {
         self.disk().submit_batch_from(bios, Some(self));
+    }
+
+    /// 同步字节读取保实际范围占用到 slot 真尾，返回前只复制完整成功的数据。
+    pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        let absolute = self.view().absolute_byte(offset, dst.len())?;
+        drop(task::current_task());
+        let result = self.disk().read_with_pages(absolute, dst, Some(self));
+        self.disk().unplug();
+        result
+    }
+
+    /// 将卷内准确原页范围换算一次，并保本占用至 accepted 与 slot 的全部完成尾。
+    pub(crate) fn load_folio(
+        &self,
+        byte: u64,
+        read: FolioRead,
+        memory: BioMemory,
+    ) -> Result<(), BlockError> {
+        let len = read.len();
+        let absolute = match self.view().absolute_byte(byte, len) {
+            Ok(absolute) => absolute,
+            Err(error) => {
+                fail_read(read, error);
+                return Err(error);
+            }
+        };
+        let (completion, result) =
+            self.disk()
+                .read_folio_bio(absolute, read, None, memory, Some(self))?;
+        drop(completion.take_memory()?);
+        if let Some(error) = result.error {
+            return Err(error);
+        }
+        if result.completed != len {
+            return Err(BlockError::ShortIo);
+        }
+        Ok(())
+    }
+
+    /// 页内分段读取携带实际卷占用，成功后原读入者继续拥有未完成的页面。
+    pub fn fill_folio_range(
+        &self,
+        byte: u64,
+        read: FolioRead,
+        offset: usize,
+        len: usize,
+    ) -> Result<FolioRead, BlockError> {
+        let absolute = match self.view().absolute_byte(byte, len) {
+            Ok(absolute) => absolute,
+            Err(error) => {
+                fail_read(read, error);
+                return Err(error);
+            }
+        };
+        let (completion, result) = self.disk().read_folio_bio(
+            absolute,
+            read,
+            Some((offset, len)),
+            Vec::new_in(BioAllocator::Heap),
+            Some(self),
+        )?;
+        finish_folio_range(completion, result, len)
     }
 
     /// 连续磁盘范围组合多个整页读入凭证，每波最多八父，提交后不逐页等待真实完成。
@@ -254,7 +315,7 @@ impl FsClaim {
             match MappedPages::from_folio(read) {
                 Ok(mapped) => memory.push(mapped),
                 Err((error, read)) => {
-                    let error = map_error(error);
+                    let error = BlockError::from(error);
                     fail_read(read, error);
                     preparation_error = Some(error);
                     break;
@@ -271,7 +332,9 @@ impl FsClaim {
             Bio::try_new(
                 self.disk(),
                 BlkOperation::Read,
-                byte_offset / SECTOR_BYTES,
+                self.view()
+                    .absolute_byte(byte_offset, memory.iter().map(MappedPages::len).sum())?
+                    / SECTOR_BYTES,
                 memory,
                 0,
                 None,
@@ -419,7 +482,7 @@ impl FsClaim {
                 }
                 Err((error, writeback)) => {
                     drop(writeback);
-                    preparation_error = Some(map_error(error));
+                    preparation_error = Some(BlockError::from(error));
                     break;
                 }
             }
@@ -670,7 +733,7 @@ impl Disk {
         memory: BioMemory,
     ) -> Result<(), BlockError> {
         let len = read.len();
-        let (completion, result) = self.read_folio_bio(byte_offset, read, None, memory)?;
+        let (completion, result) = self.read_folio_bio(byte_offset, read, None, memory, None)?;
         let memory = completion.take_memory();
         drop(completion);
         drop(memory?);
@@ -697,28 +760,9 @@ impl Disk {
             read,
             Some((offset, len)),
             Vec::new_in(BioAllocator::Heap),
+            None,
         )?;
-        if let Some(error) = result.error {
-            return Err(error);
-        }
-        let mut read = completion
-            .take_memory()
-            .expect("completed folio payload was already taken")
-            .pop()
-            .expect("single folio payload is missing")
-            .into_folio();
-        if result.completed != len {
-            // SAFETY: completion 已确认全部子请求结束及 CPU 收权；
-            // 短结果不授予内容读取权，整份读入责任仍由返回的 read 独占。
-            unsafe {
-                read.complete(IoResult {
-                    completed: result.completed,
-                    error: Some(BlockError::ShortIo),
-                })
-            };
-            return Err(BlockError::ShortIo);
-        }
-        Ok(read)
+        finish_folio_range(completion, result, len)
     }
 
     /// 锁外准备原页 Bio 并同步等待；None 结束完整读，子范围成功后由来源继续填页。
@@ -728,6 +772,7 @@ impl Disk {
         mut read: FolioRead,
         range: Option<(usize, usize)>,
         mut memory: BioMemory,
+        claim: Option<&FsClaim>,
     ) -> Result<(BioCompletion, IoResult), BlockError> {
         drop(task::current_task());
         let prepared = if byte_offset % SECTOR_BYTES != 0 {
@@ -755,7 +800,7 @@ impl Disk {
         let mapped = match mapped {
             Ok(mapped) => mapped,
             Err((error, mut read)) => {
-                let error = map_error(error);
+                let error = BlockError::from(error);
                 // SAFETY: 映射准备失败，设备从未取得范围，失败不发布可读内容。
                 unsafe {
                     read.complete(IoResult {
@@ -780,7 +825,7 @@ impl Disk {
             )
         }?;
         let completion = bio.completion();
-        self.submit_bio(bio);
+        self.submit_bio_from(bio, claim);
         self.unplug();
         let result = completion.wait();
         Ok((completion, result))
@@ -790,13 +835,18 @@ impl Disk {
     /// 非空范围必须符合设备逻辑块对齐；文件页填充直接使用自己的页提交 Bio。
     pub fn read_exact_at(self: &DiskRef, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         drop(task::current_task());
-        let result = self.read_with_pages(offset, dst);
+        let result = self.read_with_pages(offset, dst, None);
         self.unplug();
         result
     }
 
     /// 所有 fallible 页与 Vec 准备都在队列锁外，错误完成仍通过原拥有者归还原阶。
-    fn read_with_pages(self: &DiskRef, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+    fn read_with_pages(
+        self: &DiskRef,
+        offset: u64,
+        dst: &mut [u8],
+        claim: Option<&FsClaim>,
+    ) -> Result<(), BlockError> {
         let limits = self.limits();
         let logical = u64::from(limits.logical_block_size);
         let capacity = limits
@@ -826,7 +876,7 @@ impl Disk {
             let length = remaining.min(PAGE_SIZE);
             let pages = alloc_pages(0, true).ok_or(BlockError::NoMemory)?;
             let mapped = MappedPages::new(pages, 0, length, BufferDirection::DeviceToDriver)
-                .map_err(map_error)?;
+                .map_err(BlockError::from)?;
             memory.push(mapped);
             remaining -= length;
         }
@@ -843,7 +893,7 @@ impl Disk {
             )
         }?;
         let completion = bio.completion();
-        self.submit_bio(bio);
+        self.submit_bio_from(bio, claim);
         self.unplug();
         let result = completion.wait();
         let memory = completion.take_memory()?;
@@ -867,6 +917,34 @@ impl Disk {
     }
 }
 
+/// 完整收权后移回原分段读入者，短结果结束真实失败而不授予尾部访问。
+fn finish_folio_range(
+    completion: BioCompletion,
+    result: IoResult,
+    len: usize,
+) -> Result<FolioRead, BlockError> {
+    if let Some(error) = result.error {
+        return Err(error);
+    }
+    let mut read = completion
+        .take_memory()
+        .expect("completed folio payload was already taken")
+        .pop()
+        .expect("single folio payload is missing")
+        .into_folio();
+    if result.completed != len {
+        // SAFETY: completion 已结束全部子请求并收权，短结果不授予未初始化尾部访问权。
+        unsafe {
+            read.complete(IoResult {
+                completed: result.completed,
+                error: Some(BlockError::ShortIo),
+            })
+        };
+        return Err(BlockError::ShortIo);
+    }
+    Ok(read)
+}
+
 /// 略过被 admission 拒绝的 root，不为批次建立第二份拥有队列。
 fn next_active(active: &[Option<ActiveBio<'_>>; MAX_BATCH], start: usize) -> usize {
     (start..MAX_BATCH)
@@ -884,7 +962,7 @@ fn segment_limit(limits: QueueLimits, address: u64) -> usize {
 fn append_prefix(
     bio: &BioInner,
     cursor: &mut SegmentCursor,
-    sg: &mut Vec<MappedSegment>,
+    sg: &mut Vec<PayloadRange>,
     limits: QueueLimits,
     budget: usize,
 ) -> Result<usize, BlockError> {
@@ -900,16 +978,16 @@ fn append_prefix(
             return Err(BlockError::InvalidRange);
         }
         let address = source
-            .address
+            .physical
             .checked_add(scan.within)
             .ok_or(BlockError::InvalidRange)?;
         let remaining = available.min(budget - bytes);
         let mut length = 0;
         if let Some(last) = sg.last_mut() {
             let contiguous = last.direction == source.direction
-                && last.address.checked_add(last.length as usize) == Some(address);
+                && last.physical.checked_add(last.length as usize) == Some(address);
             if contiguous {
-                let room = segment_limit(limits, last.address.value())
+                let room = segment_limit(limits, last.physical as u64)
                     .checked_sub(last.length as usize)
                     .ok_or(BlockError::InvalidRange)?;
                 length = room.min(remaining);
@@ -920,12 +998,12 @@ fn append_prefix(
             if sg.len() == limits.max_segments {
                 break;
             }
-            length = segment_limit(limits, address.value()).min(remaining);
+            length = segment_limit(limits, address as u64).min(remaining);
             if length == 0 {
                 return Err(BlockError::Unsupported);
             }
-            sg.push(MappedSegment {
-                address,
+            sg.push(PayloadRange {
+                physical: address,
                 length: length as u32,
                 direction: source.direction,
             });
@@ -941,7 +1019,7 @@ fn append_prefix(
 }
 
 /// 裁掉本轮追加范围的尾部，包括与旧尾段合并的部分，保留既有 parts 的完整字节。
-fn trim_tail(sg: &mut Vec<MappedSegment>, mut bytes: usize) {
+fn trim_tail(sg: &mut Vec<PayloadRange>, mut bytes: usize) {
     while 0 < bytes {
         let last = sg.last_mut().expect("SG prefix tail is absent");
         let removed = bytes.min(last.length as usize);
@@ -950,13 +1028,5 @@ fn trim_tail(sg: &mut Vec<MappedSegment>, mut bytes: usize) {
         if last.length == 0 {
             sg.pop();
         }
-    }
-}
-
-/// 页准备失败保留原内存错误，地址或映射跨度失败归为输入范围错误。
-fn map_error(error: DmaError) -> BlockError {
-    match error {
-        DmaError::NoMemory => BlockError::NoMemory,
-        DmaError::InvalidRange | DmaError::AddressLimit => BlockError::InvalidRange,
     }
 }

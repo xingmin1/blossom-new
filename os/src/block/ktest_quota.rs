@@ -101,7 +101,9 @@ fn waiting_callback(result: &IoResult, memory: &[MappedPages]) {
     let valid = *result == owner.expected_a && memory.len() == 1 && !memory[0].is_device_owned();
     let ordinal = if valid {
         let mapped = &memory[0];
-        let segment = mapped.segment();
+        let segment = mapped
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable");
         // SAFETY: A 的原页预先全部清零；两种 origin 均无设备 descriptor 引用。
         let zero = unsafe { mapped.bytes() }.iter().all(|byte| *byte == 0);
         owner.originals.iter().position(|original| {
@@ -146,9 +148,21 @@ fn peer_callback(result: &IoResult, memory: &[MappedPages]) {
                 error: None,
             }
         && memory.len() == 1
-        && memory[0].segment().address == owner.peer_original.address
-        && memory[0].segment().length == owner.peer_original.length
-        && memory[0].segment().direction == owner.peer_original.direction
+        && memory[0]
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable")
+            .address
+            == owner.peer_original.address
+        && memory[0]
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable")
+            .length
+            == owner.peer_original.length
+        && memory[0]
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable")
+            .direction
+            == owner.peer_original.direction
         && patterned(
             &memory[0],
             owner.peer_tag.load(Ordering::Acquire) as u8,
@@ -236,7 +250,9 @@ fn bio(
     };
     let mapped = MappedPages::new(pages, 0, unit, direction)
         .map_err(|_| TestError("quota original page mapping failed"))?;
-    let original = mapped.segment();
+    let original = mapped
+        .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+        .expect("QEMU fixture mapping must be reachable");
     let mut memory = Vec::new_in(BioAllocator::Heap);
     memory
         .try_reserve_exact(1)
@@ -669,8 +685,11 @@ impl Owner {
         self.identities(context)?;
         if self.origin == Origin::Reject {
             self.claim = Some(
-                Disk::claim_fs(&self.disks[0], AccessMode::ReadOnly)
-                    .map_err(|_| TestError("quota RO FS claim failed"))?,
+                Disk::claim_fs(
+                    &crate::block::BlockView::whole(self.disks[0].clone()),
+                    AccessMode::ReadOnly,
+                )
+                .map_err(|_| TestError("quota RO FS claim failed"))?,
             );
         }
         self.before_a = self.counts(0);
@@ -725,7 +744,7 @@ impl Owner {
             self.b_slot = q
                 .slot_states
                 .iter()
-                .position(|state| matches!(state, super::disk::SlotState::Submitted { .. }));
+                .position(|state| matches!(state, super::disk::SlotState::Submitted));
         }
         if self.b_slot.is_none() {
             return Err(TestError("quota B lost original submitted slot"));
@@ -1000,7 +1019,9 @@ fn reclaim(
         .map_err(|_| TestError("quota original page unavailable"))?;
     context.expect_eq(memory.len(), 1);
     if let Some(mapped) = memory.first() {
-        let segment = mapped.segment();
+        let segment = mapped
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable");
         context.expect_eq(
             (segment.address, segment.length, segment.direction),
             (original.address, original.length, original.direction),

@@ -1,5 +1,6 @@
 //! 块设备实例、逻辑 Bio 与固定硬件请求各自持有唯一责任。
 
+pub(crate) mod backend;
 mod bio;
 mod disk;
 #[cfg(feature = "ktest")]
@@ -10,29 +11,42 @@ pub(crate) mod ktest_irq;
 mod ktest_queue;
 #[cfg(feature = "ktest")]
 mod ktest_quota;
+#[cfg(feature = "ktest")]
+mod ktest_ram;
+pub mod partition;
 mod reserve;
 mod stop;
 mod submit;
 #[cfg(feature = "ktest")]
 pub(crate) mod tests;
+mod view;
 
+pub use backend::DiskIdentity;
 pub use bio::{Bio, BioCompletion};
 pub use disk::{Disk, DiskRef};
 pub(crate) use reserve::{
     BioAllocator, BioLane, BioLease, BioMemory, BioReserve, MetadataIoContext,
 };
 pub use stop::FsClaim;
-pub use virtio_drivers::device::blk::BlkOperation;
+pub use view::BlockView;
 
+use crate::mm::dma::{DmaError, PayloadRange};
 use core::convert::TryFrom;
-use virtio_drivers::device::blk::BlkInfo;
-use virtio_drivers::{BufferDirection, MappedSegment};
+use virtio_drivers::BufferDirection;
 
 use crate::mm::dma::MappedPages;
 
 /// 协议 sector 与设备 logical block、文件系统块大小彼此独立。
 pub const SECTOR_BYTES: u64 = 512;
 pub(super) const MAX_BATCH: usize = 8;
+
+/// 块请求语义不携带具体设备协议的操作码。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlkOperation {
+    Read,
+    Write,
+    Flush,
+}
 
 /// 卷能力与挂载视图各自保存访问模式，设备只读能力仍由 QueueLimits 表达。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +87,20 @@ impl From<virtio_drivers::Error> for BlockError {
     }
 }
 
+impl From<DmaError> for BlockError {
+    /// 将原页访问准备错误统一转换为块层语义，保留内存、范围、对齐与设备同步的区别。
+    fn from(error: DmaError) -> Self {
+        match error {
+            DmaError::NoMemory => Self::NoMemory,
+            DmaError::InvalidRange | DmaError::AddressLimit | DmaError::InvalidDomain => {
+                Self::InvalidRange
+            }
+            DmaError::Alignment => Self::Misaligned,
+            DmaError::CacheMaintenance(_) => Self::DeviceFault,
+        }
+    }
+}
+
 /// 完成只报告连续成功前缀，后部反序成功不能跨越前面的失败。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoResult {
@@ -87,7 +115,7 @@ pub enum EndIo {
     Task(fn(&IoResult, &[MappedPages])),
 }
 
-/// 同一个 Disk 的真实协商能力与当前 coherent 直连限制。
+/// 物理请求限额区分硬件深度与可睡完成所需的软件槽数。
 #[derive(Clone, Copy, Debug)]
 pub struct QueueLimits {
     pub capacity_sectors: u64,
@@ -103,52 +131,13 @@ pub struct QueueLimits {
 }
 
 impl QueueLimits {
-    /// 由真实协商事实建立限额，Read 的 used.len 还必须容纳一个 status 字节。
-    pub fn from_info(info: BlkInfo) -> Result<Self, BlockError> {
-        if info.capacity_sectors == 0
-            || info.capacity_sectors.checked_mul(SECTOR_BYTES).is_none()
-            || !info.queue_depth.is_power_of_two()
-            || !(4..=128).contains(&info.queue_depth)
-            || info.tag_count == 0
-            || info.tag_count > info.queue_depth
-            || info.max_segments == 0
-            || info.max_segments > info.queue_depth - 2
-            || info.max_segment_bytes == 0
-            || info.logical_block_size < SECTOR_BYTES as u32
-            || !info.logical_block_size.is_power_of_two()
-        {
-            return Err(BlockError::InvalidRange);
-        }
-        let max_segments = usize::from(info.max_segments);
-        let logical = u64::from(info.logical_block_size);
-        let raw_bytes = (u64::from(info.max_segment_bytes) * u64::from(info.max_segments))
-            .min(u64::from(u32::MAX) - 1);
-        let max_bytes =
-            usize::try_from(raw_bytes / logical * logical).map_err(|_| BlockError::InvalidRange)?;
-        if max_bytes == 0 {
-            return Err(BlockError::Unsupported);
-        }
-        Ok(Self {
-            capacity_sectors: info.capacity_sectors,
-            max_bytes,
-            max_segments,
-            max_segment_bytes: info.max_segment_bytes,
-            logical_block_size: info.logical_block_size,
-            dma_boundary_mask: u64::MAX,
-            readonly: info.readonly,
-            flush: info.flush,
-            queue_depth: info.queue_depth,
-            tag_count: info.tag_count,
-        })
-    }
-
     /// 唯一逻辑入口校验；单 child 段数和边界由最终 SG 拆分负责。
     pub fn validate(
         &self,
         operation: BlkOperation,
         sector: u64,
         total_bytes: usize,
-        segments: impl IntoIterator<Item = MappedSegment>,
+        segments: impl IntoIterator<Item = PayloadRange>,
         attributes: u32,
     ) -> Result<(), BlockError> {
         if attributes != 0 {
@@ -178,7 +167,7 @@ impl QueueLimits {
                 || segment.length == 0
                 || segment.direction != direction
                 || segment
-                    .address
+                    .physical
                     .checked_add(segment.length as usize - 1)
                     .is_none()
             {
@@ -208,7 +197,7 @@ impl QueueLimits {
         let end_sector = sector
             .checked_add(bytes / SECTOR_BYTES)
             .ok_or(BlockError::InvalidRange)?;
-        if end_sector > self.capacity_sectors {
+        if self.capacity_sectors < end_sector {
             return Err(BlockError::InvalidRange);
         }
         Ok(())

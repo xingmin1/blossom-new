@@ -8,10 +8,13 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const NAME: &str = "loongarch64";
 
+mod liointc;
 mod mmu;
+mod rtc;
 mod signal;
 mod uaccess;
 mod user;
+pub use rtc::board_rtc_calendar;
 
 pub use mmu::{
     activate_kernel_root, activate_user_root, flush_user_translations, initialize_user_root,
@@ -54,6 +57,7 @@ global_asm!(include_str!("loongarch64/entry.S"),
     stack_size = const crate::cpu::STACK_SIZE,
     boot_stack = const offset_of!(crate::cpu::CpuBoot, stack_top),
     boot_local = const offset_of!(crate::cpu::CpuBoot, local),
+    board_platform = const cfg!(blossom_platform = "ls2k1000la") as usize,
 );
 global_asm!(include_str!("loongarch64/trap.S"),
     frame_size = const size_of::<KernelTrapFrame>(),
@@ -191,8 +195,13 @@ pub(super) fn dma_barrier() {
     unsafe { asm!("dbar 0x00", options(nostack)) };
 }
 
+/// 当前平台仅公开 coherent DMA；缺少已核非一致维护机制时拒绝假成功。
+pub fn dma_cache_flush(_: usize, _: usize) -> Result<(), &'static str> {
+    Err("LoongArch noncoherent DMA cache maintenance is unsupported")
+}
+
 /// 从 CPUId CSR 取得当前硬件身份，不解释 QEMU 的引导参数。
-pub fn boot_hardware_id(_: [usize; 3]) -> usize {
+pub fn boot_hardware_id(_: [usize; 4]) -> usize {
     csr_read::<0x20>() & 0x3ff
 }
 /// 将真实 RAM 物理地址转换为缓存 DMW 别名。
@@ -228,6 +237,7 @@ pub unsafe fn finish_boot_mappings(_: &BootInfo) {
     assert_eq!(csr_read::<0x180>(), mmio_address(0) | 1);
     // SAFETY: 本函数的 BSP 独占启动契约保证 AP 尚未发布，静态 DMW 映射已通过上面的断言。
     unsafe { mmu::initialize_invalid_tables() };
+    crate::console::configure_resources(crate::boot::info());
 }
 /// 将稳定的内核 per-CPU 指针放入 KS0；用户 TLS 寄存器不参与此约定。
 ///
@@ -257,14 +267,19 @@ pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     // 汇编仅按 Rust 提供的布局访问整数字段，不恢复 CPU 基址或扩展单元现场。
     unsafe { la_switch_context(prev, next) };
 }
-/// 安装本核异常与三级用户 walker、关闭内核扩展单元，并初始化 timer/IPI。
+/// 安装本核异常与用户 walker，按实际平台开放 timer、IPI 和外部父 cause。
 pub fn init_current_cpu() {
     irq_save();
     // SAFETY: 入口已建立本核 PLV0/DMW 和有效栈；IRQ 已关闭，异常代码在永久内核映射内。
     unsafe {
         csr_write::<0xc>(la_kernel_trap as usize);
         csr_write::<0x88>(virt_to_phys(la_kernel_refill as usize));
-        csr_write::<4>((1 << 11) | (1 << 12) | (1 << 3));
+        let external = if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+            (1 << 2) | (1 << 3)
+        } else {
+            1 << 3
+        };
+        csr_write::<4>((1 << 11) | (1 << 12) | external);
         csr_write::<2>(0);
     }
     mmu::initialize_current_cpu();
@@ -431,7 +446,7 @@ fn mail_send(cpu: usize, mailbox: usize, data: usize) {
         ((data as u64) << 32) | target | (((mailbox * 2) as u64) << 2),
     );
 }
-/// 通过真实 mailbox1 发表启动记录，mailbox0 发表物理入口，再发送启动 IPI。
+/// 板 mailbox1 发表真实栈、mailbox2 发表 CpuLocal，最后发表入口并发送启动 IPI。
 ///
 /// # Safety
 /// 必须由 BSP 串行启动尚未运行的已枚举辅核；物理地址须指向对齐、完整初始化且永久保留的 CpuBoot。
@@ -442,7 +457,15 @@ pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Resu
         return Err(-22);
     }
     barrier();
-    mail_send(hardware_id, 1, boot_record_physical);
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        // SAFETY: 调用者保证物理记录完整、对齐且永久有效；缓存 DMW 映射覆盖该内核静态对象。
+        let record =
+            unsafe { &*(phys_to_virt(boot_record_physical) as *const crate::cpu::CpuBoot) };
+        mail_send(hardware_id, 1, record.stack_top);
+        mail_send(hardware_id, 2, record.local);
+    } else {
+        mail_send(hardware_id, 1, boot_record_physical);
+    }
     let entry: usize;
     // SAFETY: 链接脚本给出可执行的物理辅核入口；这里只取符号值，记录契约由调用者保证。
     unsafe {
@@ -489,12 +512,16 @@ fn source_word(source: u32) -> (usize, u32) {
     (source as usize / 32 * 4, 1 << (source % 32))
 }
 
-/// 为实际 PCH 源逐位建立 level-high、同号 EXTIOI 向量与固定 BSP 路由。
+/// 按平台快照初始化 PCH/EXTIOI 或两组 LIOINTC，所有 level 源固定路由实际 BSP。
 ///
 /// # Safety
 /// BSP 必须在本核 IRQ 关闭且 AP 尚未释放时独占初始化；info 是永久发布的平台对象，
-/// PCH-PIC 强序 DMW 与 EXTIOI IOCSR 范围已经验证且永久有效。
+/// 所选控制器的 DMW/IOCSR 范围已经验证且永久有效。
 pub unsafe fn external_init(info: &BootInfo) {
+    if info.platform == crate::boot::Platform::Ls2k1000la {
+        liointc::initialize(info);
+        return;
+    }
     assert_eq!(info.interrupts.source_count, 64);
     assert!(info.bsp_hardware_id < 4);
     assert_eq!(info.interrupts.root_interrupt, 3);
@@ -548,8 +575,12 @@ pub unsafe fn external_init(info: &BootInfo) {
     barrier();
 }
 
-/// 按实际源位屏蔽 PCH 与 EXTIOI，不改变同 word 的其他设备。
+/// 在控制器短锁内只屏蔽实际源，不改变相邻设备。
 pub fn external_mask(source: u32) {
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        liointc::set_enabled(source, false);
+        return;
+    }
     let (word, bit) = source_word(source);
     let _controller = EXTERNAL_CONTROLLER.lock();
     pic_write(0x20 + word, pic_read(0x20 + word) | bit);
@@ -558,8 +589,12 @@ pub fn external_mask(source: u32) {
     barrier();
 }
 
-/// 清该源 PCH 锁存、先开放父向量再开放 level 源，保留相邻设备状态。
+/// 设备已准备后开放实际 level 源，保持父控制器路由与相邻源不变。
 pub fn external_unmask(source: u32) {
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        liointc::set_enabled(source, true);
+        return;
+    }
     let (word, bit) = source_word(source);
     let _controller = EXTERNAL_CONTROLLER.lock();
     pic_write(0x80 + word, bit);
@@ -569,8 +604,11 @@ pub fn external_unmask(source: u32) {
     barrier();
 }
 
-/// 遍历本核真实 EXTIOI pending 与准入位，返回最低待处理 PCH 源。
+/// 读取本核实际父控制器的 pending 和准入位，返回一个规范化设备源。
 pub fn external_claim() -> Option<u32> {
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        return liointc::claim();
+    }
     let _controller = EXTERNAL_CONTROLLER.lock();
     let enabled =
         iocsr_read32(ext_reg(0x200)) as u64 | ((iocsr_read32(ext_reg(0x204)) as u64) << 32);
@@ -582,42 +620,74 @@ pub fn external_claim() -> Option<u32> {
     }
 }
 
-/// 对本核已 claim 的源单独 W1C 完成，不清除相邻源的 pending。
+/// 完成本核真实 claim；PCH 清对应锁存，LIOINTC 在设备应答后完成访问排序。
 ///
 /// # Safety
 /// source 必须来自本核尚未完成的真实 claim；源已屏蔽，处理者已退出，
 /// 本核不可迁移，调用者持该源 descriptor 锁保护完成与重新开放。
 pub unsafe fn external_complete(source: u32) {
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        liointc::complete(source);
+        return;
+    }
     let (word, bit) = source_word(source);
     let _controller = EXTERNAL_CONTROLLER.lock();
     iocsr_write32(ext_reg(0x400 + word), bit);
     barrier();
 }
-/// 用户与 FS 生命周期已停稳后停其它 online 核，再请求所选 virt 平台 poweroff。
+/// 用户与 FS 生命周期已停稳后停其它 online 核，再执行实际 PMC 或 virt GED 断电请求。
 /// 调用者在普通 IRQ 可服务上下文中，不持锁且没有需要继续运行的 CSD 责任。
 pub fn shutdown() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        board_action(crate::boot::info().board.poweroff);
+    }
     ged_action(0, 0x34)
 }
 
-/// 用户与 FS 生命周期已停稳后永久停全部核，保留虚拟机而不写 GED poweroff。
+/// 用户与 FS 生命周期已停稳后永久停全部核，不请求 PMC 或 GED 断电。
 /// 调用环境与 shutdown 相同，永久停核确认不能用于恢复 CPU。
 pub fn halt() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
     disable_stop_sources();
+    crate::console::board_stop();
     permanent_idle()
 }
 
-/// 用户与 FS 生命周期已停稳后停其它 online 核，再写 GED reset 请求整机重启。
-/// 调用环境与 shutdown 相同，reset 使用平台规定的单字节寄存器。
+/// 用户与 FS 生命周期已停稳后停其它 online 核，再执行实际 PMC 或 virt GED 重启请求。
+/// 调用环境与 shutdown 相同，寄存器宽度与 mask 由平台资源确定。
 pub fn restart() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        board_action(crate::boot::info().board.reboot);
+    }
     ged_action(2, 0x42)
 }
 
-/// 早期或致命错误仅请求平台 poweroff，不等待 AP、CSD 或文件生命周期。
+/// 致命错误不等待 AP/CSD 或文件生命周期；板只停当前核，不发布全机清理终点。
 pub fn emergency_shutdown() -> ! {
+    if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        disable_stop_sources();
+        crate::console::board_stop_current_cpu();
+        permanent_idle();
+    }
     ged_action(0, 0x34)
+}
+
+/// catalog 或具名测试已输出完整结果后停止板观察，不把常规完成当成致命错误。
+#[cfg(feature = "ktest")]
+pub fn test_shutdown() -> ! {
+    if crate::platform::current() == crate::boot::Platform::QemuVirt {
+        ged_action(0, 0x34);
+    }
+    let _stop = if crate::cpu::current().online.load(Ordering::Acquire) {
+        Some(crate::cpu::stop_other_online_cpus())
+    } else {
+        None
+    };
+    disable_stop_sources();
+    crate::console::board_stop();
+    permanent_idle()
 }
 
 /// 关闭本核可唤醒源，发布永久确认后只执行 IDLE；只供已完成 CSD 的停核 IPI 使用。
@@ -646,6 +716,24 @@ fn ged_action(offset: usize, value: u8) -> ! {
         core::ptr::write_volatile(mmio_address(0x100e001c + offset) as *mut u8, value);
     }
     barrier();
+    permanent_idle()
+}
+
+/// 执行实际 DT syscon 的最终 RMW；无对应动作时只停核，不声称物理断电。
+fn board_action(action: Option<crate::boot::SysconAction>) -> ! {
+    disable_stop_sources();
+    crate::console::board_stop();
+    if let Some(action) = action {
+        let address = mmio_address(action.registers.start) + action.offset as usize;
+        // SAFETY: 启动边界已验证 syscon 范围、对齐及 mask/value，DMW 永久有效；
+        // 其它 CPU 已永久停稳，本核 IRQ 已关闭，不与其它 PMC 操作并发。
+        unsafe {
+            let pointer = address as *mut u32;
+            let old = pointer.read_volatile();
+            pointer.write_volatile((old & !action.mask) | (action.value & action.mask));
+        }
+        barrier();
+    }
     permanent_idle()
 }
 
@@ -719,7 +807,12 @@ fn handle_hardware_interrupt(estat: usize) {
         barrier();
         crate::cpu::handle_ipi();
     }
-    if pending & (1 << 3) != 0 {
+    let external = if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
+        (1 << 2) | (1 << 3)
+    } else {
+        1 << 3
+    };
+    if pending & external != 0 {
         crate::irq::handle_external();
     }
 }

@@ -985,7 +985,7 @@ impl Drop for PreparedSymlink {
                 let Some(buffer) = buffer else {
                     continue;
                 };
-                buffer.folio().wait_writeback();
+                buffer.wait_writeback();
                 // SAFETY: 该物理块仍由未发表 reservation 独占，inode 根尚未连接本批块；
                 // metadata_block 返回或失败时读入责任已收回，且 wait_writeback 已结束原页写回。
                 unsafe { buffer.forget(self.volume.claim()) }
@@ -2841,15 +2841,7 @@ impl Inode {
         update: impl FnOnce(&mut InodeMetadata) -> T,
     ) -> Result<T, FsError> {
         let volume = self.disk_volume()?;
-        if claim.mode() != AccessMode::ReadWrite || volume.mode() != AccessMode::ReadWrite {
-            return Err(FsError::ReadOnly);
-        }
-        if !core::ptr::eq(
-            claim.disk().as_ref().get_ref(),
-            volume.disk().as_ref().get_ref(),
-        ) {
-            return Err(FsError::InvalidOperation);
-        }
+        volume.require_write(claim)?;
         let state = self.wait_loaded()?;
         let _scope = ReclaimScope::nofs();
         let _write = state.write.write();

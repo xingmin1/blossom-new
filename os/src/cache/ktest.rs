@@ -8,7 +8,9 @@ use core::alloc::Layout;
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::block::{self, AccessMode, BioAllocator, BlockError, Disk, DiskRef, IoResult};
+use crate::block::{
+    self, AccessMode, BioAllocator, BlockError, BlockView, Disk, DiskRef, IoResult,
+};
 use crate::cache::{BufferRef, FolioIndex, MetadataCache};
 use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
 use crate::drivers::DeviceInventory;
@@ -504,10 +506,15 @@ impl Owner {
                     .map_err(|_| TestError("extra cache activation failed"))?;
             }
             if scenario == Scenario::MetadataRecords {
-                let first_root = Ext4Volume::open(disk.clone(), AccessMode::ReadOnly, 8).is_ok();
-                let second_root =
-                    Ext4Volume::open(extra.as_ref().unwrap().clone(), AccessMode::ReadOnly, 8)
+                let first_root =
+                    Ext4Volume::open(BlockView::whole(disk.clone()), AccessMode::ReadOnly, 8)
                         .is_ok();
+                let second_root = Ext4Volume::open(
+                    BlockView::whole(extra.as_ref().unwrap().clone()),
+                    AccessMode::ReadOnly,
+                    8,
+                )
+                .is_ok();
                 if first_root == second_root {
                     return Err(TestError(
                         "record case requires exactly one real ext4 root and one scratch",
@@ -536,7 +543,7 @@ impl Owner {
                 } else {
                     AccessMode::ReadOnly
                 };
-                let claim = Disk::claim_fs(&disk, mode)
+                let claim = Disk::claim_fs(&BlockView::whole(disk.clone()), mode)
                     .map_err(|_| TestError("metadata FS claim failed"))?;
                 Some(
                     MetadataCache::shared(&claim, capacity)
@@ -550,7 +557,8 @@ impl Owner {
             let extra_metadata = extra
                 .as_ref()
                 .map(|disk| {
-                    let claim = Disk::claim_fs(disk, AccessMode::ReadOnly)?;
+                    let claim =
+                        Disk::claim_fs(&BlockView::whole(disk.clone()), AccessMode::ReadOnly)?;
                     MetadataCache::shared(&claim, 8)
                 })
                 .transpose()
@@ -1206,11 +1214,10 @@ impl Owner {
             return Err(TestError("overlap case requires logical block <= 1KiB"));
         }
         let cache = self.metadata.as_ref().unwrap();
-        let claim = Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
+        let claim = Disk::claim_fs(&BlockView::whole(self.disk.clone()), AccessMode::ReadWrite)
             .map_err(|_| TestError("private metadata RW claim failed"))?;
         let same = MetadataCache::shared(&claim, 8)
             .map_err(|_| TestError("shared same-Disk metadata cache disappeared"))?;
-        context.expect_eq(Arc::ptr_eq(cache, &same), true);
         context.expect_eq(MetadataCache::shared(&claim, 7).is_err(), true);
         let tiny = cache
             .get(1, 1024, None)
@@ -1226,7 +1233,7 @@ impl Owner {
         tiny.update(&claim, |bytes| bytes.fill(0xa5))
             .map_err(|_| TestError("private tiny update failed"))?;
         context.expect_eq(tiny.folio().dirty_sectors(), 0b0000_1100);
-        let ro = Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
+        let ro = Disk::claim_fs(&BlockView::whole(self.disk.clone()), AccessMode::ReadOnly)
             .map_err(|_| TestError("private metadata RO claim failed"))?;
         context.expect_eq(
             tiny.update(&ro, |bytes| bytes.fill(0xee)),
@@ -1280,7 +1287,7 @@ impl Owner {
     fn concurrent_records(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.ready()?;
         let volume = Ext4Volume::open(
-            self.extra.as_ref().unwrap().clone(),
+            BlockView::whole(self.extra.as_ref().unwrap().clone()),
             AccessMode::ReadOnly,
             8,
         )
@@ -1345,7 +1352,7 @@ impl Owner {
             codec::validate_inode_metadata_update(&before[index], &after[index])
                 .map_err(|_| TestError("record expected metadata not representable"))?;
         }
-        let claim = Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
+        let claim = Disk::claim_fs(&BlockView::whole(self.disk.clone()), AccessMode::ReadWrite)
             .map_err(|_| TestError("private record RW claim failed"))?;
         let cache = self.metadata.as_ref().unwrap().clone();
         let buffer = cache

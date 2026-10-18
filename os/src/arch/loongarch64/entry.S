@@ -3,15 +3,15 @@
 .balign 64
 .global __primary_entry
 __primary_entry:
-    # QEMU 的 a0/a1/a2 原样保留；CPU 身份从 CSR 读取。
+    # 清 BSS 与建立 DMW 前保存完整固件参数，CPU 身份另从 CSR 读取。
+    move $s0, $a0
+    move $s1, $a1
+    move $s2, $a2
+    move $s3, $a3
     li.w $t0, 4
     csrxchg $zero, $t0, 0
     # KS0 的零值表示尚未安装本核 CpuLocal。
     csrwr $zero, 0x30
-    # BSP 的固件入口也可能是物理 PC；先切到高别名，再开启分页。
-    la.abs $t0, .Lprimary_high
-    jirl $zero, $t0, 0
-.Lprimary_high:
     la.abs $t0, __direct_base
     ori $t0, $t0, 0x11
     csrwr $t0, 0x181
@@ -20,6 +20,10 @@ __primary_entry:
     csrwr $t0, 0x180
     csrwr $zero, 0x182
     csrwr $zero, 0x183
+    # 高别名取指前先建立 DMW，兼容固件仍处于分页模式的物理入口。
+    la.abs $t0, .Lprimary_high
+    jirl $zero, $t0, 0
+.Lprimary_high:
     li.w $t0, 0x10
     li.w $t1, 0x18
     csrxchg $t0, $t1, 0
@@ -34,6 +38,10 @@ __primary_entry:
     addi.d $t0, $t0, 8
     b 1b
 2:
+    move $a0, $s0
+    move $a1, $s1
+    move $a2, $s2
+    move $a3, $s3
     b primary_main
 
 .balign 64
@@ -43,10 +51,6 @@ __secondary_entry:
     csrxchg $zero, $t0, 0
     # 辅核安装 CpuLocal 前也保持可检查的空基址。
     csrwr $zero, 0x30
-    # 邮箱入口为物理 PC，先跳到高别名，再打开 PG。
-    la.abs $t0, .Lsecondary_high
-    jirl $zero, $t0, 0
-.Lsecondary_high:
     la.abs $t0, __direct_base
     ori $t0, $t0, 0x11
     csrwr $t0, 0x181
@@ -55,13 +59,24 @@ __secondary_entry:
     csrwr $t0, 0x180
     csrwr $zero, 0x182
     csrwr $zero, 0x183
+    # mailbox 指向物理 PC；高别名建立以后才切换 CRMD 的分页状态。
+    la.abs $t0, .Lsecondary_high
+    jirl $zero, $t0, 0
+.Lsecondary_high:
     li.w $t0, 0x10
     li.w $t1, 0x18
     csrxchg $t0, $t1, 0
+    .if {board_platform}
+    li.w $t0, 0x1028
+    iocsrrd.d $sp, $t0
+    li.w $t0, 0x1030
+    iocsrrd.d $a0, $t0
+    .else
     li.w $t0, 0x1028
     iocsrrd.d $t1, $t0
     la.abs $t0, __direct_base
     or $t1, $t1, $t0
     ld.d $sp, $t1, {boot_stack}
     ld.d $a0, $t1, {boot_local}
+    .endif
     b secondary_main

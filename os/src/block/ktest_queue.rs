@@ -225,7 +225,11 @@ impl Request {
                     logical += 1;
                 }
             }
-            originals.push(mapped.segment());
+            originals.push(
+                mapped
+                    .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                    .expect("QEMU fixture mapping must be reachable"),
+            );
             memory.push(mapped);
             remaining -= length;
             offset = 0;
@@ -262,7 +266,9 @@ impl Request {
         context.expect_eq(memory.len(), self.originals.len());
         let mut logical = 0;
         for (mapped, original) in memory.iter().zip(&self.originals) {
-            let actual = mapped.segment();
+            let actual = mapped
+                .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                .expect("QEMU fixture mapping must be reachable");
             context.expect_eq(
                 (actual.address, actual.length, actual.direction),
                 (original.address, original.length, original.direction),
@@ -743,7 +749,7 @@ impl Owner {
     fn interrupt_flags(&self) -> u16 {
         let q = self.disk.queue.lock();
         let device = q.device.as_ref().expect("live queue ring owner");
-        let ring = device.control_regions().0;
+        let ring = device.test_virtio().control_regions().0;
         let flags = usize::from(self.disk.limits().queue_depth) * 16;
         crate::arch::dma_read_barrier();
         // SAFETY: 同一 queue 锁保控制区；avail.flags 位于 descriptor 表后对齐 u16，仅 volatile 读取。
@@ -885,6 +891,7 @@ impl Owner {
             .device
             .as_ref()
             .expect("blocked live device")
+            .test_virtio()
             .driver()
             .available_descriptors();
         if self.scenario == Scenario::Tag {
@@ -1103,8 +1110,11 @@ impl Owner {
     /// 独占 scratch 上 claim 拒写和 Busy stop，释放后实际 Write/Read-back/FLUSH，不写挂载盘。
     fn scratch(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.ready()?;
-        let claim = Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
-            .map_err(|_| TestError("scratch RO FS claim failed"))?;
+        let claim = Disk::claim_fs(
+            &crate::block::BlockView::whole(self.disk.clone()),
+            AccessMode::ReadOnly,
+        )
+        .map_err(|_| TestError("scratch RO FS claim failed"))?;
         let before = self.disk.test_snapshot();
         context.expect_eq(self.disk.stop(), Err(BlockError::Busy));
         self.submit(0);
@@ -1146,7 +1156,9 @@ impl Owner {
             .map_err(|_| TestError("scratch read-back original memory unavailable"))?;
         let mut logical = 0;
         for (mapped, original) in memory.iter().zip(&request.originals) {
-            let segment = mapped.segment();
+            let segment = mapped
+                .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                .expect("QEMU fixture mapping must be reachable");
             context.expect_eq(
                 (segment.address, segment.length, segment.direction),
                 (original.address, original.length, original.direction),
@@ -1173,8 +1185,11 @@ impl Owner {
     fn fs_scratch(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.ready()?;
         let before = self.disk.test_snapshot();
-        let ro = Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
-            .map_err(|_| TestError("scratch RO FS claim failed"))?;
+        let ro = Disk::claim_fs(
+            &crate::block::BlockView::whole(self.disk.clone()),
+            AccessMode::ReadOnly,
+        )
+        .map_err(|_| TestError("scratch RO FS claim failed"))?;
         self.submit(0);
         ro.submit_bio(self.requests[1].pending.take().unwrap());
         for request in &self.requests[..2] {
@@ -1190,8 +1205,11 @@ impl Owner {
         context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
         drop(ro);
         self.claim = Some(
-            Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
-                .map_err(|_| TestError("scratch RW FS claim failed"))?,
+            Disk::claim_fs(
+                &crate::block::BlockView::whole(self.disk.clone()),
+                AccessMode::ReadWrite,
+            )
+            .map_err(|_| TestError("scratch RW FS claim failed"))?,
         );
         let clone = self.claim.as_ref().unwrap().clone();
         context.expect_eq(self.disk.queue.lock().mounts, 1);
@@ -1240,8 +1258,11 @@ impl Owner {
         );
         context.expect_eq(self.observation.callback_tail.load(Ordering::Acquire), true);
         self.claim = Some(
-            Disk::claim_fs(&self.disk, AccessMode::ReadWrite)
-                .map_err(|_| TestError("scratch RW FS readback claim failed"))?,
+            Disk::claim_fs(
+                &crate::block::BlockView::whole(self.disk.clone()),
+                AccessMode::ReadWrite,
+            )
+            .map_err(|_| TestError("scratch RW FS readback claim failed"))?,
         );
         self.claim
             .as_ref()
@@ -1269,13 +1290,20 @@ impl Owner {
         self.ready()?;
         context.expect_eq(self.disk.limits().readonly, true);
         context.expect_eq(
-            Disk::claim_fs(&self.disk, AccessMode::ReadWrite).err(),
+            Disk::claim_fs(
+                &crate::block::BlockView::whole(self.disk.clone()),
+                AccessMode::ReadWrite,
+            )
+            .err(),
             Some(BlockError::ReadOnly),
         );
         context.expect_eq(self.disk.queue.lock().mounts, 0);
         self.claim = Some(
-            Disk::claim_fs(&self.disk, AccessMode::ReadOnly)
-                .map_err(|_| TestError("readonly device RO FS claim failed"))?,
+            Disk::claim_fs(
+                &crate::block::BlockView::whole(self.disk.clone()),
+                AccessMode::ReadOnly,
+            )
+            .map_err(|_| TestError("readonly device RO FS claim failed"))?,
         );
         self.claim
             .as_ref()
@@ -1295,7 +1323,12 @@ impl Owner {
         self.ready()?;
         let limits = self.disk.limits();
         let unit = limits.logical_block_size as usize;
-        let segment = self.requests[0].originals[0];
+        let original = self.requests[0].originals[0];
+        let segment = crate::mm::dma::PayloadRange {
+            physical: original.address.value() as usize,
+            length: original.length,
+            direction: original.direction,
+        };
         let before = self.disk.test_snapshot();
         context.expect_eq(
             limits.validate(BlkOperation::Read, u64::MAX, unit, [segment], 0),
@@ -1323,7 +1356,7 @@ impl Owner {
             limits.validate(BlkOperation::Read, 0, unit, [segment], 1),
             Err(BlockError::Unsupported),
         );
-        let wrong = MappedSegment {
+        let wrong = crate::mm::dma::PayloadRange {
             direction: BufferDirection::DriverToDevice,
             ..segment
         };
@@ -1336,7 +1369,7 @@ impl Owner {
                 BlkOperation::Read,
                 0,
                 511,
-                [MappedSegment {
+                [crate::mm::dma::PayloadRange {
                     length: 511,
                     ..segment
                 }],
@@ -1657,8 +1690,21 @@ impl Owner {
             .take_memory()
             .map_err(|_| TestError("WB ledger original payload not returned"))?;
         for (mapped, identity) in reclaimed.iter().zip(identities) {
-            context.expect_eq(mapped.segment().address.value(), identity as u64);
-            context.expect_eq(mapped.segment().direction, BufferDirection::DriverToDevice);
+            context.expect_eq(
+                mapped
+                    .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                    .expect("QEMU fixture mapping must be reachable")
+                    .address
+                    .value(),
+                identity as u64,
+            );
+            context.expect_eq(
+                mapped
+                    .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+                    .expect("QEMU fixture mapping must be reachable")
+                    .direction,
+                BufferDirection::DriverToDevice,
+            );
             context.expect_eq(mapped.is_device_owned(), false);
         }
         context.expect_eq(completion.take_memory().err(), Some(BlockError::Busy));
@@ -2158,6 +2204,70 @@ mod fs_claim {
         fixture: &mut FsScratch,
     ) -> TestResult {
         fixture.0.fs_scratch(context)
+    }
+
+    /// 已接受生成者、实际 slot 和卷范围共同仲裁，非重叠 scratch 保持真实可写。
+    #[test]
+    fn bounded_claims_keep_nonoverlapping_scratch_writable(
+        context: &mut TestContext<'_>,
+        fixture: &mut FsScratch,
+    ) -> TestResult {
+        let owner = &mut fixture.0;
+        owner.ready()?;
+        let root = crate::block::BlockView::new(owner.disk.clone(), 0, 1024)
+            .map_err(|_| TestError("root view construction failed"))?;
+        let scratch = crate::block::BlockView::new(owner.disk.clone(), 2048, 1024)
+            .map_err(|_| TestError("scratch view construction failed"))?;
+        let accepted = owner
+            .disk
+            .admit(owner.requests[0].pending.take().unwrap())
+            .map_err(|_| TestError("raw writer admission failed"))?;
+        context.expect_eq(
+            Disk::claim_fs(&scratch, AccessMode::ReadOnly).err(),
+            Some(BlockError::Busy),
+        );
+        let root_claim = Disk::claim_fs(&root, AccessMode::ReadWrite)
+            .map_err(|_| TestError("nonoverlapping accepted writer blocked root"))?;
+        accepted.finish(Some((0, BlockError::QueueStopped)));
+        owner.requests[0].reclaim(
+            context,
+            IoResult {
+                completed: 0,
+                error: Some(BlockError::QueueStopped),
+            },
+            None,
+        )?;
+        let overlap = crate::block::BlockView::new(owner.disk.clone(), 512, 1024)
+            .map_err(|_| TestError("overlap view construction failed"))?;
+        context.expect_eq(
+            Disk::claim_fs(&overlap, AccessMode::ReadOnly).err(),
+            Some(BlockError::Busy),
+        );
+        root_claim.submit_bio(owner.requests[1].pending.take().unwrap());
+        owner.requests[1].reclaim(
+            context,
+            IoResult {
+                completed: 0,
+                error: Some(BlockError::InvalidRange),
+            },
+            None,
+        )?;
+        scratch.submit_bio(owner.requests[2].pending.take().unwrap());
+        owner.requests[2].success(context, None)?;
+        until("scratch raw slot tail did not finish", || {
+            owner.disk.test_snapshot().inflight == 0
+        })?;
+        let scratch_claim = Disk::claim_fs(&scratch, AccessMode::ReadWrite)
+            .map_err(|_| TestError("disjoint scratch claim blocked"))?;
+        let mut bytes = [0x7b; 512];
+        context.expect_eq(
+            scratch.read_exact_at(1024 * 512, &mut bytes),
+            Err(BlockError::InvalidRange),
+        );
+        context.expect_eq(bytes, [0x7b; 512]);
+        drop(scratch_claim);
+        drop(root_claim);
+        Ok(())
     }
 }
 

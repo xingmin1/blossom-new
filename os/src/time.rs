@@ -11,7 +11,7 @@ use core::sync::atomic::{compiler_fence, fence, AtomicU64, Ordering};
 use spin::Once;
 
 use crate::arch;
-use crate::boot::{BootInfo, Region};
+use crate::boot::{BootInfo, Platform, Region};
 use crate::cpu;
 use crate::sync::SpinLock;
 
@@ -317,12 +317,43 @@ unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
     }
 }
 
-/// BSP 在唯一计数基准注册前取得一次实际 UTC，不安装 RTC 中断或周期维护。
+/// BSP 按实际平台采样持久时钟；无可用源时从未校时的 Unix 零点沿单调基准推进。
 ///
 /// # Safety
-/// info 必须是已验证的当前机器启动资源；RTC 已永久映射，IRQ 关闭且 AP 尚未释放，
-/// 没有其它 RTC 访问者，可以独占锁存和 TOY 控制寄存器。
+/// info 必须是已验证的当前机器启动资源；存在的 RTC 及其时钟、复位 provider
+/// 已永久映射，IRQ 关闭且 AP 尚未释放，没有其它 RTC 访问者。
 unsafe fn boot_realtime(info: &BootInfo) -> u64 {
+    match info.platform {
+        Platform::QemuVirt => {
+            // SAFETY: 平台身份来自已验证 BootInfo；初始化独占已映射的 QEMU RTC。
+            unsafe { qemu_realtime(info) }
+        }
+        Platform::VisionFive2 | Platform::Ls2k1000la => {
+            // SAFETY: 继承 BSP IRQ-off、AP 未释放、真实资源与 provider 永久映射的合同。
+            let calendar =
+                unsafe { arch::board_rtc_calendar(info) }.expect("board RTC sampling failed");
+            match calendar {
+                Some(calendar) => {
+                    calendar_realtime(calendar).expect("RTC calendar is invalid or out of range")
+                }
+                None => {
+                    crate::early_println!(
+                        "RTC platform={:?} source=unset; no trusted persistent clock; realtime starts at Unix epoch 0",
+                        info.platform
+                    );
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// 保留 QEMU Goldfish 的纳秒锁存与 TOY 的启用、稳定采样协议。
+///
+/// # Safety
+/// info 必须属于 QEMU virt；RTC 已永久映射，IRQ 关闭且 AP 尚未释放，
+/// 调用者独占锁存和 TOY 控制寄存器。
+unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
     #[cfg(target_arch = "riscv64")]
     {
         // TIME_LOW 锁存同一采样的高字；必须先读低字再读取该高字。
@@ -364,15 +395,22 @@ unsafe fn boot_realtime(info: &BootInfo) -> u64 {
     }
 }
 
-/// 将 TOY 的公历字段换算为 UTC Unix 纳秒；年份以 1900 为起点，不猜测无效日期。
+/// 解码以 1900 为起点的 TOY 年份及日历寄存器，复用完整公历校验。
 #[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
 fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
-    let year = i64::from(toy_year) + 1900;
-    let month = i64::from((low >> 26) & 0x3f);
-    let day = i64::from((low >> 21) & 0x1f);
-    let hour = i64::from((low >> 16) & 0x1f);
-    let minute = i64::from((low >> 10) & 0x3f);
-    let second = i64::from((low >> 4) & 0x3f);
+    calendar_realtime([
+        toy_year.checked_add(1900)?,
+        (low >> 26) & 0x3f,
+        (low >> 21) & 0x1f,
+        (low >> 16) & 0x1f,
+        (low >> 10) & 0x3f,
+        (low >> 4) & 0x3f,
+    ])
+}
+
+/// 将绝对公历年月日时分秒转换为 Unix 纳秒，拒绝无效日期和容量之外的样本。
+fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
+    let [year, month, day, hour, minute, second] = calendar.map(i64::from);
     if !(1..=12).contains(&month) || 24 <= hour || 60 <= minute || 60 <= second {
         return None;
     }
@@ -405,12 +443,12 @@ fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
     u64::try_from(seconds).ok()?.checked_mul(NSEC_PER_SEC)
 }
 
-/// 在 BSP 上一次采样实际 RTC 并注册稳定计数器，之后日历沿同一单调基准推进。
+/// BSP 一次确定持久时钟或未校时零点，并注册后续共同使用的稳定计数器。
 ///
 /// # Safety
 /// 仅 BSP 在 MM 初始化后、IRQ 关闭且 AP 尚未释放时调用一次；BootInfo 必须是
-/// 当前机器已验证的资源，RTC 永久映射已建立且无其它访问者；频率属于当前跨 CPU
-/// 一致的 64 位硬件 counter，之后不得切换计数源。
+/// 当前机器已验证的资源，存在的 RTC 及其时钟、复位 provider 已永久映射且无其它
+/// 访问者；频率属于当前跨 CPU 一致的 64 位硬件 counter，之后不得切换计数源。
 pub unsafe fn initialize(info: &BootInfo) {
     assert!(!arch::irq_enabled(), "time initialization requires IRQ-off");
     assert!(
@@ -418,7 +456,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         "timekeeper is already initialized"
     );
     TIMEKEEPER.call_once(|| {
-        // SAFETY: 本入口继承 BSP 独占、IRQ-off、AP 未释放和实际 RTC 已映射的启动合同。
+        // SAFETY: 本入口继承 BSP 独占、IRQ-off、AP 未释放和实际 RTC/provider 已映射的启动合同。
         let realtime = unsafe { boot_realtime(info) };
         compiler_fence(Ordering::SeqCst);
         let cycle = arch::read_counter();
@@ -440,7 +478,7 @@ pub fn now() -> MonotonicInstant {
     keeper().read(arch::read_counter)
 }
 
-/// 将不可变 RTC 起点与原单调经过纳秒相加，日历空间耗尽时直接失败。
+/// 将 RTC 起点或未校时零点与原单调经过纳秒相加，日历空间耗尽时直接失败。
 pub fn realtime() -> u64 {
     REALTIME_BASE
         .get()
@@ -449,7 +487,7 @@ pub fn realtime() -> u64 {
         .expect("realtime nanoseconds exhausted")
 }
 
-/// 将 UTC 绝对睡眠期限转换到原单调域；注册前的日历期限对应已经过去的零时刻。
+/// 将当前日历域的绝对睡眠期限转换到原单调域；起点之前的期限对应已经过去的零时刻。
 pub(crate) fn realtime_deadline(nanos: u64) -> MonotonicInstant {
     let base = *REALTIME_BASE
         .get()

@@ -2,7 +2,9 @@
 
 use alloc::sync::Arc;
 
-use crate::block::{AccessMode, DiskRef};
+use crate::block::partition::DeviceSelector;
+use crate::block::{AccessMode, BlockView};
+use crate::boot::{self, Platform};
 use crate::fs::ext4::crc::crc32c;
 use crate::fs::{
     Ext4Volume, FileLike, FileTable, Filesystem, FsContext, FsError, InodeCache, OpenOptions,
@@ -15,18 +17,18 @@ const DEFAULT_ROOTDIR: &[u8] = b"/riscv64";
 #[cfg(target_arch = "loongarch64")]
 const DEFAULT_ROOTDIR: &[u8] = b"/loongarch64";
 
-/// 启动参数选中的固定磁盘槽；是否存在由本次真实设备表检查。
+/// 启动参数选中的精确设备和分区；是否存在由已发现的视图表检查。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BootDevices<'a> {
-    pub root: usize,
-    pub extra: Option<usize>,
+    pub root: DeviceSelector,
+    pub extra: Option<DeviceSelector>,
     pub root_mode: AccessMode,
     pub rootdir: &'a [u8],
     pub init: &'a [u8],
 }
 
-/// 一次按 ASCII 空白消费 root/extra/rootdir/init 与完整 ro/rw token 的最后值，根默认只读。
-/// 缺键时采用固定系统盘及目标根目录；显式设备错误立即返回，路径错误由真实查找或 exec 返回。
+/// 按 ASCII 空白消费各参数的最后值，QEMU 保留默认根，开发板要求明确根设备和根目录。
+/// 设备解析失败和开发板非根目录选择立即返回，不猜分区或切换介质。
 pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError> {
     let mut root = None;
     let mut extra = None;
@@ -48,28 +50,34 @@ pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError>
             root_mode = AccessMode::ReadWrite;
         }
     }
+    let board = boot::info().platform != Platform::QemuVirt;
+    let root = match root {
+        Some(root) => root,
+        None if !board => b"/dev/vdb",
+        None => return Err(FsError::MissingRoot),
+    };
+    let rootdir = match rootdir {
+        Some(rootdir) if !board || rootdir == b"/" => rootdir,
+        None if !board => DEFAULT_ROOTDIR,
+        _ => return Err(FsError::MissingRoot),
+    };
     Ok(BootDevices {
-        root: device_index(root.unwrap_or(b"/dev/vdb"))?,
-        extra: extra.map(device_index).transpose()?,
+        root: DeviceSelector::parse(root).map_err(|_| FsError::MissingRoot)?,
+        extra: extra
+            .map(DeviceSelector::parse)
+            .transpose()
+            .map_err(|_| FsError::MissingRoot)?,
         root_mode,
-        rootdir: rootdir.unwrap_or(DEFAULT_ROOTDIR),
+        rootdir,
         init: init.unwrap_or(b"/sbin/init"),
     })
-}
-
-/// 从完整原始字节名字取得一个槽号，不接受分区、LABEL、UUID 或多字母后缀。
-pub(crate) fn device_index(name: &[u8]) -> Result<usize, FsError> {
-    match name.strip_prefix(b"/dev/vd") {
-        Some([letter @ b'a'..=b'z']) => Ok(usize::from(*letter - b'a')),
-        _ => Err(FsError::MissingRoot),
-    }
 }
 
 /// 普通可睡眠 Task 挂一次根卷，按真实目录建立 root=cwd 的初始视图，再挂显式只读附盘。
 /// 卷与路径只保活原设备及缓存；目录或附盘准备失败原样返回，不改选盘或物理根。
 pub(crate) fn mount_disks(
-    root: DiskRef,
-    extra: Option<DiskRef>,
+    root: BlockView,
+    extra: Option<BlockView>,
     inodes: Arc<InodeCache>,
     root_mode: AccessMode,
     rootdir: &[u8],

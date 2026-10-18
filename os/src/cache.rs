@@ -5,11 +5,12 @@ mod index;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::convert::TryFrom;
-use core::ops::Range;
+use core::ops::{Deref, Range};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::block::{
-    AccessMode, BioAllocator, BioMemory, BioReserve, BlockError, FsClaim, MetadataIoContext,
-    SECTOR_BYTES,
+    AccessMode, BioAllocator, BioMemory, BioReserve, BlockError, DiskRef, FsClaim,
+    MetadataIoContext, SECTOR_BYTES,
 };
 use crate::fs::ext4::Ext4Volume;
 use crate::fs::{FsError, InodeRef};
@@ -415,20 +416,64 @@ impl FolioIndex {
 #[cfg(feature = "ktest")]
 pub(crate) type MetadataLoadHook = Arc<dyn Fn(&Arc<MetadataCache>, u64, usize) + Send + Sync>;
 
-/// Disk 弱反向槽取得同一物理元数据域；外部视图保留本缓存和真实 FS 占用。
-pub struct MetadataCache {
+/// 物理盘只保留一份索引、页预算和有限 IO 来源；弱视图不反持各卷占用。
+pub struct MetadataPages {
     index: FolioIndex,
-    // 卷弱关联用于取得同一 FS 实例和标脏通知；卷持缓存，不形成强环。
-    pub(crate) filesystem: SleepMutex<Weak<Ext4Volume>>,
-    // 静止索引与弱关联先析构，最后一份 FS 占用才允许 raw writer 进入。
-    claim: FsClaim,
-    // 锁内保存下轮后台扫描的物理页 byte key，显式同步不改变它。
-    writeback: SleepMutex<u64>,
-    wb_error: SpinLock<WritebackError>,
-    #[cfg(feature = "ktest")]
-    load_hook: SpinLock<Option<MetadataLoadHook>>,
     reserve_init: SleepRwLock<()>,
     reserve: SpinLock<Option<Arc<BioReserve>>>,
+    facades: SleepMutex<Vec<Weak<MetadataCache>>>,
+    disk: DiskRef,
+}
+
+/// 每个实际范围保留独立卷、占用、扫描和错误序列，原页仍属于物理盘索引。
+pub struct MetadataCache {
+    pages: Arc<MetadataPages>,
+    pub(crate) filesystem: SleepMutex<Weak<Ext4Volume>>,
+    claim: FsClaim,
+    writeback: SleepMutex<u64>,
+    selected: SpinLock<Vec<u64>>,
+    wb_error: SpinLock<WritebackError>,
+    closed: AtomicBool,
+    #[cfg(feature = "ktest")]
+    load_hook: SpinLock<Option<MetadataLoadHook>>,
+}
+
+impl Deref for MetadataCache {
+    type Target = MetadataPages;
+
+    /// 缓存视图只借物理页域，不能以另一范围的占用提交 IO。
+    fn deref(&self) -> &Self::Target {
+        &self.pages
+    }
+}
+
+impl MetadataPages {
+    /// 失效已结束占用的半开 sector 段；只借有限索引节点，不分配、摘页或等待内容锁。
+    ///
+    /// # Safety
+    /// 调用者持同盘 queue 锁且尚未摘离最后 claim，已扣除所有其他活 claim 的范围；
+    /// 该段的 Buffer、读入、Dirty 和 WB 均已结束，重新准入只可发生在本操作返回后。
+    pub(crate) unsafe fn retire_range(&self, start: u64, end: u64) {
+        let Some(byte) = start.checked_mul(SECTOR_BYTES) else {
+            return;
+        };
+        let mut cursor = byte / PAGE_SIZE as u64 * PAGE_SIZE as u64;
+        let entries = self.index.entries.lock();
+        while let Some(node) = entries
+            .lower_bound(cursor)
+            .filter(|node| node.key / SECTOR_BYTES < end)
+        {
+            let page = node.key / SECTOR_BYTES;
+            let first = start.max(page);
+            let last = end.min(page + PAGE_SIZE as u64 / SECTOR_BYTES);
+            let offset = ((first - page) * SECTOR_BYTES) as usize;
+            let len = ((last - first) * SECTOR_BYTES) as usize;
+            // SAFETY: queue 锁仍阻止本段新准入，调用者已排除全部活范围责任；
+            // 索引锁保活原 folio，仅撤本页与退休段的交集，不接触相邻窗口的字节。
+            unsafe { node.folio.retire_metadata(offset, len) };
+            cursor = node.key + 1;
+        }
+    }
 }
 
 impl MetadataCache {
@@ -437,7 +482,7 @@ impl MetadataCache {
         self.writeback.lock()
     }
 
-    /// RW 卷发表前准备同一缓存的有限原页及 Arc 控制，现存热页保持原 PFN 和内容。
+    /// RW 卷发表前准备有限原页及控制，热节点在同一次索引锁内替换，原 PFN 与范围状态连续可见。
     pub(crate) fn prepare_reserve(self: &Arc<Self>) -> Result<Arc<BioReserve>, BlockError> {
         let _scope = ReclaimScope::noio();
         let _init = self.reserve_init.write();
@@ -472,27 +517,10 @@ impl MetadataCache {
         for slot in 0..self.capacity() {
             Node::prime(&reserve, slot)?;
         }
-        // 所有可失败申请已完成。已 prime 的控制使用同一实际 Arc Layout，
-        // 下方构造只消费原块；hot 原引用阻止 prune，miss/init 锁排除新发表。
+        // 所有可失败申请已完成，prime 后的构造只消费真实预备控制块。
+        // hot 和源基准保活原 folio，旧节点在替换控制准备期间始终留在索引中。
         for (slot, (key, folio)) in hot.into_iter().enumerate() {
-            let (selected, old) = {
-                let mut entries = self.index.entries.lock();
-                let node = entries
-                    .get(key)
-                    .expect("bootstrap metadata node disappeared");
-                assert_eq!(
-                    node.folio.phys_addr(),
-                    folio.phys_addr(),
-                    "bootstrap metadata identity changed"
-                );
-                let selected = node.to_write();
-                let old = entries.remove(key).unwrap();
-                (selected, old)
-            };
-            // 发表前没有 metadata Node observer 出口，旧 Heap 控制只有原索引拥有；
-            // 真 Drop 结束旧控制后重建 immutable key，原 baseline/Buffer/IO 不移动原页。
-            old.release();
-            let node = Node::prepare(
+            let replacement = Node::prepare(
                 key,
                 folio,
                 None,
@@ -502,11 +530,24 @@ impl MetadataCache {
                 },
             )
             .expect("primed metadata control allocation failed");
-            {
+            let old = {
                 let mut entries = self.index.entries.lock();
-                entries.insert(node);
-                entries.set_to_write(key, selected);
-            }
+                let node = entries
+                    .get(key)
+                    .expect("bootstrap metadata node disappeared");
+                assert_eq!(
+                    node.folio.phys_addr(),
+                    replacement.folio.phys_addr(),
+                    "bootstrap metadata identity changed"
+                );
+                // 范围退休也持此索引锁；它只能看到旧节点或指向同一 folio 的新节点，
+                // 不能在摘离空窗漏过原页。缺失或身份变化均不允许插回旧快照。
+                let old = entries.remove(key).unwrap();
+                entries.insert(replacement);
+                old
+            };
+            // 原 Heap 控制及其页引用在索引锁外结束，不能由最后 put 反取队列锁。
+            old.release();
         }
         reserve.mark_ready();
         *self.reserve.lock() = Some(Arc::clone(&reserve));
@@ -541,34 +582,78 @@ impl MetadataCache {
         self.wb_error.lock().record(error);
     }
 
-    /// 相同 Disk 复用唯一缓存；活域请求不同页预算明确拒绝，不默默采用首个预算。
+    /// 同盘共享唯一物理预算，同范围复用同一 facade，权限切换须等旧占用全部结束。
     pub fn shared(claim: &FsClaim, capacity: usize) -> Result<Arc<Self>, BlockError> {
         if capacity == 0 {
             return Err(BlockError::InvalidRange);
         }
-        if let Some(cache) = claim.disk().metadata_cache() {
-            if cache.capacity() != capacity {
-                return Err(BlockError::Busy);
+        let pages = match claim.disk().metadata_cache() {
+            Some(pages) => pages,
+            None => {
+                let candidate = Arc::try_new(MetadataPages {
+                    index: FolioIndex::new(Some(capacity), true),
+                    reserve_init: SleepRwLock::new(()),
+                    reserve: SpinLock::new(None),
+                    facades: SleepMutex::new(Vec::new()),
+                    disk: claim.disk().clone(),
+                })
+                .map_err(|_| BlockError::NoMemory)?;
+                claim.disk().intern_metadata_cache(&candidate)
             }
-            return Ok(cache);
+        };
+        if pages.index.capacity != Some(capacity) {
+            return Err(BlockError::Busy);
         }
+        if let Some(existing) = Self::existing_facade(&pages.facades.lock(), claim)? {
+            return Ok(existing);
+        }
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(capacity)
+            .map_err(|_| BlockError::NoMemory)?;
         let candidate = Arc::try_new(Self {
+            pages: pages.clone(),
             claim: claim.clone(),
-            index: FolioIndex::new(Some(capacity), true),
             filesystem: SleepMutex::new(Weak::new()),
             writeback: SleepMutex::new(0),
+            selected: SpinLock::new(selected),
             wb_error: SpinLock::new(WritebackError::new()),
-            reserve_init: SleepRwLock::new(()),
-            reserve: SpinLock::new(None),
+            closed: AtomicBool::new(false),
             #[cfg(feature = "ktest")]
             load_hook: SpinLock::new(None),
         })
         .map_err(|_| BlockError::NoMemory)?;
-        let cache = claim.disk().intern_metadata_cache(&candidate);
-        if cache.capacity() != capacity {
-            return Err(BlockError::Busy);
+        let mut facades = pages.facades.lock();
+        facades.retain(|entry| entry.strong_count() != 0);
+        if let Some(existing) = Self::existing_facade(&facades, claim)? {
+            drop(facades);
+            return Ok(existing);
         }
-        Ok(cache)
+        facades.try_reserve(1).map_err(|_| BlockError::NoMemory)?;
+        facades.push(Arc::downgrade(&candidate));
+        drop(facades);
+        Ok(candidate)
+    }
+
+    /// 同范围候选在发表短锁内双查，权限冲突和已关闭的旧 facade 不被默默替换。
+    fn existing_facade(
+        facades: &[Weak<Self>],
+        claim: &FsClaim,
+    ) -> Result<Option<Arc<Self>>, BlockError> {
+        for entry in facades {
+            if let Some(existing) = entry.upgrade() {
+                if existing.claim.view().same_range(claim.view()) {
+                    if existing.closed.load(Ordering::Acquire) {
+                        return Err(BlockError::QueueStopped);
+                    }
+                    if existing.claim.mode() != claim.mode() {
+                        return Err(BlockError::Busy);
+                    }
+                    return Ok(Some(existing));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// 更换槽发表后的观察者，旧回调在短锁外析构，回调不得遗留未结束的读入责任。
@@ -578,14 +663,18 @@ impl MetadataCache {
         drop(retired);
     }
 
-    /// 取得准确 1/2/4KiB 窗口；缺失段逐次认领，已有有效或脏字节不会被重新读盘覆盖。
+    /// 取得准确 1/2/4KiB 窗口；先发表全部页槽，再认领缺失段，已有有效或脏字节不被覆盖。
     pub(crate) fn get(
         self: &Arc<Self>,
         block: u64,
         block_size: usize,
         io_context: Option<MetadataIoContext<'_>>,
     ) -> Result<BufferRef, BlockError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BlockError::QueueStopped);
+        }
         let (byte, offset) = self.block_range(block, block_size)?;
+        let first_len = block_size.min(PAGE_SIZE - offset);
         let page = byte - offset as u64;
         let initial = self.reserve();
         let initial_context = match io_context {
@@ -595,7 +684,7 @@ impl MetadataCache {
         if let Some(context) = initial_context {
             context.check()?;
         }
-        let (folio, reserve) = {
+        let (folio, tail, reserve) = {
             let _init = self.reserve_init.read();
             let reserve = self.reserve();
             if let Some(context) = initial_context {
@@ -608,13 +697,23 @@ impl MetadataCache {
                 context.check()?;
             }
             let (folio, _) = self.index.get_or_prepare(page, reserve.as_ref())?;
-            (folio.with_metadata_owner(Arc::clone(self)), reserve)
+            let folio = folio.with_metadata_owner(Arc::clone(self));
+            let tail = if first_len < block_size {
+                let (tail, _) = self
+                    .index
+                    .get_or_prepare(byte + first_len as u64, reserve.as_ref())?;
+                Some(tail.with_metadata_owner(Arc::clone(self)))
+            } else {
+                None
+            };
+            (folio, tail, reserve)
         };
         let context = match initial_context {
             Some(context) => Some(context),
             None => reserve.as_ref().map(BioReserve::metadata_io_context),
         };
         #[cfg(feature = "ktest")]
+        // 完整窗口的页槽均已发表；回调只收到一次调用者的 FS 块参数，且不持初始化或钩子锁。
         {
             let hook = self.load_hook.lock().clone();
             if let Some(hook) = hook {
@@ -641,11 +740,40 @@ impl MetadataCache {
             drop(transition);
             None
         };
+        self.get_segment(&folio, byte, first_len, source, context)?;
+        if let Some(tail) = &tail {
+            self.get_segment(
+                tail,
+                byte + first_len as u64,
+                block_size - first_len,
+                source,
+                context,
+            )?;
+        }
+        Ok(BufferRef {
+            folio,
+            tail,
+            offset,
+            len: block_size,
+        })
+    }
+
+    /// 填充已发表的单页片段；调用者保活实际来源与旧 Heap IO 的初始化读侧。
+    fn get_segment(
+        self: &Arc<Self>,
+        folio: &FolioRef,
+        byte: u64,
+        len: usize,
+        source: Option<&Arc<BioReserve>>,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<(), BlockError> {
+        let offset = (byte % PAGE_SIZE as u64) as usize;
+        let page = byte - offset as u64;
         loop {
             if let Some(context) = context {
                 context.check()?;
             }
-            match folio.range_ready(offset, block_size) {
+            match folio.range_ready(offset, len) {
                 Ok(()) => break,
                 Err(BlockError::NotReady) => {}
                 Err(error) => return Err(error),
@@ -660,20 +788,16 @@ impl MetadataCache {
             if let Some(context) = context {
                 context.check()?;
             }
-            let Some(read) = folio.begin_metadata_read(offset, block_size)? else {
+            let Some(read) = folio.begin_metadata_read(offset, len)? else {
                 break;
             };
             let read = read.with_metadata_owner(Arc::clone(self));
             let memory = memory.unwrap_or_else(|| BioMemory::new_in(BioAllocator::Heap));
-            self.claim
-                .disk()
-                .load_folio(page + read.offset() as u64, read, memory)?;
+            let relative =
+                page + read.offset() as u64 - self.claim.view().start_sector() * SECTOR_BYTES;
+            self.claim.load_folio(relative, read, memory)?;
         }
-        Ok(BufferRef {
-            folio,
-            offset,
-            len: block_size,
-        })
+        Ok(())
     }
 
     /// 只取得已经存在的准确物理窗口，不填充、读盘或申请节点；有效性由使用者另行检查。
@@ -682,15 +806,30 @@ impl MetadataCache {
         block: u64,
         block_size: usize,
     ) -> Result<Option<BufferRef>, BlockError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BlockError::QueueStopped);
+        }
         let (byte, offset) = self.block_range(block, block_size)?;
-        let folio = {
+        let page = byte - offset as u64;
+        let first_len = block_size.min(PAGE_SIZE - offset);
+        let (folio, tail) = {
             let entries = self.index.entries.lock();
-            entries
-                .get(byte - offset as u64)
-                .map(|node| node.folio.clone())
+            let Some(node) = entries.get(page) else {
+                return Ok(None);
+            };
+            let tail = if first_len < block_size {
+                let Some(node) = entries.get(page + PAGE_SIZE as u64) else {
+                    return Ok(None);
+                };
+                Some(node.folio.clone().with_metadata_owner(self.clone()))
+            } else {
+                None
+            };
+            (node.folio.clone(), tail)
         };
-        Ok(folio.map(|folio| BufferRef {
+        Ok(Some(BufferRef {
             folio: folio.with_metadata_owner(self.clone()),
+            tail,
             offset,
             len: block_size,
         }))
@@ -703,35 +842,64 @@ impl MetadataCache {
         }
         let size = u64::try_from(block_size).map_err(|_| BlockError::InvalidRange)?;
         let byte = block.checked_mul(size).ok_or(BlockError::InvalidRange)?;
-        let end = byte.checked_add(size).ok_or(BlockError::InvalidRange)?;
-        let limits = self.claim.disk().limits();
-        let capacity = limits
-            .capacity_sectors
-            .checked_mul(SECTOR_BYTES)
-            .ok_or(BlockError::InvalidRange)?;
-        if capacity < end {
-            return Err(BlockError::InvalidRange);
-        }
+        let byte = self.claim.view().absolute_byte(byte, block_size)?;
+        let limits = self.claim.view().limits();
         let logical = u64::from(limits.logical_block_size);
         if byte % logical != 0 || size % logical != 0 {
             return Err(BlockError::Misaligned);
         }
         let offset = (byte % PAGE_SIZE as u64) as usize;
-        if PAGE_SIZE < offset + block_size {
-            return Err(BlockError::InvalidRange);
-        }
         Ok((byte, offset))
     }
 
-    /// 摘离无外部 Buffer/Read/WB 的静止节点，基准原页仍归同 source，返回节点数。
+    /// 只摘本视图相交且没有外部拥有、Dirty 或 WB 的原节点，物理页预算仍全盘共用。
     pub fn prune_unused(&self) -> usize {
         let reserve = self.reserve();
-        self.index.prune_unused(reserve.as_ref())
+        let (mut cursor, end) = self.page_bounds();
+        let mut removed = 0;
+        loop {
+            let (victim, next) = {
+                let mut entries = self.index.entries.lock();
+                let Some(node) = entries.lower_bound(cursor).filter(|node| node.key < end) else {
+                    break;
+                };
+                let key = node.key;
+                let baseline = reserve
+                    .as_ref()
+                    .is_some_and(|source| source.metadata_has_baseline(&node.folio));
+                let victim = if node.folio.index_unused(baseline, false) {
+                    entries.remove(key)
+                } else {
+                    None
+                };
+                (victim, key + 1)
+            };
+            if let Some(victim) = victim {
+                removed += 1;
+                victim.release();
+            }
+            cursor = next;
+        }
+        removed
     }
 
-    /// 返回在途、错误及有效范围共同占用的真实物理页数。
+    /// 返回本范围相交的实际物理页数，相邻视图共享的边界页只占一个物理预算。
     pub fn len(&self) -> usize {
-        self.index.len()
+        let (mut cursor, end) = self.page_bounds();
+        let mut count = 0;
+        loop {
+            let next = {
+                let entries = self.index.entries.lock();
+                entries
+                    .lower_bound(cursor)
+                    .filter(|node| node.key < end)
+                    .map(|node| node.key + 1)
+            };
+            let Some(next) = next else { break };
+            count += 1;
+            cursor = next;
+        }
+        count
     }
 
     /// 检查物理页索引是否为空。
@@ -739,17 +907,25 @@ impl MetadataCache {
         self.len() == 0
     }
 
-    /// 标记本次元数据写回选中的原节点，身份与内容不产生第二份拥有。
+    /// 本轮选择只属于当前 facade，同物理边界页的另一卷选择不被覆盖。
     pub(crate) fn set_to_write(&self, byte_offset: u64, selected: bool) {
-        self.index
-            .entries
-            .lock()
-            .set_to_write(byte_offset, selected);
+        let mut keys = self.selected.lock();
+        if selected {
+            if !keys.contains(&byte_offset) {
+                assert!(
+                    keys.len() < self.capacity(),
+                    "metadata selection exceeds physical budget"
+                );
+                keys.push(byte_offset);
+            }
+        } else {
+            keys.retain(|key| *key != byte_offset);
+        }
     }
 
     /// 持本缓存扫描互斥时选定入口的有限元数据集合，完整同步不限制页数。
     pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
-        self.index.mark_to_write_range(start, end, usize::MAX).0
+        self.mark_to_write_budget(start, end, usize::MAX).0
     }
 
     /// 后台只为最多 max_pages 个原节点建立 ToWrite，并返回下轮单向续扫位置。
@@ -759,12 +935,42 @@ impl MetadataCache {
         end: u64,
         max_pages: usize,
     ) -> (usize, u64) {
-        self.index.mark_to_write_range(start, end, max_pages)
+        self.selected.lock().clear();
+        let (first, limit) = self.page_bounds();
+        let mut cursor = start.max(first);
+        let end = end.min(limit);
+        let mut count = 0;
+        while cursor < end {
+            if count == max_pages {
+                return (count, cursor);
+            }
+            let next = {
+                let entries = self.index.entries.lock();
+                entries
+                    .lower_bound(cursor)
+                    .filter(|node| node.key < end)
+                    .map(|node| (node.key, node.folio.clone()))
+            };
+            let Some((key, folio)) = next else { break };
+            let (dirty, writeback) = folio.writeback_state();
+            if (dirty | writeback) & self.page_mask(key) != 0 {
+                self.set_to_write(key, true);
+                count += 1;
+            }
+            cursor = key + 1;
+        }
+        (count, 0)
     }
 
     /// 检查共同元数据原页是否仍有实际 Dirty 或 WB 义务。
     pub(crate) fn has_dirty_or_writeback(&self) -> bool {
-        self.index.has_dirty_or_writeback()
+        let mut selected = [None];
+        self.select_range(0, u64::MAX, FolioMark::Dirty, &mut selected);
+        if selected[0].is_some() {
+            return true;
+        }
+        self.select_range(0, u64::MAX, FolioMark::Writeback, &mut selected);
+        selected[0].is_some()
     }
 
     /// 按物理 byte key 有界取得真实元数据页，调用者保持本缓存到全部消费结束。
@@ -776,7 +982,59 @@ impl MetadataCache {
         mark: FolioMark,
         output: &mut [Option<(u64, FolioRef)>],
     ) -> Option<u64> {
-        self.index.select_range(start, end, mark, output)
+        let (first, limit) = self.page_bounds();
+        let mut cursor = start.max(first);
+        let end = end.min(limit);
+        let mut count = 0;
+        while cursor < end && count < output.len() {
+            let next = {
+                let entries = self.index.entries.lock();
+                entries
+                    .lower_bound(cursor)
+                    .filter(|node| node.key < end)
+                    .map(|node| (node.key, node.folio.clone()))
+            };
+            let Some((key, folio)) = next else {
+                return None;
+            };
+            let mask = self.page_mask(key);
+            let matches = match mark {
+                FolioMark::Dirty => folio.dirty_sectors() & mask != 0,
+                FolioMark::Writeback => folio.writeback_sectors() & mask != 0,
+                FolioMark::ToWrite => self.selected.lock().contains(&key),
+            };
+            if matches {
+                assert!(
+                    output[count].is_none(),
+                    "metadata scan output retains an owner"
+                );
+                output[count] = Some((key, folio));
+                count += 1;
+            }
+            cursor = key + 1;
+        }
+        (cursor < end).then_some(cursor)
+    }
+
+    /// 物理页边界用于查索引，非页对齐首尾由 sector mask 单独限制。
+    fn page_bounds(&self) -> (u64, u64) {
+        let start = self.claim.view().start_sector() * SECTOR_BYTES;
+        let end = start + self.claim.view().sectors() * SECTOR_BYTES;
+        (start / PAGE_SIZE as u64 * PAGE_SIZE as u64, end)
+    }
+
+    /// 返回本卷在指定物理页中实际占有的 sector，供 Dirty、WB 和扫描共用。
+    pub(crate) fn page_mask(&self, page: u64) -> u8 {
+        let start = self.claim.view().start_sector() * SECTOR_BYTES;
+        let end = start + self.claim.view().sectors() * SECTOR_BYTES;
+        let first = start.max(page);
+        let last = end.min(page.saturating_add(PAGE_SIZE as u64));
+        if last <= first {
+            return 0;
+        }
+        let offset = ((first - page) / SECTOR_BYTES) as usize;
+        let sectors = ((last - first) / SECTOR_BYTES) as usize;
+        (((1u16 << sectors) - 1) << offset) as u8
     }
 
     /// 返回此 Disk 活元数据域的明确页预算。
@@ -784,61 +1042,78 @@ impl MetadataCache {
         self.index.capacity.unwrap()
     }
 
-    /// 只在 RW 源 ready 后观察原 Arc 控制尾；不在 bootstrap 暴露旧热节点或造假对象。
+    /// RW 源 ready 后按绝对物理页 key 观察原 Arc 控制，范围外的节点不向此视图导出。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_node(&self, byte_offset: u64) -> Option<Weak<Node, IndexAllocator>> {
         let _init = self.reserve_init.read();
         self.reserve()?;
+        if self.page_mask(byte_offset) == 0 {
+            return None;
+        }
         self.index.entries.lock().weak_node(byte_offset)
     }
 
-    /// 关闭私有域的新取得，摘离全部页后丢弃明确无需落盘的测试或未发表内容。
+    /// 只丢弃本范围的私有字节，不关闭另一卷仍在使用的物理索引。
     ///
     /// # Safety
-    /// 调用者必须已停止全部 get/update 生产者并结束全部 IO、WB 和外部视图使用。
-    /// 这些字节只能属于未发表或私有 CPU 协议页，不得包含任何已接受的真实 FS 修改。
+    /// 调用者已停止本范围全部生产者、IO、WB 和外部视图；其中没有已接受的真实 FS 修改。
     pub unsafe fn discard_private(self: &Arc<Self>) -> Result<usize, BlockError> {
         let reserve = self.reserve();
-        let mut detached = {
-            let mut entries = self.index.entries.lock();
-            let mut cursor = 0;
-            while let Some(node) = entries.lower_bound(cursor) {
-                let baseline = reserve
-                    .as_ref()
-                    .is_some_and(|source| source.metadata_has_baseline(&node.folio));
-                if !node.folio.index_unused(baseline, true) {
-                    return Err(BlockError::Busy);
-                }
-                let Some(next) = node.key.checked_add(1) else {
-                    break;
-                };
-                cursor = next;
+        let (first, end) = self.page_bounds();
+        let mut cursor = first;
+        loop {
+            let next = {
+                let entries = self.index.entries.lock();
+                entries
+                    .lower_bound(cursor)
+                    .filter(|node| node.key < end)
+                    .map(|node| {
+                        let baseline = reserve
+                            .as_ref()
+                            .is_some_and(|source| source.metadata_has_baseline(&node.folio));
+                        (
+                            node.key,
+                            self.page_mask(node.key) != u8::MAX
+                                || node.folio.index_unused(baseline, true),
+                        )
+                    })
+            };
+            let Some((key, unused)) = next else { break };
+            if !unused {
+                return Err(BlockError::Busy);
             }
-            entries.closed = true;
-            entries.take_all()
-        };
-        let count = detached.len;
-        while let Some(node) = detached.lower_bound(0) {
-            let key = node.key;
-            let node = detached.remove(key).unwrap();
-            let mut content = node.folio.lock_content();
-            // SAFETY: 调用者已停止全部生产者和在途访问；索引已关闭并摘离全部节点，
-            // 上面核索引及真实源基准以外无外部视图。内容明确私有且无需落盘，guard 排斥 CPU 访问。
-            unsafe {
-                content.discard();
-            }
-            drop(content);
-            drop(node);
+            cursor = key + 1;
         }
-        Ok(count)
+        self.closed.store(true, Ordering::Release);
+        cursor = first;
+        loop {
+            let next = {
+                let entries = self.index.entries.lock();
+                entries
+                    .lower_bound(cursor)
+                    .filter(|node| node.key < end)
+                    .map(|node| (node.key, node.folio.clone()))
+            };
+            let Some((key, folio)) = next else { break };
+            let mask = self.page_mask(key);
+            let offset = mask.trailing_zeros() as usize * SECTOR_BYTES as usize;
+            let len = mask.count_ones() as usize * SECTOR_BYTES as usize;
+            let mut content = folio.lock_content();
+            // SAFETY: 调用者终结本范围访问；整页另核外部引用，边界页可保另一卷的外部拥有；
+            // 只失效当前 view 的准确 sector，另一卷字节及其脏义务保持。
+            unsafe { content.forget_metadata(offset, len)? };
+            cursor = key + 1;
+        }
+        self.selected.lock().clear();
+        Ok(self.prune_unused())
     }
 }
 
-impl Drop for MetadataCache {
-    /// 最后强拥有结束时摘本对象的 Disk 弱登记，锁外释放 Weak；原字段随后按声明顺序析构。
+impl Drop for MetadataPages {
+    /// 最后物理域拥有结束时摘弱登记，所有外部读入和回写已释放各自 facade。
     fn drop(&mut self) {
         let identity = self as *const Self;
-        let retired = self.claim.disk().unregister_metadata_cache(identity);
+        let retired = self.disk.unregister_metadata_cache(identity);
         drop(retired);
     }
 }
@@ -847,6 +1122,7 @@ impl Drop for MetadataCache {
 #[derive(Clone)]
 pub struct BufferRef {
     folio: FolioRef,
+    tail: Option<FolioRef>,
     offset: usize,
     len: usize,
 }
@@ -854,11 +1130,30 @@ pub struct BufferRef {
 impl BufferRef {
     /// 内容锁内短借用本视图；闭包不得分配、等待 IO 或进行可能 fault 的用户复制。
     pub fn with_read<T>(&self, consume: impl FnOnce(&[u8]) -> T) -> Result<T, BlockError> {
+        if let Some(tail) = &self.tail {
+            return self.read_split(tail, consume);
+        }
         let content = self.folio.lock_content();
         Ok(consume(content.metadata_bytes(self.offset, self.len)?))
     }
 
-    /// 同 Disk 的 RW 授权只修改准确视图，Dirty 在字节修改之前记录，已有 WB 不被清除。
+    /// 非页对齐分区的跨页块按物理地址顺序持锁，有限栈窗口只在闭包期间存在。
+    #[inline(never)]
+    fn read_split<T>(
+        &self,
+        tail: &FolioRef,
+        consume: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T, BlockError> {
+        let first = self.folio.lock_content();
+        let second = tail.lock_content();
+        let count = PAGE_SIZE - self.offset;
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes[..count].copy_from_slice(first.metadata_bytes(self.offset, count)?);
+        bytes[count..self.len].copy_from_slice(second.metadata_bytes(0, self.len - count)?);
+        Ok(consume(&bytes[..self.len]))
+    }
+
+    /// 同 view 的 RW 授权只修改准确窗口，Dirty 在字节修改之前记录。
     /// 闭包不得等待或用户复制；相邻 inode 记录与校验和在同一真实内容锁内保持一致。
     /// 普通 Task 在内容锁释放后通知所属卷，通知期间不保留卷弱关联锁。
     pub fn update<T>(
@@ -873,13 +1168,12 @@ impl BufferRef {
             .folio
             .metadata_owner()
             .expect("metadata buffer lost its cache owner");
-        if !core::ptr::eq(
-            claim.disk().as_ref().get_ref(),
-            cache.claim.disk().as_ref().get_ref(),
-        ) {
+        if !claim.view().same_range(cache.claim.view()) {
             return Err(BlockError::InvalidRange);
         }
-        let result = {
+        let result = if let Some(tail) = &self.tail {
+            self.update_split(tail, update)?
+        } else {
             let mut content = self.folio.lock_content();
             update(content.metadata_bytes_mut(self.offset, self.len)?)
         };
@@ -890,12 +1184,41 @@ impl BufferRef {
         Ok(result)
     }
 
+    /// 两页 guard 同时保持到新字节提交，避免把另一窗口的并发修改拷回旧快照。
+    #[inline(never)]
+    fn update_split<T>(
+        &self,
+        tail: &FolioRef,
+        update: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<T, BlockError> {
+        let mut first = self.folio.lock_content();
+        let mut second = tail.lock_content();
+        let count = PAGE_SIZE - self.offset;
+        let first_bytes = first.metadata_bytes_mut(self.offset, count)?;
+        let second_bytes = second.metadata_bytes_mut(0, self.len - count)?;
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes[..count].copy_from_slice(first_bytes);
+        bytes[count..self.len].copy_from_slice(second_bytes);
+        let result = update(&mut bytes[..self.len]);
+        first_bytes.copy_from_slice(&bytes[..count]);
+        second_bytes.copy_from_slice(&bytes[count..self.len]);
+        Ok(result)
+    }
+
+    /// 等待本块全部物理片段的旧 WB，不能仅以第一片段代替跨页块的完成。
+    pub(crate) fn wait_writeback(&self) {
+        self.folio.wait_writeback();
+        if let Some(tail) = &self.tail {
+            tail.wait_writeback();
+        }
+    }
+
     /// 实际块树摘离节点后失效本窗口，等待原页 WB 收权而不影响同页其他元数据块。
     ///
     /// # Safety
     /// 调用者已持真实块映射写保护摘离该节点并阻止旧根新取得，旧消费与 IO 已结束；
     /// 其他视图不得再消费本窗口旧内容，块尚未归还位图，本窗口确实无需落盘。
-    /// 同 Disk RW 占用仅证明权限，不能代替上述删除与生命周期条件。
+    /// 同 view RW 占用仅证明权限，不能代替上述删除与生命周期条件。
     pub(crate) unsafe fn forget(&self, claim: &FsClaim) -> Result<(), BlockError> {
         if claim.mode() != AccessMode::ReadWrite {
             return Err(BlockError::ReadOnly);
@@ -904,16 +1227,20 @@ impl BufferRef {
             .folio
             .metadata_owner()
             .expect("metadata buffer lost its cache owner");
-        if !core::ptr::eq(
-            claim.disk().as_ref().get_ref(),
-            cache.claim.disk().as_ref().get_ref(),
-        ) {
+        if !claim.view().same_range(cache.claim.view()) {
             return Err(BlockError::InvalidRange);
         }
         let mut content = self.folio.lock_content();
-        // SAFETY: 调用者保证真实摘树与旧消费终结；此 guard 排斥新的内容准备，
-        // metadata 内容锁只在全部 WB 实际收权后取得，按本视图范围失效且尚未归块。
-        unsafe { content.forget_metadata(self.offset, self.len) }
+        let count = self.len.min(PAGE_SIZE - self.offset);
+        // SAFETY: 调用者终结本窗口旧消费且块尚未归还；guard 排斥并发 CPU 访问，
+        // 两次失效分别覆盖同一块的准确物理片段，不改相邻卷的字节。
+        unsafe { content.forget_metadata(self.offset, count)? };
+        if let Some(tail) = &self.tail {
+            let mut content = tail.lock_content();
+            // SAFETY: 同一删除协议覆盖此块尾段，尾页 guard 排斥新访问且仅清本窗口。
+            unsafe { content.forget_metadata(0, self.len - count)? };
+        }
+        Ok(())
     }
 
     /// 返回视图自己的字节长度。
@@ -931,7 +1258,7 @@ impl BufferRef {
         self.offset
     }
 
-    /// 借用同一原页身份；内容仍只能按本视图或原页角色访问。
+    /// 借用首物理页身份供原页诊断；跨页块的内容和等待必须使用 Buffer 接口。
     pub fn folio(&self) -> &FolioRef {
         &self.folio
     }

@@ -99,7 +99,9 @@ impl Request {
             .ok_or(TestError("IRQ original Read page allocation failed"))?;
         let mapped = MappedPages::new(pages, 0, unit, BufferDirection::DeviceToDriver)
             .map_err(|_| TestError("IRQ original Read page mapping failed"))?;
-        let original = mapped.segment();
+        let original = mapped
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable");
         let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(1)
@@ -138,7 +140,9 @@ impl Request {
             return Err(TestError("IRQ original page owner count changed"));
         }
         let mapped = &memory[0];
-        let segment = mapped.segment();
+        let segment = mapped
+            .segment(crate::mm::dma::DmaDomain::qemu_coherent())
+            .expect("QEMU fixture mapping must be reachable");
         context.expect_eq(
             (segment.address, segment.length, segment.direction),
             (

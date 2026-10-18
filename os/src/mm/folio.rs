@@ -735,6 +735,36 @@ impl FolioRef {
         drop(content);
     }
 
+    /// 最后范围占用结束时仅撤有效与失败状态，可在 IRQ 中持用途锁执行，不借用页字节。
+    ///
+    /// # Safety
+    /// 调用者仍持物理盘的范围准入锁，已证明本窗口没有其他活 claim；
+    /// Buffer、读入和 WB 的真实 claim 均已结束，且解除本次 claim 前不会重新准入。
+    /// 同页其他窗口可以仍持内容锁或设备拥有，本操作不得修改其状态或原页字节。
+    pub(crate) unsafe fn retire_metadata(&self, offset: usize, len: usize) {
+        assert!(validate_range(offset, len).is_ok());
+        assert_eq!(offset % SECTOR_SIZE, 0);
+        assert_eq!(len % SECTOR_SIZE, 0);
+        let mask = sector_mask(offset, len);
+        let mut usage = self.descriptor.usage();
+        let shared = FolioState::shared_mut(&mut usage);
+        assert_eq!(
+            shared.dirty & mask,
+            0,
+            "retired metadata retains dirty contents"
+        );
+        assert_eq!(
+            shared.writeback & mask,
+            0,
+            "retired metadata retains writeback"
+        );
+        let FolioContents::Metadata { valid, errors } = &mut shared.contents else {
+            panic!("metadata retirement received a file folio");
+        };
+        *valid &= !mask;
+        errors[offset / SECTOR_SIZE..(offset + len) / SECTOR_SIZE].fill(None);
+    }
+
     /// 返回实际 512 字节脏范围位图；该快照不代表已经提交或持久化。
     pub fn dirty_sectors(&self) -> u8 {
         FolioState::shared(&self.descriptor.usage()).dirty
