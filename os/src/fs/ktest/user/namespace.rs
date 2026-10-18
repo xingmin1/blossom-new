@@ -17,8 +17,8 @@ use crate::fs::ktest::user::UserSuite;
 use crate::fs::ktest::*;
 use crate::fs::writeback::sync_metadata;
 use crate::fs::{
-    open_path, DentryRef, DescriptorFlags, FileLike, FileRef, FileTable, FsContext, FsError,
-    InodeCache, InodeMetadata, InodeRef, OpenOptions, Path, ResolveMode, SeekFrom, Vfs,
+    open_path, DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, InodeCache,
+    InodeMetadata, InodeRef, OpenOptions, Path, ResolveMode, SeekFrom, Vfs,
 };
 use crate::fs::{DirectoryEntry, InodeKind};
 use crate::mm::dma::MappedPages;

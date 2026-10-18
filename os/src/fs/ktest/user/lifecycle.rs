@@ -1,10 +1,72 @@
 //! 普通磁盘程序完成生命周期操作；夹具只观察真实绑定、登记与离栈，释放普通控制字。
 
 use super::*;
+use crate::task::futex;
 
 const PROGRAM: &[u8] = b"/test/bin/user-lifecycle";
 
 impl UserOwner {
+    /// 真实请求完成尚未消费时只请求组退出，恢复原完成后再wait和离栈join。
+    pub(super) fn cancel_inflight_file_read(
+        &mut self,
+        context: &mut TestContext<'_>,
+    ) -> TestResult {
+        let _data = self.file(context, b"/test/data.bin")?;
+        self.warm_signal_program(context)?;
+        let image = self.load_named(context, b"/test/bin/user-signal", b"r")?;
+        #[cfg(target_arch = "riscv64")]
+        let marker = image.context.gpr[2] - 8;
+        #[cfg(target_arch = "loongarch64")]
+        let marker = image.context.gpr[3] - 8;
+        let mm = Arc::clone(&image.mm);
+        let disk = self.path.owner.disk()?.clone();
+        let legacy = matches!(
+            disk.identity(),
+            DiskIdentity::Virtio(VirtioIdentity::Mmio { version: 1, .. })
+        );
+        let first_used = block::tests::used_index(&disk, legacy);
+        let before = disk.test_snapshot();
+        disk.test_suspend_completions();
+        let fs_context = self.path.context().clone();
+        self.start_program(context, image, fs_context, true, false, Credentials::ROOT)?;
+        let pid = self.running.as_ref().unwrap().pid;
+        let user = self
+            .graph()
+            .lookup_thread(pid)
+            .ok_or(TestError("取消时用户读者绑定消失"))?;
+        let executor = user
+            .executor()
+            .ok_or(TestError("取消时用户读者执行者消失"))?;
+        until("用户数据读未在真实在途请求上阻塞", || {
+            let mut marker_bytes = [0u8; 8];
+            let progress = mm.copyin(&mut marker_bytes, marker);
+            progress.error.is_none()
+                && u64::from_le_bytes(marker_bytes) == 0x51a2
+                && sched::test_state(&executor) == State::Blocked
+                && disk.test_snapshot().inflight != 0
+                && block::tests::used_index(&disk, legacy) != first_used
+        })?;
+        let inflight = disk.test_snapshot().inflight;
+        context.expect_eq(before.submitted < disk.test_snapshot().submitted, true);
+        context.expect_eq(mm.user_count(), 1);
+        self.graph().request_root_exit(9);
+        context.expect_eq(sched::test_state(&executor), State::Blocked);
+        context.expect_eq(mm.user_count(), 1);
+        context.expect_eq(disk.test_snapshot().inflight, inflight);
+        disk.test_resume_completions();
+        let event = self.wait(context)?;
+        context.expect_eq(event.status, 9);
+        self.reap_children(context, true)?;
+        context.expect_eq(mm.user_count(), 0);
+        disk.test_flush_completions();
+        context.expect_eq(disk.test_snapshot().inflight, 0);
+        context.diagnostic(format_args!(
+            "user-cancel inflight-at-request={} real-used=1 blocked-mm-users=1 status={} joined=1 final-mm-users=0 final-inflight=0",
+            inflight, event.status
+        ));
+        Ok(())
+    }
+
     /// 本例仍由原设备夹具拥有整棵用户树，非leader交接不固定组的CPU或执行者。
     fn start_lifecycle(
         &mut self,

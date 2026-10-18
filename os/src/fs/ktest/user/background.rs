@@ -1506,7 +1506,7 @@ pub(crate) mod waves {
         Ok(())
     }
 
-    /// 大于单轮上界的真实脏集合与持续再脏共存，两个后台轮都必须有限结束并保留下轮义务。
+    /// 原轮尾门先稳定扫描续点，再产生96页脏集合；持续再脏期间两轮均须有限结束并保留下轮义务。
     #[test]
     #[ktest(tags("W30", "fs-shared"), min_cpus = 2)]
     fn finite_background_round_keeps_successor_dirty(
@@ -1524,9 +1524,21 @@ pub(crate) mod waves {
         )?;
         let mapping = shared_alias(context, &file, 0)?;
         let control = fixture.observe_rounds(false)?;
+        // 先让末页通过一次真实后台轮，原单向扫描到末尾后续点归零；同一轮尾门挡住后续扫描。
+        context.expect_eq(
+            file.write_at(((ROUND_PAGES - 1) * PAGE_SIZE) as u64, &[0x41]),
+            Ok(1),
+        );
+        let prepared = control.round(1)?;
+        finite_round(context, prepared);
+        context.expect_eq(prepared.round_selected_data, 1);
+        context.expect_eq(PAGE_SIZE as u64 <= prepared.round_accepted_bytes, true);
+        context.expect_eq(
+            prepared.round_completed_bytes,
+            prepared.round_accepted_bytes,
+        );
         let before = disk.test_snapshot();
         let entry_slots = volume.dirty_inode_limit();
-        disk.test_hold_file_writeback(&folio);
         // 原扫描互斥仅稳定入口集合，普通写仍通过正式 inode/invalidate/content 路径。
         {
             let _writeback = inode.mapping().lock_writeback();
@@ -1537,7 +1549,10 @@ pub(crate) mod waves {
                     ));
                 }
             }
+            disk.test_hold_file_writeback(&folio);
         }
+        // 96页已全部发表且0号页完成尾已武装，才放行原回调进入被测的48页轮。
+        control.gate.complete();
         until(
             "background data did not reach real used with its software tail held",
             || {
@@ -1559,7 +1574,7 @@ pub(crate) mod waves {
         );
         bytes_at(context, &file, 0, &[0x41, 0x52, 0x73])?;
         disk.test_resume_completions();
-        let first = control.round(1)?;
+        let first = control.round(2)?;
         finite_round(context, first);
         context.expect_eq(first.round_limit, entry_slots);
         context.expect_eq(first.round_selected_data, 48);
@@ -1578,7 +1593,7 @@ pub(crate) mod waves {
             || produced < control.produced.load(Ordering::Acquire),
         )?;
         control.gate.complete();
-        let second = control.round(2)?;
+        let second = control.round(3)?;
         finite_round(context, second);
         context.expect_eq(second.rounds, first.rounds + 1);
         context.expect_eq(first.completed_bytes < second.completed_bytes, true);

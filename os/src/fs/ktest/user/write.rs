@@ -14,6 +14,7 @@ use crate::mm::space::{MmapAddress, MmapRequest, MmapSource};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
 use crate::sync::PreemptGuard;
+use crate::task::futex;
 use crate::task::{ReclaimMode, ReclaimScope};
 use virtio_drivers::BufferDirection;
 

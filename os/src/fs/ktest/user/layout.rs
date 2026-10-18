@@ -268,7 +268,7 @@ fn stack_string(context: &TestContext<'_>, mm: &Mm, address: usize, expected: &[
     Ok(())
 }
 
-/// 按真实消费者栈位置检查参数终止、无重复的必要 auxv 和文件派生地址。
+/// 按真实消费者栈位置检查必要 auxv、完整初始化字节区及实际硬件能力，保留参数与文件派生地址核对。
 fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout) -> TestResult {
     #[cfg(target_arch = "riscv64")]
     let sp = image.context.gpr[2];
@@ -307,7 +307,14 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
     #[cfg(target_arch = "riscv64")]
     let hwcap = (1 << 8) | (1 << 12) | 1 | (1 << 5) | (1 << 3) | (1 << 2);
     #[cfg(target_arch = "loongarch64")]
-    let hwcap = 1 | (1 << 3);
+    let hwcap = {
+        // CPUCFG2 是独立硬件事实；按扩展依赖核对用户 ABI，不回读 exec 的能力计算结果。
+        let config = crate::arch::cpucfg(2);
+        let fp = config & 1 != 0;
+        let lsx = fp && config & (1 << 6) != 0;
+        let lasx = lsx && config & (1 << 7) != 0;
+        1 | (usize::from(fp) << 3) | (usize::from(lsx) << 4) | (usize::from(lasx) << 5)
+    };
     let required = [
         (3, layout.phdr),
         (4, 56),
@@ -326,6 +333,7 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
     ];
     let mut found = [false; 14];
     let mut execfn_found = false;
+    let mut random_found = false;
     for slot in 0..32 {
         let address = sp + 48 + slot * 16;
         let kind = stack_word(context, &image.mm, address)?;
@@ -336,13 +344,20 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
                 assert!(found[index], "missing required auxv kind={}", kind);
             }
             assert!(execfn_found, "missing AT_EXECFN");
+            assert!(random_found, "missing AT_RANDOM");
             return Ok(());
         }
-        assert!(
-            !matches!(kind, 25 | 33),
-            "auxv declares unavailable random/vDSO kind={}",
-            kind
-        );
+        assert_ne!(kind, 33, "auxv declares unavailable vDSO");
+        if kind == 25 {
+            assert!(!random_found, "duplicate AT_RANDOM");
+            random_found = true;
+            assert!(
+                sp <= value && value <= crate::arch::USER_STACK_TOP - 16,
+                "AT_RANDOM is outside the initialized user stack: {value:#x}"
+            );
+            let mut bytes = [0; 16];
+            read_mm(context, &image.mm, value, &mut bytes)?;
+        }
         if kind == 31 {
             assert!(!execfn_found, "duplicate AT_EXECFN");
             execfn_found = true;

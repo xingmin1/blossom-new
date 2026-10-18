@@ -35,9 +35,25 @@ MUSL_CROSS ?= $(ARCH)-linux-musl-
 MUSL_CROSS_RV ?= riscv64-linux-musl-
 MUSL_CROSS_LA ?= loongarch64-linux-musl-
 MUSL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie
-LLVM_MC ?= llvm-mc
-USER_LD ?= rust-lld
-USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback device-map pipe events tty jobs)
+PROBE_FAMILIES := smoke io clone signal futex lifecycle write writeback device-map pipe events tty jobs
+USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,$(PROBE_FAMILIES))
+PROBE_CFLAGS := -std=gnu11 -D_GNU_SOURCE -O2 -Wall -Wextra -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector -fno-pie -fno-pic -fno-common -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
+PROBE_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -static -no-pie -Wl,--no-dynamic-linker,--no-relax,--build-id=none,--gc-sections,-z,max-page-size=4096,-T,tests/user/smoke.ld
+PROBE_COMMON := tests/user/probes/entry-$(ARCH).S tests/user/probes/runtime.c
+PROBE_CLONE_FAMILIES := clone signal futex lifecycle write pipe events tty jobs
+PROBE_EXTRA_io := tests/user/probes/io_vm.c tests/user/probes/io_access.c
+PROBE_EXTRA_clone := tests/user/probes/clone-state-$(ARCH).S
+PROBE_EXTRA_signal := tests/user/probes/signal_time.c build/user-$(ARCH)/signal-$(ARCH).o
+PROBE_EXTRA_futex := tests/user/probes/futex-$(ARCH).S
+PROBE_EXTRA_lifecycle := tests/user/probes/lifecycle_wait.c tests/user/probes/lifecycle_parent.c tests/user/probes/lifecycle-$(ARCH).S
+PROBE_EXTRA_write := $(addprefix tests/user/probes/write_,buffered.c mmap.c sync.c truncate.c namespace.c)
+PROBE_HEADERS_io := tests/user/probes/io_private.h tests/user/probes/io_wire.h
+PROBE_HEADERS_writeback := tests/user/probes/io_wire.h
+PROBE_HEADERS_write := tests/user/probes/write.h
+PROBE_HEADERS_lifecycle := tests/user/probes/lifecycle.h
+PROBE_HEADERS_signal := tests/user/probes/signal.h
+PROBE_HEADERS_tty := tests/user/probes/tty_wire.h
+PROBE_HEADERS_jobs := tests/user/probes/tty_wire.h
 RUNNER_TARGET := $(if $(filter riscv64,$(ARCH)),riscv64gc-unknown-linux-musl,loongarch64-unknown-linux-musl)
 RUNNER_TARGET_DIR ?= build/contest-run
 RUNNER_OUTPUT := $(RUNNER_TARGET_DIR)/$(RUNNER_TARGET)/release/contest-run
@@ -83,16 +99,13 @@ build-std-program = cd userland/contest-run && env -u RUSTFLAGS RUSTUP_AUTO_INST
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
-USER_TRIPLE := riscv64-unknown-linux-gnu
-USER_MATTR := +m,+a,+f,+d,-c,-v
-USER_EMULATION := elf64lriscv
+PROBE_ARCH_FLAGS := -march=rv64g -mabi=lp64d -msmall-data-limit=0 -mno-relax
 QEMU_KERNEL_EXPORT := kernel-rv
 QEMU_ROOT_EXT4_IMAGE := disk.img
 else ifeq ($(ARCH),loongarch64)
 TARGET := loongarch64-unknown-none
-USER_TRIPLE := loongarch64-unknown-linux-gnu
-USER_MATTR := +f,+d,-lsx,-lasx
-USER_EMULATION := elf64loongarch
+PROBE_ARCH_FLAGS := -march=loongarch64 -mabi=lp64d
+PROBE_CFLAGS += -fno-tree-vectorize
 QEMU_KERNEL_EXPORT := kernel-la
 QEMU_ROOT_EXT4_IMAGE := disk-la.img
 else
@@ -187,10 +200,18 @@ run-kernel-tests:
 
 user-tests: $(USER_OUTPUTS)
 
-build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
+# 每族只链接自己的业务与实际桥；原始汇编不再作为业务输入或构建后备。
+define build-probe
+build/user-$(ARCH)/user-$(1): tests/user/probes/$(1).c $(PROBE_EXTRA_$(1)) $(PROBE_COMMON) $(if $(filter $(1),$(PROBE_CLONE_FAMILIES)),tests/user/probes/clone-$(ARCH).S) tests/user/include/probe.h $(PROBE_HEADERS_$(1)) tests/user/smoke.ld Makefile
+	mkdir -p "$$(@D)"
+	"$(MUSL_CROSS)gcc" $(PROBE_CFLAGS) $(PROBE_ARCH_FLAGS) -Itests/user/include $(filter %.c %.S,$(PROBE_COMMON)) tests/user/probes/$(1).c $(PROBE_EXTRA_$(1)) $(if $(filter $(1),$(PROBE_CLONE_FAMILIES)),tests/user/probes/clone-$(ARCH).S) $(PROBE_LDFLAGS) -o "$$@"
+endef
+$(foreach family,$(PROBE_FAMILIES),$(eval $(call build-probe,$(family))))
+
+# 现场桥按架构基线独立汇编；向量指令由真实硬件能力分派，C 禁止自动向量化。
+build/user-$(ARCH)/signal-$(ARCH).o: tests/user/probes/signal-$(ARCH).S Makefile
 	mkdir -p "$(@D)"
-	"$(LLVM_MC)" --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
-	"$(USER_LD)" -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
+	"$(MUSL_CROSS)gcc" $(PROBE_ARCH_FLAGS) -c "$<" -o "$@"
 
 build-guest-userland: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config) $(foreach program,$(GUEST_BIN_PROGRAMS),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program))) build-contest-runner install-user-selftests
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(call absolute-path,$(GUEST_USERLAND_OUTPUT_DIR))" install
@@ -263,7 +284,7 @@ clean-build-artifacts:
 	cd os && CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" cargo clean
 	cd userland/contest-run && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" cargo clean --offline
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" clean
-	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "$(KERNEL_ELF_OUTPUT)"
+	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "build/user-$(ARCH)/signal-$(ARCH).o" "$(KERNEL_ELF_OUTPUT)"
 	@for program in $(GUEST_BIN_PROGRAMS) busybox; do \
 		rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; \
 	done
