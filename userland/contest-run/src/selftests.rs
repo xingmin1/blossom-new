@@ -8,25 +8,31 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const DEFAULT_PROGRAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Options {
     pub manifest: PathBuf,
     pub collections: BTreeSet<String>,
     pub programs: BTreeSet<String>,
     pub list: bool,
+    /// 每个程序从启动起独立计时，输出不能刷新此预算。
+    pub program_timeout: Duration,
 }
 
 impl Options {
-    /// 参数只选择已安装集合；重复筛选和未提供的值均为明确错误。
+    /// 解析已安装集合的选择和每程序绝对期限，重复选项或无效预算均返回错误。
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut options = Self {
             manifest: "/test/selftests/kselftest-list.txt".into(),
             collections: BTreeSet::new(),
             programs: BTreeSet::new(),
             list: false,
+            program_timeout: DEFAULT_PROGRAM_TIMEOUT,
         };
         let mut manifest_seen = false;
+        let mut program_timeout_seen = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -34,6 +40,25 @@ impl Options {
                 "--manifest" if !manifest_seen => {
                     options.manifest = args.next().ok_or("missing value for --manifest")?.into();
                     manifest_seen = true;
+                }
+                "--program-timeout-seconds" if !program_timeout_seen => {
+                    let value = args
+                        .next()
+                        .ok_or("missing value for --program-timeout-seconds")?;
+                    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err("program timeout must be a positive integer in seconds".into());
+                    }
+                    let seconds: u64 = value
+                        .parse()
+                        .map_err(|_| "program timeout exceeds the supported range")?;
+                    let timeout = Duration::from_secs(seconds);
+                    if seconds == 0 || Instant::now().checked_add(timeout).is_none() {
+                        return Err(
+                            "program timeout is zero or exceeds the monotonic clock range".into(),
+                        );
+                    }
+                    options.program_timeout = timeout;
+                    program_timeout_seen = true;
                 }
                 "--collection" | "--program" => {
                     let value = args
@@ -183,7 +208,7 @@ impl Summary {
     }
 }
 
-/// 已解析选择只复用真实进程执行器；清单模式仅写出选中身份。
+/// 按每程序独立期限复用真实进程执行器并报告预算，清单模式仅写出选中身份。
 pub fn run(options: &Options, output: &mut impl Write, outputs: [RawFd; 2]) -> Result<i32, String> {
     let programs = select(options)?;
     if options.list {
@@ -195,7 +220,13 @@ pub fn run(options: &Options, output: &mut impl Write, outputs: [RawFd; 2]) -> R
     }
     let mut summary = Summary::default();
     for program in programs {
-        writeln!(output, "SELFTEST start id={:?}", program.id).map_err(output_error)?;
+        writeln!(
+            output,
+            "SELFTEST start id={:?} timeout_seconds={}",
+            program.id,
+            options.program_timeout.as_secs()
+        )
+        .map_err(output_error)?;
         output.flush().map_err(output_error)?;
         let spec = CommandSpec::Exec {
             program: program
@@ -210,15 +241,16 @@ pub fn run(options: &Options, output: &mut impl Write, outputs: [RawFd; 2]) -> R
             &program.cwd,
             &spec,
             &BTreeMap::new(),
-            Duration::from_secs(60),
+            options.program_timeout,
             &Protocol::Tap,
             outputs,
         );
         summary.record(&run);
         writeln!(
             output,
-            "SELFTEST result id={:?} outcome={} status={:?} elapsed_ms={} tap={:?} io_errors={:?}",
+            "SELFTEST result id={:?} timeout_seconds={} outcome={} status={:?} elapsed_ms={} tap={:?} io_errors={:?}",
             program.id,
+            options.program_timeout.as_secs(),
             run.protocol.verdict.as_str(),
             run.outcome,
             run.elapsed.as_millis(),

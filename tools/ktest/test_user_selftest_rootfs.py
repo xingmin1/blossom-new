@@ -16,6 +16,7 @@ from test_rootfs import tree_contents
 
 
 HAS_E2FSPROGS = all(shutil.which(name) for name in ("mke2fs", "debugfs", "e2fsck", "dumpe2fs"))
+RUN_ID = "0123456789abcdef0123456789abcdef"
 
 
 class UserSelftestRootfsTests(unittest.TestCase):
@@ -54,31 +55,23 @@ class UserSelftestRootfsTests(unittest.TestCase):
         """调用公开准备接口，几何限定为最小合法的真实 ext4。"""
         return prepare_user_selftest_rootfs(
             "riscv64", self.userland, self.runtime, self.output, self.image,
-            image_size_mib=128, **kwargs)
+            image_size_mib=128, run_id=RUN_ID, **kwargs)
 
     @unittest.skipUnless(HAS_E2FSPROGS, "requires e2fsprogs")
-    def test_installed_manifest_assets_pid1_and_image_preserve_inputs(self):
-        """程序集合来自实际安装清单，辅助资产仍复制但不会被准备器登记为默认项。"""
+    def test_preparation_removes_installed_stale_results_from_tree_and_volume(self):
+        """安装源保留原字节，但复制出的树和实际新卷都不得携带旧结果。"""
+        stale = self.userland / "test/selftests/exit-status"
+        stale.write_bytes(b"run=ffffffffffffffffffffffffffffffff status=0\n")
         before = self.inputs()
-        self.prepare(collections=["custom"], programs=["custom:probe"])
+        self.prepare(collections=["custom"], programs=["custom:probe"],
+                     program_timeout_seconds=7)
         self.assertEqual(self.inputs(), before)
-        self.assertEqual((self.output / "test/selftests/kselftest-list.txt").read_bytes(),
-                         self.manifest.read_bytes())
-        self.assertEqual((self.output / "test/selftests/custom/helper").read_bytes(),
-                         (self.userland / "test/selftests/custom/helper").read_bytes())
-        self.assertEqual(os.readlink(self.output / "sbin/init"), "../bin/busybox")
+        self.assertFalse((self.output / "test/selftests/exit-status").exists())
         self.assertTrue(os.access(self.output / "sbin/run-user-selftests", os.X_OK))
-        for name in ("rcS", "rcK"):
-            self.assertEqual((self.output / "etc/init.d" / name).read_bytes(),
-                             (TOOLS.parent / "userland/system/etc/init.d" / name).read_bytes())
-        actions = [line.split(":", 3) for line in
-                   (self.output / "etc/inittab").read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([action[2] for action in actions], ["sysinit", "once", "shutdown"])
-        dumped = self.base / "manifest.dump"
-        subprocess.run(["debugfs", "-R", f"dump /test/selftests/kselftest-list.txt {dumped}",
-                        str(self.image)], capture_output=True, check=True)
-        self.assertEqual(dumped.read_bytes(), self.manifest.read_bytes())
-        self.assertFalse((self.base / "not-a-command").exists())
+        result = subprocess.run(
+            ["debugfs", "-R", "cat /test/selftests/exit-status", str(self.image)],
+            capture_output=True, check=True)
+        self.assertEqual(result.stdout, b"")
 
     @unittest.skipUnless(HAS_E2FSPROGS, "requires e2fsprogs")
     def test_repreparation_replaces_only_owned_tree_and_reflects_installed_deletion(self):
@@ -120,7 +113,7 @@ class UserSelftestRootfsTests(unittest.TestCase):
                               (self.output, self.output / "nested.ext4")):
             with self.subTest(output=output, image=image), self.assertRaises(ValueError):
                 prepare_user_selftest_rootfs("riscv64", self.userland, self.runtime,
-                                             output, image, image_size_mib=128)
+                                             output, image, image_size_mib=128, run_id=RUN_ID)
         self.output.symlink_to(self.userland, target_is_directory=True)
         with self.assertRaises(ValueError):
             self.prepare()
@@ -129,10 +122,13 @@ class UserSelftestRootfsTests(unittest.TestCase):
         ancestor.symlink_to(self.runtime, target_is_directory=True)
         with self.assertRaises(ValueError):
             prepare_user_selftest_rootfs("riscv64", self.userland, self.runtime,
-                                         ancestor / "root", self.image)
+                                         ancestor / "root", self.image, run_id=RUN_ID)
         for selection in ("", "custom:\0probe"):
             with self.subTest(selection=selection), self.assertRaises(ValueError):
                 self.prepare(programs=[selection])
+        for timeout in (0, -1, 1.5):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                self.prepare(program_timeout_seconds=timeout)
         self.assertEqual(self.inputs(), before)
         self.assertFalse(self.output.exists())
         self.assertFalse(self.image.exists())
@@ -154,7 +150,8 @@ class UserSelftestRootfsTests(unittest.TestCase):
         with redirect_stderr(error):
             status = main(["--arch", "loongarch64", "--guest-userland-directory", str(self.userland),
                            "--runtime-libraries-directory", str(self.runtime),
-                           "--output-directory", str(self.output), "--output-image", str(self.image)])
+                           "--output-directory", str(self.output), "--output-image", str(self.image),
+                           "--run-id", RUN_ID])
         self.assertEqual(status, 1)
         self.assertTrue(error.getvalue())
         self.assertEqual(self.inputs(), before)

@@ -63,6 +63,7 @@ USER_SELFTEST_ROOTFS_DIR ?= build/user-selftest-rootfs/$(ARCH)
 USER_SELFTEST_EXT4_IMAGE ?= build/user-selftests-$(ARCH).img
 USER_SELFTEST_WORKING_DISK_DIR ?= build/user-selftest-work/$(ARCH)
 USER_SELFTEST_ARGS ?=
+USER_SELFTEST_HOST_ARGS ?=
 LINUX_USER_SELFTEST_OUTPUT_DIR ?= build/user-selftests-linux
 LINUX_USER_SELFTEST_CFLAGS ?= -std=c11 -O2 -Wall -Wextra
 RUNNER_SYSROOT ?=
@@ -233,8 +234,7 @@ install-user-selftests: build-user-selftests
 	done
 
 run-user-selftests: build-guest-userland prepare-guest-runtime-libraries
-	python3 tools/prepare_user_selftest_rootfs.py --arch "$(ARCH)" --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(USER_SELFTEST_ROOTFS_DIR)" --output-image "$(USER_SELFTEST_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)" $(USER_SELFTEST_ARGS)
-	python3 tools/run_qemu.py --arch "$(ARCH)" --kernel-elf "$(USER_SELFTEST_KERNEL_ELF)" --system-image "$(USER_SELFTEST_EXT4_IMAGE)" --working-disk-dir "$(USER_SELFTEST_WORKING_DISK_DIR)" --system-only --init-program /sbin/init --root-mode rw $(QEMU_ARGS)
+	python3 tools/run_user_selftests.py --arch "$(ARCH)" --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(USER_SELFTEST_ROOTFS_DIR)" --system-image "$(USER_SELFTEST_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)" --kernel-elf "$(USER_SELFTEST_KERNEL_ELF)" --working-disk-dir "$(USER_SELFTEST_WORKING_DISK_DIR)" --system-only --init-program /sbin/init --root-mode rw $(USER_SELFTEST_ARGS) $(USER_SELFTEST_HOST_ARGS) $(QEMU_ARGS)
 
 $(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/%): tests/user/%.c $(SELFTEST_HEADERS)
 	mkdir -p "$$(dirname -- "$@")"
@@ -306,10 +306,13 @@ help:
 	  '  RUNNER_SYSROOT and RUNNER_LINKER select prepared Rust std compiler inputs.' \
 	  'build-user-selftests                Build default C tests, extended helpers and user-selftests.' \
 	  'install-user-selftests              Install the same sets and generate kselftest-list.txt.' \
-	  'run-user-selftests                  Prepare one PID1 workload, then call the production QEMU CLI.' \
+	  'run-user-selftests                  Prepare a new PID1 run, wait for QEMU, read its working-disk result.' \
 	  '  USER_SELFTEST_KERNEL_ELF selects an existing ordinary ELF; no kernel build dependency.' \
 	  '  USER_SELFTEST_ROOTFS_DIR, USER_SELFTEST_EXT4_IMAGE and USER_SELFTEST_WORKING_DISK_DIR own outputs.' \
-	  '  USER_SELFTEST_ARGS forwards --collection/--program selections; QEMU_ARGS passes run options.' \
+	  '  USER_SELFTEST_ARGS forwards --collection/--program and --program-timeout-seconds.' \
+	  '  USER_SELFTEST_HOST_ARGS accepts --host-timeout-seconds (default 900); UART is saved in the work dir.' \
+	  '  QEMU_ARGS passes production options; automatic runs reject reuse (use fresh or refresh-system).' \
+	  '  The Host returns Guest 0/1/2/4; Host errors return 2. GNU Make wraps any nonzero recipe as 2.' \
 	  'build-linux-user-selftests          Build only the same default C programs with native gcc.' \
 	  'run-linux-user-selftests            Run every native program in its collection cwd; preserve TAP/exit.' \
 	  '  LINUX_USER_SELFTEST_OUTPUT_DIR defaults to build/user-selftests-linux; not target-ISA evidence.' \

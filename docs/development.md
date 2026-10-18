@@ -131,7 +131,9 @@ make run-user-selftests ARCH=riscv64
 make run-user-selftests ARCH=loongarch64 USER_SELFTEST_ARGS='--collection fs'
 ```
 
-`USER_SELFTEST_KERNEL_ELF` 指向已有普通 ELF；该运行目标不构建内核，经同一生产 QEMU、BusyBox PID1、rcS/rcK 自然停机。输出树、卷和工作盘分别由 `USER_SELFTEST_ROOTFS_DIR`、`USER_SELFTEST_EXT4_IMAGE`、`USER_SELFTEST_WORKING_DISK_DIR` 指定；QEMU 选项仍经 `QEMU_ARGS` 传递。
+`USER_SELFTEST_KERNEL_ELF` 指向已有普通 ELF；该目标不构建内核。薄 Host 入口 `tools/run_user_selftests.py` 每次准备新的普通 PID1 输入，经唯一生产 QEMU、BusyBox、rcS/rcK 运行并自然停机，真实等待 QEMU 后读取本次系统工作盘。输出树、来源卷和工作目录分别由 `USER_SELFTEST_ROOTFS_DIR`、`USER_SELFTEST_EXT4_IMAGE`、`USER_SELFTEST_WORKING_DISK_DIR` 指定，UART 保存在工作目录。
+
+每程序预算默认 60 秒，可用 `USER_SELFTEST_ARGS='--program-timeout-seconds 120'` 覆盖；实际值进入程序报告。整次 Host 预算默认 900 秒，可用 `USER_SELFTEST_HOST_ARGS='--host-timeout-seconds 1200'` 覆盖，准备工具、QEMU 和结果读取共用一次绝对期限，日志不续期。QEMU 选项仍经 `QEMU_ARGS` 传递；自动运行只接受 `fresh` 或 `refresh-system`，显式 `reuse` 报错，不暗改动作。普通 `run-qemu` 的三种盘动作、Shell 和 GDB 不变。
 
 客体可直接执行默认 ELF，或选择同一安装清单：
 
@@ -142,7 +144,9 @@ cd /test/selftests/fs
 /sbin/user-selftests --program fs:file_shared
 ```
 
-默认程序、辅助 ELF 和数据只由根 Make 声明，安装时生成 `/test/selftests/kselftest-list.txt`，每行 `collection:program`；辅助程序不计默认通过。执行器解析真实 TAP 和原退出状态，返回 0/1/2/4 分别为通过、失败、基础设施错误、全 Skip，本身不关机。自动 init 动作另写 `/test/selftests/exit-status` 后关机；QEMU 或 Make 返回 0 不能代替该文件和程序/TAP 结果。
+默认程序、辅助 ELF 和数据只由根 Make 声明，安装时生成 `/test/selftests/kselftest-list.txt`，每行 `collection:program`；辅助程序不计默认通过。执行器解析真实 TAP 和进程退出，返回 0/1/2/4 分别为通过、失败、基础设施错误、全 Skip，本身不关机。
+
+自动 init 动作在执行前删除旧状态，结束后写 `/test/selftests/exit-status` 的完整一行 `run=<32位本轮标识> status=<0|1|2|4>`，再正常关机。Host 持工作盘锁到真实 wait 和盘面读取完成，只接受本轮标识；缺失、畸形、旧轮次、QEMU 非零和 Host 读盘错误均不能通过。薄入口正常传播四种用户状态，Host 错误返回 2；GNU Make 对非零 recipe 的外层出口为 2，日志仍保留原用户状态。QEMU 退出 0 或 UART 中的成功文字不替代盘面结果。
 
 同源码的 Linux 参考入口只构建、运行本机 C 程序，不启动内核、BusyBox 或用户执行器：
 

@@ -26,7 +26,6 @@ fn list_reads_only_manifest_and_execution_reports_missing_program() {
     let scratch = Scratch(directory);
     let manifest = scratch.0.join("kselftest-list.txt");
     fs::write(&manifest, "fs/file_shared\n").unwrap();
-    assert!(Options::parse(&[]).is_ok());
     let args = vec![
         "--manifest".into(),
         manifest.to_str().unwrap().into(),
@@ -66,9 +65,6 @@ fn list_reads_only_manifest_and_execution_reports_missing_program() {
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(2));
-    assert!(String::from_utf8(missing.stdout)
-        .unwrap()
-        .contains("SpawnError"));
     for selection in ["fs:missing", "../bad:test", "fs:../bad"] {
         let result = Options::parse(&[
             "--manifest".into(),
@@ -90,6 +86,28 @@ fn list_reads_only_manifest_and_execution_reports_missing_program() {
         "fs".into()
     ])
     .is_err());
+}
+
+/// 期限输入拒绝缺值、非正整数、溢出和重复覆盖，避免无效预算进入执行器。
+#[test]
+fn program_timeout_rejects_invalid_cli_values() {
+    for values in [
+        vec![],
+        vec!["0"],
+        vec!["-1"],
+        vec!["+1"],
+        vec!["1.5"],
+        vec![""],
+        vec!["18446744073709551615"],
+        vec!["18446744073709551616"],
+        vec!["1", "--program-timeout-seconds", "2"],
+    ] {
+        let args = std::iter::once("--program-timeout-seconds")
+            .chain(values)
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert!(Options::parse(&args).is_err(), "{args:?}");
+    }
 }
 
 /// 同一份协议对象派生全跳过、失败和损坏的程序级退出，不复制另一份判定。

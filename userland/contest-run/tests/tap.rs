@@ -13,34 +13,44 @@ use std::time::Duration;
 
 const SAMPLE: &str = r#"
 #include "kselftest.h"
+#include <time.h>
 int main(int argc, char **argv)
 {
-    if (argc != 2) return 1;
+    if (argc != 1 && argc != 2) return 1;
+    const char *mode = argc == 2 ? argv[1] : strrchr(argv[0], '/');
+    if (argc == 1) mode = mode ? mode + 1 : argv[0];
     ksft_print_header();
-    if (!strcmp(argv[1], "zero-skip")) ksft_exit_skip("no support\n");
-    if (!strcmp(argv[1], "unplanned-skip")) {
+    if (!strcmp(mode, "zero-skip")) ksft_exit_skip("no support\n");
+    if (!strcmp(mode, "unplanned-skip")) {
         ksft_test_result_pass("first\n");
         ksft_exit_skip("remaining\n");
     }
-    if (!strcmp(argv[1], "plan-skip") || !strcmp(argv[1], "partial-skip")) {
+    if (!strcmp(mode, "plan-skip") || !strcmp(mode, "partial-skip")) {
         ksft_set_plan(3);
-        if (!strcmp(argv[1], "partial-skip")) ksft_test_result_pass("first\n");
+        if (!strcmp(mode, "partial-skip")) ksft_test_result_pass("first\n");
         ksft_exit_skip("remaining\n");
     }
     ksft_set_plan(1);
-    if (!strcmp(argv[1], "pass")) ksft_test_result_pass("ordinary\n");
-    else if (!strcmp(argv[1], "all-skip")) ksft_test_result_skip("no support\n");
-    else if (!strcmp(argv[1], "fail-zero")) {
+    if (!strcmp(mode, "slow") || !strcmp(mode, "noisy")) {
+        struct timespec tick = { .tv_nsec = 20000000 };
+        for (int i = 0; i < 100; ++i) {
+            if (!strcmp(mode, "noisy")) ksft_print_msg("progress %d\n", i);
+            if (nanosleep(&tick, NULL)) ksft_exit_fail_msg("nanosleep failed\n");
+        }
+        ksft_test_result_pass("completed within program budget\n");
+    } else if (!strcmp(mode, "pass")) ksft_test_result_pass("ordinary\n");
+    else if (!strcmp(mode, "all-skip")) ksft_test_result_skip("no support\n");
+    else if (!strcmp(mode, "fail-zero")) {
         ksft_test_result_fail("failed\n");
         ksft_exit_pass();
-    } else if (!strcmp(argv[1], "fail-skip")) {
+    } else if (!strcmp(mode, "fail-skip")) {
         ksft_test_result_fail("failed\n");
         ksft_exit_skip("remaining\n");
-    } else if (!strcmp(argv[1], "xfail")) ksft_test_result_xfail("expected\n");
-    else if (!strcmp(argv[1], "xfail-exit")) {
+    } else if (!strcmp(mode, "xfail")) ksft_test_result_xfail("expected\n");
+    else if (!strcmp(mode, "xfail-exit")) {
         ksft_test_result_xfail("expected\n");
         ksft_exit_xfail();
-    } else if (!strcmp(argv[1], "xpass")) {
+    } else if (!strcmp(mode, "xpass")) {
         ksft_test_result_code(KSFT_XPASS, "unexpected", NULL);
         ksft_exit_pass();
     } else ksft_exit_fail_msg("aborted\n");
@@ -48,7 +58,7 @@ int main(int argc, char **argv)
 }
 "#;
 
-/// 真实头的输出与 wait 同时进入正式执行器，特殊 skip 编号不能按普通缺项处理。
+/// 同一固定头样本核对 TAP 和真实退出，再经用户入口核对慢程序与持续输出的绝对期限。
 #[test]
 fn fixed_header_outputs_keep_skip_and_failure_exit_semantics() {
     let directory = std::env::temp_dir().join(format!("selftest-tap-{}", std::process::id()));
@@ -57,8 +67,7 @@ fn fixed_header_outputs_keep_skip_and_failure_exit_semantics() {
     let source = scratch.0.join("sample.c");
     let executable = scratch.0.join("sample");
     fs::write(&source, SAMPLE).unwrap();
-    let include =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ref/linux/tools/testing/selftests");
+    let include = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/user/include");
     let compiled = Command::new("cc")
         .arg("-std=gnu11")
         .arg("-I")
@@ -124,6 +133,37 @@ fn fixed_header_outputs_keep_skip_and_failure_exit_semantics() {
                 "{mode}: chunk {size}"
             );
         }
+    }
+    let collection = scratch.0.join("timing");
+    fs::create_dir(&collection).unwrap();
+    for mode in ["slow", "noisy"] {
+        fs::hard_link(&executable, collection.join(mode)).unwrap();
+    }
+    let manifest = scratch.0.join("kselftest-list.txt");
+    fs::write(&manifest, "timing:slow\ntiming:noisy\n").unwrap();
+    for (program, seconds, expected) in [
+        ("timing:slow", "1", 1),
+        ("timing:slow", "5", 0),
+        ("timing:noisy", "1", 1),
+    ] {
+        let run = Command::new(env!("CARGO_BIN_EXE_user-selftests"))
+            .args([
+                "--manifest",
+                manifest.to_str().unwrap(),
+                "--program",
+                program,
+                "--program-timeout-seconds",
+                seconds,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            run.status.code(),
+            Some(expected),
+            "{program} budget={seconds}: stdout={} stderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 }
 

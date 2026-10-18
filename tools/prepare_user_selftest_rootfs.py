@@ -4,6 +4,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -16,8 +17,14 @@ from create_ext4_image import PROFILES, create_ext4_image
 def prepare_user_selftest_rootfs(architecture, guest_userland_directory,
                                  runtime_libraries_directory, output_directory,
                                  output_image, collections=(), programs=(),
-                                 profile="seed4k", image_size_mib=256):
-    """只重建明确拥有的树与卷，安装清单和程序选择仍由用户执行器消费。"""
+                                 profile="seed4k", image_size_mib=256, *,
+                                 run_id, program_timeout_seconds=None):
+    """重建本轮 PID1 输入并清除旧结果；程序期限默认值只由用户执行器定义。"""
+    if re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+        raise ValueError("run ID must contain exactly 32 lowercase hexadecimal digits")
+    if program_timeout_seconds is not None and (
+            not isinstance(program_timeout_seconds, int) or program_timeout_seconds < 1):
+        raise ValueError("program timeout must be a positive integer")
     userland = Path(guest_userland_directory).resolve(strict=True)
     runtime = Path(runtime_libraries_directory).resolve(strict=True)
     output = Path(os.path.abspath(output_directory))
@@ -48,6 +55,8 @@ def prepare_user_selftest_rootfs(architecture, guest_userland_directory,
             if not value or "\0" in value:
                 raise ValueError(f"{option} must be nonempty and contain no NUL")
             arguments.extend((option, value))
+    if program_timeout_seconds is not None:
+        arguments.extend(("--program-timeout-seconds", str(program_timeout_seconds)))
     with tempfile.TemporaryDirectory(prefix="user-selftest-init-") as temporary:
         config = Path(temporary) / "inittab"
         config.write_text(
@@ -55,13 +64,17 @@ def prepare_user_selftest_rootfs(architecture, guest_userland_directory,
             "ttyS0::once:/bin/sh /sbin/run-user-selftests\n"
             "::shutdown:/bin/sh /etc/init.d/rcK\n", encoding="utf-8")
         tree = assemble_rootfs_tree(architecture, userland, runtime, output, config)
+    (tree / "test/selftests/exit-status").unlink(missing_ok=True)
     action = tree / "sbin/run-user-selftests"
     action.unlink(missing_ok=True)
     action.write_text(
-        "#!/bin/sh\n" + shlex.join(arguments) + "\n"
+        "#!/bin/sh\n"
+        "/bin/busybox rm -f /test/selftests/exit-status || exit 2\n"
+        + shlex.join(arguments) + "\n"
         "status=$?\n"
+        "case \"$status\" in 0|1|2|4) ;; *) status=2 ;; esac\n"
         "printf 'user-selftests exit=%s\\n' \"$status\"\n"
-        "printf '%s\\n' \"$status\" > /test/selftests/exit-status\n"
+        f"printf 'run={run_id} status=%s\\n' \"$status\" > /test/selftests/exit-status\n"
         "/bin/busybox poweroff\n"
         "exit \"$status\"\n", encoding="utf-8")
     action.chmod(0o755)
@@ -76,6 +89,8 @@ def main(argv=None):
     parser.add_argument("--runtime-libraries-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--output-image", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--program-timeout-seconds", type=int)
     parser.add_argument("--collection", action="append", default=[])
     parser.add_argument("--program", action="append", default=[])
     parser.add_argument("--profile", choices=PROFILES, default="seed4k")
@@ -85,7 +100,8 @@ def main(argv=None):
         prepare_user_selftest_rootfs(
             args.arch, args.guest_userland_directory, args.runtime_libraries_directory,
             args.output_directory, args.output_image, args.collection, args.program,
-            args.profile, args.size_mib)
+            args.profile, args.size_mib, run_id=args.run_id,
+            program_timeout_seconds=args.program_timeout_seconds)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"User selftest preparation failed: {error}", file=sys.stderr)
         return 1

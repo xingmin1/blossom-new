@@ -7,6 +7,8 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shlex
@@ -30,9 +32,10 @@ def repository_path(value):
     return Path(os.path.abspath(ROOT / value))
 
 
-def parse_arguments(argv):
-    """仅在入口定义默认值并拒绝互斥选择，后端只接收明确字段。"""
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+def parse_arguments(argv, parser=None):
+    """共用生产参数与默认值；自动调用者可在同一解析器增加自己的输入。"""
+    if parser is None:
+        parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
     parser.add_argument("--kernel-elf", type=repository_path)
     parser.add_argument("--system-image", type=repository_path)
@@ -103,9 +106,23 @@ def print_summary(kernel_elf_path, system_image_path, contest_image_path,
         print(f"run-qemu gdb-endpoint=127.0.0.1:{gdb_port}", file=sys.stderr, flush=True)
 
 
-def main(argv=None):
-    """先纯构造命令；实际运行才核 ELF、准备工作盘并把独占锁交给 exec。"""
-    parser, args = parse_arguments(argv)
+@dataclass(frozen=True)
+class QemuConfiguration:
+    """保存纯解析得到的路径和命令，尚未读取 ELF、来源盘或工作目录。"""
+
+    architecture: str
+    kernel_elf_path: Path
+    system_image_path: Path
+    contest_image_path: Path | None
+    working_disk_directory: Path
+    working_disk_action: str
+    debug_enabled: bool
+    gdb_port: int
+    command: tuple
+
+
+def configure_qemu(args):
+    """只计算默认路径与完整 argv，展示和两种执行生命周期共用这一来源。"""
     suffix = "rv" if args.arch == "riscv64" else "la"
     kernel_elf_path = args.kernel_elf or ROOT / f"kernel-{suffix}"
     system_image_path = args.system_image or ROOT / ("disk.img" if suffix == "rv" else "disk-la.img")
@@ -122,28 +139,56 @@ def main(argv=None):
         memory_size=args.memory, network_mode=args.network, host_forward_rule=args.host_forward,
         boot_arguments=boot_arguments(args.system_only, args.root_mode, args.shell, args.init_program),
         debug_enabled=args.debug, gdb_port=gdb_port)
+    return QemuConfiguration(
+        args.arch, kernel_elf_path, system_image_path, contest_image_path, directory,
+        args.working_disk_action, args.debug, gdb_port, tuple(command))
+
+
+def summarize_configuration(configuration, disk_paths):
+    """展示实际配置和所选工作盘，保持未消费来源的只读约定。"""
+    print_summary(
+        configuration.kernel_elf_path, configuration.system_image_path,
+        configuration.contest_image_path, disk_paths, configuration.working_disk_directory,
+        configuration.working_disk_action, configuration.debug_enabled, configuration.gdb_port)
+
+
+@contextmanager
+def prepare_qemu(configuration):
+    """核对 ELF 与 QEMU 后准备工作盘；锁覆盖调用者的执行、等待和盘面读取。"""
+    kernel = configuration.kernel_elf_path
+    if not stat.S_ISREG(kernel.stat().st_mode):
+        raise ValueError(f"kernel ELF is not a regular file: {kernel}")
+    read_kernel_elf(kernel, configuration.architecture)
+    command = list(configuration.command)
+    executable = shutil.which(command[0])
+    if executable is None:
+        raise ValueError(f"required QEMU executable missing: {command[0]}")
+    command[0] = os.path.abspath(executable)
+    environment = os.environ.copy()
+    environment.pop("LD_LIBRARY_PATH", None)
+    environment.pop("LD_PRELOAD", None)
+    with prepare_working_disks(
+            configuration.working_disk_directory, configuration.system_image_path,
+            configuration.contest_image_path, configuration.working_disk_action
+    ) as (disk_paths, lock_file):
+        summarize_configuration(configuration, disk_paths)
+        print(f"run-qemu qemu-binary={command[0]}", file=sys.stderr, flush=True)
+        yield command, environment, disk_paths, lock_file
+
+
+def main(argv=None):
+    """展示不读取输入；普通启动仍通过 execve 继承同一工作盘锁。"""
+    parser, args = parse_arguments(argv)
+    configuration = configure_qemu(args)
     if args.print_command:
-        print_summary(kernel_elf_path, system_image_path, contest_image_path, disk_paths,
-                      directory, args.working_disk_action, args.debug, gdb_port)
-        print(shlex.join(command))
+        disk_paths = working_disk_paths(configuration.working_disk_directory,
+                                        configuration.contest_image_path is not None)
+        summarize_configuration(configuration, disk_paths)
+        print(shlex.join(configuration.command))
         return
     try:
-        if not stat.S_ISREG(kernel_elf_path.stat().st_mode):
-            raise ValueError(f"kernel ELF is not a regular file: {kernel_elf_path}")
-        read_kernel_elf(kernel_elf_path, args.arch)
-        executable = shutil.which(qemu_binary)
-        if executable is None:
-            raise ValueError(f"required QEMU executable missing: {qemu_binary}")
-        command[0] = os.path.abspath(executable)
-        with prepare_working_disks(directory, system_image_path, contest_image_path,
-                                   args.working_disk_action) as (prepared_paths, lock_file):
-            print_summary(kernel_elf_path, system_image_path, contest_image_path, prepared_paths,
-                          directory, args.working_disk_action, args.debug, gdb_port)
-            print(f"run-qemu qemu-binary={command[0]}", file=sys.stderr, flush=True)
+        with prepare_qemu(configuration) as (command, environment, _, lock_file):
             os.set_inheritable(lock_file.fileno(), True)
-            environment = os.environ.copy()
-            environment.pop("LD_LIBRARY_PATH", None)
-            environment.pop("LD_PRELOAD", None)
             os.execve(command[0], command, environment)
     except (ValueError, OSError) as error:
         parser.exit(1, f"run-qemu: {error}\n")
