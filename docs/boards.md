@@ -1,0 +1,165 @@
+# 人工上板、根卷与应用验证
+
+本指南使用当前生产接口，不是实板通过记录。支持组合为 riscv64/visionfive2、loongarch64/ls2k1000la；QEMU 共用 [开发指南](development.md) 的唯一运行入口。两板的固件、OS DTB、RAM、介质和串口必须由实际设备确认，构建与包装不连接串口、不刷盘、不执行 saveenv，也不依赖 ktest。
+
+## 1. 首次接触先记录实际输入
+
+在固件中只查看支持的命令和当前设置：
+
+```text
+version
+bdinfo
+printenv bootcmd bootargs loadaddr kernel_addr_r fdt_addr_r ramdisk_addr_r
+help bootm
+help bootelf
+help fdt
+```
+
+保存板修订、实际 CPU/RAM、固件版本、串口参数、OS DTB 来源、保留区及可用装载空间。某固件缺少命令就保留该事实，不从另一个项目推断支持。串口电平与针脚以本板手册为准。
+
+U-Boot control FDT 服务固件自身，working FDT 才交给 OS；有实际 OS DTB 时独立载入，若需复制 control FDT 则先复制到不重叠空间，再按已知硬件修改，不覆盖固件仍引用的树。[1]
+
+能运行原厂 Linux 时，可记录 `uname -m`、`/proc/iomem`、设备树 model 及 `lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS`。这些信息用于选择实际介质和分区，不要求 BLOSSOM 增加同名工具。
+
+## 2. 分清离线文件与运行期设备
+
+| 对象 | 语义 |
+|---|---|
+| `kernel.elf` | 带符号内核，entry/LOAD/BSS 范围是布局事实来源 |
+| `kernel.bin` | 按物理 LOAD 位置排列的文件字节，不含 ELF/调试容器 |
+| `kernel.uImage` | 带实际架构、load、entry 和 CRC 的固件容器 |
+| `board.dtb` | 本次提供的 OS DTB，保留包装所需扩展空间 |
+| `root.ext4` | 首字节为 ext4 卷起点；可放 RAM 或部署到明确分区 |
+| `root.uInitrd` | U-Boot ramdisk 头加未压缩 raw ext4；固件传 payload 范围 |
+| 整卡或整 SSD 镜像 | 可能含分区表和引导区，不等于一个 raw ext4 卷 |
+| 官方比赛盘 | 原程序、解释器、DSO 与清单输入；不得重制来替换原评测来源 |
+
+文件后缀不证明格式，不把 ext4 改名当 gzip、UBI 或厂商升级包。固件从 SD/TFTP 载入内核，与内核运行期从 SD/SATA 访问文件是不同路径；RAM 根不证明原生盘、DMA 或 IRQ 已运行。
+
+CPU 物理地址、CPU 虚拟地址和设备 DMA 地址也不同：FDT/PCI 给出物理 MMIO 资源，内核映射后由 CPU 虚拟地址访问；DMA 地址来自本设备 domain 的窗口、mask 和映射。非一致设备还需要真实 cache 维护，不能以 fence/dbar 代替。纯 Rust 布局输入和编辑器改造不改变这些硬件地址语义。
+
+## 3. 普通构建、装配和离线包装
+
+只改内核时，不必重制根卷：
+
+```sh
+make build-kernel ARCH=riscv64 TARGET_PLATFORM=visionfive2 KERNEL_BUILD_PROFILE=release
+make build-kernel ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la KERNEL_BUILD_PROFILE=release
+```
+
+工具链、目标 std、交叉 GCC 和 libc 来源按开发指南准备，不下载或升级工具链。用户树和 raw ext4 分开构建；以下输出为本次拥有的可重建路径：
+
+```sh
+make assemble-root-filesystem ARCH=riscv64 ROOTFS_OUTPUT_DIR=build/board-root-rv
+make create-ext4-image ARCH=riscv64 \
+  ROOTFS_TREE_DIR=build/board-root-rv SYSTEM_ROOT_EXT4_IMAGE=build/board-root-rv.ext4
+make assemble-root-filesystem ARCH=loongarch64 ROOTFS_OUTPUT_DIR=build/board-root-la
+make create-ext4-image ARCH=loongarch64 \
+  ROOTFS_TREE_DIR=build/board-root-la SYSTEM_ROOT_EXT4_IMAGE=build/board-root-la.ext4
+```
+
+两卷各自以 `/` 为根，含匹配 ISA 的 `/sbin/init`、Shell、std 执行器和配置，不含另一架构目录。已有外部完整树直接交 `ROOTFS_TREE_DIR`，制盘不向其补程序或改写输入。保留支持的无 journal 格式，不启用 replay/recovery。
+
+准备实际 OS DTB 后包装 RAM 启动输入；下列 DTB 路径必须替换为真实输入：
+
+```sh
+make package-board-boot-images ARCH=riscv64 TARGET_PLATFORM=visionfive2 \
+  KERNEL_BUILD_PROFILE=release BOARD_BOOT_IMAGES_OUTPUT_DIR=build/vf2-boot \
+  BOARD_ROOT_EXT4_IMAGE=build/board-root-rv.ext4 BOARD_ROOT_DEVICE=/dev/ram0 \
+  BOARD_ROOT_MODE=rw BOARD_OS_DTB=/absolute/actual-visionfive2-os.dtb
+make package-board-boot-images ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la \
+  KERNEL_BUILD_PROFILE=release BOARD_BOOT_IMAGES_OUTPUT_DIR=build/2k-boot \
+  BOARD_ROOT_EXT4_IMAGE=build/board-root-la.ext4 BOARD_ROOT_DEVICE=/dev/ram0 \
+  BOARD_ROOT_MODE=rw BOARD_OS_DTB=/absolute/actual-ls2k1000la-os.dtb
+```
+
+`BOARD_ROOT_EXT4_IMAGE` 是只读输入，不是制盘输出。包装从最终普通 ELF 的公开符号和 LOAD 取得实际布局，不导入测试包、不要求测试节或展开信息；已有固定 ELF 也可直接交 `tools/package_board_boot_images.py --help` 所示 CLI，不重编内核。
+
+每次包装产生 `kernel.elf`、`kernel.bin`、`kernel.uImage`、`boot.env`，有对应输入才产生 `root.uInitrd`、`board.dtb`。缺 DTB 或明确 root 时，不生成不可证明的完整启动命令；这类离线容器不是可部署成功或实板启动证明。LoongArch 容器使用实际架构编码，不伪装成 MIPS。
+
+`boot.env` 区分 `kernel_addr_r` 容器暂存地址、`kernel_load`、物理 `kernel_entry`、ELF entry 和完整 `kernel_mem_end`，并列出 DTB/initrd 范围。包装检查对象间不重叠，但不能证明它们落在该实板真实可用 RAM 内；需与固件、DT memory/reservation 和整个 BSS 展开范围共同核对。
+
+## 4. RAM 根：两板分别人工启动
+
+先核对本固件支持容器格式和 `bootm` 交接方式。下列变量来自本次 `boot.env` 和实际地址安排；只执行临时命令，不保存环境：
+
+```text
+setenv serverip <开发机TFTP地址>
+setenv ipaddr <开发板固件地址>
+tftpboot ${kernel_addr_r} kernel.uImage
+tftpboot ${fdt_addr_r} board.dtb
+tftpboot ${ramdisk_addr_r} root.uInitrd
+iminfo ${kernel_addr_r}
+fdt addr ${fdt_addr_r}
+fdt print /chosen
+setenv bootargs 'root=/dev/ram0 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+bootm ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
+```
+
+这是 kernel/ramdisk/OS FDT 三参数模板，必须由本固件帮助和实际启动 ABI 确认。[2] LA 原始 a0–a3、RV hart/DTB 等仍须内核收到正确输入。改用固件 FAT/ext4/USB 加载只替换 load 命令，不代表内核运行期支持那些设备。
+
+`blossom.boot=shell` 经同一 BusyBox PID1/start-session 选择 Shell，不把 Shell 改成 PID1。默认会话会运行比赛执行器 `/sbin/contest-run /dev/vda`，板上没有该比赛设备时不得省略会话选择后假定自动进入 Shell。Shell 退出不转跑比赛；正常结束用 `sync` 和 `/bin/busybox poweroff`。
+
+观察实际 `ram0`、initrd payload 范围、根卷及 INIT。写一份文件后结束，再重新加载原 RAM 卷时文件消失，这是 RAM 易失性，不是持久盘失败。RAM 卷包括空闲空间在内都占 RAM，只装当前需要的程序。
+
+## 5. VF2 SD 与 LA SATA 持久根
+
+先保留原厂固件、分区表和引导分区。VF2 用固件实际支持的 `mmc list`、`mmc info`、`part list mmc <实际编号>`；LA 若由 SCSI 层呈现 SATA，用本固件支持的 `scsi reset`、`scsi info`、`part list scsi <实际编号>`。固件编号、Linux 设备名和内核分区号不能互相猜测。
+
+部署前在原厂 Linux/宿主核对目标分区身份、未挂载状态和容量。写卷是用户明确选择目标介质后的单独操作，不属于任何 Make 目标；不得把目标分区误换为含固件的整卡/整 SSD，也不把 raw ext4 交厂商 NAND 升级菜单。
+
+直接根启动不加载 initrd。分区名仅示例，必须替换为实际目标；kernel/DTB 仍可由 TFTP 载入：
+
+```text
+# VF2：实际 SD 分区示例
+setenv bootargs 'root=/dev/mmcblk0p2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+bootm ${kernel_addr_r} - ${fdt_addr_r}
+
+# LA：实际 SATA 分区示例
+setenv bootargs 'root=/dev/sda2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+bootm ${kernel_addr_r} - ${fdt_addr_r}
+```
+
+`-` 表示无 RAM disk。不存在的明确分区应失败，不能改选最大分区或 RAM 根。需要持久根的 `boot.env` 时，包装选择实际 `BOARD_ROOT_DEVICE`，不传 `BOARD_ROOT_EXT4_IMAGE`；根卷部署仍是独立步骤。保持实际 OS DTB，不覆盖固件仍在使用的 control FDT。
+
+## 6. 持久性与普通用户测试
+
+在明确 RW 的根中写入并同步：
+
+```sh
+mkdir -p /root/board-check
+printf '%s\n' 'persistent board root' > /root/board-check/marker
+sync
+/bin/busybox poweroff
+```
+
+确认真实结束，再启动**同一持久分区**，不重新部署来源 root.ext4、不刷新或还原卷。读取 marker，并运行已有跨页图样、共享映射、rename/truncate、fsync/sync 相关程序；停止后从外部读取和冷启动重读分别记录。页缓存热读不能代替冷重开，固件看到 SSD 也不能代替内核 AHCI 请求完成。
+
+已安装的用户自测作为普通程序人工运行，不加板专属执行器或测试协议：
+
+```sh
+/sbin/user-selftests --list
+/sbin/user-selftests --collection fs
+cd /test/selftests/fs
+./file_shared
+```
+
+`user-selftests` 返回真实程序/TAP 汇总但不自行关机；辅助程序不计默认通过。比赛配置仍在 `/etc/contest/`，先按真实设备挂载和选择原盘、解释器、DSO，再运行对应 plan。只提供镜像文件而没有 loop 设备时，不能宣称可以直接 mount 任意镜像；仅有 USB 介质也不叫原生 SD/SATA/USB 根已通过。
+
+改内核只更新内核与必要 DTB；改用户程序或配置只更新对应文件并 sync，RAM 模式重载更新卷。需要关机更新持久介质时保留其余实际修改，不为每次测试重新刷整卷。断电未同步数据的恢复、journal 和新的压力/覆盖率框架不在本轮范围。
+
+## 7. 运行边界与记录
+
+| 必须分开的路径 | 当前硬件状态 |
+|---|---|
+| VF2 RAM 根 | 待用户实际固件/OS DTB/RAM 启动 |
+| VF2 SD 分区直接根 | 待原生 SD、DMA/IRQ 与同介质同步重启 |
+| LA RAM 根 | 待用户实际固件/OS DTB/RAM 启动 |
+| LA SATA 分区直接根 | 待原生 AHCI、DMA/IRQ 与同介质同步重启 |
+
+每次保留所选 ELF/卷/DTB 身份、实际 bootargs、完整 UART、设备/分区范围、请求与完成、真实结束及重启输入。原生 MAC/PHY/网络还需各自实板证据，固件 ping 不证明内核网络。SMP 要观察任务迁核或真实并行，不只看上线数量。
+
+定位按固件装载 → 入口/FDT → MM/CPU → IRQ → 控制器命令与 DMA → ext4 → ELF/运行库 → 用户选择逐层判断；错误归原层处理，不降核、猜地址、重放未知写或切换根来掩盖失败。ktest 仅双 QEMU，不提供 serial/loader/实体板 transport。LA NX 既有暂缓非 Pass；离线输入和 QEMU 软件验证不替四条实板路径签名。
+
+[1]: https://docs.u-boot.org/en/latest/usage/cmd/fdt.html
+[2]: https://docs.u-boot.org/en/v2024.01/usage/cmd/bootm.html
