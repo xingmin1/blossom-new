@@ -21,7 +21,7 @@ pub(crate) struct Registry {
     ro_end: usize,
 }
 impl Registry {
-    /// 集中校验边界和全部永久元数据；无分配且不解引用区间外槽。
+    /// 无分配核验注册槽、永久只读元数据和可执行回调；完整名称冲突由宿主目录集合检查。
     pub(crate) fn load() -> Result<Self, TestError> {
         let start = core::ptr::addr_of!(__ktest_suites_start) as usize;
         let end = core::ptr::addr_of!(__ktest_suites_end) as usize;
@@ -34,14 +34,14 @@ impl Registry {
             ro_start: core::ptr::addr_of!(__rodata_start) as usize,
             ro_end: core::ptr::addr_of!(__rodata_end) as usize,
         };
-        if value.ro_start >= value.ro_end
+        if value.ro_end <= value.ro_start
             || start < value.ro_start
-            || end > value.ro_end
+            || value.ro_end < end
             || start % align_of::<SuiteSlot>() != 0
             || end % align_of::<SuiteSlot>() != 0
             || (end - start) % size_of::<SuiteSlot>() != 0
             || !value.contains(start, end - start)
-            || value.count > u32::MAX as usize
+            || (u32::MAX as usize) < value.count
         {
             return Err(TestError(
                 "registry boundary/alignment outside permanent RO mapping",
@@ -55,12 +55,12 @@ impl Registry {
             }
             value.defaults(&suite.defaults)?;
             value.slice(suite.cases)?;
-            if suite.cases.is_empty() || suite.cases.len() > u32::MAX as usize {
+            if suite.cases.is_empty() || (u32::MAX as usize) < suite.cases.len() {
                 return Err(TestError("invalid suite case count"));
             }
             let run = suite.run as usize;
             if run < core::ptr::addr_of!(__executable_start) as usize
-                || run >= core::ptr::addr_of!(__etext) as usize
+                || core::ptr::addr_of!(__etext) as usize <= run
             {
                 return Err(TestError("suite callback outside executable mapping"));
             }
@@ -114,23 +114,6 @@ impl Registry {
                     }
                 } else if case.fatal_message.is_some() {
                     return Err(TestError("fatal message without fatal"));
-                }
-            }
-        }
-        // ponytail: 无堆 O(n²) 冲突核验；巨大目录若成为启动瓶颈再采用链接时排序。
-        for left in 0..value.count {
-            let a = value.suite(left as u32)?;
-            for right in left..value.count {
-                let b = value.suite(right as u32)?;
-                if left != right && a.name == b.name {
-                    return Err(TestError("duplicate suite full name"));
-                }
-                for (ai, ac) in a.cases.iter().enumerate() {
-                    for bc in &b.cases[if left == right { ai + 1 } else { 0 }..] {
-                        if ac.name == bc.name {
-                            return Err(TestError("duplicate case full name across registry"));
-                        }
-                    }
                 }
             }
         }

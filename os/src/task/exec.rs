@@ -288,12 +288,15 @@ impl Arguments {
     }
 }
 
-/// 路径在分配或移动之前验证，不把格式错误变成用户可写内核字符串。
+/// 路径在分配或移动前验证；空路径保留查找错误，内嵌 NUL 仍按格式错误拒绝。
 fn validate_filename(filename: &[u8]) -> Result<(), ExecError> {
     if MAX_PATH_BYTES <= filename.len() {
         return Err(ExecError::ArgumentsTooBig);
     }
-    if filename.is_empty() || filename.contains(&0) {
+    if filename.is_empty() {
+        return Err(ExecError::File(FsError::NotFound));
+    }
+    if filename.contains(&0) {
         return Err(ExecError::Format);
     }
     Ok(())

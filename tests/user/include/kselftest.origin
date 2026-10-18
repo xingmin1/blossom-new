@@ -1,0 +1,7 @@
+Linux v6.12，原样复制 ref/linux/tools/testing/selftests/ 下两个完整头。
+本地只读参考 HEAD：adc218676eef25575469234709c2d87185ca223a。
+v6.12 上游标签对象：06090c9b622a7e1f797e775db4c035e0d779b76e。
+来源：https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/tools/testing/selftests?h=v6.12
+许可证保留各头 SPDX 与版权；GPL 全文见同目录 GPL-2.0。
+kselftest.h SHA256 5d5720da5593490c7260d867904531b48230a4868798dcb4b34df8039a7be609
+kselftest_harness.h SHA256 38ac12ca1ff9cbcd57c19ae2e4230f426ae4b1ae00cf4713de578dfde4ed6e23

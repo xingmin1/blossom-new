@@ -5,7 +5,7 @@ import unittest
 
 from host_helpers import CONFIG, case_record, case_lines, parser_for
 from ktest.catalog import HostError
-from ktest.protocol import ready
+from ktest.protocol import CaseResult, ready
 
 
 class ProtocolTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class ProtocolTests(unittest.TestCase):
         for line in case_lines(row)[:3]:
             parser.feed(line)
         with self.assertRaises(HostError):
-            parser.feed("  # KTEST status 0 Pass")
+            parser.feed(f"  ok 1 {row['name']}")
         parser = parser_for([row, case_record(1)])
         for line in case_lines(row):
             parser.feed(line)
@@ -103,6 +103,87 @@ class ProtocolTests(unittest.TestCase):
         parser.feed("ok 1 os::tests0")
         parser.feed("# KTEST complete")
         self.assertEqual(parser.results[0], dict(status="Skip", reason="insufficient CPUs"))
+
+    def test_complete_result_event_keeps_identity_and_rejects_private_status(self):
+        """唯一普通终态携带清理后的身份；清 active 不影响回执消费者。"""
+        row = case_record(7)
+        samples = (("ok", "", "Pass", ""),
+                   ("not ok", "", "Fail", ""),
+                   ("ok", " # SKIP", "Skip", ""),
+                   ("ok", " # SKIP one CPU", "Skip", "one CPU"),
+                   ("not ok", " # ERROR", "Error", ""))
+        for polarity, directive, status, reason in samples:
+            with self.subTest(status=status, directive=directive):
+                parser = parser_for([row])
+                for line in case_lines(row)[:-1]:
+                    self.assertNotIsInstance(parser.feed(line), CaseResult)
+                event = parser.feed(f"  {polarity} 1 {row['name']}{directive}")
+                self.assertEqual(event, CaseResult(7, status, reason))
+                self.assertIsNone(parser.active)
+                self.assertIsNone(parser.phase)
+                self.assertEqual(parser.results[7], dict(status=status, reason=reason))
+        for suffix in (" # SKIP bad", " # ERROR", " # UNKNOWN"):
+            parser = parser_for([row])
+            for line in case_lines(row)[:-1]:
+                parser.feed(line)
+            with self.subTest(suffix=suffix), self.assertRaises(HostError):
+                parser.feed(f"  {'not ok' if 'SKIP' in suffix else 'ok'} 1 {row['name']}{suffix}")
+        parser = parser_for([row])
+        for line in case_lines(row)[:-1]:
+            parser.feed(line)
+        with self.assertRaises(HostError):
+            parser.feed("  # KTEST status 7 Pass")
+
+    def test_parameter_directive_text_is_part_of_full_result_identity(self):
+        """参数中的分隔符属于完整名字，只有名字后追加的指令改变终态。"""
+        for label in ("value # comment", "value # SKIP reason", "value # ERROR"):
+            row = case_record(7, parameter=label, name=f"os::tests0::case7[{label}]")
+            for status in ("Pass", "Fail", "Skip", "Error"):
+                with self.subTest(label=label, status=status):
+                    parser = parser_for([row])
+                    for line in case_lines(row, status=status)[:-1]:
+                        parser.feed(line)
+                    event = parser.feed(case_lines(row, status=status)[-1])
+                    reason = "insufficient CPUs" if status == "Skip" else ""
+                    self.assertEqual(event, CaseResult(7, status, reason))
+                    self.assertEqual(parser.results[7], dict(status=status, reason=reason))
+                    self.assertIsNone(parser.active)
+                    outer = "ok" if status in ("Pass", "Skip") else "not ok"
+                    parser.feed(f"{outer} 1 os::tests0")
+                    parser.feed("# KTEST complete")
+                    self.assertTrue(parser.complete)
+
+    def test_result_directive_starts_only_after_exact_full_name(self):
+        """追加指令必须紧邻完整身份，额外名字尾缀或近似名字不能冒充同例。"""
+        label = "value # comment"
+        row = case_record(7, parameter=label, name=f"os::tests0::case7[{label}]")
+        for polarity, suffix, status in (("ok", " # SKIP reason # detail", "Skip"),
+                                         ("not ok", " # ERROR actual failure", "Error")):
+            with self.subTest(suffix=suffix):
+                parser = parser_for([row])
+                for line in case_lines(row)[:-1]:
+                    parser.feed(line)
+                event = parser.feed(f"  {polarity} 1 {row['name']}{suffix}")
+                self.assertEqual(event, CaseResult(
+                    7, status, "reason # detail" if status == "Skip" else "actual failure"))
+        invalid = (
+            ("ok", row["name"] + "extra"),
+            ("ok", row["name"] + " extra # SKIP reason"),
+            ("ok", row["name"] + " # SKIPPER reason"),
+            ("ok", row["name"] + " # ERROR"),
+            ("not ok", row["name"] + " # SKIP reason"),
+            ("ok", row["name"].replace("comment", "different") + " # SKIP reason"),
+            ("ok", row["name"][:-1] + " # SKIP reason"),
+        )
+        for polarity, name in invalid:
+            with self.subTest(polarity=polarity, name=name):
+                parser = parser_for([row])
+                for line in case_lines(row)[:-1]:
+                    parser.feed(line)
+                with self.assertRaises(HostError):
+                    parser.feed(f"  {polarity} 1 {name}")
+                self.assertEqual(parser.results, {})
+                self.assertEqual(parser.active, 7)
 
     def test_fatal_message_only_matches_armed_actual_diagnostics(self):
         """arm 前的文本和 raw 声明不能冒充实际 panic 诊断。"""
@@ -230,7 +311,6 @@ class ProtocolTests(unittest.TestCase):
                                        (case_lines(rows[0])[:3], 0, "body"),
                                        (case_lines(rows[0])[:4], 1, "cleanup"),
                                        (case_lines(rows[0])[:4], 0, "join"),
-                                       (case_lines(rows[0])[:-1], 0, "cleanup"),
                                        (case_lines(rows[0]), 0, "cleanup")):
             parser = parser_for(rows)
             for line in prefix:

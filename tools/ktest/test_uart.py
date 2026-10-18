@@ -8,9 +8,8 @@ import tempfile
 import threading
 import time
 import unittest
-from types import SimpleNamespace
 
-from host_helpers import case_record, options, vm_fixture
+from host_helpers import case_record, options, session_fixture
 from ktest.catalog import HostError
 from ktest.execution_uart import ExecutionUART
 from ktest.resources import crc32c_update
@@ -34,14 +33,13 @@ class UARTTests(unittest.TestCase):
                 host, guest = socket.socketpair()
                 guest.settimeout(2)
                 try:
-                    vm = vm_fixture()
-                    vm.args = options(uart_payload=source)
-                    vm.directory = base
-                    vm.serial = host
+                    vm = session_fixture()
+                    vm.uart.args = options(uart_payload=source)
+                    vm.uart.directory = base
+                    vm.uart.serial = host
                     host.setblocking(False)
-                    vm.raw = io.BytesIO()
-                    vm.buffer = bytearray()
-                    vm.process = SimpleNamespace(poll=lambda: 0, returncode=0)
+                    vm.uart.raw = io.BytesIO()
+                    vm.uart.buffer = bytearray()
                     with guest.makefile("rb") as received:
                         for index, byte in enumerate((b"L", b"R")):
                             declaration = dict(direction="rx", length=1,
@@ -49,14 +47,14 @@ class UARTTests(unittest.TestCase):
                                                delay_ms=0, case=index)
                             if index == 1 and second_error:
                                 with self.assertRaises(HostError):
-                                    vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                                    vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                                 self.assertEqual(received.readline(), b"KTEST IO ERROR 1\n")
-                                self.assertEqual(vm.rx_offset, 1)
+                                self.assertEqual(vm.uart.rx_offset, 1)
                             else:
-                                vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                                vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                                 self.assertEqual(received.read(2), b"H" + byte)
                                 self.assertEqual(received.readline(), f"KTEST IO OK {index}\n".encode("ascii"))
-                                self.assertEqual(vm.rx_offset, index + 1)
+                                self.assertEqual(vm.uart.rx_offset, index + 1)
                     if unused:
                         with self.assertRaisesRegex(HostError, "unconsumed"):
                             vm.verify_resources(time.monotonic() + 2)
@@ -108,9 +106,9 @@ class UARTTests(unittest.TestCase):
 
                 worker = threading.Thread(target=peer)
                 try:
-                    vm = vm_fixture()
+                    vm = session_fixture()
                     if mode == "coalesced":
-                        original_send = vm.send
+                        original_send = vm.uart.send
                         handshake_count = 0
 
                         def observed_send(data, deadline):
@@ -122,25 +120,24 @@ class UARTTests(unittest.TestCase):
                                 if handshake_count == 2:
                                     next_handshake.set()
 
-                        vm.send = observed_send
-                    vm.args = options(uart_payload=source, uart_expect=expected)
-                    vm.directory = base
-                    vm.serial = host
+                        vm.uart.send = observed_send
+                    vm.uart.args = options(uart_payload=source, uart_expect=expected)
+                    vm.uart.directory = base
+                    vm.uart.serial = host
                     host.setblocking(False)
-                    vm.raw = io.BytesIO()
-                    vm.buffer = bytearray()
-                    vm.process = SimpleNamespace(poll=lambda: None)
+                    vm.uart.raw = io.BytesIO()
+                    vm.uart.buffer = bytearray()
                     worker.start()
                     for index, (rx, tx) in enumerate(phases):
                         checksum = lambda data: f"{crc32c_update(0xFFFFFFFF, data) ^ 0xFFFFFFFF:08x}"
                         declaration = dict(direction="duplex", rx_length=len(rx), rx_digest=checksum(rx),
                                            rx_delay_ms=2, tx_length=len(tx), tx_digest=checksum(tx),
                                            tx_delay_ms=1, case=index)
-                        vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                        vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                     worker.join(timeout=2)
                     self.assertFalse(worker.is_alive())
                     self.assertEqual(peer_errors, [])
-                    self.assertEqual((vm.rx_offset, vm.tx_offset), (len(payload), len(transmitted)))
+                    self.assertEqual((vm.uart.rx_offset, vm.uart.tx_offset), (len(payload), len(transmitted)))
                     vm.verify_resources(time.monotonic() + 2)
                     self.assertEqual(source.read_bytes(), payload)
                     self.assertEqual(expected.read_bytes(), transmitted)
@@ -162,26 +159,25 @@ class UARTTests(unittest.TestCase):
             host, guest = socket.socketpair()
             guest.settimeout(2)
             try:
-                vm = vm_fixture()
-                vm.args = options(uart_expect=expected)
-                vm.directory = base
-                vm.serial = host
+                vm = session_fixture()
+                vm.uart.args = options(uart_expect=expected)
+                vm.uart.directory = base
+                vm.uart.serial = host
                 host.setblocking(False)
-                vm.raw = io.BytesIO(transmitted + tail)
-                vm.raw.seek(0, io.SEEK_END)
-                vm.buffer = bytearray(transmitted + tail)
-                vm.process = SimpleNamespace(poll=lambda: None)
+                vm.uart.raw = io.BytesIO(transmitted + tail)
+                vm.uart.raw.seek(0, io.SEEK_END)
+                vm.uart.buffer = bytearray(transmitted + tail)
                 declaration = dict(direction="duplex", rx_length=0, rx_digest="00000000",
                                    rx_delay_ms=0, tx_length=len(transmitted),
                                    tx_digest=f"{crc32c_update(0xFFFFFFFF, transmitted) ^ 0xFFFFFFFF:08x}",
                                    tx_delay_ms=1, case=9)
-                vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                 with guest.makefile("rb") as acknowledgements:
                     self.assertEqual(acknowledgements.readline(), b"HKTEST IO OK 9\n")
-                self.assertEqual(vm.line(time.monotonic() + 2), "next-control")
+                self.assertEqual(vm.uart.line(time.monotonic() + 2), "next-control")
                 self.assertEqual(next(base.glob("uart-*.raw")).read_bytes(), transmitted)
-                self.assertEqual(vm.tx_offset, len(transmitted))
-                self.assertEqual(vm.raw.getvalue(), transmitted + tail)
+                self.assertEqual(vm.uart.tx_offset, len(transmitted))
+                self.assertEqual(vm.uart.raw.getvalue(), transmitted + tail)
             finally:
                 host.close()
                 guest.close()
@@ -196,23 +192,22 @@ class UARTTests(unittest.TestCase):
             host, guest = socket.socketpair()
             guest.settimeout(2)
             try:
-                vm = vm_fixture()
-                vm.args = options(uart_expect=expected)
-                vm.directory = base
-                vm.serial = host
-                vm.serial.setblocking(False)
-                vm.raw = io.BytesIO()
-                vm.buffer = bytearray()
-                vm.process = SimpleNamespace(poll=lambda: None)
+                vm = session_fixture()
+                vm.uart.args = options(uart_expect=expected)
+                vm.uart.directory = base
+                vm.uart.serial = host
+                vm.uart.serial.setblocking(False)
+                vm.uart.raw = io.BytesIO()
+                vm.uart.buffer = bytearray()
                 guest.sendall(payload)
                 declaration = dict(direction="tx", length=len(payload),
                                    digest=f"{crc32c_update(0xFFFFFFFF, payload) ^ 0xFFFFFFFF:08x}", delay_ms=0, case=0)
-                vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                 with guest.makefile("rb") as acknowledgement:
                     self.assertEqual(acknowledgement.readline(), b"HKTEST IO OK 0\n")
-                self.assertEqual(vm.raw.getvalue(), payload)
+                self.assertEqual(vm.uart.raw.getvalue(), payload)
                 self.assertEqual(next(base.glob("uart-*.raw")).read_bytes(), payload)
-                self.assertFalse(vm.buffer)
+                self.assertFalse(vm.uart.buffer)
             finally:
                 host.close()
                 guest.close()
@@ -226,18 +221,17 @@ class UARTTests(unittest.TestCase):
             host, guest = socket.socketpair()
             guest.settimeout(2)
             try:
-                vm = vm_fixture()
-                vm.args = options(uart_expect=expected)
-                vm.directory = base
-                vm.serial = host
+                vm = session_fixture()
+                vm.uart.args = options(uart_expect=expected)
+                vm.uart.directory = base
+                vm.uart.serial = host
                 host.setblocking(False)
-                vm.raw = io.BytesIO()
-                vm.buffer = bytearray(b"EVIL")
-                vm.process = SimpleNamespace(poll=lambda: None)
+                vm.uart.raw = io.BytesIO()
+                vm.uart.buffer = bytearray(b"EVIL")
                 declaration = dict(direction="tx", length=4,
                                    digest=f"{crc32c_update(0xFFFFFFFF, b'EVIL') ^ 0xFFFFFFFF:08x}", delay_ms=0, case=7)
                 with self.assertRaises(HostError):
-                    vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                    vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                 with guest.makefile("rb") as acknowledgement:
                     self.assertEqual(acknowledgement.readline(), b"HKTEST IO ERROR 7\n")
             finally:
@@ -255,15 +249,14 @@ class UARTTests(unittest.TestCase):
                 host, guest = socket.socketpair()
                 guest.settimeout(2)
                 try:
-                    vm = vm_fixture()
-                    vm.args = options(execution_uart=True)
-                    vm.serial = host
+                    vm = session_fixture()
+                    vm.uart.args = options(execution_uart=True)
+                    vm.uart.serial = host
                     host.setblocking(False)
-                    vm.process = SimpleNamespace(poll=lambda: None)
-                    vm.execution_uart = fixture
+                    vm.uart.execution_uart = fixture
                     declaration = dict(direction="pause", length=0, digest="00000000", delay_ms=3000, case=declared)
                     with self.assertRaises(HostError):
-                        vm.raw_io(declaration, time.monotonic() + 2, {"uart"})
+                        vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                     with guest.makefile("rb") as acknowledgement:
                         self.assertEqual(acknowledgement.readline(), f"KTEST IO ERROR {declared}\n".encode("ascii"))
                 finally:
@@ -290,21 +283,20 @@ class UARTTests(unittest.TestCase):
             host, guest = socket.socketpair()
             guest.settimeout(5)
             try:
-                vm = vm_fixture()
-                vm.args = options(execution_uart=True)
-                vm.directory = base
-                vm.serial = host
+                vm = session_fixture()
+                vm.uart.args = options(execution_uart=True)
+                vm.uart.directory = base
+                vm.uart.serial = host
                 host.setblocking(False)
-                vm.raw = io.BytesIO()
-                vm.buffer = bytearray()
-                vm.process = SimpleNamespace(poll=lambda: None)
-                vm.execution_uart = fixture
+                vm.uart.raw = io.BytesIO()
+                vm.uart.buffer = bytearray()
+                vm.uart.execution_uart = fixture
                 guest.sendall(prefix + b"".join(lines) + tail)
                 declaration = dict(direction="pause", length=0, digest="00000000", delay_ms=3000, case=0)
-                vm.raw_io(declaration, time.monotonic() + 8, {"uart"})
+                vm.uart.raw_io(declaration, time.monotonic() + 8, {"uart"})
                 with guest.makefile("rb") as acknowledgement:
                     self.assertEqual(acknowledgement.readline(), b"HKTEST IO OK 0\n")
-                self.assertEqual(vm.line(time.monotonic() + 2), tail[:-1].decode("ascii"))
+                self.assertEqual(vm.uart.line(time.monotonic() + 2), tail[:-1].decode("ascii"))
                 for raw in metadata:
                     fixture.observe(raw)
                 fixture.observe(b"  # diagnostic: execution-backpressure fill-bytes=17\n")

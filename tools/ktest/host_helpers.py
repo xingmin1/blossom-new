@@ -1,6 +1,7 @@
-"""宿主回归共用的目录、协议输入和最小 VM 控制状态。"""
+"""宿主回归共用的目录、协议输入和最小会话／UART 状态。"""
 
 import importlib.util
+import io
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -8,10 +9,12 @@ from types import SimpleNamespace
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 from ktest.catalog import Catalog, Invocation, case_seed
-from ktest.protocol import KTAP
-from ktest.runner import VM
+from ktest.execution_uart import ExecutionUART
+from ktest.protocol import KtapParser
+from ktest.qemu_session import QemuTestSession
+from ktest.uart_channel import UartChannel
 
-SPEC = importlib.util.spec_from_file_location("ktest_cli", TOOLS / "ktest.py")
+SPEC = importlib.util.spec_from_file_location("ktest_cli", TOOLS / "run_kernel_tests.py")
 CLI = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CLI)
 CONFIG = dict(arch="riscv64", cpus=2, mode="debug", panic="unwind")
@@ -60,22 +63,32 @@ def options(**overrides):
     return args
 
 
-def vm_fixture():
-    """为真实 socket 行为检查准备 VM 的控制状态，不创建模拟 guest。"""
-    vm = VM.__new__(VM)
-    vm.rx_offset = 0
-    vm.rx_used = False
-    vm.tx_offset = 0
-    vm.tx_used = False
-    vm.debugger = None
-    vm.gdb_command = None
-    return vm
+def session_fixture():
+    """为真实 socket 与子进程回归准备组合状态，不启动或模拟 guest。"""
+    session = QemuTestSession.__new__(QemuTestSession)
+    session.debugger = None
+    session.gdb_command = None
+    session.net_user = None
+    uart = UartChannel.__new__(UartChannel)
+    uart.args = options()
+    uart.directory = None
+    uart.check = session.check
+    uart.serial = None
+    uart.raw = io.BytesIO()
+    uart.buffer = bytearray()
+    uart.rx_offset = 0
+    uart.rx_used = False
+    uart.tx_offset = 0
+    uart.tx_used = False
+    uart.execution_uart = ExecutionUART(2, None)
+    session.uart = uart
+    return session
 
 
 def parser_for(cases):
     """初始化一组实际期待项的 KTAP 状态。"""
     items = [Invocation(row, 0, case_seed(17, 0, row["name"]), i) for i, row in enumerate(cases)]
-    parser = KTAP(suite_record(cases[0]["suite"]), items)
+    parser = KtapParser(suite_record(cases[0]["suite"]), items)
     for line in ("KTAP version 1", "1..1", f"  # Subtest: os::tests{cases[0]['suite']}",
                  f"  1..{len(cases)}", "  # KTEST suite-begin setup"):
         parser.feed(line)
@@ -86,7 +99,8 @@ def case_lines(case, position=1, status="Pass"):
     """输出经历完整清理后的最终记录。"""
     cid = case["case"]
     result = "ok" if status in ("Pass", "Skip") else "not ok"
-    name = case["name"] + (" # SKIP insufficient CPUs" if status == "Skip" else "")
+    directive = " # SKIP insufficient CPUs" if status == "Skip" else (" # ERROR" if status == "Error" else "")
+    name = case["name"] + directive
     return [f"  # KTEST case-begin {cid}", f"  # KTEST phase {cid} setup",
             f"  # KTEST phase {cid} body", f"  # KTEST phase {cid} cleanup",
-            f"  # KTEST status {cid} {status}", f"  {result} {position} {name}"]
+            f"  {result} {position} {name}"]

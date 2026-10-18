@@ -152,22 +152,10 @@ pub(crate) fn failures(outcome: &CaseOutcome) {
         diagnostic(format_args!("expectations: {}", outcome.expectations));
     }
 }
-/// 全部异步离栈及 fixture 清理之后才发布最终结果。
-pub(crate) fn result(
-    id: u32,
-    ordinal: usize,
-    case: &CaseDesc,
-    outcome: &CaseOutcome,
-    skip: Option<&str>,
-) {
+/// 发布唯一 KTAP 终态；调用方先完成适用的停止、join 和 fixture 清理。
+/// 静态 Skip 或准备失败可在 setup 结束，独立失败正文不进入结果单行。
+pub(crate) fn result(ordinal: usize, case: &CaseDesc, outcome: &CaseOutcome, skip: Option<&str>) {
     failures(outcome);
-    let status = match outcome.status {
-        Status::Pass => "Pass",
-        Status::Fail => "Fail",
-        Status::Skip => "Skip",
-        Status::Error => "Error",
-    };
-    write(format_args!("  # KTEST status {} {}\n", id, status));
     let ok = matches!(outcome.status, Status::Pass | Status::Skip);
     let _output = OUTPUT.lock();
     super::control_write(format_args!(
@@ -176,8 +164,15 @@ pub(crate) fn result(
         ordinal,
         case.name
     ));
-    if let Some(reason) = skip {
-        super::control_write(format_args!(" # SKIP {}", reason));
+    match outcome.status {
+        Status::Skip => {
+            super::control_write(format_args!(" # SKIP"));
+            if let Some(reason) = skip {
+                super::control_write(format_args!(" {}", reason));
+            }
+        }
+        Status::Error => super::control_write(format_args!(" # ERROR")),
+        _ => {}
     }
     super::control_write(format_args!("\n"));
 }

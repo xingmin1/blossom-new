@@ -282,7 +282,7 @@ impl Runner {
                 expectations: 0,
             };
             self.peer_boundary(id, b"KTEST PEER END ", || {
-                report::result(id, self.position + 1, case, &outcome, Some(reason));
+                report::result(self.position + 1, case, &outcome, Some(reason));
             });
             self.position += 1;
             self.begun = false;
@@ -319,7 +319,7 @@ impl CaseRunner for Runner {
                             expectations: 0,
                         };
                         self.peer_boundary(id, b"KTEST PEER END ", || {
-                            report::result(id, self.position + 1, case, &outcome, None);
+                            report::result(self.position + 1, case, &outcome, None);
                         });
                         self.position += 1;
                         self.begun = false;

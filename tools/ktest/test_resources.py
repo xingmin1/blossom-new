@@ -14,7 +14,7 @@ from unittest.mock import patch
 from host_helpers import TOOLS, options
 from ktest.catalog import HostError
 from ktest.resources import aliases, prepare_disks, validate_resources
-from ktest.runner import VM
+from ktest.qemu_session import QemuTestSession
 
 
 class RootModeInputTests(unittest.TestCase):
@@ -31,9 +31,9 @@ class RootModeInputTests(unittest.TestCase):
             disk = work / "root.raw"
             disk.write_bytes(b"preserved working disk")
             commands = [
-                [sys.executable, str(TOOLS / "ktest.py"), "list", "--arch", "riscv64",
+                [sys.executable, str(TOOLS / "run_kernel_tests.py"), "list", "--arch", "riscv64",
                  "--report-dir", str(base / "report")],
-                [sys.executable, str(TOOLS / "ktest.py"), "run", "--arch", "riscv64",
+                [sys.executable, str(TOOLS / "run_kernel_tests.py"), "run", "--arch", "riscv64",
                  "--report-dir", str(base / "report")],
             ]
             for mode in ("", "RO", "rwx", "ro rw", "ro=foo", "rw=foo", "%"):
@@ -123,7 +123,7 @@ class ResourceTests(unittest.TestCase):
                     directory.mkdir()
                     (directory / "uart-segment.raw").write_bytes(b"raw UART evidence")
                     (directory / "root.raw").write_bytes(b"unowned report evidence")
-                    vm = VM(args, Path("kernel.elf"), directory, {"root", "extra", "scratch"})
+                    vm = QemuTestSession(args, Path("kernel.elf"), directory, {"root", "extra", "scratch"})
                     vms.append(vm)
                     deadline = time.monotonic() + 5
                     while not (directory / "ready").exists() and time.monotonic() < deadline:
@@ -135,7 +135,7 @@ class ResourceTests(unittest.TestCase):
                     working_disks.append(paths)
                     for path in paths:
                         self.assertTrue(path.is_file())
-                    vm.raw.write(b"UART original log\n")
+                    vm.uart.raw.write(b"UART original log\n")
                 self.assertTrue(set(working_disks[0]).isdisjoint(working_disks[1]))
                 working_disks[0][0].write_bytes(b"guest mutation")
                 for index, vm in enumerate(vms):
@@ -171,7 +171,7 @@ class ResourceTests(unittest.TestCase):
             (directory / "uart-segment.raw").write_bytes(b"keep")
             with patch("ktest.resources.shutil.copyfileobj", side_effect=fail_copy):
                 with self.assertRaises(OSError) as caught:
-                    VM(args, Path("kernel.elf"), directory, {"root"})
+                    QemuTestSession(args, Path("kernel.elf"), directory, {"root"})
             self.assertIs(caught.exception, no_space)
             self.assertFalse(partial[0].parent.exists())
             self.assertTrue((directory / "uart.log").is_file())
@@ -181,7 +181,7 @@ class ResourceTests(unittest.TestCase):
             directory.mkdir()
             args.qemu = str(base / "missing-executable")
             with self.assertRaises(FileNotFoundError):
-                VM(args, Path("kernel.elf"), directory, {"root"})
+                QemuTestSession(args, Path("kernel.elf"), directory, {"root"})
             command = json.loads((directory / "command.json").read_text())
             working = Path(next(a.split("file=", 1)[1] for a in command if a.startswith("if=none,")))
             self.assertFalse(working.parent.exists())

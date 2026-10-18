@@ -123,30 +123,30 @@ class ExecutionUART:
                     "duplicate or misplaced UART fill evidence")
             self.fill_bytes = int(fill[1])
 
-    def capture(self, vm, declaration, deadline):
-        """H 后保原首次拒写和停点；以固定65条业务记录结束，不搜索文本 sentinel。"""
+    def capture(self, channel, declaration, deadline):
+        """H 后保原首次拒写和停点；直接消费通道字节，以固定65条业务记录结束。"""
         require(self.kind == "backpressure" and not self.captured and self.body,
                 "opaque UART capture outside backpressure fixture")
         require(declaration["direction"] == "pause" and declaration["length"] == 0
-                and declaration["digest"] == "00000000" and declaration["delay_ms"] >= 3000,
+                and declaration["digest"] == "00000000" and 3000 <= declaration["delay_ms"],
                 "invalid backpressure hold barrier")
         require(declaration["case"] == self.case, "backpressure case mismatch")
         acknowledgement = f"KTEST IO OK {self.case}\n".encode("ascii")
         require(len(acknowledgement) <= 16, "backpressure ACK exceeds FIFO bound")
-        vm.send(b"H", deadline)
-        vm.delay(declaration["delay_ms"] / 1000, deadline)
+        channel.send(b"H", deadline)
+        channel.delay(declaration["delay_ms"] / 1000, deadline)
         with (self.directory / f"execution-uart-{self.case}.raw").open("xb") as output:
             while len(self.lines) < 65:
-                vm.check(deadline)
-                newline = vm.buffer.find(b"\n")
+                channel.check(deadline)
+                newline = channel.buffer.find(b"\n")
                 if newline < 0:
-                    require(len(vm.buffer) <= 769, "opaque execution record exceeds native bound")
-                    vm.delay(0.005, deadline)
-                    vm.buffer.extend(vm.receive(deadline, 64))
+                    require(len(channel.buffer) <= 769, "opaque execution record exceeds native bound")
+                    channel.delay(0.005, deadline)
+                    channel.buffer.extend(channel.receive(deadline, 64))
                     continue
                 require(newline < 769, "opaque execution record exceeds native bound")
-                raw = bytes(vm.buffer[:newline + 1])
-                del vm.buffer[:newline + 1]
+                raw = bytes(channel.buffer[:newline + 1])
+                del channel.buffer[:newline + 1]
                 output.write(raw)
                 if not self.lines and raw == b"\n":
                     self.blank_bytes += 1
@@ -154,7 +154,7 @@ class ExecutionUART:
                 else:
                     self.lines.append(raw)
         self.captured = True
-        vm.send(acknowledgement, deadline)
+        channel.send(acknowledgement, deadline)
 
     def finish(self, status):
         """客体 Pass 还须完整外部正文、所有生产者及原填充字节一致。"""

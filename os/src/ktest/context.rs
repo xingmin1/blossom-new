@@ -501,7 +501,7 @@ impl<'a> RuntimeServices<'a> {
             _ => fatal("case final before lifecycle completed"),
         }
         self.finished.set(true);
-        report::result(self.id, ordinal, self.case, outcome, None);
+        report::result(ordinal, self.case, outcome, None);
     }
 }
 impl Services for RuntimeServices<'_> {

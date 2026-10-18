@@ -1,12 +1,13 @@
 """按完整身份和生命周期检查 KTAP，不把任意业务日志当作成功。"""
 
+from dataclasses import dataclass
 import json
 import re
 from .catalog import HostError, require
 
 READY = re.compile(r"KTEST READY 1 arch=(riscv64|loongarch64) cpus=(\d+) mode=(debug|release) panic=(unwind|abort)")
 RESULT = re.compile(r"(  )?(not ok|ok) (\d+) (.+)")
-CONTROL = re.compile(r"  # KTEST (case-begin|phase|status|armed|fatal|io|case-abort) (\d+)(?: (.*))?")
+CONTROL = re.compile(r"  # KTEST (case-begin|phase|armed|fatal|io|case-abort) (\d+)(?: (.*))?")
 SUITE_CONTROL = re.compile(r"  # KTEST (suite-begin|suite-error) (setup|execution|cleanup)(?: ([^\x00-\x1f\x7f]+))?")
 PHASES = ("setup", "body", "quiesce", "join", "cleanup")
 FATAL_KINDS = ("illegal", "refill", "irq-schedule", "preempt-schedule", "oom",
@@ -22,7 +23,16 @@ def ready(line, config):
             "READY configuration mismatch")
 
 
-class KTAP:
+@dataclass(frozen=True)
+class CaseResult:
+    """完整 KTAP 行确认的本例身份和 Guest 结果。"""
+
+    case_id: int
+    status: str
+    reason: str
+
+
+class KtapParser:
     """一次 VM 仅一个 suite，结果发布晚于本例清理。"""
 
     def __init__(self, suite, items):
@@ -33,7 +43,6 @@ class KTAP:
         self.started = set()
         self.active = None
         self.phase = None
-        self.status = None
         self.armed = None
         self.fatal = None
         self.fatal_message_seen = False
@@ -45,11 +54,12 @@ class KTAP:
         self.suite_started = False
         self.suite_error = None
         self.case_abort = None
+        self.aborted_case_id = None
         self.outer_result = False
         self.complete = False
 
     def feed(self, line):
-        """只接受固定缩进的控制记录；返回阶段或 raw UART 声明。"""
+        """返回生命周期、raw 声明或完整结果；普通日志不改变状态。"""
         if line == "KTAP version 1":
             require(not self.version and not self.outer_plan, "duplicate KTAP version")
             self.version = True
@@ -109,13 +119,11 @@ class KTAP:
                 self.started.add(cid)
                 self.active = cid
                 self.phase = None
-                self.status = None
                 self.armed = None
                 self.fatal = None
                 self.fatal_message_seen = False
                 return "begin"
             require(self.active == cid, "control identity mismatch")
-            require(self.status is None, "control after final status")
             if kind == "case-abort":
                 phase, separator, payload = (value or "").partition(" ")
                 require(separator and phase in ("quiesce", "join", "cleanup")
@@ -133,9 +141,10 @@ class KTAP:
                 ledger = dict(pairs)
                 require(all(ledger[key] is None or isinstance(ledger[key], str)
                             for key in ("primary", "child", "cleanup"))
-                        and type(ledger["expectations"]) is int and ledger["expectations"] >= 0
+                        and type(ledger["expectations"]) is int and 0 <= ledger["expectations"]
                         and isinstance(ledger["reason"], str), "invalid case-abort field types")
                 self.case_abort = dict(phase=phase, **ledger)
+                self.aborted_case_id = cid
                 return "case-abort"
             if kind == "phase":
                 require(value in PHASES, "unknown case phase")
@@ -146,15 +155,6 @@ class KTAP:
                 if value != "body":
                     self.armed = None
                 return value
-            if kind == "status":
-                require(value in ("Pass", "Fail", "Skip", "Error"), "unknown final status")
-                require(self.phase == "cleanup" or (self.phase == "setup" and value != "Pass"),
-                        "final status before cleanup")
-                case = self.items[len(self.results)].case
-                require(value != "Pass" or case["expected_fatal"] is None,
-                        "expected fatal requires actual fault and VM termination")
-                self.status = value
-                return "status"
             if kind == "armed":
                 case = self.items[len(self.results)].case
                 require(self.phase == "body" and self.armed is None
@@ -204,26 +204,35 @@ class KTAP:
             indent, polarity, number, name = result.groups()
             number = int(number)
             if indent:
-                require(self.case_abort is None, "ordinary result after case-abort")
+                require(self.case_abort is None and self.fatal is None,
+                        "ordinary result after non-returning termination")
                 position = len(self.results)
-                require(self.active is not None and self.status is not None
-                        and number == position + 1 and position < len(self.items),
-                        "missing, duplicate or out-of-order result")
-                expected = self.items[position].case["name"]
-                if self.status == "Skip":
-                    require(name.startswith(expected + " # SKIP ") and polarity == "ok",
-                            "skip identity/directive mismatch")
-                    reason = name[len(expected + " # SKIP "):]
+                require(self.active is not None and number == position + 1
+                        and position < len(self.items), "missing, duplicate or out-of-order result")
+                case = self.items[position].case
+                expected = case["name"]
+                require(self.active == case["case"]
+                        and (name == expected or name.startswith(expected + " # ")),
+                        "case result identity mismatch")
+                directive = name[len(expected):]
+                reason = ""
+                if directive:
+                    instruction, _, reason = directive[3:].partition(" ")
+                    require(instruction in ("SKIP", "ERROR"), "unknown case result directive")
+                    require(polarity == ("ok" if instruction == "SKIP" else "not ok"),
+                            "case result directive contradicts polarity")
+                    status = "Skip" if instruction == "SKIP" else "Error"
                 else:
-                    require(name == expected, "case result identity mismatch")
-                    require(polarity == ("ok" if self.status == "Pass" else "not ok"),
-                            "case result contradicts final status")
-                    reason = ""
-                self.results[self.active] = dict(status=self.status, reason=reason)
+                    status = "Pass" if polarity == "ok" else "Fail"
+                require(self.phase == "cleanup" or (self.phase == "setup" and status != "Pass"),
+                        "case result before cleanup")
+                require(status != "Pass" or case["expected_fatal"] is None,
+                        "expected fatal requires actual fault and VM termination")
+                event = CaseResult(self.active, status, reason)
+                self.results[event.case_id] = dict(status=status, reason=reason)
                 self.active = None
                 self.phase = None
-                self.status = None
-                return "result"
+                return event
             require(self.inner_plan and self.suite_started
                     and (self.active is None or self.case_abort is not None)
                     and (len(self.results) == len(self.items) or self.suite_error is not None
@@ -237,7 +246,7 @@ class KTAP:
             return "outer"
         if line.lstrip().startswith(("ok ", "not ok ", "KTAP version", "KTEST READY", "1..", "# KTEST", "# Subtest:")):
             raise HostError(f"malformed or unexpected KTAP record: {line[:160]}")
-        # 业务诊断不决定结果；raw 字节由 runner 独占处理，永远不进入此函数。
+        # 业务诊断不决定结果；raw 字节由 UART channel 独占消费。
         if self.active is not None and self.fatal is not None:
             message = self.items[len(self.results)].case["fatal_message"]
             if message is not None and message in line:

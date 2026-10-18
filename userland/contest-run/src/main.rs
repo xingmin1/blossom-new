@@ -2,10 +2,12 @@
 
 use contest_run::config;
 use contest_run::custom;
-use contest_run::execute::{execute_case, run_command, CaseRecord, ExitOutcome};
+use contest_run::execute::{execute_case, CaseRecord};
 use contest_run::model::{
     CommandSpec, Config, Defaults, Finish, Protocol, ResolvedCase, RootSpec, SourceLocation,
 };
+use contest_run::outcome::ExitOutcome;
+use contest_run::process::run_command;
 use contest_run::runtime::{diagnose, Mounts, CONTEST_ROOT};
 use contest_run::selection;
 use std::collections::BTreeMap;
@@ -161,7 +163,7 @@ fn print_record(case: &ResolvedCase, record: &CaseRecord) {
             "CONTEST result id={:?} iteration={} outcome={} status={:?} elapsed_ms={}",
             case.id,
             record.iteration,
-            run.verdict.as_str(),
+            run.protocol.verdict.as_str(),
             run.outcome,
             run.elapsed.as_millis()
         );

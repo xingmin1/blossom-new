@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "contest-run"
 path = "src/main.rs"
 
+[[bin]]
+name = "user-selftests"
+path = "src/bin/user-selftests.rs"
+
 [dependencies]
 serde = { version = "=1.0.217", features = ["derive"] }
 toml = "=0.8.19"

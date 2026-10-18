@@ -1,6 +1,6 @@
-use contest_run::execute::ExitOutcome;
 use contest_run::model::Protocol;
-use contest_run::report::{ProtocolObserver, StreamKind, Verdict};
+use contest_run::outcome::{ExitOutcome, Verdict};
+use contest_run::report::{ProtocolObserver, StreamKind};
 
 /// 构造正常 wait 状态，保留其原始编码供消费者检查。
 fn exited(code: i32) -> ExitOutcome {
@@ -15,7 +15,7 @@ fn observe(protocol: &Protocol, stdout: &[u8], stderr: &[u8], outcome: &ExitOutc
     let mut observer = ProtocolObserver::new(protocol);
     observer.feed(StreamKind::Stdout, stdout);
     observer.feed(StreamKind::Stderr, stderr);
-    observer.finish(outcome)
+    observer.finish(outcome).verdict
 }
 
 /// 构造固定 libc 选择，variant 与 selector 都参与原标记匹配。
@@ -334,14 +334,14 @@ fn arbitrary_chunk_boundaries_preserve_markers() {
                 let mut observer = ProtocolObserver::new(&protocol);
                 observer.feed(stream, &text.as_bytes()[..split]);
                 observer.feed(stream, &text.as_bytes()[split..]);
-                assert_eq!(observer.finish(&outcome), expected, "split {split}");
+                assert_eq!(observer.finish(&outcome).verdict, expected, "split {split}");
             }
             for size in 1..=text.len() {
                 let mut observer = ProtocolObserver::new(&protocol);
                 for chunk in text.as_bytes().chunks(size) {
                     observer.feed(stream, chunk);
                 }
-                assert_eq!(observer.finish(&outcome), expected, "chunk {size}");
+                assert_eq!(observer.finish(&outcome).verdict, expected, "chunk {size}");
             }
         }
     }
@@ -356,7 +356,7 @@ fn streams_never_synthesize_lines_or_success() {
     let mut observer = ProtocolObserver::new(&protocol);
     observer.feed(StreamKind::Stdout, &text.as_bytes()[..split]);
     observer.feed(StreamKind::Stderr, &text.as_bytes()[split..]);
-    assert_eq!(observer.finish(&exited(1)), Verdict::NotRun);
+    assert_eq!(observer.finish(&exited(1)).verdict, Verdict::NotRun);
     let framed = b"========== START entry-dynamic.exe argv ==========\n========== END entry-dynamic.exe argv ==========\n";
     assert_eq!(
         observe(&protocol, framed, b"Pass!\n", &exited(1)),
@@ -427,7 +427,7 @@ fn long_output_does_not_hide_failure_or_invent_marker() {
         StreamKind::Stdout,
         libc_output("dynamic", "argv").as_bytes(),
     );
-    assert_eq!(observer.finish(&exited(1)), Verdict::Pass);
+    assert_eq!(observer.finish(&exited(1)).verdict, Verdict::Pass);
     let mut observer = ProtocolObserver::new(&protocol);
     observer.feed(
         StreamKind::Stdout,
@@ -437,7 +437,7 @@ fn long_output_does_not_hide_failure_or_invent_marker() {
     for _ in 0..4096 {
         observer.feed(StreamKind::Stderr, b"long diagnostic ");
     }
-    assert_eq!(observer.finish(&exited(1)), Verdict::Failed);
+    assert_eq!(observer.finish(&exited(1)).verdict, Verdict::Failed);
     let mut observer = ProtocolObserver::new(&protocol);
     observer.feed(
         StreamKind::Stdout,
@@ -450,7 +450,7 @@ fn long_output_does_not_hide_failure_or_invent_marker() {
         StreamKind::Stdout,
         b"\nPass!\n========== END entry-dynamic.exe argv ==========\n",
     );
-    assert_eq!(observer.finish(&exited(1)), Verdict::NotRun);
+    assert_eq!(observer.finish(&exited(1)).verdict, Verdict::NotRun);
 }
 
 #[test]

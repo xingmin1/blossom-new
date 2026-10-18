@@ -41,6 +41,14 @@ USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex
 RUNNER_TARGET := $(if $(filter riscv64,$(ARCH)),riscv64gc-unknown-linux-musl,loongarch64-unknown-linux-musl)
 RUNNER_TARGET_DIR ?= build/contest-run
 RUNNER_OUTPUT := $(RUNNER_TARGET_DIR)/$(RUNNER_TARGET)/release/contest-run
+USER_SELFTEST_RUNNER_OUTPUT := $(RUNNER_TARGET_DIR)/$(RUNNER_TARGET)/release/user-selftests
+USER_SELFTEST_KERNEL_ELF ?= build/kernel/$(ARCH)/qemu-virt/release/kernel.elf
+USER_SELFTEST_ROOTFS_DIR ?= build/user-selftest-rootfs/$(ARCH)
+USER_SELFTEST_EXT4_IMAGE ?= build/user-selftests-$(ARCH).img
+USER_SELFTEST_WORKING_DISK_DIR ?= build/user-selftest-work/$(ARCH)
+USER_SELFTEST_ARGS ?=
+LINUX_USER_SELFTEST_OUTPUT_DIR ?= build/user-selftests-linux
+LINUX_USER_SELFTEST_CFLAGS ?= -std=c11 -O2 -Wall -Wextra
 RUNNER_SYSROOT ?=
 RUNNER_LINKER ?= $(MUSL_CROSS)gcc
 RUNNER_SYSROOT_RV ?= $(RUNNER_SYSROOT)
@@ -53,15 +61,25 @@ BOARD_OS_DTB ?=
 BOARD_ROOT_DEVICE ?=
 BOARD_ROOT_MODE ?= ro
 BOARD_INIT_PROGRAM ?= /sbin/init
-LIBC_SOURCES := tests/user/libc-smoke.c $(addprefix tests/user/libc/,common.c lifecycle.c script.c file.c system.c limits.c file_time.c clock.c socket_timeout.c)
-LIBC_HEADERS := tests/user/libc/common.h tests/user/libc/fp.h
-NETWORK_SOURCES := tests/user/network-smoke.c $(addprefix tests/user/network/,common.c tcp.c udp.c unix.c options.c ipv6.c peer.c control.c)
-NETWORK_HEADERS := tests/user/network/common.h
+LIBC_SOURCES := tests/user/abi/libc_smoke.c tests/user/abi/libc_common.c tests/user/process/libc_lifecycle.c tests/user/process/script.c tests/user/fs/libc_file.c tests/user/abi/libc_system.c tests/user/process/limits.c tests/user/fs/file_time.c tests/user/abi/clock.c tests/user/net/socket_timeout.c
+LIBC_HEADERS := tests/user/include/libc_common.h tests/user/include/fp.h
+NETWORK_SOURCES := tests/user/net/network_smoke.c $(addprefix tests/user/net/,common.c tcp.c udp.c unix.c options.c ipv6.c peer.c control.c)
+NETWORK_HEADERS := tests/user/include/net_common.h
+TEST_GEN_PROGS := fs/file_shared process/fork_exec_wait ipc/pipe_futex_epoll net/tcp_udp
+TEST_GEN_PROGS_EXTENDED := libc-smoke network-smoke observation-smoke
+TEST_FILES := $(wildcard tests/user/scripts/*)
+USER_TOOLS := klog-read ktrace-control
+GUEST_BIN_PROGRAMS := $(TEST_GEN_PROGS_EXTENDED) $(USER_TOOLS)
+SELFTEST_OUTPUTS = $(foreach program,$(TEST_GEN_PROGS),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/$(program)))
+SELFTEST_HEADERS := tests/user/include/kselftest.h tests/user/include/selftest_io.h
 
 empty :=
 space := $(empty) $(empty)
 make-path = $(subst $(space),\$(space),$(1))
 absolute-path = $(if $(filter /%,$(firstword $(1))),$(1),$(CURDIR)/$(1))
+
+# 两个 std 程序共用同一静态链接参数与已准备的工具链输入。
+build-std-program = cd userland/contest-run && env -u RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" CARGO_ENCODED_RUSTFLAGS="$$(printf '%s\037' '-Ctarget-feature=+crt-static' '-Crelocation-model=static' '-Clink-self-contained=yes' '-Clink-arg=-no-pie' $(if $(RUNNER_SYSROOT),'--sysroot' "$(call absolute-path,$(RUNNER_SYSROOT))"); printf '%s' "-Clinker=$(if $(findstring /,$(RUNNER_LINKER)),$(call absolute-path,$(RUNNER_LINKER)),$(RUNNER_LINKER))")" cargo build --bin $(1) --release --locked --offline --target $(RUNNER_TARGET)
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -88,8 +106,8 @@ ifeq ($(filter riscv64:qemu-virt riscv64:visionfive2 loongarch64:qemu-virt loong
 $(error Unsupported ARCH/TARGET_PLATFORM combination: $(ARCH)/$(TARGET_PLATFORM))
 endif
 ifneq ($(TARGET_PLATFORM),qemu-virt)
-ifneq ($(filter ktest-build ktest-list ktest,$(MAKECMDGOALS)),)
-$(error ktest-build/ktest-list/ktest require TARGET_PLATFORM=qemu-virt)
+ifneq ($(filter build-kernel-test-elf list-kernel-tests run-kernel-tests,$(MAKECMDGOALS)),)
+$(error build-kernel-test-elf/list-kernel-tests/run-kernel-tests require TARGET_PLATFORM=qemu-virt)
 endif
 endif
 ifeq ($(TARGET_PLATFORM),qemu-virt)
@@ -112,7 +130,9 @@ $(error KTEST_PANIC_STRATEGY must be unwind or abort)
 endif
 
 .PHONY: all build-kernel build-guest-userland prepare-guest-runtime-libraries assemble-root-filesystem create-ext4-image build-qemu-artifacts package-board-boot-images
-.PHONY: build-contest-runner user-tests ktest-build ktest-list ktest run-qemu clean-build-artifacts clean-qemu-working-disks help
+.PHONY: build-contest-runner user-tests build-kernel-test-elf list-kernel-tests run-kernel-tests run-qemu clean-build-artifacts clean-qemu-working-disks help
+.PHONY: build-user-selftests install-user-selftests run-user-selftests
+.PHONY: build-linux-user-selftests run-linux-user-selftests
 
 all:
 	$(MAKE) build-qemu-artifacts ARCH=riscv64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_RV)" MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)" ROOTFS_OUTPUT_DIR=build/rootfs/riscv64 GUEST_USERLAND_OUTPUT_DIR=build/userland-riscv64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-riscv64 BUSYBOX_BUILD_DIR=build/busybox-riscv64
@@ -152,18 +172,18 @@ clean-qemu-working-disks:
 	python3 tools/working_disks.py clean --arch "$(ARCH)" $(QEMU_ARGS)
 
 build-contest-runner:
-	cd userland/contest-run && env -u RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" CARGO_ENCODED_RUSTFLAGS="$$(printf '%s\037' '-Ctarget-feature=+crt-static' '-Crelocation-model=static' '-Clink-self-contained=yes' '-Clink-arg=-no-pie' $(if $(RUNNER_SYSROOT),'--sysroot' "$(call absolute-path,$(RUNNER_SYSROOT))"); printf '%s' "-Clinker=$(if $(findstring /,$(RUNNER_LINKER)),$(call absolute-path,$(RUNNER_LINKER)),$(RUNNER_LINKER))")" cargo build --bin contest-run --release --locked --offline --target $(RUNNER_TARGET)
+	$(call build-std-program,contest-run)
 
-ktest-build:
+build-kernel-test-elf:
 	cd os && env -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KTEST_CARGO_TARGET_DIR))" RUSTFLAGS="-Cpanic=$(KTEST_PANIC_STRATEGY) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 	mkdir -p "$$(dirname -- "$(KERNEL_ELF_OUTPUT)")"
 	cp "$(KTEST_CARGO_TARGET_DIR)/$(TARGET)/$(KTEST_PROFILE)/os" "$(KERNEL_ELF_OUTPUT)"
 
-ktest-list:
-	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(KERNEL_BUILD_PROFILE) --panic $(KTEST_PANIC_STRATEGY) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+list-kernel-tests:
+	python3 tools/run_kernel_tests.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(KERNEL_BUILD_PROFILE) --panic $(KTEST_PANIC_STRATEGY) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
-ktest:
-	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(KERNEL_BUILD_PROFILE) --panic $(KTEST_PANIC_STRATEGY) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+run-kernel-tests:
+	python3 tools/run_kernel_tests.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(KERNEL_BUILD_PROFILE) --panic $(KTEST_PANIC_STRATEGY) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 user-tests: $(USER_OUTPUTS)
 
@@ -172,24 +192,54 @@ build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
 	"$(LLVM_MC)" --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
 	"$(USER_LD)" -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
-build-guest-userland: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config) $(foreach program,libc-smoke network-smoke klog-read ktrace-control observation-smoke,$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program))) build-contest-runner
+build-guest-userland: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config) $(foreach program,$(GUEST_BIN_PROGRAMS),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program))) build-contest-runner install-user-selftests
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(call absolute-path,$(GUEST_USERLAND_OUTPUT_DIR))" install
 	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/sbin"
 	install -m 755 "$(RUNNER_OUTPUT)" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run"
+
+build-user-selftests: $(SELFTEST_OUTPUTS) $(foreach program,$(TEST_GEN_PROGS_EXTENDED),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program)))
+	$(call build-std-program,user-selftests)
+
+install-user-selftests: build-user-selftests
+	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/sbin" "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests"
+	install -m 755 "$(USER_SELFTEST_RUNNER_OUTPUT)" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/user-selftests"
+	@set -e; { $(foreach program,$(TEST_GEN_PROGS),printf '%s\n' '$(subst /,:,$(program))';) } > "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/kselftest-list.txt"
 	rm -rf "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
 	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
-	@for source in tests/user/scripts/*; do \
+	@set -e; for source in $(TEST_FILES); do \
 		mode=755; [ "$${source##*/}" != no-exec ] || mode=644; \
-		install -m "$$mode" "$$source" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts/" || exit; \
+		install -m "$$mode" "$$source" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts/"; \
 	done
+
+run-user-selftests: build-guest-userland prepare-guest-runtime-libraries
+	python3 tools/prepare_user_selftest_rootfs.py --arch "$(ARCH)" --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(USER_SELFTEST_ROOTFS_DIR)" --output-image "$(USER_SELFTEST_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)" $(USER_SELFTEST_ARGS)
+	python3 tools/run_qemu.py --arch "$(ARCH)" --kernel-elf "$(USER_SELFTEST_KERNEL_ELF)" --system-image "$(USER_SELFTEST_EXT4_IMAGE)" --working-disk-dir "$(USER_SELFTEST_WORKING_DISK_DIR)" --system-only --init-program /sbin/init --root-mode rw $(QEMU_ARGS)
+
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/%): tests/user/%.c $(SELFTEST_HEADERS)
+	mkdir -p "$$(dirname -- "$@")"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -pthread -Itests/user/include "$<" -o "$@"
+
+build-linux-user-selftests:
+	$(MAKE) GUEST_USERLAND_OUTPUT_DIR="$(LINUX_USER_SELFTEST_OUTPUT_DIR)" MUSL_CROSS= MUSL_CFLAGS="$(LINUX_USER_SELFTEST_CFLAGS)" $(foreach program,$(TEST_GEN_PROGS),"$(LINUX_USER_SELFTEST_OUTPUT_DIR)/test/selftests/$(program)")
+
+run-linux-user-selftests: build-linux-user-selftests
+	@failed=0; passed=0; directory="$(call absolute-path,$(LINUX_USER_SELFTEST_OUTPUT_DIR))/test/selftests"; \
+	for program in $(TEST_GEN_PROGS); do \
+		(cd "$$directory/$${program%/*}" && "$$directory/$$program"); status=$$?; \
+		printf 'linux-user-selftests program=%s exit=%s\n' "$$program" "$$status"; \
+		case "$$status" in 0) passed=1 ;; 4) ;; *) failed=1 ;; esac; \
+	done; \
+	[ "$$failed" -eq 0 ] || exit 1; \
+	[ "$$passed" -eq 0 ] || exit 0; \
+	exit 4
 
 $(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/libc-smoke): $(LIBC_SOURCES) $(LIBC_HEADERS)
 	mkdir -p "$$(dirname -- "$@")"
-	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) $(LIBC_SOURCES) -o "$@"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Itests/user/include $(LIBC_SOURCES) -o "$@"
 
 $(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/network-smoke): $(NETWORK_SOURCES) $(NETWORK_HEADERS)
 	mkdir -p "$$(dirname -- "$@")"
-	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) $(NETWORK_SOURCES) -o "$@"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Itests/user/include $(NETWORK_SOURCES) -o "$@"
 
 $(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/klog-read): userland/tools/klog-read.c userland/include/blossom-trace.h
 	mkdir -p "$$(dirname -- "$@")"
@@ -199,9 +249,9 @@ $(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/ktrace-control): userland/tool
 	mkdir -p "$$(dirname -- "$@")"
 	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
-$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/observation-smoke): tests/user/observation-smoke.c userland/include/blossom-trace.h
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/observation-smoke): tests/user/abi/observation_smoke.c userland/include/blossom-trace.h
 	mkdir -p "$$(dirname -- "$@")"
-	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Itests/user/include -Iuserland/include "$<" -o "$@"
 
 .DELETE_ON_ERROR: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config)
 $(call make-path,$(BUSYBOX_BUILD_DIR)/.config): userland/busybox.config
@@ -214,10 +264,15 @@ clean-build-artifacts:
 	cd userland/contest-run && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" cargo clean --offline
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" clean
 	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "$(KERNEL_ELF_OUTPUT)"
-	@for program in libc-smoke network-smoke klog-read ktrace-control observation-smoke busybox; do \
+	@for program in $(GUEST_BIN_PROGRAMS) busybox; do \
 		rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; \
 	done
-	rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run"
+	rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/user-selftests"
+	@for program in $(TEST_GEN_PROGS); do \
+		rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/$$program" "$(LINUX_USER_SELFTEST_OUTPUT_DIR)/test/selftests/$$program"; \
+	done
+	rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/kselftest-list.txt"
+	@for source in $(TEST_FILES); do rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts/$${source##*/}"; done
 
 help:
 	@printf '%s\n' \
@@ -225,9 +280,19 @@ help:
 	  '  Kernel only; KERNEL_BUILD_PROFILE=debug|release defaults to debug, panic=abort.' \
 	  '  KERNEL_ELF_OUTPUT defaults to build/kernel/<arch>/<platform>/<profile>/kernel.elf.' \
 	  '  Board combinations: riscv64/visionfive2 and loongarch64/ls2k1000la.' \
-	  'build-guest-userland                Incremental BusyBox/C and release contest-run.' \
+	  'build-guest-userland                Incremental BusyBox/C and both release std programs.' \
 	  '  GUEST_USERLAND_OUTPUT_DIR, BUSYBOX_BUILD_DIR, MUSL_CROSS select actual inputs/outputs.' \
 	  '  RUNNER_SYSROOT and RUNNER_LINKER select prepared Rust std compiler inputs.' \
+	  'build-user-selftests                Build default C tests, extended helpers and user-selftests.' \
+	  'install-user-selftests              Install the same sets and generate kselftest-list.txt.' \
+	  'run-user-selftests                  Prepare one PID1 workload, then call the production QEMU CLI.' \
+	  '  USER_SELFTEST_KERNEL_ELF selects an existing ordinary ELF; no kernel build dependency.' \
+	  '  USER_SELFTEST_ROOTFS_DIR, USER_SELFTEST_EXT4_IMAGE and USER_SELFTEST_WORKING_DISK_DIR own outputs.' \
+	  '  USER_SELFTEST_ARGS forwards --collection/--program selections; QEMU_ARGS passes run options.' \
+	  'build-linux-user-selftests          Build only the same default C programs with native gcc.' \
+	  'run-linux-user-selftests            Run every native program in its collection cwd; preserve TAP/exit.' \
+	  '  LINUX_USER_SELFTEST_OUTPUT_DIR defaults to build/user-selftests-linux; not target-ISA evidence.' \
+	  '  LINUX_USER_SELFTEST_CFLAGS selects native flags; no kernel, BusyBox, runner or PID1 execution.' \
 	  'prepare-guest-runtime-libraries     Copy checked local libc sources to RUNTIME_LIBRARIES_OUTPUT_DIR.' \
 	  'assemble-root-filesystem            Build userland/libraries, then replace ROOTFS_OUTPUT_DIR.' \
 	  '  ROOTFS_INIT_CONFIG optionally selects an ordinary inittab file.' \
@@ -242,6 +307,7 @@ help:
 	  'clean-qemu-working-disks ARCH=...   Remove inactive root.raw/contest.raw under their lock.' \
 	  '  QEMU_ARGS may select --working-disk-dir; keep sources, directory and unrelated files.' \
 	  'user-tests                         Build the existing raw user ELF programs.' \
-	  'ktest-build / ktest-list / ktest     QEMU only; KERNEL_BUILD_PROFILE, KTEST_PANIC_STRATEGY.' \
+	  'list-kernel-tests / run-kernel-tests QEMU only; KERNEL_BUILD_PROFILE, KTEST_PANIC_STRATEGY.' \
+	  '  build-kernel-test-elf is the internal build target used when no --kernel is supplied.' \
 	  '  TEST selects a glob; KTEST_ARGS passes other Host options; CPUS/MEMORY are VM-only.' \
 	  'clean-build-artifacts              Rebuildable compiler outputs only; keep disks and reports.'

@@ -183,6 +183,7 @@ pub enum CommandSpec {
 pub enum Protocol {
     Plain,
     Ltp,
+    Tap,
     Basic { name: String },
     Pre2025Libctest { variant: String, selector: String },
 }

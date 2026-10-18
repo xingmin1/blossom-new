@@ -125,9 +125,13 @@ def case_seed(seed, repeat, name):
     return stable_hash(f"{seed}:{repeat}:{name}")
 
 
-def select(catalog, args):
-    """正向并集、标签交集、排除与 ignore 后稳定分片，结果按完整名排序。"""
+def select(catalog, args, *, execution):
+    """按全名选择；目录保留 ignored，执行才默认排除并解释空选择原因。"""
+    names = {case["name"] for case in catalog.cases}
+    missing = sorted(set(args.exact) - names)
+    require(not missing, "unknown exact case names: " + ", ".join(missing))
     selected = []
+    ignored = []
     for case in catalog.cases:
         name = case["name"]
         positive = not (args.exact or args.include or args.parameter)
@@ -138,13 +142,18 @@ def select(catalog, args):
             continue
         if any(fnmatch.fnmatchcase(name, p) for p in args.exclude):
             continue
-        if case["ignore"] is not None and not args.include_ignored:
-            continue
         if args.shard is not None:
             index, count = args.shard
             if stable_hash(name) % count != index:
                 continue
+        if execution and case["ignore"] is not None and not args.include_ignored:
+            ignored.append(case)
+            continue
         selected.append(case)
+    if not selected and ignored:
+        reasons = "; ".join(f"{case['name']}: {case['ignore']}"
+                            for case in sorted(ignored, key=lambda case: case["name"]))
+        raise HostError(f"selection matched only ignored cases: {reasons}; use --include-ignored to run")
     require(selected, "selection matched no cases")
     selected.sort(key=lambda case: case["name"])
     return selected

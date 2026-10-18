@@ -1,11 +1,10 @@
 //! 同源真实宿主进程覆盖；不模拟 mount/chroot 成功，也不签署 guest 结论。
 
 use contest_run::custom::hook_device;
-use contest_run::execute::{
-    execute_case as execute_real_case, run_command as execute_real_command, CaseRecord, Execution,
-    ExitOutcome,
-};
+use contest_run::execute::{execute_case as execute_real_case, CaseRecord};
 use contest_run::model::{CommandSpec, Protocol, ResolvedCase, SourceLocation};
+use contest_run::outcome::{Execution, ExitOutcome};
+use contest_run::process::run_command as execute_real_command;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -255,7 +254,7 @@ fn large_stdout_and_stderr_are_forwarded_without_deadlock() {
         },
     );
     assert_eq!(run.outcome, ExitOutcome::Exited { code: 0, raw: 0 });
-    assert!(run.verdict.is_success(), "{:?}", run.verdict);
+    assert!(run.protocol.verdict.is_success(), "{:?}", run.protocol);
     assert!(run.io_errors.is_empty(), "{:?}", run.io_errors);
     let mut expected = b"========== START test_bulk ==========\n".to_vec();
     expected.extend(b"0123456789abcdef0123456789abcdef".repeat(8192));
@@ -599,7 +598,7 @@ fn shared_console_ofd_preserves_blocking_stdin() {
             );
             assert!(run.io_errors.is_empty(), "{:?}", run.io_errors);
             assert_eq!(run.outcome, ExitOutcome::Exited { code: 0, raw: 0 });
-            assert!(run.verdict.is_success(), "{:?}", run.verdict);
+            assert!(run.protocol.verdict.is_success(), "{:?}", run.protocol);
         }
         _ => {
             let _exclusive = exclusive_execution();
@@ -713,4 +712,26 @@ fn relay_drain_deadline_preserves_completed_child_status() {
         run.io_errors
     );
     assert!(run.elapsed < Duration::from_secs(3));
+}
+
+/// TAP 使用同一真实 relay，输出设备错误不能保留成功协议判定。
+#[test]
+fn tap_output_error_preserves_wait_and_fails_result() {
+    let scratch = Scratch::new();
+    let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+    let run = run_command(
+        None,
+        &scratch.0,
+        &shell("printf 'TAP version 13\\n1..1\\nok 1 completed\\n'"),
+        &BTreeMap::new(),
+        Duration::from_secs(2),
+        &Protocol::Tap,
+        [full.as_raw_fd(), full.as_raw_fd()],
+    );
+    assert_eq!(run.outcome, ExitOutcome::Exited { code: 0, raw: 0 });
+    assert!(!run.io_errors.is_empty());
+    assert_eq!(
+        run.protocol.verdict,
+        contest_run::outcome::Verdict::InfrastructureError
+    );
 }

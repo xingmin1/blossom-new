@@ -16,10 +16,11 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from host_helpers import (CLI, CONFIG, case_record, case_lines, catalog_of,
-                          options, parser_for, vm_fixture)
+                          options, parser_for, session_fixture)
 from ktest.catalog import HostError, invocations
 from ktest.net_user import NetUserPeer
-from ktest.runner import DeadlineExpired, VM, execute_batch, finish_vm
+from ktest.batch import execute_batch, finish_vm
+from ktest.uart_channel import DeadlineExpired, UartChannel
 
 
 class TerminalLifecycleTests(unittest.TestCase):
@@ -27,10 +28,10 @@ class TerminalLifecycleTests(unittest.TestCase):
 
     def test_buffered_log_flood_cannot_extend_deadline(self):
         """已缓冲的大量行也要检查绝对期限，不能只检查 recv。"""
-        vm = vm_fixture()
-        vm.buffer = bytearray(b"log\n" * 1000)
+        vm = session_fixture()
+        vm.uart.buffer = bytearray(b"log\n" * 1000)
         with self.assertRaises(DeadlineExpired):
-            vm.line(time.monotonic() - 1)
+            vm.uart.line(time.monotonic() - 1)
 
     def test_final_waits_for_exit_and_rejects_late_or_partial_control(self):
         """真实 socket 终结后普通诊断合法，迟到 final 和半条结果不能通过。"""
@@ -46,11 +47,11 @@ class TerminalLifecycleTests(unittest.TestCase):
                 parser.feed("# KTEST complete")
                 host, guest = socket.socketpair()
                 try:
-                    vm = vm_fixture()
-                    vm.serial = host
+                    vm = session_fixture()
+                    vm.uart.serial = host
                     host.setblocking(False)
-                    vm.buffer = bytearray()
-                    vm.raw = io.BytesIO()
+                    vm.uart.buffer = bytearray()
+                    vm.uart.raw = io.BytesIO()
                     vm.process = SimpleNamespace(poll=lambda: 0, returncode=0)
                     guest.sendall(payload)
                     guest.shutdown(socket.SHUT_WR)
@@ -59,7 +60,7 @@ class TerminalLifecycleTests(unittest.TestCase):
                             finish_vm(vm, time.monotonic() + 2, parser)
                     else:
                         finish_vm(vm, time.monotonic() + 2, parser)
-                        self.assertEqual(vm.raw.getvalue(), payload)
+                        self.assertEqual(vm.uart.raw.getvalue(), payload)
                 finally:
                     host.close()
                     guest.close()
@@ -102,19 +103,19 @@ class TerminalLifecycleTests(unittest.TestCase):
                     return original_select(readers, writers, errors, timeout)
 
                 try:
-                    vm = vm_fixture()
-                    vm.serial = host
+                    vm = session_fixture()
+                    vm.uart.serial = host
                     host.setblocking(False)
-                    vm.buffer = bytearray()
-                    vm.raw = io.BytesIO()
+                    vm.uart.buffer = bytearray()
+                    vm.uart.raw = io.BytesIO()
                     vm.process = process
-                    with patch("ktest.runner.select.select", side_effect=exit_after_readiness):
+                    with patch("ktest.uart_channel.select.select", side_effect=exit_after_readiness):
                         if rejected:
                             with self.assertRaises(HostError):
                                 finish_vm(vm, time.monotonic() + 2, parser)
                         else:
                             finish_vm(vm, time.monotonic() + 2, parser)
-                            self.assertEqual(vm.raw.getvalue(), payload)
+                            self.assertEqual(vm.uart.raw.getvalue(), payload)
                 finally:
                     host.close()
                     process.stdin.close()
@@ -143,11 +144,13 @@ class LifecycleAndReportTests(unittest.TestCase):
         process = subprocess.Popen([sys.executable, "-c", script, str(guest.fileno()),
                                     "\n".join(lines) + "\n"], pass_fds=(guest.fileno(),))
         guest.close()
-        vm = vm_fixture()
-        vm.serial = host
+        vm = session_fixture()
+        vm.args = vm.uart.args = args
+        vm.directory = vm.uart.directory = directory
+        vm.uart.serial = host
         host.setblocking(False)
-        vm.buffer = bytearray()
-        vm.raw = io.BytesIO()
+        vm.uart.buffer = bytearray()
+        vm.uart.raw = io.BytesIO()
         vm.process = process
         vm.connect = lambda deadline: None
 
@@ -159,11 +162,26 @@ class LifecycleAndReportTests(unittest.TestCase):
             process.wait(timeout=2)
 
         vm.close = close
-        with patch("ktest.runner.VM", return_value=vm) as factory:
+        with patch("ktest.batch.QemuTestSession", return_value=vm) as factory:
             results = execute_batch(args, Path("kernel"), catalog_of(rows),
                                     invocations(rows, args), directory)
         self.assertEqual(factory.call_count, 1, "suite failure must not retry unstarted cases")
         return results
+
+    def test_ordinary_failure_continues_same_vm_and_all_skip_remains_distinct(self):
+        """普通 Fail 的完整清理允许后例同 VM；全 Skip 保独立退出等级。"""
+        rows = [case_record(0), case_record(1)]
+        for statuses, outer, code in ((("Fail", "Pass"), "not ok", 1),
+                                      (("Skip", "Skip"), "ok", 4)):
+            with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as temporary:
+                lines = ["KTAP version 1", "1..1", "  # Subtest: os::tests0",
+                         "  1..2", "  # KTEST suite-begin setup"]
+                for position, (row, status) in enumerate(zip(rows, statuses), 1):
+                    lines.extend(case_lines(row, position, status))
+                lines.extend([f"{outer} 1 os::tests0", "# KTEST complete"])
+                results = self.execute_serial(rows, lines, Path(temporary))
+                self.assertEqual([row["status"] for row in results], list(statuses))
+                self.assertEqual(CLI.exit_status(results), code)
 
     def test_network_peer_ack_orders_real_consumers_and_successor(self):
         """真实跨例 P/Q 在 BEGIN 后产生；管道固定 begin 和 finish/drain 尚未完成的窗口。"""
@@ -230,7 +248,7 @@ for position,row in enumerate(rows,1):
     ready([udp])
     data,address=udp.recvfrom(2)
     assert data==b"Q" and address==("127.0.0.1",port), "real native peer response missing"
-    uart.sendall((f"  # KTEST phase {cid} cleanup\\n  # KTEST status {cid} Pass\\n"
+    uart.sendall((f"  # KTEST phase {cid} cleanup\\n"
                   f"  ok {position} {row['name']}\\n").encode("utf-8"))
     acknowledgement("END",cid)
 uart.sendall(b"ok 1 os::tests0\\n# KTEST complete\\n")
@@ -273,14 +291,16 @@ os._exit(0)
                 peer = NetUserPeer(current)
                 peers.append(peer)
                 os.write(ports_writer, str(peer.ports[1]).encode("ascii"))
-                vm = vm_fixture()
+                vm = session_fixture()
                 vm.args = args
                 vm.directory = current
-                vm.serial = host
+                vm.uart.args = args
+                vm.uart.directory = current
+                vm.uart.serial = host
                 host.setblocking(False)
-                vm.buffer = bytearray()
+                vm.uart.buffer = bytearray()
                 raw = (current / "uart.log").open("xb", buffering=0)
-                vm.raw = raw
+                vm.uart.raw = raw
                 vm.process = process
                 vm.net_user = peer
                 original_begin = peer.begin
@@ -327,7 +347,7 @@ os._exit(0)
 
             try:
                 args = options(startup_timeout=2, setup_timeout=2, case_timeout=2, cleanup_timeout=2)
-                with patch("ktest.runner.VM", side_effect=construct_vm) as factory:
+                with patch("ktest.batch.QemuTestSession", side_effect=construct_vm) as factory:
                     results = execute_batch(args, Path("kernel"), catalog_of(rows),
                                             invocations(rows, args), directory)
                 self.assertEqual(factory.call_count, 1)
@@ -401,7 +421,7 @@ os._exit(0)
 
     def test_case_abort_cleanup_failures_preserve_independent_ledgers_in_json_and_junit(self):
         """三处真实中止经 socket/进程终结与双报告保全主体、子任务和清理失败。"""
-        rows = [case_record(0), case_record(1), case_record(2)]
+        rows = [case_record(0), case_record(1)]
         for phase in ("quiesce", "join", "cleanup"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -409,14 +429,14 @@ os._exit(0)
                               cleanup=f"{phase} cannot converge", expectations=3,
                               reason="活资源不得释放")
                 lines = ["KTAP version 1", "1..1", "  # Subtest: os::tests0",
-                         "  1..3", "  # KTEST suite-begin setup",
+                         "  1..2", "  # KTEST suite-begin setup",
                          *case_lines(rows[0], status="Fail"), *case_lines(rows[1], 2)[:3],
                          f"  # KTEST phase 1 {phase}",
                          f"  # KTEST case-abort 1 {phase} " + json.dumps(ledger),
                          "not ok 1 os::tests0", "# KTEST complete"]
                 results = self.execute_serial(rows, lines, directory)
-                self.assertEqual([row["status"] for row in results], ["Fail", "Error", "NotRun"])
-                self.assertEqual([row["case"] for row in results], [0, 1, 2])
+                self.assertEqual([row["status"] for row in results], ["Fail", "Error"])
+                self.assertEqual([row["case"] for row in results], [0, 1])
                 self.assertFalse(any(row.get("kind") == "SuiteError" for row in results))
                 aborted = results[1]
                 self.assertNotIn("infrastructure_error", aborted)
@@ -430,7 +450,6 @@ os._exit(0)
                 self.assertEqual(message, aborted["reason"])
                 self.assertEqual(json.loads(message.split("\ncase-abort: ", 1)[1]),
                                  dict(phase=phase, **ledger))
-                self.assertEqual(nodes[2].find("error").attrib["type"], "NotRun")
 
     def test_case_abort_requires_valid_terminal_protocol_and_real_zero_exit_without_replay(self):
         """缺终结、假 PASS、迟到记录、断 UART、非零退出和活 VM 均不得确认中止。"""
@@ -471,23 +490,23 @@ os._exit(0)
                  "  # KTEST case-abort 1 join " + json.dumps(ledger), "after-abort progress",
                  "not ok 1 os::tests0", "# KTEST complete"]
         clock = [100.0]
-        vm = vm_fixture()
-        vm.buffer = bytearray(("\n".join(lines) + "\n").encode("utf-8"))
+        vm = session_fixture()
+        vm.uart.buffer = bytearray(("\n".join(lines) + "\n").encode("utf-8"))
         vm.handshake = lambda config, command, deadline: None
         vm.close = lambda: None
 
         def line(deadline):
             """使用正式缓冲行读取，仅控制业务日志所消耗的单调时间。"""
-            value = VM.line(vm, deadline)
+            value = UartChannel.line(vm.uart, deadline)
             if value.endswith("progress"):
                 clock[0] += 1.5
             return value
 
-        vm.line = line
+        vm.uart.line = line
         args = options(cleanup_timeout=2)
         with tempfile.TemporaryDirectory() as temporary, \
-                patch("ktest.runner.VM", return_value=vm) as factory, \
-                patch("ktest.runner.time.monotonic", side_effect=lambda: clock[0]):
+                patch("ktest.batch.QemuTestSession", return_value=vm) as factory, \
+                patch("ktest.batch.time.monotonic", side_effect=lambda: clock[0]):
             results = execute_batch(args, Path("kernel"), catalog_of(rows),
                                     invocations(rows, args), Path(temporary))
         self.assertEqual(factory.call_count, 1)
@@ -509,22 +528,22 @@ os._exit(0)
                         lines.extend(case_lines(row, position))
                 lines.extend(["ordinary progress", "ordinary progress"])
                 clock = [100.0]
-                vm = vm_fixture()
-                vm.buffer = bytearray(("\n".join(lines) + "\n").encode("utf-8"))
+                vm = session_fixture()
+                vm.uart.buffer = bytearray(("\n".join(lines) + "\n").encode("utf-8"))
                 vm.handshake = lambda config, command, deadline: None
                 vm.close = lambda: None
 
                 def line(deadline):
                     """先走真实缓冲行读取，再让业务日志消耗单调时间。"""
-                    value = VM.line(vm, deadline)
+                    value = UartChannel.line(vm.uart, deadline)
                     if value == "ordinary progress":
                         clock[0] += 3
                     return value
 
-                vm.line = line
+                vm.uart.line = line
                 args = options(setup_timeout=2, cleanup_timeout=2)
-                with patch("ktest.runner.VM", return_value=vm), \
-                        patch("ktest.runner.time.monotonic", side_effect=lambda: clock[0]):
+                with patch("ktest.batch.QemuTestSession", return_value=vm), \
+                        patch("ktest.batch.time.monotonic", side_effect=lambda: clock[0]):
                     results = execute_batch(args, Path("kernel"), catalog_of(rows),
                                             invocations(rows, args), Path(temporary))
                 self.assertEqual([row["status"] for row in results if row["case"] is not None],
@@ -605,6 +624,45 @@ class HostFatalReplayTests(unittest.TestCase):
             else:
                 self.assertEqual(node.find(tag).attrib["type"], status)
 
+
+    def test_guest_pass_with_missing_external_uart_records_is_real_error(self):
+        """客体 ok 保留原文；实际 UART 观察缺项使同例失败，不能只附成功摘要。"""
+        row = case_record(
+            name="os::ktest::execution_services::klog::records::allocation_free_record_identity")
+        payload = self.payload([row], [*case_lines(row)[3:],
+                                     "ok 1 os::tests0", "# KTEST complete"])
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            results = self.execute_guest([row], f"uart.sendall({payload.encode()!r})", directory)
+            self.assert_reports(directory, results, ["Error"], 2)
+            self.assertIn("Guest Pass", results[0]["reason"])
+            self.assertIn(f"  ok 1 {row['name']}\n".encode(),
+                          (directory / "part-0" / "uart.log").read_bytes())
+
+    def test_guest_pass_with_incomplete_network_peer_is_real_error(self):
+        """真实 peer 缺少业务消息时保存其错误和 Guest ok，不把原文改成失败输出。"""
+        row = case_record(tags=["network-nic-udp"], resources=["net-user"])
+        start = "\n".join(["KTAP version 1", "1..1", "  # Subtest: os::tests0",
+                           "  1..1", "  # KTEST suite-begin setup",
+                           case_lines(row)[0]]) + "\n"
+        end = "\n".join([*case_lines(row)[1:], "ok 1 os::tests0", "# KTEST complete"]) + "\n"
+        body = (f"uart.sendall({start.encode()!r})\n"
+                "ack=b''\n"
+                "while not ack.endswith(b'\\n'): ack+=uart.recv(1)\n"
+                "assert ack==b'KTEST PEER BEGIN 0\\n'\n"
+                f"uart.sendall({end.encode()!r})\n"
+                "ack=b''\n"
+                "while not ack.endswith(b'\\n'): ack+=uart.recv(1)\n"
+                "assert ack==b'KTEST PEER END 0\\n'")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            results = self.execute_guest([row], body, directory)
+            self.assert_reports(directory, results, ["Error"], 2)
+            peer = json.loads((directory / "part-0" / "peer.json").read_text())
+            self.assertTrue(peer["failures"])
+            self.assertIn(f"  ok 1 {row['name']}\n".encode(),
+                          (directory / "part-0" / "uart.log").read_bytes())
+
     def test_buffered_executed_successor_is_not_replayed_after_deadline(self):
         """A 日志耗尽期限时，B 已真实执行但 begin/final 未读，不能重放其副作用。"""
         rows = [case_record(0), case_record(1)]
@@ -615,7 +673,7 @@ class HostFatalReplayTests(unittest.TestCase):
                                              "ok 1 os::tests0", "# KTEST complete"])
         body = ("with (base/'effects').open('ab') as output: output.write(b'B\\n')\n"
                 f"uart.sendall(({first!r} if ids==[0,1] else {successor!r}).encode())")
-        original_line = VM.line
+        original_line = UartChannel.line
 
         def consuming_line(vm, deadline):
             """真实读到业务日志后消耗固定时间，其余串口内容保持排队。"""
@@ -626,7 +684,7 @@ class HostFatalReplayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            with patch.object(VM, "line", consuming_line):
+            with patch.object(UartChannel, "line", consuming_line):
                 results = self.execute_guest(rows, body, directory, options(case_timeout=0.5))
             self.assertEqual((directory / "effects").read_bytes(), b"B\n")
             self.assertEqual((directory / "commands").read_bytes(), b"run 0 17 0 0,1\n")
@@ -688,6 +746,36 @@ class HostFatalReplayTests(unittest.TestCase):
             self.assertEqual((directory / "effects").read_bytes(), b"C\n")
             self.assert_reports(directory, results, ["Fail", "Crash", "Pass"], 1)
             self.assertFalse(any("infrastructure_error" in row for row in results))
+
+    def test_complete_case_abort_self_exit_runs_only_confirmed_suffix_once(self):
+        """完整中止和自行 exit0 后才重开后缀 VM，原主体与后缀副作用均只执行一次。"""
+        rows = [case_record(0), case_record(1), case_record(2)]
+        for phase in ("quiesce", "join", "cleanup"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                ledger = dict(primary="body failed", child="child failed",
+                              cleanup="cannot release owner", expectations=2, reason="stop")
+                first = "\n".join([
+                    "KTAP version 1", "1..1", "  # Subtest: os::tests0",
+                    "  1..3", "  # KTEST suite-begin setup",
+                    *case_lines(rows[0], status="Fail"), *case_lines(rows[1], 2)[:3],
+                    f"  # KTEST phase 1 {phase}",
+                    f"  # KTEST case-abort 1 {phase} " + json.dumps(ledger),
+                    "not ok 1 os::tests0", "# KTEST complete"]) + "\n"
+                suffix = self.payload([rows[2]], [
+                    *case_lines(rows[2])[3:], "ok 1 os::tests0", "# KTEST complete"])
+                body = (
+                    "with (base/'effects').open('ab') as output:\n"
+                    " output.write(b'AB\\n' if ids==[0,1,2] else b'C\\n')\n"
+                    f"uart.sendall(({first!r} if ids==[0,1,2] else {suffix!r}).encode())\n"
+                    "uart.close()\nlistener.close()\nimport os\nos._exit(0)")
+                results = self.execute_guest(rows, body, directory)
+                self.assertEqual((directory / "commands").read_bytes(),
+                                 b"run 0 17 0 0,1,2\nrun 0 17 0 2\n")
+                self.assertEqual((directory / "effects").read_bytes(), b"AB\nC\n")
+                self.assert_reports(directory, results, ["Fail", "Error", "Pass"], 2)
+                self.assertEqual(results[1]["case_abort"], dict(phase=phase, **ledger))
+                self.assertFalse(any("infrastructure_error" in row for row in results))
 
     def test_unconfirmed_process_crash_preserves_failure_and_does_not_retry_suffix(self):
         """仅 begin 加真实进程退出9不足以证明后缀未开始，首次 Fail/Crash 不重放。"""

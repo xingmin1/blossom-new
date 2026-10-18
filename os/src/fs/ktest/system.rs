@@ -402,7 +402,9 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 6] {
 )]
 pub(crate) mod arguments {
     use super::*;
-    /// 纯模型覆盖设备和根权限的末值，以及 rootdir/init 原始字节；实际根视图由磁盘消费者验证。
+    use crate::task::exec::{Arguments, ExecError};
+
+    /// 解析保留设备、权限和路径原始字节；执行参数分别拒绝空路径与内嵌 NUL，不证明实际启动。
     #[test]
     #[ktest(tags("B01"))]
     fn parser_boundaries_are_not_boot_selection(context: &mut TestContext<'_>) -> TestResult {
@@ -491,15 +493,20 @@ pub(crate) mod arguments {
         ] {
             context.expect_eq(checked(context, boot_devices(bytes))?.init, init);
         }
-        for bytes in [
-            b"root=/dev/vda init=".as_slice(),
-            b"root=/dev/vda init=/sbin/init\0tail",
+        for (bytes, error) in [
+            (
+                b"root=/dev/vda init=".as_slice(),
+                ExecError::File(FsError::NotFound),
+            ),
+            (
+                b"root=/dev/vda init=/sbin/init\0tail".as_slice(),
+                ExecError::Format,
+            ),
         ] {
             let selected = checked(context, boot_devices(bytes))?;
             context.expect_eq(
-                crate::task::exec::Arguments::from_kernel(selected.init, &[selected.init], &[])
-                    .err(),
-                Some(crate::task::exec::ExecError::Format),
+                Arguments::from_kernel(selected.init, &[selected.init], &[]).err(),
+                Some(error),
             );
         }
         for bytes in [

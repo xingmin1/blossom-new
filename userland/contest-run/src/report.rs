@@ -1,49 +1,13 @@
 //! 原始退出事实与固定比赛输出协议的流式判定。
 
-use crate::execute::ExitOutcome;
 use crate::model::Protocol;
+use crate::outcome::{ExitOutcome, ProtocolResult, Verdict};
+use crate::tap::TapObserver;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamKind {
     Stdout,
     Stderr,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    Pass,
-    Completed,
-    Failed,
-    Broken,
-    Warning,
-    Configuration,
-    NotRun,
-    TimedOut,
-    Signaled,
-    InfrastructureError,
-}
-
-impl Verdict {
-    /// 返回报告中稳定的状态名，不将配置缺失改签为支持性跳过。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pass => "Pass",
-            Self::Completed => "Completed",
-            Self::Failed => "Failed",
-            Self::Broken => "Broken",
-            Self::Warning => "Warning",
-            Self::Configuration => "Configuration",
-            Self::NotRun => "NotRun",
-            Self::TimedOut => "TimedOut",
-            Self::Signaled => "Signaled",
-            Self::InfrastructureError => "InfrastructureError",
-        }
-    }
-
-    /// 只有真实通过与完整执行可使本轮继续按成功处理。
-    pub fn is_success(self) -> bool {
-        matches!(self, Self::Pass | Self::Completed)
-    }
 }
 
 pub struct ProtocolObserver<'a> {
@@ -52,6 +16,7 @@ pub struct ProtocolObserver<'a> {
     end: String,
     failure: String,
     streams: [LineState; 2],
+    tap: Option<TapObserver>,
 }
 
 impl<'a> ProtocolObserver<'a> {
@@ -71,6 +36,7 @@ impl<'a> ProtocolObserver<'a> {
                 format!("========== END entry-{variant}.exe {selector} =========="),
                 format!("FAIL {selector} "),
             ),
+            Protocol::Tap => (String::new(), String::new(), String::new()),
             Protocol::Plain | Protocol::Ltp => (String::new(), String::new(), String::new()),
         };
         let limit = if start.is_empty() {
@@ -86,11 +52,18 @@ impl<'a> ProtocolObserver<'a> {
             end,
             failure,
             streams: [LineState::new(limit), LineState::new(limit)],
+            tap: matches!(protocol, Protocol::Tap).then(TapObserver::new),
         }
     }
 
     /// 观察原始字节而不转发；两个流独立分行，长行仅保留有界前缀。
     pub fn feed(&mut self, stream: StreamKind, bytes: &[u8]) {
+        if let Some(tap) = &mut self.tap {
+            if stream == StreamKind::Stdout {
+                tap.feed(bytes);
+            }
+            return;
+        }
         if matches!(self.protocol, Protocol::Plain | Protocol::Ltp) {
             return;
         }
@@ -110,7 +83,18 @@ impl<'a> ProtocolObserver<'a> {
     }
 
     /// 消费各流无换行的末行，再按基础设施边界及原协议解释真实退出。
-    pub fn finish(mut self, outcome: &ExitOutcome) -> Verdict {
+    pub fn finish(mut self, outcome: &ExitOutcome) -> ProtocolResult {
+        if let Some(tap) = self.tap.take() {
+            return tap.finish(outcome);
+        }
+        ProtocolResult {
+            verdict: self.finish_marked(outcome),
+            tap: None,
+        }
+    }
+
+    /// 保持既有比赛协议的退出优先级与同流标记算法。
+    fn finish_marked(mut self, outcome: &ExitOutcome) -> Verdict {
         for state in &mut self.streams {
             if !state.line.is_empty() || state.overflow {
                 state.consume(self.protocol, &self.start, &self.end, &self.failure);
@@ -133,6 +117,7 @@ impl<'a> ProtocolObserver<'a> {
                 }
             }
             Protocol::Ltp => ltp_verdict(code),
+            Protocol::Tap => unreachable!("TAP has its own streaming state"),
             Protocol::Basic { .. } => self.marked_verdict(code, 0, false),
             Protocol::Pre2025Libctest { .. } => self.marked_verdict(code, 1, true),
         }
