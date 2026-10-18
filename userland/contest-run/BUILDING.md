@@ -22,3 +22,22 @@ make runner ARCH=loongarch64 RUNNER_SYSROOT=/absolute/prepared/sysroot RUNNER_LI
 项目默认 `make contest CONTEST_IMAGE=...` 重新生成项目管理的辅助树。显式 `SOURCE` 或自行指定的既有 `STAGING` 按普通输入处理，不自动回填 runner 或配置。`RESUME=1` 保留全部工作盘；只有 `RESUME=1 REFRESH_SYSTEM=1` 才在原工作锁下用当前系统镜像原子替换 `root.raw`，不修改 `contest.raw` 或原输入。制盘或刷新失败直接终止，不继续运行旧系统盘。
 
 `make clean` 只清理明确的编译链接产物，不删除工作盘、系统镜像、工具链、sysroot、日志或报告。`make work-clean WORK_DIR=...` 取得启动时的同一非阻塞锁，只删除四个已知角色的工作盘；目录和 `.lock` 保留，正在运行的 QEMU 持锁时清理失败。
+
+## 板平台与 DEVICE
+
+runner只按 `ARCH` 选择同架构Linux-musl用户ELF，不因 `PLATFORM` 建第二执行器。正式命令保持：
+
+```text
+/sbin/contest-run DEVICE [--plan FILE] [--file FILE ...] [--list]
+/sbin/contest-run DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]
+```
+
+DEVICE现在可用实际存在的 `/dev/ram0`、`/dev/mmcblk0`、`/dev/sda`、原 `/dev/vda` 及分区（例如ram0p1、mmcblk0p1、sda3、vda1）。CLI只要求UTF-8和 `/dev` 下直接路径；精确名字/分区号及存在性由内核mount/DeviceSelector检验，缺失不切整盘、其它盘或RAM。原plan/list、显式工作卷内root/cwd、字面argv及退出结果不变，`--root /musl` 不能改传父系统的 `/mnt/contest/musl`。
+
+内核启动的root/extra由main一次解析后传Storage及FS；只有真实无SD卡/SATA介质才视为absence。未选无介质不阻明确RAM根，实际可用的未选盘仍登记供后续mount；所需缺盘与其它资源/协议/停止错误仍失败，不改选RAM。该合同的源码已随四项初审纠正写入，修后Native门禁和连续五域复核尚待，不代表板启动或四项已验收。
+
+例如在已经挂入实际设备的guest内，`/sbin/contest-run /dev/ram0 --plan /etc/contest/plan.toml --list` 复用同一计划。这里只列用法，不证明该设备已在实板可用；已有双目标runner重建与RV RAM/分区运行归各自第一波冻结输入，不代Native合流后的构建/Clippy/运行或实板验收。
+
+板用自有系统根先经原 `make image ARCH=... PLATFORM=... SOURCE=... IMAGE=...` 制作无journal raw ext4，再经原 `make board-image ... RAMDISK=... OS_DTB=... BOARD_ROOT=/dev/ram0` 离线包装；SOURCE须已有同架构runner、配置和init。IMAGE是卷、OUTPUT是kernel ELF、BOARD_OUTPUT是包装目录，board-image不自动制盘、不修改SOURCE或写物理介质；完整双板命令与限制见[板卡规范](../../.trellis/spec/os/backend/boards.md#离线制盘与包装)。OS_DTB必须由用户提供真实OS树，不能拿参考树冒充本板现场。
+
+实际板测试仍走原 `tools/ktest.py list/run` 的有限串口transport，必须提供真实可执行loader、板串口与输入，单板jobs=1、每次fresh真实reset/reload；没有这些输入时不要用空脚本替代。串口正常 `success/all-online` 只证明软件停止scope，fatal `failure/current-cpu` 不证明其它CPU/设备停止，timeout/EOF/close也不证明物理断电。所有板连接、固件和介质操作及四根/持久重启仍暂缓，离线实现目标不因此缩减。

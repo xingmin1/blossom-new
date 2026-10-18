@@ -1,4 +1,4 @@
-"""独占 VM、UART socket 与绝对期限，流式保存输出并回收进程组。"""
+"""共用 UART 协议与绝对期限，分别拥有 QEMU 进程或有限板观察生命周期。"""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import errno
@@ -31,85 +31,12 @@ class DeadlineExpired(RuntimeError):
 
 
 class VMExited(RuntimeError):
-    """UART 已关闭或 QEMU 已退出。"""
+    """UART 已关闭或具体 transport 已到不可继续的观察终点。"""
 
 
-class VM:
-    """每个实例有独立串口 socket、工作盘和进程组，不使用 stdio 后备。"""
+class UART:
+    """共享串口协议和 raw 阶段；具体 transport 独占其端点与终结责任。"""
 
-    def __init__(self, args, kernel, directory, names):
-        """独占盘和 live peer 在启动前准备，QEMU 真正 wait 后才释放。"""
-        self.args = args
-        self.directory = directory
-        self.process = None
-        self.serial = None
-        self.buffer = bytearray()
-        self.rx_offset = 0
-        self.rx_used = False
-        self.tx_offset = 0
-        self.tx_used = False
-        self.execution_uart = None
-        self.net_user = None
-        self.debugger = None
-        self.debug_log = None
-        self.gdb_command = None
-        self.socket_directory = tempfile.TemporaryDirectory(prefix="ktest-uart-")
-        self.endpoint = str(Path(self.socket_directory.name) / "uart.sock")
-        self.raw = None
-        self.console = None
-        self.disk_directory = None
-        try:
-            self.raw = (directory / "uart.log").open("xb", buffering=0)
-            self.console = (directory / "qemu.log").open("xb", buffering=0)
-            self.disk_directory = tempfile.TemporaryDirectory(prefix="disks-", dir=directory)
-            disks = prepare_disks(names, args, Path(self.disk_directory.name))
-            if "net-user" in names:
-                self.net_user = NetUserPeer(directory)
-            command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
-                       "-kernel", str(kernel), "-m", args.memory, "-smp", str(args.cpus),
-                       "-display", "none", "-monitor", "none", "-no-reboot",
-                       "-chardev", f"socket,id=ktest,path={self.endpoint},server=on,wait=on",
-                       "-serial", "chardev:ktest"]
-            if args.arch == "riscv64":
-                command += ["-bios", "default"]
-                if args.modern:
-                    command += ["-global", "virtio-mmio.force-legacy=false"]
-            command += network_arguments(args.arch, "user" if self.net_user is not None else "none")
-            ports = self.net_user.ports if self.net_user is not None else None
-            command += disk_arguments(disks, args, names, network_ports=ports, rootdir="/")
-            if "ap-freeze" in names and args.cpus >= 2:
-                endpoint = str(Path(self.socket_directory.name) / "gdb.sock")
-                command += ["-chardev", f"socket,id=ktest-gdb,path={endpoint},server=on,wait=off",
-                            "-gdb", "chardev:ktest-gdb", "-S"]
-                self.gdb_command = ap_freeze.command(args, kernel, directory, endpoint)
-                (directory / "gdb-command.json").write_text(json.dumps(self.gdb_command) + "\n", encoding="utf-8")
-                self.debug_log = (directory / "ap-freeze-gdb.log").open("xb", buffering=0)
-            (directory / "command.json").write_text(json.dumps(command) + "\n", encoding="utf-8")
-            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=self.console,
-                                            stderr=subprocess.STDOUT, start_new_session=True)
-        except BaseException:
-            self.close()
-            raise
-
-    def connect(self, deadline):
-        """在同一个启动绝对期限内等待真实 Unix UART 端点。"""
-        self.serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        while True:
-            self.check(deadline)
-            if self.process.poll() is not None:
-                raise VMExited(f"QEMU exited {self.process.returncode}")
-            try:
-                self.serial.connect(self.endpoint)
-                self.serial.setblocking(False)
-                break
-            except OSError as error:
-                if error.errno not in (errno.ENOENT, errno.ECONNREFUSED):
-                    raise
-                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
-        if self.gdb_command is not None:
-            self.debugger = subprocess.Popen(self.gdb_command, stdin=subprocess.DEVNULL,
-                                             stdout=self.debug_log, stderr=subprocess.STDOUT,
-                                             start_new_session=True)
 
     def check(self, deadline):
         """日志数量和字节进度都不改变固定截止时刻。"""
@@ -120,14 +47,17 @@ class VM:
             require(self.debugger.poll() in (None, 0), "AP freeze GDB failed; inspect ap-freeze-gdb.log")
 
     def receive(self, deadline, limit=65536):
-        """逐块落盘 UART 原文；只认 recv 的真实 EOF，进程退出不代表 socket 已读尽。"""
+        """逐块落盘原文；真实 EOF 与进程/板停止诊断分别判断。"""
         while True:
             self.check(deadline)
             readable, _, _ = select.select([self.serial], [], [], max(0, min(0.1, deadline - time.monotonic())))
             self.check(deadline)
             if not readable:
                 continue
-            data = self.serial.recv(limit)
+            try:
+                data = self.serial.recv(limit)
+            except BlockingIOError:
+                continue
             if not data:
                 raise VMExited("UART closed")
             self.raw.write(data)
@@ -157,8 +87,11 @@ class VM:
             _, writable, _ = select.select([], [self.serial], [], max(0, min(0.1, deadline - time.monotonic())))
             self.check(deadline)
             if writable:
-                count = self.serial.send(view)
-                require(count > 0, "UART send made no progress")
+                try:
+                    count = self.serial.send(view)
+                except BlockingIOError:
+                    continue
+                require(0 < count, "UART send made no progress")
                 view = view[count:]
 
     def delay(self, seconds, deadline):
@@ -251,7 +184,7 @@ class VM:
                 expected.close()
 
     def _duplex_io(self, declaration, deadline):
-        """同一原始socket交错收发payload，按每VM真实偏移逐段校验。"""
+        """同一原始串口交错收发 payload，按本次真实偏移逐段校验。"""
         rx_length = declaration["rx_length"]
         tx_length = declaration["tx_length"]
         payload = self.args.uart_payload
@@ -323,7 +256,10 @@ class VM:
                         block = bytes(self.buffer[:count])
                         del self.buffer[:len(block)]
                     else:
-                        block = self.serial.recv(count)
+                        try:
+                            block = self.serial.recv(count)
+                        except BlockingIOError:
+                            continue
                         if not block:
                             raise VMExited("UART closed during duplex payload")
                         self.raw.write(block)
@@ -335,8 +271,11 @@ class VM:
                     receive_after = time.monotonic() + declaration["tx_delay_ms"] / 1000
 
                 if writable:
-                    count = self.serial.send(pending)
-                    require(count > 0, "UART duplex input made no progress")
+                    try:
+                        count = self.serial.send(pending)
+                    except BlockingIOError:
+                        continue
+                    require(0 < count, "UART duplex input made no progress")
                     sent = pending[:count]
                     rx_state = crc32c_update(rx_state, sent)
                     pending = pending[count:]
@@ -388,6 +327,82 @@ class VM:
         if peer is not None:
             peer.verify(deadline)
 
+class VM(UART):
+    """每个实例有独立串口 socket、工作盘和进程组，不使用 stdio 后备。"""
+
+    def __init__(self, args, kernel, directory, names):
+        """独占盘和 live peer 在启动前准备，QEMU 真正 wait 后才释放。"""
+        self.args = args
+        self.directory = directory
+        self.process = None
+        self.serial = None
+        self.buffer = bytearray()
+        self.rx_offset = 0
+        self.rx_used = False
+        self.tx_offset = 0
+        self.tx_used = False
+        self.execution_uart = None
+        self.net_user = None
+        self.debugger = None
+        self.debug_log = None
+        self.gdb_command = None
+        self.socket_directory = tempfile.TemporaryDirectory(prefix="ktest-uart-")
+        self.endpoint = str(Path(self.socket_directory.name) / "uart.sock")
+        self.raw = None
+        self.console = None
+        self.disk_directory = None
+        try:
+            self.raw = (directory / "uart.log").open("xb", buffering=0)
+            self.console = (directory / "qemu.log").open("xb", buffering=0)
+            self.disk_directory = tempfile.TemporaryDirectory(prefix="disks-", dir=directory)
+            disks = prepare_disks(names, args, Path(self.disk_directory.name))
+            if "net-user" in names:
+                self.net_user = NetUserPeer(directory)
+            command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
+                       "-kernel", str(kernel), "-m", args.memory, "-smp", str(args.cpus),
+                       "-display", "none", "-monitor", "none", "-no-reboot",
+                       "-chardev", f"socket,id=ktest,path={self.endpoint},server=on,wait=on",
+                       "-serial", "chardev:ktest"]
+            if args.arch == "riscv64":
+                command += ["-bios", "default"]
+                if args.modern:
+                    command += ["-global", "virtio-mmio.force-legacy=false"]
+            command += network_arguments(args.arch, "user" if self.net_user is not None else "none")
+            ports = self.net_user.ports if self.net_user is not None else None
+            command += disk_arguments(disks, args, names, network_ports=ports, rootdir="/")
+            if "ap-freeze" in names and args.cpus >= 2:
+                endpoint = str(Path(self.socket_directory.name) / "gdb.sock")
+                command += ["-chardev", f"socket,id=ktest-gdb,path={endpoint},server=on,wait=off",
+                            "-gdb", "chardev:ktest-gdb", "-S"]
+                self.gdb_command = ap_freeze.command(args, kernel, directory, endpoint)
+                (directory / "gdb-command.json").write_text(json.dumps(self.gdb_command) + "\n", encoding="utf-8")
+                self.debug_log = (directory / "ap-freeze-gdb.log").open("xb", buffering=0)
+            (directory / "command.json").write_text(json.dumps(command) + "\n", encoding="utf-8")
+            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=self.console,
+                                            stderr=subprocess.STDOUT, start_new_session=True)
+        except BaseException:
+            self.close()
+            raise
+
+    def connect(self, deadline):
+        """在同一个启动绝对期限内等待真实 Unix UART 端点。"""
+        self.serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        while True:
+            self.check(deadline)
+            if self.process.poll() is not None:
+                raise VMExited(f"QEMU exited {self.process.returncode}")
+            try:
+                self.serial.connect(self.endpoint)
+                self.serial.setblocking(False)
+                break
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ECONNREFUSED):
+                    raise
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        if self.gdb_command is not None:
+            self.debugger = subprocess.Popen(self.gdb_command, stdin=subprocess.DEVNULL,
+                                             stdout=self.debug_log, stderr=subprocess.STDOUT,
+                                             start_new_session=True)
     def close(self):
         """先真正 wait 进程，再取消并 join peer，最后关闭句柄及工作盘。"""
         for process in (self.debugger, self.process):
@@ -422,15 +437,32 @@ class VM:
             self.disk_directory.cleanup()
 
 
+def transport(args, kernel, directory, names):
+    """只在明确平台选择处替换装载/端点，QEMU 调用和测试替换点保持原样。"""
+    if getattr(args, "platform", "qemu-virt") == "qemu-virt":
+        return VM(args, kernel, directory, names)
+    from .board import Board
+    return Board(args, kernel, directory, names)
+
+
+def validate_transport_resources(names, args):
+    """选择同一资源声明的真实承载方，不让 QEMU 外部控制冒充板输入。"""
+    if getattr(args, "platform", "qemu-virt") == "qemu-virt":
+        validate_resources(names, args)
+    else:
+        from .board import validate_resources as validate_board_resources
+        validate_board_resources(names, args)
+
+
 def config(args):
     """发现与运行共享同一个实际配置。"""
     return dict(arch=args.arch, cpus=args.cpus, mode=args.mode, panic=args.panic)
 
 
 def discover(args, kernel, directory):
-    """目录 VM 不带盘、不执行 fixture，只读取实际注册 JSONL。"""
+    """从实际 transport 读取注册 JSONL，目录不执行 fixture。"""
     catalog = Catalog(config(args))
-    vm = VM(args, kernel, directory, set())
+    vm = transport(args, kernel, directory, set())
     deadline = time.monotonic() + args.startup_timeout
     try:
         vm.handshake(config(args), b"catalog\n", deadline)
@@ -469,13 +501,22 @@ def looks_control(value):
 
 
 def finish_vm(vm, deadline, parser=None, catalog=False):
-    """final 后持续收取诊断并检查迟到控制记录，直至真实进程退出。"""
+    """final 后继续解析，QEMU 等真实退出，板等停止诊断并观察完整清理窗口。"""
     while True:
         try:
             line = vm.line(deadline)
         except VMExited:
             fragment = bytes(vm.buffer).decode("utf-8", errors="replace").rstrip("\r")
             require(not looks_control(fragment), "partial control record at EOF")
+            if getattr(vm, "terminal", None) is not None:
+                require(getattr(vm, "observed_until_deadline", False),
+                        "board UART closed before terminal observation completed")
+                require(vm.terminal == "success" and vm.terminal_scope == "all-online",
+                        "board lacks all-online successful stop after final")
+                vm.verify_resources(deadline)
+                return
+            require(getattr(getattr(vm, "args", None), "platform", "qemu-virt") == "qemu-virt",
+                    "board UART closed without a stop decision")
             while vm.process.poll() is None:
                 vm.check(deadline)
                 time.sleep(min(0.01, max(0, deadline - time.monotonic())))
@@ -532,8 +573,11 @@ def execute_batch(args, kernel, catalog, items, directory):
         setup_deadline = case_deadline = cleanup_deadline = None
         try:
             names = resource_names(suite, pending)
-            validate_resources(names, args)
-            vm = VM(args, kernel, current, names)
+            validate_transport_resources(names, args)
+            if getattr(args, "platform", "qemu-virt") != "qemu-virt":
+                from .board import validate_cases
+                validate_cases(pending)
+            vm = transport(args, kernel, current, names)
             vm.execution_uart = ExecutionUART(args.cpus, current)
             vm.handshake(config(args), run_command(pending, args.seed), deadline)
             while not parser.complete:
@@ -563,6 +607,9 @@ def execute_batch(args, kernel, catalog, items, directory):
                 elif event == "body":
                     setup_deadline = None
                     vm.execution_uart.body = True
+                elif event == "fatal" and getattr(args, "platform", "qemu-virt") != "qemu-virt":
+                    setup_deadline = case_deadline = None
+                    cleanup_deadline = deadline = now + args.cleanup_timeout
                 elif event in ("quiesce", "join", "cleanup"):
                     setup_deadline = None
                     if cleanup_deadline is None:
@@ -582,15 +629,19 @@ def execute_batch(args, kernel, catalog, items, directory):
                     deadline = cleanup_deadline
             finish_vm(vm, cleanup_deadline or time.monotonic() + args.cleanup_timeout, parser)
             if parser.case_abort is not None:
-                # 只有完整 outer/complete 与真实退出0后才确认明确的中止 Error。
+                # 完整 outer/complete 与实际 transport 终点后才确认明确的中止 Error。
                 parser.results[parser.active] = dict(status="Error", reason=parser.case_abort["reason"],
                                                      case_abort=parser.case_abort)
                 parser.active = None
         except DeadlineExpired as error:
             external = ("Timeout", str(error))
         except VMExited as error:
-            terminated = vm is not None and vm.process.poll() is not None
-            if (parser.active is not None and parser.case_abort is None
+            board_terminal = (getattr(vm, "terminal", None)
+                              if getattr(vm, "observed_until_deadline", False) else None)
+            board = getattr(args, "platform", "qemu-virt") != "qemu-virt"
+            terminated = (board_terminal is not None if board else
+                          vm is not None and vm.process.poll() is not None)
+            if (not board and parser.active is not None and parser.case_abort is None
                     and parser.fatal is not None and not terminated):
                 try:
                     vm.process.wait(timeout=max(0, min(args.cleanup_timeout, effective - time.monotonic())))
@@ -601,20 +652,25 @@ def execute_batch(args, kernel, catalog, items, directory):
             fragment = bytes(vm.buffer).decode("utf-8", errors="replace").rstrip("\r")
             if looks_control(fragment):
                 infrastructure = "partial control record at EOF"
-            elif case is not None and time.monotonic() >= effective:
+            elif case is not None and not board_terminal and effective <= time.monotonic():
                 external = ("Timeout", "absolute host deadline expired")
             else:
-                # fatal 的生产者为 NoReturn；完整读取事件并确认自行退出0，
-                # 才能证明后续未开始。close() 主动终结进程从不提供这个证明。
+                # fatal 的不可返回终点必须由真实自行退出或板停止决策提供；
+                # close()、UART EOF 和宿主超时都不能证明后继尚未开始。
+                fatal_matches = (case is not None and parser.phase == "body"
+                                 and parser.fatal is not None
+                                 and parser.armed == parser.fatal == case["expected_fatal"]
+                                 and (case["fatal_message"] is None or parser.fatal_message_seen))
                 safe_suffix = (case is not None and parser.case_abort is None
                                and parser.fatal is not None and terminated
-                               and vm.process.returncode == 0 and not vm.buffer.strip())
+                               and ((board_terminal == "failure" and vm.terminal_scope == "current-cpu"
+                                     and vm.loaded and len(pending) == 1 and fatal_matches)
+                                    if board else vm.process.returncode == 0)
+                               and not vm.buffer.strip())
                 if safe_suffix:
                     try:
                         vm.verify_resources(effective)
-                        if (parser.phase == "body"
-                                and parser.armed == parser.fatal == case["expected_fatal"]
-                                and (case["fatal_message"] is None or parser.fatal_message_seen)):
+                        if fatal_matches:
                             boot.verify_trap(args.arch, case, vm.directory, parser.fatal)
                     except DeadlineExpired as resource_error:
                         external = ("Timeout", str(resource_error))
@@ -622,11 +678,11 @@ def execute_batch(args, kernel, catalog, items, directory):
                     except (HostError, OSError, ValueError, KeyError) as resource_error:
                         infrastructure = str(resource_error)
                         safe_suffix = False
-                if (safe_suffix and parser.phase == "body"
-                        and parser.armed == parser.fatal == case["expected_fatal"]
-                        and (case["fatal_message"] is None or parser.fatal_message_seen)):
+                if safe_suffix and fatal_matches:
+                    terminal = ("board stop scope=current-cpu reason=failure" if board else
+                                f"QEMU={vm.process.returncode}")
                     parser.results[parser.active] = dict(
-                        status="Pass", reason=f"expected fatal: {parser.fatal}; QEMU={vm.process.returncode}")
+                        status="Pass", reason=f"expected fatal: {parser.fatal}; {terminal}")
                     parser.active = None
                 else:
                     external = external or ("Crash", str(error))

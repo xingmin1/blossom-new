@@ -21,7 +21,7 @@ struct Cli {
     command: Option<(PathBuf, PathBuf, Vec<String>)>,
 }
 
-/// 参数错误在挂载前结束，命令数组不经 shell 重拆。
+/// 参数错误在挂载前结束；设备名称由实际挂载边界检验，命令数组不经 shell 重拆。
 fn parse_cli() -> Result<Cli, String> {
     let args = env::args_os()
         .skip(1)
@@ -31,8 +31,7 @@ fn parse_cli() -> Result<Cli, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let device = args.first().ok_or_else(|| "Usage: contest-run DEVICE [--plan FILE] [--file FILE ...] [--list] | DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]".to_string())?;
-    let bytes = device.as_bytes();
-    if bytes.len() != 8 || &bytes[..7] != b"/dev/vd" || !bytes[7].is_ascii_lowercase() {
+    if Path::new(device).parent() != Some(Path::new("/dev")) {
         return Err(format!("invalid contest device: {device}"));
     }
     let mut cli = Cli {

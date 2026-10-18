@@ -1,13 +1,18 @@
 .DEFAULT_GOAL := all
 
 ARCH ?= riscv64
+PLATFORM ?= qemu-virt
 CPUS ?= 4
 MEMORY ?= $(if $(filter riscv64,$(ARCH)),512M,768M)
 MODE ?= debug
 PANIC ?= unwind
 KTEST_ARGS ?=
 FEATURES ?=
-OUTPUT ?= build/$(ARCH)/kernel.elf
+OUTPUT ?= $(if $(filter qemu-virt,$(PLATFORM)),build/$(ARCH),build/$(PLATFORM)/$(MODE))/kernel.elf
+BOARD_OUTPUT ?= build/$(PLATFORM)/$(MODE)
+RAMDISK ?=
+OS_DTB ?=
+BOARD_ROOT ?= $(if $(RAMDISK),/dev/ram0)
 TEST ?=
 ROOT ?= /dev/vda
 ROOT_MODE ?= ro
@@ -77,6 +82,26 @@ else
 $(error ARCH 只支持 riscv64 或 loongarch64)
 endif
 
+ifneq ($(words $(PLATFORM)),1)
+$(error PLATFORM must name exactly one platform)
+endif
+ifeq ($(filter riscv64:qemu-virt riscv64:visionfive2 loongarch64:qemu-virt loongarch64:ls2k1000la,$(ARCH):$(PLATFORM)),)
+$(error Unsupported ARCH/PLATFORM combination: $(ARCH)/$(PLATFORM))
+endif
+ifneq ($(PLATFORM),qemu-virt)
+ifneq ($(filter run debug contest,$(MAKECMDGOALS)),)
+$(error run/debug/contest require PLATFORM=qemu-virt; board-image only generates offline files)
+endif
+endif
+ifeq ($(PLATFORM),qemu-virt)
+ifneq ($(filter board-image,$(MAKECMDGOALS)),)
+$(error board-image requires PLATFORM=visionfive2 or PLATFORM=ls2k1000la)
+endif
+endif
+
+KERNEL_TARGET_DIR := $(if $(filter qemu-virt,$(PLATFORM)),os/target,build/$(PLATFORM)/target)
+KTEST_TARGET_DIR := $(if $(filter qemu-virt,$(PLATFORM)),build/ktest-target,build/$(PLATFORM)/ktest-target)
+
 ifneq ($(words $(CPUS)),1)
 $(error CPUS 必须是一个核数)
 endif
@@ -111,29 +136,32 @@ endif
 
 CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
 
-.PHONY: all delivery-rv delivery-la kernel-rv kernel-la build image run contest debug clean runtime runner work-clean help
+.PHONY: all delivery-rv delivery-la kernel-rv kernel-la build board-image image run contest debug clean runtime runner work-clean help
 
 all: delivery-rv delivery-la
 	python3 tools/mkext4.py --delivery --contest-plan "$(CONTEST_PLAN)" --profile seed4k --size-mib 256 --rv-kernel build/delivery-riscv64/kernel.elf --la-kernel build/delivery-loongarch64/kernel.elf --rv-userland-root build/delivery-riscv64/userland --la-userland-root build/delivery-loongarch64/userland --rv-runtime-root build/runtime-riscv64 --la-runtime-root build/runtime-loongarch64
 
 delivery-rv:
-	$(MAKE) runtime ARCH=riscv64 RUNTIME_OUTPUT=build/runtime-riscv64 MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)"
-	$(MAKE) build userland ARCH=riscv64 FEATURES= PANIC=abort OUTPUT=build/delivery-riscv64/kernel.elf USERLAND_BUILD=build/delivery-riscv64/busybox USERLAND_ROOT=build/delivery-riscv64/userland MUSL_CROSS="$(MUSL_CROSS_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)"
+	$(MAKE) runtime ARCH=riscv64 PLATFORM=qemu-virt RUNTIME_OUTPUT=build/runtime-riscv64 MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)"
+	$(MAKE) build userland ARCH=riscv64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/delivery-riscv64/kernel.elf USERLAND_BUILD=build/delivery-riscv64/busybox USERLAND_ROOT=build/delivery-riscv64/userland MUSL_CROSS="$(MUSL_CROSS_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)"
 
 delivery-la:
-	$(MAKE) runtime ARCH=loongarch64 RUNTIME_OUTPUT=build/runtime-loongarch64 MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)"
-	$(MAKE) build userland ARCH=loongarch64 FEATURES= PANIC=abort OUTPUT=build/delivery-loongarch64/kernel.elf USERLAND_BUILD=build/delivery-loongarch64/busybox USERLAND_ROOT=build/delivery-loongarch64/userland MUSL_CROSS="$(MUSL_CROSS_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)"
+	$(MAKE) runtime ARCH=loongarch64 PLATFORM=qemu-virt RUNTIME_OUTPUT=build/runtime-loongarch64 MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)"
+	$(MAKE) build userland ARCH=loongarch64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/delivery-loongarch64/kernel.elf USERLAND_BUILD=build/delivery-loongarch64/busybox USERLAND_ROOT=build/delivery-loongarch64/userland MUSL_CROSS="$(MUSL_CROSS_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)"
 
 kernel-rv:
-	$(MAKE) build ARCH=riscv64 FEATURES= PANIC=abort OUTPUT=build/riscv64/kernel.elf && cp build/riscv64/kernel.elf $@
+	$(MAKE) build ARCH=riscv64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/riscv64/kernel.elf && cp build/riscv64/kernel.elf $@
 
 kernel-la:
-	$(MAKE) build ARCH=loongarch64 FEATURES= PANIC=abort OUTPUT=build/loongarch64/kernel.elf && cp build/loongarch64/kernel.elf $@
+	$(MAKE) build ARCH=loongarch64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/loongarch64/kernel.elf && cp build/loongarch64/kernel.elf $@
 
 build:
-	cd os && cargo build $(CARGO_ARGS)
-	mkdir -p $(dir $(OUTPUT))
-	cp os/target/$(TARGET)/$(MODE)/os "$(OUTPUT)"
+	cd os && BLOSSOM_PLATFORM="$(PLATFORM)" CARGO_TARGET_DIR="$(abspath $(KERNEL_TARGET_DIR))" cargo build $(CARGO_ARGS)
+	mkdir -p "$(dir $(OUTPUT))"
+	cp "$(KERNEL_TARGET_DIR)/$(TARGET)/$(MODE)/os" "$(OUTPUT)"
+
+board-image: build
+	python3 tools/board.py --arch $(ARCH) --platform $(PLATFORM) --kernel "$(OUTPUT)" --output "$(BOARD_OUTPUT)" $(if $(RAMDISK),--ramdisk "$(RAMDISK)") $(if $(OS_DTB),--dtb "$(OS_DTB)") $(if $(BOARD_ROOT),--root "$(BOARD_ROOT)") --root-mode "$(ROOT_MODE)" --init "$(INIT)"
 
 runner:
 	cd userland/contest-run && env -u CARGO_ENCODED_RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(abspath $(RUNNER_TARGET_DIR))" RUSTFLAGS="$(RUNNER_FLAGS)" cargo build --release --locked --offline --target $(RUNNER_TARGET)
@@ -174,15 +202,15 @@ endif
 
 .PHONY: ktest-build ktest-list ktest
 ktest-build:
-	cd os && CARGO_TARGET_DIR=../build/ktest-target RUSTFLAGS="-Cpanic=$(PANIC) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+	cd os && BLOSSOM_PLATFORM="$(PLATFORM)" CARGO_TARGET_DIR="$(abspath $(KTEST_TARGET_DIR))" RUSTFLAGS="-Cpanic=$(PANIC) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 	mkdir -p "$(dir $(OUTPUT))"
-	cp "build/ktest-target/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
+	cp "$(KTEST_TARGET_DIR)/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
 
 ktest-list:
-	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py list --arch $(ARCH) --platform $(PLATFORM) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 ktest:
-	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py run --arch $(ARCH) --platform $(PLATFORM) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 .PHONY: user-tests
 user-tests: $(USER_OUTPUTS)
@@ -236,18 +264,25 @@ $(USERLAND_BUILD)/.config: userland/busybox.config
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" oldconfig
 
 clean:
-	cd os && cargo clean
+	cd os && CARGO_TARGET_DIR="$(abspath $(KERNEL_TARGET_DIR))" cargo clean
 	cd userland/contest-run && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(abspath $(RUNNER_TARGET_DIR))" cargo clean --offline
 	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" clean
-	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "$(OUTPUT)" kernel-rv kernel-la
-	rm -f $(addprefix $(USERLAND_ROOT)/bin/,libc-smoke network-smoke klog-read ktrace-control observation-smoke) "$(USERLAND_ROOT)/sbin/contest-run" "$(USERLAND_ROOT)/bin/busybox" "$(USERLAND_BUILD)/busybox" build/delivery-riscv64/kernel.elf build/delivery-loongarch64/kernel.elf
+	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "$(OUTPUT)" $(if $(filter qemu-virt,$(PLATFORM)),kernel-rv kernel-la)
+	rm -f $(addprefix $(USERLAND_ROOT)/bin/,libc-smoke network-smoke klog-read ktrace-control observation-smoke) "$(USERLAND_ROOT)/sbin/contest-run" "$(USERLAND_ROOT)/bin/busybox" "$(USERLAND_BUILD)/busybox" $(if $(filter qemu-virt,$(PLATFORM)),build/delivery-riscv64/kernel.elf build/delivery-loongarch64/kernel.elf)
 
 work-clean:
 	python3 tools/run.py --work-clean --work-dir "$(WORK_DIR)"
 
 help:
 	@printf '%s\n' \
-	  'build ARCH=riscv64|loongarch64       Kernel only (MODE=debug|release).' \
+	  'build ARCH=riscv64|loongarch64 PLATFORM=qemu-virt Kernel only (MODE=debug|release).' \
+	  '  Board combinations: riscv64/visionfive2, loongarch64/ls2k1000la.' \
+	  '  Board Cargo/output directories are separate from official QEMU kernels.' \
+	  'board-image PLATFORM=... BOARD_ROOT=/dev/...  Offline raw/uImage/boot.env.' \
+	  '  RAMDISK=<raw-ext4> defaults BOARD_ROOT=/dev/ram0; OS_DTB=<OS-dtb> is optional.' \
+	  '  BOARD_OUTPUT selects the artifact directory; no board or media operations.' \
+	  '  SOURCE remains the image input; IMAGE is the volume output; OUTPUT is the ELF.' \
+	  '  Single-architecture board volumes use rootdir=/; prepare them with make image.' \
 	  'runner ARCH=...                    Offline release Linux musl runner.' \
 	  '  RUNNER_SYSROOT=... RUNNER_LINKER=... override prepared compiler inputs.' \
 	  'userland ARCH=...                  BusyBox, runner, tools and smoke programs.' \
