@@ -144,7 +144,8 @@ pub(crate) enum State {
 /// 所有字段只在调度锁中访问；两组链接代表独立成员关系。
 pub(crate) struct Scheduling {
     pub state: State,
-    pub placement: Placement,
+    pub allowed: crate::cpu::CpuSet,
+    pub affinity_pending: bool,
     pub last_wait_id: WaitId,
     pub active_wait: Option<ActiveWait>,
     pub live_previous: *const Task,
@@ -438,7 +439,11 @@ fn prepare(
         ctx: UnsafeCell::new(TaskContext::initial(stack_top)),
         scheduling: UnsafeCell::new(Scheduling {
             state: State::Ready,
-            placement,
+            allowed: match &placement {
+                Placement::Any => crate::cpu::actual_set(),
+                Placement::Cpu(owner) => crate::cpu::CpuSet::single(*owner),
+            },
+            affinity_pending: false,
             last_wait_id: WaitId::initial(),
             active_wait: None,
             live_previous: ptr::null(),

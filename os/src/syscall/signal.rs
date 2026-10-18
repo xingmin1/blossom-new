@@ -46,6 +46,7 @@ fn signal_error(error: SignalError) -> Errno {
         SignalError::OnStack => Errno::NotPermitted,
         SignalError::StackTooSmall => Errno::NoMemory,
         SignalError::QueueFull => Errno::Again,
+        SignalError::NoMemory => Errno::NoMemory,
         SignalError::NoProcess => Errno::NoProcess,
         SignalError::Permission => Errno::NotPermitted,
     }

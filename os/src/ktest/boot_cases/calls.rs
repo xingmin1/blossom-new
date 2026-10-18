@@ -15,6 +15,7 @@ struct Control {
     entered: AtomicBool,
     queued: AtomicBool,
     fault: AtomicBool,
+    executed: cpu::AtomicCpuSet,
     hits: [AtomicUsize; boot::MAX_CPUS],
     returned: [AtomicBool; boot::MAX_CPUS],
     results: [AtomicUsize; boot::MAX_CPUS],
@@ -33,6 +34,7 @@ impl Fixture for Calls {
             entered: AtomicBool::new(false),
             queued: AtomicBool::new(false),
             fault: AtomicBool::new(false),
+            executed: cpu::AtomicCpuSet::new(),
             hits: core::array::from_fn(|_| AtomicUsize::new(0)),
             returned: core::array::from_fn(|_| AtomicBool::new(false)),
             results: core::array::from_fn(|_| AtomicUsize::new(usize::MAX)),
@@ -79,6 +81,10 @@ unsafe fn identity(argument: *mut ()) {
         payload.state.fault.store(true, Ordering::Release);
     }
     payload.state.hits[payload.sender].fetch_add(1, Ordering::Relaxed);
+    payload
+        .state
+        .executed
+        .insert(cpu::current().id, Ordering::Release);
     payload.result = cpu::current().id + 0x100;
 }
 
@@ -209,6 +215,16 @@ impl Calls {
     }
 }
 
+/// 成对核互发；奇数末核仍向在线 BSP 发送一次真实远程请求。
+fn pair_target(id: usize) -> usize {
+    let paired = id ^ 1;
+    if paired < cpu::count() {
+        paired
+    } else {
+        0
+    }
+}
+
 #[::ktest::suite(context = "Thread", fixture = Calls, tags("boot", "smp-call"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
@@ -222,19 +238,46 @@ pub(crate) mod cases {
         for id in 0..cpu::count() {
             fixture.finish(context, id, id)?;
         }
+        context.expect_eq(
+            fixture.state.executed.load(Ordering::Acquire),
+            cpu::actual_set(),
+        );
         Ok(())
     }
-    /// 每对在线CPU同时互发，调用者等待时必须能够服务对向IPI。
+    /// 每对在线 CPU 同时互发，奇数末核向 BSP 发送，所有调用者等待时仍服务 IPI。
     #[test]
     #[ktest(min_cpus = 2)]
     fn pair(context: &mut TestContext<'_>, fixture: &mut Calls) -> TestResult {
         for id in 0..cpu::count() {
-            fixture.sender(id, id ^ 1, false, false, false)?;
+            fixture.sender(id, pair_target(id), false, false, false)?;
         }
         fixture.release(cpu::count())?;
         for id in 0..cpu::count() {
-            fixture.finish(context, id, id ^ 1)?;
+            fixture.finish(context, id, pair_target(id))?;
         }
+        let targets = if cpu::count() % 2 == 0 {
+            cpu::actual_set()
+        } else {
+            cpu::CpuSet::prefix(cpu::count() - 1)
+        };
+        context.expect_eq(fixture.state.executed.load(Ordering::Acquire), targets);
+        Ok(())
+    }
+    /// 全部核沿环向下一核发送，真实远端 callback 必须覆盖每个逻辑编号。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn ring(context: &mut TestContext<'_>, fixture: &mut Calls) -> TestResult {
+        for id in 0..cpu::count() {
+            fixture.sender(id, (id + 1) % cpu::count(), false, false, false)?;
+        }
+        fixture.release(cpu::count())?;
+        for id in 0..cpu::count() {
+            fixture.finish(context, id, (id + 1) % cpu::count())?;
+        }
+        context.expect_eq(
+            fixture.state.executed.load(Ordering::Acquire),
+            cpu::actual_set(),
+        );
         Ok(())
     }
     /// 全部AP同时向BSP发送，每个发送者独立核一次结果可见性。

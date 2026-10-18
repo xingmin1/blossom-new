@@ -34,6 +34,8 @@ pub enum FileIoContext<'a> {
 
 const O_ACCMODE: u32 = 0o3;
 const O_WRONLY: u32 = 0o1;
+const O_CREAT: u32 = 0o100;
+const O_EXCL: u32 = 0o200;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
@@ -1083,9 +1085,10 @@ pub(crate) fn require_write(flags: u32) -> Result<(), FsError> {
     }
 }
 
-/// 同一原子更新保留全部不可变打开位，只提交支持的可变状态位。
+/// 忽略创建、访问和描述符位；未支持的可变能力先失败，再原子提交 APPEND/NONBLOCK。
 pub(crate) fn set_status_flags(flags: &AtomicU32, raw: u32) -> Result<(), FsError> {
-    if raw & !(OPEN_FLAGS | O_ACCMODE | O_CLOEXEC) != 0 {
+    let ignored = O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC;
+    if raw & !(OPEN_FLAGS | ignored) != 0 {
         return Err(FsError::Unsupported);
     }
     let _ = flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {

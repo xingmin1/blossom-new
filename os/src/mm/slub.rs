@@ -125,10 +125,20 @@ struct NodePartial {
 
 struct Cache {
     geometry: Geometry,
-    cpus: [SpinLock<CpuSlab>; MAX_CPUS],
+    cpus: &'static [Once<SpinLock<CpuSlab>>; MAX_CPUS],
     node: SpinLock<NodePartial>,
     backing: AtomicUsize,
 }
+
+impl Cache {
+    /// 借用实际 CPU 已发布的控制槽；本核及远端排空仍使用同一份短锁。
+    fn cpu(&self, owner: usize) -> &SpinLock<CpuSlab> {
+        self.cpus[owner].get().expect("SLUB CPU is not initialized")
+    }
+}
+
+static CPU_SLABS: [[Once<SpinLock<CpuSlab>>; MAX_CPUS]; SIZES.len()] =
+    [const { [const { Once::new() }; MAX_CPUS] }; SIZES.len()];
 
 static CACHES: Once<[Cache; SIZES.len()]> = Once::new();
 
@@ -166,7 +176,7 @@ fn calculate_geometry(stride: usize) -> Geometry {
     }
 }
 
-/// BSP 在页入口可用后一次发布固定 cache、CPU 与 node 控制数组。
+/// BSP 在页入口可用后逐槽初始化实际 CPU，再发布小型 cache 与 node 控制表。
 ///
 /// # Safety
 /// 仅 BSP 在 IRQ 关闭、AP 未释放且无对象消费者时调用一次；页描述符、CPU 表与
@@ -174,15 +184,21 @@ fn calculate_geometry(stride: usize) -> Geometry {
 pub(crate) unsafe fn initialize() {
     assert!(CACHES.get().is_none(), "SLUB initialized twice");
     CACHES.call_once(|| {
-        core::array::from_fn(|class| Cache {
-            geometry: calculate_geometry(SIZES[class]),
-            cpus: core::array::from_fn(|_| SpinLock::new(CpuSlab::new())),
-            node: SpinLock::new(NodePartial {
-                head: NONE,
-                tail: NONE,
-                count: 0,
-            }),
-            backing: AtomicUsize::new(0),
+        core::array::from_fn(|class| {
+            let cpus = &CPU_SLABS[class];
+            for owner in cpu::actual_set().iter() {
+                cpus[owner].call_once(|| SpinLock::new(CpuSlab::new()));
+            }
+            Cache {
+                geometry: calculate_geometry(SIZES[class]),
+                cpus,
+                node: SpinLock::new(NodePartial {
+                    head: NONE,
+                    tail: NONE,
+                    count: 0,
+                }),
+                backing: AtomicUsize::new(0),
+            }
         })
     });
 }
@@ -430,7 +446,7 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
         let exhausted = {
             let _irq = IrqSaveGuard::new();
             let owner = cpu::current().id;
-            let mut local = cache.cpus[owner].lock();
+            let mut local = cache.cpu(owner).lock();
             if let Some(pointer) = local.pop() {
                 return Some(pointer);
             }
@@ -482,7 +498,7 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
         {
             let _irq = IrqSaveGuard::new();
             let owner = cpu::current().id;
-            let mut local = cache.cpus[owner].lock();
+            let mut local = cache.cpu(owner).lock();
             if local.active == NONE {
                 let mut slot = descriptor(head).usage();
                 install(
@@ -502,7 +518,7 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
 /// 将完整 slab 的首次归还责任先发布为 CPU partial，再取得本核控制锁插链。
 /// 调用者在本核 IRQ 关闭期间调用，避免责任声明与控制插入之间被 flush 摘离。
 fn put_cpu_partial(class: usize, owner: usize, head: usize) -> usize {
-    let mut local = cache(class).cpus[owner].lock();
+    let mut local = cache(class).cpu(owner).lock();
     let drained = if CPU_PARTIAL_LIMIT <= local.partial_count {
         let old = local.partial;
         local.partial = NONE;
@@ -558,7 +574,7 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
         let _irq = IrqSaveGuard::new();
         let owner = cpu::current().id;
         {
-            let mut local = cache(class).cpus[owner].lock();
+            let mut local = cache(class).cpu(owner).lock();
             if local.active == head {
                 // SAFETY: caller 已结束此对象全部访问并交出唯一权；本核 guard 排除
                 // local 链并发访问，远端只写 shared，首 word 满足 usize 对齐。
@@ -635,14 +651,14 @@ unsafe fn detach_cpu(argument: *mut ()) {
     let tickets = unsafe { &mut *argument.cast::<[FlushTicket; SIZES.len()]>() };
     let owner = cpu::current().id;
     for (class, ticket) in tickets.iter_mut().enumerate() {
-        *ticket = cache(class).cpus[owner].lock().take_all();
+        *ticket = cache(class).cpu(owner).lock().take_all();
     }
 }
 
 /// 普通可服务 IPI 的执行流有限摘离每核缓存；合并和 backing 归还均在 callback 外。
 /// 调用者不得持 MM 短锁；并发对象操作可在返回前重新建立缓存。
 pub fn flush_all() {
-    for owner in 0..cpu::count() {
+    for owner in cpu::actual_set().iter() {
         let mut tickets = [const { FlushTicket::new() }; SIZES.len()];
         // SAFETY: owner 属于固定在线 CPU 表，调用者可服务 IPI 且不持 MM 锁；
         // 栈数组保持有效并只由该同步 callback 写入，call 完成后才读取。
@@ -759,7 +775,7 @@ pub(crate) fn slab_head_snapshot(head: usize) -> Option<SlabSnapshot> {
 /// 持指定本核控制锁取得小快照，远端只观察且不修改其 local 链。
 #[cfg(feature = "ktest")]
 pub(crate) fn cpu_snapshot(class: usize, owner: usize) -> CpuSnapshot {
-    let local = cache(class).cpus[owner].lock();
+    let local = cache(class).cpu(owner).lock();
     CpuSnapshot {
         active: local.active,
         local: local.local,

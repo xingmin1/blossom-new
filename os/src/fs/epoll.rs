@@ -11,7 +11,7 @@ use crate::fs::file::{
 };
 use crate::fs::poll::{PollMask, PollNotify, PollTable, PollWaitHead, Pollable};
 use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path};
-use crate::sync::{SleepMutex, SpinLock};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
 mod index;
 
@@ -21,7 +21,7 @@ pub const EPOLL_CTL_MOD: u32 = 3;
 pub const EPOLLONESHOT: u32 = 1 << 30;
 pub const EPOLLET: u32 = 1 << 31;
 const CLOEXEC: u32 = 0o2000000;
-const MAX_INTERESTS: usize = 128;
+const RETIRE_BATCH: usize = 16;
 const PROVIDER_SOURCES: usize = 2;
 const ORDINARY_EVENTS: u32 =
     0x001 | 0x002 | 0x004 | 0x008 | 0x010 | 0x040 | 0x080 | 0x100 | 0x200 | 0x2000;
@@ -152,6 +152,7 @@ enum ChainKind {
 
 struct Projection {
     linked: bool,
+    previous: Option<Weak<Entry>>,
     next: Link,
 }
 
@@ -164,6 +165,11 @@ struct CandidateState {
 
 struct QueueWrite;
 
+struct ScanProjection {
+    file: Option<FileRef>,
+    next: Link,
+}
+
 struct Entry {
     key: Key,
     target: Weak<dyn FileLike>,
@@ -173,13 +179,14 @@ struct Entry {
     index: index::Links,
     candidate: UnsafeCell<CandidateState>,
     sources: UnsafeCell<Option<PollTable>>,
+    scan: UnsafeCell<ScanProjection>,
 }
 
 // SAFETY: 只移动稳定 Arc 拥有；index/sources 由所属控制互斥域独占，candidate 由
-// ReadyCore 的唯一短锁访问。三个投影不重叠，所有入口都不取得整个 Entry 的可变引用。
+// ReadyCore 短锁访问，scan 由实例扫描互斥域独占。各投影不重叠，不取得整个 Entry 的可变引用。
 unsafe impl Send for Entry {}
-// SAFETY: 不可变身份、Weak 与 Arc 可共享；源回调仅使用 candidate，控制操作和扫描
-// 串行访问 index/sources，候选变更始终持 ReadyCore 短锁。
+// SAFETY: 不可变身份、Weak 与 Arc 可共享；回调仅使用 candidate，控制操作串行
+// 访问 index/sources，扫描互斥域覆盖 scan 投影的安装、查询和锁外迭代释放。
 unsafe impl Sync for Entry {}
 
 impl Entry {
@@ -210,14 +217,20 @@ impl Entry {
                 armed: false,
                 ready: Projection {
                     linked: false,
+                    previous: None,
                     next: None,
                 },
                 overflow: Projection {
                     linked: false,
+                    previous: None,
                     next: None,
                 },
             }),
             sources: UnsafeCell::new(None),
+            scan: UnsafeCell::new(ScanProjection {
+                file: None,
+                next: None,
+            }),
         })
         .map_err(|_| FsError::NoMemory)
     }
@@ -229,13 +242,20 @@ impl Entry {
         unsafe { &mut *self.candidate.get() }
     }
 
-    /// 两条链各用自己的 linked/next，扫描期间同一节点可以同时属于两个投影。
+    /// 两条链各用自己的前后投影，扫描期间同一节点可以同时属于两个投影。
     fn projection<'a>(&'a self, kind: ChainKind, write: &'a mut QueueWrite) -> &'a mut Projection {
         let state = self.candidate_mut(write);
         match kind {
             ChainKind::Ready => &mut state.ready,
             ChainKind::Overflow => &mut state.overflow,
         }
+    }
+
+    /// 扫描拥有链只在实例扫描互斥域访问，不与候选或索引投影重叠。
+    fn scan_mut<'a>(&'a self, _write: &'a mut DeferredFiles<'_>) -> &'a mut ScanProjection {
+        // SAFETY: DeferredFiles 从唯一扫描 guard 建立，直到其 Drop 迭代清链后才结束
+        // guard；ctl/callback 不访问此投影，节点始终由扫描链或当前局部 Arc 保活。
+        unsafe { &mut *self.scan.get() }
     }
 
     /// 控制域独占安装完整登记集合；集合的 sink 原票允许 callback 安全 clone 节点。
@@ -247,7 +267,7 @@ impl Entry {
         *slot = Some(sources);
     }
 
-    /// 控制域先取走集合，再在不持候选或反链锁时执行同步 source 注销。
+    /// 控制域取走集合；退休拥有在控制 guard 结束后同步注销全部 source。
     fn take_sources(&self, _tree: &mut index::Tree) -> Option<PollTable> {
         // SAFETY: 控制互斥域串行 ADD/DEL/末释放，回调不读 sources；返回值独占
         // 原集合，之后槽为空，所有源节点仍由返回的集合和源链保活至注销完成。
@@ -256,7 +276,7 @@ impl Entry {
 }
 
 impl Drop for Entry {
-    /// 末节点拥有必须已经撤全 source、树和两个候选投影，禁止暗中遗留 Arc 环。
+    /// 末节点拥有必须已撤全 source、树、候选和扫描投影，禁止遗留拥有链。
     fn drop(&mut self) {
         assert!(
             self.sources.get_mut().is_none() && self.index.detached(),
@@ -265,10 +285,17 @@ impl Drop for Entry {
         let candidate = self.candidate.get_mut();
         assert!(
             !candidate.ready.linked
+                && candidate.ready.previous.is_none()
                 && candidate.ready.next.is_none()
                 && !candidate.overflow.linked
+                && candidate.overflow.previous.is_none()
                 && candidate.overflow.next.is_none(),
             "epoll entry still queued"
+        );
+        let scan = self.scan.get_mut();
+        assert!(
+            scan.file.is_none() && scan.next.is_none(),
+            "epoll entry still holds scan ownership"
         );
     }
 }
@@ -300,14 +327,15 @@ impl Chain {
         }
     }
 
-    /// 同一投影只挂一次，尾插不分配，另一个投影的通知不会改本链。
+    /// 同一投影只挂一次，尾插建立弱回链，不形成强引用环。
     fn push_back(&mut self, node: EntryRef, write: &mut QueueWrite) {
         let projection = node.projection(self.kind, write);
         assert!(
-            !projection.linked && projection.next.is_none(),
+            !projection.linked && projection.previous.is_none() && projection.next.is_none(),
             "epoll candidate already linked"
         );
         projection.linked = true;
+        projection.previous = self.last.as_ref().map(Arc::downgrade);
         if let Some(last) = &self.last {
             last.projection(self.kind, write).next = Some(Arc::clone(&node));
         } else {
@@ -316,76 +344,78 @@ impl Chain {
         self.last = Some(node);
     }
 
-    /// 未交付项重新放回扫描首部，不提前丢失候选资格。
+    /// 未交付项重新放回扫描首部，旧首部的回链改指新节点。
     fn push_front(&mut self, node: EntryRef, write: &mut QueueWrite) {
         let projection = node.projection(self.kind, write);
         assert!(
-            !projection.linked && projection.next.is_none(),
+            !projection.linked && projection.previous.is_none() && projection.next.is_none(),
             "epoll candidate already linked"
         );
         projection.linked = true;
         projection.next = self.first.take();
-        if self.last.is_none() {
+        let next = projection.next.as_ref().cloned();
+        if let Some(next) = next {
+            next.projection(self.kind, write).previous = Some(Arc::downgrade(&node));
+        } else {
             self.last = Some(Arc::clone(&node));
         }
         self.first = Some(node);
     }
 
-    /// 摘首部时清本投影，原 interest 或 source sink 保节点不会在短锁下末释放。
+    /// 摘首部同时清前后投影，原 interest 或 sink 保节点不会在短锁下末释放。
     fn pop_front(&mut self, write: &mut QueueWrite) -> Link {
-        let node = self.first.take()?;
-        let projection = node.projection(self.kind, write);
-        self.first = projection.next.take();
-        projection.linked = false;
-        if self.first.is_none() {
-            self.last = None;
-        }
-        Some(node)
+        let node = self.first.as_ref()?.clone();
+        self.remove(&node, write)
     }
 
-    /// 整链拼接只移动首尾原票，成员投影已经挂接。
+    /// 整链拼接只移动首尾原票，接缝的前后投影在同一短锁内更新。
     fn append(&mut self, other: &mut Self, write: &mut QueueWrite) {
-        if other.first.is_none() {
+        assert!(matches!(
+            (self.kind, other.kind),
+            (ChainKind::Ready, ChainKind::Ready) | (ChainKind::Overflow, ChainKind::Overflow)
+        ));
+        let Some(first) = other.first.take() else {
             return;
-        }
+        };
+        first.projection(self.kind, write).previous = self.last.as_ref().map(Arc::downgrade);
         if let Some(last) = &self.last {
-            last.projection(self.kind, write).next = other.first.take();
+            last.projection(self.kind, write).next = Some(first);
         } else {
-            self.first = other.first.take();
+            self.first = Some(first);
         }
         self.last = other.last.take();
     }
 
-    /// ponytail: 每实例最多 128 项，单链删除有界；扩大正式容量时再使用双链投影。
+    /// 弱前驱与强后继允许 O(1) 摘除；同一 ready 锁保证回链升级必定成功。
     fn remove(&mut self, target: &EntryRef, write: &mut QueueWrite) -> Link {
-        if self
-            .first
-            .as_ref()
-            .is_some_and(|node| Arc::ptr_eq(node, target))
-        {
-            return self.pop_front(write);
+        let projection = target.projection(self.kind, write);
+        if !projection.linked {
+            return None;
         }
-        let mut cursor = self.first.as_ref().cloned();
-        while let Some(node) = cursor {
-            let next = node.projection(self.kind, write).next.as_ref().cloned();
-            if next.as_ref().is_some_and(|next| Arc::ptr_eq(next, target)) {
-                let removed = node.projection(self.kind, write).next.take().unwrap();
-                let projection = removed.projection(self.kind, write);
-                let successor = projection.next.take();
-                projection.linked = false;
-                node.projection(self.kind, write).next = successor;
-                if self
-                    .last
-                    .as_ref()
-                    .is_some_and(|last| Arc::ptr_eq(last, &removed))
-                {
-                    self.last = Some(node);
-                }
-                return Some(removed);
-            }
-            cursor = next;
+        projection.linked = false;
+        let previous = projection.previous.take().map(|previous| {
+            previous
+                .upgrade()
+                .expect("epoll candidate predecessor lost")
+        });
+        let next = projection.next.take();
+        if let Some(next) = &next {
+            next.projection(self.kind, write).previous = previous.as_ref().map(Arc::downgrade);
+        } else {
+            self.last = previous.as_ref().cloned();
         }
-        None
+        let removed = if let Some(previous) = previous {
+            core::mem::replace(&mut previous.projection(self.kind, write).next, next)
+        } else {
+            core::mem::replace(&mut self.first, next)
+        };
+        assert!(
+            removed
+                .as_ref()
+                .is_some_and(|node| Arc::ptr_eq(node, target)),
+            "epoll candidate belongs to another chain"
+        );
+        removed
     }
 }
 
@@ -512,7 +542,7 @@ impl ReadyCore {
         }
     }
 
-    /// 同步撤源后清两个候选投影，返回票在 ready 短锁外结束。
+    /// 控制域先禁用并清两个候选投影，返回票在 ready 短锁外结束。
     fn forget(&self, entry: &EntryRef) {
         let detached = {
             let mut state = self.state.lock();
@@ -528,33 +558,37 @@ impl ReadyCore {
     }
 }
 
-struct DeferredFiles {
-    files: [Option<FileRef>; MAX_INTERESTS],
-    len: usize,
+struct DeferredFiles<'a> {
+    first: Link,
+    _scan: SleepMutexGuard<'a, ()>,
 }
 
-impl DeferredFiles {
-    /// 一轮最多访问 128 个活 interest，栈内集合不在扫描或回调中扩容。
-    fn new() -> Self {
+impl<'a> DeferredFiles<'a> {
+    /// 独占扫描 guard 覆盖所有临时目标拥有和控制锁外 put，不按兴趣总量准备容器。
+    fn new(scan: SleepMutexGuard<'a, ()>) -> Self {
         Self {
-            files: core::array::from_fn(|_| None),
-            len: 0,
+            first: None,
+            _scan: scan,
         }
     }
 
-    /// 先把升级取得的实际 OFD 放入锁外退休集合，再调用可能睡眠的 provider。
-    fn query(&mut self, entry: &Entry, event: EpollEvent) -> Result<PollMask, FsError> {
+    /// 先把真实 OFD 与节点放入扫描拥有链，再调用可能睡眠的 provider。
+    fn query(&mut self, entry: &EntryRef, event: EpollEvent) -> Result<PollMask, FsError> {
         let Some(file) = entry.target.upgrade() else {
             return Ok(PollMask::default());
         };
+        let next = self.first.take();
+        let projection = entry.scan_mut(self);
         assert!(
-            self.len < self.files.len(),
-            "epoll deferred put capacity exceeded"
+            projection.file.is_none() && projection.next.is_none(),
+            "epoll entry queried twice in one scan"
         );
-        let slot = self.len;
-        self.files[slot] = Some(file);
-        self.len += 1;
-        self.files[slot]
+        projection.file = Some(file);
+        projection.next = next;
+        self.first = Some(Arc::clone(entry));
+        entry
+            .scan_mut(self)
+            .file
             .as_ref()
             .unwrap()
             .pollable()
@@ -564,9 +598,30 @@ impl DeferredFiles {
     }
 }
 
+impl Drop for DeferredFiles<'_> {
+    /// 控制 guard 已结束后逐项断开扫描链，末目标 put 可重入反向 release。
+    fn drop(&mut self) {
+        while let Some(entry) = self.first.take() {
+            let projection = entry.scan_mut(self);
+            let next = projection.next.take();
+            let file = projection.file.take();
+            self.first = next;
+            drop(file);
+            drop(entry);
+        }
+    }
+}
+
+struct RetiredEntry {
+    // 字段按声明顺序析构；先同步撤全源，具体节点拥有覆盖每个 callback 的完整尾部。
+    sources: PollTable,
+    entry: EntryRef,
+}
+
 /// 事件 OFD 本身就是 FileRef payload；控制互斥与短候选锁分别承担睡眠和通知责任。
 pub struct EpollFile {
     control: SleepMutex<index::Tree>,
+    scan: SleepMutex<()>,
     core: Arc<ReadyCore>,
     flags: AtomicU32,
     inode: u64,
@@ -584,6 +639,7 @@ impl EpollFile {
             .expect("epoll inode identity exhausted");
         Arc::try_new(Self {
             control: SleepMutex::new(index::Tree::new()),
+            scan: SleepMutex::new(()),
             core,
             flags: AtomicU32::new(2),
             inode,
@@ -673,14 +729,11 @@ impl EpollFile {
         fd: i32,
         watches: &Arc<WatchHead>,
         event: EpollEvent,
-        retired: &mut Link,
+        retired: &mut Option<RetiredEntry>,
     ) -> Result<(), FsError> {
         let key = Key::new(target, fd);
         if tree.get(key).is_some() {
             return Err(FsError::Exists);
-        }
-        if MAX_INTERESTS <= tree.len {
-            return Err(FsError::NoSpace);
         }
         let entry = Entry::prepare(owner, target, fd, &self.core, watches)?;
         let sink: Arc<dyn PollNotify> = Arc::try_new(EntrySink {
@@ -689,8 +742,11 @@ impl EpollFile {
         .map_err(|_| FsError::NoMemory)?;
         let mut sources = PollTable::new(sink, PROVIDER_SOURCES)?;
         let provider = target.pollable().unwrap();
-        // 准备期 callback 尚未 armed；失败时先 Drop 局部表同步撤全源，未发表节点无环。
-        provider.poll(Some(&mut sources))?;
+        // 准备期 callback 尚未 armed；部分登记失败也交退休拥有在控制锁外同步撤源。
+        if let Err(error) = provider.poll(Some(&mut sources)) {
+            *retired = Some(RetiredEntry { sources, entry });
+            return Err(error);
+        }
         entry.install_sources(sources, tree);
         tree.insert(Arc::clone(&entry));
         watches.attach(&entry.reverse);
@@ -709,19 +765,21 @@ impl EpollFile {
         }
     }
 
-    /// 控制域内先同步撤 source，随后 reverse、interest、ready；从不反取源锁。
-    fn detach(&self, tree: &mut index::Tree, key: Key) -> Link {
+    /// 控制域只禁用并摘离原节点，具体退休拥有在 guard 结束后同步撤源再 put。
+    fn detach(&self, tree: &mut index::Tree, key: Key) -> Option<RetiredEntry> {
         let entry = Arc::clone(tree.get(key)?);
         let sources = entry
             .take_sources(tree)
             .expect("epoll interest has no source table");
-        drop(sources);
+        self.core.forget(&entry);
         entry.watches.unlink(&entry.reverse);
         let removed = tree
             .remove(key)
             .expect("epoll interest disappeared under control lock");
-        self.core.forget(&entry);
-        Some(removed)
+        Some(RetiredEntry {
+            sources,
+            entry: removed,
+        })
     }
 
     /// 反向 release 不升级目标，只在自己的控制 guard 结束后放退休节点。
@@ -742,7 +800,7 @@ impl EpollFile {
         if maxevents == 0 {
             return Err(FsError::InvalidOperation);
         }
-        let mut deferred = DeferredFiles::new();
+        let mut deferred = DeferredFiles::new(self.scan.lock());
         let result = {
             let _control = self.control.lock();
             let mut local = self.core.begin();
@@ -792,7 +850,7 @@ impl EpollFile {
 
     /// 自身 poll 也复核候选，移走陈旧项而不消费 ET 或提前禁用 ONESHOT。
     fn query_ready(&self) -> Result<bool, FsError> {
-        let mut deferred = DeferredFiles::new();
+        let mut deferred = DeferredFiles::new(self.scan.lock());
         let result = {
             let _control = self.control.lock();
             let mut local = self.core.begin();
@@ -973,22 +1031,29 @@ impl FileLike for EpollFile {
 }
 
 impl Drop for EpollFile {
-    /// 末事件 OFD 显式撤完所有 hook 和候选 Arc 环，节点在控制 guard 结束后逐项释放。
+    /// 每轮至多摘十六项；控制锁外同步撤源及末 put，反复直到稳定树和候选链为空。
     fn drop(&mut self) {
-        let mut retired: [Link; MAX_INTERESTS] = core::array::from_fn(|_| None);
-        {
-            let mut tree = self.control.lock();
-            let mut count = 0;
-            while let Some(entry) = tree.first() {
-                retired[count] = self.detach(&mut tree, entry.key);
-                count += 1;
+        loop {
+            let mut retired: [Option<RetiredEntry>; RETIRE_BATCH] = core::array::from_fn(|_| None);
+            let empty = {
+                let mut tree = self.control.lock();
+                for slot in &mut retired {
+                    let Some(entry) = tree.first() else {
+                        break;
+                    };
+                    *slot = self.detach(&mut tree, entry.key);
+                }
+                tree.len == 0
+            };
+            drop(retired);
+            if empty {
+                break;
             }
-            let state = self.core.state.lock();
-            assert!(
-                !state.scanning && state.ready.first.is_none() && state.overflow.first.is_none(),
-                "epoll candidate chains not drained"
-            );
         }
-        drop(retired);
+        let state = self.core.state.lock();
+        assert!(
+            !state.scanning && state.ready.first.is_none() && state.overflow.first.is_none(),
+            "epoll candidate chains not drained"
+        );
     }
 }

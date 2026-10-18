@@ -1,9 +1,9 @@
 //! 静态 libc、真实脚本解释和确定迁核复用同一 UserOwner 生命周期。
 
 use super::*;
+use crate::sync::SpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::fs::ktest::user::network::network_until;
 use crate::fs::{DescriptorFlags, FileRef};
@@ -81,7 +81,13 @@ impl UserOwner {
         self.prepare_tty(context, 4)?;
         let image = self.load_named(context, LIBC, b"stage7")?;
         let target = (cpu::current().id + 1) % cpu::count();
-        self.start_console_program(context, image, Placement::Cpu(target), Credentials::ROOT)?;
+        self.start_console_program(
+            context,
+            image,
+            Placement::Cpu(target),
+            Credentials::ROOT,
+            None,
+        )?;
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -124,6 +130,7 @@ impl UserOwner {
                 &go_text[go_start..],
             ],
             &[],
+            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|_| TestError("libc migration arguments failed"))?;
         let image = exec::prepare(
@@ -131,7 +138,6 @@ impl UserOwner {
             self.path.context(),
             arguments,
             Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|error| {
             context.diagnostic(format_args!("libc-image-prepare error={:?}", error));
@@ -144,9 +150,9 @@ impl UserOwner {
         let task = user
             .executor()
             .ok_or(TestError("libc migration executor disappeared"))?;
-        let initial_mask = Arc::try_new(AtomicUsize::new(0))
+        let initial_mask = Arc::try_new(SpinLock::new(cpu::CpuSet::empty()))
             .map_err(|_| TestError("migration initial mask allocation failed"))?;
-        let first_mask = Arc::try_new(AtomicUsize::new(0))
+        let first_mask = Arc::try_new(SpinLock::new(cpu::CpuSet::empty()))
             .map_err(|_| TestError("migration first mask allocation failed"))?;
         let coordination_task = task.clone();
         let coordination_user = user.clone();
@@ -172,11 +178,11 @@ impl UserOwner {
                 }
                 let mask = coordination_user.ktest_take_user_cpu_mask();
                 if target == 0 {
-                    initial_observed.store(mask, Ordering::Release);
+                    *initial_observed.lock() = mask;
                 } else {
-                    first_observed.store(mask, Ordering::Release);
+                    *first_observed.lock() = mask;
                 }
-                if mask == 0 || (target == 1 && mask & 1 == 0) {
+                if mask == cpu::CpuSet::empty() || (target == 1 && !mask.contains(0)) {
                     return 1;
                 }
                 sched::test_request_migration(&coordination_task, target);
@@ -200,7 +206,7 @@ impl UserOwner {
         self.observer = Some(coordinator.publish());
         let event = self.wait(context)?;
         let final_mask = user.ktest_take_user_cpu_mask();
-        context.expect_eq(final_mask & (1usize << 1) != 0, true);
+        context.expect_eq(final_mask.contains(1), true);
         context.expect_eq(event.status, 0);
         if event.status != 0 {
             self.graph().request_root_exit(9);
@@ -208,11 +214,11 @@ impl UserOwner {
         self.reap_children(context, event.status != 0)?;
         context.expect_eq(self.observer.take().unwrap().join(), 0);
         context.diagnostic(format_args!(
-            "libc-migration task={} status={} blocked_windows=2 initial_mask={:#x} cpu0_mask={:#x} final_mask={:#x}",
+            "libc-migration task={} status={} blocked_windows=2 initial_mask={:?} cpu0_mask={:?} final_mask={:?}",
             task.id().as_usize(),
             event.status,
-            initial_mask.load(Ordering::Acquire),
-            first_mask.load(Ordering::Acquire),
+            *initial_mask.lock(),
+            *first_mask.lock(),
             final_mask
         ));
         Ok(())
@@ -226,20 +232,24 @@ impl UserOwner {
             b"/test/scripts/option".as_slice(),
             b"/test/scripts/chain1".as_slice(),
         ] {
-            let arguments = Arguments::from_kernel(script, &[script, b"tail"], &[SCRIPT_ENV])
-                .map_err(|_| TestError("script arguments failed"))?;
+            let arguments = Arguments::from_kernel(
+                script,
+                &[script, b"tail"],
+                &[SCRIPT_ENV],
+                exec::DEFAULT_STACK_BYTES,
+            )
+            .map_err(|_| TestError("script arguments failed"))?;
             let image = exec::prepare(
                 self.path.vfs(),
                 self.path.context(),
                 arguments,
                 Credentials::ROOT,
-                exec::DEFAULT_STACK_BYTES,
             )
             .map_err(|error| {
                 context.diagnostic(format_args!("script-image-prepare error={:?}", error));
                 TestError("script image preparation failed")
             })?;
-            self.start_console_program(context, image, Placement::Any, Credentials::ROOT)?;
+            self.start_console_program(context, image, Placement::Any, Credentials::ROOT, None)?;
             let event = self.wait(context)?;
             context.expect_eq(event.status, 0);
             if event.status != 0 {
@@ -264,18 +274,19 @@ impl UserOwner {
             },
         )?;
         context.diagnostic(format_args!(
-            "script-exec scripts=no-option,option,chain1,no-exec errors=eloop,enoent,enoexec,e2big mode0644=executed base-abi=busybox"
+            "script-exec scripts=no-option,option,chain1,no-exec errors=eloop,enoent,enoexec mode0644=executed base-abi=busybox"
         ));
         Ok(())
     }
 
-    /// 给明确选择 console 的普通入口安装标准流后发表用户任务，旧汇编入口不经过此路径。
+    /// 安装 console 标准流，可在发表前把 stdout/stderr 替换为同一输出 OFD，stdin 保持 console。
     fn start_console_program(
         &mut self,
         context: &TestContext<'_>,
         image: LoadedImage,
         placement: Placement,
         credentials: Credentials,
+        output: Option<FileRef>,
     ) -> Result<(), TestError> {
         let runtime = checked(
             context,
@@ -287,6 +298,13 @@ impl UserOwner {
             ),
         )?;
         checked(context, runtime.install_console())?;
+        if let Some(output) = output {
+            let fd = publish_descriptor(context, &runtime, output)?;
+            let limit = crate::task::process::DEFAULT_NOFILE.current as usize;
+            checked(context, runtime.files.dup_exact(fd, 1, limit))?;
+            checked(context, runtime.files.dup_exact(fd, 2, limit))?;
+            checked(context, runtime.files.close(fd))?;
+        }
         let target = match &placement {
             Placement::Cpu(target) => Some(*target),
             Placement::Any => None,
@@ -309,13 +327,75 @@ impl UserOwner {
     }
 
     /// 以实际 argv/env 准备一个明确 console 的普通程序并消费退出树。
-    fn run_console_named(
+    pub(super) fn run_console_named(
         &mut self,
         context: &mut TestContext<'_>,
         program: &[u8],
         tail: &[&[u8]],
         credentials: Credentials,
     ) -> TestResult {
+        let image = self.load_console_named(context, program, tail, credentials)?;
+        self.start_console_program(context, image, Placement::Any, credentials, None)?;
+        let event = self.wait(context)?;
+        context.expect_eq(event.status, 0);
+        if event.status != 0 {
+            self.graph().request_root_exit(9);
+        }
+        self.reap_children(context, event.status != 0)
+    }
+
+    /// 把真实 selftest 输出收集为 KTAP 注释；用户树退出、离栈和回收后才消费收集任务。
+    pub(super) fn run_selftest_named(
+        &mut self,
+        context: &mut TestContext<'_>,
+        program: &[u8],
+        tail: &[&[u8]],
+        credentials: Credentials,
+    ) -> TestResult {
+        assert!(
+            self.observer.is_none(),
+            "selftest output observer already owned"
+        );
+        let image = self.load_console_named(context, program, tail, credentials)?;
+        let (reader, writer) = checked(
+            context,
+            crate::fs::pipe::try_new(0, credentials.uid, credentials.gid),
+        )?;
+        // 收集任务只持读端；未发表时可正常 Drop，发表后由 observer 承担唯一 join 责任。
+        let collector = task::prepare_kernel(move || {
+            let mut bytes = [0u8; 128];
+            loop {
+                match reader.read(&mut bytes) {
+                    Ok(0) => return 0,
+                    Ok(count) => crate::ktest::report::write(format_args!(
+                        "  # selftest output: {}\n",
+                        bytes[..count].escape_ascii()
+                    )),
+                    Err(_) => return 1,
+                }
+            }
+        })
+        .map_err(|_| TestError("selftest output collector preparation failed"))?;
+        self.start_console_program(context, image, Placement::Any, credentials, Some(writer))?;
+        self.observer = Some(collector.publish());
+        let event = self.wait(context)?;
+        context.expect_eq(event.status, 0);
+        if event.status != 0 {
+            self.graph().request_root_exit(9);
+        }
+        self.reap_children(context, event.status != 0)?;
+        context.expect_eq(self.observer.take().unwrap().join(), 0);
+        Ok(())
+    }
+
+    /// 共用普通 console 与 selftest 的 argv/env 和 ELF 准备，不改变程序凭据及解释器语义。
+    fn load_console_named(
+        &self,
+        context: &TestContext<'_>,
+        program: &[u8],
+        tail: &[&[u8]],
+        credentials: Credentials,
+    ) -> Result<LoadedImage, TestError> {
         let mut argv = Vec::new();
         argv.try_reserve_exact(tail.len() + 1)
             .map_err(|_| TestError("console argv allocation failed"))?;
@@ -326,26 +406,14 @@ impl UserOwner {
         } else {
             &[][..]
         };
-        let arguments = Arguments::from_kernel(program, &argv, env)
+        let arguments = Arguments::from_kernel(program, &argv, env, exec::DEFAULT_STACK_BYTES)
             .map_err(|_| TestError("console named arguments failed"))?;
-        let image = exec::prepare(
-            self.path.vfs(),
-            self.path.context(),
-            arguments,
-            credentials,
-            exec::DEFAULT_STACK_BYTES,
+        exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials).map_err(
+            |error| {
+                context.diagnostic(format_args!("console-image-prepare error={:?}", error));
+                TestError("console image preparation failed")
+            },
         )
-        .map_err(|error| {
-            context.diagnostic(format_args!("console-image-prepare error={:?}", error));
-            TestError("console image preparation failed")
-        })?;
-        self.start_console_program(context, image, Placement::Any, credentials)?;
-        let event = self.wait(context)?;
-        context.expect_eq(event.status, 0);
-        if event.status != 0 {
-            self.graph().request_root_exit(9);
-        }
-        self.reap_children(context, event.status != 0)
     }
 }
 
@@ -355,7 +423,13 @@ fn publish_descriptor(
     runtime: &UserRuntime,
     file: FileRef,
 ) -> Result<usize, TestError> {
-    Ok(checked(context, runtime.files.reserve())?.publish(file, DescriptorFlags::default()))
+    Ok(checked(
+        context,
+        runtime
+            .files
+            .reserve(crate::task::process::DEFAULT_NOFILE.current as usize),
+    )?
+    .publish(file, DescriptorFlags::default()))
 }
 
 /// 为迁核 argv 生成栈内有界十进制描述符字符串，不引入准备期堆分配。

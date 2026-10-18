@@ -20,7 +20,7 @@ const PRESSURE_OBJECTS: usize = 96;
 #[derive(Default)]
 struct Counts {
     task: usize,
-    visited: usize,
+    visited: cpu::CpuSet,
     hops: usize,
     local_rounds: usize,
     page_allocs: usize,
@@ -111,7 +111,7 @@ fn check_execution(target: usize, local: &usize, witness: &StackWitness, counts:
         task::current_task_id().map(|id| id.as_usize()),
         Some(counts.task)
     );
-    counts.visited |= 1usize << target;
+    counts.visited.insert(target);
     counts.cpu_checks += 1;
 
     assert_eq!(black_box(local) as *const _ as usize, witness.address);
@@ -293,7 +293,7 @@ fn consume(fixture: &mut Payload, migrate: bool, stop: &AtomicBool) {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            let pattern = 0x40 + hop as u8;
+            let pattern = 0x40u8.wrapping_add(hop as u8);
             let origin = cpu::current().id;
             let target = hop % cpu::count();
             assert_ne!(origin, target);
@@ -311,9 +311,9 @@ fn consume(fixture: &mut Payload, migrate: bool, stop: &AtomicBool) {
     assert_eq!(
         counts.visited,
         if migrate {
-            (1usize << cpu::count()) - 1
+            cpu::actual_set()
         } else {
-            1
+            cpu::CpuSet::single(0)
         }
     );
     assert_eq!(counts.hops, if migrate { 2 * cpu::count() } else { 0 });

@@ -102,7 +102,7 @@ impl SystemOwner {
             ),
         )?;
         let vfs = Arc::try_new(vfs).map_err(|_| TestError("system VFS owner OOM"))?;
-        let files = Arc::try_new(checked(context, FileTable::try_new(8))?)
+        let files = Arc::try_new(checked(context, FileTable::try_new())?)
             .map_err(|_| TestError("system file table owner OOM"))?;
         context.expect_eq(
             checked(
@@ -268,6 +268,7 @@ fn verify_pattern(
             fixture.context(),
             pathname,
             OpenOptions::default(),
+            1024,
         ),
     )?;
     let result = (|| {
@@ -320,6 +321,7 @@ fn verify_probe(
             fixture.context(),
             pathname,
             OpenOptions::default(),
+            1024,
         ),
     )?;
     let result = (|| {
@@ -402,7 +404,7 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 6] {
 )]
 pub(crate) mod arguments {
     use super::*;
-    use crate::task::exec::{Arguments, ExecError};
+    use crate::task::exec::{self, Arguments, ExecError};
 
     /// 解析保留设备、权限和路径原始字节；执行参数分别拒绝空路径与内嵌 NUL，不证明实际启动。
     #[test]
@@ -505,7 +507,13 @@ pub(crate) mod arguments {
         ] {
             let selected = checked(context, boot_devices(bytes))?;
             context.expect_eq(
-                Arguments::from_kernel(selected.init, &[selected.init], &[]).err(),
+                Arguments::from_kernel(
+                    selected.init,
+                    &[selected.init],
+                    &[],
+                    exec::DEFAULT_STACK_BYTES,
+                )
+                .err(),
                 Some(error),
             );
         }

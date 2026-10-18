@@ -22,7 +22,7 @@ def discover(args, kernel, directory):
     """从实际 QEMU UART 读取注册 JSONL，目录不执行 fixture。"""
     catalog = Catalog(config(args))
     vm = QemuTestSession(args, kernel, directory, set())
-    deadline = time.monotonic() + args.startup_timeout
+    deadline = time.monotonic() + args.startup_timeout_seconds
     try:
         vm.handshake(config(args), b"catalog\n", deadline)
         while not catalog.done:
@@ -33,7 +33,7 @@ def discover(args, kernel, directory):
                 catalog.feed(json.loads(line))
             else:
                 require(not line.strip() or line.lstrip().startswith("#"), "unexpected catalog output")
-        finish_vm(vm, time.monotonic() + args.cleanup_timeout, catalog=True)
+        finish_vm(vm, time.monotonic() + args.cleanup_timeout_seconds, catalog=True)
         return catalog
     finally:
         vm.close()
@@ -143,7 +143,7 @@ def execute_batch(args, kernel, catalog, items, directory):
         infrastructure = None
         external = None
         safe_suffix = False
-        deadline = time.monotonic() + args.startup_timeout
+        deadline = time.monotonic() + args.startup_timeout_seconds
         setup_deadline = case_deadline = cleanup_deadline = None
         try:
             names = resource_names(suite, pending)
@@ -155,7 +155,7 @@ def execute_batch(args, kernel, catalog, items, directory):
                 event = parser.feed(vm.uart.line(effective))
                 now = time.monotonic()
                 if event == "suite-setup":
-                    setup_deadline = now + args.setup_timeout
+                    setup_deadline = now + args.setup_timeout_seconds
                 elif event == "case-abort":
                     cleanup_deadline = effective
                     setup_deadline = case_deadline = None
@@ -163,16 +163,16 @@ def execute_batch(args, kernel, catalog, items, directory):
                 elif event == "suite-error":
                     setup_deadline = case_deadline = None
                     if cleanup_deadline is None:
-                        cleanup_deadline = now + args.cleanup_timeout
+                        cleanup_deadline = now + args.cleanup_timeout_seconds
                     deadline = cleanup_deadline
                 elif event == "begin":
                     item = pending[len(parser.results)]
                     vm.uart.execution_uart.begin(item.case)
-                    case_deadline = now + min(item.case["timeout_ms"] / 1000, args.case_timeout)
+                    case_deadline = now + min(item.case["timeout_ms"] / 1000, args.case_timeout_seconds)
                     peer = vm.net_user
                     if peer is not None:
                         peer.begin(item.case, case_deadline)
-                    setup_deadline = now + args.setup_timeout
+                    setup_deadline = now + args.setup_timeout_seconds
                     cleanup_deadline = None
                     deadline = case_deadline
                     if peer is not None:
@@ -184,7 +184,7 @@ def execute_batch(args, kernel, catalog, items, directory):
                 elif event in ("quiesce", "join", "cleanup"):
                     setup_deadline = None
                     if cleanup_deadline is None:
-                        cleanup_deadline = now + args.cleanup_timeout
+                        cleanup_deadline = now + args.cleanup_timeout_seconds
                 elif isinstance(event, dict):
                     vm.uart.raw_io(event, effective, names)
                 elif isinstance(event, CaseResult):
@@ -197,9 +197,9 @@ def execute_batch(args, kernel, catalog, items, directory):
                         raise
                     setup_deadline = case_deadline = None
                     if cleanup_deadline is None:
-                        cleanup_deadline = now + args.cleanup_timeout
+                        cleanup_deadline = now + args.cleanup_timeout_seconds
                     deadline = cleanup_deadline
-            finish_vm(vm, cleanup_deadline or time.monotonic() + args.cleanup_timeout, parser)
+            finish_vm(vm, cleanup_deadline or time.monotonic() + args.cleanup_timeout_seconds, parser)
             if parser.case_abort is not None:
                 # 完整 outer/complete 与 QEMU 真实退出后才确认明确的中止 Error。
                 parser.results[parser.aborted_case_id] = dict(
@@ -213,7 +213,7 @@ def execute_batch(args, kernel, catalog, items, directory):
             if (parser.active is not None and parser.case_abort is None
                     and parser.fatal is not None and not terminated):
                 try:
-                    vm.process.wait(timeout=max(0, min(args.cleanup_timeout, effective - time.monotonic())))
+                    vm.process.wait(timeout=max(0, min(args.cleanup_timeout_seconds, effective - time.monotonic())))
                     terminated = True
                 except subprocess.TimeoutExpired:
                     pass

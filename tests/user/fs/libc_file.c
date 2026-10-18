@@ -1,6 +1,13 @@
 #include "libc_common.h"
 #include "fp.h"
 
+enum {
+    ABI_AT_EMPTY_PATH = 0x1000,
+    ABI_AT_NO_AUTOMOUNT = 0x800,
+    ABI_AT_STATX_FORCE_SYNC = 0x2000,
+    ABI_AT_STATX_DONT_SYNC = 0x4000,
+};
+
 /// 从实际 little-endian statx 字节布局取得 mode，不依赖工具链的 struct statx 定义。
 static uint16_t statx_u16(const unsigned char *bytes, size_t offset)
 {
@@ -23,6 +30,74 @@ static uint64_t statx_u64(const unsigned char *bytes, size_t offset)
     uint64_t value;
     memcpy(&value, bytes + offset, sizeof(value));
     return value;
+}
+
+/// 精确 NULL 快路与真实字符串分开查询，提示位仅从 statx 的快路判定中去除。
+static int check_statx_paths(int fd, const unsigned char expected[256])
+{
+    unsigned char result[256];
+    const unsigned valid[] = {
+        ABI_AT_EMPTY_PATH,
+        ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT,
+        ABI_AT_EMPTY_PATH | ABI_AT_STATX_FORCE_SYNC,
+        ABI_AT_EMPTY_PATH | ABI_AT_STATX_DONT_SYNC,
+        ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT | ABI_AT_STATX_DONT_SYNC,
+    };
+    for (size_t index = 0; index < sizeof(valid) / sizeof(valid[0]); ++index) {
+        if (syscall(SYS_statx, fd, (void *)NULL, valid[index], 0x7ffU, result) != 0 ||
+            memcmp(result, expected, sizeof(result)) != 0)
+            return fail("statx NULL fd identity");
+        errno = 0;
+        if (syscall(SYS_statx, 0x7fffffff, (void *)NULL, valid[index],
+                    0x7ffU, result) != -1 || errno != EBADF)
+            return fail("statx NULL invalid nonnegative fd");
+        errno = 0;
+        if (syscall(SYS_statx, fd, (void *)UINTPTR_MAX, valid[index],
+                    0x7ffU, result) != -1 || errno != EFAULT)
+            return fail("statx nonzero pathname fault");
+        errno = 0;
+        if (syscall(SYS_statx, 0x7fffffff, (void *)UINTPTR_MAX, valid[index],
+                    0x7ffU, result) != -1 || errno != EFAULT)
+            return fail("statx pathname fault before bad fd");
+        const long negative[] = { AT_FDCWD, -1, 0xffffffffUL };
+        for (size_t item = 0; item < sizeof(negative) / sizeof(negative[0]); ++item) {
+            errno = 0;
+            if (syscall(SYS_statx, negative[item], (void *)NULL, valid[index],
+                        0x7ffU, result) != -1 || errno != EFAULT)
+                return fail("statx NULL negative int fd");
+        }
+    }
+    const unsigned nonexact[] = {
+        0, ABI_AT_NO_AUTOMOUNT, ABI_AT_STATX_FORCE_SYNC,
+        ABI_AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+        ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW,
+        ABI_AT_EMPTY_PATH | ABI_AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW,
+    };
+    for (size_t index = 0; index < sizeof(nonexact) / sizeof(nonexact[0]); ++index) {
+        errno = 0;
+        if (syscall(SYS_statx, fd, (void *)NULL, nonexact[index],
+                    0x7ffU, result) != -1 || errno != EFAULT)
+            return fail("statx NULL nonexact flags");
+        errno = 0;
+        if (syscall(SYS_statx, 0x7fffffff, (void *)NULL, nonexact[index],
+                    0x7ffU, result) != -1 || errno != EFAULT)
+            return fail("statx NULL nonexact before bad fd");
+    }
+    if (syscall(SYS_statx, (1UL << 32) | (unsigned)fd, (void *)NULL,
+                ABI_AT_EMPTY_PATH, 0x7ffU, result) != 0 ||
+        memcmp(result, expected, sizeof(result)) != 0)
+        return fail("statx int fd conversion");
+    struct stat cwd;
+    if (stat(".", &cwd) != 0 ||
+        syscall(SYS_statx, AT_FDCWD, "", ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT |
+                AT_SYMLINK_NOFOLLOW, 0x7ffU, result) != 0 ||
+        statx_u64(result, 32) != (uint64_t)cwd.st_ino ||
+        statx_u16(result, 28) != (uint16_t)cwd.st_mode)
+        return fail("statx readable empty cwd");
+    if (syscall(SYS_statx, fd, "", ABI_AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                0x7ffU, result) != 0 || memcmp(result, expected, sizeof(result)) != 0)
+        return fail("statx readable empty nonexact fd");
+    return EXIT_SUCCESS;
 }
 
 /// 直接执行 statx syscall，核对真实普通文件、console、未选能力与错误后的旧运行资源。
@@ -77,6 +152,8 @@ static int check_statx(int fd)
         for (size_t offset = zero_ranges[range][0]; offset < zero_ranges[range][1]; ++offset)
             if (path_stat[offset] != 0 || fd_stat[offset] != 0 || console_stat[offset] != 0)
                 return fail("statx unsupported fields");
+    if (check_statx_paths(fd, fd_stat) != EXIT_SUCCESS)
+        return EXIT_FAILURE;
     errno = 0;
     if (syscall(SYS_statx, AT_FDCWD, "/bin/libc-smoke", 0, 0x80000000U, fd_stat) != -1 ||
         errno != EINVAL)
@@ -99,7 +176,47 @@ static int check_statx(int fd)
     return EXIT_SUCCESS;
 }
 
-/// 核对 root 与非 root 两种真实凭据，并用 fchdir 恢复实际 cwd。
+/// 消费原脚本已写好的 tmpfs 文件，拒绝创建目录组合时不能发表名字或描述符。
+static int check_openat_memory(int directory)
+{
+    int fd = openat(directory, "abi-data", O_RDWR);
+    struct stat before, after;
+    char bytes[11];
+    if (fd < 0 || fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) ||
+        before.st_size != sizeof(bytes) || read(fd, bytes, sizeof(bytes)) != sizeof(bytes) ||
+        memcmp(bytes, "tmpfs-data\n", sizeof(bytes)) != 0)
+        return fail("openat existing writable memory input");
+    int available = dup(fd);
+    if (available < 0 || close(available) != 0)
+        return fail("openat free descriptor reference");
+    const char *absent = "abi-creat-directory-absent";
+    errno = 0;
+    if (fstatat(directory, absent, &after, 0) != -1 || errno != ENOENT)
+        return fail("openat memory absent name before");
+    const char *names[] = { "abi-data", ".", absent };
+    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
+        errno = 0;
+        if (openat(directory, names[index], O_CREAT | O_DIRECTORY | O_RDWR, 0600) != -1 ||
+            errno != EINVAL)
+            return fail("openat create directory flags");
+    }
+    errno = 0;
+    if (fstatat(directory, absent, &after, 0) != -1 || errno != ENOENT)
+        return fail("openat memory absent name after");
+    int exclusive = openat(directory, "abi-data", O_EXCL | O_RDONLY);
+    if (exclusive != available || fstat(exclusive, &after) != 0 ||
+        before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_mode != after.st_mode || before.st_size != after.st_size ||
+        before.st_nlink != after.st_nlink ||
+        read(exclusive, bytes, sizeof(bytes)) != sizeof(bytes) ||
+        memcmp(bytes, "tmpfs-data\n", sizeof(bytes)) != 0)
+        return fail("openat exclusive noncreate identity and no leaked fd");
+    if (close(exclusive) != 0 || close(fd) != 0)
+        return fail("openat memory descriptor release");
+    return EXIT_SUCCESS;
+}
+
+/// 核对两种真实凭据；root 消费脚本已准备的可写 tmpfs，最后用 fchdir 恢复 cwd。
 int abi_check(unsigned uid, unsigned gid)
 {
     if ((unsigned)getuid() != uid || (unsigned)geteuid() != uid ||
@@ -126,6 +243,11 @@ int abi_check(unsigned uid, unsigned gid)
     if (plain < 0)
         return fail("open non-directory");
     if (check_statx(plain) != EXIT_SUCCESS) {
+        close(plain);
+        close(directory);
+        return EXIT_FAILURE;
+    }
+    if (uid == 0 && check_openat_memory(directory) != EXIT_SUCCESS) {
         close(plain);
         close(directory);
         return EXIT_FAILURE;

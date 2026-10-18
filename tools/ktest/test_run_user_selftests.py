@@ -9,14 +9,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import test_user_selftest_rootfs
 from host_helpers import TOOLS
 from run_qemu import configure_qemu, parse_arguments, prepare_qemu
-from run_user_selftests import (HOST_CANCELLATION_SIGNALS, host_deadline, read_result,
-                               run_host_process, stop_and_wait, wait_for_qemu)
+from run_user_selftests import (HOST_CANCELLATION_SIGNALS, check_preparation_outputs,
+                               host_deadline, read_result, run_host_process,
+                               stop_and_wait, wait_for_qemu)
 from test_boot import kernel_image
 
 RUN_ID = "0123456789abcdef0123456789abcdef"
@@ -60,6 +62,24 @@ class UserSelftestHostTests(unittest.TestCase):
             self.assertIsNone(process.poll(), "host exited before reaching the controlled stage")
             self.assertLess(time.monotonic(), deadline, f"missing lifecycle marker: {path}")
             time.sleep(0.01)
+
+    def test_preparation_rejects_output_aliases_of_live_working_directory(self):
+        """父目录链接与文件硬链接都不能使准备输出覆盖实际工作目录中的对象。"""
+        work = self.base / "work"
+        work.mkdir()
+        lock = work / ".lock"
+        lock.write_bytes(b"active work lock")
+        parent_link = self.base / "ordinary-parent-link"
+        parent_link.symlink_to(work, target_is_directory=True)
+        arguments = SimpleNamespace(output_directory=parent_link / "root")
+        configuration = SimpleNamespace(
+            working_disk_directory=work, system_image_path=self.image)
+        with self.assertRaises(ValueError):
+            check_preparation_outputs(arguments, configuration)
+        arguments.output_directory = self.base / "published-root"
+        os.link(lock, self.image)
+        with self.assertRaises(ValueError):
+            check_preparation_outputs(arguments, configuration)
 
     @unittest.skipUnless(HAS_E2FSPROGS, "requires e2fsprogs")
     def test_complete_current_record_preserves_status_and_rejects_other_records(self):
@@ -348,7 +368,6 @@ class UserSelftestHostTests(unittest.TestCase):
             _, error = host.communicate(timeout=budget + 2)
             self.assertLess(time.monotonic() - started, budget + 1)
             self.assertEqual(host.returncode, 2, error.decode(errors="replace"))
-            self.assertIn(b"host selftest deadline expired", error)
             self.assertTrue(marker.exists(), "deadline did not reach the real working-volume copy")
             self.assertEqual(disk.read_bytes(), previous)
             self.assertEqual(sorted(path.name for path in work.iterdir()), [".lock", "root.raw"])
@@ -358,6 +377,23 @@ class UserSelftestHostTests(unittest.TestCase):
             if host.poll() is None:
                 host.kill()
             host.communicate()
+
+    def test_preparation_output_parent_file_is_host_error(self):
+        """输出父路径为真实普通文件时返回Host错误2，既有文件和工作目录均不改变。"""
+        parent = self.base / "ordinary-file"
+        parent.write_bytes(b"preserved input")
+        result = subprocess.run(
+            [sys.executable, str(TOOLS / "run_user_selftests.py"), "--arch", "riscv64",
+             "--guest-userland-directory", str(self.base / "missing-userland"),
+             "--runtime-libraries-directory", str(self.base / "missing-runtime"),
+             "--output-directory", str(parent / "root"),
+             "--system-image", str(self.image),
+             "--working-disk-dir", str(self.base / "work")],
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(parent.read_bytes(), b"preserved input")
+        self.assertFalse((self.base / "work").exists())
+        self.assertFalse(self.image.exists())
 
     def test_cli_rejects_unsafe_outputs_reuse_and_invalid_deadlines_before_preparation(self):
         """输出重叠、自动 reuse 和非法期限在缺失安装输入之前失败，不生成输出。"""

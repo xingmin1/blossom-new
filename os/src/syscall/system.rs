@@ -4,7 +4,7 @@ use core::convert::TryFrom;
 
 use crate::block::partition::DeviceSelector;
 use crate::block::AccessMode;
-use crate::fs::memfs::{FilesystemStat, MemoryFs, MemoryFsKind};
+use crate::fs::memfs::{FilesystemStat, MemoryFs};
 use crate::fs::{devfs, procfs, Ext4Volume, Filesystem, Path, ResolveMode};
 use crate::storage::Storage;
 use crate::syscall::error::{copyout, Errno, SysResult};
@@ -15,6 +15,7 @@ use crate::{mm, sched, time};
 
 const PATH_LIMIT: usize = 4096;
 const MS_RDONLY: usize = 1;
+const MS_REMOUNT: usize = 32;
 const MS_SILENT: usize = 0x8000;
 const UMOUNT_NOFOLLOW: usize = 8;
 const STATFS_SIZE: usize = 120;
@@ -159,23 +160,28 @@ fn encode_statfs(stat: FilesystemStat, mode: AccessMode) -> [u8; STATFS_SIZE] {
     bytes
 }
 
-/// uid0 才可挂载原设备的 ext4 或独立内存后端；输入各读取一次，锁外准备后沿原 Mount 发表。
+/// 新挂载构造真实后端；tmpfs 重配只修改目标原实例的已出现额度字段。
 pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("mount has no runtime");
     if runtime.credentials.uid != 0 {
         return Err(Errno::NotPermitted);
     }
-    if raw[3] & !(MS_RDONLY | MS_SILENT) != 0 || raw[2] == 0 {
+    let remount = raw[3] & MS_REMOUNT != 0;
+    if raw[3] & !(MS_RDONLY | MS_SILENT | MS_REMOUNT) != 0 || (!remount && raw[2] == 0) {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("mount has no MM");
-    let source = if raw[0] == 0 {
+    let source = if remount || raw[0] == 0 {
         None
     } else {
         Some(mm.read_c_string(raw[0], PATH_LIMIT)?)
     };
     let target = mm.read_c_string(raw[1], PATH_LIMIT)?;
-    let kind = mm.read_c_string(raw[2], PATH_LIMIT)?;
+    let kind = if remount {
+        None
+    } else {
+        Some(mm.read_c_string(raw[2], PATH_LIMIT)?)
+    };
     let options = if raw[4] == 0 {
         None
     } else {
@@ -187,7 +193,22 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     } else {
         AccessMode::ReadWrite
     };
-    let (filesystem, mode) = match kind.as_slice() {
+    if remount {
+        let (vfs, context) = {
+            let fs = runtime.fs.lock();
+            (fs.vfs.clone(), fs.context.clone())
+        };
+        let path = vfs.resolve_from(
+            &context,
+            context.cwd(),
+            &target,
+            ResolveMode::Follow,
+            Some((runtime.credentials.uid, runtime.credentials.gid)),
+        )?;
+        path.reconfigure_tmpfs(requested_mode, options)?;
+        return Ok(0);
+    }
+    let (filesystem, mode) = match kind.as_deref().expect("new mount has no type") {
         b"ext4" => {
             if !options.is_empty() {
                 return Err(Errno::InvalidArgument);
@@ -200,15 +221,14 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
             (Filesystem::Ext4(volume), requested_mode)
         }
         b"tmpfs" => {
-            let root_mode = tmpfs_mode(options)?;
-            let filesystem = MemoryFs::try_new(MemoryFsKind::Tmpfs, root_mode)?;
+            let filesystem = MemoryFs::try_tmpfs(options)?;
             (Filesystem::Memory(filesystem), requested_mode)
         }
         b"proc" | b"devfs" => {
             if !options.is_empty() {
                 return Err(Errno::InvalidArgument);
             }
-            let filesystem = if kind.as_slice() == b"proc" {
+            let filesystem = if kind.as_deref() == Some(b"proc".as_slice()) {
                 procfs::try_new(0o555)?
             } else {
                 devfs::try_new(0o755)?
@@ -263,11 +283,11 @@ pub(super) fn umount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     Ok(0)
 }
 
-/// 对当前 VFS 的全部真实挂载执行锁外同步，后端失败按原 errno 返回。
+/// 等待当前 VFS 全部真实挂载完成同步；系统调用不报告后端错误，OFD 错误样本保持独立。
 pub(super) fn sync(user: &UserThread) -> SysResult {
     let runtime = user.runtime().expect("sync has no runtime");
     let vfs = runtime.fs.lock().vfs.clone();
-    vfs.sync()?;
+    let _ = vfs.sync();
     Ok(0)
 }
 
@@ -300,31 +320,4 @@ pub(super) fn reboot(user: &UserThread, raw: &[usize; 6]) -> Outcome {
         Ok(()) => Outcome::GroupExit(0),
         Err(error) => Outcome::Return(Errno::from(error).result()),
     }
-}
-
-/// 只解析唯一完整八进制 mode，空选项使用 1777；逗号、重复键及超出权限位均拒绝。
-fn tmpfs_mode(options: &[u8]) -> Result<u16, Errno> {
-    if options.is_empty() {
-        return Ok(0o1777);
-    }
-    let digits = options
-        .strip_prefix(b"mode=")
-        .ok_or(Errno::InvalidArgument)?;
-    if digits.is_empty() {
-        return Err(Errno::InvalidArgument);
-    }
-    let mut mode = 0u16;
-    for &digit in digits {
-        if !(b'0'..=b'7').contains(&digit) {
-            return Err(Errno::InvalidArgument);
-        }
-        mode = mode
-            .checked_mul(8)
-            .and_then(|value| value.checked_add(u16::from(digit - b'0')))
-            .ok_or(Errno::InvalidArgument)?;
-        if 0o7777 < mode {
-            return Err(Errno::InvalidArgument);
-        }
-    }
-    Ok(mode)
 }

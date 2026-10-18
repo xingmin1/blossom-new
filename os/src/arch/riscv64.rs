@@ -60,7 +60,8 @@ static mut RV_BOOT_ROOT: PageTable = PageTable([0; 512]);
 #[link_section = ".boot.tables"]
 static mut RV_BOOT_IMAGE: PageTable = PageTable([0; 512]);
 #[link_section = ".boot.tables"]
-static mut FINAL_TABLES: [PageTable; 64] = [const { PageTable([0; 512]) }; 64];
+static mut FINAL_TABLES: [PageTable; MAX_BOOT_TABLES] =
+    [const { PageTable([0; 512]) }; MAX_BOOT_TABLES];
 #[no_mangle]
 static mut RV_FINAL_SATP: usize = 0;
 
@@ -221,9 +222,9 @@ pub fn mmio_address(pa: usize) -> usize {
 /// 取得最终页表池中的一张表，不创建可别名的 Rust 引用。
 ///
 /// # Safety
-/// `index` 必须小于 64；调用者必须独占尚未激活的最终表池。
+/// `index` 必须小于 MAX_BOOT_TABLES；调用者必须独占尚未激活的最终表池。
 unsafe fn table(index: usize) -> *mut usize {
-    // SAFETY: 调用者保证索引落在完整的 64 张静态 PageTable 内。
+    // SAFETY: 调用者保证索引落在完整的静态 PageTable 池内。
     unsafe {
         ptr::addr_of_mut!(FINAL_TABLES)
             .cast::<PageTable>()
@@ -236,7 +237,7 @@ unsafe fn table(index: usize) -> *mut usize {
 /// # Safety
 /// BSP 必须独占未激活的表池；va/pa/end 必须页对齐、无地址溢出且位于实际映射窗口。
 /// va 必须为 Sv39 canonical 地址；已有非叶 PTE 必须仅指向该池，
-/// 映射不得覆盖既有叶项；next 必须是 1..=64 中首张未使用表的索引。
+/// 映射不得覆盖既有叶项；next 必须是 1..=MAX_BOOT_TABLES 中首张未使用表的索引。
 unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next: &mut usize) {
     // SAFETY: 调用者保证表池独占、地址范围有效；槽索引被限制到 512 项内，
     // 新表的容量在取址前检查，非叶项只由本函数写入池中表的物理地址。
@@ -249,7 +250,10 @@ unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next
                 let slot = current.add((va >> (12 + 9 * level)) & 511);
                 let mut pte = ptr::read(slot);
                 if pte == 0 {
-                    assert!(*next < 64, "Sv39 boot page table pool exhausted");
+                    assert!(
+                        *next < MAX_BOOT_TABLES,
+                        "Sv39 boot page table pool exhausted"
+                    );
                     let child = table(*next);
                     *next += 1;
                     pte = (virt_to_phys(child as usize) >> 2) | 1;
@@ -279,7 +283,23 @@ struct BootMapping {
     flags: usize,
 }
 
-const MAX_BOOT_MAPPINGS: usize = 1 + MAX_MEMORY_REGIONS + 3 + MAX_VIRTIO_MMIO + 1 + 4 + 16;
+// 每套 setup 最多引用两组各八个时钟及其父源、三个复位和十六个引脚 provider。
+// UART 只有时钟，RTC、MMC、GMAC 各有完整 setup；重复 provider 在加入映射时合并。
+const MAX_CLOCK_MAPPINGS: usize = 2 * (8 + 8);
+const MAX_SETUP_MAPPINGS: usize = MAX_CLOCK_MAPPINGS + 3 + 16;
+const MAX_BOOT_MAPPINGS: usize = 1
+    + MAX_MEMORY_REGIONS
+    + 6
+    + MAX_VIRTIO_MMIO
+    + 1
+    + 4
+    + 5
+    + MAX_CLOCK_MAPPINGS
+    + 3 * MAX_SETUP_MAPPINGS;
+// 内核只占 Sv39 高半的 256 个根槽；各映射的 VA/PA 有相同的 2MiB 页内偏移，
+// 因而仅首尾各可能需要一个 L0，其余部分使用 2MiB 叶。保留区不新增映射。
+const MAX_BOOT_BRANCHES: usize = 256 + 2 * MAX_BOOT_MAPPINGS;
+const MAX_BOOT_TABLES: usize = 1 + MAX_BOOT_BRANCHES;
 
 /// 在建表之前核对页边界、canonical VA 和所有实际映射的虚拟范围不重叠。
 fn add_mapping(
@@ -293,17 +313,20 @@ fn add_mapping(
         physical.start < physical.end
             && (physical.start | physical.end | virtual_start) & 4095 == 0
     );
+    assert_eq!(
+        (virtual_start ^ physical.start) & 0x1f_ffff,
+        0,
+        "Sv39 boot mapping offsets differ"
+    );
     let virtual_end = virtual_start
         .checked_add(physical.end - physical.start)
         .expect("Sv39 mapping address overflows");
     for address in [virtual_start, virtual_end - 1] {
-        let upper = address >> 39;
-        let expected = if address & (1usize << 38) == 0 {
-            0
-        } else {
-            usize::MAX >> 39
-        };
-        assert_eq!(upper, expected, "Sv39 mapping is not canonical");
+        assert_eq!(
+            address >> 38,
+            usize::MAX >> 38,
+            "Sv39 kernel mapping is not canonical high-half"
+        );
     }
     for old in &mappings[..*count] {
         let old_end = old.virtual_start + (old.physical.end - old.physical.start);
@@ -378,9 +401,9 @@ fn add_setup_mappings(
     }
 }
 
-/// 按实际 2MiB/4KiB 叶项计算唯一 L1/L0 表数，64页不足时在写表前明确失败。
+/// 按实际叶项计算唯一 L1/L0 表数，在写表前拒绝超出同源静态池的输入。
 fn mapping_table_count(mappings: &[BootMapping]) -> usize {
-    let mut branches = [usize::MAX; 64];
+    let mut branches = [usize::MAX; MAX_BOOT_BRANCHES];
     let mut count = 0;
     for mapping in mappings {
         let mut va = mapping.virtual_start;
@@ -390,7 +413,10 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
             let keys = [va >> 30, (1usize << 63) | (va >> 21)];
             for &key in &keys[..if huge { 1 } else { 2 }] {
                 if !branches[..count].contains(&key) {
-                    assert!(count < 63, "Sv39 boot page table pool exhausted");
+                    assert!(
+                        count < branches.len(),
+                        "Sv39 boot page table pool exhausted"
+                    );
                     branches[count] = key;
                     count += 1;
                 }
@@ -496,7 +522,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         ptr::write_bytes(
             ptr::addr_of_mut!(FINAL_TABLES).cast::<u8>(),
             0,
-            size_of::<[PageTable; 64]>(),
+            size_of::<[PageTable; MAX_BOOT_TABLES]>(),
         );
         let mut next = 1;
         for mapping in &mappings[..count] {
@@ -594,15 +620,17 @@ pub fn wait_for_interrupt() {
 /// 关闭全局 SIE 时复查提示并执行 WFI，随后临时服务 IRQ，返回保持 IRQ 关闭。
 ///
 /// # Safety
-/// 仅允许本核 scheduler 的 IRQ-off、无锁且无普通 guard 的最终等待边界调用；
-/// 原子必须属于本核并永久有效，trap 与各独立 IRQ 源已经使能；测试计数不得非原子访问。
+/// 仅允许本核永久 boot/scheduler 栈上的最终等待边界调用：IRQ 关闭、无普通任务、
+/// 锁或 IRQ/BH/preempt guard，允许临时服务 IRQ，栈不得迁移或回收。
+/// kick_pending 与测试计数是本核永久字段；wake_pending 在本次调用期间地址稳定，
+/// 所有原子只能原子访问，唤醒方按所属协议发表条件并通知本核；trap 与独立 IRQ 源已使能。
 pub(crate) unsafe fn idle_once(
     kick_pending: &AtomicUsize,
-    need_resched: &AtomicBool,
+    wake_pending: &AtomicBool,
     #[cfg(feature = "ktest")] wait_completions: &AtomicUsize,
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
-    if kick_pending.load(Ordering::Acquire) == 0 && !need_resched.load(Ordering::Acquire) {
+    if kick_pending.load(Ordering::Acquire) == 0 && !wake_pending.load(Ordering::Acquire) {
         // SAFETY: 调用者保证 S-mode、本核有效 trap 栈与独立使能的 IRQ 源。
         // WFI 在全局 SIE 关闭时仍由独立使能源的 pending 唤醒，通知不会在检查与等待间被消费。
         unsafe { asm!("wfi", options(nostack)) };
@@ -610,7 +638,7 @@ pub(crate) unsafe fn idle_once(
         wait_completions.fetch_add(1, Ordering::Release);
     }
     // SAFETY: 调用者保证无锁且可服务 IRQ；无论是否执行 WFI 都开放一次处理 pending，
-    // 再关闭 SIE 返回调度段，不恢复任何旧 CPU 的 IRQ 状态。
+    // 再关闭 SIE 返回本核等待边界，不恢复任何旧 CPU 的 IRQ 状态。
     unsafe {
         asm!(
             "csrsi sstatus, 2",
@@ -792,13 +820,10 @@ pub unsafe fn external_complete(source: u32) {
     // SAFETY: 本核真实 claim 与已验证 S context 对应，固定 enable 保留其完成资格。
     unsafe { mmio_write(claim_offset(), source) };
 }
-/// 用户与 FS 生命周期已停稳后请求 SBI SRST poweroff，拒绝固件错误和异常返回。
+/// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST poweroff。
+/// 仅限能服务 IRQ/IPI、无业务锁及待完成 CSD 责任的普通执行上下文。
 pub fn shutdown() -> ! {
-    let _stop = if crate::platform::current() == crate::boot::Platform::VisionFive2 {
-        Some(crate::cpu::stop_other_online_cpus())
-    } else {
-        None
-    };
+    let _stop = crate::cpu::stop_other_online_cpus();
     if crate::platform::current() == crate::boot::Platform::VisionFive2 {
         disable_stop_sources();
     }
@@ -819,13 +844,10 @@ pub fn halt() -> ! {
     }
 }
 
-/// 用户与 FS 生命周期已停稳后请求 SBI SRST cold restart，拒绝固件错误和异常返回。
+/// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST cold restart。
+/// 调用环境与 shutdown 相同，停核 guard 持有至固件执行整机动作。
 pub fn restart() -> ! {
-    let _stop = if crate::platform::current() == crate::boot::Platform::VisionFive2 {
-        Some(crate::cpu::stop_other_online_cpus())
-    } else {
-        None
-    };
+    let _stop = crate::cpu::stop_other_online_cpus();
     if crate::platform::current() == crate::boot::Platform::VisionFive2 {
         disable_stop_sources();
     }

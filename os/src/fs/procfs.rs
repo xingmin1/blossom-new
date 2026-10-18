@@ -17,8 +17,6 @@ use crate::net::NetStack;
 use crate::sync::SleepMutex;
 use crate::{accounting, cpu, irq, mm, time};
 
-const SNAPSHOT_LIMIT: usize = 64 * 1024;
-
 /// 每个实际打开实例拥有本次文本和共享游标，重新打开才观察新的系统状态。
 pub struct SnapshotFile {
     path: Path,
@@ -27,7 +25,7 @@ pub struct SnapshotFile {
     flags: AtomicU32,
 }
 
-/// 格式化只允许有限 fallible 增长，原始分配错误保留到格式化边界返回。
+/// 格式化按实际文本 fallible 增长，原始分配错误保留到格式化边界返回。
 struct SnapshotText {
     bytes: Vec<u8>,
     error: Option<FsError>,
@@ -55,15 +53,18 @@ impl SnapshotText {
 }
 
 impl Write for SnapshotText {
-    /// 每个格式片段先检查上限并准备容量，然后无失败追加。
+    /// 每个格式片段先检查长度运算并准备容量，然后完整追加。
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        let result = if SNAPSHOT_LIMIT - self.bytes.len() < text.len() {
-            Err(FsError::FileTooLarge)
-        } else {
-            self.bytes
-                .try_reserve_exact(text.len())
-                .map_err(|_| FsError::NoMemory)
-        };
+        let result = self
+            .bytes
+            .len()
+            .checked_add(text.len())
+            .ok_or(FsError::FileTooLarge)
+            .and_then(|_| {
+                self.bytes
+                    .try_reserve(text.len())
+                    .map_err(|_| FsError::NoMemory)
+            });
         if let Err(error) = result {
             self.error = Some(error);
             return Err(fmt::Error);
@@ -129,9 +130,6 @@ pub fn open(
         }
         _ => return Err(FsError::InvalidOperation),
     };
-    if SNAPSHOT_LIMIT < bytes.len() {
-        return Err(FsError::FileTooLarge);
-    }
     Ok(Arc::try_new(SnapshotFile {
         path,
         bytes,
@@ -144,12 +142,10 @@ pub fn open(
 /// 复制固件命令行的完整原字节并追加一个换行，不解释内容或改变编码。
 fn cmdline() -> Result<Vec<u8>, FsError> {
     let bootargs = boot::info().bootargs();
-    if SNAPSHOT_LIMIT <= bootargs.len() {
-        return Err(FsError::FileTooLarge);
-    }
+    let length = bootargs.len().checked_add(1).ok_or(FsError::FileTooLarge)?;
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(bootargs.len() + 1)
+        .try_reserve_exact(length)
         .map_err(|_| FsError::NoMemory)?;
     bytes.extend_from_slice(bootargs);
     bytes.push(b'\n');

@@ -16,8 +16,8 @@ use crate::fs::FsError;
 use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
-const INODE_LIMIT: usize = 128;
-const PAGE_LIMIT: usize = 4096;
+mod options;
+pub use options::TmpfsOptions;
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1 << 32);
 
 /// 后端容量快照只保存块与 inode 计数；挂载模式由取得快照的完整 Path 提供。
@@ -153,6 +153,8 @@ struct MemoryIndex {
     inodes: Vec<MemorySlot>,
     next_number: u64,
     pages: usize,
+    max_pages: usize,
+    max_inodes: usize,
     namespace: Weak<DentryCache>,
     root_dentry: Weak<Dentry>,
     /// 名字域首次公开后禁止可信初始化，即使弱 cache/root 此后已退休。
@@ -181,16 +183,33 @@ impl Drop for MemoryPageCharge {
 }
 
 impl MemoryFs {
-    /// 可睡眠构造真实根与固定 canonical 预算，任一分配失败不发表实例。
+    /// 普通 tmpfs 使用实际 RAM 默认额度，可信 dev/proc 节点不施加挂载额度。
     pub fn try_new(kind: MemoryFsKind, root_mode: u16) -> Result<Arc<Self>, FsError> {
-        let mut inodes = Vec::new();
-        inodes
-            .try_reserve_exact(INODE_LIMIT)
-            .map_err(|_| FsError::NoMemory)?;
-        inodes.resize_with(INODE_LIMIT, || MemorySlot {
-            number: 0,
-            inode: Weak::new(),
-        });
+        let limits = if kind == MemoryFsKind::Tmpfs {
+            TmpfsOptions::default().limits(managed_pages())
+        } else {
+            (0, 0)
+        };
+        Self::try_with_limits(kind, root_mode, limits)
+    }
+
+    /// 解析用户挂载选项并构造同一真实状态，不预分配额度对应的 inode 或页。
+    pub fn try_tmpfs(options: &[u8]) -> Result<Arc<Self>, FsError> {
+        let pages = managed_pages();
+        let options = TmpfsOptions::parse(options, pages)?;
+        Self::try_with_limits(
+            MemoryFsKind::Tmpfs,
+            options.mode.unwrap_or(0o1777),
+            options.limits(pages),
+        )
+    }
+
+    /// 所有内存实例共用根和计费状态，只有额度策略由可信调用者选定。
+    fn try_with_limits(
+        kind: MemoryFsKind,
+        root_mode: u16,
+        (max_pages, max_inodes): (usize, usize),
+    ) -> Result<Arc<Self>, FsError> {
         let device = NEXT_DEVICE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -203,9 +222,11 @@ impl MemoryFs {
             rename: SleepMutex::new(()),
             allocation: SleepMutex::new(()),
             index: SpinLock::new(MemoryIndex {
-                inodes,
+                inodes: Vec::new(),
                 next_number: 1,
                 pages: 0,
+                max_pages,
+                max_inodes,
                 namespace: Weak::new(),
                 root_dentry: Weak::new(),
                 namespace_published: false,
@@ -251,8 +272,7 @@ impl MemoryFs {
         }
     }
 
-    /// 同一短索引锁内观察 tmpfs 的原页票和可复用弱槽，不清索引或分配对象。
-    /// 固定设备与 proc 节点没有数据块容量，保持零计数。
+    /// 同一短索引锁内观察额度、实际原页票与活 canonical inode；无限字段保持零。
     pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
         let mut stat = FilesystemStat {
             fs_type: match self.kind {
@@ -270,18 +290,46 @@ impl MemoryFs {
         };
         if self.kind == MemoryFsKind::Tmpfs {
             let index = self.index.lock();
-            let used_inodes = index
-                .inodes
-                .iter()
-                .filter(|slot| 0 < slot.inode.strong_count())
-                .count();
-            stat.blocks = PAGE_LIMIT as u64;
-            stat.free = (PAGE_LIMIT - index.pages) as u64;
+            let used_inodes = index.used_inodes();
+            stat.blocks = index.max_pages as u64;
+            if index.max_pages != 0 {
+                stat.free = (index.max_pages - index.pages) as u64;
+            }
             stat.available = stat.free;
-            stat.files = INODE_LIMIT as u64;
-            stat.freefiles = (INODE_LIMIT - used_inodes) as u64;
+            stat.files = index.max_inodes as u64;
+            if index.max_inodes != 0 {
+                stat.freefiles = (index.max_inodes - used_inodes) as u64;
+            }
         }
         Ok(stat)
+    }
+
+    /// 与 inode 构造和页票预留串行，全部 seen 额度校验成功后一次提交。
+    /// mode 只用于初始根，重配不会修改根 inode 或替换原名字和 mapping。
+    pub fn reconfigure(&self, bytes: &[u8]) -> Result<(), FsError> {
+        if self.kind != MemoryFsKind::Tmpfs {
+            return Err(FsError::InvalidOperation);
+        }
+        let options = TmpfsOptions::parse(bytes, managed_pages())?;
+        let _allocation = self.allocation.lock();
+        let mut index = self.index.lock();
+        if let Some(limit) = options.blocks {
+            if limit != 0 && (index.max_pages == 0 || limit < index.pages) {
+                return Err(FsError::InvalidOperation);
+            }
+        }
+        if let Some(limit) = options.inodes {
+            if limit != 0 && (index.max_inodes == 0 || limit < index.used_inodes()) {
+                return Err(FsError::InvalidOperation);
+            }
+        }
+        if let Some(limit) = options.blocks {
+            index.max_pages = limit;
+        }
+        if let Some(limit) = options.inodes {
+            index.max_inodes = limit;
+        }
+        Ok(())
     }
 
     /// 外部根引用保活本实例，根内部 Arc 不反向强持文件系统。
@@ -385,33 +433,68 @@ impl MemoryFs {
         rdev: u64,
     ) -> Result<InodeRef, FsError> {
         let _allocation = self.allocation.lock();
-        let (position, number) = {
+        let (position, number, growth) = {
             let mut index = self.index.lock();
+            if index.max_inodes != 0 && index.max_inodes <= index.used_inodes() {
+                return Err(FsError::NoSpace);
+            }
             let position = index
                 .inodes
                 .iter()
-                .position(|slot| slot.inode.strong_count() == 0)
-                .ok_or(FsError::NoSpace)?;
+                .position(|slot| slot.inode.strong_count() == 0);
+            let growth = if position.is_none() && index.inodes.len() == index.inodes.capacity() {
+                Some(
+                    index
+                        .inodes
+                        .len()
+                        .checked_mul(2)
+                        .ok_or(FsError::NoMemory)?
+                        .max(4),
+                )
+            } else {
+                None
+            };
             let number = index.next_number;
             index.next_number = number.checked_add(1).ok_or(FsError::NoSpace)?;
-            (position, number)
+            (position, number, growth)
         };
+        let mut prepared = Vec::new();
+        if let Some(length) = growth {
+            prepared
+                .try_reserve(length)
+                .map_err(|_| FsError::NoMemory)?;
+        }
         metadata.number = number;
         metadata.rdev = rdev;
         let inode = InodeRef::try_memory(self, metadata, content)?;
         let weak = Arc::downgrade(&inode.memory_arc());
-        let retired = core::mem::replace(
-            &mut self.index.lock().inodes[position],
-            MemorySlot {
-                number,
-                inode: weak,
-            },
-        );
-        drop(retired);
+        let slot = MemorySlot {
+            number,
+            inode: weak,
+        };
+        let (retired_slot, retired_buffer) = {
+            let mut index = self.index.lock();
+            if let Some(position) = position {
+                (
+                    Some(core::mem::replace(&mut index.inodes[position], slot)),
+                    None,
+                )
+            } else {
+                let retired = if growth.is_some() {
+                    prepared.append(&mut index.inodes);
+                    Some(core::mem::replace(&mut index.inodes, prepared))
+                } else {
+                    None
+                };
+                index.inodes.push(slot);
+                (None, retired)
+            }
+        };
+        drop((retired_slot, retired_buffer));
         Ok(inode)
     }
 
-    /// 从有限弱 canonical 索引取得原对象，准备中的候选也使用同一身份。
+    /// 从可增长弱 canonical 索引取得原对象，仍被外部拥有的身份不能复用。
     pub(crate) fn find(self: &Arc<Self>, number: u64) -> Result<InodeRef, FsError> {
         let inode = self
             .index
@@ -426,11 +509,12 @@ impl MemoryFs {
 
     /// 原页分配前预留额度，失败申请与最终归页都消费同一不可复制票。
     pub(crate) fn reserve_page(self: &Arc<Self>) -> Result<MemoryPageCharge, FsError> {
+        let _allocation = self.allocation.lock();
         let mut index = self.index.lock();
-        if PAGE_LIMIT <= index.pages {
+        if index.max_pages != 0 && index.max_pages <= index.pages {
             return Err(FsError::NoSpace);
         }
-        index.pages += 1;
+        index.pages = index.pages.checked_add(1).ok_or(FsError::NoMemory)?;
         Ok(MemoryPageCharge {
             filesystem: Arc::downgrade(self),
         })
@@ -477,4 +561,20 @@ impl MemoryFs {
         drop(index);
         Ok((cache, root))
     }
+}
+
+impl MemoryIndex {
+    /// 权威目录及外部 fd/VMA/folio 保活的原 inode 都继续占额。
+    fn used_inodes(&self) -> usize {
+        self.inodes
+            .iter()
+            .filter(|slot| 0 < slot.inode.strong_count())
+            .count()
+    }
+}
+
+/// 使用启动后稳定的受管 RAM 总页数，不把当前空闲页或物理地址跨度当作总容量。
+fn managed_pages() -> usize {
+    let stats = crate::mm::pages().stats();
+    stats.present_pages - stats.reserved_pages - stats.metadata_pages
 }

@@ -1,6 +1,7 @@
 //! 成熟 TCP 算法拥有连接自己的 ring 与环境；本层只处理包拥有、复制进度和时间域转换。
 
 use ::core::convert::TryFrom;
+use alloc::vec::Vec;
 use smoltcp::socket::tcp::TcpContext;
 use smoltcp::socket::{tcp, PollAt};
 use smoltcp::time::{Duration, Instant};
@@ -24,10 +25,15 @@ pub enum ProtocolDeadline {
 pub struct TcpCore {
     socket: tcp::Socket<'static>,
     context: tcp::TcpContextState,
+    buffers_ready: bool,
+    receive_capacity: usize,
+    send_capacity: usize,
+    receive_budget: usize,
+    send_budget: usize,
 }
 
 impl TcpCore {
-    /// 在发表前准备两个 fallible ring 和独立随机环境，失败只释放未发表的存储。
+    /// 创建零容量冷核心并记录后备配置，首次监听或连接才准备两向 ring。
     pub fn try_new(
         rx_len: usize,
         tx_len: usize,
@@ -40,14 +46,39 @@ impl TcpCore {
         if ip_mtu < 68 || (u16::MAX as usize) < ip_mtu {
             return Err(FsError::InvalidOperation);
         }
-        let rx = tcp::SocketBuffer::new(zeroed_bytes(rx_len)?);
-        let tx = tcp::SocketBuffer::new(zeroed_bytes(tx_len)?);
-        let mut socket = tcp::Socket::new(rx, tx);
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(Vec::new()),
+            tcp::SocketBuffer::new(Vec::new()),
+        );
         socket.set_congestion_control(tcp::CongestionControl::Reno);
         Ok(Self {
             socket,
             context: tcp::TcpContextState::new(Instant::ZERO, ip_mtu, seed),
+            buffers_ready: false,
+            receive_capacity: rx_len,
+            send_capacity: tx_len,
+            receive_budget: rx_len,
+            send_budget: tx_len,
         })
+    }
+
+    /// 操作拥有内一次安装两向后备；任一准备失败保留冷 raw、选项和环境。
+    pub(crate) fn prepare_buffers(&mut self) -> Result<(), FsError> {
+        if self.buffers_ready {
+            return Ok(());
+        }
+        let rx = tcp::SocketBuffer::new(zeroed_bytes(self.receive_capacity)?);
+        let tx = tcp::SocketBuffer::new(zeroed_bytes(self.send_capacity)?);
+        let mut socket = tcp::Socket::new(rx, tx);
+        socket.set_congestion_control(self.socket.congestion_control());
+        socket.set_nagle_enabled(self.socket.nagle_enabled());
+        socket.set_keep_alive(self.socket.keep_alive());
+        socket.set_recv_budget(self.receive_budget);
+        socket.set_send_budget(self.send_budget);
+        self.socket = socket;
+        // 后备安装后永不再替换 raw，协议回到 Closed 也保留原队列和算法拥有。
+        self.buffers_ready = true;
+        Ok(())
     }
 
     /// 源地址和端口已由网络域选择；本核心只开始这个明确四元组的握手。
@@ -57,6 +88,7 @@ impl TcpCore {
         peer: InetEndpoint,
         now: MonotonicInstant,
     ) -> Result<(), FsError> {
+        self.prepare_buffers()?;
         self.context.set_now(raw_time(now));
         self.socket
             .connect(&mut self.context, peer.raw(), local.raw())
@@ -68,6 +100,7 @@ impl TcpCore {
 
     /// 监听保留通配地址，不分配临时端口；绑定冲突属于同一网络域的表。
     pub fn listen(&mut self, local: InetEndpoint) -> Result<(), FsError> {
+        self.prepare_buffers()?;
         self.socket
             .listen(local.raw_listen())
             .map_err(|error| match error {
@@ -226,41 +259,47 @@ impl TcpCore {
         }
     }
 
-    /// 返回 raw 接收 ring 的实际容量，listener child 用它准备同容量存储。
+    /// 返回配置的接收后备容量，冷 listener child 仍继承同容量。
     pub fn receive_capacity(&self) -> usize {
-        self.socket.recv_capacity()
+        self.receive_capacity
     }
 
-    /// 返回 raw 发送 ring 的实际容量，不另存一份可能失配的配置。
+    /// 返回配置的发送后备容量，冷对象不以零 ring 限制早期选项。
     pub fn send_capacity(&self) -> usize {
-        self.socket.send_capacity()
+        self.send_capacity
     }
 
-    /// 接纳预算与物理后备独立，旧接收数据和通告信用仍由 raw 保存。
+    /// 返回配置的接收预算，激活后同值交给 raw 管理数据和通告信用。
     pub fn receive_budget(&self) -> usize {
-        self.socket.recv_budget()
+        self.receive_budget
     }
 
-    /// 未 ACK 字节占用同一 raw 发送预算。
+    /// 返回配置的发送预算，激活后未 ACK 字节占用同一预算。
     pub fn send_budget(&self) -> usize {
-        self.socket.send_budget()
+        self.send_budget
     }
 
-    /// 预算必须处于真实接收后备内，不重建 ring 或裁剪旧数据。
+    /// 预算须处于配置的接收后备内，热核心只调整原 ring 的接纳预算。
     pub fn set_receive_budget(&mut self, budget: usize) -> Result<(), FsError> {
         if budget == 0 || self.receive_capacity() < budget {
             return Err(FsError::InvalidOperation);
         }
-        self.socket.set_recv_budget(budget);
+        if self.buffers_ready {
+            self.socket.set_recv_budget(budget);
+        }
+        self.receive_budget = budget;
         Ok(())
     }
 
-    /// 预算必须处于真实发送后备内，未 ACK 内容保持原拥有。
+    /// 预算须处于配置的发送后备内，热核心保留已有未 ACK 字节。
     pub fn set_send_budget(&mut self, budget: usize) -> Result<(), FsError> {
         if budget == 0 || self.send_capacity() < budget {
             return Err(FsError::InvalidOperation);
         }
-        self.socket.set_send_budget(budget);
+        if self.buffers_ready {
+            self.socket.set_send_budget(budget);
+        }
+        self.send_budget = budget;
         Ok(())
     }
 

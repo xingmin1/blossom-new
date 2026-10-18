@@ -10,20 +10,197 @@ pub(crate) mod stack {
     use smoltcp::wire::{IpAddress, IpProtocol, IpRepr, Ipv4Address, Ipv6Address, UdpRepr};
 
     use super::owner::StackOwner;
+    use super::socket_udp_lease::receive_exact;
     use super::stack_helpers::{accepted, listener, udp_buffer};
     use super::support::{
         child_operation, observe, operation, pattern, socket_retired, CLIENT, SERVER,
     };
+    use crate::cache::ktest::HeapPressure;
     use crate::fs::{FsError, PollMask, ReadBuffer, WriteBuffer};
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
     use crate::net::packet::OwnedPacket;
     use crate::net::route::InterfaceId;
+    use crate::net::table::NetTables;
     use crate::net::udp::UdpEndpoint;
     use crate::net::{IoProgress, LOOPBACK_CAPACITY, LOOPBACK_MTU};
-    use crate::sync::SpinLock;
+    use crate::sync::{Completion, SpinLock};
     use crate::{cpu, time, timer};
 
+    /// 独立生产表填满实际容量后，真实 OOM 只阻止新索引发表，原端点和双向消息仍可恢复。
+    #[test]
+    #[ktest(tags("network-growth"))]
+    fn udp_owner_table_growth_no_memory_preserves_prepared_objects(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let first = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+        child_operation(first.bind(SERVER))?;
+        let candidate = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+        let source = child_operation(candidate.bind(CLIENT))?;
+        // 独立表不接管回调寿命；原 fixture 的正式表始终覆盖全部端点直到同步停止。
+        let table = child_operation(NetTables::try_new())?;
+        child_operation(table.insert_udp(Arc::clone(&first)))?;
+        let capacity = table.ktest_udp_storage()[0].1;
+        let mut fillers = Vec::new();
+        fillers
+            .try_reserve_exact(capacity - 1)
+            .map_err(|_| TestError("UDP owner table fillers OOM"))?;
+        while table.ktest_udp_storage()[0].0 < capacity {
+            let endpoint = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+            child_operation(table.insert_udp(Arc::clone(&endpoint)))?;
+            fillers.push(endpoint);
+        }
+        let before = table.ktest_udp_storage();
+        let root_before = fixture.net.tables().ktest_udp_storage();
+        context.expect_eq(before[0].0, before[0].1);
+        let mut pressure = HeapPressure::prepare()?;
+        fixture.net.work_queue().flush();
+        let evidence = pressure.exhaust();
+        let result = table.insert_udp(Arc::clone(&candidate));
+        let after = table.ktest_udp_storage();
+        let root_after = fixture.net.tables().ktest_udp_storage();
+        let old_present = ::core::iter::once(&first)
+            .chain(fillers.iter())
+            .all(|endpoint| {
+                table
+                    .udp_by_id(endpoint.id())
+                    .is_some_and(|entry| Arc::ptr_eq(&entry, endpoint))
+            });
+        let unpublished = table.udp_by_id(candidate.id()).is_none();
+        let root_key = fixture
+            .net
+            .tables()
+            .lookup_udp(SERVER, source)
+            .map(|entry| entry.id());
+        drop(pressure);
+        context.diagnostic(format_args!(
+            "UDP owner table capacity={} pressure={:?} insert={:?}",
+            before[0].1, evidence, result
+        ));
+        context.expect_eq(evidence, (true, true));
+        context.expect_eq(result, Err(FsError::NoMemory));
+        context.expect_eq(after, before);
+        context.expect_eq(root_after, root_before);
+        context.expect_eq(old_present, true);
+        context.expect_eq(unpublished, true);
+        context.expect_eq(root_key, Some(first.id()));
+        child_operation(table.insert_udp(Arc::clone(&candidate)))?;
+        context.expect_eq(table.ktest_udp_storage()[0].0, before[0].0 + 1);
+        context.expect_eq(
+            table
+                .udp_by_id(candidate.id())
+                .is_some_and(|entry| Arc::ptr_eq(&entry, &candidate)),
+            true,
+        );
+        for (sender, receiver, expected_source, destination) in [
+            (&candidate, &first, source, SERVER),
+            (&first, &candidate, SERVER, source),
+        ] {
+            let payload: [u8; 513] = ::core::array::from_fn(pattern);
+            context.expect_eq(
+                child_operation(sender.send(&payload, Some(destination)))?,
+                IoProgress::Ready(payload.len()),
+            );
+            receive_exact(receiver, &payload, expected_source)?;
+        }
+        drop(table);
+        for endpoint in &fillers {
+            endpoint.close();
+        }
+        first.close();
+        candidate.close();
+        drop((first, candidate, fillers));
+        socket_retired(&fixture.net)
+    }
+
+    /// Completion 同时释放两个真实 Task 的关闭与创建工作，全部成功端点逐个消费真实消息。
+    #[test]
+    #[ktest(min_cpus = 2, tags("network-growth"))]
+    fn udp_close_and_create_publish_parallel_consumes_all_successes(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let sender = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+        let source = child_operation(sender.bind(CLIENT))?;
+        let mut old = Vec::new();
+        old.try_reserve_exact(129)
+            .map_err(|_| TestError("UDP closing owners OOM"))?;
+        let mut new = Vec::new();
+        new.try_reserve_exact(129)
+            .map_err(|_| TestError("UDP creating owners OOM"))?;
+        for index in 0..129u16 {
+            let endpoint = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+            let local = child_operation(endpoint.bind(InetEndpoint {
+                port: 47000 + index,
+                ..SERVER
+            }))?;
+            let bytes = index.to_le_bytes();
+            context.expect_eq(
+                child_operation(sender.send(&bytes, Some(local)))?,
+                IoProgress::Ready(bytes.len()),
+            );
+            receive_exact(&endpoint, &bytes, source)?;
+            old.push(endpoint);
+        }
+        let before = fixture.net.tables().ktest_udp_storage();
+        let start =
+            Arc::try_new(Completion::new()).map_err(|_| TestError("UDP parallel start OOM"))?;
+        let ready =
+            Arc::try_new(Completion::new()).map_err(|_| TestError("UDP parallel ready OOM"))?;
+        let closing_start = Arc::clone(&start);
+        let closing_ready = Arc::clone(&ready);
+        let closed = Arc::try_new(AtomicUsize::new(0))
+            .map_err(|_| TestError("UDP close observation OOM"))?;
+        let closing_count = Arc::clone(&closed);
+        let closer =
+            crate::ktest::spawn_result_on((cpu::current().id + 1) % cpu::count(), move |_| {
+                closing_ready.complete();
+                closing_start.wait();
+                for endpoint in old {
+                    endpoint.close();
+                    closing_count.fetch_add(1, Ordering::Release);
+                }
+                Ok(0)
+            })?;
+        ready.wait();
+        start.complete();
+        for index in 0..129u16 {
+            let endpoint = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
+            child_operation(endpoint.bind(InetEndpoint {
+                port: 47200 + index,
+                ..SERVER
+            }))?;
+            new.push(endpoint);
+        }
+        context.expect_eq(closer.join()?, 0);
+        context.expect_eq(closed.load(Ordering::Acquire), 129);
+        context.expect_eq(new.len(), 129);
+        context.diagnostic(format_args!(
+            "UDP parallel close={} created={} storage-before={:?} storage-after={:?}",
+            closed.load(Ordering::Acquire),
+            new.len(),
+            before,
+            fixture.net.tables().ktest_udp_storage()
+        ));
+        for (index, endpoint) in new.iter().enumerate() {
+            let local = endpoint
+                .local()
+                .ok_or(TestError("UDP concurrent publication lost binding"))?;
+            let bytes: [u8; 513] = ::core::array::from_fn(|offset| pattern(offset + index * 513));
+            context.expect_eq(
+                child_operation(sender.send(&bytes, Some(local)))?,
+                IoProgress::Ready(bytes.len()),
+            );
+            receive_exact(endpoint, &bytes, source)?;
+        }
+        for endpoint in &new {
+            endpoint.close();
+        }
+        sender.close();
+        drop((new, sender));
+        socket_retired(&fixture.net)
+    }
     /// IPv6 通配 port0 的同一租约覆盖 IPv4，V6ONLY port0 则允许同端口的 IPv4 绑定。
     #[test]
     fn udp_dual_stack_port_zero_reserves_both_protocol_faces(
@@ -629,18 +806,15 @@ pub(crate) mod stack {
         )?;
         let mut nodes: Vec<Arc<UdpEndpoint>> = Vec::new();
         nodes
-            .try_reserve_exact(128)
-            .map_err(|_| TestError("endpoint capacity observation allocation failed"))?;
-        for _ in 0..128 {
+            .try_reserve_exact(129)
+            .map_err(|_| TestError("endpoint growth observation allocation failed"))?;
+        for _ in 0..129 {
             nodes.push(operation(
                 context,
                 fixture.net.try_new_udp(AddressFamily::Ipv4),
             )?);
         }
-        match fixture.net.try_new_udp(AddressFamily::Ipv4) {
-            Err(FsError::NoMemory) => {}
-            _ => return Err(TestError("live endpoint slot capacity not enforced")),
-        }
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 129);
         for endpoint in &nodes {
             endpoint.close();
         }

@@ -79,7 +79,12 @@ pub unsafe fn initialize(info: &BootInfo) {
         "physical memory is already initialized"
     );
 
-    let mut memory = BootMemory::new(info)
+    let mut memory = const { BootMemory::empty() };
+    memory
+        .initialize(
+            &info.memory[..info.memory_count],
+            &info.reserved[..info.reserved_count],
+        )
         .unwrap_or_else(|error| panic!("memory boot range initialization failed: {}", error));
     // SAFETY: 调用者保证 BSP 独占实际空闲 RAM、IRQ 关闭且 AP 未释放；BootMemory
     // 来自完整实际 BootInfo，backing 使用永久可写且一一对应的 RAM 直接映射，

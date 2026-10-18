@@ -36,7 +36,6 @@ SECTIONS {
   __bss_end = .;
   __kernel_virt_end = .;
   __kernel_phys_end = . - __kernel_virt_start + __kernel_phys_start;
-  __boot_stacks_phys = BOOT_STACKS - __kernel_virt_start + __kernel_phys_start;
   __bootstrap_root_phys = RV_BOOT_ROOT - __kernel_virt_start + __kernel_phys_start;
   __bootstrap_image_phys = RV_BOOT_IMAGE - __kernel_virt_start + __kernel_phys_start;
   __bss_phys_start = __bss_start - __kernel_virt_start + __kernel_phys_start;

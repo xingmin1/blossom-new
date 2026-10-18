@@ -19,6 +19,7 @@ use crate::mm::user_table::{
 use crate::mm::vma::{self, MmapState, Vma, VmaBacking};
 use crate::mm::{AnonPageRef, FolioRef, OwnedPages, PAGE_SIZE};
 use crate::sync::{IrqSaveGuard, ReadGuard, SleepRwLock, SpinLock, SpinLockGuard};
+use crate::task::{self, process::Resource};
 
 /// 用户映射失败保留范围、权限、实际文件和内存不足各自的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -771,6 +772,24 @@ impl Mm {
         Ok(())
     }
 
+    /// 登记初始栈实际范围并允许当前绑定线程随后向下增长；不预留整个软限额。
+    /// 离线 exec 候选须先完整登记构栈所需页，首次触页仍沿普通 fault 准备原页。
+    pub fn map_stack(
+        &self,
+        address: usize,
+        length: usize,
+        permissions: PagePermissions,
+        maximum: PagePermissions,
+    ) -> Result<(), VmError> {
+        let range = vma::checked_range(address, length)?;
+        let vma = Vma::try_stack(range, permissions, maximum)?;
+        let mut mmap = self.mmap.write();
+        let retired = self.insert_vma(&mut mmap, vma)?;
+        drop(mmap);
+        drop(retired);
+        Ok(())
+    }
+
     /// 映射持完整打开实例，属性检查与取页均不占 mmap/PTE 锁，关闭 fd 不撤销映射。
     pub fn map_file(
         &self,
@@ -934,7 +953,7 @@ impl Mm {
         Ok(address)
     }
 
-    /// byte break 与页增删在单次 mmap 写侧完成；零请求及任何失败均返回原 break。
+    /// byte break 与页增删在单次 mmap 写侧完成；增长避开栈 guard，任何失败均保原 break。
     pub(crate) fn brk(&self, request: usize) -> usize {
         let mut mmap = self.mmap.write();
         let old = mmap.heap_end;
@@ -951,7 +970,7 @@ impl Mm {
         let mut inserted = None;
         if previous < end {
             let range = previous..end;
-            if !mmap.vacant(&range) {
+            if !mmap.vacant_with_guard(&range) {
                 return old;
             }
             let permissions = PagePermissions {
@@ -982,13 +1001,21 @@ impl Mm {
         request
     }
 
-    /// 按当前 VMA 与实际叶权限处理缺页、COW 或文件写准备，睡眠与复制均在映射锁外。
+    /// 按当前 VMA 与实际叶权限处理缺页、COW 或文件写准备；缺口仅允许当前绑定栈增长。
+    /// 限额快照、睡眠与原页准备均在短锁外，栈身份与页分别沿原 mmap/PTE 协议发表。
     pub fn fault(&self, address: usize, access: UserAccess) -> Result<(), VmError> {
         let base = address & !(PAGE_SIZE - 1);
         let mut attempt = ReclaimAttempt::new();
         loop {
-            let Some(source) = self.fault_source(address, access)? else {
-                return Ok(());
+            let source = match self.fault_source(address, access) {
+                Ok(Some(source)) => source,
+                Ok(None) => return Ok(()),
+                Err(VmError::Unmapped) => {
+                    let limit = self.current_stack_limit().ok_or(VmError::Unmapped)?;
+                    self.grow_stack(address, access, limit)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             if access == UserAccess::Write && source.vma.is_shared_file() {
                 if self.mkwrite(&source, address, &mut attempt)? {
@@ -1141,6 +1168,40 @@ impl Mm {
             drop(prepared);
             return Ok(());
         }
+    }
+
+    /// 只从合法普通 Task 的实际用户绑定取当前 STACK soft，离线或无关 Mm 不借用限额。
+    /// 所有拥有和值在独立短段取得，返回前释放短锁，调用者随后才取得 mmap 写侧。
+    fn current_stack_limit(&self) -> Option<u64> {
+        task::current_task_id()?;
+        let task = task::current_task();
+        let user = task.user_thread()?;
+        let active = current_mm()?;
+        if !core::ptr::eq(Arc::as_ptr(&active), self) {
+            return None;
+        }
+        let bound = user.mm()?;
+        if !Arc::ptr_eq(&active, &bound) {
+            return None;
+        }
+        let identity = user.identity()?;
+        Some(identity.group().resource_limit(Resource::Stack).current)
+    }
+
+    /// 在 mmap 写侧重查真实缺口并准备完整替换索引；分配或边界失败不发表部分范围。
+    /// 原驻留页及叶不变，新缺页在返回后才沿 fault 的锁外准备和短锁提交处理。
+    fn grow_stack(&self, address: usize, access: UserAccess, limit: u64) -> Result<(), VmError> {
+        let mut mmap = self.mmap.write();
+        if mmap.find(address).is_some() {
+            return Ok(());
+        }
+        let stack = mmap.stack_growth(address, access, limit)?;
+        let range = stack.range.clone();
+        let vmas = mmap.replacement(&range, Some(stack))?;
+        let retired = self.publish_vmas(&mut mmap, vmas, None)?;
+        drop(mmap);
+        drop(retired);
+        Ok(())
     }
 
     /// 文件写准备退出所有 FS guard 后重新检查范围；最终遵守 mmap→invalidate→folio→PTE。
@@ -1351,7 +1412,7 @@ impl Mm {
         }))
     }
 
-    /// 短页命中保持读侧及 PTE 拥有稳定；缺页/COW 返回 None，调用者须放锁后 fault。
+    /// 短页命中保持读侧及 PTE 拥有稳定；缺 VMA、缺页或 COW 返回 None，调用者放锁后 fault。
     /// visit 不得分配、睡眠、调度、构造用户内容引用或保留可继续访问的原始地址。
     pub(crate) fn with_page<R>(
         &self,
@@ -1360,7 +1421,9 @@ impl Mm {
         visit: impl FnOnce(usize) -> R,
     ) -> Result<Option<R>, VmError> {
         let mmap = self.mmap.read();
-        let vma = mmap.find(address).ok_or(VmError::Unmapped)?;
+        let Some(vma) = mmap.find(address) else {
+            return Ok(None);
+        };
         if !vma.allows(access) {
             return Err(VmError::Permission);
         }
@@ -1912,9 +1975,9 @@ unsafe fn invalidate_cpu(_: *mut ()) {
     arch::sync_user_icache();
 }
 
-/// 叶修改在 PTE/范围短锁外同步所有在线 CPU，固定 ASID0 不需要活动核代次集合。
+/// 叶修改在 PTE/范围短锁外同步全部实际 CPU，固定 ASID0 不维护每个 Mm 的活跃集合。
 pub(crate) fn sync_all() {
-    for target in 0..cpu::count() {
+    for target in cpu::actual_set().iter() {
         // SAFETY: CPU 在线集合启动后固定，普通可切换任务能服务本地 IPI；
         // 未持 PTE 或其他 callback 锁，回调只做架构动作，不读取空参数或递归 call。
         unsafe { cpu::call(target, invalidate_cpu, core::ptr::null_mut()) };

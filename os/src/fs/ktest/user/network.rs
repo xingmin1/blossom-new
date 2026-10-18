@@ -238,10 +238,20 @@ impl UserOwner {
             let (ready_reader, ready_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
             let (go_reader, go_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
             checked(context, ready_reader.set_status_flags(0o4000))?;
-            let ready_fd = checked(context, runtime.files.reserve())?
-                .publish(ready_writer, DescriptorFlags::default());
-            let go_fd = checked(context, runtime.files.reserve())?
-                .publish(go_reader, DescriptorFlags::default());
+            let ready_fd = checked(
+                context,
+                runtime
+                    .files
+                    .reserve(crate::task::process::DEFAULT_NOFILE.current as usize),
+            )?
+            .publish(ready_writer, DescriptorFlags::default());
+            let go_fd = checked(
+                context,
+                runtime
+                    .files
+                    .reserve(crate::task::process::DEFAULT_NOFILE.current as usize),
+            )?
+            .publish(go_reader, DescriptorFlags::default());
             Some((ready_reader, go_writer, ready_fd, go_fd))
         } else {
             None
@@ -278,19 +288,14 @@ impl UserOwner {
             _ if nic || channels.is_some() => 4,
             _ => 2,
         };
-        let arguments = Arguments::from_kernel(PROGRAM, &argv[..count], &[])
-            .map_err(|_| TestError("network user arguments failed"))?;
-        let image = exec::prepare(
-            self.path.vfs(),
-            self.path.context(),
-            arguments,
-            credentials,
-            exec::DEFAULT_STACK_BYTES,
-        )
-        .map_err(|error| {
-            context.diagnostic(format_args!("network-user image-error={:?}", error));
-            TestError("network user image preparation failed")
-        })?;
+        let arguments =
+            Arguments::from_kernel(PROGRAM, &argv[..count], &[], exec::DEFAULT_STACK_BYTES)
+                .map_err(|_| TestError("network user arguments failed"))?;
+        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
+            .map_err(|error| {
+                context.diagnostic(format_args!("network-user image-error={:?}", error));
+                TestError("network user image preparation failed")
+            })?;
         let prepared = task::prepare_program(self.graph(), None, image, runtime, Placement::Any)
             .map_err(|_| TestError("network user task preparation failed"))?;
         let pid = prepared.pid();

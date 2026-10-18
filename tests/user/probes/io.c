@@ -1,5 +1,7 @@
 #include "io_private.h"
 
+enum { ABI_AT_NO_AUTOMOUNT = 0x800, ABI_AT_EMPTY_PATH = 0x1000 };
+
 unsigned char io_buffer[16384] __attribute__((aligned(8)));
 static struct StorageStat data_stat, dir_stat, first_stat, second_stat, link_stat, temporary;
 static unsigned char file_segment = 0x57;
@@ -178,6 +180,70 @@ static long check_paths(long fd)
     return directory;
 }
 
+/// NULL 与可读空串分开核验；打开失败保持原名字，EXCL 不改变非创建路径。
+static void check_stat_open(long fd, long directory, long mapping)
+{
+    E(190, probe_sys4(PROBE_NR_NEWFSTATAT, -100, IO_DATA, &temporary,
+                     ABI_AT_NO_AUTOMOUNT), 0);
+    equal(191, &data_stat, &temporary, 128);
+    E(192, probe_sys4(PROBE_NR_NEWFSTATAT, directory, "link", &temporary,
+                     ABI_AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW), 0);
+    equal(193, &link_stat, &temporary, 128);
+    E(194, probe_sys4(PROBE_NR_NEWFSTATAT, fd, "", &temporary,
+                     ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT), 0);
+    equal(195, &data_stat, &temporary, 128);
+    E(196, probe_sys4(PROBE_NR_NEWFSTATAT, fd, 0, &temporary, ABI_AT_EMPTY_PATH), 0);
+    equal(197, &data_stat, &temporary, 128);
+    E(198, probe_sys4(PROBE_NR_NEWFSTATAT, fd, 0, &temporary,
+                     ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT), -EFAULT);
+    E(199, probe_sys4(PROBE_NR_NEWFSTATAT, fd, 0, &temporary,
+                     ABI_AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW), -EFAULT);
+    E(200, probe_sys4(PROBE_NR_NEWFSTATAT, fd, 0, &temporary, 0), -EFAULT);
+    E(201, probe_sys4(PROBE_NR_NEWFSTATAT, 0x7fffffff, 0, &temporary,
+                     ABI_AT_EMPTY_PATH), -EBADF);
+    E(202, probe_sys4(PROBE_NR_NEWFSTATAT, -1, 0, &temporary,
+                     ABI_AT_EMPTY_PATH), -EFAULT);
+    E(203, probe_sys4(PROBE_NR_NEWFSTATAT, -100, 0, &temporary,
+                     ABI_AT_EMPTY_PATH), -EFAULT);
+    E(204, probe_sys4(PROBE_NR_NEWFSTATAT, fd, mapping + 4096, &temporary,
+                     ABI_AT_EMPTY_PATH), -EFAULT);
+    E(205, probe_sys4(PROBE_NR_NEWFSTATAT, 0x7fffffff, mapping + 4096, &temporary,
+                     ABI_AT_EMPTY_PATH), -EFAULT);
+    E(206, probe_sys4(PROBE_NR_NEWFSTATAT, -100, ".", &temporary, 0), 0);
+    struct StorageStat cwd = temporary;
+    E(207, probe_sys4(PROBE_NR_NEWFSTATAT, -100, "", &temporary,
+                     ABI_AT_EMPTY_PATH), 0);
+    equal(208, &cwd, &temporary, 128);
+    E(209, probe_sys4(PROBE_NR_NEWFSTATAT, fd, "", &temporary,
+                     ABI_AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW), 0);
+    equal(210, &data_stat, &temporary, 128);
+    E(211, probe_sys4(PROBE_NR_NEWFSTATAT, (1UL << 32) | (unsigned long)fd,
+                     0, &temporary, ABI_AT_EMPTY_PATH), 0);
+    equal(212, &data_stat, &temporary, 128);
+    E(213, probe_sys4(PROBE_NR_NEWFSTATAT, 0x7fffffff, 0, &temporary,
+                     ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT), -EFAULT);
+    E(214, probe_sys4(PROBE_NR_NEWFSTATAT, 0xffffffffUL, 0, &temporary,
+                     ABI_AT_EMPTY_PATH), -EFAULT);
+    E(215, probe_sys4(PROBE_NR_NEWFSTATAT, fd, "", &temporary, 0), -ENOENT);
+    E(216, probe_sys4(PROBE_NR_NEWFSTATAT, -100, "", &temporary,
+                     ABI_AT_EMPTY_PATH | ABI_AT_NO_AUTOMOUNT), 0);
+    equal(217, &cwd, &temporary, 128);
+    const char *absent = "/test/io-dir/creat-directory-absent";
+    E(218, probe_sys4(PROBE_NR_NEWFSTATAT, -100, absent, &temporary, 0), -ENOENT);
+    E(219, probe_sys4(SYS_openat, -100, IO_DATA, O_CREAT | O_DIRECTORY, 0600), -EINVAL);
+    E(220, probe_sys4(SYS_openat, -100, "/test/io-dir",
+                     O_CREAT | O_DIRECTORY, 0700), -EINVAL);
+    E(221, probe_sys4(SYS_openat, -100, absent, O_CREAT | O_DIRECTORY, 0600), -EINVAL);
+    E(222, probe_sys4(PROBE_NR_NEWFSTATAT, -100, absent, &temporary, 0), -ENOENT);
+    E(223, probe_sys4(SYS_openat, -100, mapping + 4096,
+                     O_CREAT | O_DIRECTORY, 0600), -EINVAL);
+    long exclusive = probe_sys4(SYS_openat, -100, IO_DATA, O_EXCL | O_RDONLY, 0);
+    PROBE_CHECK(224, 0 <= exclusive);
+    E(225, probe_sys2(PROBE_NR_FSTAT, exclusive, &temporary), 0);
+    equal(226, &data_stat, &temporary, 128);
+    E(227, probe_sys1(SYS_close, exclusive), 0);
+}
+
 /// readlink 仅写实际目标字节，短读与完整读均必须保留尾哨兵。
 static void check_readlink(long directory)
 {
@@ -281,6 +347,7 @@ _Noreturn void probe_main(const unsigned long *initial_stack)
     check_descriptors(fd, &duplicate, &independent);
     check_errors_and_stat(fd, mapping);
     long directory = check_paths(fd);
+    check_stat_open(fd, directory, mapping);
     check_readlink(directory);
     check_directory(directory, mapping);
     io_memory(fd, independent, duplicate, mapping);

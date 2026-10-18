@@ -119,7 +119,7 @@ rv_primary_high:
     .option norelax
     la gp, __global_pointer$
     .option pop
-    la sp, BOOT_STACKS
+    la sp, BOOT_STACK
     li t0, {stack_size}
     add sp, sp, t0
     mv tp, zero

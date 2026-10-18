@@ -12,11 +12,12 @@ void write_sync_wait(void)
     EQ(112, probe_sys1(SYS_fdatasync, fd), 0);
 }
 
-/// F_SETFL 保同步位，失败 write 保已接受位置，成功 pwrite 不改 cursor。
+/// 保同步位与原双阶段门；全局 sync 不报告 FLUSH 错误，各 OFD 随后的 fsync 独立消费错误。
 void write_sync_write(char mode)
 {
     long flags = mode == 'z' ? 0x1002 : 0x100002;
     long fd = write_open(WRITE_SHARED, flags, 0, mode == 'z' ? 114 : 113);
+    long observer = write_open(WRITE_SHARED, 0, 0, 230);
     write_store64(16, fd);
     EQ(115, probe_sys3(SYS_fcntl, fd, 4, 0), 0);
     EQ(116, probe_sys2(SYS_fcntl, fd, 3), mode == 'z' ? 0x1002 : 0x101002);
@@ -26,6 +27,12 @@ void write_sync_write(char mode)
     write_cursor(fd, 1, 118);
     write_phase(2);
     write_gate(2);
+    EQ(231, probe_sys0(SYS_sync), 0);
+    EQ(232, probe_sys1(SYS_fsync, observer), -EIO);
+    EQ(233, probe_sys1(SYS_fsync, observer), 0);
+    EQ(234, probe_sys1(SYS_fsync, fd), -EIO);
+    EQ(235, probe_sys1(SYS_fsync, fd), 0);
+    EQ(236, probe_sys1(SYS_close, observer), 0);
     EQ(119, probe_sys4(SYS_pwrite64, fd, "9", 1, 2), 1);
     write_cursor(fd, 1, 120);
 }

@@ -13,6 +13,9 @@ use crate::mm::space::{PteDomain, VmError};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
 
+/// 向下增长栈与普通可访问前邻之间保留的基本页间隙。
+const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
+
 /// 映射保留完整文件打开实例；私有匿名内容的原页拥有在实际驻留节点中。
 #[derive(Clone)]
 pub(crate) enum VmaBacking {
@@ -34,6 +37,7 @@ pub(crate) struct Vma {
     pub(crate) range: Range<usize>,
     pub(crate) permissions: PagePermissions,
     pub(crate) maximum: PagePermissions,
+    pub(crate) growdown: bool,
     pub(crate) backing: VmaBacking,
     pub(crate) file_range: Option<FileRangeRegistration>,
 }
@@ -46,6 +50,34 @@ impl Vma {
         maximum: PagePermissions,
         backing: VmaBacking,
         domain: Option<&Arc<PteDomain>>,
+    ) -> Result<Arc<Self>, VmError> {
+        Self::try_new_with_growth(range, permissions, maximum, backing, domain, false)
+    }
+
+    /// 栈只登记已经准备的实际范围，运行时向下增长另按当前线程限额裁决。
+    pub(crate) fn try_stack(
+        range: Range<usize>,
+        permissions: PagePermissions,
+        maximum: PagePermissions,
+    ) -> Result<Arc<Self>, VmError> {
+        Self::try_new_with_growth(
+            range,
+            permissions,
+            maximum,
+            VmaBacking::Anonymous,
+            None,
+            true,
+        )
+    }
+
+    /// 转换范围时保留增长属性，完整候选分配失败不改已发表身份。
+    fn try_new_with_growth(
+        range: Range<usize>,
+        permissions: PagePermissions,
+        maximum: PagePermissions,
+        backing: VmaBacking,
+        domain: Option<&Arc<PteDomain>>,
+        growdown: bool,
     ) -> Result<Arc<Self>, VmError> {
         validate_permissions(permissions)?;
         validate_permissions(maximum)?;
@@ -74,6 +106,7 @@ impl Vma {
             range,
             permissions,
             maximum,
+            growdown,
             backing,
             file_range,
         })
@@ -99,7 +132,16 @@ impl Vma {
         matches!(&self.backing, VmaBacking::File { private: false, .. })
     }
 
-    /// 从原范围拆出新身份，文件及共享匿名偏移随左边界移动，最大权限保持原义。
+    /// 自动选址将栈下方的 guard 视为占用；显式固定映射仍只检查实际范围。
+    fn start_gap(&self) -> usize {
+        if self.growdown {
+            self.range.start.saturating_sub(STACK_GUARD_GAP)
+        } else {
+            self.range.start
+        }
+    }
+
+    /// 从原范围拆出新身份，保留增长属性，文件及共享匿名偏移随左边界移动。
     fn slice(
         &self,
         range: Range<usize>,
@@ -127,20 +169,22 @@ impl Vma {
                 private: *private,
             },
         };
-        Self::try_new(
+        Self::try_new_with_growth(
             range,
             permissions,
             self.maximum,
             backing,
             self.file_range.as_ref().map(|range| &range.data().domain),
+            self.growdown,
         )
     }
 
-    /// 只合并权限及真实后备连续的相邻范围，保留无访问范围的独立边界。
+    /// 只合并增长属性、权限及真实后备连续的相邻范围，保留无访问范围的独立边界。
     fn mergeable(&self, next: &Self) -> bool {
         if self.range.end != next.range.start
             || self.permissions != next.permissions
             || self.maximum != next.maximum
+            || self.growdown != next.growdown
             || !(self.permissions.read || self.permissions.write || self.permissions.execute)
         {
             return false;
@@ -207,19 +251,67 @@ impl MmapState {
             .is_none_or(|vma| range.end <= vma.range.start)
     }
 
-    /// 独立子 Mm 为每份文件 VMA 创建自己的登记，匿名不可变身份可以共享。
+    /// 非固定分配与堆增长不得消耗下一栈的 guard，实际冲突仍按原有序索引判断。
+    pub(crate) fn vacant_with_guard(&self, range: &Range<usize>) -> bool {
+        let index = self
+            .vmas
+            .partition_point(|vma| vma.range.end <= range.start);
+        self.vmas
+            .get(index)
+            .is_none_or(|vma| range.end <= vma.start_gap())
+    }
+
+    /// 缺口只允许最近的上邻栈向下扩展；前邻、权限和当前软限额均在 mmap 写侧核实。
+    /// 邻区或软限额拒绝仍是未映射访问，只有候选对象真实分配失败才报告内存不足。
+    pub(crate) fn stack_growth(
+        &self,
+        address: usize,
+        access: UserAccess,
+        limit: u64,
+    ) -> Result<Arc<Vma>, VmError> {
+        let base = address & !(PAGE_SIZE - 1);
+        checked_range(base, PAGE_SIZE)?;
+        let index = self.vmas.partition_point(|vma| vma.range.start <= address);
+        let stack = self.vmas.get(index).ok_or(VmError::Unmapped)?;
+        if !stack.growdown {
+            return Err(VmError::Unmapped);
+        }
+        if !stack.allows(access) {
+            return Err(VmError::Permission);
+        }
+        if let Some(previous) = index.checked_sub(1).map(|index| &self.vmas[index]) {
+            if base < previous.range.end {
+                return Err(VmError::Unmapped);
+            }
+            if !previous.growdown
+                && (previous.permissions.read
+                    || previous.permissions.write
+                    || previous.permissions.execute)
+                && base - previous.range.end < STACK_GUARD_GAP
+            {
+                return Err(VmError::Unmapped);
+            }
+        }
+        if limit < (stack.range.end - base) as u64 {
+            return Err(VmError::Unmapped);
+        }
+        Vma::try_stack(base..stack.range.end, stack.permissions, stack.maximum)
+    }
+
+    /// 独立子 Mm 保留增长属性，文件 VMA 创建自己的登记，匿名不可变身份可以共享。
     pub(crate) fn snapshot(&self, domain: &Arc<PteDomain>) -> Result<Self, VmError> {
         let mut vmas = Vec::new();
         vmas.try_reserve_exact(self.vmas.len())
             .map_err(|_| VmError::NoMemory)?;
         for vma in &self.vmas {
             if vma.file_range.is_some() {
-                vmas.push(Vma::try_new(
+                vmas.push(Vma::try_new_with_growth(
                     vma.range.clone(),
                     vma.permissions,
                     vma.maximum,
                     vma.backing.clone(),
                     Some(domain),
+                    vma.growdown,
                 )?);
             } else {
                 vmas.push(Arc::clone(vma));
@@ -304,13 +396,13 @@ impl MmapState {
         Ok(vmas)
     }
 
-    /// 先尝试已页下取整的合法 hint，冲突或越界时从普通 64KiB 起找首个完整空隙。
+    /// 先尝试已页下取整的合法 hint，再从普通 64KiB 起找完整空隙；两者均避开栈 guard。
     pub(crate) fn choose_address(&self, hint: usize, length: usize) -> Result<usize, VmError> {
         const MINIMUM: usize = 64 * 1024;
         let hint = hint & !(PAGE_SIZE - 1);
         if MINIMUM <= hint {
             if let Ok(range) = checked_range(hint, length) {
-                if self.vacant(&range) {
+                if self.vacant_with_guard(&range) {
                     return Ok(hint);
                 }
             }
@@ -321,7 +413,7 @@ impl MmapState {
                 continue;
             }
             let range = checked_range(cursor, length).map_err(|_| VmError::NoMemory)?;
-            if range.end <= vma.range.start {
+            if range.end <= vma.start_gap() {
                 return Ok(cursor);
             }
             cursor = vma.range.end;
@@ -337,7 +429,7 @@ fn coalesce(vmas: &mut Vec<Arc<Vma>>) -> Result<(), VmError> {
     for index in 0..vmas.len() {
         if 0 < kept && vmas[kept - 1].mergeable(&vmas[index]) {
             let previous = &vmas[kept - 1];
-            let merged = Vma::try_new(
+            let merged = Vma::try_new_with_growth(
                 previous.range.start..vmas[index].range.end,
                 previous.permissions,
                 previous.maximum,
@@ -346,6 +438,7 @@ fn coalesce(vmas: &mut Vec<Arc<Vma>>) -> Result<(), VmError> {
                     .file_range
                     .as_ref()
                     .map(|range| &range.data().domain),
+                previous.growdown,
             )?;
             vmas[kept - 1] = merged;
         } else {

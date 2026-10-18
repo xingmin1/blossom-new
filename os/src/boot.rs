@@ -1,10 +1,13 @@
 //! 固件资源与内核保留区的不可变快照，由 BSP 在释放 AP 前发布。
 
+use core::mem::MaybeUninit;
+use core::ptr;
 use spin::Once;
 
-pub const MAX_CPUS: usize = 4;
-pub const MAX_MEMORY_REGIONS: usize = 8;
-pub const MAX_RESERVED_REGIONS: usize = 24;
+include!(concat!(env!("OUT_DIR"), "/cpu-capacity.rs"));
+pub const MAX_BOOTARGS_BYTES: usize = 4096;
+pub const MAX_MEMORY_REGIONS: usize = 32;
+pub const MAX_RESERVED_REGIONS: usize = 128;
 pub const MAX_VIRTIO_MMIO: usize = 8;
 /// 所选控制器的 source 表容量，PLIC 包含保留的零号源。
 pub const MAX_INTERRUPT_SOURCES: usize = if cfg!(blossom_platform = "visionfive2") {
@@ -48,7 +51,7 @@ impl Region {
 }
 
 /// QEMU 实际提供的 UART 和中断控制器资源。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct InterruptResources {
     pub uart: Region,
     pub uart_source: u32,
@@ -58,6 +61,21 @@ pub struct InterruptResources {
     pub parent_controller: Region,
     pub root_interrupt: u32,
     pub plic_contexts: [usize; MAX_CPUS],
+}
+
+impl Default for InterruptResources {
+    /// 空控制器快照在发现时逐字段填充，PLIC槽数由编译容量决定。
+    fn default() -> Self {
+        Self {
+            uart: Region::default(),
+            uart_source: 0,
+            source_count: 0,
+            controller: Region::default(),
+            parent_controller: Region::default(),
+            root_interrupt: 0,
+            plic_contexts: [0; MAX_CPUS],
+        }
+    }
 }
 
 /// UART 的访问几何和输入时钟；可编程时钟由实际 provider 引用描述。
@@ -329,36 +347,56 @@ pub struct BootInfo {
     pub pci: PciResources,
     pub virtio_mmio: [VirtioMmioResource; MAX_VIRTIO_MMIO],
     pub virtio_mmio_count: usize,
-    pub bootargs: [u8; 256],
+    pub bootargs: [u8; MAX_BOOTARGS_BYTES],
     pub bootargs_len: usize,
     pub counter_frequency: u64,
 }
 
 impl BootInfo {
-    /// 创建仅供边界解析填充的空快照；计数决定哪些数组槽位有效。
+    /// 创建测试或独立解析拥有的空快照；生产发现直接初始化永久槽。
     pub fn empty(raw_args: [usize; 4], bsp_hardware_id: usize) -> Self {
-        Self {
-            platform: crate::platform::current(),
-            raw_args,
-            bsp_hardware_id,
-            cpu_count: 0,
-            hardware_ids: [0; MAX_CPUS],
-            memory_count: 0,
-            memory: [Region::default(); MAX_MEMORY_REGIONS],
-            reserved_count: 0,
-            reserved: [Region::default(); MAX_RESERVED_REGIONS],
-            dtb: Region::default(),
-            initrd: None,
-            uart: UartResources::default(),
-            board: BoardResources::default(),
-            interrupts: InterruptResources::default(),
-            rtc: Region::default(),
-            pci: PciResources::default(),
-            virtio_mmio: [VirtioMmioResource::default(); MAX_VIRTIO_MMIO],
-            virtio_mmio_count: 0,
-            bootargs: [0; 256],
-            bootargs_len: 0,
-            counter_frequency: 0,
+        let mut info = MaybeUninit::uninit();
+        // SAFETY: 独占且对齐的局部槽足以容纳Self；initialize_at写完全部字段后才取已初始化值。
+        unsafe {
+            Self::initialize_at(info.as_mut_ptr(), raw_args, bsp_hardware_id);
+            info.assume_init()
+        }
+    }
+
+    /// 逐字段初始化独占槽，不在早期栈构造或复制整个CPU容量相关快照。
+    ///
+    /// # Safety
+    /// pointer必须指向对齐、可写且独占的Self存储，期间没有读取者或存活字段需要析构。
+    pub(crate) unsafe fn initialize_at(
+        pointer: *mut Self,
+        raw_args: [usize; 4],
+        bsp_hardware_id: usize,
+    ) {
+        // SAFETY: 调用者提供完整独占存储；addr_of_mut不对未初始化对象形成引用，
+        // 每个字段写入合法的具体类型值，全部写完以后调用者才可形成Self引用。
+        unsafe {
+            ptr::addr_of_mut!((*pointer).platform).write(crate::platform::current());
+            ptr::addr_of_mut!((*pointer).raw_args).write(raw_args);
+            ptr::addr_of_mut!((*pointer).bsp_hardware_id).write(bsp_hardware_id);
+            ptr::addr_of_mut!((*pointer).cpu_count).write(0);
+            ptr::addr_of_mut!((*pointer).hardware_ids).write([0; MAX_CPUS]);
+            ptr::addr_of_mut!((*pointer).memory_count).write(0);
+            ptr::addr_of_mut!((*pointer).memory).write([Region::default(); MAX_MEMORY_REGIONS]);
+            ptr::addr_of_mut!((*pointer).reserved_count).write(0);
+            ptr::addr_of_mut!((*pointer).reserved).write([Region::default(); MAX_RESERVED_REGIONS]);
+            ptr::addr_of_mut!((*pointer).dtb).write(Region::default());
+            ptr::addr_of_mut!((*pointer).initrd).write(None);
+            ptr::addr_of_mut!((*pointer).uart).write(UartResources::default());
+            ptr::addr_of_mut!((*pointer).board).write(BoardResources::default());
+            ptr::addr_of_mut!((*pointer).interrupts).write(InterruptResources::default());
+            ptr::addr_of_mut!((*pointer).rtc).write(Region::default());
+            ptr::addr_of_mut!((*pointer).pci).write(PciResources::default());
+            ptr::addr_of_mut!((*pointer).virtio_mmio)
+                .write([VirtioMmioResource::default(); MAX_VIRTIO_MMIO]);
+            ptr::addr_of_mut!((*pointer).virtio_mmio_count).write(0);
+            ptr::addr_of_mut!((*pointer).bootargs).write([0; MAX_BOOTARGS_BYTES]);
+            ptr::addr_of_mut!((*pointer).bootargs_len).write(0);
+            ptr::addr_of_mut!((*pointer).counter_frequency).write(0);
         }
     }
 
@@ -378,7 +416,25 @@ impl BootInfo {
     }
 }
 
-static BOOT_INFO: Once<BootInfo> = Once::new();
+static mut BOOT_STORAGE: MaybeUninit<BootInfo> = MaybeUninit::uninit();
+static BOOT_INFO: Once<&'static BootInfo> = Once::new();
+
+/// BSP在永久槽准备唯一可变快照，发现及内核保留完成后由publish冻结。
+///
+/// # Safety
+/// BSP只能在IRQ关闭、AP未释放时调用一次，且存储尚无任何引用；返回拥有不得复制或泄漏可变别名。
+pub(crate) unsafe fn prepare(
+    raw_args: [usize; 4],
+    bsp_hardware_id: usize,
+) -> &'static mut BootInfo {
+    assert!(BOOT_INFO.get().is_none(), "BootInfo is already published");
+    let pointer = ptr::addr_of_mut!(BOOT_STORAGE).cast::<BootInfo>();
+    // SAFETY: BSP调用契约独占永久槽，MaybeUninit允许逐字段写入；完成初始化后才建立唯一可变借用。
+    unsafe {
+        BootInfo::initialize_at(pointer, raw_args, bsp_hardware_id);
+        &mut *pointer
+    }
+}
 
 /// 从附近高地址链接符号取得完整内核物理保留区，包含栈和启动表。
 pub fn kernel_region() -> Region {
@@ -392,17 +448,21 @@ pub fn kernel_region() -> Region {
     }
 }
 
-/// 发布实际固件资源和当前内核拥有的物理区间；AP 读取以前完成初始化。
+/// 冻结实际固件资源与当前内核保留区，发布永久只读借用而不复制整个快照。
 ///
 /// # Safety
-/// 只能由 BSP 在 AP 尚未释放、IRQ 关闭时执行一次。info 必须来自选定机器的
-/// 实际固件，已验证数组计数、物理区间和设备寄存器，并包含内核保留区。
-pub unsafe fn publish(info: BootInfo) {
+/// 只能由BSP在AP尚未释放、IRQ关闭时执行一次。info必须是prepare返回的唯一借用，
+/// 来自选定机器的实际固件，已验证全部资源并包含内核保留区；发布后不得再修改存储。
+pub unsafe fn publish(info: &'static mut BootInfo) {
     assert!(BOOT_INFO.get().is_none(), "BootInfo is already published");
+    let info: &'static BootInfo = info;
     BOOT_INFO.call_once(|| info);
 }
 
 /// 借用已发布的真实启动资源；发布前调用会在这个边界失败。
 pub fn info() -> &'static BootInfo {
-    BOOT_INFO.get().expect("BootInfo has not been published")
+    BOOT_INFO
+        .get()
+        .copied()
+        .expect("BootInfo has not been published")
 }

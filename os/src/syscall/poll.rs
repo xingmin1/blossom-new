@@ -10,15 +10,14 @@ use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable};
 use crate::fs::{DescriptorFlags, FileRef, FileTable, FsError};
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
+use crate::syscall::file::nofile;
 use crate::syscall::{time as time_abi, Outcome, Request, Restart};
-use crate::task::{UserRuntime, UserThread};
+use crate::task::UserThread;
 use crate::time::{self, Duration, MonotonicInstant};
 use crate::wait::WaitMode;
 
-const DESCRIPTORS: usize = UserRuntime::DESCRIPTOR_CAPACITY;
 const POLLFD_SIZE: usize = 8;
 const INLINE_POLL_BYTES: usize = 128 * POLLFD_SIZE;
-const SET_BYTES: usize = DESCRIPTORS / 8;
 const EVENT_SIZE: usize = 16;
 const CLOEXEC: u32 = 0x80000;
 const ADD: u32 = 1;
@@ -38,8 +37,8 @@ struct Timeout {
 
 struct SelectSets {
     addresses: [usize; 3],
-    input: [[u8; SET_BYTES]; 3],
-    output: [[u8; SET_BYTES]; 3],
+    input: [Vec<u8>; 3],
+    output: [Vec<u8>; 3],
     nfds: usize,
     span: usize,
 }
@@ -53,7 +52,7 @@ enum Interests<'a> {
 struct RegisteredPoll {
     context: Arc<PollContext>,
     _table: PollTable,
-    _files: Vec<FileRef>,
+    files: Vec<(usize, Option<FileRef>)>,
 }
 
 /// 五个 raw 入口只保存本次参数；临时 mask 的收尾由各自 syscall 返回协议决定。
@@ -75,7 +74,7 @@ fn create(user: &UserThread, raw: usize) -> SysResult {
         return Err(Errno::InvalidArgument);
     }
     let runtime = user.runtime().expect("epoll_create1 has no runtime");
-    let reservation = runtime.files.reserve()?;
+    let reservation = runtime.files.reserve(nofile(user))?;
     let file: FileRef = EpollFile::try_new(flags)?;
     Ok(reservation.publish(
         file,
@@ -132,7 +131,7 @@ fn ppoll(user: &UserThread, request: Request) -> Outcome {
     finish_select(user, &mm, request, timeout, result)
 }
 
-/// 容量沿当前表；小数组保留栈快照，大数组按实际跨度准备，nfds=0 不访问用户数组。
+/// nfds 受本次组 NOFILE 约束，小数组使用栈快照，大数组按实际跨度准备。
 fn core_ppoll(
     user: &UserThread,
     mm: &Mm,
@@ -141,11 +140,7 @@ fn core_ppoll(
     deadline: Option<MonotonicInstant>,
 ) -> Result<usize, Errno> {
     let runtime = user.runtime().expect("ppoll has no runtime");
-    assert!(
-        runtime.files.capacity() <= DESCRIPTORS,
-        "user file table exceeds poll stack bound"
-    );
-    if runtime.files.capacity() < nfds {
+    if nofile(user) < nfds {
         return Err(Errno::InvalidArgument);
     }
     let length = nfds * POLLFD_SIZE;
@@ -195,7 +190,7 @@ fn pselect(user: &UserThread, request: Request) -> Outcome {
     finish_select(user, &mm, request, timeout, result)
 }
 
-/// signed n 先拒负数、再夹当前容量、最后算 64 位机器字跨度；三个集合独立计数。
+/// signed n 拒负数后只取一次 max_fds 快照，六份位图按该范围准备。
 fn core_pselect(
     user: &UserThread,
     mm: &Mm,
@@ -207,17 +202,20 @@ fn core_pselect(
         return Err(Errno::InvalidArgument);
     }
     let runtime = user.runtime().expect("pselect6 has no runtime");
-    assert!(
-        runtime.files.capacity() <= DESCRIPTORS,
-        "user file table exceeds select stack bound"
-    );
-    let nfds = (n as usize).min(runtime.files.capacity());
+    let nfds = (n as usize).min(runtime.files.allocated_slots());
+    let span = nfds.div_ceil(64) * 8;
+    let mut input = core::array::from_fn(|_| Vec::new());
+    let mut output = core::array::from_fn(|_| Vec::new());
+    for set in input.iter_mut().chain(output.iter_mut()) {
+        set.try_reserve_exact(span).map_err(|_| Errno::NoMemory)?;
+        set.resize(span, 0);
+    }
     let mut sets = SelectSets {
         addresses: [raw[1], raw[2], raw[3]],
-        input: [[0u8; SET_BYTES]; 3],
-        output: [[0u8; SET_BYTES]; 3],
+        input,
+        output,
         nfds,
-        span: nfds.div_ceil(64) * 8,
+        span,
     };
     for index in 0..3 {
         if sets.addresses[index] != 0 {
@@ -283,7 +281,7 @@ impl Interests<'_> {
                     entry[6..8].fill(0);
                 }
             }
-            Self::Select(sets) => sets.output = [[0u8; SET_BYTES]; 3],
+            Self::Select(sets) => sets.output.iter_mut().for_each(|set| set.fill(0)),
         }
     }
 
@@ -315,7 +313,7 @@ impl Interests<'_> {
     }
 }
 
-/// 不冻结 fdtable；每轮通过当前编号重新 lookup，登记期引用只保原 source 的生命期。
+/// 无登记的首轮快速观察；后续扫描只使用登记时保留的原 OFD。
 fn scan_fds(files: &FileTable, interests: &mut Interests<'_>) -> Result<usize, Errno> {
     interests.clear();
     let mut count = 0;
@@ -357,25 +355,40 @@ impl RegisteredPoll {
         let mut registered = Self {
             context,
             _table: table,
-            _files: retained,
+            files: retained,
         };
         for index in 0..interests.len() {
             let Some(fd) = interests.descriptor(index) else {
                 continue;
             };
             let file = match files.lookup(fd) {
-                Ok(file) => file,
-                Err(FsError::BadFd) if matches!(interests, Interests::Poll(_)) => continue,
+                Ok(file) => Some(file),
+                Err(FsError::BadFd) if matches!(interests, Interests::Poll(_)) => None,
                 Err(error) => return Err(error.into()),
             };
-            // 文件先进入保活集合，失败析构仍先同步撤 table，再最后 put 这些 OFD。
-            registered._files.push(file);
-            let file = registered._files.last().unwrap();
-            if let Some(provider) = file.pollable() {
-                provider.poll(Some(&mut registered._table))?;
+            // 先持有本次实际 OFD，失败析构仍先撤源登记再释放文件。
+            registered.files.push((index, file));
+            if let Some(file) = &registered.files.last().unwrap().1 {
+                if let Some(provider) = file.pollable() {
+                    provider.poll(Some(&mut registered._table))?;
+                }
             }
         }
         Ok(registered)
+    }
+
+    /// 已登记项只查询原 OFD，整数关闭复用不会替换正在等待的对象。
+    fn scan(&self, interests: &mut Interests<'_>) -> Result<usize, Errno> {
+        interests.clear();
+        let mut count = 0;
+        for (index, file) in &self.files {
+            let mask = match file {
+                Some(file) => query(file)?,
+                None => PollMask::POLLNVAL,
+            };
+            count += interests.record(*index, mask);
+        }
+        Ok(count)
     }
 }
 
@@ -392,7 +405,10 @@ fn wait_fds(
         if let Some(waiting) = &registered {
             waiting.context.clear_triggered();
         }
-        let count = scan_fds(files, interests)?;
+        let count = match &registered {
+            Some(waiting) => waiting.scan(interests)?,
+            None => scan_fds(files, interests)?,
+        };
         if 0 < count {
             return Ok(count);
         }
@@ -593,7 +609,7 @@ fn descriptor(raw: usize) -> Result<usize, Errno> {
 }
 
 /// 集合只查询 n 内已经初始化的字节，最后机器字的高位不参与扫描。
-fn selected(set: &[u8; SET_BYTES], fd: usize) -> bool {
+fn selected(set: &[u8], fd: usize) -> bool {
     set[fd / 8] & (1 << (fd % 8)) != 0
 }
 

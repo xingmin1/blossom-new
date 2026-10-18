@@ -52,7 +52,7 @@ class UserSelftestRootfsTests(unittest.TestCase):
             self.userland, self.runtime, TOOLS.parent / "userland/system"))
 
     def prepare(self, **kwargs):
-        """调用公开准备接口，几何限定为最小合法的真实 ext4。"""
+        """调用公开准备接口，以明确大小消费实际工具几何。"""
         return prepare_user_selftest_rootfs(
             "riscv64", self.userland, self.runtime, self.output, self.image,
             image_size_mib=128, run_id=RUN_ID, **kwargs)
@@ -72,6 +72,11 @@ class UserSelftestRootfsTests(unittest.TestCase):
             ["debugfs", "-R", "cat /test/selftests/exit-status", str(self.image)],
             capture_output=True, check=True)
         self.assertEqual(result.stdout, b"")
+        for relative in ("custom/probe", "custom/helper"):
+            result = subprocess.run(
+                ["debugfs", "-R", f"cat /test/selftests/{relative}", str(self.image)],
+                capture_output=True, check=True)
+            self.assertEqual(result.stdout, (self.userland / "test/selftests" / relative).read_bytes())
 
     @unittest.skipUnless(HAS_E2FSPROGS, "requires e2fsprogs")
     def test_repreparation_replaces_only_owned_tree_and_reflects_installed_deletion(self):
@@ -87,6 +92,29 @@ class UserSelftestRootfsTests(unittest.TestCase):
         self.assertFalse((self.output / "test/selftests/custom/helper").exists())
         self.assertEqual((self.output / "test/selftests/kselftest-list.txt").read_bytes(),
                          b"custom:replacement\n")
+        missing = self.base / "removed-helper.dump"
+        subprocess.run(["debugfs", "-R", f"dump /test/selftests/custom/helper {missing}",
+                        str(self.image)], capture_output=True, check=True)
+        self.assertFalse(missing.exists())
+
+    @unittest.skipUnless(HAS_E2FSPROGS, "requires e2fsprogs")
+    def test_symlink_workspace_parent_prepares_tree_and_real_small_volume(self):
+        """准备器的树、卷与日志均允许普通工作区父目录链接。"""
+        workspace = self.base / "workspace"
+        workspace.symlink_to(self.base, target_is_directory=True)
+        output = workspace / "small-root"
+        image = workspace / "small.ext4"
+        before = self.inputs()
+        prepare_user_selftest_rootfs(
+            "riscv64", self.userland, self.runtime, output, image,
+            image_size_mib=8, run_id=RUN_ID)
+        self.assertEqual(self.inputs(), before)
+        self.assertEqual((output / "test/selftests/custom/helper").read_bytes(),
+                         (self.userland / "test/selftests/custom/helper").read_bytes())
+        result = subprocess.run(
+            ["debugfs", "-R", "cat /test/selftests/custom/helper", str(image)],
+            capture_output=True, check=True)
+        self.assertEqual(result.stdout, b"installed:test/selftests/custom/helper")
 
     def test_missing_installed_runner_or_manifest_preserves_existing_outputs(self):
         """缺少真正消费的安装文件时，在装配或制卷之前失败。"""

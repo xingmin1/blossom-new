@@ -3,6 +3,7 @@
 pub mod address;
 pub(crate) mod control;
 pub mod core;
+mod lifecycle;
 pub mod packet;
 pub mod route;
 pub mod socket;
@@ -41,6 +42,8 @@ use crate::drivers::DeviceInventory;
 use crate::fs::FsError;
 use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
 use crate::net::core::TcpCore;
+pub(crate) use crate::net::lifecycle::EgressWait;
+use crate::net::lifecycle::{EgressWaiting, RetiredEndpoint, RetiredEndpoints};
 use crate::net::packet::{return_capture_storage, zeroed_bytes, CaptureStorage, OwnedPacket};
 use crate::net::route::{
     unicast, DefaultRouteRequest, EthernetConfig, InterfaceId, InterfaceSnapshot, Route,
@@ -58,7 +61,7 @@ use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
 
 pub const LOOPBACK_CAPACITY: usize = 32;
 pub const LOOPBACK_MTU: usize = 65535;
-pub(crate) const ENDPOINT_CAPACITY: usize = 128;
+pub(crate) const SOMAXCONN: usize = 4096;
 pub(crate) const PROTOCOL_BUDGET: usize = 16;
 const ETHERNET_FRAME_CAPACITY: usize = 1514;
 const INTERFACE_WORKSPACE_CAPACITY: usize = 65536;
@@ -439,22 +442,6 @@ impl<'s> TransportIngress<'s> for IngressCollector<'_> {
     }
 }
 
-/// 两类端点共享同一已预留退休容量，最后 slot 归还仍由真实对象析构负责。
-enum RetiredEndpoint {
-    Tcp(Arc<TcpEndpoint>),
-    Udp(Arc<UdpEndpoint>),
-}
-
-impl RetiredEndpoint {
-    /// 回收者在所有根短锁外等待端点实际后台尾部。
-    fn stop_sync(self) {
-        match self {
-            Self::Tcp(endpoint) => endpoint.stop_sync(),
-            Self::Udp(endpoint) => endpoint.stop_sync(),
-        }
-    }
-}
-
 /// Runtime、打开对象和系统拥有者持同一域，不按进程复制网络状态。
 pub type NetStackRef = Arc<NetStack>;
 
@@ -496,13 +483,13 @@ impl Drop for NetStackOwner {
     }
 }
 
-/// 额度覆盖准备中、表中、退休及外部引用；最后节点释放才归还。
+/// 计数覆盖准备中、表中、退休及外部引用；最后节点释放才归还。
 pub struct EndpointSlot {
     net: Weak<NetStack>,
 }
 
 impl Drop for EndpointSlot {
-    /// 弱域不形成拥有环；域已销毁时不再存在可复用的本域额度。
+    /// 弱域不形成拥有环；域仍存活时减少实际端点计数。
     fn drop(&mut self) {
         if let Some(net) = self.net.upgrade() {
             let previous = net.endpoints.fetch_sub(1, Ordering::AcqRel);
@@ -515,7 +502,7 @@ impl Drop for EndpointSlot {
 struct Egress {
     open: bool,
     packets: VecDeque<QueuedPacket>,
-    waiting: Vec<u64>,
+    waiting: EgressWaiting,
     #[cfg(feature = "ktest")]
     packet_control: Option<TestPacketControl>,
 }
@@ -564,7 +551,7 @@ pub struct NetStack {
     loopback_stats: SpinLock<InterfaceStats>,
     admission: SleepMutex<()>,
     egress: SpinLock<Egress>,
-    retired: SpinLock<Vec<RetiredEndpoint>>,
+    retired: SpinLock<RetiredEndpoints>,
     queue: Once<WorkQueue>,
     ingress: Once<Pin<Arc<Work>>>,
     reaper: Once<Pin<Arc<Work>>>,
@@ -618,14 +605,6 @@ impl NetStack {
         packets
             .try_reserve_exact(LOOPBACK_CAPACITY)
             .map_err(|_| FsError::NoMemory)?;
-        let mut waiting = Vec::new();
-        waiting
-            .try_reserve_exact(ENDPOINT_CAPACITY)
-            .map_err(|_| FsError::NoMemory)?;
-        let mut retired = Vec::new();
-        retired
-            .try_reserve_exact(ENDPOINT_CAPACITY)
-            .map_err(|_| FsError::NoMemory)?;
         let net = Arc::try_new(Self {
             tables: NetTables::try_new()?,
             loopback: SleepMutex::new(Some(InterfaceState::try_new(
@@ -638,11 +617,11 @@ impl NetStack {
             egress: SpinLock::new(Egress {
                 open: true,
                 packets,
-                waiting,
+                waiting: EgressWaiting::new(),
                 #[cfg(feature = "ktest")]
                 packet_control: None,
             }),
-            retired: SpinLock::new(retired),
+            retired: SpinLock::new(RetiredEndpoints::new()),
             queue: Once::new(),
             ingress: Once::new(),
             reaper: Once::new(),
@@ -1050,14 +1029,14 @@ impl NetStack {
         self.stopping.load(Ordering::Acquire)
     }
 
-    /// 取得实际节点额度，准备失败由这个值本身归还。
+    /// 记录实际端点拥有数，只有计数不可表示或关门才拒绝准备。
     pub fn claim_endpoint_slot(self: &NetStackRef) -> Result<EndpointSlot, FsError> {
         if self.is_stopping() {
             return Err(FsError::NotConnected);
         }
         self.endpoints
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < ENDPOINT_CAPACITY).then_some(count + 1)
+                count.checked_add(1)
             })
             .map_err(|_| FsError::NoMemory)?;
         Ok(EndpointSlot {
@@ -1182,10 +1161,7 @@ impl NetStack {
         if !egress.open {
             return Err(FsError::NotConnected);
         }
-        if !egress.waiting.contains(&endpoint.id()) {
-            assert!(egress.waiting.len() < ENDPOINT_CAPACITY);
-            egress.waiting.push(endpoint.id());
-        }
+        egress.waiting.push(endpoint.egress_wait());
         Err(FsError::WouldBlock)
     }
 
@@ -1213,20 +1189,22 @@ impl NetStack {
         })
     }
 
-    /// 配置解锁后移出原等待身份，通知同一协议 Work 并推进原接口 Work。
+    /// 配置解锁后只消费入口时已有的节点，通知期间重新登记留待真实恢复。
     fn configuration_changed(&self) {
-        let mut waiting = [0u64; ENDPOINT_CAPACITY];
-        let count = {
-            let mut egress = self.egress.lock();
-            let count = egress.waiting.len();
-            waiting[..count].copy_from_slice(&egress.waiting);
-            egress.waiting.clear();
-            count
-        };
-        for id in &waiting[..count] {
-            self.notify_egress(*id);
-        }
+        let count = self.egress.lock().waiting.len();
+        self.wake_egress_waiters(count);
         self.kick_egress();
+    }
+
+    /// 每次摘首后解根锁，再调用原通知和释放轻量节点拥有。
+    fn wake_egress_waiters(&self, count: usize) {
+        for _ in 0..count {
+            let node = self.egress.lock().waiting.pop();
+            let Some(node) = node else {
+                break;
+            };
+            self.notify_egress(node.id());
+        }
     }
 
     /// 真实 TX 完成、邻居输入或库期限只安排根 Work，不主动轮询连接。
@@ -1246,28 +1224,26 @@ impl NetStack {
         self.try_emit(packet).map_err(|(error, _packet)| error)
     }
 
-    /// 满额度和管理暂停共用原等待身份，恢复只由实际容量或配置通知触发。
-    pub(crate) fn egress_ready(&self, id: u64) -> Result<bool, FsError> {
+    /// 容量检查和稳定节点登记由同一根短锁串行，不在协议回调扩容。
+    pub(crate) fn egress_ready(&self, node: &Arc<EgressWait>) -> Result<bool, FsError> {
         let mut egress = self.egress.lock();
         if !egress.open {
             return Err(FsError::NotConnected);
         }
-        if egress.waiting.contains(&id) {
+        if node.linked() {
             return Ok(false);
         }
         if egress.packets.len() < LOOPBACK_CAPACITY {
             return Ok(true);
         }
-        if !egress.waiting.contains(&id) {
-            assert!(egress.waiting.len() < ENDPOINT_CAPACITY);
-            egress.waiting.push(id);
-        }
+        egress.waiting.push(node);
         Ok(false)
     }
 
     /// 末关闭只撤本端点身份，不影响同一共享容量上的其它等待者。
     pub(crate) fn cancel_egress_wait(&self, id: u64) {
-        self.egress.lock().waiting.retain(|waiting| *waiting != id);
+        let node = self.egress.lock().waiting.remove(id);
+        drop(node);
     }
 
     /// 表锁只克隆本身份拥有，解锁后定向安排 TCP Work 或通知 UDP 的同一源。
@@ -1282,14 +1258,13 @@ impl NetStack {
         }
     }
 
-    /// 从表移动同一 Arc 到预留退休队列，当前 callback 不等待自己的 Work。
+    /// 表中成功移出的同一 Arc 接入独立退休投影，当前 callback 不等待自己的 Work。
     pub(crate) fn retire_tcp(&self, id: u64) {
         let mut retired = self.retired.lock();
         if self.is_stopping() {
             return;
         }
         if let Some(endpoint) = self.tables.take_tcp(id) {
-            assert!(retired.len() < ENDPOINT_CAPACITY);
             retired.push(RetiredEndpoint::Tcp(endpoint));
         }
         drop(retired);
@@ -1303,7 +1278,6 @@ impl NetStack {
             return;
         }
         if let Some(endpoint) = self.tables.take_udp(id) {
-            assert!(retired.len() < ENDPOINT_CAPACITY);
             retired.push(RetiredEndpoint::Udp(endpoint));
         }
         drop(retired);
@@ -1324,7 +1298,7 @@ impl NetStack {
     /// 测试只观察真实容量等待登记，查询不安排或修改连接进度。
     #[cfg(feature = "ktest")]
     pub(crate) fn egress_waiting(&self, id: u64) -> bool {
-        self.egress.lock().waiting.contains(&id)
+        self.egress.lock().waiting.contains(id)
     }
 
     /// 只读实际 EndpointSlot 数，包含准备中、表、退休和外部真实拥有。
@@ -1560,7 +1534,6 @@ impl NetStack {
 
     /// 原队列领取槽与容量通知同锁；设备或协议处理、最后 packet put 全在短锁外。
     fn finish_egress(&self, index: usize) {
-        let mut waiting = [0u64; ENDPOINT_CAPACITY];
         let (entry, count) = {
             let mut egress = self.egress.lock();
             let entry = egress
@@ -1568,14 +1541,10 @@ impl NetStack {
                 .remove(index)
                 .expect("network egress slot missing");
             let count = egress.waiting.len();
-            waiting[..count].copy_from_slice(&egress.waiting);
-            egress.waiting.clear();
             (entry, count)
         };
         drop(entry);
-        for id in &waiting[..count] {
-            self.notify_egress(*id);
-        }
+        self.wake_egress_waiters(count);
     }
 
     /// 一个接口同时只 dispatch 一条队列责任，最后帧交出后才归还原32项额度。
@@ -2160,14 +2129,17 @@ impl NetStack {
         self.ingress.get().unwrap().as_ref().close_sync();
         self.reaper.get().unwrap().as_ref().close_sync();
         let (tcp, udp, unix) = self.tables.take_all();
-        let retired = ::core::mem::take(&mut *self.retired.lock());
         for endpoint in tcp {
             endpoint.stop_sync();
         }
         for endpoint in udp {
             endpoint.stop_sync();
         }
-        for endpoint in retired {
+        loop {
+            let endpoint = self.retired.lock().pop();
+            let Some(endpoint) = endpoint else {
+                break;
+            };
             endpoint.stop_sync();
         }
         for pair in unix {
@@ -2187,9 +2159,15 @@ impl NetStack {
             let control = self.egress.lock().packet_control.take();
             drop(control);
         }
+        loop {
+            let node = self.egress.lock().waiting.pop();
+            let Some(node) = node else {
+                break;
+            };
+            drop(node);
+        }
         let packets = {
             let mut egress = self.egress.lock();
-            egress.waiting.clear();
             ::core::mem::take(&mut egress.packets)
         };
         drop(packets);

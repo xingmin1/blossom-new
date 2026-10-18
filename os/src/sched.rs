@@ -3,12 +3,14 @@
 pub mod context;
 
 use alloc::sync::Arc;
+use core::pin::pin;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
 use crate::sync::{IrqSaveGuard, SpinLock};
-use crate::task::{ActiveWait, Placement, Resources, Scheduling, State, SwitchIntent, Task};
-use crate::wait::WaitId;
+use crate::task::{ActiveWait, Resources, Scheduling, State, SwitchIntent, Task};
+use crate::wait::queue::{WaitNode, WaitQueue};
+use crate::wait::{WaitId, Waiter};
 use crate::{accounting, cpu, time, trace};
 
 struct Scheduler {
@@ -21,6 +23,7 @@ struct Scheduler {
 unsafe impl Send for Scheduler {}
 
 static SCHED_LOCK: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+static AFFINITY_CHANGED: WaitQueue = WaitQueue::new();
 
 /// 在原活登记锁内统计已发表且尚未离栈退出的执行者，不计私有准备对象或旧观察引用。
 pub(crate) fn live_task_count() -> usize {
@@ -38,10 +41,7 @@ pub(crate) fn live_task_count() -> usize {
 
 /// 归属与一次测试迁核目标使用同一准入判断，队列选择和 idle 重检不能分歧。
 fn allowed_on(data: &Scheduling, owner: usize) -> bool {
-    let allowed = match data.placement {
-        Placement::Any => true,
-        Placement::Cpu(cpu) => cpu == owner,
-    };
+    let allowed = data.allowed.contains(owner);
     #[cfg(feature = "ktest")]
     let allowed = allowed && data.next_cpu.is_none_or(|cpu| cpu == owner);
     allowed
@@ -88,7 +88,7 @@ impl Scheduler {
             // 本核离栈后会直接 pick；自发 IPI 反而在下一 Task 开 IRQ 时重建已消费提示，
             // 令用户安全点反复让出而到不了真实用户入口；idle窗口仍保留原IPI唤醒。
             let local = cpu::current();
-            for owner in 0..cpu::count() {
+            for owner in data.allowed.iter() {
                 if allowed_on(data, owner)
                     && cpu::get(owner).online.load(Ordering::Acquire)
                     && (owner != local.id
@@ -300,7 +300,7 @@ pub(crate) fn request_user_work(task: &Task) {
             cpu::kick(owner, cpu::KICK_RESCHEDULE);
         }
         State::Ready => {
-            for owner in 0..cpu::count() {
+            for owner in data.allowed.iter() {
                 if allowed_on(data, owner) && cpu::get(owner).online.load(Ordering::Acquire) {
                     cpu::kick(owner, cpu::KICK_RESCHEDULE);
                 }
@@ -308,6 +308,85 @@ pub(crate) fn request_user_work(task: &Task) {
         }
         // Blocked 的可中断轮次只由其精确 WaitId 通知；内核 DMA 等待保留原资源责任。
         State::Blocked | State::Exited => {}
+    }
+}
+
+/// 在唯一调度锁下读取许可；用户观察和继承不读取另一份 placement 快照。
+pub(crate) fn affinity(task: &Task) -> cpu::CpuSet {
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY: 调度锁保护许可，借用保持 Task 控制块存活。
+    unsafe { (*task.scheduling.get()).allowed }
+}
+
+/// 未发表子执行者与父许可在同一锁下快照，子任务首次运行即遵守继承集合。
+pub(crate) fn inherit_affinity(parent: &Task, child: &Task) {
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY: 两个 Task 由调用者保活，调度锁独占许可；child 尚未发表。
+    unsafe {
+        let source = (*parent.scheduling.get()).allowed;
+        let target = &mut *child.scheduling.get();
+        assert_eq!(target.state, State::Ready);
+        target.allowed = source;
+    }
+}
+
+/// 完成条件在与 pick/finish 相同的锁域判定，不能用 IPI 已发送替代离栈。
+fn affinity_complete(task: &Task) -> bool {
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY: 调度锁保护状态及许可，Task 由等待者的稳定拥有保活。
+    let data = unsafe { &*task.scheduling.get() };
+    match data.state {
+        State::Running(owner) => data.allowed.contains(owner),
+        State::SwitchingOut(_, _) => false,
+        State::Ready | State::Blocked | State::Exited => true,
+    }
+}
+
+/// 提交真实调度许可，等待被排除的运行者保存现场并由原 finish 交出运行权。
+pub(crate) fn set_affinity(task: &Task, allowed: cpu::CpuSet) {
+    assert!(!allowed.is_empty());
+    {
+        let _scheduler = SCHED_LOCK.lock();
+        // SAFETY: 调度锁独占状态与许可，调用者保活原目标，不访问远端现场。
+        let data = unsafe { &mut *task.scheduling.get() };
+        data.allowed = allowed;
+        match data.state {
+            State::Running(owner) if !allowed.contains(owner) => {
+                data.affinity_pending = true;
+                cpu::kick(owner, cpu::KICK_RESCHEDULE);
+            }
+            State::SwitchingOut(owner, _) => {
+                data.affinity_pending = true;
+                cpu::kick(owner, cpu::KICK_RESCHEDULE);
+            }
+            State::Ready => {
+                for owner in allowed.iter() {
+                    if cpu::get(owner).online.load(Ordering::Acquire) {
+                        cpu::kick(owner, cpu::KICK_RESCHEDULE);
+                    }
+                }
+            }
+            State::Running(_) | State::Blocked | State::Exited => {}
+        }
+    }
+    if task.id() == crate::task::current_task().id() {
+        if !affinity_complete(task) {
+            yield_now();
+        }
+        return;
+    }
+    loop {
+        if affinity_complete(task) {
+            return;
+        }
+        let waiter = Waiter::new();
+        let mut node = pin!(WaitNode::new(waiter.waker()));
+        // SAFETY: 全局等待源永久存在；本轮固定节点先撤登记后离栈，登记后复查关闭通知窗口。
+        let _registration = unsafe { AFFINITY_CHANGED.register(node.as_mut()) };
+        if affinity_complete(task) {
+            return;
+        }
+        waiter.park();
     }
 }
 
@@ -572,7 +651,18 @@ fn finish_current(previous_mm: Option<Arc<crate::mm::space::Mm>>) {
         (task, local.id)
     };
     assert!(!task.is_null(), "scheduler returned without a task");
-    let retired = SCHED_LOCK.lock().finish(task, owner);
+    let (retired, affinity_changed) = {
+        let mut scheduler = SCHED_LOCK.lock();
+        // SAFETY: 当前任务仍属本核离栈交接，锁独占 pending；finish 后不再借用原任务。
+        let changed = unsafe {
+            let data = &mut *(*task).scheduling.get();
+            core::mem::replace(&mut data.affinity_pending, false)
+        };
+        (scheduler.finish(task, owner), changed)
+    };
+    if affinity_changed {
+        AFFINITY_CHANGED.wake_all();
+    }
     if let Some((resources, result)) = retired {
         // SAFETY: finish 已摘离活登记；task 对应此前 into_raw 的那一份强拥有，仅在此恢复一次。
         let task = unsafe { Arc::from_raw(task) };
@@ -669,7 +759,7 @@ fn idle_once() {
     local.idle.store(false, Ordering::Release);
 }
 
-/// Any 任务只将下一次真实分派指定为在线目标 CPU，pick 后立即恢复 Any 选择。
+/// 在允许集合内指定下一次真实分派 CPU，pick 后恢复集合内的普通选择。
 #[cfg(feature = "ktest")]
 pub fn test_migrate_to(target: usize) {
     assert_switchable();
@@ -682,11 +772,11 @@ pub fn test_migrate_to(target: usize) {
         let _irq = IrqSaveGuard::new();
         let local = cpu::current();
         let _scheduler = SCHED_LOCK.lock();
-        // SAFETY: 本核 IRQ 关闭且调度锁保护 placement/next_cpu；活登记保护当前 Running 节点。
+        // SAFETY: 本核 IRQ 关闭且调度锁保护许可/next_cpu；活登记保护当前 Running 节点。
         let data = unsafe { &mut *(*(*local.current_task.get())).scheduling.get() };
         assert!(
-            matches!(data.placement, Placement::Any),
-            "migration test requires an Any task"
+            data.allowed.contains(target),
+            "migration CPU is not allowed"
         );
         assert!(
             data.next_cpu.is_none(),
@@ -697,7 +787,7 @@ pub fn test_migrate_to(target: usize) {
     yield_now();
 }
 
-/// 在调度锁内为已阻塞的 Any Task 指定下一次真实分派 CPU。
+/// 在调度锁内为已阻塞 Task 指定允许集合内的下一次真实分派 CPU。
 #[cfg(feature = "ktest")]
 pub(crate) fn test_request_migration(task: &Task, target: usize) {
     assert!(target < cpu::count(), "migration CPU is out of range");
@@ -706,7 +796,7 @@ pub(crate) fn test_request_migration(task: &Task, target: usize) {
         "migration CPU is offline"
     );
     let _scheduler = SCHED_LOCK.lock();
-    // SAFETY: 调度锁保护状态、placement 和 next_cpu；调用者强引用保持 Task 活着。
+    // SAFETY: 调度锁保护状态、许可和 next_cpu；调用者强引用保持 Task 活着。
     let data = unsafe { &mut *task.scheduling.get() };
     assert_eq!(
         data.state,
@@ -714,8 +804,8 @@ pub(crate) fn test_request_migration(task: &Task, target: usize) {
         "migration request requires Blocked task"
     );
     assert!(
-        matches!(data.placement, Placement::Any),
-        "migration request requires Any task"
+        data.allowed.contains(target),
+        "migration CPU is not allowed"
     );
     assert!(
         data.next_cpu.is_none(),

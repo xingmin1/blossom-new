@@ -1,4 +1,4 @@
-//! 具体打开文件、固定描述符表和真实异步拥有的消费回归。
+//! 具体打开文件、可增长描述符表和真实异步拥有的消费回归。
 
 use crate::arch::{self, UserAccess, UserContext, UserTrap};
 use crate::fs::ktest::path::PathOwner;
@@ -14,13 +14,15 @@ struct FileOwner {
     table: Option<Arc<FileTable>>,
     hook_volume: Option<Arc<Ext4Volume>>,
     user: Option<usize>,
+    limit: usize,
 }
 
 impl FileOwner {
-    /// 正文构造完整路径视图与固定表，失败时保留原设备的清理责任。
-    fn prepare(&mut self, context: &TestContext<'_>, capacity: usize) -> TestResult {
+    /// 正文构造完整路径视图和小表，本例额度独立保存。
+    fn prepare(&mut self, context: &TestContext<'_>, limit: usize) -> TestResult {
         self.path.prepare_path(context, AccessMode::ReadOnly, 4)?;
-        let table = Arc::try_new(checked(context, FileTable::try_new(capacity))?)
+        self.limit = limit;
+        let table = Arc::try_new(checked(context, FileTable::try_new())?)
             .map_err(|_| TestError("file table owner OOM"))?;
         self.table = Some(table);
         Ok(())
@@ -42,8 +44,13 @@ impl FileOwner {
     ) -> Result<usize, TestError> {
         checked(
             context,
-            self.table()
-                .open(self.path.vfs(), self.path.context(), pathname, options),
+            self.table().open(
+                self.path.vfs(),
+                self.path.context(),
+                pathname,
+                options,
+                self.limit,
+            ),
         )
     }
 
@@ -88,6 +95,7 @@ impl Fixture<DeviceInventory> for FileOwner {
             table: None,
             hook_volume: None,
             user: None,
+            limit: 0,
         })
     }
 
@@ -115,6 +123,7 @@ impl Fixture<DeviceInventory> for FileOwner {
             table,
             hook_volume,
             user: _,
+            limit: _,
         } = self;
         drop(table);
         drop(hook_volume);
@@ -216,7 +225,7 @@ pub(crate) mod regular {
         read_pattern(context, table, fd, 0, 17)?;
         read_pattern(context, table, independent, 0, 11)?;
         read_pattern(context, table, hard, 0, 7)?;
-        let duplicate = checked(context, table.dup(fd))?;
+        let duplicate = checked(context, table.dup(fd, fixture.limit))?;
         context.expect_eq(
             Arc::ptr_eq(&first, &checked(context, table.lookup(duplicate))?),
             true,
@@ -349,7 +358,7 @@ pub(crate) mod directories {
             )?;
             let independent = fixture.open(context, pathname, OpenOptions::default())?;
             let table = fixture.table();
-            let duplicate = checked(context, table.dup(fd))?;
+            let duplicate = checked(context, table.dup(fd, fixture.limit))?;
             let first = checked(context, table.readdir(fd))?
                 .ok_or(TestError("directory first entry absent"))?;
             let reread_cookie = first.next_cookie;
@@ -423,6 +432,7 @@ pub(crate) mod directories {
                         no_follow: true,
                         ..OpenOptions::default()
                     },
+                    fixture.limit,
                 )
                 .err(),
             Some(FsError::TooManySymlinks),
@@ -437,6 +447,7 @@ pub(crate) mod directories {
                         directory: true,
                         ..OpenOptions::default()
                     },
+                    fixture.limit,
                 )
                 .err(),
             Some(FsError::NotDirectory),
@@ -452,6 +463,7 @@ pub(crate) mod directories {
                         no_follow: true,
                         ..OpenOptions::default()
                     },
+                    fixture.limit,
                 )
                 .err(),
             Some(FsError::NotDirectory),
@@ -475,7 +487,10 @@ pub(crate) mod slots {
         context: &mut TestContext<'_>,
         fixture: &mut FileOwner,
     ) -> TestResult {
-        context.expect_eq(FileTable::try_new(0).err(), Some(FsError::InvalidOperation));
+        context.expect_eq(
+            checked(context, FileTable::try_new())?.reserve(0).err(),
+            Some(FsError::TooManyFiles),
+        );
         fixture.prepare(context, 2)?;
         let fd = fixture.open(
             context,
@@ -486,15 +501,24 @@ pub(crate) mod slots {
             },
         )?;
         let table = fixture.table();
-        context.expect_eq(table.capacity(), 2);
-        let reservation = checked(context, table.reserve())?;
+        context.expect_eq(2 <= table.allocated_slots(), true);
+        let reservation = checked(context, table.reserve(fixture.limit))?;
         context.expect_eq(reservation.fd(), 1);
         context.expect_eq(table.lookup(1).err(), Some(FsError::BadFd));
         context.expect_eq(table.flags(1).err(), Some(FsError::BadFd));
         context.expect_eq(table.close(1).err(), Some(FsError::BadFd));
-        context.expect_eq(table.dup_exact(fd, 1).err(), Some(FsError::Busy));
-        context.expect_eq(table.reserve().err(), Some(FsError::TooManyFiles));
-        context.expect_eq(table.dup(fd).err(), Some(FsError::TooManyFiles));
+        context.expect_eq(
+            table.dup_exact(fd, 1, fixture.limit).err(),
+            Some(FsError::Busy),
+        );
+        context.expect_eq(
+            table.reserve(fixture.limit).err(),
+            Some(FsError::TooManyFiles),
+        );
+        context.expect_eq(
+            table.dup(fd, fixture.limit).err(),
+            Some(FsError::TooManyFiles),
+        );
         context.expect_eq(
             table
                 .open(
@@ -502,24 +526,31 @@ pub(crate) mod slots {
                     fixture.path.context(),
                     b"/empty",
                     OpenOptions::default(),
+                    fixture.limit,
                 )
                 .err(),
             Some(FsError::TooManyFiles),
         );
         drop(reservation);
-        let reservation = checked(context, table.reserve())?;
+        let reservation = checked(context, table.reserve(fixture.limit))?;
         context.expect_eq(reservation.fd(), 1);
         let file = checked(context, table.lookup(fd))?;
         let second = reservation.publish(file.clone(), DescriptorFlags::default());
         read_pattern(context, table, second, 0, 23)?;
         context.expect_eq(checked(context, table.seek(fd, SeekFrom::Current(0)))?, 23);
-        context.expect_eq(checked(context, table.dup_exact(fd, fd))?, fd);
+        context.expect_eq(
+            checked(context, table.dup_exact(fd, fd, fixture.limit))?,
+            fd,
+        );
         context.expect_eq(checked(context, table.flags(fd))?.close_on_exec, true);
         context.expect_eq(table.lookup(usize::MAX).err(), Some(FsError::BadFd));
-        context.expect_eq(table.dup_exact(fd, 2).err(), Some(FsError::BadFd));
+        context.expect_eq(
+            table.dup_exact(fd, 2, fixture.limit).err(),
+            Some(FsError::BadFd),
+        );
         checked(context, table.close(second))?;
         context.expect_eq(table.close(second).err(), Some(FsError::BadFd));
-        context.expect_eq(checked(context, table.dup(fd))?, second);
+        context.expect_eq(checked(context, table.dup(fd, fixture.limit))?, second);
         checked(context, table.close(fd))?;
         context.expect_eq(table.read(fd, &mut [0; 1]).err(), Some(FsError::BadFd));
         context.expect_eq(
@@ -529,6 +560,7 @@ pub(crate) mod slots {
                     fixture.path.context(),
                     b"/missing",
                     OpenOptions::default(),
+                    fixture.limit,
                 )
                 .err(),
             Some(FsError::NotFound),
@@ -537,19 +569,56 @@ pub(crate) mod slots {
             fixture.open(context, b"/empty", OpenOptions::default())?,
             fd,
         );
-        context.expect_eq(checked(context, table.dup_exact(second, fd))?, fd);
+        context.expect_eq(
+            checked(context, table.dup_exact(second, fd, fixture.limit))?,
+            fd,
+        );
         context.expect_eq(
             Arc::ptr_eq(&file, &checked(context, table.lookup(fd))?),
             true,
         );
         context.expect_eq(checked(context, table.flags(fd))?.close_on_exec, false);
-        let wide = checked(context, FileTable::try_new(300))?;
-        let base = checked(context, wide.reserve())?.publish(file, DescriptorFlags::default());
-        context.expect_eq(checked(context, wide.dup_exact(base, 299))?, 299);
+        let wide = checked(context, FileTable::try_new())?;
+        let base = checked(context, wide.reserve(4097))?.publish(file, DescriptorFlags::default());
+        context.expect_eq(checked(context, wide.dup_exact(base, 299, 4097))?, 299);
         read_pattern(context, &wide, 299, 23, 13)?;
         context.expect_eq(checked(context, wide.seek(base, SeekFrom::Current(0)))?, 36);
         checked(context, wide.close(299))?;
         context.expect_eq(wide.lookup(299).err(), Some(FsError::BadFd));
+        for fd in [1023, 1024, 1025, 4096] {
+            context.expect_eq(checked(context, wide.dup_exact(base, fd, 4097))?, fd);
+            context.expect_eq(
+                Arc::ptr_eq(
+                    &checked(context, wide.lookup(base))?,
+                    &checked(context, wide.lookup(fd))?,
+                ),
+                true,
+            );
+        }
+        let reserved = checked(context, wide.reserve(4097))?;
+        let child = checked(context, wide.try_clone())?;
+        context.expect_eq(child.lookup(reserved.fd()).err(), Some(FsError::BadFd));
+        drop(reserved);
+        context.expect_eq(checked(context, child.dup(base, 4097))?, 1);
+        checked(
+            context,
+            wide.set_flags(
+                4096,
+                DescriptorFlags {
+                    close_on_exec: true,
+                },
+            ),
+        )?;
+        wide.close_on_exec();
+        context.expect_eq(wide.lookup(4096).err(), Some(FsError::BadFd));
+        context.expect_eq(child.lookup(4096).is_ok(), true);
+        context.expect_eq(
+            checked(
+                context,
+                wide.dup_min(base, 4096, DescriptorFlags::default(), 4097),
+            )?,
+            4096,
+        );
         Ok(())
     }
 }
@@ -605,7 +674,7 @@ pub(crate) mod racing {
             submitted < fixture.path.owner.disk()?.test_snapshot().submitted,
             true,
         );
-        let reservation = checked(context, table.reserve())?;
+        let reservation = checked(context, table.reserve(fixture.limit))?;
         let target = reservation.fd();
         fixture.path.owner.publish(
             1,
@@ -824,6 +893,9 @@ pub(crate) mod oom {
             new_error,
             reserved_fd,
             reused_fd,
+            growth_errors,
+            growth_reused_fd,
+            growth_initial_slots,
             submitted_before,
             submitted_after,
         } = checked(context, result)?
@@ -838,6 +910,8 @@ pub(crate) mod oom {
         context.expect_eq(new_error, Some(FsError::NoMemory));
         context.expect_eq(reserved_fd, 1);
         context.expect_eq(reused_fd, reserved_fd);
+        context.expect_eq(growth_errors, [Some(FsError::NoMemory); 2]);
+        context.expect_eq(growth_reused_fd, growth_initial_slots);
         context.expect_eq(submitted_after, submitted_before);
         context.expect_eq(
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,

@@ -12,6 +12,7 @@ use crate::fs::{
 };
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
+use crate::task::process::Resource;
 use crate::task::{UserRuntime, UserThread};
 
 const AT_FDCWD: i32 = -100;
@@ -48,6 +49,15 @@ const MAX_PATH_BYTES: usize = 4096;
 pub(super) const MAX_RW_COUNT: usize = 0x7fff_f000;
 pub(super) const MAX_IOV_COUNT: usize = 1024;
 
+/// 实际用户 syscall 必须仍绑定身份，额度每次读取原组而不缓存到共享文件表。
+pub(super) fn nofile(user: &UserThread) -> usize {
+    user.identity()
+        .expect("descriptor syscall has no user identity")
+        .group()
+        .resource_limit(Resource::NoFile)
+        .current as usize
+}
+
 /// 只接受两个管道打开位；两个原预留槽在完整 copyout 成功后才分别发表。
 pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let flags = raw[1] as u32;
@@ -55,8 +65,8 @@ pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
         return Err(Errno::InvalidArgument);
     }
     let runtime = user.runtime().expect("pipe2 has no runtime");
-    let reader_slot = runtime.files.reserve()?;
-    let writer_slot = runtime.files.reserve()?;
+    let reader_slot = runtime.files.reserve(nofile(user))?;
+    let writer_slot = runtime.files.reserve(nofile(user))?;
     let (reader, writer) =
         fs::pipe::try_new(flags, runtime.credentials.uid, runtime.credentials.gid)?;
     let mut bytes = [0u8; 8];
@@ -262,21 +272,21 @@ pub(super) fn writev(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)
 }
 
-/// 先预留描述符，再让 VFS 决定最终名字；创建分支在名字发表前构造完整 OFD。
+/// 校验打开标志后预留描述符；创建分支在名字发表前构造完整 OFD。
 pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("openat has no runtime");
     let mm = user.mm().expect("openat has no MM");
     let flags = raw[2] as u32;
-    let reservation = runtime.files.reserve()?;
     if flags & 3 == 3 {
         return Err(Errno::InvalidArgument);
     }
     if flags & !OPENAT_SUPPORTED != 0 {
         return Err(Errno::Unsupported);
     }
-    if flags & EXCLUSIVE != 0 && flags & CREATE == 0 {
+    if flags & (CREATE | DIRECTORY) == (CREATE | DIRECTORY) {
         return Err(Errno::InvalidArgument);
     }
+    let reservation = runtime.files.reserve(nofile(user))?;
     let pathname = mm.read_c_string(raw[1], MAX_PATH_BYTES)?;
     let (vfs, context) = fs_snapshot(&runtime);
     let start = resolve_start(&runtime, &context, raw[0], &pathname)?;
@@ -631,7 +641,7 @@ pub(super) fn dup(user: &UserThread, raw: usize) -> SysResult {
         .runtime()
         .expect("dup has no runtime")
         .files
-        .dup(descriptor(raw)?)? as isize)
+        .dup(descriptor(raw)?, nofile(user))? as isize)
 }
 
 /// dup3只接受CLOEXEC且同号EINVAL，替换释放责任由原表在锁外承担。
@@ -646,6 +656,7 @@ pub(super) fn dup3(user: &UserThread, raw: [usize; 6]) -> SysResult {
         DescriptorFlags {
             close_on_exec: raw[2] as u32 & CLOEXEC != 0,
         },
+        nofile(user),
     )? as isize)
 }
 
@@ -656,7 +667,7 @@ pub(super) fn fcntl(user: &UserThread, raw: [usize; 6]) -> SysResult {
     match raw[1] as u32 {
         0 | 1030 => {
             let minimum = raw[2] as i32;
-            if minimum < 0 || runtime.files.capacity() <= minimum as usize {
+            if minimum < 0 {
                 return Err(Errno::InvalidArgument);
             }
             Ok(runtime.files.dup_min(
@@ -665,6 +676,7 @@ pub(super) fn fcntl(user: &UserThread, raw: [usize; 6]) -> SysResult {
                 DescriptorFlags {
                     close_on_exec: raw[1] as u32 == 1030,
                 },
+                nofile(user),
             )? as isize)
         }
         1 => Ok(runtime.files.flags(fd)?.close_on_exec as isize),
@@ -695,19 +707,19 @@ pub(super) fn fstat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(0)
 }
 
-/// statat按真实dirfd和最后链接选项查询，空路径只在显式EMPTY_PATH时查原对象。
+/// 按真实 dirfd 和最后链接选项查询；NULL 仅接受精确 EMPTY_PATH 与非负 fd。
 pub(super) fn statat(user: &UserThread, raw: [usize; 6]) -> SysResult {
-    if raw[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+    if raw[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT as usize) != 0 {
         return Err(Errno::InvalidArgument);
     }
     let runtime = user.runtime().expect("statat has no runtime");
     let mm = user.mm().expect("statat has no MM");
-    let stat = query_stat(&runtime, &mm, raw[0], raw[1], raw[3], false)?;
+    let stat = query_stat(&runtime, &mm, raw[0], raw[1], raw[3])?;
     copyout(&mm, raw[2], &encode_stat(stat)?)?;
     Ok(0)
 }
 
-/// 从唯一 FileStat 查询编码 statx；本地当前属性不需要远程同步或磁盘 FLUSH。
+/// 从唯一 FileStat 查询编码 statx；去除同步与自动挂载提示后判定 NULL 快路。
 pub(super) fn statx(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let flags = raw[2] as u32;
     let mask = raw[3] as u32;
@@ -722,25 +734,23 @@ pub(super) fn statx(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("statx has no runtime");
     let mm = user.mm().expect("statx has no MM");
     let path_flags = (flags & !(AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) as usize;
-    let allow_null = path_flags == AT_EMPTY_PATH;
-    if raw[1] == 0 && !allow_null {
-        return Err(Errno::BadAddress);
-    }
-    let stat = query_stat(&runtime, &mm, raw[0], raw[1], path_flags, allow_null)?;
+    let stat = query_stat(&runtime, &mm, raw[0], raw[1], path_flags)?;
     copyout(&mm, raw[4], &encode_statx(stat))?;
     Ok(0)
 }
 
-/// 共用 dirfd、空路径和最后链接属性查询；只有 statx 明确授权的 NULL 才视作空串。
+/// 共用属性查找；NULL 快路限定精确 EMPTY_PATH 与非负 int fd，普通空串仍可查 cwd。
 fn query_stat(
     runtime: &UserRuntime,
     mm: &Mm,
     dirfd: usize,
     address: usize,
     flags: usize,
-    allow_null: bool,
 ) -> Result<FileStat, Errno> {
-    let pathname = if address == 0 && allow_null {
+    let pathname = if address == 0 {
+        if flags != AT_EMPTY_PATH || (dirfd as i32) < 0 {
+            return Err(Errno::BadAddress);
+        }
         Vec::new()
     } else {
         mm.read_c_string(address, MAX_PATH_BYTES)?

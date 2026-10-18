@@ -57,7 +57,7 @@ def options(**overrides):
                            uart_payload=None, uart_expect=None, scratch_bytes=4096, logical_block_size=512,
                            ap_freeze=False, gdb=None,
                            iommu_platform=False, modern=False, root=None, root_mode="ro", extra_root=None,
-                           startup_timeout=10, setup_timeout=5, case_timeout=10, cleanup_timeout=5)
+                           startup_timeout_seconds=10, setup_timeout_seconds=5, case_timeout_seconds=10, cleanup_timeout_seconds=5)
     for key, value in overrides.items():
         setattr(args, key, value)
     return args

@@ -10,7 +10,7 @@ use crate::net::address::{
 use crate::net::socket::SocketFile;
 use crate::net::UnixSocketType;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
-use crate::syscall::file::{import_vectors, MAX_IOV_COUNT};
+use crate::syscall::file::{import_vectors, nofile, MAX_IOV_COUNT};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::UserThread;
 use crate::timer::TICK_NS;
@@ -126,7 +126,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let runtime = user.runtime().expect("socket has no runtime");
     let net = runtime.net.ok_or(Errno::NetworkUnreachable)?;
-    let reservation = runtime.files.reserve()?;
+    let reservation = runtime.files.reserve(nofile(user))?;
     let file: FileRef = if kind == SOCK_STREAM {
         SocketFile::try_new_tcp(
             net,
@@ -187,8 +187,8 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     let runtime = user.runtime().expect("socketpair has no runtime");
     let net = runtime.net.ok_or(Errno::NetworkUnreachable)?;
-    let first_slot = runtime.files.reserve()?;
-    let second_slot = runtime.files.reserve()?;
+    let first_slot = runtime.files.reserve(nofile(user))?;
+    let second_slot = runtime.files.reserve(nofile(user))?;
     let [first, second] = SocketFile::try_new_unix_pair(
         net,
         kind,
@@ -255,10 +255,10 @@ fn bind(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(0)
 }
 
-/// signed backlog 按有限监听队列上界处理，零仍交给真实 listener。
+/// signed backlog 转为无符号后按独立 somaxconn 限幅，零交给真实 listener。
 fn listen(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let file = socket_file(user, raw[0])?;
-    let backlog = (raw[1] as i32 as u32).min(128) as usize;
+    let backlog = (raw[1] as i32 as u32).min(crate::net::SOMAXCONN as u32) as usize;
     file.socket()
         .expect("checked socket capability")
         .listen(backlog)?;
@@ -272,7 +272,7 @@ fn accept(user: &UserThread, raw: [usize; 6], flags: u32) -> SysResult {
     }
     let file = socket_file(user, raw[0])?;
     let runtime = user.runtime().expect("accept has no runtime");
-    let reservation = runtime.files.reserve()?;
+    let reservation = runtime.files.reserve(nofile(user))?;
     let child = file.socket().expect("checked socket capability").accept(
         flags,
         runtime.credentials.uid,

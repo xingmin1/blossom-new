@@ -1,5 +1,6 @@
-//! 固定描述符槽负责编号与发表，具体文件独立拥有路径和共享位置。
+//! 描述符槽按实际使用增长，额度由每次调用者提供，具体文件独立拥有路径和共享位置。
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -35,11 +36,76 @@ enum Slot {
     },
 }
 
-/// 固定上限的内核描述符表；具体文件调用与最后引用释放均在短锁外。
-/// ponytail: 有限槽内线性选择最小空号，容量显著增大时改用空槽位图。
+const PAGE_SLOTS: usize = 64;
+
+/// 每页空闲位与槽在同一短锁内修改，页拥有只在目录增长时移动。
+struct SlotPage {
+    slots: [Slot; PAGE_SLOTS],
+    free: u64,
+}
+
+struct Slots {
+    pages: Vec<Box<SlotPage>>,
+}
+
+impl Slots {
+    /// 已分配空间是 max_fds 快照，不代表任何线程组的限额。
+    fn len(&self) -> usize {
+        self.pages.len() * PAGE_SLOTS
+    }
+
+    /// fork 只为已经发表的最高号准备空间，旧高号关闭和 Reserved 不扩大子表。
+    fn open_span(&self) -> usize {
+        (0..self.len())
+            .rev()
+            .find(|fd| matches!(self.get(*fd), Some(Slot::Open { .. })))
+            .map_or(0, |fd| fd + 1)
+    }
+
+    /// 借用已存在的槽，调用者不得使借用跨越表锁。
+    fn get(&self, fd: usize) -> Option<&Slot> {
+        self.pages
+            .get(fd / PAGE_SLOTS)
+            .map(|page| &page.slots[fd % PAGE_SLOTS])
+    }
+
+    /// 在同一锁内修改槽及空闲位；移出的 OFD 由调用者锁外释放。
+    fn replace(&mut self, fd: usize, slot: Slot) -> Slot {
+        let page = &mut self.pages[fd / PAGE_SLOTS];
+        let bit = 1u64 << (fd % PAGE_SLOTS);
+        if matches!(slot, Slot::Vacant) {
+            page.free |= bit;
+        } else {
+            page.free &= !bit;
+        }
+        mem::replace(&mut page.slots[fd % PAGE_SLOTS], slot)
+    }
+
+    /// 位图选择不小于最低号且严格小于本次额度的最小空号。
+    fn vacant(&self, minimum: usize, limit: usize) -> Option<usize> {
+        if limit <= minimum {
+            return None;
+        }
+        for index in minimum / PAGE_SLOTS..self.pages.len().min(limit.div_ceil(PAGE_SLOTS)) {
+            let base = index * PAGE_SLOTS;
+            let mut free = self.pages[index].free;
+            if base < minimum {
+                free &= u64::MAX << (minimum - base);
+            }
+            if limit - base < PAGE_SLOTS {
+                free &= (1u64 << (limit - base)) - 1;
+            }
+            if free != 0 {
+                return Some(base + free.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+}
+
+/// 槽页、空闲位图和目录一起发表；额度不保存在可跨线程组共享的表内。
 pub struct FileTable {
-    slots: SpinLock<Vec<Slot>>,
-    capacity: usize,
+    slots: SpinLock<Slots>,
     users: AtomicUsize,
 }
 
@@ -51,37 +117,85 @@ pub struct FileReservation<'a> {
 }
 
 impl FileTable {
-    /// 在锁外一次预留并初始化全部槽位，零容量无可用描述符而返回 InvalidOperation。
-    pub fn try_new(capacity: usize) -> Result<Self, FsError> {
-        if capacity == 0 {
-            return Err(FsError::InvalidOperation);
-        }
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(capacity)
-            .map_err(|_| FsError::NoMemory)?;
-        slots.resize_with(capacity, || Slot::Vacant);
-        Ok(Self {
-            slots: SpinLock::new(slots),
-            capacity,
+    /// 锁外建立一个小槽页，不预先分配用户额度对应的空间。
+    pub fn try_new() -> Result<Self, FsError> {
+        let table = Self {
+            slots: SpinLock::new(Slots { pages: Vec::new() }),
             users: AtomicUsize::new(0),
-        })
+        };
+        table.grow(PAGE_SLOTS)?;
+        Ok(table)
     }
 
-    /// 锁外准备完整空表，父锁内仅复制 Open 引用与属性，Reserved 不转移。
+    /// 锁外准备全部新页及替代目录，重验后只移动已有页的拥有。
+    fn grow(&self, required: usize) -> Result<(), FsError> {
+        let needed = required.div_ceil(PAGE_SLOTS);
+        loop {
+            let (current, capacity) = {
+                let slots = self.slots.lock();
+                (slots.pages.len(), slots.pages.capacity())
+            };
+            if needed <= current {
+                return Ok(());
+            }
+            let mut directory = Vec::new();
+            if capacity < needed {
+                directory
+                    .try_reserve_exact(needed.max(capacity.saturating_mul(2)))
+                    .map_err(|_| FsError::NoMemory)?;
+            }
+            let mut added = Vec::new();
+            added
+                .try_reserve_exact(needed - current)
+                .map_err(|_| FsError::NoMemory)?;
+            for _ in current..needed {
+                added.push(
+                    Box::try_new(SlotPage {
+                        slots: [const { Slot::Vacant }; PAGE_SLOTS],
+                        free: u64::MAX,
+                    })
+                    .map_err(|_| FsError::NoMemory)?,
+                );
+            }
+            {
+                let mut slots = self.slots.lock();
+                if slots.pages.len() != current {
+                    continue;
+                }
+                if capacity < needed {
+                    directory.extend(slots.pages.drain(..));
+                    mem::swap(&mut slots.pages, &mut directory);
+                }
+                slots.pages.append(&mut added);
+            }
+            return Ok(());
+        }
+    }
+
+    /// 复制最终锁内的 Open 集合；并发增长时重新准备，Reserved 在子表保持空闲。
     pub fn try_clone(&self) -> Result<Self, FsError> {
-        let child = Self::try_new(self.capacity)?;
-        {
+        let child = Self::try_new()?;
+        loop {
+            let required = self.slots.lock().open_span();
+            child.grow(required)?;
             let mut target = child.slots.lock();
             let source = self.slots.lock();
-            for (source, target) in source.iter().zip(target.iter_mut()) {
-                if let Slot::Open { file, flags } = source {
-                    *target = Slot::Open {
-                        file: file.clone(),
-                        flags: *flags,
-                    };
+            let highest = source.open_span();
+            if target.len() < highest {
+                continue;
+            }
+            for fd in 0..highest {
+                if let Some(Slot::Open { file, flags }) = source.get(fd) {
+                    target.replace(
+                        fd,
+                        Slot::Open {
+                            file: file.clone(),
+                            flags: *flags,
+                        },
+                    );
                 }
             }
+            break;
         }
         Ok(child)
     }
@@ -106,24 +220,31 @@ impl FileTable {
         self.users.load(Ordering::Acquire)
     }
 
-    /// 返回构造时固定的槽数，预留和复制描述符都不能扩大它。
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    /// 返回本次已分配槽空间，供 select 按一次 max_fds 快照裁剪输入。
+    pub fn allocated_slots(&self) -> usize {
+        self.slots.lock().len()
     }
 
-    /// 同一短锁内选最小空槽并交出独占发表责任，表满不改变已有槽。
-    pub fn reserve(&self) -> Result<FileReservation<'_>, FsError> {
-        let mut slots = self.slots.lock();
-        let fd = slots
-            .iter()
-            .position(|slot| matches!(slot, Slot::Vacant))
-            .ok_or(FsError::TooManyFiles)?;
-        slots[fd] = Slot::Reserved;
-        Ok(FileReservation {
-            table: self,
-            fd,
-            active: true,
-        })
+    /// 以本次调用者额度选择最小空槽，必要元数据均在短锁外准备。
+    pub fn reserve(&self, limit: usize) -> Result<FileReservation<'_>, FsError> {
+        loop {
+            let required = {
+                let mut slots = self.slots.lock();
+                if let Some(fd) = slots.vacant(0, limit) {
+                    slots.replace(fd, Slot::Reserved);
+                    return Ok(FileReservation {
+                        table: self,
+                        fd,
+                        active: true,
+                    });
+                }
+                if limit <= slots.len() {
+                    return Err(FsError::TooManyFiles);
+                }
+                (slots.len() + PAGE_SLOTS).min(limit)
+            };
+            self.grow(required)?;
+        }
     }
 
     /// 短锁内取得已发表文件的强引用；调用者随后不重查可复用的整数编号。
@@ -147,7 +268,11 @@ impl FileTable {
     /// 同一次槽锁中替换 descriptor 属性，不改变其共享 OFD。
     pub fn set_flags(&self, fd: usize, replacement: DescriptorFlags) -> Result<(), FsError> {
         let mut slots = self.slots.lock();
-        match slots.get_mut(fd) {
+        match slots
+            .pages
+            .get_mut(fd / PAGE_SLOTS)
+            .map(|page| &mut page.slots[fd % PAGE_SLOTS])
+        {
             Some(Slot::Open { flags, .. }) => {
                 *flags = replacement;
                 Ok(())
@@ -163,8 +288,9 @@ impl FileTable {
         context: &FsContext,
         pathname: &[u8],
         options: OpenOptions,
+        limit: usize,
     ) -> Result<usize, FsError> {
-        let reservation = self.reserve()?;
+        let reservation = self.reserve(limit)?;
         let mode = if options.no_follow {
             ResolveMode::NoFollow
         } else {
@@ -242,24 +368,22 @@ impl FileTable {
     pub fn close(&self, fd: usize) -> Result<(), FsError> {
         let old = {
             let mut slots = self.slots.lock();
-            let slot = slots.get_mut(fd).ok_or(FsError::BadFd)?;
-            if !matches!(slot, Slot::Open { .. }) {
+            if !matches!(slots.get(fd), Some(Slot::Open { .. })) {
                 return Err(FsError::BadFd);
             }
-            mem::replace(slot, Slot::Vacant)
+            slots.replace(fd, Slot::Vacant)
         };
         drop(old);
         Ok(())
     }
 
-    /// 逐槽移出带CLOEXEC的打开文件，锁外最后释放，不分配或改变固定容量。
+    /// exec 已独占或私有化此表，逐槽撤 CLOEXEC 并锁外释放最后拥有。
     pub fn close_on_exec(&self) {
-        for fd in 0..self.capacity {
+        for fd in 0..self.allocated_slots() {
             let old = {
                 let mut slots = self.slots.lock();
-                let slot = &mut slots[fd];
-                if matches!(slot, Slot::Open { flags, .. } if flags.close_on_exec) {
-                    Some(mem::replace(slot, Slot::Vacant))
+                if matches!(slots.get(fd), Some(Slot::Open { flags, .. }) if flags.close_on_exec) {
+                    Some(slots.replace(fd, Slot::Vacant))
                 } else {
                     None
                 }
@@ -268,78 +392,99 @@ impl FileTable {
         }
     }
 
-    /// 内核最小空号复制清除新描述符 CLOEXEC，仍共享原 OFD。
-    pub fn dup(&self, fd: usize) -> Result<usize, FsError> {
-        self.dup_min(fd, 0, DescriptorFlags::default())
+    /// 最小空号复制清除新描述符 CLOEXEC，仍共享原 OFD。
+    pub fn dup(&self, fd: usize, limit: usize) -> Result<usize, FsError> {
+        self.dup_min(fd, 0, DescriptorFlags::default(), limit)
     }
 
-    /// 验证源后选择不小于 min 的最小空槽，固定表不隐式扩容。
-    pub fn dup_min(&self, fd: usize, min: usize, flags: DescriptorFlags) -> Result<usize, FsError> {
-        let mut slots = self.slots.lock();
-        let Some(Slot::Open { file, .. }) = slots.get(fd) else {
-            return Err(FsError::BadFd);
-        };
-        if self.capacity <= min {
-            return Err(FsError::InvalidOperation);
+    /// 每次重取锁均重验源 Open 与当前空号，扩容失败不留下预留。
+    pub fn dup_min(
+        &self,
+        fd: usize,
+        min: usize,
+        flags: DescriptorFlags,
+        limit: usize,
+    ) -> Result<usize, FsError> {
+        loop {
+            let required = {
+                let mut slots = self.slots.lock();
+                let Some(Slot::Open { file, .. }) = slots.get(fd) else {
+                    return Err(FsError::BadFd);
+                };
+                if limit <= min {
+                    return Err(FsError::InvalidOperation);
+                }
+                if let Some(target) = slots.vacant(min, limit) {
+                    let file = file.clone();
+                    slots.replace(target, Slot::Open { file, flags });
+                    return Ok(target);
+                }
+                if limit <= slots.len() {
+                    return Err(FsError::TooManyFiles);
+                }
+                (slots.len() + PAGE_SLOTS).max(min + 1).min(limit)
+            };
+            self.grow(required)?;
         }
-        let target = slots
-            .iter()
-            .enumerate()
-            .skip(min)
-            .find(|(_, slot)| matches!(slot, Slot::Vacant))
-            .map(|(fd, _)| fd)
-            .ok_or(FsError::TooManyFiles)?;
-        let file = file.clone();
-        slots[target] = Slot::Open { file, flags };
-        Ok(target)
     }
 
-    /// 内核精确复制允许同号保留原属性，其余复制清除 CLOEXEC。
-    pub fn dup_exact(&self, source: usize, target: usize) -> Result<usize, FsError> {
-        self.replace_duplicate(source, target, DescriptorFlags::default(), true)
+    /// 精确复制允许同号保留原属性，其余复制清除 CLOEXEC。
+    pub fn dup_exact(&self, source: usize, target: usize, limit: usize) -> Result<usize, FsError> {
+        self.replace_duplicate(source, target, DescriptorFlags::default(), true, limit)
     }
 
-    /// 用户 dup3 原子替换指定槽，同号无效，Reserved 不可由其他责任替换。
+    /// dup3 同号无效，目标 Reserved 不可由其他责任替换。
     pub fn dup_exact_flags(
         &self,
         source: usize,
         target: usize,
         flags: DescriptorFlags,
+        limit: usize,
     ) -> Result<usize, FsError> {
-        self.replace_duplicate(source, target, flags, false)
+        self.replace_duplicate(source, target, flags, false, limit)
     }
 
-    /// 同锁验证并移动完整目标拥有值，最后 put 在表锁之外执行。
+    /// 扩容之后重验源及目标，原子替换并在表锁外释放旧 OFD。
     fn replace_duplicate(
         &self,
         source: usize,
         target: usize,
         flags: DescriptorFlags,
         allow_same: bool,
+        limit: usize,
     ) -> Result<usize, FsError> {
         if !allow_same && source == target {
             return Err(FsError::InvalidOperation);
         }
-        let old = {
-            let mut slots = self.slots.lock();
-            let Some(Slot::Open { file, .. }) = slots.get(source) else {
-                return Err(FsError::BadFd);
+        loop {
+            let old = {
+                let mut slots = self.slots.lock();
+                let Some(Slot::Open { file, .. }) = slots.get(source) else {
+                    return Err(FsError::BadFd);
+                };
+                if source == target && allow_same {
+                    return Ok(target);
+                }
+                if limit <= target {
+                    return Err(FsError::BadFd);
+                }
+                if slots.len() <= target {
+                    drop(slots);
+                    self.grow(target + 1)?;
+                    continue;
+                }
+                if matches!(slots.get(target), Some(Slot::Reserved)) {
+                    return Err(FsError::Busy);
+                }
+                let replacement = Slot::Open {
+                    file: file.clone(),
+                    flags,
+                };
+                slots.replace(target, replacement)
             };
-            let target_slot = slots.get(target).ok_or(FsError::BadFd)?;
-            if matches!(target_slot, Slot::Reserved) {
-                return Err(FsError::Busy);
-            }
-            if source == target {
-                return Ok(target);
-            }
-            let replacement = Slot::Open {
-                file: file.clone(),
-                flags,
-            };
-            mem::replace(&mut slots[target], replacement)
-        };
-        drop(old);
-        Ok(target)
+            drop(old);
+            return Ok(target);
+        }
     }
 }
 
@@ -349,12 +494,12 @@ impl FileReservation<'_> {
         self.fd
     }
 
-    /// 消费唯一预留责任并移动完整文件入槽，既有固定槽无需分配且不能被外人替换。
+    /// 消费唯一预留责任并移动完整文件入槽；原槽和位图均已准备。
     pub fn publish(mut self, file: FileRef, flags: DescriptorFlags) -> usize {
         {
             let mut slots = self.table.slots.lock();
-            debug_assert!(matches!(slots[self.fd], Slot::Reserved));
-            slots[self.fd] = Slot::Open { file, flags };
+            assert!(matches!(slots.get(self.fd), Some(Slot::Reserved)));
+            slots.replace(self.fd, Slot::Open { file, flags });
             self.active = false;
         }
         self.fd
@@ -366,8 +511,8 @@ impl Drop for FileReservation<'_> {
     fn drop(&mut self) {
         if self.active {
             let mut slots = self.table.slots.lock();
-            debug_assert!(matches!(slots[self.fd], Slot::Reserved));
-            slots[self.fd] = Slot::Vacant;
+            assert!(matches!(slots.get(self.fd), Some(Slot::Reserved)));
+            slots.replace(self.fd, Slot::Vacant);
         }
     }
 }

@@ -24,6 +24,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
     println!("cargo:rerun-if-env-changed=BLOSSOM_PLATFORM");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTEST");
+    println!("cargo:rerun-if-env-changed=BLOSSOM_MAX_CPUS");
     println!("cargo:rerun-if-changed=src/platform/layout.rs");
     println!("cargo:rustc-check-cfg=cfg(blossom_platform, values(\"qemu-virt\", \"visionfive2\", \"ls2k1000la\"))");
     println!("cargo:rustc-cfg=blossom_platform=\"{platform}\"");
@@ -33,6 +34,28 @@ fn main() {
         _ => panic!("unsupported kernel target: {}", arch),
     };
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory is missing"));
+    let max_cpus = match env::var("BLOSSOM_MAX_CPUS") {
+        Ok(value) => {
+            assert!(
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "BLOSSOM_MAX_CPUS must be a positive integer"
+            );
+            value
+                .parse::<usize>()
+                .expect("BLOSSOM_MAX_CPUS is out of range")
+        }
+        Err(env::VarError::NotPresent) => 12,
+        Err(error) => panic!("BLOSSOM_MAX_CPUS cannot be read: {}", error),
+    };
+    assert!(0 < max_cpus, "BLOSSOM_MAX_CPUS must be a positive integer");
+    max_cpus
+        .checked_add(usize::BITS as usize - 1)
+        .expect("BLOSSOM_MAX_CPUS bitmap size overflows");
+    fs::write(
+        output.join("cpu-capacity.rs"),
+        format!("pub const MAX_CPUS: usize = {max_cpus};\n"),
+    )
+    .expect("CPU capacity cannot be written");
     let linker_layout = format!(
         "__blossom_platform = {identity};\n\
          __kernel_phys_start = {physical:#x};\n\

@@ -13,7 +13,12 @@ use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
-const CHILDREN: usize = 64;
+// 每核参与者之外保留一个协调 Task；普通非逐核用例仍有原来的最小登记预算。
+const CHILDREN: usize = if 64 < crate::boot::MAX_CPUS + 1 {
+    crate::boot::MAX_CPUS + 1
+} else {
+    64
+};
 const NO_CASE: u32 = u32::MAX;
 static BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
 static BOOT_BOUNDARY: AtomicPtr<Boundary> = AtomicPtr::new(ptr::null_mut());
@@ -372,7 +377,7 @@ fn prepare_child(
         }
         if slots.slots.iter().all(Option::is_some) {
             drop(slots);
-            return Err(TestError("child scope capacity exhausted (64)"));
+            return Err(TestError("child scope capacity exhausted"));
         }
     }
     // 已登记的原调用 Task 保住预备尾部；未发表入口不能开始执行，失败析构允许睡眠。
@@ -433,7 +438,7 @@ impl PreparedChild {
             Some(slot) => slot,
             None => {
                 drop(slots);
-                return Err(TestError("child scope capacity exhausted (64)"));
+                return Err(TestError("child scope capacity exhausted"));
             }
         };
         let handle = self.prepared.publish();

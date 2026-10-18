@@ -1,5 +1,12 @@
 //! 固定在线 CPU 的执行基础；请求节点由同步调用者拥有，完成前不离开其栈。
 
+mod set;
+pub(crate) mod stack;
+#[cfg(feature = "ktest")]
+pub(crate) use set::AtomicCpuSet;
+pub use set::CpuSet;
+
+use alloc::alloc::AllocError;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -8,6 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Once;
 
 use crate::boot::{BootInfo, MAX_CPUS};
+use crate::cpu::stack::StackSlot;
 use crate::sched::context::TaskContext;
 use crate::sync::{IrqSaveGuard, SpinLock};
 use crate::task::Task;
@@ -20,16 +28,16 @@ pub(crate) const KICK_TIMER_REPROGRAM: usize = 1 << 1;
 pub(crate) const KICK_LOG_PRINTER: usize = 1 << 2;
 const KICK_STOP: usize = 1 << 3;
 
-/// 链接期保留的独立启动栈，不由旧页分配器申请。
+/// 链接期保留的主核启动栈，不依赖页分配器。
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct BootStack(pub [u8; STACK_SIZE]);
 
-/// 汇编主辅入口共同使用的四份静态栈。
+/// 主核入口使用的唯一静态栈。
 #[no_mangle]
 #[link_section = ".boot.stacks"]
 #[used]
-pub static mut BOOT_STACKS: [BootStack; MAX_CPUS] = [BootStack([0; STACK_SIZE]); MAX_CPUS];
+pub static mut BOOT_STACK: BootStack = BootStack([0; STACK_SIZE]);
 
 /// AP 使用的不可变启动记录；记录、独占栈和 CpuLocal 在内核生命周期内保留。
 #[repr(C)]
@@ -100,7 +108,7 @@ impl CallQueue {
 pub struct CpuLocal {
     pub id: usize,
     pub hardware_id: usize,
-    pub stack_top: usize,
+    stack: StackSlot,
     pub online: AtomicBool,
     pub timer_interrupts: AtomicUsize,
     pub ipi_interrupts: AtomicUsize,
@@ -151,12 +159,12 @@ unsafe impl Sync for CpuLocal {}
 unsafe impl Send for CpuLocal {}
 
 impl CpuLocal {
-    /// 构造 CPU 身份、静态调度现场与独立执行深度，不申请普通任务对象。
+    /// 构造 CPU 身份和调度状态；主核使用静态栈，辅核等待 MM 建立后准备栈。
     const fn new(id: usize, hardware_id: usize, stack_top: usize) -> Self {
         Self {
             id,
             hardware_id,
-            stack_top,
+            stack: StackSlot::new(stack_top),
             online: AtomicBool::new(false),
             timer_interrupts: AtomicUsize::new(0),
             ipi_interrupts: AtomicUsize::new(0),
@@ -197,6 +205,17 @@ impl CpuLocal {
         }
     }
 
+    /// 返回可供本核启动和调度使用的已发布栈顶。
+    pub fn stack_top(&self) -> usize {
+        self.stack.top()
+    }
+
+    /// 返回本核动态栈实际拥有的直映起点和字节数，主核静态栈返回空。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn stack_allocation(&self) -> Option<(usize, usize)> {
+        self.stack.allocation()
+    }
+
     /// 只观察未处理原因；最终等待检查不得消费通知。
     pub(crate) fn kick_pending(&self) -> bool {
         self.kick_reasons.load(Ordering::Acquire) != 0
@@ -233,7 +252,7 @@ static mut BOOT_RECORDS: [CpuBoot; MAX_CPUS] = [CpuBoot {
     local: 0,
 }; MAX_CPUS];
 
-/// 构造 CPU 表和启动记录，并安装 BSP 的每核基址。
+/// 构造 CPU 表和早期启动记录，仅主核填写静态栈顶，并安装主核的每核基址。
 ///
 /// # Safety
 /// 只能由 BSP 在 AP 未释放、IRQ 关闭时执行一次；info 是已发布的实际资源，
@@ -243,28 +262,51 @@ pub unsafe fn initialize(info: &BootInfo) {
         CPU_LOCALS.iter().all(|local| local.get().is_none()),
         "CPU table is already initialized"
     );
-    let stack_base = ptr::addr_of!(BOOT_STACKS) as usize;
+    let bsp_stack_top = ptr::addr_of!(BOOT_STACK) as usize + STACK_SIZE;
     for (id, slot) in CPU_LOCALS[..info.cpu_count].iter().enumerate() {
-        let local = slot.call_once(|| {
-            CpuLocal::new(
-                id,
-                info.hardware_ids[id],
-                stack_base + (id + 1) * STACK_SIZE,
-            )
-        });
+        let stack_top = if id == 0 { bsp_stack_top } else { 0 };
+        let local = slot.call_once(|| CpuLocal::new(id, info.hardware_ids[id], stack_top));
         // SAFETY: id 来自已验证的有效 CPU 范围；BSP 独占静态记录，AP 尚未读取。
         unsafe {
             ptr::addr_of_mut!(BOOT_RECORDS)
                 .cast::<CpuBoot>()
                 .add(id)
                 .write(CpuBoot {
-                    stack_top: local.stack_top,
+                    stack_top: local.stack_top(),
                     local: local as *const CpuLocal as usize,
                 });
         }
     }
     // SAFETY: 逻辑 0 是 BSP；Once 中的对象已完成构造且永久存在，IRQ 尚未开启。
     unsafe { crate::arch::install_cpu_local(get(0)) };
+}
+
+/// 在 MM 建立后准备全部实际辅核栈，成功后填写启动记录，主核记录保持不变。
+///
+/// # Safety
+/// 只能由 BSP 在 IRQ 关闭、MM 页分配器与永久可写直映已建立后调用。
+/// CPU 表已构造，全部 AP 尚未释放，调用者独占启动记录与栈准备；
+/// 全部辅核槽尚为空，记录不得被固件或其他 CPU 并发读取。
+pub(crate) unsafe fn prepare_secondary_stacks() -> Result<(), AllocError> {
+    assert_eq!(current().id, 0, "only BSP may prepare AP stacks");
+    assert!(
+        !crate::arch::irq_enabled(),
+        "AP stack preparation requires IRQ off"
+    );
+    // SAFETY: 调用者保证 MM 已建立且全部 AP 未释放；逻辑编号的有限范围无重复，
+    // 每个槽属于永久 CpuLocal，准备和启动记录写入均由唯一 BSP 独占。
+    unsafe { stack::prepare_slots((1..count()).map(|id| &get(id).stack)) }?;
+    for id in 1..count() {
+        // SAFETY: 目标 AP 尚未释放，BSP 独占该有效记录，只填写准备成功的栈顶；
+        // local 指向的永久对象保持原值，栈页由同一 CpuLocal 永久保活。
+        unsafe {
+            ptr::addr_of_mut!(
+                (*ptr::addr_of_mut!(BOOT_RECORDS).cast::<CpuBoot>().add(id)).stack_top
+            )
+            .write(get(id).stack_top());
+        }
+    }
+    Ok(())
 }
 
 /// 借用当前核的稳定 CPU 对象；未安装基址时直接报告初始化错误。
@@ -278,6 +320,11 @@ pub fn current() -> &'static CpuLocal {
 /// 返回已解析的固定 CPU 数量。
 pub fn count() -> usize {
     crate::boot::info().cpu_count
+}
+
+/// 返回固件实际发现的逻辑 CPU 集合，与编译容量和硬件 ID 分离。
+pub fn actual_set() -> CpuSet {
+    CpuSet::prefix(count())
 }
 
 /// 借用有效逻辑编号的 CPU；构造时序和编号错误只在此对象边界报告。
@@ -306,20 +353,60 @@ pub fn publish_online() {
     local.online.store(true, Ordering::Release);
 }
 
-/// 由 BSP 串行释放 AP，等待每核能服务中断；失败保留记录和栈。
+/// 在本核永久启动栈等待执行许可，硬件停等期间仍可服务 IRQ/IPI，返回时恢复原 IRQ 状态。
+/// 仅用于尚未进入调度器的在线 CPU；ready 在等待期间保持地址稳定，
+/// 发布者必须先 Release 写入许可，再向等待核发送 kick。
+pub(crate) fn wait_until_started(ready: &AtomicBool) {
+    let local = current();
+    assert!(
+        crate::arch::irq_enabled(),
+        "CPU startup wait requires IRQ enabled"
+    );
+    assert!(
+        local.online.load(Ordering::Acquire)
+            && local.current_task_id.load(Ordering::Relaxed) == 0
+            && local.hardirq_depth.load(Ordering::Relaxed) == 0
+            && local.bh_depth.load(Ordering::Relaxed) == 0
+            && local.preempt_depth.load(Ordering::Relaxed) == 0,
+        "CPU startup wait requires online boot context"
+    );
+    while !ready.load(Ordering::Acquire) {
+        let saved = crate::arch::irq_save();
+        if !ready.load(Ordering::Acquire) {
+            // SAFETY: 本核已上线且仍在永久启动栈，无普通任务、锁或执行深度 guard；
+            // 本次 irq_save 后没有依赖 IRQ-off 的可变借用，允许架构临时服务 IRQ。
+            // CpuLocal 字段永久稳定，ready 的共享借用覆盖整个等待；发布后 kick
+            // 与架构的最终原子重查共同覆盖检查到硬件停等的窗口，测试计数仅原子访问。
+            unsafe {
+                #[cfg(feature = "ktest")]
+                crate::arch::idle_once(&local.kick_reasons, ready, &local.test_wait_completions);
+                #[cfg(not(feature = "ktest"))]
+                crate::arch::idle_once(&local.kick_reasons, ready);
+            }
+        }
+        // SAFETY: saved 来自本轮同核 irq_save；期间不切换栈或迁核，
+        // 架构等待保持 IRQ-off 返回，且没有锁、guard 或临界区借用跨越恢复。
+        unsafe { crate::arch::irq_restore(saved) };
+    }
+}
+
+/// 由 BSP 串行释放 AP，等待每核能服务中断；失败只归还尚未尝试启动的后缀栈。
 ///
 /// # Safety
-/// CPU 表和全部静态启动记录已构造，本核为 BSP，目标 AP 尚未启动。
-/// 调用期间不得重写记录、回收栈或改变当前映射，且本核可以服务 IPI。
+/// CPU 表、全部独占栈和启动记录已准备，本核为唯一 BSP 启动者。
+/// 全部 AP 尚未启动；记录交给固件后不得再改写或回收对应栈，映射永久有效。
+/// 等待期间若 AP 会向 BSP 提交同步 CSD，本核须能服务对应 IPI；不得持有目标初始化所需的锁。
 pub unsafe fn start_secondaries() {
     for id in 1..count() {
         let local = get(id);
         // SAFETY: id 位于已构造的 CPU 范围，静态记录已发布且不会被回收。
         let record = unsafe { ptr::addr_of!(BOOT_RECORDS).cast::<CpuBoot>().add(id) as usize };
         let physical = crate::arch::virt_to_phys(record);
-        // SAFETY: 本核是唯一启动者；静态记录、不同栈和 CpuLocal 由 initialize 发布，
-        // physical 使用当前内核的真实物理转换，所有指向对象保持永久有效。
+        // SAFETY: 本核是唯一启动者；记录已指向准备成功的独占栈与永久 CpuLocal，
+        // physical 是记录的真实物理地址。调用后即保留目标记录和栈，不根据错误回收。
         if let Err(error) = unsafe { crate::arch::start_cpu(local.hardware_id, physical) } {
+            // SAFETY: 串行启动仅尝试至 id，后缀从未交给固件，也没有 CPU 访问其栈。
+            unsafe { release_unstarted_suffix(id + 1) };
             panic!(
                 "AP start failed: hardware={} error={}",
                 local.hardware_id, error
@@ -328,10 +415,32 @@ pub unsafe fn start_secondaries() {
         let deadline = crate::arch::read_counter() + crate::boot::info().counter_frequency * 5;
         while !local.online.load(Ordering::Acquire) {
             if deadline <= crate::arch::read_counter() {
+                // SAFETY: 超时目标可能正在使用栈；仅回收从未尝试启动的后缀。
+                unsafe { release_unstarted_suffix(id + 1) };
                 panic!("AP online timed out: hardware={}", local.hardware_id);
             }
             spin_loop();
         }
+    }
+}
+
+/// 清空尚未交给固件的后缀记录，并在各槽短锁外归还对应栈页。
+///
+/// # Safety
+/// 只能由独占启动过程的 BSP 调用；first 及之后的 CPU 从未尝试启动，
+/// 不存在固件、CPU 或其他裸地址使用者访问这些记录和栈。此前记录必须保持不变。
+unsafe fn release_unstarted_suffix(first: usize) {
+    for id in first..count() {
+        // SAFETY: 调用者保证后缀记录未交给固件且由 BSP 独占；只撤下栈顶，
+        // 永久 local 地址不变，也不触碰此前已借给 AP 的记录。
+        unsafe {
+            ptr::addr_of_mut!(
+                (*ptr::addr_of_mut!(BOOT_RECORDS).cast::<CpuBoot>().add(id)).stack_top
+            )
+            .write(0);
+        }
+        // SAFETY: 本槽位于从未尝试启动的后缀，记录已清空且无其他栈访问者。
+        unsafe { get(id).stack.release_unstarted() };
     }
 }
 
@@ -509,7 +618,7 @@ pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
         0,
         "CPU stop in bottom half"
     );
-    let mut targets = 0usize;
+    let mut targets = CpuSet::empty();
     for id in 0..count() {
         let local = get(id);
         if id != coordinator.id && local.online.load(Ordering::Acquire) {
@@ -517,23 +626,19 @@ pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
                 !local.stopped.load(Ordering::Acquire),
                 "CPU stop acknowledgement reused"
             );
-            targets |= 1 << id;
+            targets.insert(id);
         }
     }
-    for id in 0..count() {
-        if targets & (1 << id) != 0 {
-            kick(id, KICK_STOP);
-        }
+    for id in targets.iter() {
+        kick(id, KICK_STOP);
     }
-    for id in 0..count() {
-        if targets & (1 << id) != 0 {
-            while !get(id).stopped.load(Ordering::Acquire) {
-                spin_loop();
-            }
+    for id in targets.iter() {
+        while !get(id).stopped.load(Ordering::Acquire) {
+            spin_loop();
         }
     }
     crate::early_println!(
-        "CPU stop complete: coordinator={} acknowledged={:#x}",
+        "CPU stop complete: coordinator={} acknowledged={:?}",
         coordinator.id,
         targets
     );

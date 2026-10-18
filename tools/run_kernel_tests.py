@@ -20,11 +20,11 @@ from ktest.boot import validate_test_kernel_layout
 from ktest.batch import discover, execute, config
 from ktest.qemu_session import CANCELLED
 
-ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def positive(value):
-    """CLI 时间必须有限且为正数。"""
+def positive_seconds(value):
+    """CLI 的秒数预算必须有限且为正数。"""
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be finite and positive")
@@ -63,7 +63,7 @@ def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("command", choices=("list", "run"))
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
-    parser.add_argument("--cpus", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--cpus", type=natural, default=1)
     parser.add_argument("--memory")
     parser.add_argument("--mode", choices=("debug", "release"), default="debug")
     parser.add_argument("--panic", choices=("unwind", "abort"), default="unwind")
@@ -95,12 +95,12 @@ def arguments(argv=None):
     parser.add_argument("--ap-freeze", action="store_true", help="freeze the actual first AP entry with GDB")
     parser.add_argument("--gdb", help="explicit GDB binary for the AP freeze fixture")
     parser.add_argument("--iommu-platform", action="store_true", help="require ACCESS_PLATFORM in its declared status-only fixture")
-    parser.add_argument("--startup-timeout", type=positive, default=30)
-    parser.add_argument("--setup-timeout", type=positive, default=30)
-    parser.add_argument("--case-timeout", type=positive, default=120)
-    parser.add_argument("--cleanup-timeout", type=positive, default=30)
-    parser.add_argument("--build-timeout", type=positive, default=600)
-    parser.add_argument("--report-dir", type=Path, default=ROOT / "build" / "ktest")
+    parser.add_argument("--startup-timeout", dest="startup_timeout_seconds", metavar="STARTUP_TIMEOUT", type=positive_seconds, default=30)
+    parser.add_argument("--setup-timeout", dest="setup_timeout_seconds", metavar="SETUP_TIMEOUT", type=positive_seconds, default=30)
+    parser.add_argument("--case-timeout", dest="case_timeout_seconds", metavar="CASE_TIMEOUT", type=positive_seconds, default=120)
+    parser.add_argument("--cleanup-timeout", dest="cleanup_timeout_seconds", metavar="CLEANUP_TIMEOUT", type=positive_seconds, default=30)
+    parser.add_argument("--build-timeout", dest="build_timeout_seconds", metavar="BUILD_TIMEOUT", type=positive_seconds, default=600)
+    parser.add_argument("--report-dir", type=Path, default=REPOSITORY_ROOT / "build" / "ktest")
     parser.add_argument("--uart-expect", type=Path, help="expected full tx/pause/slow payload")
     args = parser.parse_args(argv)
     if 1 << 32 <= args.repeat:
@@ -151,10 +151,10 @@ def fixed_kernel(args, directory):
                    f"KTEST_PANIC_STRATEGY={args.panic}", f"KERNEL_ELF_OUTPUT={kernel}"]
         (directory / "build-command.json").write_text(json.dumps(command) + "\n", encoding="utf-8")
         with (directory / "build.log").open("xb") as log:
-            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
+            process = subprocess.Popen(command, cwd=REPOSITORY_ROOT, stdin=subprocess.DEVNULL,
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                status = process.wait(timeout=args.build_timeout)
+                status = process.wait(timeout=args.build_timeout_seconds)
             finally:
                 terminate_group(process)
         require(status == 0, f"build-kernel-test-elf failed: {status}")

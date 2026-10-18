@@ -1,6 +1,6 @@
 //! 启动阶段按真实 RAM 管理整页区间，元数据只从未保留页取得。
 
-use crate::boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS};
+use crate::boot::{Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS};
 
 pub(crate) const PAGE_SIZE: usize = 4096;
 // root 索引一次，每段 RAM 至多一次描述符 backing。
@@ -29,7 +29,7 @@ struct Ranges {
 
 impl Ranges {
     /// 创建启动期小型固定容量表，不借用堆存储。
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             entries: [PageRange { start: 0, end: 0 }; RANGE_CAPACITY],
             count: 0,
@@ -69,21 +69,20 @@ impl Ranges {
         Ok(())
     }
 
-    /// 先合并物理字节区间再取整，避免相邻片段共同覆盖的完整页丢失。
-    fn from_regions(regions: &[Region], inward: bool) -> Result<Self, &'static str> {
-        let mut ranges = Self::new();
+    /// 在已有空表内合并物理字节区间再取整，避免返回固定数组副本和丢失相邻片段的完整页。
+    fn initialize_regions(&mut self, regions: &[Region], inward: bool) -> Result<(), &'static str> {
         for region in regions {
             if region.end <= region.start {
                 return Err("invalid boot physical region");
             }
-            ranges.insert(PageRange {
+            self.insert(PageRange {
                 start: region.start,
                 end: region.end,
             })?;
         }
         let mut output = 0;
-        for index in 0..ranges.count {
-            let region = ranges.entries[index];
+        for index in 0..self.count {
+            let region = self.entries[index];
             let range = if inward {
                 PageRange {
                     start: round_up(region.start)? / PAGE_SIZE,
@@ -96,16 +95,16 @@ impl Ranges {
                 }
             };
             if range.start < range.end {
-                if 0 < output && range.start <= ranges.entries[output - 1].end {
-                    ranges.entries[output - 1].end = ranges.entries[output - 1].end.max(range.end);
+                if 0 < output && range.start <= self.entries[output - 1].end {
+                    self.entries[output - 1].end = self.entries[output - 1].end.max(range.end);
                 } else {
-                    ranges.entries[output] = range;
+                    self.entries[output] = range;
                     output += 1;
                 }
             }
         }
-        ranges.count = output;
-        Ok(ranges)
+        self.count = output;
+        Ok(())
     }
 
     /// 累计互不重叠区间的页数。
@@ -134,22 +133,39 @@ pub(crate) struct BootMemory {
 }
 
 impl BootMemory {
-    /// 从不可变固件快照得到整页 RAM，并只扣除保留区与 RAM 的交集。
-    pub(crate) fn new(info: &BootInfo) -> Result<Self, &'static str> {
-        if MAX_MEMORY_REGIONS < info.memory_count || MAX_RESERVED_REGIONS < info.reserved_count {
-            return Err("boot region count exceeds capacity");
-        }
-        let ram = Ranges::from_regions(&info.memory[..info.memory_count], true)?;
-        let reservations = Ranges::from_regions(&info.reserved[..info.reserved_count], false)?;
-        let mut memory = Self {
-            ram,
+    /// 为调用方存储建立合法空账本，常量初始化不经过大对象返回帧。
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ram: Ranges::new(),
             reserved: Ranges::new(),
             metadata: Ranges::new(),
             free: Ranges::new(),
             allocation_count: 0,
-        };
+        }
+    }
+
+    /// 在新空账本内分类真实整页RAM，只扣除保留区与RAM的交集；失败后调用方不得继续启动。
+    pub(crate) fn initialize(
+        &mut self,
+        ram: &[Region],
+        reserved: &[Region],
+    ) -> Result<(), &'static str> {
+        assert!(
+            self.ram.count == 0
+                && self.reserved.count == 0
+                && self.metadata.count == 0
+                && self.free.count == 0
+                && self.allocation_count == 0,
+            "boot memory is already initialized"
+        );
+        if MAX_MEMORY_REGIONS < ram.len() || MAX_RESERVED_REGIONS < reserved.len() {
+            return Err("boot region count exceeds capacity");
+        }
+        self.ram.initialize_regions(ram, true)?;
+        let mut reservations = const { Ranges::new() };
+        reservations.initialize_regions(reserved, false)?;
         let mut reservation_index = 0;
-        for ram in memory.ram.as_slice() {
+        for ram in self.ram.as_slice() {
             let mut cursor = ram.start;
             while reservation_index < reservations.count
                 && reservations.entries[reservation_index].end <= cursor
@@ -161,24 +177,24 @@ impl BootMemory {
                 let reservation = reservations.entries[index];
                 let start = reservation.start.max(cursor);
                 let end = reservation.end.min(ram.end);
-                memory.free.insert(PageRange {
+                self.free.insert(PageRange {
                     start: cursor,
                     end: start,
                 })?;
-                memory.reserved.insert(PageRange { start, end })?;
+                self.reserved.insert(PageRange { start, end })?;
                 cursor = end;
                 if ram.end <= reservation.end {
                     break;
                 }
                 index += 1;
             }
-            memory.free.insert(PageRange {
+            self.free.insert(PageRange {
                 start: cursor,
                 end: ram.end,
             })?;
             reservation_index = index;
         }
-        Ok(memory)
+        Ok(())
     }
 
     /// 借用真实整页 RAM 并集，空洞不属于该集合。

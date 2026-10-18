@@ -27,7 +27,7 @@ __primary_entry:
     li.w $t0, 0x10
     li.w $t1, 0x18
     csrxchg $t0, $t1, 0
-    la.abs $sp, BOOT_STACKS
+    la.abs $sp, BOOT_STACK
     li.d $t0, {stack_size}
     add.d $sp, $sp, $t0
     la.abs $t0, __bss_start

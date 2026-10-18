@@ -17,6 +17,7 @@ import subprocess
 import time
 
 from create_ext4_image import PROFILES
+from rootfs_paths import output_path, reject_overlap
 from run_qemu import configure_qemu, parse_arguments, prepare_qemu, repository_path
 
 DEFAULT_HOST_TIMEOUT_SECONDS = 900
@@ -186,12 +187,14 @@ def prepare_run_input(args, configuration, run_id, deadline):
 
 
 def check_preparation_outputs(args, configuration):
-    """准备输出不得替换工作目录、锁或其父树，写入前只按现有词法绝对路径检查。"""
-    directory = configuration.working_disk_directory
+    """准备输出按实际父目录核对，不得替换工作目录、锁或其父树。"""
+    directory = output_path(configuration.working_disk_directory, directory=True)
     image = configuration.system_image_path
-    for output in (args.output_directory, image, image.with_suffix(".log")):
-        if output == directory or output in directory.parents or directory in output.parents:
-            raise ValueError(f"selftest preparation output overlaps working disk directory: {output}")
+    for output in (
+            output_path(args.output_directory, directory=True),
+            output_path(image),
+            output_path(image.with_suffix(".log"))):
+        reject_overlap(directory, output)
 
 
 def main(argv=None):
@@ -221,7 +224,7 @@ def main(argv=None):
     configuration = configure_qemu(args)
     try:
         check_preparation_outputs(args, configuration)
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         parser.error(str(error))
     run_id = secrets.token_hex(16)
     deadline = time.monotonic() + args.host_timeout_seconds

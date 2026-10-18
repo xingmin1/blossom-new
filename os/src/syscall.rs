@@ -1,5 +1,6 @@
 //! 每次调用只读取一次用户寄存器；返回值与退出是互斥控制结果，阻塞时不借用户现场。
 
+mod affinity;
 mod error;
 mod file;
 mod futex;
@@ -218,6 +219,9 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         164 => task::setrlimit(user, raw),
         261 => task::prlimit64(user, raw),
         142 => return system::reboot(user, &raw),
+        122 => affinity::set(user, raw),
+        123 => affinity::get(user, raw),
+        168 => affinity::getcpu(user, raw),
         124 => {
             sched::yield_now();
             Ok(0)

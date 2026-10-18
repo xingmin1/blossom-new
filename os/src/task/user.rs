@@ -1,12 +1,12 @@
 //! 私有用户现场与独立 MM 引用；反向执行关联不保活 Task 或内核栈。
 
+#[cfg(feature = "ktest")]
+use crate::cpu::AtomicCpuSet;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::alloc::AllocError;
 use core::cell::{Cell, RefCell, RefMut};
 use core::mem;
-#[cfg(feature = "ktest")]
-use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use spin::Once;
 
@@ -59,9 +59,6 @@ pub(crate) struct UserRuntime {
 }
 
 impl UserRuntime {
-    /// 普通用户表的固定容量，也是多路复用快照必须覆盖的最大编号范围。
-    pub(crate) const DESCRIPTOR_CAPACITY: usize = 1024;
-
     /// 在普通任务锁外准备运行资源；无网络夹具显式传入 None，失败不发表用户身份。
     pub(crate) fn try_new(
         vfs: Arc<Vfs>,
@@ -69,7 +66,7 @@ impl UserRuntime {
         credentials: Credentials,
         net: Option<NetStackRef>,
     ) -> Result<Self, crate::fs::FsError> {
-        let files = FileTable::try_new(Self::DESCRIPTOR_CAPACITY)?;
+        let files = FileTable::try_new()?;
         let files = Arc::try_new(files).map_err(|_| crate::fs::FsError::NoMemory)?;
         let fs = Arc::try_new(SleepMutex::new(UserFs { vfs, context }))
             .map_err(|_| crate::fs::FsError::NoMemory)?;
@@ -91,15 +88,15 @@ impl UserRuntime {
         };
         let path = vfs.resolve(&context, b"/dev/console", ResolveMode::Follow)?;
         let console = open_path_with_flags(&vfs, path, 2, FileIoContext::Kernel)?;
-        let first = self.files.reserve()?;
+        let first = self.files.reserve(3)?;
         if first.fd() != 0 {
             return Err(FsError::InvalidOperation);
         }
-        let second = self.files.reserve()?;
+        let second = self.files.reserve(3)?;
         if second.fd() != 1 {
             return Err(FsError::InvalidOperation);
         }
-        let third = self.files.reserve()?;
+        let third = self.files.reserve(3)?;
         if third.fd() != 2 {
             return Err(FsError::InvalidOperation);
         }
@@ -222,7 +219,7 @@ pub struct UserThread {
     restart: Cell<Option<Restart>>,
     saved_mask: Cell<Option<u64>>,
     #[cfg(feature = "ktest")]
-    user_cpu_mask: AtomicUsize,
+    user_cpu_mask: AtomicCpuSet,
 }
 
 // SAFETY: context、user_timer_interrupts、restart与saved_mask仅由弱关联指定的唯一Running Task访问；
@@ -243,7 +240,7 @@ impl UserThread {
             restart: Cell::new(None),
             saved_mask: Cell::new(None),
             #[cfg(feature = "ktest")]
-            user_cpu_mask: AtomicUsize::new(0),
+            user_cpu_mask: AtomicCpuSet::new(),
         })
     }
 
@@ -525,8 +522,7 @@ impl UserThread {
         // 架构在同一调用栈返回，IRQ 关闭且硬中断 guard 已结束，期间不切换 Task。
         let trap = unsafe { arch::run_user(&mut context) };
         #[cfg(feature = "ktest")]
-        self.user_cpu_mask
-            .fetch_or(1usize << local.id, Ordering::Relaxed);
+        self.user_cpu_mask.insert(local.id, Ordering::Relaxed);
         crate::accounting::user_leave();
         if local.timer_interrupts.load(Ordering::Relaxed) != timer_before {
             self.user_timer_interrupts.set(
@@ -541,8 +537,8 @@ impl UserThread {
 
     /// 取走自上次观察以来真实返回用户入口的 CPU 位集合。
     #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_take_user_cpu_mask(&self) -> usize {
-        self.user_cpu_mask.swap(0, Ordering::AcqRel)
+    pub(crate) fn ktest_take_user_cpu_mask(&self) -> crate::cpu::CpuSet {
+        self.user_cpu_mask.take(Ordering::AcqRel)
     }
 
     /// 用户入口正常结束时先解绑运行资源，最后 MM 拥有在锁外释放。

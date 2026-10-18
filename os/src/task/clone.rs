@@ -172,6 +172,12 @@ pub(crate) fn create(
         arguments.clear_child_tid,
     )
     .map_err(program_error)?;
+    let parent = user.executor().expect("clone has no parent executor");
+    let child = program
+        .user()
+        .executor()
+        .expect("clone has no child executor");
+    crate::sched::inherit_affinity(&parent, &child);
     let pid = program.pid();
     let vfork = if arguments.vfork {
         let completion = Arc::try_new(Completion::new()).map_err(|_| CloneError::NoMemory)?;

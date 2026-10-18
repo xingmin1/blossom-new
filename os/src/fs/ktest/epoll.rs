@@ -281,6 +281,40 @@ fn control_fd(
     )
 }
 
+/// 按真实规模准备消费位图，扫描只消费完整高位 data，不按规模展开内核栈。
+fn delivery_slots(count: usize) -> Result<Vec<bool>, TestError> {
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(count)
+        .map_err(|_| TestError("epoll delivery slots OOM"))?;
+    seen.resize(count, false);
+    Ok(seen)
+}
+
+/// 完整消费本轮每个 data 和普通事件位，重复、遗漏或外来 data 都失败。
+fn scan_data(
+    context: &mut TestContext<'_>,
+    file: &EpollFile,
+    seen: &mut [bool],
+    base: u64,
+) -> TestResult {
+    seen.fill(false);
+    let expected = seen.len();
+    let result = file.scan(expected, &mut |item| {
+        if item.data < base || base + expected as u64 <= item.data {
+            return Err(FsError::Corrupt);
+        }
+        let slot = (item.data - base) as usize;
+        if seen[slot] || item.events != PollMask::POLLIN.0 {
+            return Err(FsError::Corrupt);
+        }
+        seen[slot] = true;
+        Ok(())
+    });
+    context.expect_eq(checked(context, result)?, expected);
+    context.expect_eq(seen.iter().all(|slot| *slot), true);
+    Ok(())
+}
+
 /// 原锚点集合只保留实际宏生成 suite，不增加中心分派或新 runner。
 pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
     events::__ktest_anchor()
@@ -405,10 +439,10 @@ pub(crate) mod events {
         fixture: &mut EpollOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let table = checked(context, FileTable::try_new(8))?;
-        let fd = checked(context, table.reserve())?
+        let table = checked(context, FileTable::try_new())?;
+        let fd = checked(context, table.reserve(1024))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
-        let duplicate = checked(context, table.dup(fd))?;
+        let duplicate = checked(context, table.dup(fd, 1024))?;
         let child = checked(context, table.try_clone())?;
         let held = checked(context, child.lookup(fd))?;
         let old_weak = Arc::downgrade(&held);
@@ -433,7 +467,7 @@ pub(crate) mod events {
         checked(context, table.close(fd))?;
         checked(context, child.close(fd))?;
         let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
-        let reused = checked(context, table.reserve())?
+        let reused = checked(context, table.reserve(1024))?
             .publish(new_reader.clone(), DescriptorFlags::default());
         context.expect_eq(reused, fd);
         context.expect_eq(
@@ -837,7 +871,7 @@ pub(crate) mod events {
             }
         })?;
         parked.wait();
-        until("epoll query did not block on real control mutex", || {
+        until("epoll query did not block on real scan mutex", || {
             fixture.blocked(1)
         })?;
         release.complete();
@@ -957,8 +991,8 @@ pub(crate) mod events {
         drop(table);
         let owner: FileRef = checked(context, EpollFile::try_new(0))?;
         fixture.owner = Some(owner);
-        let descriptors = checked(context, FileTable::try_new(128))?;
-        let fd = checked(context, descriptors.reserve())?
+        let descriptors = checked(context, FileTable::try_new())?;
+        let fd = checked(context, descriptors.reserve(1024))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
         control_fd(
             context,
@@ -1019,8 +1053,8 @@ pub(crate) mod events {
         fixture: &mut EpollOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
-        let table = checked(context, FileTable::try_new(128))?;
-        let fd = checked(context, table.reserve())?
+        let table = checked(context, FileTable::try_new())?;
+        let fd = checked(context, table.reserve(1024))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
         control_fd(
             context,
@@ -1056,10 +1090,10 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 实际 128 槽 dup 表填满兴趣，逐项交付并按不同顺序删除原 AVL 节点，不按 fd 值扩容。
+    /// 匿名事件保持真实 stat、noop seek 和能力错误，不把兴趣数量当作对象能力。
     #[test]
     #[ktest(tags("T13", "T14", "T18"))]
-    fn anonymous_event_capabilities_and_interest_budget(
+    fn anonymous_event_capabilities(
         context: &mut TestContext<'_>,
         fixture: &mut EpollOwner,
     ) -> TestResult {
@@ -1160,80 +1194,320 @@ pub(crate) mod events {
             fixture.epoll().scan(0, &mut |_event| Ok(())),
             Err(FsError::InvalidOperation),
         );
-        let table = checked(context, FileTable::try_new(128))?;
-        let first = checked(context, table.reserve())?
+        Ok(())
+    }
+
+    /// 实际 dup 表跨越旧额度；完整 data、陈旧复核、同键重加和 fd 复用都走原生产路径。
+    #[test]
+    #[case("127", 127usize)]
+    #[case("128", 128usize)]
+    #[case("129", 129usize)]
+    #[case("1024", 1024usize)]
+    #[ktest(tags("F08", "fs-epoll-growth"))]
+    fn growing_interests_preserve_data_reuse_delete_and_last_target(
+        context: &mut TestContext<'_>,
+        fixture: &mut EpollOwner,
+        count: usize,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let table = checked(context, FileTable::try_new())?;
+        let first = checked(context, table.reserve(count + 1))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
-        for _ in 1..128 {
-            checked(context, table.dup(first))?;
+        for fd in 1..count {
+            context.expect_eq(checked(context, table.dup(first, count + 1))?, fd);
         }
-        checked(context, fixture.writer().write(b"budget"))?;
-        let base = 0xf000_0000_0000_0000;
-        for fd in 0..128 {
+        let mut seen = delivery_slots(count + 1)?;
+        let base = 0xf123_4567_89ab_0000;
+        let bytes = b"growth-old-full-data";
+        checked(context, fixture.writer().write(bytes))?;
+        for fd in 0..count {
             control_fd(
                 context,
                 fixture,
                 &table,
                 EPOLL_CTL_ADD,
                 fd,
-                Some(event(PollMask::POLLIN.0 | EPOLLONESHOT, base + fd as u64)),
+                Some(event(PollMask::POLLIN.0, base + fd as u64)),
             )?;
         }
-        let mut events = [EpollEvent::default(); 128];
+        scan_data(context, fixture.epoll(), &mut seen[..count], base)?;
+        let mut old_bytes = [0; 20];
         context.expect_eq(
-            checked(context, collect(fixture.epoll(), &mut events))?,
-            128,
+            checked(context, fixture.reader().read(&mut old_bytes))?,
+            bytes.len(),
         );
-        let mut seen = [false; 128];
-        for item in events {
-            if item.data < base || base + 128 <= item.data {
-                return Err(TestError("epoll budget returned foreign data"));
-            }
-            let slot = (item.data - base) as usize;
-            context.expect_eq(seen[slot], false);
-            seen[slot] = true;
-            context.expect_eq(item.events, PollMask::POLLIN.0);
-        }
-        context.expect_eq(seen, [true; 128]);
-        checked(context, table.close(first))?;
-        let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
-        let reused = checked(context, table.reserve())?
-            .publish(new_reader.clone(), DescriptorFlags::default());
-        context.expect_eq(reused, first);
-        context.expect_eq(
-            fixture.epoll().control(
-                fixture.owner(),
-                EPOLL_CTL_ADD,
-                &new_reader,
-                reused as i32,
-                Some(event(1, 0)),
-            ),
-            Err(FsError::NoSpace),
-        );
-        let middle = watch(fixture.epoll(), fixture.reader(), 64);
-        control_fd(context, fixture, &table, EPOLL_CTL_DEL, 64, None)?;
+        context.expect_eq(old_bytes.as_slice(), bytes.as_slice());
+        // 全部 LT 候选已陈旧，自身 poll 必须一次走完真实增长规模的扫描拥有链。
+        context.expect_eq(mask(context, fixture.owner())?, PollMask::default());
+        checked(context, fixture.writer().write(bytes))?;
+        let middle_fd = count / 2;
+        let middle = watch(fixture.epoll(), fixture.reader(), middle_fd as i32);
+        control_fd(context, fixture, &table, EPOLL_CTL_DEL, middle_fd, None)?;
         context.expect_eq(middle.upgrade().is_none(), true);
         control_fd(
             context,
             fixture,
             &table,
             EPOLL_CTL_ADD,
-            reused,
-            Some(event(PollMask::POLLIN.0 | EPOLLONESHOT, base + 128)),
+            middle_fd,
+            Some(event(PollMask::POLLIN.0, base + middle_fd as u64)),
         )?;
-        checked(context, new_writer.write(b"new budget"))?;
-        context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 1);
-        context.expect_eq(events[0], event(PollMask::POLLIN.0, base + 128));
-        for fd in (1..128).rev() {
-            if fd != 64 {
-                control_fd(context, fixture, &table, EPOLL_CTL_DEL, fd, None)?;
-            }
+        checked(context, table.close(first))?;
+        let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
+        let reused = checked(context, table.reserve(count + 1))?
+            .publish(new_reader.clone(), DescriptorFlags::default());
+        context.expect_eq(reused, first);
+        control_fd(
+            context,
+            fixture,
+            &table,
+            EPOLL_CTL_ADD,
+            reused,
+            Some(event(
+                PollMask::POLLIN.0 | EPOLLONESHOT,
+                base + count as u64,
+            )),
+        )?;
+        let new_lifetime = watch(fixture.epoll(), &new_reader, reused as i32);
+        let new_target = Arc::downgrade(&new_reader);
+        let replacement = b"growth-new-full-data";
+        checked(context, new_writer.write(replacement))?;
+        scan_data(context, fixture.epoll(), &mut seen, base)?;
+        context.expect_eq(
+            checked(context, fixture.reader().read(&mut old_bytes))?,
+            bytes.len(),
+        );
+        context.expect_eq(old_bytes.as_slice(), bytes.as_slice());
+        let mut new_bytes = [0; 20];
+        context.expect_eq(
+            checked(context, new_reader.read(&mut new_bytes))?,
+            replacement.len(),
+        );
+        context.expect_eq(new_bytes.as_slice(), replacement.as_slice());
+        for fd in (1..count).rev() {
+            let lifetime = watch(fixture.epoll(), fixture.reader(), fd as i32);
+            control_fd(context, fixture, &table, EPOLL_CTL_DEL, fd, None)?;
+            context.expect_eq(lifetime.upgrade().is_none(), true);
             checked(context, table.close(fd))?;
         }
         let old = watch(fixture.epoll(), fixture.reader(), first as i32);
+        let old_target = Arc::downgrade(fixture.reader());
         drop(fixture.reader.take());
+        context.expect_eq(old_target.upgrade().is_none(), true);
         context.expect_eq(old.upgrade().is_none(), true);
-        control_fd(context, fixture, &table, EPOLL_CTL_DEL, reused, None)?;
-        context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
+        context.expect_eq(fixture.writer().write(b"ended"), Err(FsError::BrokenPipe));
+        drop(new_reader);
+        checked(context, table.close(reused))?;
+        context.expect_eq(new_target.upgrade().is_none(), true);
+        context.expect_eq(new_lifetime.upgrade().is_none(), true);
+        context.expect_eq(new_writer.write(b"ended"), Err(FsError::BrokenPipe));
+        let mut output = [EpollEvent::default(); 1];
+        context.expect_eq(checked(context, collect(fixture.epoll(), &mut output))?, 0);
+        Ok(())
+    }
+
+    /// 千项 ready 和持续源在末事件拥有结束时分批撤销，原管道仍能完整消费后续字节。
+    #[test]
+    #[ktest(tags("F08", "fs-epoll-growth"))]
+    fn grown_ready_interests_last_epoll_drop_drains_all_sources(
+        context: &mut TestContext<'_>,
+        fixture: &mut EpollOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let count = 1024;
+        let table = checked(context, FileTable::try_new())?;
+        let first = checked(context, table.reserve(count))?
+            .publish(fixture.reader().clone(), DescriptorFlags::default());
+        let mut lifetimes = Vec::new();
+        lifetimes
+            .try_reserve_exact(count)
+            .map_err(|_| TestError("epoll lifetime slots OOM"))?;
+        let mut seen = delivery_slots(count)?;
+        let base = 0xe123_4567_89ab_0000;
+        checked(context, fixture.writer().write(b"before-drop"))?;
+        for fd in 0..count {
+            if fd != first {
+                context.expect_eq(checked(context, table.dup(first, count))?, fd);
+            }
+            control_fd(
+                context,
+                fixture,
+                &table,
+                EPOLL_CTL_ADD,
+                fd,
+                Some(event(PollMask::POLLIN.0, base + fd as u64)),
+            )?;
+            lifetimes.push(watch(fixture.epoll(), fixture.reader(), fd as i32));
+        }
+        scan_data(context, fixture.epoll(), &mut seen, base)?;
+        let poll = checked(context, PollContext::try_new())?;
+        let sink: Arc<dyn PollNotify> = poll.clone();
+        let mut sources = checked(context, PollTable::new(sink, 2))?;
+        checked(
+            context,
+            fixture.owner().pollable().unwrap().poll(Some(&mut sources)),
+        )?;
+        poll.clear_triggered();
+        let owner = Arc::downgrade(fixture.owner());
+        drop(fixture.owner.take());
+        context.expect_eq(owner.upgrade().is_none(), true);
+        context.expect_eq(lifetimes.iter().all(|node| node.upgrade().is_none()), true);
+        checked(context, fixture.writer().write(b"after-drop"))?;
+        context.expect_eq(poll.triggered(), false);
+        let mut bytes = [0; 21];
+        context.expect_eq(
+            checked(context, fixture.reader().read(&mut bytes))?,
+            bytes.len(),
+        );
+        context.expect_eq(bytes.as_slice(), b"before-dropafter-drop".as_slice());
+        drop(sources);
+        Ok(())
+    }
+
+    /// 超过旧额度的独立目标在各自 emit 内失去最后描述符，扫描链逐项锁外 put 才能反向撤源。
+    #[test]
+    #[ktest(tags("F08", "fs-epoll-growth"))]
+    fn grown_scan_defers_all_last_targets_until_control_unlock(
+        context: &mut TestContext<'_>,
+        fixture: &mut EpollOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let count = 129;
+        let table = checked(context, FileTable::try_new())?;
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(count)
+            .map_err(|_| TestError("epoll target slots OOM"))?;
+        let base = 0xd123_4567_89ab_0000;
+        for fd in 0..count {
+            let (reader, writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
+            checked(context, writer.write(b"payload"))?;
+            context.expect_eq(
+                checked(context, table.reserve(count))?
+                    .publish(reader.clone(), DescriptorFlags::default()),
+                fd,
+            );
+            checked(
+                context,
+                fixture.epoll().control(
+                    fixture.owner(),
+                    EPOLL_CTL_ADD,
+                    &reader,
+                    fd as i32,
+                    Some(event(PollMask::POLLIN.0 | EPOLLONESHOT, base + fd as u64)),
+                ),
+            )?;
+            let lifetime = watch(fixture.epoll(), &reader, fd as i32);
+            targets.push((writer, Arc::downgrade(&reader), lifetime));
+        }
+        let mut seen = delivery_slots(count)?;
+        let result = fixture.epoll().scan(count, &mut |item| {
+            if item.data < base || base + count as u64 <= item.data {
+                return Err(FsError::Corrupt);
+            }
+            let fd = (item.data - base) as usize;
+            if seen[fd] || item.events != PollMask::POLLIN.0 {
+                return Err(FsError::Corrupt);
+            }
+            let reader = table.lookup(fd)?;
+            let mut bytes = [0; 7];
+            if reader.read(&mut bytes)? != bytes.len() || bytes != *b"payload" {
+                return Err(FsError::Corrupt);
+            }
+            drop(reader);
+            table.close(fd)?;
+            if targets[fd].1.strong_count() != 1 || targets[fd].0.write(b"held")? != 4 {
+                return Err(FsError::Corrupt);
+            }
+            seen[fd] = true;
+            Ok(())
+        });
+        context.expect_eq(checked(context, result)?, count);
+        context.expect_eq(seen.iter().all(|slot| *slot), true);
+        for (writer, target, lifetime) in targets {
+            context.expect_eq(target.upgrade().is_none(), true);
+            context.expect_eq(lifetime.upgrade().is_none(), true);
+            context.expect_eq(writer.write(b"ended"), Err(FsError::BrokenPipe));
+        }
+        Ok(())
+    }
+
+    /// 真实堆页耗尽使新兴趣返回 ENOMEM；已发表的超额候选无分配扫描，放压后同键可正式加入。
+    #[test]
+    #[ktest(tags("F08", "fs-epoll-growth", "fs-oom"))]
+    fn real_oom_preserves_grown_interests_and_recovers_add(
+        context: &mut TestContext<'_>,
+        fixture: &mut EpollOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let count = 129;
+        let table = checked(context, FileTable::try_new())?;
+        let first = checked(context, table.reserve(count + 1))?
+            .publish(fixture.reader().clone(), DescriptorFlags::default());
+        let mut seen = delivery_slots(count + 1)?;
+        let base = 0xc123_4567_89ab_0000;
+        checked(context, fixture.writer().write(b"real-oom-data"))?;
+        for fd in 0..count {
+            if fd != first {
+                checked(context, table.dup(first, count + 1))?;
+            }
+            control_fd(
+                context,
+                fixture,
+                &table,
+                EPOLL_CTL_ADD,
+                fd,
+                Some(event(PollMask::POLLIN.0, base + fd as u64)),
+            )?;
+        }
+        let extra = checked(context, table.dup(first, count + 1))?;
+        let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
+        let evidence = pressure.exhaust();
+        let creation_error = EpollFile::try_new(0).err();
+        let add_error = fixture.epoll().control(
+            fixture.owner(),
+            EPOLL_CTL_ADD,
+            fixture.reader(),
+            extra as i32,
+            Some(event(PollMask::POLLIN.0, base + extra as u64)),
+        );
+        let absent = fixture
+            .epoll()
+            .ktest_watch_lifetime(fixture.reader(), extra as i32)
+            .is_none();
+        let scanned = fixture.epoll().scan(count, &mut |item| {
+            if item.data < base || base + count as u64 <= item.data {
+                return Err(FsError::Corrupt);
+            }
+            let slot = (item.data - base) as usize;
+            if seen[slot] || item.events != PollMask::POLLIN.0 {
+                return Err(FsError::Corrupt);
+            }
+            seen[slot] = true;
+            Ok(())
+        });
+        drop(pressure);
+        context.expect_eq(evidence, (true, true));
+        context.expect_eq(creation_error, Some(FsError::NoMemory));
+        context.expect_eq(add_error, Err(FsError::NoMemory));
+        context.expect_eq(absent, true);
+        context.expect_eq(checked(context, scanned)?, count);
+        context.expect_eq(seen[..count].iter().all(|slot| *slot), true);
+        control_fd(
+            context,
+            fixture,
+            &table,
+            EPOLL_CTL_ADD,
+            extra,
+            Some(event(PollMask::POLLIN.0, base + extra as u64)),
+        )?;
+        scan_data(context, fixture.epoll(), &mut seen, base)?;
+        let mut bytes = [0; 13];
+        context.expect_eq(
+            checked(context, fixture.reader().read(&mut bytes))?,
+            bytes.len(),
+        );
+        context.expect_eq(bytes, *b"real-oom-data");
         Ok(())
     }
 }

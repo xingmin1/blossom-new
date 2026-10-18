@@ -10,12 +10,12 @@ import shutil
 import stat
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def default_working_disk_directory(architecture):
     """生产启动和清理共用每架构唯一的默认工作目录。"""
-    return ROOT / "build" / f"qemu-{architecture}"
+    return REPOSITORY_ROOT / "build" / f"qemu-{architecture}"
 
 
 def working_disk_paths(working_disk_directory, include_contest):
@@ -128,7 +128,7 @@ def main(argv=None):
     directory = args.working_disk_dir
     if directory is None:
         directory = default_working_disk_directory(args.arch)
-    directory = Path(os.path.abspath(ROOT / directory))
+    directory = Path(os.path.abspath(REPOSITORY_ROOT / directory))
     try:
         clean_working_disks(directory)
     except (ValueError, OSError) as error:

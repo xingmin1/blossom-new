@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from rootfs_paths import output_path, reject_overlap
+
 
 PROFILES = {
     "legacy1k": (1024, 128, "none,ext_attr,resize_inode,dir_index,filetype,sparse_super,large_file,uninit_bg"),
@@ -65,23 +67,17 @@ def check_ext4_image(image_path, profile):
 def create_ext4_image(source_tree_dir, output_image_path, profile="seed4k", image_size_mib=256):
     """完整源树仅作输入；新卷检查成功才替换输出文件，失败保留原卷及工具诊断。"""
     source = Path(source_tree_dir).resolve(strict=True)
-    output = Path(os.path.abspath(output_image_path))
-    log = output.with_suffix(".log")
+    output = output_path(output_image_path)
+    log = output_path(output.with_suffix(".log"))
     if not source.is_dir():
         raise ValueError("source tree must be an existing directory")
     if profile not in PROFILES:
         raise ValueError(f"unsupported ext4 profile: {profile}")
-    if image_size_mib < 128:
-        raise ValueError("image size must be at least 128 MiB")
-    if log == output:
-        raise ValueError("image path must be separate from its .log file")
+    if image_size_mib <= 0:
+        raise ValueError("image size must be positive")
+    reject_overlap(output, log)
     for target in (output, log):
-        if source == target or source in target.resolve().parents:
-            raise ValueError("image and log output must not be inside the source tree")
-        if any(path.is_symlink() for path in (target, *target.parents)):
-            raise ValueError("image and log output paths must not contain symbolic links")
-        if target.exists() and not target.is_file():
-            raise ValueError(f"output must be a regular file: {target}")
+        reject_overlap(source, target)
     for binary in ("mke2fs", "debugfs", "e2fsck", "dumpe2fs"):
         if shutil.which(binary) is None:
             raise ValueError(f"required tool missing: {binary}")
@@ -95,12 +91,12 @@ def create_ext4_image(source_tree_dir, output_image_path, profile="seed4k", imag
                 stream.truncate(image_size_mib * 1024 * 1024)
             run_checked_command([
                 "mke2fs", "-q", "-F", "-t", "ext4", "-b", block_size,
-                "-I", inode_size, "-N", 24000, "-O", features,
+                "-I", inode_size, "-O", features,
                 "-E", "lazy_itable_init=0", "-L", profile,
                 "-U", "ae649880-7392-4424-a21c-392fdc0d1357", "-d", source, image,
             ], temporary_log)
             check_ext4_image(image, profile)
-        except (ValueError, OSError, subprocess.CalledProcessError):
+        except (ValueError, OSError, OverflowError, subprocess.CalledProcessError):
             if temporary_log.exists():
                 os.replace(temporary_log, log)
             raise
@@ -120,7 +116,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         create_ext4_image(args.source_tree, args.output_image, args.profile, args.size_mib)
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, OverflowError, subprocess.CalledProcessError) as error:
         print(f"Ext4 image creation failed: {error}", file=sys.stderr)
         return 1
     return 0

@@ -20,7 +20,7 @@ from qemu_command import build_qemu_command
 from working_disks import (default_working_disk_directory, prepare_working_disks,
                            working_disk_paths)
 
-ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CPU_COUNT = 1
 DEFAULT_MEMORY_SIZE = "1G"
 DEFAULT_NETWORK_MODE = "user"
@@ -29,7 +29,7 @@ DEFAULT_GDB_PORT = 1234
 
 def repository_path(value):
     """词法解释仓库相对路径，不读取未消费来源或解引用符号链接。"""
-    return Path(os.path.abspath(ROOT / value))
+    return Path(os.path.abspath(REPOSITORY_ROOT / value))
 
 
 def parse_arguments(argv, parser=None):
@@ -124,10 +124,10 @@ class QemuConfiguration:
 def configure_qemu(args):
     """只计算默认路径与完整 argv，展示和两种执行生命周期共用这一来源。"""
     suffix = "rv" if args.arch == "riscv64" else "la"
-    kernel_elf_path = args.kernel_elf or ROOT / f"kernel-{suffix}"
-    system_image_path = args.system_image or ROOT / ("disk.img" if suffix == "rv" else "disk-la.img")
+    kernel_elf_path = args.kernel_elf or REPOSITORY_ROOT / f"kernel-{suffix}"
+    system_image_path = args.system_image or REPOSITORY_ROOT / ("disk.img" if suffix == "rv" else "disk-la.img")
     contest_image_path = None if args.system_only else (
-        args.contest_image or ROOT / f"sdcard-{suffix}.img")
+        args.contest_image or REPOSITORY_ROOT / f"sdcard-{suffix}.img")
     directory = args.working_disk_dir or default_working_disk_directory(args.arch)
     disk_paths = working_disk_paths(directory, contest_image_path is not None)
     qemu_binary = str(args.qemu_binary) if args.qemu_binary is not None else f"qemu-system-{args.arch}"

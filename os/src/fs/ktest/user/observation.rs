@@ -74,10 +74,20 @@ impl UserOwner {
         let (reader, user_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
         let (user_reader, writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
         checked(context, reader.set_status_flags(0o4000))?;
-        let command_fd = checked(context, runtime.files.reserve())?
-            .publish(user_writer, DescriptorFlags::default());
-        let reply_fd = checked(context, runtime.files.reserve())?
-            .publish(user_reader, DescriptorFlags::default());
+        let command_fd = checked(
+            context,
+            runtime
+                .files
+                .reserve(crate::task::process::DEFAULT_NOFILE.current as usize),
+        )?
+        .publish(user_writer, DescriptorFlags::default());
+        let reply_fd = checked(
+            context,
+            runtime
+                .files
+                .reserve(crate::task::process::DEFAULT_NOFILE.current as usize),
+        )?
+        .publish(user_reader, DescriptorFlags::default());
         if command_fd != 3 || reply_fd != 4 {
             return Err(TestError("observation private pipe descriptors changed"));
         }

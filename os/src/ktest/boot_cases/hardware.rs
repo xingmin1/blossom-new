@@ -7,6 +7,8 @@ use ::ktest::{Fixture, TestContext, TestError, TestResult};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+pub(super) mod stacks;
+
 #[cfg(target_arch = "loongarch64")]
 pub(crate) mod fcc;
 
@@ -258,7 +260,8 @@ fn identity(target: usize, _: bool, _: u8, _: &AtomicBool) -> TestResult {
     assert!(core::ptr::eq(local, cpu::get(target)));
     assert!(local.online.load(Ordering::Acquire));
     let boot_stack = local.boot_stack_probe.load(Ordering::Acquire);
-    assert!(local.stack_top - cpu::STACK_SIZE <= boot_stack && boot_stack < local.stack_top);
+    let top = local.stack_top();
+    assert!(top - cpu::STACK_SIZE <= boot_stack && boot_stack < top);
     assert_eq!(
         local.boot_local_probe.load(Ordering::Acquire),
         local as *const _ as usize
@@ -274,7 +277,7 @@ fn identity(target: usize, _: bool, _: u8, _: &AtomicBool) -> TestResult {
     assert!(start <= address && address < start + bytes);
     for other in 0..target {
         assert!(!core::ptr::eq(local, cpu::get(other)));
-        assert!(cpu::STACK_SIZE <= local.stack_top.abs_diff(cpu::get(other).stack_top));
+        assert!(cpu::STACK_SIZE <= top.abs_diff(cpu::get(other).stack_top()));
         assert_ne!(local.hardware_id, cpu::get(other).hardware_id);
     }
     Ok(())

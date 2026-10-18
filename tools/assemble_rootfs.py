@@ -7,8 +7,10 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from rootfs_paths import output_path, reject_overlap
 
-ROOT = Path(__file__).resolve().parents[1]
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def copy_rootfs_entries(source_directory, destination_directory):
@@ -40,25 +42,19 @@ def assemble_rootfs_tree(architecture, guest_userland_directory,
         raise ValueError(f"unsupported architecture: {architecture}")
     userland = Path(guest_userland_directory).resolve(strict=True)
     runtime = Path(runtime_libraries_directory).resolve(strict=True)
-    system = ROOT / "userland/system"
-    contest = ROOT / "userland/contest"
-    output = Path(os.path.abspath(output_directory))
+    system = REPOSITORY_ROOT / "userland/system"
+    contest = REPOSITORY_ROOT / "userland/contest"
+    output = output_path(output_directory, directory=True)
     init_config = Path(init_config_path).resolve(strict=True) if init_config_path is not None else None
     sources = (userland, runtime, system.resolve(), contest.resolve())
     for source in sources:
         if not source.is_dir():
             raise ValueError(f"required source is not a directory: {source}")
-        if output == source or output in source.parents or source in output.parents:
-            raise ValueError(f"source and output directories overlap: {source}")
+        reject_overlap(source, output)
     if init_config is not None:
         if not init_config.is_file():
             raise ValueError(f"init config is not a regular file: {init_config}")
-        if output == init_config or output in init_config.parents:
-            raise ValueError("init config must be outside the output directory")
-    if any(path.is_symlink() for path in (output, *output.parents)):
-        raise ValueError("output directory and ancestors must not be symbolic links")
-    if output.exists() and not output.is_dir():
-        raise ValueError("output must be a directory")
+        reject_overlap(init_config, output)
     for name in ("bin/busybox", "bin/sh", "sbin/init", "sbin/contest-run", "bin/libc-smoke"):
         if not (userland / name).is_file():
             raise ValueError(f"required installed guest program missing: {userland / name}")

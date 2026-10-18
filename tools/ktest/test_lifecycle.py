@@ -346,7 +346,7 @@ os._exit(0)
                 return vm
 
             try:
-                args = options(startup_timeout=2, setup_timeout=2, case_timeout=2, cleanup_timeout=2)
+                args = options(startup_timeout_seconds=2, setup_timeout_seconds=2, case_timeout_seconds=2, cleanup_timeout_seconds=2)
                 with patch("ktest.batch.QemuTestSession", side_effect=construct_vm) as factory:
                     results = execute_batch(args, Path("kernel"), catalog_of(rows),
                                             invocations(rows, args), directory)
@@ -474,7 +474,7 @@ os._exit(0)
         for suffix, tail, status in scenarios:
             with self.subTest(suffix=suffix, tail=tail), tempfile.TemporaryDirectory() as temporary:
                 results = self.execute_serial(rows, prefix + suffix, Path(temporary),
-                                              options(cleanup_timeout=0.15), tail)
+                                              options(cleanup_timeout_seconds=0.15), tail)
                 self.assertEqual([row["status"] for row in results], ["Pass", status, "NotRun"])
                 self.assertEqual(results[1]["case_abort"], dict(phase="join", **ledger))
                 self.assertTrue(results[1]["infrastructure_error"])
@@ -503,7 +503,7 @@ os._exit(0)
             return value
 
         vm.uart.line = line
-        args = options(cleanup_timeout=2)
+        args = options(cleanup_timeout_seconds=2)
         with tempfile.TemporaryDirectory() as temporary, \
                 patch("ktest.batch.QemuTestSession", return_value=vm) as factory, \
                 patch("ktest.batch.time.monotonic", side_effect=lambda: clock[0]):
@@ -541,7 +541,7 @@ os._exit(0)
                     return value
 
                 vm.uart.line = line
-                args = options(setup_timeout=2, cleanup_timeout=2)
+                args = options(setup_timeout_seconds=2, cleanup_timeout_seconds=2)
                 with patch("ktest.batch.QemuTestSession", return_value=vm), \
                         patch("ktest.batch.time.monotonic", side_effect=lambda: clock[0]):
                     results = execute_batch(args, Path("kernel"), catalog_of(rows),
@@ -685,7 +685,7 @@ class HostFatalReplayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             with patch.object(UartChannel, "line", consuming_line):
-                results = self.execute_guest(rows, body, directory, options(case_timeout=0.5))
+                results = self.execute_guest(rows, body, directory, options(case_timeout_seconds=0.5))
             self.assertEqual((directory / "effects").read_bytes(), b"B\n")
             self.assertEqual((directory / "commands").read_bytes(), b"run 0 17 0 0,1\n")
             self.assert_reports(directory, results, ["Timeout", "NotRun"], 1)
@@ -808,7 +808,7 @@ class HostFatalReplayTests(unittest.TestCase):
                 directory = Path(temporary)
                 payload = self.payload(rows, tail)
                 body = f"uart.sendall({payload.encode()!r})\n{process_tail}"
-                results = self.execute_guest(rows, body, directory, options(cleanup_timeout=0.1))
+                results = self.execute_guest(rows, body, directory, options(cleanup_timeout_seconds=0.1))
                 self.assert_reports(directory, results, [status], 0 if status == "Pass" else 1)
                 self.assertEqual((directory / "commands").read_bytes(), b"run 0 17 0 0\n")
 

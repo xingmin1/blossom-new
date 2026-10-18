@@ -106,6 +106,12 @@ static void take_sender(long pid, int code)
 static void pending(void)
 {
     struct SignalInfo info;
+    unsigned long limit[2];
+    unsigned long old_limit[2];
+    PROBE_CHECK(1, probe_sys4(261, 0, 11, 0, old_limit) == 0);
+    limit[0] = 256;
+    limit[1] = old_limit[1];
+    PROBE_CHECK(1, probe_sys4(261, 0, 11, limit, 0) == 0);
     signal_mask(0, 0x80000a00, 2);
     PROBE_CHECK(3, queue_signal(10, 0x31) == 0);
     PROBE_CHECK(4, queue_signal(10, 0x32) == 0);
@@ -138,6 +144,7 @@ static void pending(void)
     PROBE_CHECK(38, queue_signal(32, 0x71) == 0);
     PROBE_CHECK(39, take_signal(0x80000000, (void *)-8L) == -EFAULT);
     PROBE_CHECK(40, take_signal(0x80000000, &info) == -EAGAIN);
+    PROBE_CHECK(41, probe_sys4(261, 0, 11, old_limit, 0) == 0);
 }
 
 /* /// C handler正常返回到内核安装的RA，sigreturn本身不经libc。 */

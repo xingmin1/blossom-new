@@ -12,7 +12,7 @@ import unittest
 from test_boot import kernel_image
 
 TOOLS = Path(__file__).resolve().parents[1]
-ROOT = TOOLS.parent
+REPOSITORY_ROOT = TOOLS.parent
 
 
 class RunQemuTests(unittest.TestCase):
@@ -61,14 +61,14 @@ class RunQemuTests(unittest.TestCase):
                 with self.subTest(architecture=architecture):
                     command, summary = self.printed_command(["--arch", architecture], temporary)
                     self.assertEqual(command[0], f"qemu-system-{architecture}")
-                    self.assertEqual(command[command.index("-kernel") + 1], str(ROOT / f"kernel-{suffix}"))
+                    self.assertEqual(command[command.index("-kernel") + 1], str(REPOSITORY_ROOT / f"kernel-{suffix}"))
                     self.assertEqual(command[command.index("-smp") + 1], "1")
                     self.assertEqual(command[command.index("-m") + 1], "1G")
                     self.assertNotIn("-append", command)
                     self.assertNotIn("-S", command)
                     self.assertNotIn("-gdb", command)
-                    self.assertIn(f"source={ROOT / system}", summary)
-                    self.assertIn(f"source={ROOT / f'sdcard-{suffix}.img'}", summary)
+                    self.assertIn(f"source={REPOSITORY_ROOT / system}", summary)
+                    self.assertIn(f"source={REPOSITORY_ROOT / f'sdcard-{suffix}.img'}", summary)
                     self.assertEqual(command.count("-drive"), 2)
                     self.assertIn("user,id=", command[command.index("-netdev") + 1])
 
@@ -150,8 +150,8 @@ class RunQemuTests(unittest.TestCase):
         """空格、逗号和引号在真实 argv 中保留，路径不受调用者 cwd 影响。"""
         with tempfile.TemporaryDirectory() as temporary:
             relative = Path(os.path.relpath(
-                Path(temporary) / "missing parent" / "lexical" / ".." / "chosen , 'quoted'", ROOT))
-            absolute = Path(os.path.abspath(ROOT / relative))
+                Path(temporary) / "missing parent" / "lexical" / ".." / "chosen , 'quoted'", REPOSITORY_ROOT))
+            absolute = Path(os.path.abspath(REPOSITORY_ROOT / relative))
             command, summary = self.printed_command([
                 "--arch", "riscv64", "--kernel-elf", str(relative / "kernel.elf"),
                 "--system-image", str(relative / "system.img"),

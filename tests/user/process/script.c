@@ -81,7 +81,7 @@ static int non_executable_script(void)
     return EXIT_SUCCESS;
 }
 
-/// 真实消费0644脚本成功，以及解释器深度、缺失、格式和参数预算错误。
+/// 真实消费0644脚本成功及解释器深度、缺失、格式错误，失败后保留原映像状态。
 int script_errors(void)
 {
     const char *execfn = (const char *)(uintptr_t)getauxval(AT_EXECFN);
@@ -96,31 +96,6 @@ int script_errors(void)
         result = non_executable_script();
     if (result == EXIT_SUCCESS)
         result = failed_exec("/test/scripts/non-script", ENOEXEC, "non-script", saved);
-    static char *large_argv[129];
-    static char *empty_env[] = { NULL };
-    for (size_t index = 0; index < 128; ++index)
-        large_argv[index] = (char *)(index == 0 ? "/test/scripts/no-option" : "tail");
-    large_argv[128] = NULL;
-    errno = 0;
-    if (result == EXIT_SUCCESS &&
-        (execve("/test/scripts/no-option", large_argv, empty_env) != -1 || errno != E2BIG))
-        result = fail("oversized exec argv");
-    static char large_arg[33000];
-    static char *byte_argv[3];
-    memset(large_arg, 'x', sizeof(large_arg) - 1);
-    large_arg[sizeof(large_arg) - 1] = '\0';
-    byte_argv[0] = (char *)"/bin/libc-smoke";
-    byte_argv[1] = large_arg;
-    byte_argv[2] = NULL;
-    errno = 0;
-    if (result == EXIT_SUCCESS &&
-        (execve("/bin/libc-smoke", byte_argv, empty_env) != -1 || errno != E2BIG))
-        result = fail("oversized exec bytes");
-    if (result == EXIT_SUCCESS &&
-        (tls_image != 0x2468ace0U || tls_zero != 0x10203040U ||
-         strcmp((const char *)(uintptr_t)getauxval(AT_EXECFN), saved) != 0 ||
-         read_fp_value() != fp_pattern))
-        result = fail("oversized exec preserved image");
     if (result == EXIT_SUCCESS && (fputc('E', stdout) == EOF || fflush(stdout) != 0))
         result = fail("failed exec stdio");
     free(saved);

@@ -50,11 +50,16 @@ impl UserOwner {
         let header = read_header(context, &main)?;
         let mut interpreter_bytes = [0; 4096];
         let interpreter = read_interpreter(context, &main, &header, &mut interpreter_bytes)?;
-        let arguments =
-            Arguments::from_kernel(ENTRY, &[ENTRY, selector], &[LIBRARY_ENV]).map_err(|error| {
-                context.diagnostic(format_args!("runtime-arguments error={:?}", error));
-                TestError("runtime arguments preparation failed")
-            })?;
+        let arguments = Arguments::from_kernel(
+            ENTRY,
+            &[ENTRY, selector],
+            &[LIBRARY_ENV],
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|error| {
+            context.diagnostic(format_args!("runtime-arguments error={:?}", error));
+            TestError("runtime arguments preparation failed")
+        })?;
         let image = prepare_image(self, context, &fs_context, arguments)?;
         verify_image(
             context,
@@ -234,14 +239,8 @@ impl UserOwner {
         ] {
             let candidate = open(context, self, &fs_context, pathname)?;
             let arguments = runtime_arguments(context, pathname, &[pathname])?;
-            let error = exec::prepare(
-                self.path.vfs(),
-                &fs_context,
-                arguments,
-                Credentials::ROOT,
-                exec::DEFAULT_STACK_BYTES,
-            )
-            .err();
+            let error =
+                exec::prepare(self.path.vfs(), &fs_context, arguments, Credentials::ROOT).err();
             assert_eq!(
                 error,
                 Some(ExecError::File(expected)),
@@ -282,7 +281,6 @@ impl UserOwner {
                     candidate,
                     &arguments,
                     Credentials::ROOT,
-                    exec::DEFAULT_STACK_BYTES,
                 );
                 drop(pressure);
                 *child_observed.lock() = Some((evidence, result));
@@ -378,10 +376,12 @@ fn runtime_arguments(
     filename: &[u8],
     argv: &[&[u8]],
 ) -> Result<Arguments, TestError> {
-    Arguments::from_kernel(filename, argv, &[LIBRARY_ENV]).map_err(|error| {
-        context.diagnostic(format_args!("runtime-arguments error={:?}", error));
-        TestError("runtime arguments preparation failed")
-    })
+    Arguments::from_kernel(filename, argv, &[LIBRARY_ENV], exec::DEFAULT_STACK_BYTES).map_err(
+        |error| {
+            context.diagnostic(format_args!("runtime-arguments error={:?}", error));
+            TestError("runtime arguments preparation failed")
+        },
+    )
 }
 
 /// 根调用者显式采用默认栈限额，装载错误保留生产原因。
@@ -391,14 +391,7 @@ fn prepare_image(
     fs_context: &FsContext,
     arguments: Arguments,
 ) -> Result<LoadedImage, TestError> {
-    exec::prepare(
-        owner.path.vfs(),
-        fs_context,
-        arguments,
-        Credentials::ROOT,
-        exec::DEFAULT_STACK_BYTES,
-    )
-    .map_err(|error| {
+    exec::prepare(owner.path.vfs(), fs_context, arguments, Credentials::ROOT).map_err(|error| {
         context.diagnostic(format_args!("runtime-image error={:?}", error));
         TestError("real runtime image preparation failed")
     })

@@ -97,6 +97,18 @@ impl Path {
         self.mount.mode
     }
 
+    /// 只对真实 tmpfs 挂载根重配原实例；目前不支持改变独立挂载的 RO/RW 模式。
+    /// 该 Path 持有原 Mount，普通卸载的 Busy 检查使重配期间实例不能被摘除。
+    pub fn reconfigure_tmpfs(&self, mode: AccessMode, options: &[u8]) -> Result<(), FsError> {
+        if !self.dentry.ptr_eq(&self.mount.root) || mode != self.mount.mode {
+            return Err(FsError::InvalidOperation);
+        }
+        match &self.mount.filesystem {
+            Filesystem::Memory(fs) => fs.reconfigure(options),
+            Filesystem::Ext4(_) => Err(FsError::InvalidOperation),
+        }
+    }
+
     /// 借用原挂载，为同一实际文件系统的零链接 inode 构造未入名字索引的路径。
     /// 调用者须在可睡眠任务中持合法 canonical inode；本操作不创建名字或替换挂载根。
     pub(crate) fn unhashed_inode(&self, inode: InodeRef) -> Result<Self, FsError> {
@@ -1638,16 +1650,11 @@ impl Vfs {
     }
 }
 
-/// 挂载文本限制为64KiB；分配失败和超限保留真实错误，不发表截断的行。
+/// 挂载文本按真实长度增长；算术和分配失败保留错误，不发表截断的行。
 fn append_mount_bytes(text: &mut Vec<u8>, bytes: &[u8]) -> Result<(), FsError> {
-    if 64 * 1024
-        < text
-            .len()
-            .checked_add(bytes.len())
-            .ok_or(FsError::FileTooLarge)?
-    {
-        return Err(FsError::FileTooLarge);
-    }
+    text.len()
+        .checked_add(bytes.len())
+        .ok_or(FsError::FileTooLarge)?;
     text.try_reserve(bytes.len())
         .map_err(|_| FsError::NoMemory)?;
     text.extend_from_slice(bytes);

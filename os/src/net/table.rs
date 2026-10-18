@@ -11,9 +11,8 @@ use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::UnixPair;
 use crate::net::{NetStack, NetStackRef};
-use crate::sync::SpinLock;
+use crate::sync::{SleepMutex, SpinLock};
 
-const TABLE_CAPACITY: usize = 128;
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
 /// TCP 和 UDP 使用互不冲突的端口空间。
@@ -97,30 +96,55 @@ struct TablesState {
     closed: bool,
 }
 
-/// ponytail: 128 项有限线性索引，实际查找竞争影响吞吐时再按真实键拆桶。
+/// ponytail: 各类对象使用独立增长的线性索引，查找竞争影响吞吐时再按真实键拆桶。
 pub struct NetTables {
     state: SpinLock<TablesState>,
+    /// 每类插入都从准备到提交持有自己的互斥；删除和查找只取 state。
+    bindings_growth: SleepMutex<()>,
+    tcp_growth: SleepMutex<()>,
+    tuples_growth: SleepMutex<()>,
+    listeners_growth: SleepMutex<()>,
+    udp_growth: SleepMutex<()>,
+    udp_keys_growth: SleepMutex<()>,
+    unix_growth: SleepMutex<()>,
 }
 
 impl NetTables {
-    /// 在构造期锁外 fallible 预留各表，发表后插入不扩容。
+    /// 建立七个空表；后继插入只为自身索引在短锁外申请后备。
     pub fn try_new() -> Result<Self, FsError> {
         Ok(Self {
             state: SpinLock::new(TablesState {
-                bindings: reserved_entries()?,
-                tcp: reserved_entries()?,
-                tuples: reserved_entries()?,
-                listeners: reserved_entries()?,
-                udp: reserved_entries()?,
-                udp_keys: reserved_entries()?,
-                unix: reserved_entries()?,
+                bindings: Vec::new(),
+                tcp: Vec::new(),
+                tuples: Vec::new(),
+                listeners: Vec::new(),
+                udp: Vec::new(),
+                udp_keys: Vec::new(),
+                unix: Vec::new(),
                 next_port: FIRST_EPHEMERAL_PORT,
                 closed: false,
             }),
+            bindings_growth: SleepMutex::new(()),
+            tcp_growth: SleepMutex::new(()),
+            tuples_growth: SleepMutex::new(()),
+            listeners_growth: SleepMutex::new(()),
+            udp_growth: SleepMutex::new(()),
+            udp_keys_growth: SleepMutex::new(()),
+            unix_growth: SleepMutex::new(()),
         })
     }
+    /// 只读本域 UDP 相关表的实际长度和后备容量，消费者据此选择真正的增长边界。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_udp_storage(&self) -> [(usize, usize); 3] {
+        let state = self.state.lock();
+        [
+            (state.udp.len(), state.udp.capacity()),
+            (state.bindings.len(), state.bindings.capacity()),
+            (state.udp_keys.len(), state.udp_keys.capacity()),
+        ]
+    }
 
-    /// 锁外准备独立租约身份；选端口、复用冲突与发表记录在同一短锁完成。
+    /// 插入互斥覆盖租约和后备准备；短锁复核绑定冲突后一次发表租约身份与端口。
     pub fn reserve_binding(
         &self,
         net: &NetStackRef,
@@ -136,6 +160,7 @@ impl NetTables {
         if !requested.is_unspecified() && !net.is_local(requested.address) {
             return Err(FsError::AddressNotAvailable);
         }
+        let _growth = self.bindings_growth.lock();
         let mut lease = Arc::try_new(BindLease {
             protocol,
             local: requested,
@@ -146,16 +171,14 @@ impl NetTables {
             published: false,
         })
         .map_err(|_| FsError::NoMemory)?;
-        {
+        let mut candidate = Vec::new();
+        loop {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(FsError::InvalidOperation);
             }
-            if state.bindings.len() == TABLE_CAPACITY {
-                return Err(FsError::NoMemory);
-            }
-            let local = if requested.port == 0 {
-                choose_ephemeral(&mut state, protocol, requested, dual_stack)?
+            let (local, next_port) = if requested.port == 0 {
+                choose_ephemeral(&state, protocol, requested, dual_stack)?
             } else {
                 if binding_conflicts(&state.bindings, protocol, requested, reuse, dual_stack)
                     || (protocol == TransportProtocol::Tcp
@@ -166,8 +189,18 @@ impl NetTables {
                 {
                     return Err(FsError::AddressInUse);
                 }
-                requested
+                (requested, state.next_port)
             };
+            if state.bindings.len() == state.bindings.capacity() {
+                if candidate.capacity() <= state.bindings.len() {
+                    let capacity = state.bindings.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.bindings);
+                mem::swap(&mut candidate, &mut state.bindings);
+            }
             // 尚无外部强引用或弱引用，只有准备者能修改最终端点。
             let prepared = Arc::get_mut(&mut lease).expect("unpublished binding lease shared");
             prepared.local = local;
@@ -179,7 +212,9 @@ impl NetTables {
                 reuse,
                 dual_stack,
             });
+            state.next_port = next_port;
             prepared.published = true;
+            break;
         }
         Ok(lease)
     }
@@ -212,49 +247,82 @@ impl NetTables {
         }
     }
 
-    /// 完整准备的 TCP 节点获得真实表拥有，失败参数在退出锁域后析构。
+    /// 插入互斥串行 TCP 拥有准备；短锁复核身份，失败参数及旧后备均在锁外析构。
     pub fn insert_tcp(&self, endpoint: Arc<TcpEndpoint>) -> Result<(), FsError> {
+        let _growth = self.tcp_growth.lock();
         let id = endpoint.id();
-        let mut state = self.state.lock();
-        if state.closed || state.tcp.iter().any(|entry| entry.id() == id) {
-            return Err(FsError::InvalidOperation);
+        let mut candidate = Vec::new();
+        loop {
+            let mut state = self.state.lock();
+            if state.closed || state.tcp.iter().any(|entry| entry.id() == id) {
+                return Err(FsError::InvalidOperation);
+            }
+            if state.tcp.len() == state.tcp.capacity() {
+                if candidate.capacity() <= state.tcp.len() {
+                    let capacity = state.tcp.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.tcp);
+                mem::swap(&mut candidate, &mut state.tcp);
+            }
+            state.tcp.push(endpoint);
+            return Ok(());
         }
-        if state.tcp.len() == TABLE_CAPACITY {
-            return Err(FsError::NoMemory);
-        }
-        state.tcp.push(endpoint);
-        Ok(())
     }
 
-    /// 完整准备的 UDP 节点获得真实表拥有，端口索引另行发表。
+    /// 插入互斥串行 UDP 拥有准备；端口索引独立增长，失败不取得节点拥有。
     pub fn insert_udp(&self, endpoint: Arc<UdpEndpoint>) -> Result<(), FsError> {
+        let _growth = self.udp_growth.lock();
         let id = endpoint.id();
-        let mut state = self.state.lock();
-        if state.closed || state.udp.iter().any(|entry| entry.id() == id) {
-            return Err(FsError::InvalidOperation);
+        let mut candidate = Vec::new();
+        loop {
+            let mut state = self.state.lock();
+            if state.closed || state.udp.iter().any(|entry| entry.id() == id) {
+                return Err(FsError::InvalidOperation);
+            }
+            if state.udp.len() == state.udp.capacity() {
+                if candidate.capacity() <= state.udp.len() {
+                    let capacity = state.udp.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.udp);
+                mem::swap(&mut candidate, &mut state.udp);
+            }
+            state.udp.push(endpoint);
+            return Ok(());
         }
-        if state.udp.len() == TABLE_CAPACITY {
-            return Err(FsError::NoMemory);
-        }
-        state.udp.push(endpoint);
-        Ok(())
     }
 
-    /// pair 和两个端点完整准备后才发表根拥有；失败拥有由调用者在表锁外释放。
+    /// 完整 pair 在专用插入互斥内取得表拥有，移动时不克隆或释放端点引用。
     pub fn insert_unix(&self, pair: Arc<UnixPair>) -> Result<(), FsError> {
+        let _growth = self.unix_growth.lock();
         let id = pair.id();
-        let mut state = self.state.lock();
-        if state.closed || state.unix.iter().any(|entry| entry.id() == id) {
-            return Err(FsError::InvalidOperation);
+        let mut candidate = Vec::new();
+        loop {
+            let mut state = self.state.lock();
+            if state.closed || state.unix.iter().any(|entry| entry.id() == id) {
+                return Err(FsError::InvalidOperation);
+            }
+            if state.unix.len() == state.unix.capacity() {
+                if candidate.capacity() <= state.unix.len() {
+                    let capacity = state.unix.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.unix);
+                mem::swap(&mut candidate, &mut state.unix);
+            }
+            state.unix.push(pair);
+            return Ok(());
         }
-        if state.unix.len() == TABLE_CAPACITY {
-            return Err(FsError::NoMemory);
-        }
-        state.unix.push(pair);
-        Ok(())
     }
 
-    /// 同锁核完整 tuple 唯一性后发表，重复 SYN 不能取得第二个连接键。
+    /// tuple 插入串行准备后备，短锁重新核对端点身份及完整键唯一性后才提交。
     pub fn publish_tcp_tuple(&self, id: u64, tuple: TcpTuple) -> Result<(), FsError> {
         if tuple.local.address.version() != tuple.peer.address.version()
             || tuple.local.is_unspecified()
@@ -264,85 +332,125 @@ impl NetTables {
         {
             return Err(FsError::InvalidOperation);
         }
-        let mut state = self.state.lock();
-        if state.closed || !state.tcp.iter().any(|entry| entry.id() == id) {
-            return Err(FsError::BadFd);
+        let _growth = self.tuples_growth.lock();
+        let mut candidate = Vec::new();
+        loop {
+            let mut state = self.state.lock();
+            if state.closed || !state.tcp.iter().any(|entry| entry.id() == id) {
+                return Err(FsError::BadFd);
+            }
+            if state.tuples.iter().any(|entry| entry.1 == tuple) {
+                return Err(FsError::AddressInUse);
+            }
+            if state.tuples.iter().any(|entry| entry.0 == id) {
+                return Err(FsError::InvalidOperation);
+            }
+            if state.tuples.len() == state.tuples.capacity() {
+                if candidate.capacity() <= state.tuples.len() {
+                    let capacity = state.tuples.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.tuples);
+                mem::swap(&mut candidate, &mut state.tuples);
+            }
+            state.tuples.push((id, tuple));
+            return Ok(());
         }
-        if state.tuples.iter().any(|entry| entry.1 == tuple) {
-            return Err(FsError::AddressInUse);
-        }
-        if state.tuples.iter().any(|entry| entry.0 == id) {
-            return Err(FsError::InvalidOperation);
-        }
-        if state.tuples.len() == TABLE_CAPACITY {
-            return Err(FsError::NoMemory);
-        }
-        state.tuples.push((id, tuple));
-        Ok(())
     }
 
-    /// 监听发表复核当前绑定策略；重叠监听者永远不能共享地址和端口。
+    /// 监听索引独立准备后备，重取短锁后复核租约、复用策略和重叠监听者。
     pub fn publish_listener(&self, id: u64, local: InetEndpoint) -> Result<(), FsError> {
-        let mut state = self.state.lock();
-        if state.closed || !state.tcp.iter().any(|entry| entry.id() == id) {
-            return Err(FsError::BadFd);
+        let _growth = self.listeners_growth.lock();
+        let mut candidate = Vec::new();
+        loop {
+            let mut state = self.state.lock();
+            if state.closed || !state.tcp.iter().any(|entry| entry.id() == id) {
+                return Err(FsError::BadFd);
+            }
+            let binding = state
+                .bindings
+                .iter()
+                .find(|entry| entry.owner_id == id)
+                .ok_or(FsError::BadFd)?;
+            if binding.protocol != TransportProtocol::Tcp || binding.local != local {
+                return Err(FsError::InvalidOperation);
+            }
+            let dual_stack = binding.dual_stack;
+            if state
+                .listeners
+                .iter()
+                .any(|entry| overlaps(entry.1, entry.2, local, dual_stack))
+                || state.bindings.iter().any(|entry| {
+                    entry.owner_id != id
+                        && entry.protocol == TransportProtocol::Tcp
+                        && overlaps(entry.local, entry.dual_stack, local, dual_stack)
+                        && !(binding.reuse && entry.reuse)
+                })
+            {
+                return Err(FsError::AddressInUse);
+            }
+            if local.port == 0 || state.listeners.iter().any(|entry| entry.0 == id) {
+                return Err(FsError::InvalidOperation);
+            }
+            if state.listeners.len() == state.listeners.capacity() {
+                if candidate.capacity() <= state.listeners.len() {
+                    let capacity = state.listeners.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.listeners);
+                mem::swap(&mut candidate, &mut state.listeners);
+            }
+            state.listeners.push((id, local, dual_stack));
+            return Ok(());
         }
-        let binding = state
-            .bindings
-            .iter()
-            .find(|entry| entry.owner_id == id)
-            .ok_or(FsError::BadFd)?;
-        if binding.protocol != TransportProtocol::Tcp || binding.local != local {
-            return Err(FsError::InvalidOperation);
-        }
-        let dual_stack = binding.dual_stack;
-        if state
-            .listeners
-            .iter()
-            .any(|entry| overlaps(entry.1, entry.2, local, dual_stack))
-            || state.bindings.iter().any(|entry| {
-                entry.owner_id != id
-                    && entry.protocol == TransportProtocol::Tcp
-                    && overlaps(entry.local, entry.dual_stack, local, dual_stack)
-                    && !(binding.reuse && entry.reuse)
-            })
-        {
-            return Err(FsError::AddressInUse);
-        }
-        publish_local(&mut state.listeners, id, local, dual_stack)
     }
 
-    /// UDP 键只复制端点当前地址和 peer；合法复用不再被精确地址检查否定。
+    /// UDP 插入串行准备后备；同身份更新复用原槽并移至末尾，保持最近发表优先。
     pub fn publish_udp(
         &self,
         id: u64,
         local: InetEndpoint,
         peer: Option<InetEndpoint>,
     ) -> Result<(), FsError> {
-        let mut state = self.state.lock();
-        if state.closed || !state.udp.iter().any(|entry| entry.id() == id) {
-            return Err(FsError::BadFd);
+        let _growth = self.udp_keys_growth.lock();
+        let mut candidate = Vec::new();
+        loop {
+            let mut state = self.state.lock();
+            if state.closed || !state.udp.iter().any(|entry| entry.id() == id) {
+                return Err(FsError::BadFd);
+            }
+            if local.port == 0 {
+                return Err(FsError::InvalidOperation);
+            }
+            let dual_stack = state
+                .bindings
+                .iter()
+                .find(|entry| {
+                    entry.owner_id == id
+                        && entry.protocol == TransportProtocol::Udp
+                        && matches_local(entry.local, entry.dual_stack, local)
+                })
+                .ok_or(FsError::BadFd)?
+                .dual_stack;
+            if let Some(index) = state.udp_keys.iter().position(|entry| entry.0 == id) {
+                state.udp_keys.remove(index);
+            } else if state.udp_keys.len() == state.udp_keys.capacity() {
+                if candidate.capacity() <= state.udp_keys.len() {
+                    let capacity = state.udp_keys.capacity();
+                    drop(state);
+                    candidate = prepare_growth(capacity)?;
+                    continue;
+                }
+                candidate.append(&mut state.udp_keys);
+                mem::swap(&mut candidate, &mut state.udp_keys);
+            }
+            state.udp_keys.push((id, local, peer, dual_stack));
+            return Ok(());
         }
-        if local.port == 0 {
-            return Err(FsError::InvalidOperation);
-        }
-        let dual_stack = state
-            .bindings
-            .iter()
-            .find(|entry| {
-                entry.owner_id == id
-                    && entry.protocol == TransportProtocol::Udp
-                    && matches_local(entry.local, entry.dual_stack, local)
-            })
-            .ok_or(FsError::BadFd)?
-            .dual_stack;
-        if let Some(index) = state.udp_keys.iter().position(|entry| entry.0 == id) {
-            state.udp_keys.remove(index);
-        } else if state.udp_keys.len() == TABLE_CAPACITY {
-            return Err(FsError::NoMemory);
-        }
-        state.udp_keys.push((id, local, peer, dual_stack));
-        Ok(())
     }
 
     /// 断开自动绑定只撤本身份的查询键，节点拥有和租约由各自拥有者结束。
@@ -445,11 +553,12 @@ impl NetTables {
     }
 }
 
-/// 所有有限索引使用同一构造期容量，不在持锁插入时申请存储。
-fn reserved_entries<T>() -> Result<Vec<T>, FsError> {
+/// 按单表原容量几何准备空后备；只能在 state 短锁外调用。
+fn prepare_growth<T>(capacity: usize) -> Result<Vec<T>, FsError> {
+    let capacity = capacity.checked_mul(2).ok_or(FsError::NoMemory)?.max(1);
     let mut entries = Vec::new();
     entries
-        .try_reserve_exact(TABLE_CAPACITY)
+        .try_reserve_exact(capacity)
         .map_err(|_| FsError::NoMemory)?;
     Ok(entries)
 }
@@ -483,23 +592,24 @@ fn matches_local(binding: InetEndpoint, dual_stack: bool, local: InetEndpoint) -
                     || (dual_stack && matches!(local.address, IpAddress::Ipv4(_))))))
 }
 
-/// 游标仅覆盖动态端口区间，自动端口不使用复用策略；选中和发表保持同一锁。
+/// 只试选动态端口与后继游标；调用者在容量和冲突复核通过后一起提交。
 fn choose_ephemeral(
-    state: &mut TablesState,
+    state: &TablesState,
     protocol: TransportProtocol,
     requested: InetEndpoint,
     dual_stack: bool,
-) -> Result<InetEndpoint, FsError> {
+) -> Result<(InetEndpoint, u16), FsError> {
     let start = state.next_port;
+    let mut next_port = start;
     loop {
         let local = InetEndpoint {
-            port: state.next_port,
+            port: next_port,
             ..requested
         };
-        state.next_port = if state.next_port == u16::MAX {
+        next_port = if next_port == u16::MAX {
             FIRST_EPHEMERAL_PORT
         } else {
-            state.next_port + 1
+            next_port + 1
         };
         if !binding_conflicts(&state.bindings, protocol, local, false, dual_stack)
             && !(protocol == TransportProtocol::Tcp
@@ -508,35 +618,12 @@ fn choose_ephemeral(
                     .iter()
                     .any(|entry| overlaps(entry.1, entry.2, local, dual_stack)))
         {
-            return Ok(local);
+            return Ok((local, next_port));
         }
-        if state.next_port == start {
+        if next_port == start {
             return Err(FsError::AddressInUse);
         }
     }
-}
-
-/// 本地键同一身份只发表一次，完整相同键冲突真实返回 AddressInUse。
-fn publish_local(
-    entries: &mut Vec<(u64, InetEndpoint, bool)>,
-    id: u64,
-    local: InetEndpoint,
-    dual_stack: bool,
-) -> Result<(), FsError> {
-    if local.port == 0 {
-        return Err(FsError::InvalidOperation);
-    }
-    if entries.iter().any(|entry| entry.1 == local) {
-        return Err(FsError::AddressInUse);
-    }
-    if entries.iter().any(|entry| entry.0 == id) {
-        return Err(FsError::InvalidOperation);
-    }
-    if entries.len() == TABLE_CAPACITY {
-        return Err(FsError::NoMemory);
-    }
-    entries.push((id, local, dual_stack));
-    Ok(())
 }
 
 /// 地址精确键优先于同端口通配键，返回值不借用索引存储。

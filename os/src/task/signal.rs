@@ -5,9 +5,13 @@ use alloc::sync::{Arc, Weak};
 use core::mem;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+pub(crate) use self::pending::PreparedSignal;
+use self::pending::{Pending, Retired};
 use crate::arch::UserContext;
 use crate::sync::SpinLock;
-use crate::task::process::TaskGraph;
+use crate::task::process::{TaskGraph, ThreadGroup};
+
+mod pending;
 use crate::wait::{WaitId, WaitMode, Waker};
 
 pub(crate) const SIGNAL_COUNT: usize = 64;
@@ -22,7 +26,6 @@ const SA_NOCLDWAIT: usize = 2;
 const ACTION_FLAGS: usize =
     1 | SA_NOCLDWAIT | 4 | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
 const STOP_MASK: u64 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21);
-const RT_CAPACITY: usize = 64;
 
 /// 两目标的动作对象没有restorer字段；内核保存用户handler地址但不解引用它。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +50,7 @@ pub(crate) enum SignalError {
     OnStack,
     StackTooSmall,
     QueueFull,
+    NoMemory,
     NoProcess,
     Permission,
 }
@@ -257,89 +261,6 @@ impl Sighand {
     }
 }
 
-struct Pending {
-    ordinary: [Option<SignalInfo>; 31],
-    // ponytail: 每个pending源64个RT排队额度；kill额外保每号一个实例，不扩动态分配。
-    realtime: [Option<SignalInfo>; RT_CAPACITY],
-    kill_reserve: [Option<SignalInfo>; 33],
-    rt_len: usize,
-    bits: u64,
-}
-
-impl Pending {
-    /// 固定容量随拥有者一次准备，IRQ普通发送与领取不分配。
-    fn new() -> Self {
-        Self {
-            ordinary: [None; 31],
-            realtime: [None; RT_CAPACITY],
-            kill_reserve: [None; 33],
-            rt_len: 0,
-            bits: 0,
-        }
-    }
-
-    /// 普通保首次实例；RT用户排队满报错，kill满时保每号一个真实实例并允许合并。
-    fn push(&mut self, info: SignalInfo, queued: bool) -> Result<(), SignalError> {
-        let bit = signal_bit(info.signum)?;
-        if info.signum < 32 {
-            self.ordinary[info.signum as usize - 1].get_or_insert(info);
-        } else {
-            if self.rt_len == RT_CAPACITY {
-                if queued {
-                    return Err(SignalError::QueueFull);
-                }
-                if self.bits & bit == 0 {
-                    self.kill_reserve[info.signum as usize - 32] = Some(info);
-                }
-            } else {
-                self.realtime[self.rt_len] = Some(info);
-                self.rt_len += 1;
-            }
-        }
-        self.bits |= bit;
-        Ok(())
-    }
-
-    /// 从允许集中选最低号码，RT同号按原到达顺序移出一次。
-    fn take(&mut self, allowed: u64) -> Option<SignalInfo> {
-        let bits = self.bits & allowed;
-        if bits == 0 {
-            return None;
-        }
-        let signum = bits.trailing_zeros() as u8 + 1;
-        if signum < 32 {
-            self.bits &= !(1 << (signum - 1));
-            return self.ordinary[signum as usize - 1].take();
-        }
-        // 保底实例只会在该号码原无实例时产生，因此先于随后获得额度的新实例。
-        let info = if let Some(info) = self.kill_reserve[signum as usize - 32].take() {
-            Some(info)
-        } else {
-            let index = self.realtime[..self.rt_len]
-                .iter()
-                .position(|entry| entry.is_some_and(|info| info.signum == signum))
-                .expect("RT bit has no queued instance");
-            let info = self.realtime[index].take();
-            self.realtime.copy_within(index + 1..self.rt_len, index);
-            self.rt_len -= 1;
-            self.realtime[self.rt_len] = None;
-            info
-        };
-        if !self.realtime[..self.rt_len]
-            .iter()
-            .any(|entry| entry.is_some_and(|info| info.signum == signum))
-        {
-            self.bits &= !(1 << (signum - 1));
-        }
-        info
-    }
-
-    /// 丢弃明确取消的号码集合，不触碰其他FIFO实例顺序。
-    fn discard(&mut self, mask: u64) {
-        while self.take(mask).is_some() {}
-    }
-}
-
 struct GroupState {
     pending: Pending,
     members: usize,
@@ -421,9 +342,16 @@ impl SignalGroup {
 
     /// 稳定组拥有在图锁外发出调度提醒和等待通知，不在siglock中反查图。
     pub(crate) fn notify(&self) {
+        self.reclaim_pending();
         if let Some(graph) = self.graph.upgrade() {
             graph.notify_group(self.tgid, self);
         }
+    }
+
+    /// 只在 Graph 和信号锁外调用，摘走此前忽略或控制取消的节点再析构。
+    pub(super) fn reclaim_pending(&self) {
+        let retired = self.state.lock().pending.retired();
+        drop(retired);
     }
 
     /// 图发表事务登记真实成员，早到的pending保留到其首次用户返回点。
@@ -444,10 +372,14 @@ impl SignalGroup {
         let _siglock = binding.actions.lock();
         let mut group = self.state.lock();
         let mut private = thread.state.lock();
+        private.pending.discard(u64::MAX);
         group.members = group
             .members
             .checked_sub(1)
             .expect("signal member underflow");
+        if group.members == 0 {
+            group.pending.discard(u64::MAX);
+        }
         if private.stopped {
             private.stopped = false;
             group.stopped = group.stopped.checked_sub(1).expect("stop count underflow");
@@ -460,7 +392,8 @@ impl SignalGroup {
         &self,
         info: SignalInfo,
         target: Option<&ThreadSignals>,
-        queued: bool,
+        prepared: &mut PreparedSignal,
+        account: Option<&ThreadGroup>,
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<bool, SignalError> {
         let bit = signal_bit(info.signum)?;
@@ -471,7 +404,8 @@ impl SignalGroup {
             bit,
             actions[info.signum as usize - 1],
             target,
-            queued,
+            prepared,
+            account,
             threads,
         )
     }
@@ -483,7 +417,8 @@ impl SignalGroup {
         bit: u64,
         action: SignalAction,
         target: Option<&ThreadSignals>,
-        queued: bool,
+        prepared: &mut PreparedSignal,
+        account: Option<&ThreadGroup>,
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<bool, SignalError> {
         if self.system_init && matches!(info.signum, 9 | 19) {
@@ -529,8 +464,8 @@ impl SignalGroup {
             group.stop_signal = None;
         } else if blocked || !ignored(action, info.signum, self.system_init) {
             match target {
-                Some(thread) => thread.state.lock().pending.push(info, queued)?,
-                None => group.pending.push(info, queued)?,
+                Some(thread) => thread.state.lock().pending.push(info, prepared, account)?,
+                None => group.pending.push(info, prepared, account)?,
             }
             if eligible
                 && action.handler == 0
@@ -556,7 +491,15 @@ impl SignalGroup {
         let action = actions[16];
         let autoreap = action.handler == 1 || action.flags & SA_NOCLDWAIT != 0;
         if action.handler != 1 {
-            match self.deliver_locked(info, 1 << 16, action, None, false, threads) {
+            match self.deliver_locked(
+                info,
+                1 << 16,
+                action,
+                None,
+                &mut PreparedSignal::kernel(),
+                None,
+                threads,
+            ) {
                 Ok(_) => {}
                 Err(error) => panic!("ordinary child signal failed: {:?}", error),
             }
@@ -810,6 +753,7 @@ impl ThreadSignals {
 
     /// sigtimedwait只领取请求集合中的真实实例；领取后copyout失败不得重新排队。
     pub(crate) fn take_waited(&self, set: u64) -> Option<SignalInfo> {
+        let mut retired = Retired::new();
         let binding = self.group.sighand.lock();
         let _siglock = binding.actions.lock();
         let mut group = self.group.state.lock();
@@ -819,10 +763,12 @@ impl ThreadSignals {
             .pending
             .take(allowed)
             .or_else(|| group.pending.take(allowed))
+            .map(|removed| retired.add(removed))
     }
 
     /// 一次领取与处置快照同时完成；强制同步故障不应用系统根默认忽略规则。
     pub(crate) fn select(&self) -> Option<SignalSelection> {
+        let mut retired = Retired::new();
         let binding = self.group.sighand.lock();
         let mut actions = binding.actions.lock();
         let mut group = self.group.state.lock();
@@ -839,11 +785,15 @@ impl ThreadSignals {
         loop {
             let allowed = !private.mask;
             let forced = private.fault.is_some();
-            let info = private
-                .fault
-                .take()
-                .or_else(|| private.pending.take(allowed))
-                .or_else(|| group.pending.take(allowed))?;
+            let info = if let Some(info) = private.fault.take() {
+                info
+            } else {
+                let removed = private
+                    .pending
+                    .take(allowed)
+                    .or_else(|| group.pending.take(allowed))?;
+                retired.add(removed)
+            };
             let mut action = actions[info.signum as usize - 1];
             if forced && action.handler == 1 {
                 action = SignalAction::DEFAULT;
@@ -942,6 +892,7 @@ impl ThreadSignals {
 
     /// 短锁中按组角色取得可中断等待快照，真正通知与最后Waker拥有都在锁外。
     pub(crate) fn notify_wait(&self) {
+        self.reclaim_pending();
         let waker = {
             let binding = self.group.sighand.lock();
             let actions = binding.actions.lock();
@@ -955,6 +906,12 @@ impl ThreadSignals {
         if let Some(waker) = waker {
             waker.notify();
         }
+    }
+
+    /// 已摘除节点的最后拥有不进入 siglock 或 Graph 持有期。
+    pub(super) fn reclaim_pending(&self) {
+        let retired = self.state.lock().pending.retired();
+        drop(retired);
     }
 
     /// 请求本线程在合法点退出并打断等待，不改变组退出原因或其他成员控制。

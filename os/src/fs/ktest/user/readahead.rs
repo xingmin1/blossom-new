@@ -228,10 +228,10 @@ pub(crate) mod reads {
             checked(context, random.path().unwrap().inode())?.ptr_eq(&inode),
             true,
         );
-        let table = checked(context, FileTable::try_new(2))?;
-        let fd =
-            checked(context, table.reserve())?.publish(first.clone(), DescriptorFlags::default());
-        let duplicate = checked(context, table.dup(fd))?;
+        let table = checked(context, FileTable::try_new())?;
+        let fd = checked(context, table.reserve(1024))?
+            .publish(first.clone(), DescriptorFlags::default());
+        let duplicate = checked(context, table.dup(fd, 1024))?;
         let shared = checked(context, table.lookup(duplicate))?;
         context.expect_eq(Arc::ptr_eq(&first, &shared), true);
         let empty = ReadaheadSnapshot {

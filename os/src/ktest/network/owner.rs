@@ -1,11 +1,15 @@
-//! stack 与 socket_native 共用的生产后台网络域和真实停点拥有。
+//! 后台网络域和七个 socket 行为套件共用的真实停点拥有。
 
 use ::core::sync::atomic::{AtomicBool, Ordering};
 use ::ktest::{Fixture, TestContext, TestError, TestResult};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use super::support::operation;
+use crate::cache::ktest::HeapPressure;
 use crate::ktest::execution_services::{baseline, Baseline, SuiteBaseline};
+use crate::net::socket::SocketFile;
+use crate::net::tcp::TcpEndpoint;
 use crate::net::{NetStack, NetStackOwner, NetStackRef};
 
 pub(super) struct StackOwner {
@@ -13,6 +17,9 @@ pub(super) struct StackOwner {
     pub(super) owner: Option<NetStackOwner>,
     pub(super) net: NetStackRef,
     pub(super) release: Arc<AtomicBool>,
+    pub(super) tcp_candidates: Vec<Arc<SocketFile>>,
+    pub(super) tcp_observers: Vec<Weak<TcpEndpoint>>,
+    pub(super) pressure: Option<HeapPressure>,
 }
 
 impl Fixture<SuiteBaseline> for StackOwner {
@@ -28,11 +35,16 @@ impl Fixture<SuiteBaseline> for StackOwner {
             owner: Some(owner),
             net,
             release,
+            tcp_candidates: Vec::new(),
+            tcp_observers: Vec::new(),
+            pressure: None,
         })
     }
 
-    /// 先解除本例真实 CPU 停点，框架随后合作停止并 join 原子任务。
+    /// 先释放真实压力与候选拥有、解除 CPU 停点，框架随后合作停止并 join 原子任务。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
+        drop(self.pressure.take());
+        self.tcp_candidates.clear();
         self.release.store(true, Ordering::Release);
         Ok(())
     }

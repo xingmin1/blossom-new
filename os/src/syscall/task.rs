@@ -7,7 +7,7 @@ use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::clone::{self, CloneArguments, CloneError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
-use crate::task::process::{ChildEvent, StackLimit, WaitSelector};
+use crate::task::process::{ChildEvent, Resource, ResourceLimit, WaitSelector};
 use crate::task::signal::{SignalInfo, SignalPayload};
 use crate::task::{UserRuntime, UserThread};
 use crate::wait::{WaitNode, WaitResult, Waiter};
@@ -54,19 +54,20 @@ fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, User
     let runtime = user.runtime().expect("exec has no runtime");
     let mm = user.mm().expect("exec has no MM");
     let pathname = mm.read_c_string(raw[0], 4096)?;
-    let arguments = Arguments::from_user(&mm, pathname, raw[1], raw[2]).map_err(exec_error)?;
-    let (vfs, context) = {
-        let fs = runtime.fs.lock();
-        (fs.vfs.clone(), fs.context.clone())
-    };
     let stack_limit = user
         .identity()
         .expect("exec has no identity")
         .group()
-        .stack_limit()
+        .resource_limit(Resource::Stack)
         .current;
-    let image = exec::prepare(&vfs, &context, arguments, runtime.credentials, stack_limit)
-        .map_err(exec_error)?;
+    let arguments =
+        Arguments::from_user(&mm, pathname, raw[1], raw[2], stack_limit).map_err(exec_error)?;
+    let (vfs, context) = {
+        let fs = runtime.fs.lock();
+        (fs.vfs.clone(), fs.context.clone())
+    };
+    let image =
+        exec::prepare(&vfs, &context, arguments, runtime.credentials).map_err(exec_error)?;
     Ok((image, runtime))
 }
 
@@ -110,15 +111,19 @@ fn resource_limit(
     if 16 <= resource {
         return Err(Errno::InvalidArgument);
     }
-    if resource != 3 {
-        return Err(Errno::NoSyscall);
-    }
+    let resource = match resource {
+        3 => Resource::Stack,
+        6 => Resource::Nproc,
+        7 => Resource::NoFile,
+        11 => Resource::SigPending,
+        _ => return Err(Errno::NoSyscall),
+    };
     let mm = user.mm().expect("rlimit has no MM");
     let new = match new_address {
         Some(address) => {
             let mut bytes = [0u8; 16];
             copyin(&mm, &mut bytes, address)?;
-            Some(StackLimit {
+            Some(ResourceLimit {
                 current: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
                 maximum: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
             })
@@ -131,7 +136,7 @@ fn resource_limit(
     let identity = user.identity().expect("rlimit has no identity");
     let old = identity
         .graph()
-        .prlimit_stack(&identity, pid as usize, new)?;
+        .prlimit(&identity, pid as usize, resource, new)?;
     if let Some(address) = old_address {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&old.current.to_le_bytes());

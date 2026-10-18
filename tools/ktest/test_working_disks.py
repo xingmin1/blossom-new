@@ -42,6 +42,31 @@ class WorkingDiskTests(unittest.TestCase):
             self.assertEqual(system.read_bytes(), b"updated system")
             self.assertEqual(contest.read_bytes(), b"source contest")
 
+    def test_symlink_workspace_parent_keeps_disk_ownership_and_lock_inode(self):
+        """普通父目录链接不改变工作盘独占、原来源或清理后保锁的责任。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace = base / "workspace"
+            workspace.symlink_to(base, target_is_directory=True)
+            source = base / "system.img"
+            source.write_bytes(b"source bytes")
+            work = workspace / "work"
+            with prepare_working_disks(work, source, None, "fresh") as (paths, lock):
+                inode = os.fstat(lock.fileno()).st_ino
+                self.assertEqual(paths["system"].read_bytes(), b"source bytes")
+                self.assertFalse(paths["system"].samefile(source))
+                paths["system"].write_bytes(b"guest bytes")
+                with self.assertRaises(BlockingIOError):
+                    clean_working_disks(base / "work")
+                self.assertEqual((base / "work/.lock").stat().st_ino, inode)
+            with prepare_working_disks(work, base / "missing.img", None, "reuse") as (paths, lock):
+                self.assertEqual(paths["system"].read_bytes(), b"guest bytes")
+                self.assertEqual(os.fstat(lock.fileno()).st_ino, inode)
+            clean_working_disks(work)
+            self.assertFalse((base / "work/root.raw").exists())
+            self.assertEqual((base / "work/.lock").stat().st_ino, inode)
+            self.assertEqual(source.read_bytes(), b"source bytes")
+
     def test_unconsumed_sources_are_not_statted_resolved_or_opened(self):
         """来源消失后 reuse 可运行，refresh 不探测或读取比赛来源。"""
         with tempfile.TemporaryDirectory() as temporary:

@@ -101,7 +101,7 @@ extern "C" {
     /// 在启 IE 到 IDLE 的显式窗口内复查软件提示；trap 可把返回地址改到函数入口重新检查。
     fn la_idle_once_asm(
         kick_pending: *const AtomicUsize,
-        need_resched: *const AtomicBool,
+        wake_pending: *const AtomicBool,
         #[cfg(feature = "ktest")] wait_completions: *const AtomicUsize,
     );
     static la_idle_window_start: u8;
@@ -325,24 +325,25 @@ pub fn wait_for_interrupt() {
 /// 以启 IE 后重查与 trap 返回回滚避免通知已消费后进入 IDLE，返回保持 IRQ 关闭。
 ///
 /// # Safety
-/// 仅允许本核 scheduler 在 IRQ-off、无锁且无普通 guard 时调用；原子必须是本核
-/// 永久有效字段，trap 与独立 IRQ 源已安装且开启，当前栈不得跨本次调用迁移。
-/// 测试计数以自然对齐的 AtomicUsize 提供，整个生命周期仅使用原子访问。
+/// 仅允许本核永久 boot/scheduler 栈上的最终等待边界调用：IRQ 关闭、无普通任务、
+/// 锁或 IRQ/BH/preempt guard，允许临时服务 IRQ，栈不得迁移或回收。
+/// kick_pending 与测试计数是本核永久字段；wake_pending 在本次调用期间地址稳定，
+/// 所有原子只能原子访问，唤醒方按所属协议发表条件并通知本核；trap 与独立 IRQ 源已使能。
 pub(crate) unsafe fn idle_once(
     kick_pending: &AtomicUsize,
-    need_resched: &AtomicBool,
+    wake_pending: &AtomicBool,
     #[cfg(feature = "ktest")] wait_completions: &AtomicUsize,
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
-    // SAFETY: 调用者保证本核稳定原子与无锁 scheduler 栈；汇编遵守整数 ABI，
+    // SAFETY: 调用者保证本核永久 boot/scheduler 栈、稳定原子及无锁 IRQ-off 边界；汇编遵守整数 ABI，
     // 在精确标记的启 IE/重查/IDLE 窗口可被 trap 重启，返回前关闭 IE，不改 FP/KS0。
     // 测试计数指针经 a2 传入；amadd_db.d 的输出 t1、增量 t0、地址 a2 互不重叠，
     // 64 位原子 RMW 的完整屏障与远端 Acquire 读取匹配，trap 保留全部参数和临时寄存器。
     unsafe {
         #[cfg(feature = "ktest")]
-        la_idle_once_asm(kick_pending, need_resched, wait_completions);
+        la_idle_once_asm(kick_pending, wake_pending, wait_completions);
         #[cfg(not(feature = "ktest"))]
-        la_idle_once_asm(kick_pending, need_resched);
+        la_idle_once_asm(kick_pending, wake_pending);
     };
     assert!(!irq_enabled(), "idle exit has IRQ enabled");
 }
@@ -423,9 +424,19 @@ pub fn disable_timer() {
         csr_write::<0x44>(1);
     }
 }
-/// 按 QEMU MAIL_SEND 编码向目标 CPU 发表一个 64 位邮箱值。
-fn mail_send(cpu: usize, mailbox: usize, data: usize) {
-    let target = (1u64 << 31) | ((cpu as u64) << 16);
+/// 编码 IOCSR 的十位真实 CPU target；编译逻辑 CPU 容量不参与硬件寻址。
+pub(crate) const fn ipi_target(hardware_id: usize) -> Option<u32> {
+    if hardware_id < 1024 {
+        Some((1 << 31) | ((hardware_id as u32) << 16))
+    } else {
+        None
+    }
+}
+
+/// 用已编码的 target 向四个硬件 mailbox 之一发表完整 64 位值。
+fn mail_send(target: u32, mailbox: usize, data: usize) {
+    assert!(mailbox < 4, "IOCSR mailbox index is out of range");
+    let target = u64::from(target);
     iocsr_write64(
         0x1048,
         (data as u64 & 0xffff_ffff_0000_0000) | target | (((mailbox * 2 + 1) as u64) << 2),
@@ -442,33 +453,32 @@ fn mail_send(cpu: usize, mailbox: usize, data: usize) {
 /// 记录中的栈须独占、满足 16 字节 ABI 对齐，CpuLocal 须属于目标核且完整初始化；两者与 DMW 均须永久有效。
 /// 发布后不得再修改启动记录。
 pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Result<(), isize> {
-    if crate::boot::MAX_CPUS <= hardware_id {
-        return Err(-22);
-    }
+    let target = ipi_target(hardware_id).ok_or(-22isize)?;
     barrier();
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
         // SAFETY: 调用者保证物理记录完整、对齐且永久有效；缓存 DMW 映射覆盖该内核静态对象。
         let record =
             unsafe { &*(phys_to_virt(boot_record_physical) as *const crate::cpu::CpuBoot) };
-        mail_send(hardware_id, 1, record.stack_top);
-        mail_send(hardware_id, 2, record.local);
+        mail_send(target, 1, record.stack_top);
+        mail_send(target, 2, record.local);
     } else {
-        mail_send(hardware_id, 1, boot_record_physical);
+        mail_send(target, 1, boot_record_physical);
     }
     let entry: usize;
     // SAFETY: 链接脚本给出可执行的物理辅核入口；这里只取符号值，记录契约由调用者保证。
     unsafe {
         asm!("la.abs {entry}, {symbol}", entry = out(reg) entry, symbol = sym __secondary_entry_phys, options(nomem, nostack));
     }
-    mail_send(hardware_id, 0, entry);
+    mail_send(target, 0, entry);
     barrier();
-    iocsr_write32(0x1040, (1 << 31) | ((hardware_id as u32) << 16));
+    iocsr_write32(0x1040, target);
     Ok(())
 }
 /// 队列发表屏障后发送 bit1 的真实 IOCSR IPI。
 pub fn send_ipi(hardware_id: usize) {
+    let target = ipi_target(hardware_id).expect("IOCSR IPI target is out of range");
     barrier();
-    iocsr_write32(0x1040, (1 << 31) | ((hardware_id as u32) << 16) | 1);
+    iocsr_write32(0x1040, target | 1);
 }
 /// 写入已验证 PCH-PIC 范围的 32 位寄存器，共享 word 由控制器锁保护。
 fn pic_write(offset: usize, value: u32) {
@@ -501,6 +511,17 @@ fn source_word(source: u32) -> (usize, u32) {
     (source as usize / 32 * 4, 1 << (source % 32))
 }
 
+/// EXTIOI 路由字节用高半表示 node、低半表示该 node 的四核位图。
+pub(crate) const fn extioi_route(hardware_id: usize) -> Option<u8> {
+    let node = hardware_id / 4;
+    let core = hardware_id % 4;
+    if node < 16 {
+        Some(((node as u8) << 4) | (1u8 << core))
+    } else {
+        None
+    }
+}
+
 /// 按平台快照初始化 PCH/EXTIOI 或两组 LIOINTC，所有 level 源固定路由实际 BSP。
 ///
 /// # Safety
@@ -512,7 +533,14 @@ pub unsafe fn external_init(info: &BootInfo) {
         return;
     }
     assert_eq!(info.interrupts.source_count, 64);
-    assert!(info.bsp_hardware_id < 4);
+    let route = extioi_route(info.bsp_hardware_id).expect("EXTIOI target node is out of range");
+    // QEMU 的传统 EXTIOI 只解码 node 0 的四核位图；其余核仍可正常启动和接收 IPI。
+    // 高 node 的外部 IRQ 需要另行配置 CPU_ENCODE，不能让模拟器静默投递到 core 0。
+    assert_eq!(
+        info.bsp_hardware_id / 4,
+        0,
+        "EXTIOI bitmap mode cannot route to a remote node"
+    );
     assert_eq!(info.interrupts.root_interrupt, 3);
     let _controller = EXTERNAL_CONTROLLER.lock();
     for source in 0..info.interrupts.source_count {
@@ -530,7 +558,7 @@ pub unsafe fn external_init(info: &BootInfo) {
         }
         let route_reg = ext_reg(0x800 + (source as usize & !3));
         let shift = source % 4 * 8;
-        let route = (1u32 << info.bsp_hardware_id) << shift;
+        let route = u32::from(route) << shift;
         iocsr_write32(
             route_reg,
             (iocsr_read32(route_reg) & !(0xff << shift)) | route,

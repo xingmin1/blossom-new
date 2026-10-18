@@ -133,9 +133,7 @@ pub(crate) mod testing {
 
     /// 汇总此源的逐核真实 claim 次数，不推断任一设备 ISR 或共享 action 数。
     pub(crate) fn dispatch_count(number: IrqNumber) -> usize {
-        SOURCES[number.0 as usize]
-            .lock()
-            .interrupts
+        SOURCES[number.0 as usize].lock().interrupts[..crate::cpu::count()]
             .iter()
             .fold(0usize, |total, &count| total.wrapping_add(count))
     }

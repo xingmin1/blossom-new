@@ -206,10 +206,10 @@ pub(super) mod cases {
             seen[writer] |= 1 << index;
         }
         context.expect_eq(seen, [u32::MAX; 2]);
-        let table = checked(context, FileTable::try_new(4))?;
-        let fd =
-            checked(context, table.reserve())?.publish(first.clone(), DescriptorFlags::default());
-        let dup = checked(context, table.dup(fd))?;
+        let table = checked(context, FileTable::try_new())?;
+        let fd = checked(context, table.reserve(1024))?
+            .publish(first.clone(), DescriptorFlags::default());
+        let dup = checked(context, table.dup(fd, 1024))?;
         context.expect_eq(
             Arc::ptr_eq(&checked(context, table.lookup(dup))?, &first),
             true,
@@ -689,30 +689,20 @@ pub(super) mod cases {
                 FileIoContext::Kernel,
             ),
         )?;
-        let args = Arguments::from_kernel(PROGRAM_WRITE, &[PROGRAM_WRITE, b"e"], &[])
-            .map_err(|_| TestError("deny arguments OOM"))?;
+        let args = Arguments::from_kernel(
+            PROGRAM_WRITE,
+            &[PROGRAM_WRITE, b"e"],
+            &[],
+            exec::DEFAULT_STACK_BYTES,
+        )
+        .map_err(|_| TestError("deny arguments OOM"))?;
         context.expect_eq(
-            exec::load(
-                &vfs,
-                &fs_context,
-                program.clone(),
-                &args,
-                Credentials::ROOT,
-                exec::DEFAULT_STACK_BYTES,
-            )
-            .err(),
+            exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT).err(),
             Some(ExecError::File(FsError::TextBusy)),
         );
         drop(writer);
-        let image = exec::load(
-            &vfs,
-            &fs_context,
-            program.clone(),
-            &args,
-            Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
-        )
-        .map_err(|_| TestError("deny real ELF load failed"))?;
+        let image = exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT)
+            .map_err(|_| TestError("deny real ELF load failed"))?;
         context.expect_eq(
             open_path_with_flags(
                 fixture.user.path.vfs(),
@@ -783,27 +773,12 @@ pub(super) mod cases {
         )?);
         let bad = fixture.open(context, b"/test/write-map", 0)?;
         context.expect_eq(
-            exec::load(
-                &vfs,
-                &fs_context,
-                bad.clone(),
-                &args,
-                Credentials::ROOT,
-                exec::DEFAULT_STACK_BYTES,
-            )
-            .err(),
+            exec::load(&vfs, &fs_context, bad.clone(), &args, Credentials::ROOT).err(),
             Some(ExecError::Format),
         );
         drop(fixture.open(context, b"/test/write-map", 1)?);
-        let image = exec::load(
-            &vfs,
-            &fs_context,
-            program.clone(),
-            &args,
-            Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
-        )
-        .map_err(|_| TestError("prepare deny real load failed"))?;
+        let image = exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT)
+            .map_err(|_| TestError("prepare deny real load failed"))?;
         let runtime = checked(
             context,
             UserRuntime::try_new(
@@ -841,15 +816,8 @@ pub(super) mod cases {
                 FileIoContext::Kernel,
             ),
         )?);
-        let image = exec::load(
-            &vfs,
-            &fs_context,
-            program.clone(),
-            &args,
-            Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
-        )
-        .map_err(|_| TestError("OOM deny real load failed"))?;
+        let image = exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT)
+            .map_err(|_| TestError("OOM deny real load failed"))?;
         let runtime = checked(
             context,
             UserRuntime::try_new(
@@ -908,15 +876,8 @@ pub(super) mod cases {
                 let _pin = PreemptGuard::new();
                 pages.exhaust()
             };
-            let error = exec::load(
-                &vfs,
-                &fs_context,
-                program.clone(),
-                &args,
-                Credentials::ROOT,
-                exec::DEFAULT_STACK_BYTES,
-            )
-            .err();
+            let error =
+                exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT).err();
             drop(pages);
             (evidence, error)
         };

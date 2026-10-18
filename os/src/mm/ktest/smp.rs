@@ -7,6 +7,7 @@ use crate::{
     sync::SpinLock,
 };
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ktest::{Fixture, TestContext, TestError, TestResult};
 
@@ -20,8 +21,8 @@ pub(crate) struct State {
     pub(crate) turn: AtomicUsize,
     drain_epoch: AtomicUsize,
     pub(crate) done: [AtomicUsize; MAX],
-    pub(crate) pages: [SpinLock<Option<OwnedPages>>; MAX * WORK],
-    identities: [AtomicUsize; MAX * WORK],
+    pub(crate) pages: Vec<SpinLock<Option<OwnedPages>>>,
+    identities: Vec<AtomicUsize>,
     pub(crate) objects: [SpinLock<Option<SlabObject>>; 96],
     pub(crate) command: AtomicUsize,
     pub(crate) acknowledgement: AtomicUsize,
@@ -30,24 +31,35 @@ pub(crate) struct State {
     payload: SpinLock<Option<Arc<Payload>>>,
 }
 impl State {
-    /// 每例独立原子与 owning 槽；不继承旧全局 phase/turn/go。
-    pub(crate) fn new() -> Self {
-        Self {
+    /// 按实际核数在堆上逐槽准备 owning 表，避免把最大 CPU 页槽数组放到任务栈。
+    pub(crate) fn new() -> Result<Self, TestError> {
+        let slots = cpu::count() * WORK;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(slots)
+            .map_err(|_| TestError("NoMemory: SMP page slots"))?;
+        pages.resize_with(slots, || SpinLock::new(None));
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(slots)
+            .map_err(|_| TestError("NoMemory: SMP page identities"))?;
+        identities.resize_with(slots, || AtomicUsize::new(usize::MAX));
+        Ok(Self {
             stop: AtomicBool::new(false),
             ready: AtomicUsize::new(0),
             phase: AtomicUsize::new(0),
             turn: AtomicUsize::new(0),
             drain_epoch: AtomicUsize::new(0),
             done: [const { AtomicUsize::new(0) }; MAX],
-            pages: [const { SpinLock::new(None) }; MAX * WORK],
+            pages,
             objects: [const { SpinLock::new(None) }; 96],
-            identities: [const { AtomicUsize::new(usize::MAX) }; MAX * WORK],
+            identities,
             command: AtomicUsize::new(0),
             acknowledgement: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
             drop_cpu: AtomicUsize::new(usize::MAX),
             payload: SpinLock::new(None),
-        }
+        })
     }
     /// 普通 Task 合作等待；超时返回真实错误并由 fixture 停止/框架 join。
     pub(crate) fn wait(
@@ -76,8 +88,7 @@ impl State {
     }
     /// 原子页身份采样只在发布停点，不复制释放权。
     fn unique_pages(&self, first: usize, count: usize) {
-        let mut identities = [usize::MAX; MAX * WORK];
-        let mut used = 0;
+        assert!(count <= WORK);
         for id in first..cpu::count() {
             for index in 0..count {
                 let pfn = self.pages[id * WORK + index]
@@ -85,9 +96,16 @@ impl State {
                     .as_ref()
                     .unwrap()
                     .phys_addr();
-                assert!(!identities[..used].contains(&pfn));
-                identities[used] = pfn;
-                used += 1;
+                for other in first..=id {
+                    let previous = if other == id { index } else { count };
+                    for before in 0..previous {
+                        assert_ne!(
+                            self.identities[other * WORK + before].load(Ordering::Relaxed),
+                            pfn
+                        );
+                    }
+                }
+                self.identities[id * WORK + index].store(pfn, Ordering::Relaxed);
             }
         }
     }
@@ -128,7 +146,7 @@ impl Fixture for SmpFixture {
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let baseline = settled();
         let state =
-            Arc::try_new(State::new()).map_err(|_| TestError("NoMemory: SMP memory controls"))?;
+            Arc::try_new(State::new()?).map_err(|_| TestError("NoMemory: SMP memory controls"))?;
         Ok(Self { baseline, state })
     }
     /// 关闭具体合作源；框架随后一次 stop_children 和真实 join 全部原 Task。

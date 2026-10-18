@@ -452,16 +452,16 @@ pub(crate) mod streams {
         fixture: &mut PipeOwner,
     ) -> TestResult {
         fixture.prepare(context, NONBLOCK)?;
-        let parent = checked(context, FileTable::try_new(8))?;
-        let r = checked(context, parent.reserve())?
+        let parent = checked(context, FileTable::try_new())?;
+        let r = checked(context, parent.reserve(1024))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
-        let w = checked(context, parent.reserve())?.publish(
+        let w = checked(context, parent.reserve(1024))?.publish(
             fixture.writer().clone(),
             DescriptorFlags {
                 close_on_exec: true,
             },
         );
-        let duplicate = checked(context, parent.dup(w))?;
+        let duplicate = checked(context, parent.dup(w, 1024))?;
         let child = checked(context, parent.try_clone())?;
         let held = checked(context, child.lookup(w))?;
         context.expect_eq(Arc::ptr_eq(&held, fixture.writer()), true);
@@ -522,10 +522,10 @@ pub(crate) mod streams {
             checked(context, fixture.reader().stat())?.inode != stat.inode,
             true,
         );
-        let parent = checked(context, FileTable::try_new(4))?;
-        let r = checked(context, parent.reserve())?
+        let parent = checked(context, FileTable::try_new())?;
+        let r = checked(context, parent.reserve(1024))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
-        let duplicate = checked(context, parent.dup(r))?;
+        let duplicate = checked(context, parent.dup(r, 1024))?;
         let child = checked(context, parent.try_clone())?;
         let held_reader = checked(context, child.lookup(r))?;
         drop(fixture.reader.take());

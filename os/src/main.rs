@@ -46,7 +46,7 @@ use crate::drivers::DeviceInventory;
 
 static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// 完成一次性固件资源与 CPU 准备，返回后不再保留构造数组。
+/// 在永久槽中完成一次性固件资源与 CPU 准备，发布后仅保留只读资源借用。
 ///
 /// # Safety
 /// 调用者须满足 primary_main 的 BSP、映射和固件参数约束。
@@ -54,8 +54,8 @@ static EXECUTION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 unsafe fn initialize_boot(arguments: [usize; 4]) {
     console::initialize();
     let hardware_id = arch::boot_hardware_id(arguments);
-    // SAFETY: BSP 汇编保留实际固件参数并建立 DTB 访问映射；本核为唯一解析者。
-    let mut resources = unsafe { platform::discover(arguments, hardware_id) }
+    // SAFETY: BSP 保留实际固件参数并建立 DTB 映射；本核独占尚未发布的永久资源槽。
+    let resources = unsafe { platform::discover(arguments, hardware_id) }
         .unwrap_or_else(|error| panic!("boot resource discovery failed: {}", error));
     let kernel = boot::kernel_region();
     assert!(
@@ -67,7 +67,7 @@ unsafe fn initialize_boot(arguments: [usize; 4]) {
     resources
         .reserve(kernel)
         .expect("kernel reservation failed");
-    // SAFETY: DTB 解析和内核保留已完成，AP 尚未释放，BSP 仅发布一次。
+    // SAFETY: 永久槽的独占借用已完成 DTB 解析和内核保留；AP 未释放，发布消费借用后仅允许只读访问。
     unsafe { boot::publish(resources) };
     let resources = boot::info();
     // SAFETY: 仍在独占 bootstrap 执行阶段；实际 RAM 包含当前镜像、栈和静态页表。
@@ -121,6 +121,9 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
     // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
     unsafe { mm::initialize(resources) };
+    // SAFETY: 唯一 BSP 仍保持 IRQ 关闭且 AP 未释放；MM 已完成页分配器和永久直映，
+    // CPU 表已提前构造，辅核记录尚无固件读者，全部动态槽尚为空。
+    unsafe { cpu::prepare_secondary_stacks() }.expect("AP stack allocation failed");
     // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前初始化时间源；
     // BootInfo 的频率与 RTC 资源已验证，永久 MMIO 映射有效，尚无其他 RTC 访问者。
     unsafe { time::initialize(resources) };
@@ -194,12 +197,18 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
             local.id,
             local.hardware_id,
             local as *const _ as usize,
-            local.stack_top
+            local.stack_top()
         );
     }
     early_println!("READY arch={} cpus={}", arch::NAME, cpu::count());
 
     EXECUTION_READY.store(true, core::sync::atomic::Ordering::Release);
+    for id in 0..cpu::count() {
+        let local = cpu::get(id);
+        if id != cpu::current().id && local.online.load(core::sync::atomic::Ordering::Acquire) {
+            cpu::kick(id, cpu::KICK_RESCHEDULE);
+        }
+    }
     enter_scheduler();
 }
 
@@ -220,9 +229,7 @@ pub unsafe extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
 
 /// 全部 CPU 已上线且启动输出完成后才允许分派，等待中的 AP 仍能服务 IRQ/IPI。
 fn enter_scheduler() -> ! {
-    while !EXECUTION_READY.load(core::sync::atomic::Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
+    cpu::wait_until_started(&EXECUTION_READY);
     sched::run()
 }
 
@@ -308,7 +315,8 @@ unsafe fn init_filesystems(
     } else {
         net::NetStack::try_new_lo()?
     };
-    let graph = task::process::TaskGraph::try_new(128, task::process::RootRole::System)?;
+    let graph =
+        task::process::TaskGraph::try_new(task::process::MAX_PID, task::process::RootRole::System)?;
     let arguments = task::exec::Arguments::from_kernel(
         selected.init,
         &[selected.init],
@@ -317,14 +325,9 @@ unsafe fn init_filesystems(
             b"HOME=/root",
             b"TERM=vt102",
         ],
-    )?;
-    let image = task::exec::prepare(
-        &vfs,
-        &context,
-        arguments,
-        task::Credentials::ROOT,
         task::exec::DEFAULT_STACK_BYTES,
     )?;
+    let image = task::exec::prepare(&vfs, &context, arguments, task::Credentials::ROOT)?;
     let runtime = task::UserRuntime::try_new(
         Arc::clone(&vfs),
         context.clone(),

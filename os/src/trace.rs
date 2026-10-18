@@ -121,15 +121,17 @@ pub(crate) fn record(kind: Kind, object: u64, value: u64) {
     RINGS[cpu].lock().push(record);
 }
 
-/// 普通可睡眠任务在停稳后清空全部环，再发布新采集；已经采集时返回 Busy。
+/// 普通可睡眠任务在停稳后原位清空实际 CPU 的环，再发布新采集；已经采集时返回 Busy。
 pub(crate) fn start() -> Result<(), FsError> {
     let _control = CONTROL.lock();
     if enabled() {
         return Err(FsError::Busy);
     }
     // 同一控制锁保证前次 STOP 的全部 CSD 已返回，不会与清环并行提交。
-    for ring in &RINGS {
-        *ring.lock() = Ring::new();
+    for owner in cpu::actual_set().iter() {
+        let mut ring = RINGS[owner].lock();
+        ring.records.fill(None);
+        ring.next_seq = 1;
     }
     ENABLED.store(true, Ordering::Release);
     Ok(())
@@ -149,7 +151,7 @@ pub(crate) fn stop() -> Result<(), FsError> {
         return Ok(());
     }
     ENABLED.store(false, Ordering::Release);
-    for target in 0..cpu::count() {
+    for target in cpu::actual_set().iter() {
         assert!(
             cpu::get(target).online.load(Ordering::Acquire),
             "trace stop requires online CPUs"

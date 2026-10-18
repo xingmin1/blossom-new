@@ -14,12 +14,12 @@ use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::{AddressFamily, InetEndpoint};
 use crate::net::core::{ProtocolDeadline, TcpCore};
+use crate::net::lifecycle::{EgressWait, RetirementLink};
 use crate::net::packet::OwnedPacket;
 use crate::net::socket::SocketTimeouts;
 use crate::net::table::{BindLease, TcpTuple, TransportProtocol};
 use crate::net::{
-    EndpointSlot, IoProgress, NetStack, NetStackRef, ENDPOINT_CAPACITY, LOOPBACK_CAPACITY,
-    PROTOCOL_BUDGET,
+    EndpointSlot, IoProgress, NetStack, NetStackRef, LOOPBACK_CAPACITY, PROTOCOL_BUDGET, SOMAXCONN,
 };
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::timer::{Timer, TimerKind};
@@ -66,6 +66,8 @@ pub struct TcpEndpoint {
     metadata: SpinLock<Metadata>,
     children: SpinLock<Children>,
     source: Arc<PollWaitHead>,
+    egress_wait: Arc<EgressWait>,
+    pub(crate) retirement: RetirementLink,
     work: Once<Pin<Arc<Work>>>,
     timer: Once<Pin<Arc<Timer>>>,
     stopped: AtomicBool,
@@ -203,6 +205,8 @@ impl TcpEndpoint {
                 ready: VecDeque::new(),
             }),
             source: Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
+            egress_wait: EgressWait::try_new(id)?,
+            retirement: RetirementLink::new(),
             work: Once::new(),
             timer: Once::new(),
             stopped: AtomicBool::new(false),
@@ -233,6 +237,17 @@ impl TcpEndpoint {
     /// 返回本域不复用的身份，描述符编号不进入协议索引。
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 等待登记只借创建期准备的轻量节点，不延长协议对象寿命。
+    pub(crate) fn egress_wait(&self) -> &Arc<EgressWait> {
+        &self.egress_wait
+    }
+
+    /// 测试只观察当前真实租约身份，不取得会延长端口占用的强引用。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_binding_identity(&self) -> Option<u64> {
+        self.metadata.lock().lease.as_ref().map(|lease| lease.id())
     }
 
     /// 返回普通 Work 和精确 Timer 共同固定的执行 CPU。
@@ -607,13 +622,15 @@ impl TcpEndpoint {
         if self.metadata.lock().lease.is_some() {
             return Err(FsError::InvalidOperation);
         }
+        let dual_stack =
+            local.address == AddressFamily::Ipv6.unspecified() && !self.metadata.lock().v6_only;
         let lease = net.tables().reserve_binding(
             &net,
             self.id,
             TransportProtocol::Tcp,
             local,
             self.reuse_address(),
-            local.address == AddressFamily::Ipv6.unspecified() && !self.metadata.lock().v6_only,
+            dual_stack,
         )?;
         let local = lease.local();
         let mut metadata = self.metadata.lock();
@@ -627,7 +644,7 @@ impl TcpEndpoint {
     /// 重复 listen 只更新有限 backlog，既有半连接及 ready 仍由原队列拥有。
     /// backlog 零保留一项正常队列容量；扩容准备不持 child 短锁。
     pub fn listen(self: &Arc<Self>, backlog: usize) -> Result<(), FsError> {
-        let limit = backlog.clamp(1, ENDPOINT_CAPACITY);
+        let limit = backlog.clamp(1, SOMAXCONN);
         let mut core = self.lock();
         let listening = core.state() == State::Listen;
         if !listening && (core.state() != State::Closed || self.metadata.lock().engaged) {
@@ -654,6 +671,7 @@ impl TcpEndpoint {
         let net = self.net()?;
         let _admission = net.admission()?;
         if !listening {
+            core.prepare_buffers()?;
             let lease = self.binding_or_ephemeral(&net)?;
             core.listen(lease.local())?;
             if let Err(error) = net.tables().publish_listener(self.id, lease.local()) {
@@ -692,6 +710,7 @@ impl TcpEndpoint {
         self.check_address(peer.address, true)?;
         let net = self.net()?;
         let admission = net.admission()?;
+        core.prepare_buffers()?;
         let lease = self.binding_or_ephemeral(&net)?;
         let route = net.resolve_route(peer.address, lease.local().address)?;
         let local = InetEndpoint {
@@ -723,6 +742,7 @@ impl TcpEndpoint {
         if let Some(lease) = self.metadata.lock().lease.as_ref().cloned() {
             return Ok(lease);
         }
+        let dual_stack = self.family == AddressFamily::Ipv6 && !self.metadata.lock().v6_only;
         let lease = net.tables().reserve_binding(
             net,
             self.id,
@@ -732,7 +752,7 @@ impl TcpEndpoint {
                 port: 0,
             },
             self.reuse_address(),
-            self.family == AddressFamily::Ipv6 && !self.metadata.lock().v6_only,
+            dual_stack,
         )?;
         self.metadata.lock().lease = Some(lease.clone());
         Ok(lease)
@@ -856,7 +876,7 @@ impl TcpEndpoint {
         }
         if blocked {
             self.timer.get().unwrap().as_ref().cancel_pending();
-            if net.egress_ready(self.id) == Ok(true) {
+            if net.egress_ready(self.egress_wait()) == Ok(true) {
                 net.notify_egress(self.id);
             }
             return;

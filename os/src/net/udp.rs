@@ -15,6 +15,7 @@ use spin::Once;
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer};
 use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress};
+use crate::net::lifecycle::{EgressWait, RetirementLink};
 use crate::net::packet::{zeroed_bytes, OwnedPacket};
 use crate::net::socket::SocketTimeouts;
 use crate::net::table::{BindLease, TransportProtocol};
@@ -36,6 +37,9 @@ struct Input {
 /// 原 raw 队列唯一保存消息；发送旁表只延长每条记录对应的绑定租约。
 struct State {
     socket: udp::Socket<'static>,
+    buffers_ready: bool,
+    receive_budget: usize,
+    send_budget: usize,
     leases: VecDeque<Arc<BindLease>>,
     binding: Option<Arc<BindLease>>,
     peer: Option<InetEndpoint>,
@@ -50,6 +54,27 @@ struct State {
 }
 
 impl State {
+    /// 持操作锁准备两向后备，全部成功后才安装；热 raw 永不替换。
+    fn prepare_buffers(&mut self) -> Result<(), FsError> {
+        if self.buffers_ready {
+            return Ok(());
+        }
+        let rx = UdpEndpoint::packet_buffer()?;
+        let tx = UdpEndpoint::packet_buffer()?;
+        let mut socket = udp::Socket::new(rx, tx);
+        socket.set_recv_budget(self.receive_budget);
+        socket.set_send_budget(self.send_budget);
+        socket.set_hop_limit(self.socket.hop_limit());
+        self.socket = socket;
+        self.buffers_ready = true;
+        Ok(())
+    }
+
+    /// 冷对象尚无记录且配置预算非零，不能由零容量 raw 伪造发送背压。
+    fn can_send(&self) -> bool {
+        !self.buffers_ready || self.socket.can_send()
+    }
+
     /// 从原队列和方向关闭事实计算就绪，不驱动 dispatch 或领取输入。
     fn mask(&self) -> PollMask {
         if self.closed {
@@ -59,7 +84,7 @@ impl State {
         if self.socket.can_recv() || self.read_closed {
             mask |= PollMask::POLLIN | PollMask::POLLRDNORM;
         }
-        if self.socket.can_send() || self.write_closed {
+        if self.can_send() || self.write_closed {
             mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
         }
         if self.read_closed {
@@ -97,6 +122,8 @@ pub struct UdpEndpoint {
     source: Arc<PollWaitHead>,
     work: Once<Pin<Arc<Work>>>,
     stopped: AtomicBool,
+    pub(crate) retirement: RetirementLink,
+    egress_wait: Arc<EgressWait>,
     _slot: EndpointSlot,
 }
 
@@ -149,7 +176,7 @@ impl Drop for OperationGuard<'_> {
             if !self.initial_closed && state.closed {
                 mask |= PollMask::POLLERR | PollMask::POLLHUP;
             }
-            if self.initial_send_budget < state.socket.send_budget() && state.socket.can_send() {
+            if self.initial_send_budget < state.send_budget && state.can_send() {
                 mask |= PollMask::POLLOUT | PollMask::POLLWRNORM;
             }
             mask
@@ -171,14 +198,17 @@ impl Drop for OperationGuard<'_> {
 }
 
 impl UdpEndpoint {
-    /// 域先取得节点额度，发表前 fallible 准备两向原队列和全部有限旁表。
+    /// 域先取得节点拥有，创建零后备 raw 并预备有界输入、租约旁表及等待节点。
     pub(crate) fn try_new(
         net: &NetStackRef,
         id: u64,
         slot: EndpointSlot,
         family: AddressFamily,
     ) -> Result<Arc<Self>, FsError> {
-        let socket = udp::Socket::new(Self::packet_buffer()?, Self::packet_buffer()?);
+        let socket = udp::Socket::new(
+            udp::PacketBuffer::new(Vec::new(), Vec::new()),
+            udp::PacketBuffer::new(Vec::new(), Vec::new()),
+        );
         let mut packets = VecDeque::new();
         packets
             .try_reserve_exact(PACKET_RECORDS)
@@ -193,6 +223,9 @@ impl UdpEndpoint {
             stack: Arc::downgrade(net),
             state: SleepMutex::new(State {
                 socket,
+                buffers_ready: false,
+                receive_budget: PAYLOAD_CAPACITY,
+                send_budget: PAYLOAD_CAPACITY,
                 leases,
                 binding: None,
                 peer: None,
@@ -214,6 +247,8 @@ impl UdpEndpoint {
             source: Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?,
             work: Once::new(),
             stopped: AtomicBool::new(false),
+            retirement: RetirementLink::new(),
+            egress_wait: EgressWait::try_new(id)?,
             _slot: slot,
         })
         .map_err(|_| FsError::NoMemory)?;
@@ -256,7 +291,7 @@ impl UdpEndpoint {
     fn operation(&self, mode: OperationMode) -> OperationGuard<'_> {
         let state = self.state.lock();
         let initial_mask = state.mask();
-        let initial_send_budget = state.socket.send_budget();
+        let initial_send_budget = state.send_budget;
         let initial_read_closed = state.read_closed;
         let initial_write_closed = state.write_closed;
         let initial_closed = state.closed;
@@ -275,6 +310,26 @@ impl UdpEndpoint {
     /// 返回域内不复用的身份，关闭后外部拥有仍保留该身份。
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 只观察原 raw 的真实后备，冷对象检查不得通过配置容量推断已分配字节。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_buffer_storage(&self) -> (bool, [usize; 4]) {
+        let state = self.operation(OperationMode::Observe);
+        (
+            state.buffers_ready,
+            [
+                state.socket.packet_recv_capacity(),
+                state.socket.payload_recv_capacity(),
+                state.socket.packet_send_capacity(),
+                state.socket.payload_send_capacity(),
+            ],
+        )
+    }
+
+    /// 根容量等待持同一轻量节点，不延长协议端点的业务寿命。
+    pub(crate) fn egress_wait(&self) -> &Arc<EgressWait> {
+        &self.egress_wait
     }
 
     /// OFD 地址族由构造固定，不从某条报文的协议族推测。
@@ -330,7 +385,7 @@ impl UdpEndpoint {
             && matches!(local.address, IpAddress::Ipv6(address) if address.is_unspecified())
     }
 
-    /// 同一操作权内取得显式绑定；真实源校验在表锁外的根接口查询完成。
+    /// 持操作权先准备两向后备再取得显式绑定，OOM 不发表地址或租约。
     pub fn bind(self: &Arc<Self>, requested: InetEndpoint) -> Result<InetEndpoint, FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
@@ -342,6 +397,7 @@ impl UdpEndpoint {
         self.check_family(&state, requested.address, AddressOperation::Bind)?;
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
+        state.prepare_buffers()?;
         let lease = net.tables().reserve_binding(
             &net,
             self.id,
@@ -416,6 +472,7 @@ impl UdpEndpoint {
             .as_ref()
             .map_or(self.family.unspecified(), |lease| lease.local().address);
         let route = net.resolve_route(peer.address, bound)?;
+        state.prepare_buffers()?;
         let lease = match state.binding.as_ref() {
             Some(lease) => Arc::clone(lease),
             None => self.automatic_binding(&net, &state)?,
@@ -451,7 +508,7 @@ impl UdpEndpoint {
             IpAddress::Ipv4(_) => 65507,
             IpAddress::Ipv6(_) => 65487,
         };
-        if protocol_limit < payload.len() || state.socket.send_budget() < payload.len() {
+        if protocol_limit < payload.len() || state.send_budget < payload.len() {
             return Err(FsError::MessageTooLarge);
         }
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
@@ -466,6 +523,7 @@ impl UdpEndpoint {
         {
             return Err(FsError::MessageTooLarge);
         }
+        state.prepare_buffers()?;
         if !state.socket.can_send_size(payload.len()) {
             return Ok(IoProgress::Blocked);
         }
@@ -620,54 +678,56 @@ impl UdpEndpoint {
         state.peer.ok_or(FsError::NotConnected)
     }
 
-    /// 返回原 RX PacketBuffer 的当前有效预算。
+    /// 返回配置的 RX 预算，冷对象保持与激活后相同的用户可见值。
     pub fn receive_budget(&self) -> usize {
-        self.operation(OperationMode::Observe).socket.recv_budget()
+        self.operation(OperationMode::Observe).receive_budget
     }
 
-    /// 返回原 TX PacketBuffer 的当前有效预算。
+    /// 返回配置的 TX 预算，不把冷 raw 的零容量作为 SO_SNDBUF。
     pub fn send_budget(&self) -> usize {
-        self.operation(OperationMode::Observe).socket.send_budget()
+        self.operation(OperationMode::Observe).send_budget
     }
 
-    /// 同一原队列缩小预算保留旧记录，提高后由 guard 安排后继 backlog。
+    /// 冷对象只修改配置；热队列缩预算保留旧记录，提高后安排原 backlog。
     pub fn set_receive_budget(&self, budget: usize) -> Result<(), FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
             return Err(FsError::NotConnected);
         }
-        if budget == 0 || state.socket.payload_recv_capacity() < budget {
+        if budget == 0 || PAYLOAD_CAPACITY < budget {
             return Err(FsError::InvalidOperation);
         }
-        state.socket.set_recv_budget(budget);
+        if state.buffers_ready {
+            state.socket.set_recv_budget(budget);
+        }
+        state.receive_budget = budget;
         Ok(())
     }
 
-    /// TX 预算控制原空间，不重建或删除旧消息；提高预算的 OUT 通知在锁外发生。
+    /// 冷对象保存 TX 配置，热对象只改原队列预算，OUT 通知仍在锁外发生。
     pub fn set_send_budget(&self, budget: usize) -> Result<(), FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
             return Err(FsError::NotConnected);
         }
-        if budget == 0 || state.socket.payload_send_capacity() < budget {
+        if budget == 0 || PAYLOAD_CAPACITY < budget {
             return Err(FsError::InvalidOperation);
         }
-        state.socket.set_send_budget(budget);
+        if state.buffers_ready {
+            state.socket.set_send_budget(budget);
+        }
+        state.send_budget = budget;
         Ok(())
     }
 
-    /// 物理 RX 容量与可调预算分开，均来自同一原对象。
+    /// 返回固定配置的 RX 后备容量，冷对象也允许完整范围内的早期预算。
     pub fn receive_capacity(&self) -> usize {
-        self.operation(OperationMode::Observe)
-            .socket
-            .payload_recv_capacity()
+        PAYLOAD_CAPACITY
     }
 
-    /// 物理 TX 容量不再从 Root 共享软件队列伪造。
+    /// 返回固定配置的 TX 后备容量，与是否已安装 payload 无关。
     pub fn send_capacity(&self) -> usize {
-        self.operation(OperationMode::Observe)
-            .socket
-            .payload_send_capacity()
+        PAYLOAD_CAPACITY
     }
 
     /// 一次消费真正后台 dispatch 错误，不合成 ICMP 或重复回显。
@@ -782,7 +842,7 @@ impl UdpEndpoint {
         if pending_input || (result.is_ok() && pending_tx) {
             self.schedule();
         }
-        if result == Err(FsError::WouldBlock) && net.egress_ready(self.id) == Ok(true) {
+        if result == Err(FsError::WouldBlock) && net.egress_ready(self.egress_wait()) == Ok(true) {
             self.schedule();
         }
     }
@@ -836,7 +896,7 @@ impl UdpEndpoint {
                 return Ok(());
             };
             remaining -= 1;
-            if !net.egress_ready(self.id)? {
+            if !net.egress_ready(self.egress_wait())? {
                 return Err(FsError::WouldBlock);
             }
             let mut context = UdpContextState::new(None, None);

@@ -63,7 +63,7 @@ class RootfsAssemblyTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(f"{family}:{name}".encode())
         (self.runtime / "musl/lib/loader.so").symlink_to("libc.so")
-        self.root_patch = patch.object(assemble_rootfs, "ROOT", self.project)
+        self.root_patch = patch.object(assemble_rootfs, "REPOSITORY_ROOT", self.project)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
 
@@ -144,6 +144,22 @@ class RootfsAssemblyTests(unittest.TestCase):
         self.assertTrue(self.output.is_symlink())
         self.assertEqual((external / "preserved").read_bytes(), b"external content")
 
+    def test_symlink_workspace_parent_publishes_real_tree_and_rejects_input_alias(self):
+        """普通链接父目录可发布，指向输入的父目录仍按实际路径拒绝。"""
+        workspace = self.base / "workspace"
+        workspace.symlink_to(self.base, target_is_directory=True)
+        self.output = workspace / "published root"
+        before = tuple(tree_contents(path) for path in (self.userland, self.runtime))
+        self.assemble()
+        self.assertEqual((self.base / "published root/bin/libc-smoke").read_bytes(),
+                         (self.userland / "bin/libc-smoke").read_bytes())
+        self.assertEqual(before, tuple(tree_contents(path) for path in (self.userland, self.runtime)))
+        alias = self.base / "input-alias"
+        alias.symlink_to(self.userland, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            assemble_rootfs_tree("riscv64", self.userland, self.runtime, alias / "nested")
+        self.assertFalse((self.userland / "nested").exists())
+
 
 @unittest.skipUnless(all(shutil.which(binary) for binary in ("mke2fs", "dumpe2fs", "debugfs", "e2fsck")),
                      "requires e2fsprogs")
@@ -204,6 +220,70 @@ class Ext4ImageTests(unittest.TestCase):
             subprocess.run(["debugfs", "-R", f"dump /removed {missing}", str(image)],
                            capture_output=True, check=True)
             self.assertFalse(missing.exists())
+            self.assertEqual(tree_contents(source), before)
+
+    def test_small_volumes_and_symlink_workspace_keep_real_payload(self):
+        """可容纳输入的三种小卷由真实工具决定，父目录链接不阻止发布。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            source.mkdir()
+            payload = b"small-volume bytes\x00\xff" * 257
+            (source / "payload").write_bytes(payload)
+            workspace = base / "workspace"
+            workspace.symlink_to(base, target_is_directory=True)
+            before = tree_contents(source)
+            for profile in PROFILES:
+                for size in (8, 16, 32):
+                    with self.subTest(profile=profile, size=size):
+                        image = workspace / f"{profile}-{size}.ext4"
+                        create_ext4_image(source, image, profile, size)
+                        self.assertEqual(image.stat().st_size, size * 1024 * 1024)
+                        self.assertEqual(self.read_image_file(
+                            image, "/payload", base / "payload.dump"), payload)
+            self.assertEqual(tree_contents(source), before)
+
+    def test_physical_source_alias_and_image_log_hardlink_preserve_old_bytes(self):
+        """实际父目录重叠与卷日志同 inode 在写临时卷前拒绝。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            source.mkdir()
+            (source / "payload").write_bytes(b"input")
+            alias = base / "source-alias"
+            alias.symlink_to(source, target_is_directory=True)
+            before = tree_contents(source)
+            with self.assertRaises(ValueError):
+                create_ext4_image(source, alias / "nested.ext4", image_size_mib=8)
+            image = base / "old.ext4"
+            image.write_bytes(b"previous volume")
+            image.with_suffix(".log").hardlink_to(image)
+            with self.assertRaises(ValueError):
+                create_ext4_image(source, image, image_size_mib=8)
+            self.assertEqual(image.read_bytes(), b"previous volume")
+            self.assertEqual(tree_contents(source), before)
+
+    def test_source_file_hardlink_and_nonpositive_sizes_preserve_inputs_and_old_volume(self):
+        """输出不得借硬链接别名源文件，无效容量不得覆盖已发布卷。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            source.mkdir()
+            payload = source / "payload"
+            payload.write_bytes(b"input bytes")
+            image = base / "root.ext4"
+            image.hardlink_to(payload)
+            before = tree_contents(source)
+            with self.assertRaises(ValueError):
+                create_ext4_image(source, image, image_size_mib=8)
+            self.assertEqual(image.read_bytes(), b"input bytes")
+            self.assertEqual(tree_contents(source), before)
+            image.unlink()
+            image.write_bytes(b"old volume")
+            for size in (0, -1):
+                with self.subTest(size=size), self.assertRaises(ValueError):
+                    create_ext4_image(source, image, image_size_mib=size)
+                self.assertEqual(image.read_bytes(), b"old volume")
             self.assertEqual(tree_contents(source), before)
 
     def test_invalid_outputs_and_generation_failure_preserve_source_and_previous_image(self):

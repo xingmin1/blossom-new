@@ -341,6 +341,9 @@ enum Returned {
         new_error: Option<FsError>,
         reserved_fd: usize,
         reused_fd: usize,
+        growth_errors: [Option<FsError>; 2],
+        growth_reused_fd: usize,
+        growth_initial_slots: usize,
         submitted_before: usize,
         submitted_after: usize,
     },
@@ -448,7 +451,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             source,
             target,
         } => table
-            .dup_exact(source, target)
+            .dup_exact(source, target, 1024)
             .map(Returned::FileDescriptor),
         Job::FileOom {
             table,
@@ -462,21 +465,35 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             let root = vfs.root();
             let disk = root.inode()?.disk_volume()?.disk();
             let submitted_before = disk.test_snapshot().submitted;
+            let growth = FileTable::try_new()?;
+            let base = growth
+                .reserve(4097)?
+                .publish(cached.clone(), DescriptorFlags::default());
+            let initial_slots = growth.allocated_slots();
+            for _ in 1..initial_slots {
+                growth.dup(base, 4097)?;
+            }
             let evidence = pressure.exhaust();
+            let growth_errors = [
+                growth.reserve(4097).err(),
+                growth.dup_exact(base, 4096, 4097).err(),
+            ];
             let same = table.lookup(fd)?;
             let mut data = [0xa7; mm::PAGE_SIZE];
             let bytes = same.read_at(0, &mut data)?;
-            let reservation = table.reserve()?;
+            let reservation = table.reserve(1024)?;
             let reserved_fd = reservation.publish(cached.clone(), DescriptorFlags::default());
             let published = table.lookup(reserved_fd)?;
             let same_ofd = Arc::ptr_eq(&same, &cached) && Arc::ptr_eq(&published, &cached);
             table.close(reserved_fd)?;
             let new_error = table
-                .open(&vfs, &context, pathname, OpenOptions::default())
+                .open(&vfs, &context, pathname, OpenOptions::default(), 1024)
                 .err();
-            let reservation = table.reserve()?;
+            let reservation = table.reserve(1024)?;
             let reused_fd = reservation.fd();
             drop(reservation);
+            drop(pressure);
+            let growth_reused_fd = growth.reserve(4097)?.fd();
             let returned = Returned::FileOom {
                 producer_cpu: cpu::current().id,
                 evidence,
@@ -486,10 +503,12 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
                 new_error,
                 reserved_fd,
                 reused_fd,
+                growth_errors,
+                growth_reused_fd,
+                growth_initial_slots: initial_slots,
                 submitted_before,
                 submitted_after: disk.test_snapshot().submitted,
             };
-            drop(pressure);
             Ok(returned)
         }
         Job::Lookup { vfs, parent, name } => vfs

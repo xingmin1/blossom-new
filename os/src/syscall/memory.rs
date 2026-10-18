@@ -11,9 +11,11 @@ const PRIVATE: usize = 2;
 const FIXED: usize = 0x10;
 const ANONYMOUS: usize = 0x20;
 const DENYWRITE: usize = 0x800;
+const EXECUTABLE: usize = 0x1000;
 const STACK: usize = 0x2_0000;
 const FIXED_NOREPLACE: usize = 0x10_0000;
-const SUPPORTED: usize = SHARED | PRIVATE | FIXED | ANONYMOUS | DENYWRITE | STACK | FIXED_NOREPLACE;
+const SUPPORTED: usize =
+    SHARED | PRIVATE | FIXED | ANONYMOUS | DENYWRITE | EXECUTABLE | STACK | FIXED_NOREPLACE;
 const MS_ASYNC: usize = 1;
 const MS_INVALIDATE: usize = 2;
 const MS_SYNC: usize = 4;
@@ -26,7 +28,7 @@ const ALL: PagePermissions = PagePermissions {
 /// 共享最大 W 来自真实 RW OFD 与挂载写能力；私有文件写仍只授权匿名 COW。
 pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let [address, length, prot, flags, fd, offset] = raw;
-    // 栈提示保持基本页映射，不请求自动向下增长；历史 DENYWRITE 不改变原执行写占用。
+    // 栈提示不请求自动增长；历史 DENYWRITE/EXECUTABLE 不改变权限或原执行写占用。
     if flags & !SUPPORTED != 0
         || !matches!(flags & 3, SHARED | PRIVATE)
         || offset & (PAGE_SIZE - 1) != 0

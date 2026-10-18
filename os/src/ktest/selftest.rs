@@ -657,13 +657,13 @@ mod fatal {
 /// 每例只分配一个拥有型状态，分别记录实际启动 CPU 和局部对象释放。
 struct ChildState {
     drops: core::sync::atomic::AtomicUsize,
-    entered: core::sync::atomic::AtomicUsize,
-    finished: core::sync::atomic::AtomicUsize,
+    entered: crate::cpu::AtomicCpuSet,
+    finished: crate::cpu::AtomicCpuSet,
 }
 struct ChildFixture {
     state: alloc::sync::Arc<ChildState>,
     started: usize,
-    cpu_mask: usize,
+    cpu_mask: crate::cpu::CpuSet,
 }
 impl Fixture for ChildFixture {
     /// 只在 Thread 例申请拥有型状态，分配失败返回真实 TestError。
@@ -671,12 +671,12 @@ impl Fixture for ChildFixture {
         Ok(Self {
             state: alloc::sync::Arc::try_new(ChildState {
                 drops: core::sync::atomic::AtomicUsize::new(0),
-                entered: core::sync::atomic::AtomicUsize::new(0),
-                finished: core::sync::atomic::AtomicUsize::new(0),
+                entered: crate::cpu::AtomicCpuSet::new(),
+                finished: crate::cpu::AtomicCpuSet::new(),
             })
             .map_err(|_| TestError("NoMemory: owned child state"))?,
             started: 0,
-            cpu_mask: 0,
+            cpu_mask: crate::cpu::CpuSet::empty(),
         })
     }
     /// 父框架完成合作停止和真实离栈 join 后，才观察子局部对象的实际析构。
@@ -696,9 +696,7 @@ impl Drop for OwnedChildDrop {
     fn drop(&mut self) {
         use core::sync::atomic::Ordering;
         self.state.drops.fetch_add(1, Ordering::AcqRel);
-        self.state
-            .finished
-            .fetch_or(1 << self.cpu, Ordering::AcqRel);
+        self.state.finished.insert(self.cpu, Ordering::AcqRel);
     }
 }
 
@@ -714,7 +712,7 @@ fn publish_child(
         local
             .state
             .entered
-            .fetch_or(1 << cpu, core::sync::atomic::Ordering::AcqRel);
+            .insert(cpu, core::sync::atomic::Ordering::AcqRel);
         assert_eq!(crate::cpu::current().id, cpu);
         match failure {
             1 => Err(TestError("vertical real child error")),
@@ -728,7 +726,7 @@ fn publish_child(
         }
     })?;
     fixture.started += 1;
-    fixture.cpu_mask |= 1 << cpu;
+    fixture.cpu_mask.insert(cpu);
     Ok(handle)
 }
 
@@ -741,8 +739,13 @@ mod children {
     #[case("cpu0", 0usize)]
     #[case("cpu1", 1usize)]
     #[case("both", 2usize)]
+    #[case("all", 3usize)]
     fn ownership(_: &mut TestContext<'_>, fixture: &mut ChildFixture, cpu: usize) -> TestResult {
-        if cpu == 2 {
+        if cpu == 3 {
+            for target in 0..crate::cpu::count() {
+                drop(publish_child(fixture, target, 0)?);
+            }
+        } else if cpu == 2 {
             drop(publish_child(fixture, 0, 0)?);
             drop(publish_child(fixture, 1, 0)?);
         } else {

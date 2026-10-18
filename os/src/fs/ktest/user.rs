@@ -8,11 +8,13 @@ use crate::mm::space::{Mm, VmError};
 use crate::net::route::{DefaultRouteRequest, EthernetConfig, InterfaceSnapshot, RouteSnapshot};
 use crate::net::{NetStack, NetStackOwner, NetStackRef};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
-use crate::task::process::{RootRole, TaskGraph, WaitEvent, WaitSelector};
+use crate::task::process::{RootRole, TaskGraph, WaitEvent, WaitSelector, MAX_PID};
 use crate::task::{Credentials, JoinObserver, Placement, TaskId, UserRuntime};
 use crate::workqueue::testing::{metadata_stats, MetadataStats};
 
+mod affinity;
 mod background;
+mod descriptors;
 mod events;
 mod futex;
 mod jobs;
@@ -25,9 +27,12 @@ mod observation;
 mod pipe;
 mod preparation;
 mod readahead;
+mod resources;
 mod runtime;
 mod signal;
+mod stack;
 mod system;
+mod tmpfs;
 mod tty;
 mod write;
 
@@ -101,10 +106,12 @@ impl UserOwner {
         mount_capacity: usize,
     ) -> TestResult {
         self.path.prepare_path(context, mode, mount_capacity)?;
-        self.graph = Some(TaskGraph::try_new(64, RootRole::Kernel).map_err(|error| {
-            context.diagnostic(format_args!("user-graph-prepare error={:?}", error));
-            TestError("user identity graph preparation failed")
-        })?);
+        self.graph = Some(
+            TaskGraph::try_new(MAX_PID, RootRole::Kernel).map_err(|error| {
+                context.diagnostic(format_args!("user-graph-prepare error={:?}", error));
+                TestError("user identity graph preparation failed")
+            })?,
+        );
         Ok(())
     }
 
@@ -117,10 +124,12 @@ impl UserOwner {
     /// 系统例直接在同源八槽视图中构造唯一系统图，准备失败仍由原夹具回收。
     fn prepare_system(&mut self, context: &TestContext<'_>) -> TestResult {
         self.path.prepare_path(context, AccessMode::ReadOnly, 8)?;
-        self.graph = Some(TaskGraph::try_new(64, RootRole::System).map_err(|error| {
-            context.diagnostic(format_args!("user-system-graph-prepare error={:?}", error));
-            TestError("system identity graph preparation failed")
-        })?);
+        self.graph = Some(
+            TaskGraph::try_new(MAX_PID, RootRole::System).map_err(|error| {
+                context.diagnostic(format_args!("user-system-graph-prepare error={:?}", error));
+                TestError("system identity graph preparation failed")
+            })?,
+        );
         self.mount_console_devfs(context)
     }
 
@@ -161,7 +170,12 @@ impl UserOwner {
 
     /// 内核初次参数来自已拥有字节，与普通启动使用相同初始栈契约。
     fn arguments(&self) -> Result<Arguments, ExecError> {
-        Arguments::from_kernel(PROGRAM, &[PROGRAM, b"raw"], &[b"USER_SMOKE=1"])
+        Arguments::from_kernel(
+            PROGRAM,
+            &[PROGRAM, b"raw"],
+            &[b"USER_SMOKE=1"],
+            exec::DEFAULT_STACK_BYTES,
+        )
     }
 
     /// 从本例文件系统快照准备真实程序，路径、凭据和解释器解析共用正式入口。
@@ -175,7 +189,6 @@ impl UserOwner {
             self.path.context(),
             arguments,
             Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|error| {
             context.diagnostic(format_args!("user-image-prepare error={:?}", error));
@@ -234,7 +247,7 @@ impl UserOwner {
             let worker_release = release.clone();
             let worker = task::prepare_kernel_on(target, move || {
                 let reservation = files
-                    .reserve()
+                    .reserve(crate::task::process::DEFAULT_NOFILE.current as usize)
                     .expect("fresh user table has no reservation slot");
                 assert_eq!(
                     reservation.fd(),
@@ -276,16 +289,16 @@ impl UserOwner {
         mode: &[u8],
     ) -> Result<LoadedImage, TestError> {
         let arguments =
-            Arguments::from_kernel(program, &[program, mode], &[]).map_err(|error| {
-                context.diagnostic(format_args!("user-named-arguments error={:?}", error));
-                TestError("named user arguments failed")
-            })?;
+            Arguments::from_kernel(program, &[program, mode], &[], exec::DEFAULT_STACK_BYTES)
+                .map_err(|error| {
+                    context.diagnostic(format_args!("user-named-arguments error={:?}", error));
+                    TestError("named user arguments failed")
+                })?;
         exec::prepare(
             self.path.vfs(),
             self.path.context(),
             arguments,
             Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|error| {
             context.diagnostic(format_args!("user-named-load error={:?}", error));
@@ -322,19 +335,14 @@ impl UserOwner {
         expected_status: i32,
         credentials: Credentials,
     ) -> Result<WaitEvent, TestError> {
-        let arguments = Arguments::from_kernel(program, &[program, mode], &[])
-            .map_err(|_| TestError("named user arguments failed"))?;
-        let image = exec::prepare(
-            self.path.vfs(),
-            self.path.context(),
-            arguments,
-            credentials,
-            exec::DEFAULT_STACK_BYTES,
-        )
-        .map_err(|error| {
-            context.diagnostic(format_args!("user-named-load error={:?}", error));
-            TestError("named user image failed")
-        })?;
+        let arguments =
+            Arguments::from_kernel(program, &[program, mode], &[], exec::DEFAULT_STACK_BYTES)
+                .map_err(|_| TestError("named user arguments failed"))?;
+        let image = exec::prepare(self.path.vfs(), self.path.context(), arguments, credentials)
+            .map_err(|error| {
+                context.diagnostic(format_args!("user-named-load error={:?}", error));
+                TestError("named user image failed")
+            })?;
         let affine_group = !matches!(mode.first(), Some(b't' | b'T' | b'g' | b'c'));
         let fs_context = self.path.context().clone();
         self.start_program(
@@ -524,10 +532,15 @@ impl Fixture<UserSuite> for UserOwner {
     }
 }
 
-/// 父入口只保留原生 suite 宏的真实锚点。
+/// 保活各用户行为叶的原生 suite 槽，所有叶仍由同一具名目录发现。
 pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
     core::hint::black_box(network_programs::__ktest_anchor());
     core::hint::black_box(serial_programs::__ktest_anchor());
+    core::hint::black_box(affinity::behavior::__ktest_anchor());
+    core::hint::black_box(descriptors::descriptor_growth::__ktest_anchor());
+    core::hint::black_box(resources::resource_limits::__ktest_anchor());
+    core::hint::black_box(tmpfs::tmpfs_growth::__ktest_anchor());
+    core::hint::black_box(stack::behavior::__ktest_anchor());
     programs::__ktest_anchor()
 }
 

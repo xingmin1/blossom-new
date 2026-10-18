@@ -1,5 +1,67 @@
 #include "io_private.h"
 
+/// 忽略创建位不改变只读 OFD 或各 fd 的 CLOEXEC；不支持的能力请求不得部分提交。
+static void check_status_flags(long fd, long independent_fd, long duplicate_fd)
+{
+    long original = probe_sys2(SYS_fcntl, fd, F_GETFL);
+    PROBE_CHECK(230, 0 <= original);
+    long mutable = O_APPEND | O_NONBLOCK;
+    long ignored = O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW | O_NOCTTY;
+    E(231, probe_sys3(SYS_fcntl, duplicate_fd, F_SETFL, ignored | O_WRONLY | O_SYNC), 0);
+    E(232, probe_sys2(SYS_fcntl, fd, F_GETFL), original & ~mutable);
+    E(233, probe_sys2(SYS_fcntl, fd, F_GETFD), FD_CLOEXEC);
+    E(234, probe_sys2(SYS_fcntl, duplicate_fd, F_GETFD), 0);
+    E(235, probe_sys3(SYS_fcntl, fd, F_SETFL, ignored | O_RDWR | mutable), 0);
+    long shared = (original & ~mutable) | mutable;
+    E(236, probe_sys2(SYS_fcntl, duplicate_fd, F_GETFL), shared);
+    E(237, probe_sys2(SYS_fcntl, independent_fd, F_GETFL) & mutable, 0);
+    E(238, probe_sys3(SYS_write, duplicate_fd, io_buffer, 1), -EBADF);
+    const long unsupported[] = { O_DIRECT, O_ASYNC, O_NOATIME };
+    for (unsigned i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); ++i) {
+        E(239, probe_sys3(SYS_fcntl, duplicate_fd, F_SETFL, unsupported[i]), -EOPNOTSUPP);
+        E(240, probe_sys2(SYS_fcntl, fd, F_GETFL), shared);
+    }
+    E(241, probe_sys3(SYS_fcntl, duplicate_fd, F_SETFL, original), 0);
+    E(242, probe_sys2(SYS_fcntl, fd, F_GETFL), original);
+}
+
+/// 历史映射位不改变匿名页读写、文件 COW、共享最大写权限或未支持位的拒绝边界。
+static void check_legacy_mappings(long fd)
+{
+    long mapping = probe_sys6(SYS_mmap, 0, 4096, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_EXECUTABLE, -1, 0);
+    PROBE_CHECK(243, 0 < mapping);
+    volatile unsigned char *bytes = (void *)mapping;
+    io_zero(244, bytes, 4096);
+    bytes[0] = 0x6d;
+    E(244, bytes[0], 0x6d);
+    E(244, probe_sys3(SYS_mprotect, mapping, 4096, PROT_READ), 0);
+    E(244, probe_sys4(SYS_pread64, fd, mapping, 1, 0), -EFAULT);
+    E(245, probe_sys2(SYS_munmap, mapping, 4096), 0);
+
+    mapping = probe_sys6(SYS_mmap, 0, 4096, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_EXECUTABLE, fd, 0);
+    PROBE_CHECK(246, 0 < mapping);
+    bytes = (void *)mapping;
+    io_pattern(247, bytes, 4096, 0);
+    bytes[0] = 0x9b;
+    E(248, bytes[0], 0x9b);
+    E(249, probe_sys4(SYS_pread64, fd, io_buffer, 1, 0), 1);
+    E(249, io_buffer[0], 0);
+    E(250, probe_sys2(SYS_munmap, mapping, 4096), 0);
+
+    E(251, probe_sys6(SYS_mmap, 0, 4096, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_EXECUTABLE, fd, 0), -EACCES);
+    mapping = probe_sys6(SYS_mmap, 0, 4096, PROT_READ, MAP_SHARED | MAP_EXECUTABLE, fd, 0);
+    PROBE_CHECK(252, 0 < mapping);
+    io_pattern(252, (void *)mapping, 4096, 0);
+    E(253, probe_sys3(SYS_mprotect, mapping, 4096, PROT_READ | PROT_WRITE), -EACCES);
+    E(253, probe_sys2(SYS_munmap, mapping, 4096), 0);
+    E(254, probe_sys6(SYS_mmap, 0, 4096, PROT_READ,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_EXECUTABLE | MAP_GROWSDOWN, -1, 0),
+      -EINVAL);
+}
+
 /// 核对保留页字节和重新分配页的零填充，所有 brk 返回保持原始 byte break。
 static void check_break(void)
 {
@@ -104,10 +166,12 @@ static void check_file_mappings(long fd, long independent_fd, long duplicate_fd)
     E(163, probe_sys1(SYS_close, fd), 0);
 }
 
-/// 按原先顺序消费匿名地址和三个 OFD，再检查独立的 break 生命周期。
+/// 先核共享 OFD 状态，再按原顺序消费映射和三个 fd，最后检查独立的 break 生命周期。
 void io_memory(long fd, long independent_fd, long duplicate_fd, long mapping)
 {
+    check_status_flags(fd, independent_fd, duplicate_fd);
     check_anonymous(fd, mapping);
+    check_legacy_mappings(fd);
     check_file_mappings(fd, independent_fd, duplicate_fd);
     check_break();
 }

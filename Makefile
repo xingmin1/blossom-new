@@ -10,7 +10,7 @@ KTEST_PANIC_STRATEGY ?= unwind
 KTEST_ARGS ?=
 QEMU_ARGS ?=
 TEST ?=
-CPUS ?= 4
+CPUS ?= 1
 MEMORY ?= $(if $(filter riscv64,$(ARCH)),512M,768M)
 ROOT ?= /dev/vda
 ROOT_MODE ?= ro
@@ -23,6 +23,7 @@ SYSTEM_ROOT_EXT4_IMAGE ?= build/system-$(ARCH).img
 EXT4_PROFILE ?= seed4k
 EXT4_SIZE_MIB ?= 256
 GUEST_USERLAND_OUTPUT_DIR ?= build/userland-$(ARCH)
+USER_SELFTEST_BUILD_DIR ?= build/user-selftest-cache/$(ARCH)
 RUNTIME_LIBRARIES_OUTPUT_DIR ?= build/runtime-$(ARCH)
 BUSYBOX_BUILD_DIR ?= build/busybox-$(ARCH)
 MUSL_LIBC ?=
@@ -82,12 +83,12 @@ LIBC_SOURCES := tests/user/abi/libc_smoke.c tests/user/abi/libc_common.c tests/u
 LIBC_HEADERS := tests/user/include/libc_common.h tests/user/include/fp.h
 NETWORK_SOURCES := tests/user/net/network_smoke.c $(addprefix tests/user/net/,common.c tcp.c udp.c unix.c options.c ipv6.c peer.c control.c)
 NETWORK_HEADERS := tests/user/include/net_common.h
-TEST_GEN_PROGS := fs/file_shared process/fork_exec_wait ipc/pipe_futex_epoll net/tcp_udp
+TEST_GEN_PROGS := fs/file_shared process/fork_exec_wait ipc/pipe_futex_epoll net/tcp_udp process/affinity process/resource_limits fs/descriptor_growth fs/tmpfs_growth process/exec_stack
 TEST_GEN_PROGS_EXTENDED := libc-smoke network-smoke observation-smoke
 TEST_FILES := $(wildcard tests/user/scripts/*)
 USER_TOOLS := klog-read ktrace-control
 GUEST_BIN_PROGRAMS := $(TEST_GEN_PROGS_EXTENDED) $(USER_TOOLS)
-SELFTEST_OUTPUTS = $(foreach program,$(TEST_GEN_PROGS),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/$(program)))
+SELFTEST_OUTPUTS = $(foreach program,$(TEST_GEN_PROGS),$(call make-path,$(USER_SELFTEST_BUILD_DIR)/test/selftests/$(program)))
 SELFTEST_HEADERS := tests/user/include/kselftest.h tests/user/include/selftest_io.h
 
 empty :=
@@ -214,20 +215,30 @@ build/user-$(ARCH)/signal-$(ARCH).o: tests/user/probes/signal-$(ARCH).S Makefile
 	mkdir -p "$(@D)"
 	"$(MUSL_CROSS)gcc" $(PROBE_ARCH_FLAGS) -c "$<" -o "$@"
 
-build-guest-userland: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config) $(foreach program,$(GUEST_BIN_PROGRAMS),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program))) build-contest-runner install-user-selftests
+build-guest-userland: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config) $(foreach program,$(USER_TOOLS),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program))) build-contest-runner install-user-selftests
 	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(call absolute-path,$(GUEST_USERLAND_OUTPUT_DIR))" install
 	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/sbin"
 	install -m 755 "$(RUNNER_OUTPUT)" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run"
 
-build-user-selftests: $(SELFTEST_OUTPUTS) $(foreach program,$(TEST_GEN_PROGS_EXTENDED),$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program)))
+build-user-selftests: $(SELFTEST_OUTPUTS) $(foreach program,$(TEST_GEN_PROGS_EXTENDED),$(call make-path,$(USER_SELFTEST_BUILD_DIR)/bin/$(program)))
 	$(call build-std-program,user-selftests)
 
 install-user-selftests: build-user-selftests
-	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/sbin" "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests"
+	@set -e; if [ -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/extended-bin.txt" ]; then \
+		while IFS= read -r program; do rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; done < "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/extended-bin.txt"; \
+	fi
+	rm -rf "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
+	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/sbin" "$(GUEST_USERLAND_OUTPUT_DIR)/bin" "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
+	@set -e; for program in $(TEST_GEN_PROGS); do \
+		mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/$${program%/*}"; \
+		install -m 755 "$(USER_SELFTEST_BUILD_DIR)/test/selftests/$$program" "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/$$program"; \
+	done
+	@set -e; for program in $(TEST_GEN_PROGS_EXTENDED); do \
+		install -m 755 "$(USER_SELFTEST_BUILD_DIR)/bin/$$program" "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; \
+	done
+	@{ :; $(foreach program,$(TEST_GEN_PROGS_EXTENDED),printf '%s\n' '$(program)';) } > "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/extended-bin.txt"
 	install -m 755 "$(USER_SELFTEST_RUNNER_OUTPUT)" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/user-selftests"
-	@set -e; { $(foreach program,$(TEST_GEN_PROGS),printf '%s\n' '$(subst /,:,$(program))';) } > "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/kselftest-list.txt"
-	rm -rf "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
-	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
+	@set -e; { :; $(foreach program,$(TEST_GEN_PROGS),printf '%s\n' '$(subst /,:,$(program))';) } > "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/kselftest-list.txt"
 	@set -e; for source in $(TEST_FILES); do \
 		mode=755; [ "$${source##*/}" != no-exec ] || mode=644; \
 		install -m "$$mode" "$$source" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts/"; \
@@ -236,12 +247,12 @@ install-user-selftests: build-user-selftests
 run-user-selftests: build-guest-userland prepare-guest-runtime-libraries
 	python3 tools/run_user_selftests.py --arch "$(ARCH)" --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(USER_SELFTEST_ROOTFS_DIR)" --system-image "$(USER_SELFTEST_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)" --kernel-elf "$(USER_SELFTEST_KERNEL_ELF)" --working-disk-dir "$(USER_SELFTEST_WORKING_DISK_DIR)" --system-only --init-program /sbin/init --root-mode rw $(USER_SELFTEST_ARGS) $(USER_SELFTEST_HOST_ARGS) $(QEMU_ARGS)
 
-$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/%): tests/user/%.c $(SELFTEST_HEADERS)
+$(call make-path,$(USER_SELFTEST_BUILD_DIR)/test/selftests/%): tests/user/%.c $(SELFTEST_HEADERS)
 	mkdir -p "$$(dirname -- "$@")"
 	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -pthread -Itests/user/include "$<" -o "$@"
 
 build-linux-user-selftests:
-	$(MAKE) GUEST_USERLAND_OUTPUT_DIR="$(LINUX_USER_SELFTEST_OUTPUT_DIR)" MUSL_CROSS= MUSL_CFLAGS="$(LINUX_USER_SELFTEST_CFLAGS)" $(foreach program,$(TEST_GEN_PROGS),"$(LINUX_USER_SELFTEST_OUTPUT_DIR)/test/selftests/$(program)")
+	$(MAKE) USER_SELFTEST_BUILD_DIR="$(LINUX_USER_SELFTEST_OUTPUT_DIR)" MUSL_CROSS= MUSL_CFLAGS="$(LINUX_USER_SELFTEST_CFLAGS)" $(foreach program,$(TEST_GEN_PROGS),"$(LINUX_USER_SELFTEST_OUTPUT_DIR)/test/selftests/$(program)")
 
 run-linux-user-selftests: build-linux-user-selftests
 	@failed=0; passed=0; directory="$(call absolute-path,$(LINUX_USER_SELFTEST_OUTPUT_DIR))/test/selftests"; \
@@ -254,11 +265,11 @@ run-linux-user-selftests: build-linux-user-selftests
 	[ "$$passed" -eq 0 ] || exit 0; \
 	exit 4
 
-$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/libc-smoke): $(LIBC_SOURCES) $(LIBC_HEADERS)
+$(call make-path,$(USER_SELFTEST_BUILD_DIR)/bin/libc-smoke): $(LIBC_SOURCES) $(LIBC_HEADERS)
 	mkdir -p "$$(dirname -- "$@")"
 	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Itests/user/include $(LIBC_SOURCES) -o "$@"
 
-$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/network-smoke): $(NETWORK_SOURCES) $(NETWORK_HEADERS)
+$(call make-path,$(USER_SELFTEST_BUILD_DIR)/bin/network-smoke): $(NETWORK_SOURCES) $(NETWORK_HEADERS)
 	mkdir -p "$$(dirname -- "$@")"
 	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Itests/user/include $(NETWORK_SOURCES) -o "$@"
 
@@ -270,7 +281,7 @@ $(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/ktrace-control): userland/tool
 	mkdir -p "$$(dirname -- "$@")"
 	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
-$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/observation-smoke): tests/user/abi/observation_smoke.c userland/include/blossom-trace.h
+$(call make-path,$(USER_SELFTEST_BUILD_DIR)/bin/observation-smoke): tests/user/abi/observation_smoke.c userland/include/blossom-trace.h
 	mkdir -p "$$(dirname -- "$@")"
 	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Itests/user/include -Iuserland/include "$<" -o "$@"
 
@@ -289,11 +300,10 @@ clean-build-artifacts:
 		rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; \
 	done
 	rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/user-selftests"
-	@for program in $(TEST_GEN_PROGS); do \
-		rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/$$program" "$(LINUX_USER_SELFTEST_OUTPUT_DIR)/test/selftests/$$program"; \
-	done
-	rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/kselftest-list.txt"
-	@for source in $(TEST_FILES); do rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts/$${source##*/}"; done
+	@set -e; if [ -f "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/extended-bin.txt" ]; then \
+		while IFS= read -r program; do rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; done < "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests/extended-bin.txt"; \
+	fi
+	rm -rf "$(USER_SELFTEST_BUILD_DIR)" "$(GUEST_USERLAND_OUTPUT_DIR)/test/selftests" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts" "$(LINUX_USER_SELFTEST_OUTPUT_DIR)/test/selftests"
 
 help:
 	@printf '%s\n' \
@@ -306,6 +316,7 @@ help:
 	  '  RUNNER_SYSROOT and RUNNER_LINKER select prepared Rust std compiler inputs.' \
 	  'build-user-selftests                Build default C tests, extended helpers and user-selftests.' \
 	  'install-user-selftests              Install the same sets and generate kselftest-list.txt.' \
+	  '  USER_SELFTEST_BUILD_DIR is the compilation cache; installation rebuilds only current declarations.' \
 	  'run-user-selftests                  Prepare a new PID1 run, wait for QEMU, read its working-disk result.' \
 	  '  USER_SELFTEST_KERNEL_ELF selects an existing ordinary ELF; no kernel build dependency.' \
 	  '  USER_SELFTEST_ROOTFS_DIR, USER_SELFTEST_EXT4_IMAGE and USER_SELFTEST_WORKING_DISK_DIR own outputs.' \

@@ -1,8 +1,8 @@
 //! 真正硬件trap与AP上线失败各自独立VM；类型由实际错误控制者报告。
 
 use crate::ktest::panic::Boundary;
-use crate::{arch, cpu};
-use ::ktest::{TestContext, TestError, TestResult};
+use crate::{arch, boot, cpu, mm};
+use ::ktest::TestContext;
 
 struct UncaughtBoot {
     previous: *mut Boundary,
@@ -83,11 +83,23 @@ pub(crate) mod traps {
 )]
 pub(crate) mod startup {
     use super::*;
-    /// host仅修改本VM的AP首条指令为自跳，真实启动协议必须五秒超时且不释放启动记录。
+    /// 独立冻结AP的终结性Boot动作独占建立MM和动态栈，再等待生产启核五秒超时；
+    /// 建立MM后不得返回普通Boot分派，意外上线同样以未捕获panic终结本VM。
     #[test]
     #[ktest(expected_fatal = "panic", fatal_message = "AP online timed out")]
-    fn frozen_ap(context: &mut TestContext<'_>) -> TestResult {
+    fn frozen_ap(context: &mut TestContext<'_>) {
         assert_eq!(cpu::current().id, 0);
+        let _uncaught = UncaughtBoot::enter();
+        {
+            let _irq = crate::sync::IrqSaveGuard::new();
+            // SAFETY: 本例独占一个新VM，普通Boot尚未建立MM；CPU0唯一执行且IRQ已关闭，
+            // 所有AP未释放。实际BootInfo完整保留内核、BSP栈、页表和固件区域，最终RAM
+            // 直映永久可写且一一对应；空闲RAM无其他使用者，发布的metadata不再别名修改或归还。
+            unsafe { mm::initialize(boot::info()) };
+            // SAFETY: CPU表已建立，CPU0仍独占启动、IRQ关闭，MM的buddy/PCP/SLUB均已初始化；
+            // 全部AP从未交给固件，无并发准备或栈访问；成功页随后只交给原生产启核路径。
+            unsafe { cpu::prepare_secondary_stacks() }.expect("AP stack preparation failed");
+        }
         for id in 1..cpu::count() {
             assert!(!cpu::get(id)
                 .online
@@ -96,15 +108,14 @@ pub(crate) mod startup {
                 "frozen-ap before id={} hardware={} stack={:#x} local={:#x}",
                 id,
                 cpu::get(id).hardware_id,
-                cpu::get(id).stack_top,
+                cpu::get(id).stack_top(),
                 cpu::get(id) as *const _ as usize
             ));
         }
-        let _uncaught = UncaughtBoot::enter();
-        // SAFETY: BootInfo/CpuLocal/永久独立启动栈已完成，只有BSP启动；所有AP尚未释放，
-        // 当前BSP可服务IPI且不持有call需要的锁。host控制只冻结本VM的真实AP入口，
-        // 超时路径不归还记录/栈、不降核，最终panic在无catch边界的真实控制者终结整VM。
+        // SAFETY: 实际BootInfo/CpuLocal已永久发布，MM和每个AP的独占动态启动栈均已准备；
+        // 只有CPU0运行，所有AP尚未释放，未持有目标初始化所需锁；host保证目标在进入
+        // Rust初始化前自跳，不会向BSP发同步CSD。生产超时保留目标栈，未捕获panic终结VM。
         unsafe { cpu::start_secondaries() };
-        Err(TestError("frozen AP unexpectedly came online"))
+        panic!("frozen AP unexpectedly came online");
     }
 }

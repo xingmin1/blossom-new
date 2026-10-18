@@ -7,11 +7,9 @@ use crate::mm::{
     page::{PageDesc, PageKind, PageMap},
 };
 
-/// 构造原区间边界输入，所有用例各持一份独立 BootMemory。
-fn ranges() -> BootMemory {
-    let mut info = BootInfo::empty([0; 4], 0);
-    info.memory_count = 5;
-    info.memory[..5].copy_from_slice(&[
+/// 在调用方的空账本中填写原区间边界输入，不构造完整固件快照或返回账本副本。
+fn ranges(memory: &mut BootMemory) {
+    let ram = [
         Region {
             start: 20 * PAGE_SIZE,
             end: 24 * PAGE_SIZE,
@@ -32,9 +30,8 @@ fn ranges() -> BootMemory {
             start: 40 * PAGE_SIZE + 1,
             end: 40 * PAGE_SIZE + 2,
         },
-    ]);
-    info.reserved_count = 5;
-    info.reserved[..5].copy_from_slice(&[
+    ];
+    let reserved = [
         Region {
             start: 3 * PAGE_SIZE + 1,
             end: 4 * PAGE_SIZE + 1,
@@ -55,16 +52,15 @@ fn ranges() -> BootMemory {
             start: 30 * PAGE_SIZE,
             end: 31 * PAGE_SIZE,
         },
-    ]);
-    BootMemory::new(&info).unwrap()
+    ];
+    memory.initialize(&ram, &reserved).unwrap();
 }
 
-/// 执行原两次实际 metadata 扣除，保留对齐前缀与尾部空洞。
-fn deducted() -> BootMemory {
-    let mut memory = ranges();
+/// 执行原两次实际metadata扣除，保留对齐前缀与尾部空洞，全部状态留在调用方账本。
+fn deducted(memory: &mut BootMemory) {
+    ranges(memory);
     assert_eq!(memory.allocate(2, 4), Ok(PageRange { start: 8, end: 10 }));
     assert_eq!(memory.allocate(2, 2), Ok(PageRange { start: 6, end: 8 }));
-    memory
 }
 
 #[ktest::suite(context = "Boot", tags("mm", "bootmem"), timeout_ms = 10000)]
@@ -73,8 +69,10 @@ mod boot_ranges {
     /// RAM 先合并原字节区间后向内取整，保留真实空洞。
     #[test]
     fn ram_union() {
+        let mut memory = const { BootMemory::empty() };
+        ranges(&mut memory);
         assert_eq!(
-            ranges().ram(),
+            memory.ram(),
             [
                 PageRange { start: 2, end: 11 },
                 PageRange { start: 20, end: 24 }
@@ -84,8 +82,10 @@ mod boot_ranges {
     /// reserved 向外取整后仅扣除与 RAM 的交集。
     #[test]
     fn reserved_intersection() {
+        let mut memory = const { BootMemory::empty() };
+        ranges(&mut memory);
         assert_eq!(
-            ranges().reserved(),
+            memory.reserved(),
             [
                 PageRange { start: 3, end: 6 },
                 PageRange { start: 10, end: 11 },
@@ -96,7 +96,8 @@ mod boot_ranges {
     /// 原 free 与分类账务互斥且总数守恒。
     #[test]
     fn initial_free() {
-        let memory = ranges();
+        let mut memory = const { BootMemory::empty() };
+        ranges(&mut memory);
         assert_eq!(
             memory.free(),
             [
@@ -118,7 +119,8 @@ mod boot_ranges {
     /// 对齐申请合并 metadata，free 真实扣除四页。
     #[test]
     fn metadata_deduction() {
-        let memory = deducted();
+        let mut memory = const { BootMemory::empty() };
+        deducted(&mut memory);
         assert_eq!(memory.metadata(), [PageRange { start: 6, end: 10 }]);
         assert_eq!(
             memory.free(),
@@ -146,7 +148,8 @@ mod boot_ranges {
     #[case("size_overflow", usize::MAX, 1)]
     #[case("align_overflow", 1, 1usize << (usize::BITS - 1))]
     fn allocation_rejection(pages: usize, alignment: usize) {
-        let mut memory = deducted();
+        let mut memory = const { BootMemory::empty() };
+        deducted(&mut memory);
         let before = memory.stats();
         assert!(memory.allocate(pages, alignment).is_err());
         assert_eq!(memory.stats(), before);
@@ -155,17 +158,18 @@ mod boot_ranges {
     /// 两片未对齐且相邻的字节 RAM 共同覆盖一页，metadata 居中切分 free。
     #[test]
     fn adjacent_byte_fragments() {
-        let mut info = BootInfo::empty([0; 4], 0);
-        info.memory_count = 2;
-        info.memory[0] = Region {
-            start: PAGE_SIZE,
-            end: PAGE_SIZE + PAGE_SIZE / 2,
-        };
-        info.memory[1] = Region {
-            start: PAGE_SIZE + PAGE_SIZE / 2,
-            end: 8 * PAGE_SIZE,
-        };
-        let mut memory = BootMemory::new(&info).unwrap();
+        let ram = [
+            Region {
+                start: PAGE_SIZE,
+                end: PAGE_SIZE + PAGE_SIZE / 2,
+            },
+            Region {
+                start: PAGE_SIZE + PAGE_SIZE / 2,
+                end: 8 * PAGE_SIZE,
+            },
+        ];
+        let mut memory = const { BootMemory::empty() };
+        memory.initialize(&ram, &[]).unwrap();
         assert_eq!(memory.ram(), [PageRange { start: 1, end: 8 }]);
         assert_eq!(memory.allocate(2, 4), Ok(PageRange { start: 4, end: 6 }));
         assert_eq!(
@@ -186,7 +190,7 @@ mod boot_ranges {
             }
         );
     }
-    /// 原始输入溢出、数组计数和无效区间分别独立拒绝。
+    /// 原始输入的对齐溢出、片段数量与无效区间分别独立拒绝。
     #[test]
     #[case("ram_overflow", 0)]
     #[case("reserved_overflow", 1)]
@@ -194,43 +198,52 @@ mod boot_ranges {
     #[case("reserved_count", 3)]
     #[case("empty_region", 4)]
     fn input_rejection(kind: usize) {
-        let mut info = BootInfo::empty([0; 4], 0);
-        info.memory_count = 1;
-        info.memory[0] = Region {
+        let mut ram = [Region {
             start: 0,
             end: 32 * PAGE_SIZE,
-        };
-        match kind {
+        }; MAX_MEMORY_REGIONS + 1];
+        let mut reserved = [Region { start: 0, end: 1 }; MAX_RESERVED_REGIONS + 1];
+        let (ram_count, reserved_count) = match kind {
             0 => {
-                info.memory[0] = Region {
-                    start: usize::MAX - 1,
-                    end: usize::MAX,
-                }
-            }
-            1 => {
-                info.reserved_count = 1;
-                info.reserved[0] = Region {
+                ram[0] = Region {
                     start: usize::MAX - 1,
                     end: usize::MAX,
                 };
+                (1, 0)
             }
-            2 => info.memory_count = MAX_MEMORY_REGIONS + 1,
-            3 => info.reserved_count = MAX_RESERVED_REGIONS + 1,
-            _ => info.memory[0] = Region { start: 10, end: 10 },
-        }
-        assert!(BootMemory::new(&info).is_err());
+            1 => {
+                reserved[0] = Region {
+                    start: usize::MAX - 1,
+                    end: usize::MAX,
+                };
+                (1, 1)
+            }
+            2 => (MAX_MEMORY_REGIONS + 1, 0),
+            3 => (1, MAX_RESERVED_REGIONS + 1),
+            _ => {
+                ram[0] = Region { start: 10, end: 10 };
+                (1, 0)
+            }
+        };
+        let mut memory = const { BootMemory::empty() };
+        assert!(memory
+            .initialize(&ram[..ram_count], &reserved[..reserved_count])
+            .is_err());
     }
     /// 每次成功申请消费一个固定 metadata 额度，超限不改已分配页。
     #[test]
     fn metadata_capacity() {
-        let mut info = BootInfo::empty([0; 4], 0);
-        info.memory_count = 1;
-        info.memory[0] = Region {
-            start: 0,
-            end: 32 * PAGE_SIZE,
-        };
-        let mut memory = BootMemory::new(&info).unwrap();
         let limit = 1 + MAX_MEMORY_REGIONS;
+        let mut memory = const { BootMemory::empty() };
+        memory
+            .initialize(
+                &[Region {
+                    start: 0,
+                    end: (limit + 1) * PAGE_SIZE,
+                }],
+                &[],
+            )
+            .unwrap();
         for pfn in 0..limit {
             assert_eq!(
                 memory.allocate(1, 1),

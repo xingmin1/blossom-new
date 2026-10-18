@@ -38,7 +38,6 @@ pub(crate) fn early() -> RunCommand {
     core::hint::black_box(crate::cache::ktest::anchors());
     core::hint::black_box(crate::fs::ktest::anchors());
     core::hint::black_box(super::network::anchors());
-    core::hint::black_box(crate::ktest::network::socket_native::__ktest_anchor());
     core::hint::black_box(crate::drivers::virtio_net::ktest::native::__ktest_anchor());
     let registry = Registry::load().unwrap_or_else(|e| super::context::fatal(e.0));
     let arch = if cfg!(target_arch = "riscv64") {

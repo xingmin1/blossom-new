@@ -5,7 +5,7 @@ use crate::block::AccessMode;
 use crate::fs::file::{open_path_with_flags, FileIoContext};
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::*;
-use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind};
+use crate::fs::memfs::{Filesystem, MemoryFs};
 use crate::mm::space::{Mm, VmError};
 use crate::mm::user_table::PagePermissions;
 
@@ -47,7 +47,10 @@ pub(crate) mod mapping {
     ) -> TestResult {
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let covered = resolve(context, fixture, b"/plain")?;
-        let memory = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o777))?;
+        let memory = checked(
+            context,
+            MemoryFs::try_tmpfs(b"mode=0777,nr_inodes=128,nr_blocks=4096"),
+        )?;
         checked(
             context,
             fixture.vfs().mount(

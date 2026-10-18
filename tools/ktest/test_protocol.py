@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from host_helpers import CONFIG, case_record, case_lines, parser_for
+from host_helpers import CLI, CONFIG, case_record, case_lines, parser_for
 from ktest.catalog import HostError
 from ktest.protocol import CaseResult, ready
 
@@ -16,6 +16,30 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(HostError):
             ready("KTEST READY 1 arch=riscv64 cpus=1 mode=debug panic=unwind", CONFIG)
 
+
+    def test_cpu_arguments_match_ready_without_narrowing(self):
+        """正整数 CPU 原样进入请求配置，少核 READY 必须拒绝而非降核。"""
+        for architecture in ("riscv64", "loongarch64"):
+            for count in (1, 2, 3, 4, 5, 8, 16, 32, 33, 64, 65, 128):
+                with self.subTest(architecture=architecture, count=count):
+                    args = CLI.arguments(["run", "--arch", architecture, "--cpus", str(count)])
+                    config = CLI.config(args)
+                    line = (f"KTEST READY 1 arch={architecture} cpus={count} "
+                            "mode=debug panic=unwind")
+                    ready(line, config)
+                    with self.assertRaises(HostError):
+                        ready(line.replace(f"cpus={count} ", f"cpus={count + 1} "), config)
+
+    def test_cpu_arguments_reject_nonpositive_and_fractional(self):
+        """零、负数、非整数无法到达会话创建边界。"""
+        from contextlib import redirect_stderr
+        import io
+
+        for value in ("0", "-1", "1.5", "one"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    CLI.arguments(["run", "--arch", "riscv64", "--cpus", value])
+                self.assertEqual(raised.exception.code, 2)
     def test_complete_pass_with_diagnostics(self):
         """业务 panic 字样只是诊断，完整生命周期才决定结果。"""
         row = case_record()

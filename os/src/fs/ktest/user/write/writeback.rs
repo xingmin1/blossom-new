@@ -581,10 +581,10 @@ pub(super) mod cases {
         context.expect_eq(Arc::ptr_eq(&first, &second), false);
         let inode = fixture.inodes.last().unwrap().clone();
         let disk = fixture.user.path.owner.disk()?.clone();
-        let table = checked(context, FileTable::try_new(4))?;
-        let fd =
-            checked(context, table.reserve())?.publish(first.clone(), DescriptorFlags::default());
-        let duplicate = checked(context, table.dup(fd))?;
+        let table = checked(context, FileTable::try_new())?;
+        let fd = checked(context, table.reserve(1024))?
+            .publish(first.clone(), DescriptorFlags::default());
+        let duplicate = checked(context, table.dup(fd, 1024))?;
         let duplicated = checked(context, table.lookup(duplicate))?;
         context.expect_eq(Arc::ptr_eq(&first, &duplicated), true);
         context.expect_eq(first.write_at(0, &[0x91; 4096]), Ok(4096));
@@ -888,8 +888,8 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 同步 write 交数据和 cursor 后放写锁，独立覆盖可前进；用户完成 phase2 后才观察自己的错误完成。
-    /// 暂停完成前的原页观察由一份显式有限请求准备。
+    /// 同步 write 提交后释放 inode/cursor 锁，受控 EIO 不回滚接受的字节和位置。
+    /// 后续 sync 完成真实 FLUSH，两个独立 OFD 分别消费各自的 errseq 样本。
     #[test]
     #[case("O_SYNC", b"d" as &[u8])]
     #[case("O_DSYNC", b"z" as &[u8])]
@@ -963,8 +963,18 @@ pub(super) mod cases {
         context.expect_eq(disk.test_completion_error_pending(), false);
         bytes_at(context, &file, 0, &[0x39, 0x33])?;
         context.expect_eq(original.seek(SeekFrom::Current(0)), Ok(1));
+        if !disk.limits().flush {
+            return Err(TestError("sync error probe requires device FLUSH"));
+        }
+        let before_sync = disk.test_snapshot();
+        disk.test_fail_next_flush(BlockError::Io);
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
+        context.expect_eq(disk.test_completion_error_pending(), false);
+        context.expect_eq(
+            before_sync.flush_submitted < disk.test_snapshot().flush_submitted,
+            true,
+        );
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
         context.diagnostic(format_args!("W14 mode={} actual-sync-write-blocked=1 inode-lock-released=1 OFD-cursor-lock-released=1 accepted-data-and-cursor-not-rolled-back-on-EIO=1", if mode == b"d" { "O_SYNC" } else { "O_DSYNC" }));
         Ok(())

@@ -357,16 +357,14 @@ fn irq(node: Node<'_>, controller: Node<'_>) -> Result<u32, &'static str> {
     word(value, 0)
 }
 
-/// 将完整 DTB 转为一份资源快照，保留 BSP 身份及全部实际 RAM/保留区。
+/// 在调用者独占的空快照中发现全部资源，早期调用链不返回或复制大型BootInfo值。
 fn discover_tree(
     bytes: &[u8],
-    raw_args: [usize; 4],
-    bsp: usize,
+    info: &mut BootInfo,
     dtb_address: usize,
-) -> Result<BootInfo, &'static str> {
+) -> Result<(), &'static str> {
     validate(bytes)?;
     let tree = Fdt::new(bytes).map_err(|_| "FDT parser rejected the input")?;
-    let mut info = BootInfo::empty(raw_args, bsp);
     info.dtb = Region::from_size(dtb_address, tree.total_size())?;
     info.reserve(info.dtb)?;
     #[cfg(target_arch = "loongarch64")]
@@ -456,14 +454,14 @@ fn discover_tree(
             return Err("FDT CPU hardware IDs are duplicated");
         }
         if info.cpu_count == MAX_CPUS {
-            return Err("FDT CPU count exceeds the four-CPU capacity");
+            return Err("FDT CPU count exceeds the compiled capacity");
         }
         info.hardware_ids[info.cpu_count] = id;
         info.cpu_count += 1;
     }
     let bsp_index = info.hardware_ids[..info.cpu_count]
         .iter()
-        .position(|id| *id == bsp)
+        .position(|id| *id == info.bsp_hardware_id)
         .ok_or("FDT enabled CPUs do not include the BSP")?;
     info.hardware_ids.swap(0, bsp_index);
     #[cfg(target_arch = "riscv64")]
@@ -482,20 +480,20 @@ fn discover_tree(
     let chosen = tree
         .find_node("/chosen")
         .ok_or("FDT chosen node is missing")?;
-    discover_bootargs(chosen, &mut info)?;
-    discover_initrd(chosen, &mut info)?;
+    discover_bootargs(chosen, info)?;
+    discover_initrd(chosen, info)?;
     let uart = resources::stdout_uart(&tree, chosen)?;
     info.interrupts.uart = single_region(&tree, uart)?;
     if info.interrupts.uart.start != EARLY_UART_BASE {
         return Err("FDT chosen UART differs from the early UART");
     }
-    resources::discover_uart(&tree, chosen, uart, &mut info)?;
+    resources::discover_uart(&tree, chosen, uart, info)?;
     match current() {
-        Platform::QemuVirt => discover_qemu(&tree, cpus, uart, &mut info)?,
-        Platform::VisionFive2 => visionfive2::discover(&tree, cpus, uart, &mut info)?,
-        Platform::Ls2k1000la => ls2k1000la::discover(&tree, uart, &mut info)?,
+        Platform::QemuVirt => discover_qemu(&tree, cpus, uart, info)?,
+        Platform::VisionFive2 => visionfive2::discover(&tree, cpus, uart, info)?,
+        Platform::Ls2k1000la => ls2k1000la::discover(&tree, uart, info)?,
     }
-    Ok(info)
+    Ok(())
 }
 
 /// 对测试拥有的 DTB 字节运行唯一正式结构校验，不访问固件指针或修改启动状态。
@@ -504,15 +502,23 @@ pub(crate) fn ktest_validate(bytes: &[u8]) -> Result<(), &'static str> {
     validate(bytes)
 }
 
-/// 对测试拥有的 DTB 字节运行正式资源发现，返回独立快照而不发布到全局启动信息。
+/// 对测试拥有的DTB字节运行正式资源发现，填写独占槽而不发布或按值返回整份快照。
 #[cfg(feature = "ktest")]
-pub(crate) fn ktest_discover_tree(
+pub(crate) fn ktest_discover_tree<'a>(
     bytes: &[u8],
     raw_args: [usize; 4],
     bsp: usize,
     dtb_address: usize,
-) -> Result<crate::boot::BootInfo, &'static str> {
-    discover_tree(bytes, raw_args, bsp, dtb_address)
+    output: &'a mut core::mem::MaybeUninit<BootInfo>,
+) -> Result<&'a mut BootInfo, &'static str> {
+    // SAFETY: 可变借用独占完整对齐槽；BootInfo字段均无需Drop，旧值已无引用，
+    // 逐字段初始化完成后才形成已初始化借用，解析失败不发布任何快照。
+    let info = unsafe {
+        BootInfo::initialize_at(output.as_mut_ptr(), raw_args, bsp);
+        output.assume_init_mut()
+    };
+    discover_tree(bytes, info, dtb_address)?;
+    Ok(info)
 }
 
 /// 保存完整 NUL 结尾的单一命令行，拒绝截断、内嵌 NUL 和容量外输入。
@@ -930,17 +936,17 @@ fn discover_plic(
     Ok(())
 }
 
-/// 从所选平台的显式固件交接读取唯一 DTB 和命令行，返回完整无堆资源快照。
+/// 从显式固件交接在永久槽中完成唯一DTB与命令行发现，不在引导栈传递整份快照。
 ///
 /// # Safety
 /// 固件必须提供至少可读的 FDT 头部及头部所声明的完整存储范围；本函数检查内容边界，
 /// 不能验证任意物理指针是否实际可读。调用时 BSP 必须已建立对应 RAM 访问映射；
 /// QEMU LA 的 a1 命令行须在快照容量内可读；板固件须满足 UHI/bootm/go 的显式参数
-/// 契约，其中 go 的 argv[1] 必须是最多 18 字节、NUL 结尾的可读十六进制 DTB 地址。
+/// 契约，其中go的argv[1]须为最多18字节的可读NUL结尾十六进制DTB地址；只能由BSP调用一次。
 pub unsafe fn discover(
     raw_args: [usize; 4],
     bsp_hardware_id: usize,
-) -> Result<BootInfo, &'static str> {
+) -> Result<&'static mut BootInfo, &'static str> {
     #[cfg(target_arch = "riscv64")]
     let physical = raw_args[1];
     #[cfg(target_arch = "loongarch64")]
@@ -968,10 +974,11 @@ pub unsafe fn discover(
     }
     // SAFETY: caller 保证固件声明的完整存储可读；长度、物理和虚拟地址范围已验证。
     let bytes = unsafe { core::slice::from_raw_parts(pointer, total) };
-    let info = discover_tree(bytes, raw_args, bsp_hardware_id, physical)?;
+    // SAFETY: discover只由BSP在IRQ关闭且AP未释放时调用一次；永久槽尚无引用，下面借用持续到发布。
+    let info = unsafe { crate::boot::prepare(raw_args, bsp_hardware_id) };
+    discover_tree(bytes, info, physical)?;
     #[cfg(target_arch = "loongarch64")]
     {
-        let mut info = info;
         if current() != Platform::QemuVirt {
             return Ok(info);
         }
@@ -982,6 +989,7 @@ pub unsafe fn discover(
             // 地址零也是有效物理地址。读取受快照容量限制，遇到终止 NUL 立即停止。
             let byte = unsafe { command.add(index).read() };
             if byte == 0 {
+                info.bootargs[index] = 0;
                 info.bootargs_len = index;
                 return Ok(info);
             }

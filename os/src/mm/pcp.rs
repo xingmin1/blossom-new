@@ -88,7 +88,7 @@ impl Pageset {
     }
 }
 
-static PAGESETS: Once<[SpinLock<Pageset>; MAX_CPUS]> = Once::new();
+static PAGESETS: [Once<SpinLock<Pageset>>; MAX_CPUS] = [const { Once::new() }; MAX_CPUS];
 
 /// 由初始 managed 页数推导固定小批量，不维护依赖 vmstat 的自适应参数。
 fn batch_size(managed: usize) -> usize {
@@ -97,23 +97,29 @@ fn batch_size(managed: usize) -> usize {
     (rounded - 1).max(1)
 }
 
-/// 在 buddy 发布后，由 BSP 一次构造固定控制数组，不申请堆或缓存页。
+/// 在 buddy 发布后，由 BSP 逐槽建立实际 CPU 的缓存，不申请堆或缓存页。
 ///
 /// # Safety
 /// buddy 和 CPU 表必须已初始化；仅 BSP 可在 IRQ 关闭、AP 未释放且无分配/归还时
 /// 调用一次，所有可管理页的直接映射须永久可写且一一对应。
 pub(crate) unsafe fn initialize() {
-    assert!(PAGESETS.get().is_none(), "PCP initialized twice");
+    assert!(PAGESETS[0].get().is_none(), "PCP initialized twice");
     let batch = batch_size(buddy::free_pages());
-    PAGESETS.call_once(|| core::array::from_fn(|_| SpinLock::new(Pageset::new(batch))));
+    for owner in cpu::actual_set().iter() {
+        PAGESETS[owner].call_once(|| SpinLock::new(Pageset::new(batch)));
+    }
+}
+
+/// 借用已经发布的实际 CPU 缓存，未初始化的槽不能参与分配或排空。
+fn pageset(owner: usize) -> &'static SpinLock<Pageset> {
+    PAGESETS[owner].get().expect("PCP is not initialized")
 }
 
 /// 保存一次 IRQ 状态固定当前 CPU，再尝试缓存锁；命中不取 zone，竞争时直接申请 buddy 零阶页。
 pub(crate) fn allocate() -> Option<Block> {
     let cached = {
         let irq = IrqSaveGuard::new();
-        let pagesets = PAGESETS.get().expect("PCP is not initialized");
-        if let Some(mut pageset) = pagesets[cpu::current().id].try_lock_with_irq(irq) {
+        if let Some(mut pageset) = pageset(cpu::current().id).try_lock_with_irq(irq) {
             if pageset.count == 0 {
                 pageset.refill();
             }
@@ -133,8 +139,7 @@ pub(crate) fn allocate() -> Option<Block> {
 pub(crate) unsafe fn release(head_pfn: usize) {
     let cached = {
         let irq = IrqSaveGuard::new();
-        let pagesets = PAGESETS.get().expect("PCP is not initialized");
-        if let Some(mut pageset) = pagesets[cpu::current().id].try_lock_with_irq(irq) {
+        if let Some(mut pageset) = pageset(cpu::current().id).try_lock_with_irq(irq) {
             // SAFETY: 调用者交出未归还真实零阶页唯一归还权，全部访问已结束；
             // IRQ-save 固定当前 CPU，PCP guard 排除本地及远端链访问。
             unsafe { pageset.push(head_pfn) };
@@ -158,8 +163,8 @@ pub(crate) unsafe fn release(head_pfn: usize) {
 /// 每核只处理首次快照数量，批次间放锁；并发新增缓存不延长本次排空。
 /// 参与者静止时全部缓存回到 buddy，并发继续运行时只保证此次有界移动。
 pub fn drain_all_pages() {
-    let pagesets = PAGESETS.get().expect("PCP is not initialized");
-    for pageset in &pagesets[..cpu::count()] {
+    for owner in cpu::actual_set().iter() {
+        let pageset = pageset(owner);
         let mut remaining = pageset.lock().count;
         while 0 < remaining {
             let drained = pageset.lock().drain_batch(remaining);
@@ -173,10 +178,9 @@ pub fn drain_all_pages() {
 
 /// 持每份 PCP 锁求缓存快照，停止所有分配与归还后才是精确总数。
 pub(crate) fn cached_pages() -> usize {
-    let pagesets = PAGESETS.get().expect("PCP is not initialized");
-    pagesets[..cpu::count()]
+    cpu::actual_set()
         .iter()
-        .map(|pageset| pageset.lock().count)
+        .map(|owner| pageset(owner).lock().count)
         .sum()
 }
 
@@ -184,14 +188,12 @@ pub(crate) fn cached_pages() -> usize {
 #[cfg(feature = "ktest")]
 pub(crate) fn cpu_cached_pages(cpu: usize) -> usize {
     assert!(cpu < cpu::count(), "PCP CPU index is out of range");
-    PAGESETS.get().expect("PCP is not initialized")[cpu]
-        .lock()
-        .count
+    pageset(cpu).lock().count
 }
 
 /// 提供生产固定参数供正常流测试核对真实 partial refill 与 high 边界。
 #[cfg(feature = "ktest")]
 pub(crate) fn parameters() -> (usize, usize) {
-    let pageset = PAGESETS.get().expect("PCP is not initialized")[0].lock();
+    let pageset = pageset(0).lock();
     (pageset.batch, pageset.high)
 }

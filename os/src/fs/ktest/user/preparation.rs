@@ -13,16 +13,15 @@ use crate::mm::space::{Mm, VmError};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
 use crate::sync::PreemptGuard;
-use crate::task::exec::{
-    self, Arguments, ExecError, LoadedImage, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT,
-};
+use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
 use crate::task::process::{ProcessError, UserIdentity};
 use crate::task::signal::SignalInheritance;
 use crate::task::{prepare_program, Credentials, Placement, ProgramError, UserRuntime};
 
 const WORD: usize = size_of::<usize>();
 const SCRATCH: usize = 0x400000;
-const SCRATCH_BYTES: usize = (MAX_ARGUMENT_BYTES / PAGE_SIZE + 4) * PAGE_SIZE;
+const ARGUMENT_STRING_BYTES: usize = 32 * PAGE_SIZE;
+const SCRATCH_BYTES: usize = ARGUMENT_STRING_BYTES + 8 * PAGE_SIZE;
 const ARGV: usize = SCRATCH + PAGE_SIZE - 4;
 const ENVP: usize = SCRATCH + 2 * PAGE_SIZE - 4;
 const STRING: usize = SCRATCH + 3 * PAGE_SIZE - 3;
@@ -51,6 +50,16 @@ fn checked_vm<T>(context: &TestContext<'_>, result: Result<T, VmError>) -> Resul
         context.diagnostic(format_args!("user preparation VM error={:?}", error));
         TestError("user preparation VM operation failed")
     })
+}
+
+/// 为用户指针复制准备独立拥有的文件名，真实分配失败保留为参数准备错误。
+fn owned_filename() -> Result<Vec<u8>, ExecError> {
+    let mut filename = Vec::new();
+    filename
+        .try_reserve_exact(PROGRAM.len())
+        .map_err(|_| ExecError::NoMemory)?;
+    filename.extend_from_slice(PROGRAM);
+    Ok(filename)
 }
 
 /// 通过正式 uaccess 写入已初始化内核字节，不创建用户内存的 Rust 引用。
@@ -137,9 +146,10 @@ fn snapshot_arguments(
         context,
         Arguments::from_user(
             mm,
-            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            checked_exec(context, owned_filename())?,
             ARGV,
             ENVP,
+            exec::DEFAULT_STACK_BYTES,
         ),
     )?;
     write_vector(context, mm, ARGV, &[])?;
@@ -155,7 +165,6 @@ fn snapshot_arguments(
             Arc::clone(file),
             &arguments,
             Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
         ),
     )?;
     check_stack(context, &image, &[PROGRAM, raw], &[b"USER_SMOKE=1"])
@@ -171,9 +180,10 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
     ] {
         let error = Arguments::from_user(
             mm,
-            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            checked_exec(context, owned_filename())?,
             table,
             0,
+            exec::DEFAULT_STACK_BYTES,
         )
         .err();
         context.diagnostic(format_args!(
@@ -190,9 +200,10 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
         write_vector(context, mm, ARGV, &[pointer])?;
         let error = Arguments::from_user(
             mm,
-            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            checked_exec(context, owned_filename())?,
             ARGV,
             0,
+            exec::DEFAULT_STACK_BYTES,
         )
         .err();
         context.diagnostic(format_args!(
@@ -207,9 +218,10 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
     context.expect_eq(
         Arguments::from_user(
             mm,
-            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            checked_exec(context, owned_filename())?,
             ARGV,
             0,
+            exec::DEFAULT_STACK_BYTES,
         )
         .err(),
         Some(ExecError::Vm(VmError::Unmapped)),
@@ -218,9 +230,10 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
     write_vector(context, mm, ARGV, &[STRING])?;
     let error = Arguments::from_user(
         mm,
-        checked_exec(context, exec::copy_bytes(PROGRAM))?,
+        checked_exec(context, owned_filename())?,
         ARGV,
         0,
+        exec::DEFAULT_STACK_BYTES,
     )
     .err();
     context.diagnostic(format_args!(
@@ -231,7 +244,7 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
     Ok(())
 }
 
-/// NULL 与显式空 argv 都按同一文件系统视图下的真实初始栈补空 argv[0]，合计计数上限包含环境项。
+/// NULL 与显式空 argv 都在真实初始栈上产生一个空 argv[0] 和完整的终止边界。
 fn argument_count(
     context: &mut TestContext<'_>,
     fixture: &UserOwner,
@@ -244,9 +257,10 @@ fn argument_count(
             context,
             Arguments::from_user(
                 mm,
-                checked_exec(context, exec::copy_bytes(PROGRAM))?,
+                checked_exec(context, owned_filename())?,
                 table,
                 0,
+                exec::DEFAULT_STACK_BYTES,
             ),
         )?;
         let image = checked_exec(
@@ -257,67 +271,14 @@ fn argument_count(
                 Arc::clone(file),
                 &arguments,
                 Credentials::ROOT,
-                exec::DEFAULT_STACK_BYTES,
             ),
         )?;
         check_stack(context, &image, &[b""], &[])?;
     }
-    write_bytes(context, mm, STRING, &[0])?;
-    let count = MAX_ARGUMENT_COUNT / 2;
-    let pointers = [STRING; MAX_ARGUMENT_COUNT + 1];
-    write_vector(context, mm, ARGV, &pointers[..count])?;
-    write_vector(context, mm, ENVP, &pointers[..MAX_ARGUMENT_COUNT - count])?;
-    let arguments = checked_exec(
-        context,
-        Arguments::from_user(
-            mm,
-            checked_exec(context, exec::copy_bytes(PROGRAM))?,
-            ARGV,
-            ENVP,
-        ),
-    )?;
-    let image = checked_exec(
-        context,
-        exec::load(
-            fixture.path.vfs(),
-            fixture.path.context(),
-            Arc::clone(file),
-            &arguments,
-            Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
-        ),
-    )?;
-    let empty: [&[u8]; MAX_ARGUMENT_COUNT] = [b""; MAX_ARGUMENT_COUNT];
-    check_stack(
-        context,
-        &image,
-        &empty[..count],
-        &empty[..MAX_ARGUMENT_COUNT - count],
-    )?;
-    drop(image);
-    drop(arguments);
-    write_vector(
-        context,
-        mm,
-        ENVP,
-        &pointers[..MAX_ARGUMENT_COUNT - count + 1],
-    )?;
-    let error = Arguments::from_user(
-        mm,
-        checked_exec(context, exec::copy_bytes(PROGRAM))?,
-        ARGV,
-        ENVP,
-    )
-    .err();
-    context.diagnostic(format_args!(
-        "user preparation argument count overflow error={:?}",
-        error
-    ));
-    context.expect_eq(error, Some(ExecError::ArgumentsTooBig));
     Ok(())
 }
 
-/// 精确总字节预算包含路径、NUL、argc 与指针；同一文件系统视图下满预算后再加环境项必须返回 E2BIG。
+/// 单串含 NUL 可占32页，超过该字节边界仍返回 E2BIG，后方可读页不能改变这个结果。
 fn argument_bytes(
     context: &mut TestContext<'_>,
     fixture: &UserOwner,
@@ -325,7 +286,7 @@ fn argument_bytes(
     file: &FileRef,
     source: &[u8],
 ) -> TestResult {
-    let length = MAX_ARGUMENT_BYTES - PROGRAM.len() - 2 - 4 * WORD;
+    let length = ARGUMENT_STRING_BYTES - 1;
     write_bytes(context, mm, STRING, source)?;
     write_bytes(context, mm, STRING + length, &[0])?;
     write_vector(context, mm, ARGV, &[STRING])?;
@@ -333,9 +294,10 @@ fn argument_bytes(
         context,
         Arguments::from_user(
             mm,
-            checked_exec(context, exec::copy_bytes(PROGRAM))?,
+            checked_exec(context, owned_filename())?,
             ARGV,
             0,
+            exec::DEFAULT_STACK_BYTES,
         ),
     )?;
     let image = checked_exec(
@@ -346,23 +308,22 @@ fn argument_bytes(
             Arc::clone(file),
             &arguments,
             Credentials::ROOT,
-            exec::DEFAULT_STACK_BYTES,
         ),
     )?;
     check_stack(context, &image, &[&source[..length]], &[])?;
     drop(image);
     drop(arguments);
-    write_bytes(context, mm, SCRATCH, b"x\0")?;
-    write_vector(context, mm, ENVP, &[SCRATCH])?;
+    write_bytes(context, mm, STRING + length, b"x\0")?;
     let error = Arguments::from_user(
         mm,
-        checked_exec(context, exec::copy_bytes(PROGRAM))?,
+        checked_exec(context, owned_filename())?,
         ARGV,
-        ENVP,
+        0,
+        exec::DEFAULT_STACK_BYTES,
     )
     .err();
     context.diagnostic(format_args!(
-        "user preparation total argument bytes overflow error={:?}",
+        "user preparation single argument string overflow error={:?}",
         error
     ));
     context.expect_eq(error, Some(ExecError::ArgumentsTooBig));
@@ -485,7 +446,12 @@ fn allocation_failure(
     let (evidence, arguments, program) = {
         let _pin = PreemptGuard::new();
         let evidence = fixture.pressure().exhaust();
-        let arguments = Arguments::from_kernel(PROGRAM, &[&source[..3 * PAGE_SIZE]], &[]);
+        let arguments = Arguments::from_kernel(
+            PROGRAM,
+            &[&source[..3 * PAGE_SIZE]],
+            &[],
+            exec::DEFAULT_STACK_BYTES,
+        );
         let program = prepare_program(&graph, None, image, runtime, placement);
         fixture.release_pressure();
         (evidence, arguments, program)
@@ -539,9 +505,9 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
     let file = fixture.file(context, PROGRAM)?;
     let mut source = Vec::new();
     source
-        .try_reserve_exact(MAX_ARGUMENT_BYTES)
+        .try_reserve_exact(ARGUMENT_STRING_BYTES)
         .map_err(|_| TestError("user preparation source bytes OOM"))?;
-    source.resize(MAX_ARGUMENT_BYTES, b'x');
+    source.resize(ARGUMENT_STRING_BYTES, b'x');
     snapshot_arguments(context, fixture, &old_image.mm, &file)?;
     invalid_arguments(context, &old_image.mm, &source)?;
     argument_count(context, fixture, &old_image.mm, &file)?;

@@ -108,7 +108,13 @@ pub(crate) fn read_summary(
     context: &FsContext,
     pathname: &[u8],
 ) -> Result<FileSummary, FsError> {
-    let fd = files.open(vfs, context, pathname, OpenOptions::default())?;
+    let fd = files.open(
+        vfs,
+        context,
+        pathname,
+        OpenOptions::default(),
+        crate::task::process::DEFAULT_NOFILE.current as usize,
+    )?;
     let result = files
         .lookup(fd)
         .and_then(|file| summarize_file(file.as_ref()));

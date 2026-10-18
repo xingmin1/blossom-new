@@ -472,6 +472,9 @@ fn remote_callback(timer: Pin<&Timer>) {
             ),
             Ordering::Release,
         );
+        scenario()
+            .remote_cpus
+            .insert(cpu::current().id, Ordering::Release);
     } else {
         panic!("old long timer fired before explicit stop");
     }
@@ -491,8 +494,7 @@ fn test_remote() {
     let mut idle = 0;
     let mut first = 0;
     let mut stale = 0;
-    let start = if cpu::count() == 1 { 0 } else { 1 };
-    for (target, (early_timer, long_timer)) in prepared.iter().enumerate().skip(start) {
+    for (target, (early_timer, long_timer)) in prepared.iter().enumerate() {
         scenario().remote_fired.store(0, Ordering::Relaxed);
         scenario().remote_early.store(0, Ordering::Relaxed);
         let end = raw_deadline();
@@ -620,8 +622,11 @@ fn test_remote() {
     assert_eq!(remote, cpu::count() - 1);
     assert!(remote <= kicks && remote <= idle);
     assert_eq!(stale, 0);
-    assert_eq!(first, if cpu::count() == 1 { 1 } else { remote });
-    let first = usize::from(0 < first);
+    assert_eq!(first, cpu::count());
+    assert_eq!(
+        scenario().remote_cpus.load(Ordering::Acquire),
+        cpu::actual_set()
+    );
     for (early, long) in prepared {
         early.as_ref().close_sync();
         long.as_ref().close_sync();
@@ -818,6 +823,7 @@ struct Scenario {
     cancel_done: AtomicBool,
     fail_after_cancel: AtomicBool,
     remote_fired: AtomicUsize,
+    remote_cpus: cpu::AtomicCpuSet,
     remote_early: AtomicUsize,
     remote_deadline: AtomicU64,
     coarse_fired: AtomicUsize,
@@ -851,7 +857,7 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
         sched::test_migrate_to(0);
         let initial = super::baseline();
         let state = Arc::try_new(Scenario {
-            nodes: super::Nodes::new(256, 0, 0, 0)?,
+            nodes: super::Nodes::new(256usize.max(2 * cpu::count()), 0, 0, 0)?,
             stop: AtomicBool::new(false),
             sleep_task: SpinLock::new(None),
             sleep_waker: SpinLock::new(None),
@@ -870,6 +876,7 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
             cancel_done: AtomicBool::new(false),
             fail_after_cancel: AtomicBool::new(false),
             remote_fired: AtomicUsize::new(0),
+            remote_cpus: cpu::AtomicCpuSet::new(),
             remote_early: AtomicUsize::new(0),
             remote_deadline: AtomicU64::new(0),
             coarse_fired: AtomicUsize::new(0),
@@ -1053,7 +1060,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
-    /// 每个远核在真实提交停点插入更早节点，原long计划不得覆盖它，实际ISA返回单列。
+    /// 每核触发真实 precise 回调，远核另在提交停点验证更早节点与 ISA 返回。
     #[test]
     fn earlier_remote_deadline(
         _: &mut ::ktest::TestContext<'_>,

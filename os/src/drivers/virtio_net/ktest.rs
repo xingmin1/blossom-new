@@ -977,7 +977,7 @@ pub(crate) mod native {
             &[b'N', b'P', 32, 0][..],
         );
         context.expect_eq(
-            net.egress_ready(udp.id())
+            net.egress_ready(udp.egress_wait())
                 .map_err(|_| TestError("native full capacity query failed"))?,
             false,
         );
@@ -1011,7 +1011,7 @@ pub(crate) mod native {
         }
         context.expect_eq(seen, u32::MAX);
         observe(
-            || net.egress_ready(udp.id()).is_ok_and(|ready| ready),
+            || net.egress_ready(udp.egress_wait()).is_ok_and(|ready| ready),
             "native software capacity did not recover",
         )?;
         context.expect_eq(net.egress_waiting(udp.id()), false);
