@@ -12,11 +12,6 @@ use crate::fs::{
 };
 use crate::mm::PAGE_SIZE;
 
-#[cfg(target_arch = "riscv64")]
-const DEFAULT_ROOTDIR: &[u8] = b"/riscv64";
-#[cfg(target_arch = "loongarch64")]
-const DEFAULT_ROOTDIR: &[u8] = b"/loongarch64";
-
 /// 启动参数选中的精确设备和分区；是否存在由已发现的视图表检查。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BootDevices<'a> {
@@ -27,7 +22,7 @@ pub(crate) struct BootDevices<'a> {
     pub init: &'a [u8],
 }
 
-/// 按 ASCII 空白消费各参数的最后值，QEMU 保留默认根，开发板要求明确根设备和根目录。
+/// 按 ASCII 空白消费各参数的最后值，QEMU 默认使用卷内根目录，开发板要求明确根设备和根目录。
 /// 设备解析失败和开发板非根目录选择立即返回，不猜分区或切换介质。
 pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError> {
     let mut root = None;
@@ -58,7 +53,7 @@ pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError>
     };
     let rootdir = match rootdir {
         Some(rootdir) if !board || rootdir == b"/" => rootdir,
-        None if !board => DEFAULT_ROOTDIR,
+        None if !board => b"/",
         _ => return Err(FsError::MissingRoot),
     };
     Ok(BootDevices {

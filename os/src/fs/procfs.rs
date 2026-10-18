@@ -6,7 +6,7 @@ use core::fmt::{self, Write};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::boot::MAX_CPUS;
+use crate::boot::{self, MAX_CPUS};
 use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{
@@ -77,6 +77,7 @@ impl Write for SnapshotText {
 pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     let fs = MemoryFs::try_new(MemoryFsKind::Procfs, root_mode)?;
     let root = fs.root();
+    fs.initialize_special(&root, b"cmdline", MemorySpecial::Cmdline, 0o444, 0)?;
     fs.initialize_special(&root, b"mounts", MemorySpecial::Mounts, 0o444, 0)?;
     fs.initialize_special(&root, b"meminfo", MemorySpecial::Meminfo, 0o444, 0)?;
     fs.initialize_special(&root, b"uptime", MemorySpecial::Uptime, 0o444, 0)?;
@@ -99,6 +100,7 @@ pub fn open(
         return Err(FsError::ReadOnly);
     }
     let bytes = match special {
+        MemorySpecial::Cmdline => cmdline()?,
         MemorySpecial::Mounts => {
             let root = match caller {
                 FileIoContext::Kernel => vfs.root(),
@@ -137,6 +139,21 @@ pub fn open(
         flags: AtomicU32::new(flags),
     })
     .map_err(|_| FsError::NoMemory)?)
+}
+
+/// 复制固件命令行的完整原字节并追加一个换行，不解释内容或改变编码。
+fn cmdline() -> Result<Vec<u8>, FsError> {
+    let bootargs = boot::info().bootargs();
+    if SNAPSHOT_LIMIT <= bootargs.len() {
+        return Err(FsError::FileTooLarge);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(bootargs.len() + 1)
+        .map_err(|_| FsError::NoMemory)?;
+    bytes.extend_from_slice(bootargs);
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// 固定本次 online CPU 列，逐行复制实际计数；源锁外有界渲染，不承诺跨核同时冻结。

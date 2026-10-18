@@ -1,0 +1,36 @@
+#!/bin/sh
+
+if ! cmdline=$(/bin/cat /proc/cmdline); then
+    printf '%s\n' 'start-session: cannot read /proc/cmdline' >&2
+    exit 1
+fi
+
+# 参数只按启动空白分词，不展开路径；同名参数沿命令行取末值。
+set -f
+IFS=$(printf ' \t\n\r\v\f')
+boot_set=
+boot=
+for argument in $cmdline; do
+    case "$argument" in
+        blossom.boot=*)
+            boot_set=yes
+            boot=${argument#blossom.boot=}
+            ;;
+        blossom.boot)
+            boot_set=yes
+            boot=
+            ;;
+    esac
+done
+
+if [ -z "$boot_set" ]; then
+    exec /sbin/contest-run /dev/vda
+fi
+
+case "$boot" in
+    shell) exec /bin/sh -i ;;
+    *)
+        printf 'start-session: unsupported blossom.boot value: <%s>\n' "$boot" >&2
+        exit 1
+        ;;
+esac

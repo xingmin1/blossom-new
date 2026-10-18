@@ -563,7 +563,8 @@ pub fn open_path_with_flags(
             }
             MemorySpecial::Kmsg => kmsg::open(path, flags),
             MemorySpecial::Ktrace => ktrace::open(path, flags),
-            MemorySpecial::Mounts
+            MemorySpecial::Cmdline
+            | MemorySpecial::Mounts
             | MemorySpecial::Meminfo
             | MemorySpecial::Uptime
             | MemorySpecial::NetDev

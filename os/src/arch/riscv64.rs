@@ -2,6 +2,7 @@
 use crate::{
     boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO},
     cpu::{CpuBoot, CpuLocal},
+    platform::LINK_LAYOUT,
     sched::context::TaskContext,
 };
 use core::{
@@ -32,12 +33,7 @@ pub use user::{run_user, signal_return_code, UserContext};
 /// 当前唯一编译目标的架构名称。
 pub const NAME: &str = "riscv64";
 extern "C" {
-    static __kernel_phys_start: u8;
     static __kernel_phys_end: u8;
-    static __kernel_virt_start: u8;
-    static __direct_base: u8;
-    static __mmio_base: u8;
-    static __phys_ram_base: u8;
     static __secondary_entry_phys: u8;
     fn rv_trap_entry();
 }
@@ -205,20 +201,21 @@ pub fn boot_hardware_id(args: [usize; 4]) -> usize {
 }
 /// 将实际 RAM 物理地址转换成直映地址；只计算地址，不证明该地址已经映射。
 pub fn phys_to_virt(pa: usize) -> usize {
-    address!(__direct_base).wrapping_add(pa.wrapping_sub(address!(__phys_ram_base)))
+    (LINK_LAYOUT.direct_map_virt_base as usize)
+        .wrapping_add(pa.wrapping_sub(LINK_LAYOUT.ram_phys_base as usize))
 }
 /// 转换内核镜像或 RAM 直映地址为物理地址。
 pub fn virt_to_phys(va: usize) -> usize {
-    if address!(__kernel_virt_start) <= va {
-        va - address!(__kernel_virt_start) + address!(__kernel_phys_start)
+    if LINK_LAYOUT.kernel_link_virt as usize <= va {
+        va - LINK_LAYOUT.kernel_link_virt as usize + LINK_LAYOUT.kernel_load_phys as usize
     } else {
-        va.wrapping_sub(address!(__direct_base))
-            .wrapping_add(address!(__phys_ram_base))
+        va.wrapping_sub(LINK_LAYOUT.direct_map_virt_base as usize)
+            .wrapping_add(LINK_LAYOUT.ram_phys_base as usize)
     }
 }
 /// 计算物理设备地址在 MMIO 窗口中的位置；解引用者必须保证设备范围已映射。
 pub fn mmio_address(pa: usize) -> usize {
-    address!(__mmio_base).wrapping_add(pa)
+    (LINK_LAYOUT.mmio_virt_base as usize).wrapping_add(pa)
 }
 
 /// 取得最终页表池中的一张表，不创建可别名的 Rust 引用。
@@ -414,7 +411,7 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
 /// 不得与其他页表访问并发。IO ranges 不作为内存或 DMA RAM 映射。
 pub unsafe fn finish_boot_mappings(info: &BootInfo) {
     let kernel = Region {
-        start: address!(__kernel_phys_start),
+        start: LINK_LAYOUT.kernel_load_phys as usize,
         end: address!(__kernel_phys_end)
             .checked_add(4095)
             .expect("kernel page rounding overflows")
@@ -430,7 +427,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
     add_mapping(
         &mut mappings,
         &mut count,
-        address!(__kernel_virt_start),
+        LINK_LAYOUT.kernel_link_virt as usize,
         kernel,
         0xce,
     );

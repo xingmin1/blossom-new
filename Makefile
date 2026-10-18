@@ -1,56 +1,42 @@
 .DEFAULT_GOAL := all
 
 ARCH ?= riscv64
-PLATFORM ?= qemu-virt
+TARGET_PLATFORM ?= qemu-virt
+KERNEL_BUILD_PROFILE ?= debug
+KERNEL_ELF_OUTPUT ?= build/kernel/$(ARCH)/$(TARGET_PLATFORM)/$(KERNEL_BUILD_PROFILE)/kernel.elf
+KERNEL_CARGO_TARGET_DIR ?= build/kernel/$(ARCH)/$(TARGET_PLATFORM)/target
+KTEST_CARGO_TARGET_DIR ?= build/ktest-target
+KTEST_PANIC_STRATEGY ?= unwind
+KTEST_ARGS ?=
+TEST ?=
 CPUS ?= 4
 MEMORY ?= $(if $(filter riscv64,$(ARCH)),512M,768M)
-MODE ?= debug
-PANIC ?= unwind
-KTEST_ARGS ?=
-FEATURES ?=
-OUTPUT ?= $(if $(filter qemu-virt,$(PLATFORM)),build/$(ARCH),build/$(PLATFORM)/$(MODE))/kernel.elf
-BOARD_OUTPUT ?= build/$(PLATFORM)/$(MODE)
-RAMDISK ?=
-OS_DTB ?=
-BOARD_ROOT ?= $(if $(RAMDISK),/dev/ram0)
-TEST ?=
 ROOT ?= /dev/vda
 ROOT_MODE ?= ro
-ROOTDIR ?= /
-INIT ?= /sbin/init
-NET ?= none
-NET_FORWARD ?=
 EXTRA_ROOT ?=
-IDENTITY ?= root
-IMAGE ?= build/$(if $(filter extra,$(IDENTITY)),extra,system)-$(ARCH).img
-MANAGED_CONTEST := $(if $(filter undefined,$(origin STAGING)),1,0)
-STAGING ?= build/system-$(ARCH)-$(IDENTITY)
-SOURCE ?=
-EXTRA_IMAGE ?=
-SCRATCH_IMAGE ?=
-WORK_DIR ?= build/run-$(ARCH)
-CONTEST_IMAGE ?=
-CONTEST_BOOT ?= 0
-RESUME ?= 0
-REFRESH_SYSTEM ?= 0
-CONTEST_PLAN ?= userland/contest/plan.toml
-LLVM_MC ?= llvm-mc
-USER_LD ?= rust-lld
-USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback device-map pipe events tty jobs)
-MUSL_CROSS ?= $(ARCH)-linux-musl-
-MUSL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie
-USERLAND_BUILD ?= build/busybox-$(ARCH)
-USERLAND_ROOT ?= build/userland-$(ARCH)
+
+ROOTFS_OUTPUT_DIR ?= build/rootfs/$(ARCH)
+ROOTFS_TREE_DIR ?= $(ROOTFS_OUTPUT_DIR)
+ROOTFS_INIT_CONFIG ?=
+SYSTEM_ROOT_EXT4_IMAGE ?= build/system-$(ARCH).img
+EXT4_PROFILE ?= seed4k
+EXT4_SIZE_MIB ?= 256
+GUEST_USERLAND_OUTPUT_DIR ?= build/userland-$(ARCH)
+RUNTIME_LIBRARIES_OUTPUT_DIR ?= build/runtime-$(ARCH)
+BUSYBOX_BUILD_DIR ?= build/busybox-$(ARCH)
 MUSL_LIBC ?=
 GLIBC_LIBDIR ?=
-RUNTIME_OUTPUT ?= build/runtime-$(ARCH)
 MUSL_LIBC_RV ?=
 MUSL_LIBC_LA ?=
 GLIBC_LIBDIR_RV ?=
 GLIBC_LIBDIR_LA ?=
+MUSL_CROSS ?= $(ARCH)-linux-musl-
 MUSL_CROSS_RV ?= riscv64-linux-musl-
 MUSL_CROSS_LA ?= loongarch64-linux-musl-
-USERLAND_SCRIPTS := $(patsubst tests/user/scripts/%,$(USERLAND_ROOT)/test/scripts/%,$(wildcard tests/user/scripts/*))
+MUSL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie
+LLVM_MC ?= llvm-mc
+USER_LD ?= rust-lld
+USER_OUTPUTS := $(addprefix build/user-$(ARCH)/user-,smoke io clone signal futex lifecycle write writeback device-map pipe events tty jobs)
 RUNNER_TARGET := $(if $(filter riscv64,$(ARCH)),riscv64gc-unknown-linux-musl,loongarch64-unknown-linux-musl)
 RUNNER_TARGET_DIR ?= build/contest-run
 RUNNER_OUTPUT := $(RUNNER_TARGET_DIR)/$(RUNNER_TARGET)/release/contest-run
@@ -60,246 +46,191 @@ RUNNER_SYSROOT_RV ?= $(RUNNER_SYSROOT)
 RUNNER_SYSROOT_LA ?= $(RUNNER_SYSROOT)
 RUNNER_LINKER_RV ?= $(MUSL_CROSS_RV)gcc
 RUNNER_LINKER_LA ?= $(MUSL_CROSS_LA)gcc
-RUNNER_FLAGS := -Ctarget-feature=+crt-static -Crelocation-model=static -Clink-self-contained=yes -Clink-arg=-no-pie $(if $(RUNNER_SYSROOT),--sysroot $(abspath $(RUNNER_SYSROOT))) -Clinker=$(if $(findstring /,$(RUNNER_LINKER)),$(abspath $(RUNNER_LINKER)),$(RUNNER_LINKER))
+BOARD_BOOT_IMAGES_OUTPUT_DIR ?= build/board/$(ARCH)/$(TARGET_PLATFORM)/$(KERNEL_BUILD_PROFILE)
+BOARD_ROOT_EXT4_IMAGE ?=
+BOARD_OS_DTB ?=
+BOARD_ROOT_DEVICE ?=
+BOARD_ROOT_MODE ?= ro
+BOARD_INIT_PROGRAM ?= /sbin/init
 LIBC_SOURCES := tests/user/libc-smoke.c $(addprefix tests/user/libc/,common.c lifecycle.c script.c file.c system.c limits.c file_time.c clock.c socket_timeout.c)
 LIBC_HEADERS := tests/user/libc/common.h tests/user/libc/fp.h
 NETWORK_SOURCES := tests/user/network-smoke.c $(addprefix tests/user/network/,common.c tcp.c udp.c unix.c options.c ipv6.c peer.c control.c)
 NETWORK_HEADERS := tests/user/network/common.h
 
+empty :=
+space := $(empty) $(empty)
+make-path = $(subst $(space),\$(space),$(1))
+absolute-path = $(if $(filter /%,$(firstword $(1))),$(1),$(CURDIR)/$(1))
+
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
-QEMU := qemu-system-riscv64
 USER_TRIPLE := riscv64-unknown-linux-gnu
 USER_MATTR := +m,+a,+f,+d,-c,-v
 USER_EMULATION := elf64lriscv
+QEMU_KERNEL_EXPORT := kernel-rv
+QEMU_ROOT_EXT4_IMAGE := disk.img
 else ifeq ($(ARCH),loongarch64)
 TARGET := loongarch64-unknown-none
-QEMU := qemu-system-loongarch64
 USER_TRIPLE := loongarch64-unknown-linux-gnu
 USER_MATTR := +f,+d,-lsx,-lasx
 USER_EMULATION := elf64loongarch
+QEMU_KERNEL_EXPORT := kernel-la
+QEMU_ROOT_EXT4_IMAGE := disk-la.img
 else
-$(error ARCH 只支持 riscv64 或 loongarch64)
+$(error ARCH must be riscv64 or loongarch64)
 endif
 
-ifneq ($(words $(PLATFORM)),1)
-$(error PLATFORM must name exactly one platform)
+ifneq ($(words $(TARGET_PLATFORM)),1)
+$(error TARGET_PLATFORM must name exactly one platform)
 endif
-ifeq ($(filter riscv64:qemu-virt riscv64:visionfive2 loongarch64:qemu-virt loongarch64:ls2k1000la,$(ARCH):$(PLATFORM)),)
-$(error Unsupported ARCH/PLATFORM combination: $(ARCH)/$(PLATFORM))
+ifeq ($(filter riscv64:qemu-virt riscv64:visionfive2 loongarch64:qemu-virt loongarch64:ls2k1000la,$(ARCH):$(TARGET_PLATFORM)),)
+$(error Unsupported ARCH/TARGET_PLATFORM combination: $(ARCH)/$(TARGET_PLATFORM))
 endif
-ifneq ($(PLATFORM),qemu-virt)
-ifneq ($(filter run debug contest,$(MAKECMDGOALS)),)
-$(error run/debug/contest require PLATFORM=qemu-virt; package-board-boot-images only generates offline files)
-endif
+ifneq ($(TARGET_PLATFORM),qemu-virt)
 ifneq ($(filter ktest-build ktest-list ktest,$(MAKECMDGOALS)),)
-$(error ktest-build/ktest-list/ktest require PLATFORM=qemu-virt)
-endif
-ifneq ($(findstring ktest,$(FEATURES)),)
-$(error Kernel test features require PLATFORM=qemu-virt)
+$(error ktest-build/ktest-list/ktest require TARGET_PLATFORM=qemu-virt)
 endif
 endif
-ifeq ($(PLATFORM),qemu-virt)
+ifeq ($(TARGET_PLATFORM),qemu-virt)
 ifneq ($(filter package-board-boot-images,$(MAKECMDGOALS)),)
-$(error package-board-boot-images requires PLATFORM=visionfive2 or PLATFORM=ls2k1000la)
+$(error package-board-boot-images requires TARGET_PLATFORM=visionfive2 or TARGET_PLATFORM=ls2k1000la)
 endif
 endif
 
-KERNEL_TARGET_DIR := $(if $(filter qemu-virt,$(PLATFORM)),os/target,build/$(PLATFORM)/target)
-ifeq ($(PLATFORM),qemu-virt)
-KTEST_TARGET_DIR := build/ktest-target
+ifeq ($(KERNEL_BUILD_PROFILE),release)
+CARGO_PROFILE_ARG := --release
+else ifneq ($(KERNEL_BUILD_PROFILE),debug)
+$(error KERNEL_BUILD_PROFILE must be debug or release)
 endif
-
-ifneq ($(words $(CPUS)),1)
-$(error CPUS 必须是一个核数)
-endif
-ifeq ($(filter $(CPUS),1 2 4),)
-$(error 当前阶段 CPUS 只支持 1、2、4)
-endif
-
-ifneq ($(words $(ROOT_MODE)),1)
-$(error ROOT_MODE 必须是一个挂载模式)
-endif
-ifneq ($(ROOT_MODE),$(filter ro rw,$(ROOT_MODE)))
-$(error ROOT_MODE 只支持 ro 或 rw)
-endif
-
-ifneq ($(words $(RESUME) $(REFRESH_SYSTEM)),2)
-$(error RESUME and REFRESH_SYSTEM must each be 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(RESUME) $(REFRESH_SYSTEM)),)
-$(error RESUME and REFRESH_SYSTEM must each be 0 or 1)
-endif
-ifeq ($(REFRESH_SYSTEM),1)
-ifneq ($(RESUME),1)
-$(error REFRESH_SYSTEM requires RESUME=1)
-endif
-endif
-
-ifeq ($(MODE),release)
-CARGO_MODE := --release
-else ifneq ($(MODE),debug)
-$(error MODE 只支持 debug 或 release)
-endif
-
-CARGO_ARGS := --locked --target $(TARGET) $(CARGO_MODE) $(if $(FEATURES),--features $(FEATURES))
-
-.PHONY: all delivery-rv delivery-la kernel-rv kernel-la build package-board-boot-images image run contest debug clean runtime runner work-clean help
-
-all: delivery-rv delivery-la
-	python3 tools/mkext4.py --delivery --contest-plan "$(CONTEST_PLAN)" --profile seed4k --size-mib 256 --rv-kernel build/delivery-riscv64/kernel.elf --la-kernel build/delivery-loongarch64/kernel.elf --rv-userland-root build/delivery-riscv64/userland --la-userland-root build/delivery-loongarch64/userland --rv-runtime-root build/runtime-riscv64 --la-runtime-root build/runtime-loongarch64
-
-delivery-rv:
-	$(MAKE) runtime ARCH=riscv64 PLATFORM=qemu-virt RUNTIME_OUTPUT=build/runtime-riscv64 MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)"
-	$(MAKE) build userland ARCH=riscv64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/delivery-riscv64/kernel.elf USERLAND_BUILD=build/delivery-riscv64/busybox USERLAND_ROOT=build/delivery-riscv64/userland MUSL_CROSS="$(MUSL_CROSS_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)"
-
-delivery-la:
-	$(MAKE) runtime ARCH=loongarch64 PLATFORM=qemu-virt RUNTIME_OUTPUT=build/runtime-loongarch64 MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)"
-	$(MAKE) build userland ARCH=loongarch64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/delivery-loongarch64/kernel.elf USERLAND_BUILD=build/delivery-loongarch64/busybox USERLAND_ROOT=build/delivery-loongarch64/userland MUSL_CROSS="$(MUSL_CROSS_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)"
-
-kernel-rv:
-	$(MAKE) build ARCH=riscv64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/riscv64/kernel.elf && cp build/riscv64/kernel.elf $@
-
-kernel-la:
-	$(MAKE) build ARCH=loongarch64 PLATFORM=qemu-virt FEATURES= PANIC=abort OUTPUT=build/loongarch64/kernel.elf && cp build/loongarch64/kernel.elf $@
-
-build:
-	cd os && BLOSSOM_PLATFORM="$(PLATFORM)" CARGO_TARGET_DIR="$(abspath $(KERNEL_TARGET_DIR))" cargo build $(CARGO_ARGS)
-	mkdir -p "$(dir $(OUTPUT))"
-	cp "$(KERNEL_TARGET_DIR)/$(TARGET)/$(MODE)/os" "$(OUTPUT)"
-
-package-board-boot-images: build
-	python3 tools/package_board_boot_images.py --arch $(ARCH) --target-platform $(PLATFORM) --kernel-elf "$(OUTPUT)" --output-directory "$(BOARD_OUTPUT)" $(if $(RAMDISK),--root-ext4-image "$(RAMDISK)") $(if $(OS_DTB),--os-dtb "$(OS_DTB)") $(if $(BOARD_ROOT),--root-device "$(BOARD_ROOT)") --root-mode "$(ROOT_MODE)" --init-program "$(INIT)"
-
-runner:
-	cd userland/contest-run && env -u CARGO_ENCODED_RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(abspath $(RUNNER_TARGET_DIR))" RUSTFLAGS="$(RUNNER_FLAGS)" cargo build --release --locked --offline --target $(RUNNER_TARGET)
-
-runtime:
-	python3 userland/runtime/prepare.py --arch $(ARCH) $(if $(MUSL_LIBC),--musl-libc "$(MUSL_LIBC)") $(if $(GLIBC_LIBDIR),--glibc-libdir "$(GLIBC_LIBDIR)") --output "$(RUNTIME_OUTPUT)"
-
-image:
-	@if [ -z "$(SOURCE)" ] && { { [ "$(CONTEST_BOOT)" = 1 ] && [ "$(MANAGED_CONTEST)" = 1 ]; } || [ ! -e "$(STAGING)" ]; }; then $(MAKE) runtime && $(MAKE) userland; fi
-	python3 tools/mkext4.py --arch $(ARCH) --output "$(IMAGE)" --identity $(IDENTITY) --profile seed4k --size-mib 256 $(if $(SOURCE),--source "$(SOURCE)",--staging "$(STAGING)" --userland-root "$(USERLAND_ROOT)" --runtime-root "$(RUNTIME_OUTPUT)" $(if $(and $(filter 1,$(CONTEST_BOOT)),$(filter 1,$(MANAGED_CONTEST))),--managed-contest)) $(if $(filter 1,$(CONTEST_BOOT)),--contest-boot --contest-plan "$(CONTEST_PLAN)")
-
-contest: IMAGE = build/contest-system-$(ARCH).img
-contest: STAGING = build/contest-system-$(ARCH)
-contest: WORK_DIR = build/contest-run-$(ARCH)
-contest: CONTEST_BOOT := 1
-ifneq ($(RESUME),1)
-contest: image
-else ifeq ($(REFRESH_SYSTEM),1)
-contest: image
-endif
-ifeq ($(REFRESH_SYSTEM),1)
-run debug: image
-endif
-
-run debug contest: build
-	@case "$(RESUME)" in 0|1) ;; *) echo "RESUME must be 0 or 1"; exit 1;; esac
-	$(if $(filter contest,$@),@test -n "$(CONTEST_IMAGE)" || { echo "CONTEST_IMAGE is required"; exit 1; })
-	python3 tools/run.py --arch $(ARCH) --kernel "$(OUTPUT)" --cpus $(CPUS) --memory "$(MEMORY)" --qemu "$(QEMU)" --image "$(IMAGE)" --root "$(if $(filter contest,$@),/dev/vdb,$(ROOT))" --rootdir "$(ROOTDIR)" --root-mode "$(ROOT_MODE)" --init "$(INIT)" --net "$(NET)" --net-forward "$(NET_FORWARD)" --work-dir "$(WORK_DIR)" $(if $(filter contest,$@),--contest-image "$(CONTEST_IMAGE)") $(if $(filter 1,$(RESUME)),--resume) $(if $(filter 1,$(REFRESH_SYSTEM)),--refresh-system) $(if $(EXTRA_IMAGE),--extra-image "$(EXTRA_IMAGE)") $(if $(SCRATCH_IMAGE),--scratch-image "$(SCRATCH_IMAGE)") $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(filter debug,$@),--debug)
-
-
-ifeq ($(PANIC),unwind)
-KTEST_PROFILE := $(if $(filter release,$(MODE)),ktest-release,ktest-dev)
-else ifeq ($(PANIC),abort)
-KTEST_PROFILE := $(if $(filter release,$(MODE)),ktest-abort-release,ktest-abort-dev)
+ifeq ($(KTEST_PANIC_STRATEGY),unwind)
+KTEST_PROFILE := $(if $(filter release,$(KERNEL_BUILD_PROFILE)),ktest-release,ktest-dev)
+else ifeq ($(KTEST_PANIC_STRATEGY),abort)
+KTEST_PROFILE := $(if $(filter release,$(KERNEL_BUILD_PROFILE)),ktest-abort-release,ktest-abort-dev)
 else
-$(error PANIC 只支持 unwind 或 abort)
+$(error KTEST_PANIC_STRATEGY must be unwind or abort)
 endif
 
-.PHONY: ktest-build ktest-list ktest
+.PHONY: all build-kernel build-guest-userland prepare-guest-runtime-libraries assemble-root-filesystem create-ext4-image build-qemu-artifacts package-board-boot-images
+.PHONY: build-contest-runner user-tests ktest-build ktest-list ktest clean help
+
+all:
+	$(MAKE) build-qemu-artifacts ARCH=riscv64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_RV)" MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)" ROOTFS_OUTPUT_DIR=build/rootfs/riscv64 GUEST_USERLAND_OUTPUT_DIR=build/userland-riscv64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-riscv64 BUSYBOX_BUILD_DIR=build/busybox-riscv64
+	$(MAKE) build-qemu-artifacts ARCH=loongarch64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_LA)" MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)" ROOTFS_OUTPUT_DIR=build/rootfs/loongarch64 GUEST_USERLAND_OUTPUT_DIR=build/userland-loongarch64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-loongarch64 BUSYBOX_BUILD_DIR=build/busybox-loongarch64
+
+build-kernel:
+	cd os && env -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" RUSTFLAGS="-Cpanic=abort -Cforce-frame-pointers=yes" cargo build --locked --target $(TARGET) $(CARGO_PROFILE_ARG)
+	mkdir -p "$$(dirname -- "$(KERNEL_ELF_OUTPUT)")"
+	cp "$(KERNEL_CARGO_TARGET_DIR)/$(TARGET)/$(KERNEL_BUILD_PROFILE)/os" "$(KERNEL_ELF_OUTPUT)"
+
+build-qemu-artifacts:
+	$(MAKE) build-kernel TARGET_PLATFORM=qemu-virt KERNEL_BUILD_PROFILE=release KERNEL_CARGO_TARGET_DIR=build/kernel/$(ARCH)/qemu-virt/target KERNEL_ELF_OUTPUT=build/kernel/$(ARCH)/qemu-virt/release/kernel.elf
+	$(MAKE) assemble-root-filesystem TARGET_PLATFORM=qemu-virt
+	$(MAKE) create-ext4-image ROOTFS_TREE_DIR="$(ROOTFS_OUTPUT_DIR)" SYSTEM_ROOT_EXT4_IMAGE="$(QEMU_ROOT_EXT4_IMAGE)"
+	@temporary="$$(mktemp -- "./.$(QEMU_KERNEL_EXPORT).XXXXXX")" || exit $$?; \
+	trap 'status=$$?; rm -f -- "$$temporary"; exit "$$status"' EXIT; \
+	trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+	cp --preserve=mode -- "build/kernel/$(ARCH)/qemu-virt/release/kernel.elf" "$$temporary" || exit $$?; \
+	mv -fT -- "$$temporary" "$(QEMU_KERNEL_EXPORT)" || exit $$?
+
+prepare-guest-runtime-libraries:
+	python3 userland/runtime/prepare_runtime_libraries.py --arch $(ARCH) $(if $(MUSL_LIBC),--musl-libc "$(MUSL_LIBC)") $(if $(GLIBC_LIBDIR),--glibc-libdir "$(GLIBC_LIBDIR)") --output-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)"
+
+assemble-root-filesystem: build-guest-userland prepare-guest-runtime-libraries
+	python3 tools/assemble_rootfs.py --arch $(ARCH) --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(ROOTFS_OUTPUT_DIR)" $(if $(ROOTFS_INIT_CONFIG),--init-config "$(ROOTFS_INIT_CONFIG)")
+
+create-ext4-image:
+	python3 tools/create_ext4_image.py --source-tree "$(ROOTFS_TREE_DIR)" --output-image "$(SYSTEM_ROOT_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)"
+
+package-board-boot-images: build-kernel
+	python3 tools/package_board_boot_images.py --arch $(ARCH) --target-platform $(TARGET_PLATFORM) --kernel-elf "$(KERNEL_ELF_OUTPUT)" --output-directory "$(BOARD_BOOT_IMAGES_OUTPUT_DIR)" $(if $(BOARD_ROOT_EXT4_IMAGE),--root-ext4-image "$(BOARD_ROOT_EXT4_IMAGE)") $(if $(BOARD_OS_DTB),--os-dtb "$(BOARD_OS_DTB)") $(if $(BOARD_ROOT_DEVICE),--root-device "$(BOARD_ROOT_DEVICE)") --root-mode "$(BOARD_ROOT_MODE)" --init-program "$(BOARD_INIT_PROGRAM)"
+
+build-contest-runner:
+	cd userland/contest-run && env -u RUSTFLAGS RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" CARGO_ENCODED_RUSTFLAGS="$$(printf '%s\037' '-Ctarget-feature=+crt-static' '-Crelocation-model=static' '-Clink-self-contained=yes' '-Clink-arg=-no-pie' $(if $(RUNNER_SYSROOT),'--sysroot' "$(call absolute-path,$(RUNNER_SYSROOT))"); printf '%s' "-Clinker=$(if $(findstring /,$(RUNNER_LINKER)),$(call absolute-path,$(RUNNER_LINKER)),$(RUNNER_LINKER))")" cargo build --bin contest-run --release --locked --offline --target $(RUNNER_TARGET)
+
 ktest-build:
-	cd os && BLOSSOM_PLATFORM="$(PLATFORM)" CARGO_TARGET_DIR="$(abspath $(KTEST_TARGET_DIR))" RUSTFLAGS="-Cpanic=$(PANIC) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
-	mkdir -p "$(dir $(OUTPUT))"
-	cp "$(KTEST_TARGET_DIR)/$(TARGET)/$(KTEST_PROFILE)/os" "$(OUTPUT)"
+	cd os && env -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KTEST_CARGO_TARGET_DIR))" RUSTFLAGS="-Cpanic=$(KTEST_PANIC_STRATEGY) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+	mkdir -p "$$(dirname -- "$(KERNEL_ELF_OUTPUT)")"
+	cp "$(KTEST_CARGO_TARGET_DIR)/$(TARGET)/$(KTEST_PROFILE)/os" "$(KERNEL_ELF_OUTPUT)"
 
 ktest-list:
-	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py list --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(KERNEL_BUILD_PROFILE) --panic $(KTEST_PANIC_STRATEGY) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
 ktest:
-	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(MODE) --panic $(PANIC) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
+	python3 tools/ktest.py run --arch $(ARCH) --cpus $(CPUS) --memory "$(MEMORY)" --mode $(KERNEL_BUILD_PROFILE) --panic $(KTEST_PANIC_STRATEGY) --root "$(ROOT)" --root-mode "$(ROOT_MODE)" $(if $(EXTRA_ROOT),--extra-root "$(EXTRA_ROOT)") $(if $(TEST),--glob "$(TEST)") $(KTEST_ARGS)
 
-.PHONY: user-tests
 user-tests: $(USER_OUTPUTS)
 
 build/user-$(ARCH)/user-%: tests/user/%-$(ARCH).S tests/user/smoke.ld
-	mkdir -p "$(dir $@)"
-	$(LLVM_MC) --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
-	$(USER_LD) -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
+	mkdir -p "$(@D)"
+	"$(LLVM_MC)" --triple=$(USER_TRIPLE) --mattr=$(USER_MATTR) --filetype=obj "$<" -o "$@.o"
+	"$(USER_LD)" -flavor gnu -static --no-dynamic-linker --no-relax --build-id=none -z max-page-size=4096 -T tests/user/smoke.ld -m $(USER_EMULATION) "$@.o" -o "$@"
 
-.PHONY: userland
-userland: $(USERLAND_BUILD)/.config $(USERLAND_ROOT)/bin/libc-smoke $(USERLAND_ROOT)/bin/network-smoke $(USERLAND_ROOT)/bin/klog-read $(USERLAND_ROOT)/bin/ktrace-control $(USERLAND_ROOT)/bin/observation-smoke $(USERLAND_ROOT)/sbin/contest-run $(USERLAND_SCRIPTS)
-	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(abspath $(USERLAND_ROOT))" install
+build-guest-userland: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config) $(foreach program,libc-smoke network-smoke klog-read ktrace-control observation-smoke,$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/$(program))) build-contest-runner
+	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" CONFIG_PREFIX="$(call absolute-path,$(GUEST_USERLAND_OUTPUT_DIR))" install
+	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/sbin"
+	install -m 755 "$(RUNNER_OUTPUT)" "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run"
+	rm -rf "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
+	mkdir -p "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts"
+	@for source in tests/user/scripts/*; do \
+		mode=755; [ "$${source##*/}" != no-exec ] || mode=644; \
+		install -m "$$mode" "$$source" "$(GUEST_USERLAND_OUTPUT_DIR)/test/scripts/" || exit; \
+	done
 
-$(USERLAND_ROOT)/bin/libc-smoke: $(LIBC_SOURCES) $(LIBC_HEADERS)
-	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) $(LIBC_SOURCES) -o "$@"
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/libc-smoke): $(LIBC_SOURCES) $(LIBC_HEADERS)
+	mkdir -p "$$(dirname -- "$@")"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) $(LIBC_SOURCES) -o "$@"
 
-$(USERLAND_ROOT)/bin/network-smoke: $(NETWORK_SOURCES) $(NETWORK_HEADERS)
-	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) $(NETWORK_SOURCES) -o "$@"
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/network-smoke): $(NETWORK_SOURCES) $(NETWORK_HEADERS)
+	mkdir -p "$$(dirname -- "$@")"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) $(NETWORK_SOURCES) -o "$@"
 
-$(USERLAND_ROOT)/bin/klog-read: userland/tools/klog-read.c userland/include/blossom-trace.h
-	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/klog-read): userland/tools/klog-read.c userland/include/blossom-trace.h
+	mkdir -p "$$(dirname -- "$@")"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
-$(USERLAND_ROOT)/bin/ktrace-control: userland/tools/ktrace-control.c userland/include/blossom-trace.h
-	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/ktrace-control): userland/tools/ktrace-control.c userland/include/blossom-trace.h
+	mkdir -p "$$(dirname -- "$@")"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
-$(USERLAND_ROOT)/bin/observation-smoke: tests/user/observation-smoke.c userland/include/blossom-trace.h
-	mkdir -p "$(dir $@)"
-	$(MUSL_CROSS)gcc $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
+$(call make-path,$(GUEST_USERLAND_OUTPUT_DIR)/bin/observation-smoke): tests/user/observation-smoke.c userland/include/blossom-trace.h
+	mkdir -p "$$(dirname -- "$@")"
+	"$(MUSL_CROSS)gcc" $(MUSL_CFLAGS) -Iuserland/include "$<" -o "$@"
 
-$(USERLAND_ROOT)/sbin/contest-run: runner
-	mkdir -p "$(dir $@)"
-	install -m 755 "$(RUNNER_OUTPUT)" "$@"
-
-$(USERLAND_ROOT)/test/scripts/%: tests/user/scripts/%
-	mkdir -p "$(dir $@)"
-	install -m 755 "$<" "$@"
-
-
-$(USERLAND_ROOT)/test/scripts/no-exec: tests/user/scripts/no-exec
-	mkdir -p "$(dir $@)"
-	install -m 644 "$<" "$@"
-
-.DELETE_ON_ERROR: $(USERLAND_BUILD)/.config
-$(USERLAND_BUILD)/.config: userland/busybox.config
-	mkdir -p "$(USERLAND_BUILD)"
+.DELETE_ON_ERROR: $(call make-path,$(BUSYBOX_BUILD_DIR)/.config)
+$(call make-path,$(BUSYBOX_BUILD_DIR)/.config): userland/busybox.config
+	mkdir -p "$(BUSYBOX_BUILD_DIR)"
 	cp "$<" "$@"
-	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" oldconfig
+	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" oldconfig
 
 clean:
-	cd os && CARGO_TARGET_DIR="$(abspath $(KERNEL_TARGET_DIR))" cargo clean
-	cd userland/contest-run && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(abspath $(RUNNER_TARGET_DIR))" cargo clean --offline
-	$(MAKE) -C dependency/busybox O="$(abspath $(USERLAND_BUILD))" KBUILD_OUTPUT="$(abspath $(USERLAND_BUILD))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" clean
-	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "$(OUTPUT)" $(if $(filter qemu-virt,$(PLATFORM)),kernel-rv kernel-la)
-	rm -f $(addprefix $(USERLAND_ROOT)/bin/,libc-smoke network-smoke klog-read ktrace-control observation-smoke) "$(USERLAND_ROOT)/sbin/contest-run" "$(USERLAND_ROOT)/bin/busybox" "$(USERLAND_BUILD)/busybox" $(if $(filter qemu-virt,$(PLATFORM)),build/delivery-riscv64/kernel.elf build/delivery-loongarch64/kernel.elf)
-
-work-clean:
-	python3 tools/run.py --work-clean --work-dir "$(WORK_DIR)"
+	cd os && CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" cargo clean
+	cd userland/contest-run && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$(call absolute-path,$(RUNNER_TARGET_DIR))" cargo clean --offline
+	$(MAKE) -C dependency/busybox O="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" KBUILD_OUTPUT="$(call absolute-path,$(BUSYBOX_BUILD_DIR))" ARCH="$(ARCH)" CROSS_COMPILE="$(MUSL_CROSS)" clean
+	rm -f $(USER_OUTPUTS) $(addsuffix .o,$(USER_OUTPUTS)) "$(KERNEL_ELF_OUTPUT)"
+	@for program in libc-smoke network-smoke klog-read ktrace-control observation-smoke busybox; do \
+		rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/bin/$$program"; \
+	done
+	rm -f "$(GUEST_USERLAND_OUTPUT_DIR)/sbin/contest-run"
 
 help:
 	@printf '%s\n' \
-	  'build ARCH=riscv64|loongarch64 PLATFORM=qemu-virt Kernel only (MODE=debug|release).' \
-	  '  Board combinations: riscv64/visionfive2, loongarch64/ls2k1000la.' \
-	  '  Board Cargo/output directories are separate from official QEMU kernels.' \
-	  'package-board-boot-images PLATFORM=... BOARD_ROOT=/dev/...  Offline raw/uImage/boot.env.' \
-	  '  RAMDISK=<raw-ext4> defaults BOARD_ROOT=/dev/ram0; OS_DTB=<OS-dtb> is optional.' \
-	  '  BOARD_OUTPUT selects the artifact directory; no board or media operations.' \
-	  '  SOURCE remains the image input; IMAGE is the volume output; OUTPUT is the ELF.' \
-	  '  Single-architecture board volumes use rootdir=/; prepare them with make image.' \
-	  'runner ARCH=...                    Offline release Linux musl runner.' \
-	  '  RUNNER_SYSROOT=... RUNNER_LINKER=... override prepared compiler inputs.' \
-	  'userland ARCH=...                  BusyBox, runner, tools and smoke programs.' \
-	  'image ARCH=...                     Ordinary staging; SOURCE is never refilled.' \
-	  'contest CONTEST_IMAGE=...          Fresh contest copies with current runner/config.' \
-	  '  CONTEST_PLAN=userland/contest/plan.toml selects an entry inside the full tree.' \
-	  '  RESUME=1                         Keep all existing working disks.' \
-	  '  RESUME=1 REFRESH_SYSTEM=1         Replace only root.raw under the work lock.' \
-	  'all                               Export kernel-rv/kernel-la/disk.img/disk-la.img.' \
-	  'ktest-list / ktest TEST=...         Named kernel tests; PLATFORM=qemu-virt only.' \
-	  'clean                             Rebuildable outputs only; keep disks and reports.' \
-	  'work-clean WORK_DIR=...            Remove known working disks under their lock.'
+	  'build-kernel ARCH=riscv64|loongarch64 TARGET_PLATFORM=qemu-virt' \
+	  '  Kernel only; KERNEL_BUILD_PROFILE=debug|release defaults to debug, panic=abort.' \
+	  '  KERNEL_ELF_OUTPUT defaults to build/kernel/<arch>/<platform>/<profile>/kernel.elf.' \
+	  '  Board combinations: riscv64/visionfive2 and loongarch64/ls2k1000la.' \
+	  'build-guest-userland                Incremental BusyBox/C and release contest-run.' \
+	  '  GUEST_USERLAND_OUTPUT_DIR, BUSYBOX_BUILD_DIR, MUSL_CROSS select actual inputs/outputs.' \
+	  '  RUNNER_SYSROOT and RUNNER_LINKER select prepared Rust std compiler inputs.' \
+	  'prepare-guest-runtime-libraries     Copy checked local libc sources to RUNTIME_LIBRARIES_OUTPUT_DIR.' \
+	  'assemble-root-filesystem            Build userland/libraries, then replace ROOTFS_OUTPUT_DIR.' \
+	  '  ROOTFS_INIT_CONFIG optionally selects an ordinary inittab file.' \
+	  'create-ext4-image                   Only consume ROOTFS_TREE_DIR; write SYSTEM_ROOT_EXT4_IMAGE.' \
+	  'build-qemu-artifacts ARCH=...        Fixed release/abort QEMU kernel and one single-root disk.' \
+	  'all                                Export kernel-rv/kernel-la/disk.img/disk-la.img.' \
+	  'package-board-boot-images           Build board kernel and generate offline boot files.' \
+	  '  BOARD_BOOT_IMAGES_OUTPUT_DIR, BOARD_ROOT_EXT4_IMAGE, BOARD_OS_DTB,' \
+	  '  BOARD_ROOT_DEVICE, BOARD_ROOT_MODE and BOARD_INIT_PROGRAM map directly to packaging.' \
+	  'user-tests                         Build the existing raw user ELF programs.' \
+	  'ktest-build / ktest-list / ktest     QEMU only; KERNEL_BUILD_PROFILE, KTEST_PANIC_STRATEGY.' \
+	  '  TEST selects a glob; KTEST_ARGS passes other Host options; CPUS/MEMORY are VM-only.' \
+	  'clean                              Rebuildable compiler outputs only; keep disks and reports.'

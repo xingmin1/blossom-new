@@ -6,9 +6,23 @@ use crate::boot::{
 };
 use fdt::{node::FdtNode, Fdt};
 
+pub mod layout;
 mod ls2k1000la;
 mod resources;
 mod visionfive2;
+
+/// 与构建脚本按目标架构和平台选取的链接输入保持同源。
+pub const LINK_LAYOUT: layout::KernelLinkLayout = if cfg!(target_arch = "riscv64") {
+    if cfg!(blossom_platform = "visionfive2") {
+        layout::RISCV64_VISIONFIVE2
+    } else {
+        layout::RISCV64_QEMU_VIRT
+    }
+} else if cfg!(blossom_platform = "ls2k1000la") {
+    layout::LOONGARCH64_LS2K1000LA
+} else {
+    layout::LOONGARCH64_QEMU_VIRT
+};
 
 /// 返回构建时已验证的平台选择，不读取固件或重新识别板型。
 pub const fn current() -> Platform {

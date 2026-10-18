@@ -137,7 +137,7 @@ def terminate_group(process):
 
 
 def fixed_kernel(args, directory):
-    """固定独占测试 ELF 并核对 QEMU 布局，目录与装载始终消费同一副本。"""
+    """按测试 profile 构建或复制独占 ELF，目录与装载始终消费同一 QEMU 副本。"""
     kernel = directory / "kernel.elf"
     if args.kernel is not None:
         source = args.kernel.resolve()
@@ -145,9 +145,9 @@ def fixed_kernel(args, directory):
         with source.open("rb") as input_file, kernel.open("xb") as output:
             shutil.copyfileobj(input_file, output, 1024 * 1024)
     else:
-        command = ["make", "ktest-build", f"ARCH={args.arch}", f"CPUS={args.cpus}",
-                   f"MEMORY={args.memory}", f"MODE={args.mode}", f"PANIC={args.panic}",
-                   f"OUTPUT={kernel}"]
+        command = ["make", "ktest-build", f"ARCH={args.arch}",
+                   "TARGET_PLATFORM=qemu-virt", f"KERNEL_BUILD_PROFILE={args.mode}",
+                   f"KTEST_PANIC_STRATEGY={args.panic}", f"KERNEL_ELF_OUTPUT={kernel}"]
         (directory / "build-command.json").write_text(json.dumps(command) + "\n", encoding="utf-8")
         with (directory / "build.log").open("xb") as log:
             process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,

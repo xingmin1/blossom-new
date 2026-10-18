@@ -1,5 +1,6 @@
 //! QEMU 9.2.1 virt 的 DMW、异常、一次定时器及 PCH-PIC/EXTIOI 机制。
 use crate::boot::BootInfo;
+use crate::platform::LINK_LAYOUT;
 use crate::sched::context::TaskContext;
 use crate::sync::SpinLock;
 use core::arch::{asm, global_asm};
@@ -90,8 +91,6 @@ global_asm!(
     execution_tests = const cfg!(feature = "ktest") as usize,
 );
 extern "C" {
-    static __direct_base: u8;
-    static __mmio_base: u8;
     static __secondary_entry_phys: u8;
     /// 普通内核异常入口，由硬件跳转并按 KernelTrapFrame 布局保存本核现场。
     fn la_kernel_trap();
@@ -206,25 +205,15 @@ pub fn boot_hardware_id(_: [usize; 4]) -> usize {
 }
 /// 将真实 RAM 物理地址转换为缓存 DMW 别名。
 pub fn phys_to_virt(pa: usize) -> usize {
-    let base: usize;
-    // SAFETY: 链接脚本提供绝对 DMW 段值；la.abs 仅取符号值，不读取该地址。
-    unsafe {
-        asm!("la.abs {base}, {symbol}", base = out(reg) base, symbol = sym __direct_base, options(nomem, nostack));
-    }
-    pa | base
+    pa | LINK_LAYOUT.direct_map_virt_base as usize
 }
 /// 从缓存 DMW 内的 RAM 地址取得物理地址；其他地址类别不适用此换算。
 pub fn virt_to_phys(va: usize) -> usize {
-    va & !phys_to_virt(0)
+    va & !(LINK_LAYOUT.direct_map_virt_base as usize)
 }
 /// 将设备物理地址转换为强序 DMW 地址；返回整数地址，不验证设备资源范围。
 pub fn mmio_address(pa: usize) -> usize {
-    let base: usize;
-    // SAFETY: 链接脚本提供强序 DMW 段值；此指令仅计算地址，不访问设备。
-    unsafe {
-        asm!("la.abs {base}, {symbol}", base = out(reg) base, symbol = sym __mmio_base, options(nomem, nostack));
-    }
-    pa | base
+    pa | LINK_LAYOUT.mmio_virt_base as usize
 }
 /// 确认最终 PLV0 DMW 并建立永久 invalid 页表链；普通内核不再使用 DA 低地址别名。
 ///
