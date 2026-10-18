@@ -53,6 +53,8 @@ make create-ext4-image ARCH=riscv64 \
 
 装配替换其明确拥有的输出，删除源配置也会删除树中的旧文件；不向外部输入树回填内容。制盘不隐含构建、补程序或重新装配。外部完整树直接作为 `ROOTFS_TREE_DIR`，必须已含该 ISA 的 init、程序和依赖。
 
+默认卷大小为256MiB，`EXT4_SIZE_MIB` 可指定正整数；8/16/32MiB等小卷能否容纳输入由真实 e2fsprogs 决定，不设128MiB门槛或固定 inode 数。失败保留旧卷和工具诊断。装配、制卷和自测准备允许普通 symlink 父工作区；最终输出链接、实际输入输出重叠或文件别名会被拒绝，树、卷和日志各有独立路径。
+
 同一 inittab 经 `/sbin/start-session` 读取真实 `/proc/cmdline`，选择 runner 或显式 Shell。BusyBox 仍拥有 rcS、子进程回收和 rcK；读取失败或未知会话值报错，不改跑另一会话。Shell 退出不自动运行比赛；需要自然停机时执行 `sync` 和 `/bin/busybox poweroff`。
 
 ## 3. 唯一生产 QEMU 入口
@@ -120,6 +122,8 @@ make run-kernel-tests ARCH=riscv64 CPUS=2 TEST='*final_address'
 
 Host 为 `tools/run_kernel_tests.py`。未传 `--kernel` 时只调用内部 `build-kernel-test-elf`；`KERNEL_BUILD_PROFILE`、`KTEST_PANIC_STRATEGY` 选择实际构建，CPUS/MEMORY 只控制 VM。`TEST` 为 glob，`KTEST_ARGS` 转交精确选择、分片等参数。先列出本次 ELF 的完整名；目录显示 ignore 及理由，执行默认排除 ignore，任一不存在的精确名报错，不缩小成部分成功。
 
+`--startup-timeout`、`--setup-timeout`、`--case-timeout`、`--cleanup-timeout`、`--build-timeout` 均以秒计；内部字段明确带 `_seconds`，公开选项名与客体目录的 `timeout_ms` 协议保持不变。
+
 磁盘、UART、网络资源按实际 case 合同提供，缺少输入不是支持性 Skip。普通 Guest 终态来自完整 KTAP，外部观察还可判失败；未知日志不生成结果。只有完整中止/清理记录并确认 QEMU 结束后，Host 才继续已证实未开始的后缀，未知进度保留 NotRun，不透明重放。
 
 ### 独立用户自测
@@ -145,6 +149,8 @@ cd /test/selftests/fs
 ```
 
 默认程序、辅助 ELF 和数据只由根 Make 声明，安装时生成 `/test/selftests/kselftest-list.txt`，每行 `collection:program`；辅助程序不计默认通过。执行器解析真实 TAP 和进程退出，返回 0/1/2/4 分别为通过、失败、基础设施错误、全 Skip，本身不关机。
+
+编译缓存 `USER_SELFTEST_BUILD_DIR` 默认是 `build/user-selftest-cache/ARCH`，与 `GUEST_USERLAND_OUTPUT_DIR` 安装树分开。每次安装按当前声明重建 `test/selftests`、`test/scripts`，撤销程序或脚本后重新安装、装配、制卷不会带上旧缓存文件。extended helpers 仍安装在 `/bin`，`extended-bin.txt` 仅记录它们的安装删除责任，不是执行清单。不要用 `kselftest-list.txt` 过滤完整安装树；不在默认清单内的 helper、脚本和数据仍须保留。
 
 自动 init 动作在执行前删除旧状态，结束后写 `/test/selftests/exit-status` 的完整一行 `run=<32位本轮标识> status=<0|1|2|4>`，再正常关机。Host 持工作盘锁到真实 wait 和盘面读取完成，只接受本轮标识；缺失、畸形、旧轮次、QEMU 非零和 Host 读盘错误均不能通过。薄入口正常传播四种用户状态，Host 错误返回 2；GNU Make 对非零 recipe 的外层出口为 2，日志仍保留原用户状态。QEMU 退出 0 或 UART 中的成功文字不替代盘面结果。
 

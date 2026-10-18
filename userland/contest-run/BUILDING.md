@@ -9,23 +9,23 @@
 从仓库根目录执行：
 
 ```sh
-make runner ARCH=riscv64 RUNNER_SYSROOT=/absolute/prepared/sysroot RUNNER_LINKER=riscv64-linux-musl-gcc
-make runner ARCH=loongarch64 RUNNER_SYSROOT=/absolute/prepared/sysroot RUNNER_LINKER=loongarch64-linux-musl-gcc
+make build-contest-runner ARCH=riscv64 RUNNER_SYSROOT=/absolute/prepared/sysroot RUNNER_LINKER=riscv64-linux-musl-gcc
+make build-contest-runner ARCH=loongarch64 RUNNER_SYSROOT=/absolute/prepared/sysroot RUNNER_LINKER=loongarch64-linux-musl-gcc
 ```
 
 不指定 `RUNNER_SYSROOT` 时使用该工具链自己的 sysroot。`RUNNER_LINKER` 默认是 `$(MUSL_CROSS)gcc`。目标分别为 `riscv64gc-unknown-linux-musl`、`loongarch64-unknown-linux-musl`；程序位于 `build/contest-run/<target>/release/contest-run`。两个目标都固定使用 `+crt-static`、`relocation-model=static`、`link-self-contained=yes`、`-no-pie`，release 使用 `panic=abort`，不关闭 LoongArch 的 LSX/LASX。
 
-`make userland ARCH=...` 安装当前程序到 `USERLAND_ROOT/sbin/contest-run`，不安装同名旧 Shell 或构建旧 C helper。BusyBox 与 Cargo 分别通过自己的真实依赖判定是否重新编译；修改 `userland/contest/` 不进入这两套编译输入。`make build` 只编译内核。
+`make build-guest-userland ARCH=...` 安装当前程序到 `GUEST_USERLAND_OUTPUT_DIR/sbin/contest-run`，不安装同名旧 Shell 或构建旧 C helper。BusyBox 与 Cargo 分别通过真实依赖判定是否重新编译；修改 `userland/contest/` 后需要重新装配、制卷并明确刷新系统工作盘，不必重编程序。`make build-kernel` 只编译内核。
 
-`make all` 使用两架构 release runner 并导出 `kernel-rv`、`kernel-la`、`disk.img`、`disk-la.img`；可分别指定 `RUNNER_SYSROOT_RV`、`RUNNER_SYSROOT_LA`、`RUNNER_LINKER_RV`、`RUNNER_LINKER_LA`。完整配置树复制到每个系统根的 `/etc/contest/`。`CONTEST_PLAN` 默认是 `userland/contest/plan.toml`，也可指向树内的嵌套入口；其原相对位置和相对引用保持不变，由生成的 inittab 明确选择。
+`make all` 使用两架构 release runner 并导出 `kernel-rv`、`kernel-la`、`disk.img`、`disk-la.img`；可分别指定 `RUNNER_SYSROOT_RV`、`RUNNER_SYSROOT_LA`、`RUNNER_LINKER_RV`、`RUNNER_LINKER_LA`。`assemble-root-filesystem` 将完整配置树复制到系统根 `/etc/contest/`，默认计划为 `/etc/contest/plan.toml`；显式计划由 runner 的 `--plan` 选择，不从目录存在推导执行集合。
 
-项目默认 `make contest CONTEST_IMAGE=...` 重新生成项目管理的辅助树。显式 `SOURCE` 或自行指定的既有 `STAGING` 按普通输入处理，不自动回填 runner 或配置。`RESUME=1` 保留全部工作盘；只有 `RESUME=1 REFRESH_SYSTEM=1` 才在原工作锁下用当前系统镜像原子替换 `root.raw`，不修改 `contest.raw` 或原输入。制盘或刷新失败直接终止，不继续运行旧系统盘。
+`make create-ext4-image ROOTFS_TREE_DIR=... SYSTEM_ROOT_EXT4_IMAGE=...` 只读完整输入，不自动回填 runner 或配置。普通启动由 `make run-qemu QEMU_ARGS='--working-disk-action fresh'` 复制所选盘；`reuse` 保全部工作盘，`refresh-system` 在原锁下只替换 `root.raw`，不修改 `contest.raw` 或原输入。制盘或刷新失败直接终止，不改用旧系统盘继续运行。
 
-`make clean` 只清理明确的编译链接产物，不删除工作盘、系统镜像、工具链、sysroot、日志或报告。`make work-clean WORK_DIR=...` 取得启动时的同一非阻塞锁，只删除四个已知角色的工作盘；目录和 `.lock` 保留，正在运行的 QEMU 持锁时清理失败。
+`make clean-build-artifacts` 只清明确编译链接产物和自有安装子树，不删工作盘、系统镜像、工具链、sysroot、日志或报告。`make clean-qemu-working-disks ARCH=... QEMU_ARGS='--working-disk-dir ...'` 取得启动时同一非阻塞锁，只删除 `root.raw`、`contest.raw`；目录和 `.lock` inode 保留，运行中的 QEMU 持锁时清理失败。
 
 ## 板平台与 DEVICE
 
-runner只按 `ARCH` 选择同架构Linux-musl用户ELF，不因 `PLATFORM` 建第二执行器。正式命令保持：
+runner只按 `ARCH` 选择同架构Linux-musl用户ELF，不因 `TARGET_PLATFORM` 建第二执行器。正式命令保持：
 
 ```text
 /sbin/contest-run DEVICE [--plan FILE] [--file FILE ...] [--list]
@@ -38,6 +38,6 @@ DEVICE现在可用实际存在的 `/dev/ram0`、`/dev/mmcblk0`、`/dev/sda`、�
 
 例如在已经挂入实际设备的guest内，`/sbin/contest-run /dev/ram0 --plan /etc/contest/plan.toml --list` 复用同一计划。这里只列用法，不证明该设备已在实板可用；已有双目标runner重建与RV RAM/分区运行归各自第一波冻结输入，不代Native合流后的构建/Clippy/运行或实板验收。
 
-板用自有系统根先经原 `make image ARCH=... PLATFORM=... SOURCE=... IMAGE=...` 制作无journal raw ext4，再经原 `make board-image ... RAMDISK=... OS_DTB=... BOARD_ROOT=/dev/ram0` 离线包装；SOURCE须已有同架构runner、配置和init。IMAGE是卷、OUTPUT是kernel ELF、BOARD_OUTPUT是包装目录，board-image不自动制盘、不修改SOURCE或写物理介质；完整双板命令与限制见[板卡规范](../../.trellis/spec/os/backend/boards.md#离线制盘与包装)。OS_DTB必须由用户提供真实OS树，不能拿参考树冒充本板现场。
+板用完整自有系统树经 `make create-ext4-image ROOTFS_TREE_DIR=... SYSTEM_ROOT_EXT4_IMAGE=...` 制作无journal raw ext4，再经 `make package-board-boot-images ... BOARD_ROOT_EXT4_IMAGE=... BOARD_OS_DTB=... BOARD_ROOT_DEVICE=/dev/ram0` 离线包装。输入树须已有同架构runner、配置和init。卷、内核 ELF 与包装目录角色独立；包装不自动制盘、不修改源树或写物理介质，完整双板命令见[上板指南](../../docs/boards.md)。OS DTB必须由用户提供真实OS树，不能拿参考树冒充本板现场。
 
-实际板测试仍走原 `tools/ktest.py list/run` 的有限串口transport，必须提供真实可执行loader、板串口与输入，单板jobs=1、每次fresh真实reset/reload；没有这些输入时不要用空脚本替代。串口正常 `success/all-online` 只证明软件停止scope，fatal `failure/current-cpu` 不证明其它CPU/设备停止，timeout/EOF/close也不证明物理断电。所有板连接、固件和介质操作及四根/持久重启仍暂缓，离线实现目标不因此缩减。
+内核具名测试只走 `tools/run_kernel_tests.py list/run` 的双 QEMU，不提供板串口transport。板连接、固件、介质和四根/持久重启须人工执行并保实际日志；没有硬件或输入不能用空脚本代替。串口 `success/all-online` 只证明其软件停止scope，fatal `failure/current-cpu` 不证明其它CPU/设备停止，timeout/EOF/close也不证明物理断电。离线产物和QEMU结果不签实板通过。
