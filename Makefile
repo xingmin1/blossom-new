@@ -154,7 +154,7 @@ all:
 	$(MAKE) build-qemu-artifacts ARCH=loongarch64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_LA)" MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)" ROOTFS_OUTPUT_DIR=build/rootfs/loongarch64 GUEST_USERLAND_OUTPUT_DIR=build/userland-loongarch64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-loongarch64 BUSYBOX_BUILD_DIR=build/busybox-loongarch64
 
 build-kernel:
-	cd os && env -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" RUSTFLAGS="-Cpanic=abort -Cforce-frame-pointers=yes" cargo build --locked --target $(TARGET) $(CARGO_PROFILE_ARG)
+	cd os && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" cargo --config 'target.$(TARGET).rustflags=["-Cpanic=abort"]' build --locked --target $(TARGET) $(CARGO_PROFILE_ARG)
 	mkdir -p "$$(dirname -- "$(KERNEL_ELF_OUTPUT)")"
 	cp "$(KERNEL_CARGO_TARGET_DIR)/$(TARGET)/$(KERNEL_BUILD_PROFILE)/os" "$(KERNEL_ELF_OUTPUT)"
 
@@ -190,7 +190,7 @@ build-contest-runner:
 	$(call build-std-program,contest-run)
 
 build-kernel-test-elf:
-	cd os && env -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KTEST_CARGO_TARGET_DIR))" RUSTFLAGS="-Cpanic=$(KTEST_PANIC_STRATEGY) -Cforce-frame-pointers=yes -Cforce-unwind-tables=yes" cargo build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
+	cd os && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KTEST_CARGO_TARGET_DIR))" cargo --config 'target.$(TARGET).rustflags=["-Cpanic=$(KTEST_PANIC_STRATEGY)", "-Cforce-unwind-tables=yes"]' build --locked --target $(TARGET) --profile $(KTEST_PROFILE) --features ktest
 	mkdir -p "$$(dirname -- "$(KERNEL_ELF_OUTPUT)")"
 	cp "$(KTEST_CARGO_TARGET_DIR)/$(TARGET)/$(KTEST_PROFILE)/os" "$(KERNEL_ELF_OUTPUT)"
 

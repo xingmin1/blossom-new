@@ -2,7 +2,13 @@
 rustflags = ["-Cforce-frame-pointers=yes"]
 
 [target.loongarch64-unknown-none]
-rustflags = ["-Cforce-frame-pointers=yes"]
+# LA264 没有硬件非对齐访问，内核必须生成严格对齐的访存指令。
+rustflags = ["-Cforce-frame-pointers=yes", "-Ctarget-feature=-ual"]
+
+# 标准库与内核必须使用同一组目标指令约束。
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
 
 [source.crates-io]
 replace-with = "vendored-sources"

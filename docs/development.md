@@ -6,6 +6,8 @@
 
 宿主命令在仓库根执行。准备固定 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC，以及需要的 QEMU 9.2.1。制盘使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；运行库检查使用支持目标 ELF 的 `readelf`。工具由 PATH 或明确参数提供；构建不下载或升级工具链，Nix 仅是个人环境。
 
+普通内核与 ktest 都需要该固定工具链的 `rust-src`，由 `os/.cargo/config.toml` 统一重编 `core/alloc` 及 `compiler-builtins-mem`。LoongArch 统一关闭 `ual`，使内核和标准库都生成严格对齐的访存；不能只约束内核后继续链接预编译的标准库。Make 清除外部 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS`，通过 Cargo 原生 `--config` 数组合并 panic/unwind 参数与目标 ISA 约束。直接 Cargo 构建仍从 `os/` 执行；独立用户 std 程序继续消费已准备的目标标准库和 sysroot，不读取内核配置。
+
 ```sh
 make help
 make build-kernel ARCH=riscv64
