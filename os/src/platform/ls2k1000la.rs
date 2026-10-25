@@ -227,7 +227,7 @@ fn lio_irq<'a>(
     Ok(index as u32 * 32 + source)
 }
 
-/// 读取 Loongson CFG0/CFG1、窗口与所选集成功能，不枚举或伪造 ABAR。
+/// 收集 Loongson CFG0/CFG1、窗口与所选集成功能资源，保留 SATA 节点显式声明的端口图。
 fn discover_pci<'a>(
     tree: &'a Fdt<'a>,
     banks: [Node<'a>; 2],
@@ -293,6 +293,7 @@ fn discover_pci<'a>(
         pci: Some(ahci),
         interrupt_source: ahci.interrupt_source,
         dma_coherent: ahci.dma_coherent,
+        ports_implemented: resources::optional_number(sata, "ports-implemented")?,
         ..AhciResources::default()
     });
     let mac = host

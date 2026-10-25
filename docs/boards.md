@@ -106,6 +106,10 @@ bootm ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
 
 先保留原厂固件、分区表和引导分区。VF2 用固件实际支持的 `mmc list`、`mmc info`、`part list mmc <实际编号>`；LA 若由 SCSI 层呈现 SATA，用本固件支持的 `scsi reset`、`scsi info`、`part list scsi <实际编号>`。固件编号、Linux 设备名和内核分区号不能互相猜测。
 
+LA 的 OS DTB 中，PCI 与直接 MMIO 路径都接收 SATA 节点的 `ports-implemented`（单个 u32 bitmask），值须来自匹配板型与修订的资料，并经实际配置验收。PI 为零且未声明该属性时仍失败，不能因 CAP 报告一个端口就自动猜测 port0，也不能依赖先运行固件 `scsi reset` 初始化 PI。
+
+RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设备，也不会忽略其资源或初始化错误。
+
 部署前在原厂 Linux/宿主核对目标分区身份、未挂载状态和容量。写卷是用户明确选择目标介质后的单独操作，不属于任何 Make 目标；不得把目标分区误换为含固件的整卡/整 SSD，也不把 raw ext4 交厂商 NAND 升级菜单。
 
 直接根启动不加载 initrd。分区名仅示例，必须替换为实际目标；kernel/DTB 仍可由 TFTP 载入：
