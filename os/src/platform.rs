@@ -780,7 +780,7 @@ fn discover_pci(
     Ok(())
 }
 
-/// 按所选 QEMU 9.2.1 host 的六 cell 条目解析 INTx，不猜测其他表格式。
+/// 按父控制器声明的 cell 数解析 INTx 路由条目。
 fn discover_pci_intx(
     tree: &Fdt<'_>,
     host: Node<'_>,
@@ -788,8 +788,8 @@ fn discover_pci_intx(
     info: &mut BootInfo,
 ) -> Result<(), &'static str> {
     // 两机器均以三个 PCI 地址 cell 和一个 pin 构成 key。LA host 未声明
-    // #interrupt-cells，PCH-PIC 虽声明两个 cell，host 条目实际只有 source，
-    // 没有 flag；所选机器的 PCI INTx 固定为 level-high。
+    // #interrupt-cells；PCH-PIC 声明两个 cell，旧固件的 host 条目只写 source，
+    // 新固件按声明补上 level-high flag，两种布局都按同一组路由解释。
     if host.property("#interrupt-cells").is_some() && number(host, "#interrupt-cells")? != 1 {
         return Err("FDT PCI host interrupt cells do not describe one INTx pin");
     }
@@ -803,11 +803,27 @@ fn discover_pci_intx(
     if info.pci.intx_mask != [0x1800, 0, 0, 7] {
         return Err("FDT PCI interrupt-map-mask differs from the selected host profile");
     }
+    // 条目宽度由父控制器的 #interrupt-cells 决定：一个 cell 只写 source，
+    // 两个 cell 追加 level-high flag；旧固件即使声明两个 cell 也只写 source。
     let map = property(host, "interrupt-map")?;
-    if map.is_empty() || map.len() % 24 != 0 {
-        return Err("FDT PCI interrupt-map is not a complete six-cell table");
+    if map.is_empty() {
+        return Err("FDT PCI interrupt-map is empty");
     }
-    for entry in map.chunks_exact(24) {
+    let parent = tree
+        .find_phandle(word(map, 16)?)
+        .ok_or("FDT PCI interrupt-map parent phandle has no controller")?;
+    if parent.name.as_ptr() != controller.name.as_ptr() {
+        return Err("FDT PCI interrupt-map parent is not the selected controller");
+    }
+    let declared = 20 + 4 * number(parent, "#interrupt-cells")? as usize;
+    let stride = if map.len() % declared == 0 {
+        declared
+    } else if map.len() % 24 == 0 {
+        24
+    } else {
+        return Err("FDT PCI interrupt-map is not a complete route table");
+    };
+    for entry in map.chunks_exact(stride) {
         if info.pci.intx_route_count == info.pci.intx_routes.len() {
             return Err("FDT PCI INTx route capacity exceeded");
         }
@@ -825,6 +841,9 @@ fn discover_pci_intx(
             .ok_or("FDT PCI interrupt-map parent phandle has no controller")?;
         if parent.name.as_ptr() != controller.name.as_ptr() {
             return Err("FDT PCI interrupt-map parent is not the selected controller");
+        }
+        if 24 < stride && word(entry, 24)? != 4 {
+            return Err("FDT PCI INTx route is not level-high");
         }
         let source = word(entry, 20)?;
         device_source(source, info)?;
