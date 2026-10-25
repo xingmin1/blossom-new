@@ -625,8 +625,13 @@ fn configure_resources(
             let (domain, address, size) = bar_address(bar);
             if address != 0 {
                 validate_bar_address(bar, address)?;
-                translate(host, domain, address, size)?;
-                reserve(occupied, domain, address, size)?;
+                if matches!(bar, BarInfo::IO { .. }) {
+                    translate(host, domain, address, size)?;
+                    reserve(occupied, domain, address, size)?;
+                } else if translate(host, domain, address, size).is_ok() {
+                    reserve(occupied, domain, address, size)?;
+                }
+                // 内存 BAR 的固件地址若不在 host 窗口，由下一轮清零后按窗口重分配。
             }
         }
     }
@@ -642,12 +647,20 @@ fn configure_resources(
             else {
                 continue;
             };
-            let address = if *address == 0 {
-                allocate(host, occupied, *address_type, *size)?
+            let address_type = *address_type;
+            let size = *size;
+            let existing = *address;
+            let address = if existing != 0 && translate(host, 2, existing, size).is_ok() {
+                existing
             } else {
-                *address
+                // 固件留下的地址不在 host 窗口（或为零）时，清零后按窗口重新分配。
+                match address_type {
+                    MemoryBarType::Width64 => root.set_bar_64(entry.device.bdf(), index as u8, 0),
+                    _ => root.set_bar_32(entry.device.bdf(), index as u8, 0),
+                }
+                allocate(host, occupied, address_type, size)?
             };
-            let physical = translate(host, 2, address, *size)?;
+            let physical = translate(host, 2, address, size)?;
             mmio_region_address(physical)?;
             entry.device.bars[index] = Some(PciBar {
                 bus_address: address,
