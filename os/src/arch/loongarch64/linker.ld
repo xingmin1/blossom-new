@@ -43,3 +43,7 @@ SECTIONS {
     __primary_entry_phys = __primary_entry - __direct_base;
     __secondary_entry_phys = __secondary_entry - __direct_base;
 }
+
+ASSERT((la_kernel_trap & 0xfff) == 0, "la_kernel_trap must be 4KiB aligned for EENTRY");
+ASSERT((la_kernel_refill & 0xfff) == 0, "la_kernel_refill must be 4KiB aligned for TLBRENTRY");
+ASSERT((la_user_trap & 0xfff) == 0, "la_user_trap must be 4KiB aligned for EENTRY");

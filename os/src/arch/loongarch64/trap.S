@@ -1,6 +1,7 @@
 .text
 
-.balign 64
+# EENTRY 低 12 位只读零，异常入口必须按 4KiB 对齐，不能只按 64 字节对齐。
+.balign 4096
 .global la_kernel_trap
 la_kernel_trap:
     addi.d $sp, $sp, -{frame_size}
@@ -200,7 +201,8 @@ la_kernel_trap:
     ld.d $sp, $sp, {gpr}+3*8
     ertn
 
-.balign 64
+# TLBRENTRY 低 12 位只读零，重填入口必须按 4KiB 对齐，不能只按 64 字节对齐。
+.balign 4096
 .global la_kernel_refill
 la_kernel_refill:
     # 用户 refill 把 t0 存入 TLBRSAVE、t1 存入临时 KS2，不触碰用户 SP 或 KS0。

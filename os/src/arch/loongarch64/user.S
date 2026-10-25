@@ -155,7 +155,8 @@ la_run_user:
     ld.d $sp, $sp, {gpr}+3*8
     ertn
 
-.balign 64
+# EENTRY 低 12 位只读零，用户异常入口必须按 4KiB 对齐，不能只按 64 字节对齐。
+.balign 4096
 .global la_user_trap
 la_user_trap:
     # KS0 永久保留 CpuLocal；KS2 只在入口暂存用户 t0。
