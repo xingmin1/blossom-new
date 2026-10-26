@@ -1,42 +1,19 @@
+# 编辑器与工具缓存
 .vscode
+__pycache__/
 
-os/target/
-/crates/*/target/
-/tools/**/__pycache__/
+# Rust 构建产物
+**/target/
+os/target-*/
+
+# 顶层构建与运行产物
 /build/
+/kernel-la
+/kernel-rv
+/disk.img
+/disk-la.img
+/os.bin
+/uImage
 
+# 运行日志
 os/qemu.log
-
-user/target/
-
-make_test/copyfilerange_test_1
-make_test/copyfilerange_test_2
-make_test/copyfilerange_test_3
-make_test/copyfilerange_test_4
-make_test/splice_test
-make_test/interrupts_test1
-make_test/interrupts_test2
-
-fs-img-dir
-
-kernel-la
-
-kernel-rv
-
-sdcard-la.img
-
-sdcard-rv.img
-
-uImage
-
-util/qemu-2k1000/tmp/qemu-2k1000-static.20240526.tar.xz
-
-util/qemu-2k1000/tmp/.extracted
-
-os.bin
-
-apps/kilo/build
-apps/tetris/build
-
-user/LaTest
-user/RvTest
