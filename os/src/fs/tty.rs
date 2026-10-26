@@ -170,6 +170,13 @@ impl Drop for WriterGuard {
 
 /// 在原工作队列初始化后准备常驻端点、域与 CPU0 工作。
 pub fn initialize_service() -> Result<(), core::alloc::AllocError> {
+    // 端点的初始速度采用平台声明的控制台速率，避免首次打开把线路从既有速率改走。
+    {
+        let speed = termios::speed_for_baud(crate::console::console_baud())
+            .expect("console baud is not representable in termios");
+        let mut state = STATE.lock();
+        state.termios.cflag = (state.termios.cflag & !termios::CBAUD) | speed;
+    }
     let read_head = Arc::try_new(PollWaitHead::new())?;
     let write_head = Arc::try_new(PollWaitHead::new())?;
     let hangup_head = Arc::try_new(PollWaitHead::new())?;

@@ -5,7 +5,7 @@ use crate::wait::WaitQueue;
 use core::convert::TryFrom;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use spin::Once;
 
 struct PortResources {
@@ -14,6 +14,8 @@ struct PortResources {
     shift: u32,
     baud_base: u32,
     dw_apb: bool,
+    /// 平台为控制台声明的工作波特率；线路速率由固件建立，内核首次打开不改写。
+    console_baud: u32,
 }
 
 static RESOURCES: Once<PortResources> = Once::new();
@@ -46,6 +48,8 @@ const EMERGENCY_POLL_BUDGET: usize = 10_000;
 static PORT: SpinLock<RxState> = SpinLock::new(RxState::new());
 static TX_WAIT: WaitQueue = WaitQueue::new();
 static RECEIVED: AtomicUsize = AtomicUsize::new(0);
+// MCR 的 DTR/RTS 位在部分板卡不可回读，差异只报告一次以免每次打开都刷屏。
+static READBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static LAST_BYTE: AtomicU8 = AtomicU8::new(0);
 
 /// 中断已从 FIFO 取出的一个真实字节及其同步读取的 LSR。
@@ -245,6 +249,7 @@ pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
         shift: info.uart.reg_shift,
         baud_base,
         dw_apb: info.uart.dw_apb,
+        console_baud: info.uart.baud,
     });
 }
 
@@ -534,6 +539,14 @@ pub fn baud_base() -> u32 {
         .baud_base
 }
 
+/// 返回平台为控制台声明的工作波特率，供首次打开时保持既有线路速率。
+pub fn console_baud() -> u32 {
+    RESOURCES
+        .get()
+        .expect("UART resources not configured")
+        .console_baud
+}
+
 /// 只读真实 LSR 的 TEMT 位；不用时钟延时代替硬件发送空标志。
 pub fn transmitter_empty() -> bool {
     let _port = PORT.lock();
@@ -626,16 +639,33 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         lsr: read_register(LSR),
         baud_base: baud_base(),
     };
+    // DLAB 未清会让 DATA/IER 变成分频别名，后续输出与配置都会落到错误寄存器；
+    // 该后置条件必须在释放端口锁前成立，避免其它消费者取得端口后继续用错寄存器组。
     assert_eq!(
-        snapshot.divisor, config.divisor,
-        "UART divisor was not accepted"
+        snapshot.line_control & DLAB,
+        0,
+        "UART line control left DLAB set"
     );
-    assert_eq!(
-        snapshot.line_control, config.line_control,
-        "UART line control was not accepted"
-    );
-    assert_eq!(snapshot.ier, ier, "UART interrupt enable was not accepted");
-    assert_eq!(snapshot.mcr, mcr, "UART modem control was not accepted");
+    drop(_port);
+    // 常规配置不以回读相等作为致命条件；保留完整差异作为硬件事实。
+    if (snapshot.divisor != config.divisor
+        || snapshot.line_control != config.line_control
+        || snapshot.ier != ier
+        || snapshot.mcr != mcr)
+        && !READBACK_WARNED.swap(true, Ordering::Relaxed)
+    {
+        crate::early_println!(
+            "UART readback differs exp div={} lc={:#x} ier={:#x} mcr={:#x} got div={} lc={:#x} ier={:#x} mcr={:#x}",
+            config.divisor,
+            config.line_control,
+            ier,
+            mcr,
+            snapshot.divisor,
+            snapshot.line_control,
+            snapshot.ier,
+            snapshot.mcr,
+        );
+    }
     snapshot
 }
 

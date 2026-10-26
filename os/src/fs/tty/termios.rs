@@ -111,8 +111,6 @@ pub const FFDLY: u32 = 0x8000;
 
 /// CBAUD 波特率掩码。
 pub const CBAUD: u32 = 0x0000_100f;
-/// CBAUDEX 扩展波特率位。
-pub const CBAUDEX: u32 = 0x0000_1000;
 /// BOTHER 自定义波特率标记。
 pub const BOTHER: u32 = 0x0000_1000;
 /// CSIZE 字长掩码。
@@ -222,8 +220,8 @@ pub const SUPPORTED_LFLAG: u32 = ISIG
     | FLUSHO
     | IEXTEN;
 
-/// 标准 CBAUD 编码与名义波特率对照。
-const STANDARD_BAUDS: [(u32, u32); 16] = [
+/// 标准 CBAUD 编码与名义波特率对照；高位为 CBAUDEX 扩展编码。
+const STANDARD_BAUDS: [(u32, u32); 19] = [
     (0x0, 0),
     (0x1, 50),
     (0x2, 75),
@@ -240,6 +238,9 @@ const STANDARD_BAUDS: [(u32, u32); 16] = [
     (0xd, 9600),
     (0xe, 19200),
     (0xf, 38400),
+    (0x1001, 57600),
+    (0x1002, 115200),
+    (0x1003, 230400),
 ];
 
 /// 目标 termios 结构，字段与 UAPI 四个 u32、line 与 19 个控制字符对应。
@@ -341,17 +342,14 @@ fn validate_cflag(cflag: u32) -> Result<(), FsError> {
         return Err(FsError::InvalidOperation);
     }
     let output = cflag & CBAUD;
-    if output & CBAUDEX != 0 {
-        return Err(FsError::InvalidOperation);
-    }
-    if 0x10 <= output {
+    if baud_rate(output).is_none() {
         return Err(FsError::InvalidOperation);
     }
     let input = (cflag & CIBAUD) >> IBSHIFT;
     if input != 0 && input != output {
         return Err(FsError::InvalidOperation);
     }
-    if input & CBAUDEX != 0 || (input != 0 && 0x10 <= input) {
+    if input != 0 && baud_rate(input).is_none() {
         return Err(FsError::InvalidOperation);
     }
     let known = CSIZE | CSTOPB | CREAD | PARENB | PARODD | HUPCL | CLOCAL | CBAUD | CIBAUD;
@@ -367,6 +365,14 @@ pub fn baud_rate(code: u32) -> Option<u32> {
         .iter()
         .find(|(value, _)| *value == code)
         .map(|(_, rate)| *rate)
+}
+
+/// 把名义波特率转换为 CBAUD 编码，未列出的速率返回 None。
+pub fn speed_for_baud(baud: u32) -> Option<u32> {
+    STANDARD_BAUDS
+        .iter()
+        .find(|(_, rate)| *rate == baud)
+        .map(|(code, _)| *code)
 }
 
 /// 把名义波特率转换为最接近的 16 位分频，无法表示时返回 None。
