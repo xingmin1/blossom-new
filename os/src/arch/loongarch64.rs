@@ -10,12 +10,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub const NAME: &str = "loongarch64";
 
 pub mod ale;
+mod counter;
 mod liointc;
 mod mmu;
 mod rtc;
 mod signal;
 mod uaccess;
 mod user;
+pub use counter::{apply_counter_epoch, establish_counter_epoch};
 pub use rtc::board_rtc_calendar;
 
 pub use mmu::{

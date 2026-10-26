@@ -124,6 +124,8 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     // SAFETY: 唯一 BSP 仍保持 IRQ 关闭且 AP 未释放；MM 已完成页分配器和永久直映，
     // CPU 表已提前构造，辅核记录尚无固件读者，全部动态槽尚为空。
     unsafe { cpu::prepare_secondary_stacks() }.expect("AP stack allocation failed");
+    // 统一各核计数器零点后才能开放时间服务与 AP 采样。
+    arch::establish_counter_epoch();
     // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前初始化时间源；
     // BootInfo 的频率与 RTC 资源已验证，永久 MMIO 映射有效，尚无其他 RTC 访问者。
     unsafe { time::initialize(resources) };
@@ -201,7 +203,6 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
         );
     }
     early_println!("READY arch={} cpus={}", arch::NAME, cpu::count());
-
     EXECUTION_READY.store(true, core::sync::atomic::Ordering::Release);
     for id in 0..cpu::count() {
         let local = cpu::get(id);
@@ -221,6 +222,8 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
 pub unsafe extern "C" fn secondary_main(local: *const cpu::CpuLocal) -> ! {
     // SAFETY: AP 汇编从 BSP 的静态记录读出本核对象，尚无本核 IRQ 访问。
     unsafe { arch::install_cpu_local(local) };
+    // SAFETY: 本核尚无时间采样；BSP 已在开放 AP 前建立统一补偿。
+    unsafe { arch::apply_counter_epoch() };
     arch::init_current_cpu();
     arch::enable_interrupts();
     cpu::publish_online();

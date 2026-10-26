@@ -649,6 +649,15 @@ pub(crate) unsafe fn idle_once(
     };
 }
 /// 读取真实硬件时间计数器。
+/// RISC-V 的 `time` 是系统级共享计数器，不存在每核补偿寄存器。
+pub fn establish_counter_epoch() {}
+
+/// RISC-V 的 `time` 已由平台共享，各核无需写入补偿。
+///
+/// # Safety
+/// 无架构前置条件；保留为与 LoongArch 启动顺序一致的接口。
+pub unsafe fn apply_counter_epoch() {}
+
 pub fn read_counter() -> u64 {
     let value;
     // SAFETY: 固件已向 S-mode 开放 time 计数器；读取不涉及内存或修改计时状态。
