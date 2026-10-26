@@ -165,6 +165,7 @@ pub(crate) struct Ahci {
 
 impl Ahci {
     /// 消费真实 ABAR/IRQ 并识别介质；只有端口扫描确认无介质才返回 None，硬件错误不作缺盘。
+    /// 选端口后先建立 FIS 接收并做一次端口复位再识别。
     ///
     /// # Safety
     /// 资源来自唯一库存，PCI BAR 已解析；ABAR 完整窗口永久强序映射且独占，固件已不再使用。
@@ -222,10 +223,59 @@ impl Ahci {
             }
             return Ok(None);
         };
-        if !registers::poll(Duration::from_secs(1), || port.read(TFD) & TASK_BUSY == 0) {
+        let controls = Controls::allocate(domain)?;
+        port.start_fis_rx(
+            controls.list.region().device.value(),
+            controls.fis.region().device.value(),
+        );
+        if let Err(error) = port.comreset() {
+            if !port.stop_polled() {
+                core::mem::forget(controls);
+                panic!("AHCI comreset stop unconfirmed; control pages retained");
+            }
+            crate::early_println!(
+                "AHCI probe failed stage=comreset cmd={:#x} ssts={:#x} sig={:#x} tfd={:#x}",
+                port.read(CMD),
+                port.read(registers::SSTS),
+                port.read(registers::SIG),
+                port.read(TFD),
+            );
+            return Err(error);
+        }
+        if !registers::poll(Duration::from_secs(1), || port.taskfile_ready()) {
+            if !port.stop_polled() {
+                core::mem::forget(controls);
+                panic!("AHCI taskfile stop unconfirmed; control pages retained");
+            }
+            crate::early_println!(
+                "AHCI probe failed stage=taskfile cmd={:#x} ssts={:#x} sig={:#x} tfd={:#x}",
+                port.read(CMD),
+                port.read(registers::SSTS),
+                port.read(registers::SIG),
+                port.read(TFD),
+            );
             return Err(BlockError::NotReady);
         }
-        let controls = Controls::allocate(domain)?;
+        if port.read(registers::SIG) != 0x0000_0101 {
+            if !port.stop_polled() {
+                core::mem::forget(controls);
+                panic!("AHCI signature stop unconfirmed; control pages retained");
+            }
+            crate::early_println!(
+                "AHCI probe failed stage=signature cmd={:#x} ssts={:#x} sig={:#x} tfd={:#x}",
+                port.read(CMD),
+                port.read(registers::SSTS),
+                port.read(registers::SIG),
+                port.read(TFD),
+            );
+            return Err(BlockError::Unsupported);
+        }
+        // 构造 Arc 前收回设备访问权，保持识别命令准备期间控制页由 CPU 独占。
+        // Arc 分配失败或命令准备提前返回时，控制页也只能在确认停止后释放。
+        if !port.stop_polled() {
+            core::mem::forget(controls);
+            panic!("AHCI probe stop unconfirmed; control pages retained");
+        }
         let mut controller = Arc::try_new(Self {
             port,
             interrupt,

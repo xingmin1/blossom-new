@@ -4,6 +4,7 @@ use crate::arch;
 use crate::block::BlockError;
 use crate::boot::Region;
 use crate::time::{self, Duration};
+use crate::timer;
 use core::hint::spin_loop;
 use core::ptr;
 
@@ -48,6 +49,9 @@ pub(super) const ERROR: u32 = (1 << 30)
     | (1 << 6)
     | (1 << 4);
 pub(super) const INTERRUPTS: u32 = COMPLETION | ERROR;
+
+/// 写回 SControl.DET 时允许的尝试次数；部分控制器会忽略首次写入。
+const LINK_RESUME_TRIES: usize = 5;
 
 #[derive(Clone, Copy)]
 pub(super) struct Host {
@@ -192,6 +196,46 @@ impl Port {
             self.write(FBS, 0);
         }
         let _ = self.read(CMD);
+    }
+
+    /// 端口停止时编程控制页地址并开启 FIS 接收；调用者须保活控制页直到确认停止。
+    pub(super) fn start_fis_rx(self, list: u64, fis: u64) {
+        self.write(CLBU, (list >> 32) as u32);
+        self.write(CLB, list as u32);
+        self.write(FBU, (fis >> 32) as u32);
+        self.write(FB, fis as u32);
+        self.write(CMD, self.read(CMD) | FRE);
+        let _ = self.read(CMD);
+    }
+
+    /// 在可睡眠任务中复位链路并等待设备在线，期间保持 FIS 接收开启且命令引擎停止。
+    pub(super) fn comreset(self) -> Result<(), BlockError> {
+        let sctl = self.read(SCTL);
+        self.write(SCTL, (sctl & 0x0f0) | 0x301);
+        let _ = self.read(SCTL);
+        timer::sleep(Duration::from_millis(1));
+        // 写入 DET=0 后需等待 200ms 再读回；个别控制器会忽略首次写入。
+        let mut restored = sctl;
+        for _ in 0..LINK_RESUME_TRIES {
+            self.write(SCTL, (sctl & 0x0f0) | 0x300);
+            timer::sleep(Duration::from_millis(200));
+            restored = self.read(SCTL);
+            if restored & 0xf0f == 0x300 {
+                break;
+            }
+        }
+        if restored & 0xf0f != 0x300 {
+            return Err(BlockError::NotReady);
+        }
+        if !poll(Duration::from_secs(1), || self.read(SSTS) & 0xf == 3) {
+            return Err(BlockError::NotReady);
+        }
+        Ok(())
+    }
+
+    /// 复位后的任务文件只以 BSY 清零判断设备已经就绪。
+    pub(super) fn taskfile_ready(self) -> bool {
+        self.read(TFD) & 0x80 == 0
     }
 
     /// 按 W1C 应答本端口的错误和中断，再应答对应 host 位。
