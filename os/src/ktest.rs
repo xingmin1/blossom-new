@@ -1,6 +1,8 @@
 //! 测试专用入口与捕获桥；控制协议只使用生产唯一 UART。
 
 mod admission;
+#[cfg(target_arch = "loongarch64")]
+mod ale;
 mod boot_cases;
 mod context;
 mod diagnostic;

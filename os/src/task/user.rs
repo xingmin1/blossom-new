@@ -11,6 +11,11 @@ use core::sync::atomic::Ordering;
 use spin::Once;
 
 use crate::arch::{self, UserContext, UserTrap};
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::{
+    ale::{EmulationResult, Instruction, UserMemory},
+    UserAccess,
+};
 use crate::fs::{
     open_path_with_flags, DescriptorFlags, FileIoContext, FileTable, FsContext, FsError,
     ResolveMode, Vfs,
@@ -689,6 +694,78 @@ pub(crate) fn prepare_bound_user(
     })
 }
 
+#[cfg(target_arch = "loongarch64")]
+struct AleMemory<'a>(&'a Mm);
+
+#[cfg(target_arch = "loongarch64")]
+impl AleMemory<'_> {
+    /// 短映射读侧只访问一个字节，缺页或 COW 在回调外完成后重试。
+    fn with_byte<R>(
+        &self,
+        address: usize,
+        access: UserAccess,
+        mut visit: impl FnMut(usize) -> R,
+    ) -> Result<R, VmError> {
+        loop {
+            if let Some(value) = self.0.with_page(address, access, &mut visit)? {
+                return Ok(value);
+            }
+            self.0.fault(address, access)?;
+        }
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl UserMemory for AleMemory<'_> {
+    /// 只在可读页保活期间执行原始字节复制，不构造用户内容引用。
+    fn read_byte(&mut self, address: usize) -> Result<u8, VmError> {
+        self.with_byte(address, UserAccess::Read, |source| {
+            let mut value = 0u8;
+            // SAFETY: with_page 保活当前可读映射，单字节必定位于页内；
+            // 内核目标独占且已初始化，两侧不重叠，原始用户指针不逃逸。
+            unsafe { arch::copy_user_bytes(&mut value, source as *const u8, 1) };
+            value
+        })
+    }
+
+    /// 只在可写且非 COW 的驻留页保活期间提交一个字节。
+    fn write_byte(&mut self, address: usize, value: u8) -> Result<(), VmError> {
+        self.with_byte(address, UserAccess::Write, |target| {
+            // SAFETY: with_page 保活当前可写非 COW 映射，单字节位于页内；
+            // 源来自已初始化内核局部量，两侧不重叠，用户指针不逃逸。
+            unsafe { arch::copy_user_bytes(target as *mut u8, &value, 1) };
+        })
+    }
+}
+
+/// 取指、源快照与结果提交各自短暂借用现场；访存错误与未支持指令分别返回。
+#[cfg(target_arch = "loongarch64")]
+fn emulate_ale(user: &UserThread, address: usize) -> EmulationResult {
+    let pc = user.context().pc;
+    if address == pc || pc & 3 != 0 {
+        return EmulationResult::Unsupported;
+    }
+    let mm = user.mm().expect("user ALE has no MM");
+    let mut bytes = [0u8; 4];
+    let fetched = mm.with_page(pc, UserAccess::Read, |source| {
+        // SAFETY: PC 已按四字节对齐，四字节指令不会跨越 4KiB 页；
+        // with_page 保活可读页，内核目标独占且足够大，指针只在回调内使用。
+        unsafe { arch::copy_user_bytes(bytes.as_mut_ptr(), source as *const u8, 4) };
+    });
+    if !matches!(fetched, Ok(Some(()))) {
+        return EmulationResult::Fault;
+    }
+    let Some(instruction) = Instruction::decode(u32::from_le_bytes(bytes)) else {
+        return EmulationResult::Unsupported;
+    };
+    let source = instruction.source_value(&user.context());
+    let Ok(value) = instruction.access(&mut AleMemory(&mm), address, source) else {
+        return EmulationResult::Fault;
+    };
+    instruction.complete(&mut user.context(), value);
+    EmulationResult::Emulated
+}
+
 /// 同一真实Task先向自身Mm尝试复制小端child_tid，部分写入或错误不取消创建。
 /// 随后循环执行用户现场，只有返回 Rust 并结束 IRQ/现场借用后才允许等待或调度。
 /// 临时 mask 保留至真实信号选择；没有 handler 时恢复尚未领取的旧 mask。
@@ -810,10 +887,26 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 }
             }
             UserTrap::Exception { code, address } => {
+                #[cfg(target_arch = "loongarch64")]
+                let ale_fault = if code == 9 {
+                    match emulate_ale(&user, address) {
+                        EmulationResult::Emulated => continue,
+                        EmulationResult::Unsupported => false,
+                        EmulationResult::Fault => true,
+                    }
+                } else {
+                    false
+                };
                 let mut context = user.context();
                 let pc = context.pc;
                 let fcsr = context.fcsr;
                 let (signum, si_code) = exception_signal(code, fcsr);
+                #[cfg(target_arch = "loongarch64")]
+                let (signum, si_code) = if ale_fault {
+                    (11, 1)
+                } else {
+                    (signum, si_code)
+                };
                 #[cfg(target_arch = "loongarch64")]
                 if code == 18 {
                     context.fcsr = fcsr & !((fcsr & 0x1f) << 24);

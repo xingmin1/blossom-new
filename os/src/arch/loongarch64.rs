@@ -5,10 +5,11 @@ use crate::sched::context::TaskContext;
 use crate::sync::SpinLock;
 use core::arch::{asm, global_asm};
 use core::mem::{offset_of, size_of, MaybeUninit};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const NAME: &str = "loongarch64";
 
+pub mod ale;
 mod liointc;
 mod mmu;
 mod rtc;
