@@ -24,9 +24,9 @@ __primary_entry:
     la.abs $t0, .Lprimary_high
     jirl $zero, $t0, 0
 .Lprimary_high:
-    li.w $t0, 0x10
-    li.w $t1, 0x18
-    csrxchg $t0, $t1, 0
+    # DATF/DATM 取一致缓存：refill 在 DA 下读页表必须看到内核 DMW 写回的叶。
+    li.w $t0, 0xb0
+    csrwr $t0, 0
     la.abs $sp, BOOT_STACK
     li.d $t0, {stack_size}
     add.d $sp, $sp, $t0
@@ -63,9 +63,9 @@ __secondary_entry:
     la.abs $t0, .Lsecondary_high
     jirl $zero, $t0, 0
 .Lsecondary_high:
-    li.w $t0, 0x10
-    li.w $t1, 0x18
-    csrxchg $t0, $t1, 0
+    # DATF/DATM 取一致缓存：refill 在 DA 下读页表必须看到内核 DMW 写回的叶。
+    li.w $t0, 0xb0
+    csrwr $t0, 0
     .if {board_platform}
     li.w $t0, 0x1028
     iocsrrd.d $sp, $t0
