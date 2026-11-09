@@ -1,7 +1,7 @@
 //! `kselftest` TAP v13（Test Anything Protocol）标准输出有界流式解析器。
 //!
 //! # 模块职责与架构定位
-//! 本模块供 [`crate::process`] 在运行 `Protocol::Tap` 协议的测试程序时实时消费子进程的标准输出（`stdout`），并将其与子进程退出状态（[`ExitOutcome`]）结合，判定最终的测试结论（[`Verdict`]）与子项统计（[`TapSummary`]）。
+//! 本模块供 [`crate::process::run_tap_command`] 在运行 `user-selftests` 程序时实时消费子进程的标准输出（`stdout`），并将其与子进程退出状态（[`ExitOutcome`]）结合，判定最终的测试结论（[`Verdict`]）与子项统计（[`TapSummary`]）。
 //!
 //! # 核心机制与流式解析状态机
 //!
@@ -41,7 +41,7 @@
 use crate::outcome::{ExitOutcome, ProtocolResult, TapSummary, Verdict};
 
 /// TAP v13 标准输出流式观察器。
-pub(crate) struct TapObserver {
+pub struct TapObserver {
     /// 累计解析出的 TAP 计划数、各类子项计数、中止标志与首个协议错误信息。
     summary: TapSummary,
     /// 当前正在拼装的单行字节缓冲区（容量上限为 4096 字节）。
@@ -62,7 +62,7 @@ pub(crate) struct TapObserver {
 
 impl TapObserver {
     /// 创建一个具有 4096 字节预分配行缓冲区的 [`TapObserver`]。
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             summary: TapSummary::default(),
             line: Vec::with_capacity(4096),
@@ -83,7 +83,7 @@ impl TapObserver {
     }
 
     /// 将新读取到的 `stdout` 字节流推入观察器，按换行符 `\n` 切分并触发单行解析。
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+    pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             if byte == b'\n' {
                 self.consume();
@@ -194,7 +194,7 @@ impl TapObserver {
     }
 
     /// 在子进程结束时刷新末尾未换行的残留输出，并结合进程退出状态生成最终 [`ProtocolResult`]。
-    pub(crate) fn finish(mut self, outcome: &ExitOutcome) -> ProtocolResult {
+    pub fn finish(mut self, outcome: &ExitOutcome) -> ProtocolResult {
         if !self.line.is_empty() || self.overflow {
             self.consume();
         }
@@ -238,6 +238,13 @@ impl TapObserver {
             4 if self.zero_skip || self.summary.skipped != 0 => Verdict::Skip,
             _ => Verdict::Failed,
         }
+    }
+}
+
+impl Default for TapObserver {
+    /// 创建空的 TAP 观察器，等价于 [`TapObserver::new`]。
+    fn default() -> Self {
+        Self::new()
     }
 }
 

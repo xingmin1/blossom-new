@@ -156,7 +156,7 @@ $(error KTEST_PANIC_STRATEGY must be unwind or abort)
 endif
 
 .PHONY: all build-kernel build-guest-userland prepare-guest-runtime-libraries assemble-root-filesystem create-ext4-image build-qemu-artifacts build-board-dtb package-board-boot-images
-.PHONY: build-contest-runner user-tests build-kernel-test-elf list-kernel-tests run-kernel-tests run-qemu clean-build-artifacts clean-qemu-working-disks help
+.PHONY: build-contest-runner user-tests build-kernel-test-elf list-kernel-tests run-kernel-tests run-qemu contest clean-build-artifacts clean-qemu-working-disks help
 .PHONY: build-user-selftests install-user-selftests run-user-selftests
 .PHONY: build-linux-user-selftests run-linux-user-selftests
 
@@ -206,6 +206,10 @@ package-board-boot-images: build-kernel
 
 run-qemu:
 	python3 tools/run_qemu.py --arch "$(ARCH)" $(QEMU_ARGS)
+
+contest:
+	$(MAKE) build-qemu-artifacts ARCH=$(ARCH)
+	$(MAKE) run-qemu ARCH=$(ARCH)
 
 clean-qemu-working-disks:
 	python3 tools/working_disks.py clean --arch "$(ARCH)" $(QEMU_ARGS)
@@ -365,6 +369,7 @@ help:
 	  '  BOARD_ROOT_DEVICE, BOARD_ROOT_MODE and BOARD_INIT_PROGRAM map directly to packaging.' \
 	  'run-qemu ARCH=...                   Run existing inputs; QEMU_ARGS passes CLI options unchanged.' \
 	  '  tools/run_qemu.py --help lists session, disk, network and debugger options.' \
+	  'contest ARCH=...                    Rebuild one architecture with build-qemu-artifacts, then run-qemu (QEMU_ARGS forwarded).' \
 	  'clean-qemu-working-disks ARCH=...   Remove inactive root.raw/contest.raw under their lock.' \
 	  '  QEMU_ARGS may select --working-disk-dir; keep sources, directory and unrelated files.' \
 	  'user-tests                         Build the existing raw user ELF programs.' \

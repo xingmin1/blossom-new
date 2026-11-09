@@ -18,8 +18,8 @@
 | 伪文件系统、网络与内核观测 | `fs` 下的 `devfs`、`procfs`、`memfs`、`pipe`、`poll`、`epoll`、`tty` 提供标准系统设备与多路复用接口；[net.rs](../../os/src/net.rs) 下的 `core`、`socket`、`tcp`、`udp`、`unix` 配合 [drivers/virtio_net.rs](../../os/src/drivers/virtio_net.rs)（及板载网卡驱动）提供网络协议栈支持；[klog.rs](../../os/src/klog.rs)、[trace.rs](../../os/src/trace.rs) 及 `/dev/kmsg`、`/dev/ktrace` 提供内核日志与追踪观测接口。 |
 | 系统生命周期管理 | [fs/system.rs](../../os/src/fs/system.rs) 负责挂载并切换真实根文件系统视图；`main` 负责启动 `PID 1`、等待并回收子进程、停止网络子系统、同步并卸载文件系统，最后发起底层关机请求。 |
 | 内核具名测试（`ktest`） | [ktest.rs](../../os/src/ktest.rs) 仅在启用 `ktest` feature 时参与编译，宿主机侧驱动脚本为 [tools/run_kernel_tests.py](../../tools/run_kernel_tests.py)。例如文件写入相关测试位于 [user/write](../../os/src/fs/ktest/user/write/)（共享夹具 `WriteOwner` 定义在 `write.rs` 中）；网络与串口接收测试夹具均按用例实际需求组合。 |
-| 比赛用例选择与执行 | [model.rs](../contest-run/src/model.rs) 定义配置模型与 `ResolvedCase`；[config.rs](../contest-run/src/config.rs) 负责 TOML 解码与一次性静态校验；[selection.rs](../contest-run/src/selection.rs) 根据真实磁盘目录与清单展开待测集合；[execute.rs](../contest-run/src/execute.rs) 负责子进程创建、标准流重定向、超时控制与每轮前后清理；[runtime.rs](../contest-run/src/runtime.rs) 负责挂载目标块设备、准备系统根环境与动态链接器缺失诊断；[report.rs](../contest-run/src/report.rs) 实现各类判题协议解析，[custom.rs](../contest-run/src/custom.rs) 存放特定用例的用户态前置操作。测试计划与集合定义位于 [userland/contest](../contest/)。 |
-| 内核专属测试辅助（Hook） | [contest_hooks.rs](../../os/src/contest_hooks.rs) 通过 `devfs` 的 `/dev/testhook` 节点接收完整控制消息并直接分派；Hook 在控制者进程的普通 `Task` 上下文中执行并复用内核 `trace` 机制（而非在被测进程触发异常或中断的瞬间切入，也不是通用的状态回滚框架）。 |
+| 比赛用例选择与执行 | [model.rs](../contest-run/src/model.rs) 定义配置模型、来源位置与 `ResolvedCase`；[config.rs](../contest-run/src/config.rs) 负责多文件 TOML 加载与静态校验；[expand.rs](../contest-run/src/expand.rs) 做固定字段的单遍模板替换；[selection.rs](../contest-run/src/selection.rs) 按名字、目录或清单展开选择并应用覆盖，[execute.rs](../contest-run/src/execute.rs) 负责一次执行的生命周期与各环节错误记录；[process.rs](../contest-run/src/process.rs) 负责子进程启动、单调时钟期限与进程组收尾；[outcome.rs](../contest-run/src/outcome.rs) 保存进程事实与 TAP 自测结果；[runtime.rs](../contest-run/src/runtime.rs) 负责挂载目标块设备、准备 root 与动态链接器缺失诊断；[custom.rs](../contest-run/src/custom.rs) 负责测试通知设备的单次写入。测试计划与集合定义位于 [userland/contest](../contest/)。 |
+| 内核专属测试辅助（Hook） | [contest_hooks.rs](../../os/src/contest_hooks.rs) 通过 `devfs` 的 `/dev/testhook` 节点接收完整控制消息并直接分派；runner 对每个展开后的 case 自动发送 `before <id>` 与 `after <id>` 通知，未匹配的 ID 不做任何操作。Hook 在控制者进程的普通 `Task` 上下文中执行并复用内核 `trace` 机制（而非在被测进程触发异常或中断的瞬间切入，也不是通用的状态回滚框架）。 |
 | 用户态诊断工具与冒烟测试 | [userland/tools](../tools/) 存放 `klog-read` 与 `ktrace-control`（安装路径为 `/bin/klog-read` 与 `/bin/ktrace-control`）；[tests/user](../../tests/user/) 下的 `libc-smoke`、`network-smoke`、`observation-smoke` 包含用户态测试断言，其中 libc 与网络测试按功能模块拆分为多个独立的 C 编译单元。 |
 
 需要注意，工作区中若存在未挂载到 `main.rs` 模块树的文件（如 `mm/zram.rs`、`fs/swap.rs`、`lang_items.rs` 或早期废弃的设备/文件系统代码），它们并不参与内核编译，不能据此认为内核已支持 zram、swap、用户态 RTC 设备或全部 Linux ABI。日常开发与问题修复应直接在上述活跃模块中进行，不要恢复早期已废弃的 `HAL`、`TCB`、`MemorySet`、旧版用户缓冲区抽象或旧版测试执行入口。
@@ -39,11 +39,11 @@ DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]
   ./runtest.exe -w entry-dynamic.exe stat
 ```
 
-该模式会在 `contest-run` 内部直接构造一个 `ResolvedCase` 并调用同一套正式的 Rust 执行函数（不会转去调用外部 Shell 或 C 语言包装器）。由于单次命令模式默认采用通用的 `Plain` 输出协议，它不会自动套用 `libctest` 专属的“退出码 `1` 结合输出正文判定通过”规则；若需使用特定测试集的判定规则，请通过声明了 `kind="libctest"` 的 `.toml` 计划文件运行。
+该模式会在 `contest-run` 内部构造一个只有一个用例的 `ResolvedCase`，并调用与计划模式相同的 Rust 执行函数（不会转去调用外部 Shell 或 C 语言包装器）。单命令模式不判题：标准输出与标准错误直接继承，主命令的 shell 风格状态作为本次运行的退出码返回（正常退出取原值，信号为 `128 + signal`，超时为 124，命令不存在为 127，权限或格式错误为 126）；主命令未运行时返回 1。
 
-执行过程中，`contest-run` 父进程始终保持在系统根文件系统中，仅在 `fork` 出的被测子进程内执行真实的 `chroot`、`chdir` 与 `execve`。命令行参数数组（`argv`）直接原样传递给 `execve`，不经过任何字符串拼接或 Shell `eval` 展开，因此空字符串参数、包含空格的参数及通配符等特殊字符均能原封不动地传给被测程序；仅当命令显式指定为 `/bin/sh`（或计划中的 `shell` 类型步骤）时，才要求目标子根目录内存在 Shell 解释器。对于动态链接的 ELF 程序，内核会在其切换后的子根目录内查找 `PT_INTERP` 指定的动态链接器与共享库——如果目标子根内缺失所需的链接器或库，执行器不会自动向比赛盘复制文件、不会猜测调用 `/busybox`，也不会用其他 libc 族的库强行覆盖，而是将 `execve` 失败与子进程自身返回退出码 `127` 明确区分并如实记录。
+执行过程中，`contest-run` 父进程始终保持在系统根文件系统中，仅在 `fork` 出的被测子进程内执行真实的 `chroot`、`chdir` 与 `execve`。命令行参数数组（`argv`）直接原样传递给 `execve`，不经过任何字符串拼接或 Shell `eval` 展开，因此空字符串参数、包含空格的参数及通配符等特殊字符均能原封不动地传给被测程序；仅当命令显式指定为 `/bin/sh` 时，才要求目标子根目录内存在 Shell 解释器。对于动态链接的 ELF 程序，内核会在其切换后的子根目录内查找 `PT_INTERP` 指定的动态链接器与共享库——如果目标子根内缺失所需的链接器或库，执行器不会自动向比赛盘复制文件、不会猜测调用 `/busybox`，也不会用其他 libc 族的库强行覆盖，而是将 `execve` 失败与子进程自身返回退出码 `127` 明确区分并如实记录。
 
-单次命令模式使用的 `Plain` 协议会直接继承标准输入（`stdin`），并将标准输出/错误（`stdout`/`stderr`）通过带 `CLOEXEC` 标志的 `dup` 直接交给被测子进程，既不拦截解析输出正文，也不会修改父进程所借用标准流底层打开文件描述（Open File Description, OFD）的状态标志。测试计划中的 `LTP` 用例同样采用这条零拷贝直通路径；只有需要解析输出正文以判定结果的 `Basic` 与固定 `Pre2025` 等协议，才会创建有界内存队列并派生一个仅调用基础 `libc` 读写的输出转发（relay）子进程（父进程仅对自身独占的管道描述符设置非阻塞 `O_NONBLOCK` 标志）。测试结束或超时到达时，父进程会对输出转发子进程执行完整的管道排空（drain）或定向信号终止并 `wait` 回收；若输出转发过程发生 I/O 错误，将独立记录报告，不会篡改被测主进程的原始 `wait` 退出状态。`contest-run` 始终按单线程顺序逐一执行用例，不引入多线程并发池或后台全系统 `/proc` 进程树扫描（关于绝对超时与进程组回收的详细说明请参阅 [公共操作指南](../../docs/development.md#5-比赛配置进程与协议)）。
+单次命令模式直接继承标准输入（`stdin`），并把标准输出/错误（`stdout`/`stderr`）交给被测子进程，不拦截、不解析输出正文。比赛路径（单命令模式与计划中的全部用例）都采用这条直通路径；`user-selftests` 的 TAP 自测仍通过管道与输出转发（relay）捕获 stdout 并解析协议，其父进程仅对自身独占的管道描述符设置非阻塞 `O_NONBLOCK`。测试结束或超时到达时，父进程对输出转发子进程执行完整的管道排空（drain）或定向信号终止并 `wait` 回收；若输出转发过程发生 I/O 错误，将独立记录报告，不会篡改被测主进程的原始 `wait` 退出状态。`contest-run` 始终按单线程顺序逐一执行用例，不引入多线程并发池或后台全系统 `/proc` 进程树扫描（关于绝对超时与进程组回收的详细说明请参阅 [公共操作指南](../../docs/development.md#5-比赛配置进程与执行)）。
 
 仓库自带的 [contest-argv](../../tests/user/scripts/contest-argv) 脚本专门用于校验参数原样传递与工作目录切换。该脚本仅安装在项目**自有的非评分测试根** `/tests` 目录下（且该根内实际包含 `/bin/sh`），切勿将其注入官方比赛测试盘中：
 
@@ -57,7 +57,7 @@ DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]
 ## 学生与 agent 的最短修改路线
 
 1. **仅调整测试集合选择、命令行参数、`root`/`cwd`、超时时间或重复次数**：直接修改 `userland/contest/` 下的 `.toml` 配置文件，先用 `--list` 核对展开后的实际用例列表，再定向运行测试。虽然装配时会将整个 `userland/contest/` 目录打包进 `/etc/contest/`，但只有被入口计划文件显式引用的配置才会生效。注意：如果复用了已有的 QEMU 工作盘目录，必须显式传入 `--working-disk-action refresh-system` 才会将更新后的系统根镜像写入 `root.raw`（使用 `reuse` 不会更新系统盘内容）。
-2. **新增判题结果解析协议或特定用例的用户态环境准备**：修改 `userland/contest-run/src/` 下对应的具体模块，并补充宿主机侧单元测试；涉及真实的 `execve`、超时控制、`PT_INTERP` 动态链接器解析与输出捕获的行为，仍须在 QEMU 客体系统中实际运行验证。编写前置操作时请注意区分执行上下文：`case.setup` / `case.cleanup` 运行在切换后的用例子根目录（case root）内，而 `roots.NAME.prepare` 则运行在父系统根目录内。
+2. **修改执行生命周期或增加特定用例的用户态环境准备**：修改 `userland/contest-run/src/` 下对应的具体模块，并补充宿主机侧单元测试；涉及真实的 `execve`、超时控制、`PT_INTERP` 动态链接器解析与通知设备写入的行为，仍须在 QEMU 客体系统中实际运行验证。执行器不判题，比赛结果由外部 judge 判定；专属内核行为在 `os/src/contest_hooks.rs` 中按 case ID 匹配，或在对应内核位置直接处理。编写前置操作时区分执行上下文：`case.setup` / `case.cleanup` 运行在切换后的用例子根目录（case root）内，而 `roots.NAME.prepare` 则运行在父系统根目录内。
 3. **实现新的内核系统调用 ABI 或修复并发/内存缺陷**：直接在内核对应的活跃子系统模块中修改，并补充针对性的最小 `ktest` 内核测试或 `user-selftests` 回归测试。运行内核测试前先通过 `make list-kernel-tests` 获取完整的具名用例路径，再按名称定向执行。修复问题时必须保持真实的系统调用 ABI、准确的错误码（errno）、确定性的并发交错控制、失败路径的资源回滚以及完整的线程停止与内存释放，切勿通过人为清零统计计数器的方式来凑出表面通过。
 4. **仅需读取内核日志或控制追踪缓冲区**：直接使用 `userland/tools/` 下的现成工具（`/bin/klog-read` 与 `/bin/ktrace-control`）；若需编写带断言的回归测试，请放在 `tests/user/` 目录下。无需将所有 C 语言测试程序重写为 Rust，也不要为每一个普通比赛用例都在内核中添加空的 `ktest` 或 `testhook` 分支。
 

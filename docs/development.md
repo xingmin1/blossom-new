@@ -127,7 +127,7 @@ make clean-qemu-working-disks ARCH=riscv64 QEMU_ARGS='--working-disk-dir build/m
 | 内核内部数据结构、错误路径与并发交错 | `list-kernel-tests` / `run-kernel-tests`（仅在双架构 QEMU 上运行）；由测试夹具（Fixture）在停止后台线程、等待回收并释放对象后校验内核资源状态 |
 | 标准 Linux 用户态行为与系统调用契约 | 独立的 `user-selftests` 执行器、默认 C 测试程序与标准 TAP 协议输出；无需挂载比赛盘，也不启用内核 `ktest` 特性 |
 | 用户态初始栈布局、原始 errno、signal/clone 寄存器现场 | 由 `user-tests` 构建极简探测程序（raw probe），通过对应的内核具名测试夹具加载执行，同时在内核态校验内部状态 |
-| 官方比赛测试盘与原始判题协议 | `/sbin/contest-run`，严格按照当前挂载的比赛盘内容、TOML 计划与对应判题协议执行并解析结果 |
+| 官方比赛测试盘与测试计划 | `/sbin/contest-run`，按 TOML 计划在比赛盘上执行选中用例并输出原始文本；不解析判定规则，测试结果由外部 judge 判定 |
 
 ### 内核具名测试
 
@@ -179,24 +179,24 @@ make run-linux-user-selftests
 
 宿主机原生运行结果仅用于对照标准 Linux 行为，不能作为目标架构（RISC-V / LoongArch）内核的验证依据；其中合法的 UDP 大报文分片测试依赖宿主机网络栈配置支持，不得通过改小测试报文长度来迁就受限的宿主环境。
 
-## 5. 比赛配置、进程与协议
+## 5. 比赛配置、进程与执行
 
 ```sh
 /sbin/contest-run /dev/vda --list
-/sbin/contest-run /dev/vda --plan /etc/contest/plan-onsite.toml --list
-/sbin/contest-run /dev/vda --plan /etc/contest/plan.toml \
-  --file sets/basic.toml --file sets/libctest.toml
+/sbin/contest-run /dev/vda --plan /etc/contest/onsite-plan.toml --list
+/sbin/contest-run /dev/vda --only 'basic:musl:getpid' --timeout-sec 120 --finish return
+/sbin/contest-run /dev/vda --file sets/ltp.toml --list
 ```
 
-比赛测试计划与集合配置位于 [userland/contest](../userland/contest/)。命令行接口格式为 `DEVICE [--plan FILE] [--file FILE ...] [--list]`；传入 `--list` 时仅挂载目标设备并解析、校验本次配置与磁盘文件列表，不执行环境准备（prepare/setup）、内核 Hook、测试子进程或系统关机。默认计划只会加载配置文件中显式引用的集合，不会因为目录中存在其他 `.toml` 文件而自动将其纳入运行。
+测试计划与集合配置位于 [userland/contest](../userland/contest/)；面向运行人员的完整说明见 [比赛测试执行手册](contest-run.md)。命令行格式为 `DEVICE [--plan FILE] [--file FILE]... [--list] [--only PATTERN]... [--timeout-sec N] [--repeat N] [--verbose] [--finish poweroff|return]`，显式单命令模式为 `DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]`。`--file` 整体替换主计划的 `files`，主计划的 `roots`、`defaults` 与 `finish` 保留；`--only` 按完整 ID 的 glob 缩小选择集；`--timeout-sec` 与 `--repeat` 覆盖全部已选用例，不作用于 setup、cleanup 与 prepare。`--list` 只挂载设备并解析、校验配置与磁盘文件，不执行 prepare/setup/cleanup、内核通知、测试子进程或关机。默认计划只加载 `files` 显式引用的集合，不会因为目录中存在其他 `.toml` 文件而自动将其纳入运行。
 
-配置文件中的相对路径（`files`）均相对于当前入口文件解析，解析与合并顺序依次为：入口 `step`、`files`、`roots`、`include`。`exclude` 过滤规则仅作用于当前 `step`；若精确名称或通配模式未匹配到任何用例、最终选择集为空或存在定义冲突，执行器会直接报错退出。`override` 仅用于修改已选中用例的参数（如超时或重复次数），不会重新引入已被排除的用例。`exec` 模式严格保持原始 `argv` 数组直接调用 `execve`，仅在 `shell` 模式下才会调用显式指定的 Shell 解释器。工作目录（`cwd`）、绝对路径符号链接、动态链接器（`PT_INTERP`）及共享库（DSO）均在目标子根目录（chroot）内实际解析；若目标根缺少动态链接器，执行器会如实报告 `exec` 错误，而不会通过修改环境变量或借用其他 libc 族的库来掩盖问题。
+`files` 路径相对主计划文件所在目录，只加载一层；group 文件只允许 `[[group]]`，override 文件只允许 `[[override]]`。step 的候选来源是 `names`、`directory` 或 `catalog` 三者之一：`names` 按原顺序取名字，`directory` 列出有效 `cwd` 中具有执行位的普通文件并按文件名排序，`catalog` 读取清单文件每行首个词作为名字、其余部分作为 `{command}` 原文。`include` 省略等价于 `["*"]`，某个 include 未匹配任何候选时执行器报错；`exclude` 无匹配不报错。选择按文件、group、root、step 的顺序展开，同一 root 内跑完该组全部 step 后再切换下一个 root。有效工作目录按 step、group、root 的优先级取第一个已声明值，环境变量按 root、group、step 的顺序按键合并。`override` 只修改已选中用例的字段，不会把用例重新加入计划；未命中的覆盖项在 `--list` 与 `--verbose` 中提示。最终选择集为空、ID 重复或 step 未给出或给出多个候选来源时按配置错误处理。
 
-每一轮测试严格按照 `setup` → `before` → 启动被测子进程并收集输出 → 对应的 `after` → `cleanup` 顺序执行；被测进程的 `wait` 状态、`exec` 错误码（errno）、超时事件以及 Hook/清理阶段的错误均分别独立记录。每个用例在启动前都会建立一次基于单调时钟（monotonic clock）的绝对截止时间，串口或标准输出持续产生日志不会延长该期限；到达截止时间或测试结束时，执行器会对所属范围内的进程执行真实的信号终止（`kill`）与回收等待（`wait`）。
+每个展开后的用例按 `setup` → `before` 文本 → 主命令 → `after` 文本 → `cleanup` 的顺序执行。用例开始前向执行器所在系统根中的 `/dev/testhook` 发送 `before <case-id>`，执行结束后发送 `after <case-id>`；[contest_hooks.rs](../os/src/contest_hooks.rs) 对未知 ID 直接返回成功，不执行操作。通知失败、cleanup 失败、输出失败或 setup/主命令的进程控制未收尾会停止会话；进程控制失败时不再写 `after` 文本、执行 cleanup 或发送 `after` 通知。setup 命令非零退出、超时与信号终止只结束当前用例，清理后继续下一例。`after` 文本以主命令的 shell 风格状态展开 `{status}`。
 
-在输出协议处理上，`Plain` 与 `LTP` 模式直接让子进程继承标准输出/错误文件描述符；需要解析输出正文的 `Basic`、固定 `Pre2025` 与 `Tap` 模式则通过有界缓冲区捕获并转发输出。各判题协议严格遵循其原始判定规则，标准输出中夹带的普通 `PASS`/`FAIL` 文本不会覆盖协议解析结果。配置层面的显式跳过（Skip）、动态链接器缺失与进程启动后运行失败属于三种截然不同的状态，绝不混为一谈。
+比赛路径不捕获、不解析、不转发测试输出：子进程直接继承标准输入、标准输出和标准错误，程序与脚本打印的正文原样出现在串口。每个用例按单调时钟设置绝对期限，持续日志不会延长期限；到期先向进程组发送 `SIGTERM`，再发送 `SIGKILL` 并回收组首进程。进程组不追踪自行 `setsid` 脱离的后代。超时、信号终止与 `exec` 失败属于执行错误并记录诊断；普通非零退出不是执行错误，执行器不判定测试结果，也不解析 `PASS`/`FAIL` 文本，比赛结果由对应版本的外部 judge 判定。
 
-内核专属测试辅助（Hook）仅在确有必要时通过 [contest_hooks.rs](../os/src/contest_hooks.rs) 与配置项 `hooks=true` 启用，不为普通测试用例添加空操作分支。Hook 逻辑运行在控制者进程的普通可睡眠任务上下文中（而非目标进程的缺页异常或中断上下文），因此全局状态观测结果中可能包含系统后台任务的活动。关于运行库准备与源码模块结构的详细说明请参阅 [runtime 开发导读](../userland/runtime/development.md)。
+计划模式退出码 `0` 表示编排完成且无执行错误，`1` 表示存在执行错误，`2` 表示命令行、配置或选择错误。单命令模式透传主命令的 shell 风格状态。退出码 `0` 只说明调度执行完成，不是成绩。关于运行库准备与源码模块结构的详细说明请参阅 [runtime 开发导读](../userland/runtime/development.md)。
 
 ## 6. 四平台布局与人工上板
 

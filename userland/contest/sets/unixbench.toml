@@ -1,0 +1,9 @@
+# 执行盘内原脚本；脚本自己输出组标记，group 不写 start/end。
+[[group]]
+name = "unixbench"
+roots = ["musl", "glibc"]
+
+[[group.step]]
+names = ["script"]
+exec = ["/busybox", "sh", "/unixbench_testcode.sh"]
+timeout_sec = 3600

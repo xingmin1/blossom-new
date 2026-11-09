@@ -1,0 +1,16 @@
+# 与 ltp.toml 二选一，不能同时生成同一个 ltp/root 分组。
+# 只有盘内确实包含该清单时才能使用；不存在时不会自动扫描目录顶替。
+[[group]]
+name = "ltp"
+roots = ["musl", "glibc"]
+cwd = "/"
+env = { LTPROOT = "/ltp", TMPDIR = "/tmp" }
+start = "#### OS COMP TEST GROUP START ltp-{root} ####\n"
+end = "#### OS COMP TEST GROUP END ltp-{root} ####\n"
+
+[[group.step]]
+catalog = "/ltp/runtest/syscalls"
+include = ["open*", "fork*", "waitpid*"]
+exec = ["/busybox", "sh", "-c", "{command}"]
+before = "RUN LTP CASE {name}\n"
+after = "FAIL LTP CASE {name} : {status}\n"

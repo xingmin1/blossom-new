@@ -1,0 +1,13 @@
+# 示例假定比赛盘根目录有 /tests，程序及其解释器/共享库路径已配套。
+files = ["sets/onsite.toml"]
+finish = "poweroff"
+
+[defaults]
+timeout_sec = 60
+repeat = 1
+
+[roots.onsite]
+path = "/mnt/contest"
+cwd = "/tests"
+mounts = ["dev", "proc", "tmp"]
+env = { PATH = "/bin:/usr/bin", LD_LIBRARY_PATH = "/runtime/lib", HOME = "/" }

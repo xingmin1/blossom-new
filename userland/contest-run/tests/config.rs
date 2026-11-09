@@ -1,29 +1,13 @@
-//! `contest-run` 测试计划配置加载（`config`）与用例选择展开（`selection`）集成测试集。
+//! `contest-run` 计划加载（`config`）与用例选择展开（`selection`）的集成测试。
 //!
-//! # 模块职责与架构定位
-//! 本文件作为 `contest-run` 的外部集成测试，针对 [`contest_run::config::load`] 与 [`contest_run::selection::resolve`] 构成的完整输入与选择流水线进行端到端验证，覆盖：
-//! 1. 多文件引入顺序、目标根目录（`roots`）迭代顺序、通配符（Glob）匹配与排除（`exclude`）规则；
-//! 2. 命令行显式子配置文件列表覆盖与防递归引入保护；
-//! 3. `Exec`、Shell 与 LTP `runtest` 清单命令的参数原样保留语义；
-//! 4. 多级环境变量合并、`override` 精确覆盖、重复 ID 去重与冲突检测；
-//! 5. 目标根目录下的相对/绝对符号链接（Symlink）受限解析行为。
-//!
-//! # 测试夹具与隔离布局（[`Tree`]）
-//! ```text
-//! $TMPDIR/contest-config-<pid>-<seq>/    <-- Tree(PathBuf) 独立临时目录（Drop 时自动清理）
-//! ├── plan.toml                          <-- 顶层测试计划文件
-//! ├── sets/*.toml / override.toml        <-- 子步骤文件与覆盖规则文件
-//! └── root/                              <-- 模拟的目标系统根目录 (roots.a / roots.b)
-//!     ├── catalog / run-dynamic.sh       <-- 文本测试清单
-//!     └── cases/* / basic/*              <-- 具有 0o755 权限的可执行脚本或符号链接
-//! ```
-//!
-//! # 锁获取顺序与并发契约
-//! 各测试用例通过全局原子计数器 [`NEXT`] 生成互不冲突的临时子目录，支持 `cargo test` 多线程并行运行，无需共享互斥锁。
+//! 覆盖文件组合顺序、静态输入边界、root-major 展开、cwd/env/超时优先级、覆盖规则、`--only` 过滤、
+//! 目录与清单来源的 root 内解析，以及仓库实际发布的计划文件。每个测试在自己的临时目录里构造计划与
+//! 假测试根，互不共享可变状态，可并行运行。
 
 use contest_run::config;
-use contest_run::model::{CommandSpec, Protocol};
-use contest_run::selection;
+use contest_run::expand::expand;
+use contest_run::model::{Config, ResolvedCase};
+use contest_run::selection::{self, Selection};
 use std::fmt::Write;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -31,14 +15,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 用于为每个测试实例分配唯一临时目录序号的全局原子递增计数器。
+/// 为每个夹具分配唯一临时目录序号，避免并行测试互相覆盖。
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// 单个测试用例独占的临时目录夹具（RAII 守卫，在析构时自动递归删除整个目录）。
+/// 测试专用的临时目录树，析构时整体删除。
 struct Tree(PathBuf);
 
 impl Tree {
-    /// 在系统临时目录下创建一个带进程号与递增序号的独立测试目录。
+    /// 在系统临时目录下建立带进程号与序号的空目录。
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "contest-config-{}-{}",
@@ -49,52 +33,773 @@ impl Tree {
         Self(path)
     }
 
-    /// 将相对路径拼接到当前测试临时目录根路径下，返回完整路径。
+    /// 把相对路径拼到夹具根下。
     fn path(&self, relative: &str) -> PathBuf {
         self.0.join(relative)
     }
 
-    /// 在测试临时目录内创建指定相对路径的文件（自动创建缺失的父目录）并写入文本内容。
+    /// 写入文本文件，自动创建缺失的父目录。
     fn put(&self, relative: &str, contents: &str) {
         let path = self.path(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
     }
 
-    /// 在测试临时目录内创建一个最小可执行 Shell 脚本，并将其权限位设置为 `0o755`。
+    /// 写入一个权限为 `0o755` 的最小可执行脚本，供目录扫描选中。
     fn executable(&self, relative: &str) {
         self.put(relative, "#!/bin/sh\nexit 0\n");
         fs::set_permissions(self.path(relative), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// 生成指向同一个 `root` 子目录的两个根目录（`roots.a` 与 `roots.b`）的 TOML 配置片段，用于测试多 `roots` 展开顺序。
+    /// 生成指向同一个 `root/` 的 `roots.a`、`roots.b` 配置片段。
     fn roots(&self) -> String {
         format!(
-            "[roots.a]\npath = {:?}\ncwd = '/'\n[roots.b]\npath = {:?}\ncwd = '/'\n",
+            "[roots.a]\npath = {:?}\n[roots.b]\npath = {:?}\n",
             self.path("root"),
             self.path("root")
         )
     }
 
-    /// 加载指定相对路径的测试计划文件，并按 `"riscv64"` 架构解析展开为 [`contest_run::model::ResolvedCase`] 列表。
-    fn resolve(&self, plan: &str) -> Result<Vec<contest_run::model::ResolvedCase>, String> {
-        let config = config::load(&self.path(plan), &[])?;
-        selection::resolve(&config, "riscv64")
+    /// 加载夹具内的计划文件。
+    fn load(&self, plan: &str) -> Result<Config, String> {
+        config::load(&self.path(plan), &[])
+    }
+
+    /// 以 `riscv64` 加载并展开计划。
+    fn resolve(&self, plan: &str) -> Result<Selection, String> {
+        self.resolve_only(plan, &[])
+    }
+
+    /// 以 `riscv64` 加载计划并按 `only` 过滤展开。
+    fn resolve_only(&self, plan: &str, only: &[String]) -> Result<Selection, String> {
+        let config = self.load(plan)?;
+        selection::resolve(&config, "riscv64", only)
+    }
+
+    /// 断言计划在选择阶段被拒绝并返回错误文本；成功说明测试前提已失效。
+    fn error(&self, plan: &str) -> String {
+        match self.resolve(plan) {
+            Ok(_) => panic!("expected {plan} to be rejected"),
+            Err(error) => error,
+        }
+    }
+
+    /// 断言带 `only` 的选择被拒绝并返回错误文本；成功说明测试前提已失效。
+    fn error_only(&self, plan: &str, only: &[String]) -> String {
+        match self.resolve_only(plan, only) {
+            Ok(_) => panic!("expected {plan} to be rejected for {only:?}"),
+            Err(error) => error,
+        }
     }
 }
 
 impl Drop for Tree {
-    /// 测试结束时递归清理当前测试实例创建的临时目录。
+    /// 测试结束时递归清理夹具目录。
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
 
-/// 验证多配置文件、`roots` 列表、`include` 精确名与通配符（Glob）、`exclude` 排除项的展开顺序及源文件行号溯源。
-///
-/// - **测试目标**：确认 `selection::resolve` 严格按照文件顺序 -> `roots` 顺序 -> `include` 顺序 -> 清单行顺序生成用例，并准确记录清单文件路径与行号。
-/// - **场景步骤**：构造包含两个子文件、两个 root（`['b', 'a']`）、多条 `include` 模式与 `exclude` 过滤的测试计划并解析。
-/// - **预期结果**：返回的 ID 序列与预期顺序完全一致，且 `source` 元数据准确指向 `/catalog` 第 2 行。
+/// 按执行顺序把全部结果组展平为用例序列。
+fn cases(selection: &Selection) -> Vec<&ResolvedCase> {
+    selection
+        .groups
+        .iter()
+        .flat_map(|group| group.cases.iter())
+        .collect()
+}
+
+/// 按执行顺序取出全部用例 ID，便于断言展开顺序。
+fn ids(selection: &Selection) -> Vec<&str> {
+    selection
+        .groups
+        .iter()
+        .flat_map(|group| group.cases.iter())
+        .map(|case| case.id.as_str())
+        .collect()
+}
+
+/// 取首组首例，只在测试已确认唯一或只关心首例时使用。
+fn first(selection: &Selection) -> &ResolvedCase {
+    &selection.groups[0].cases[0]
+}
+
+/// 把字符串字面量列表转成 `selection::resolve` 的 `only` 参数。
+fn only(patterns: &[&str]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|pattern| (*pattern).to_owned())
+        .collect()
+}
+
+/// 单遍替换对未闭合花括号、空占位符与未知键必须原样保留，避免把普通文本当模板吞掉。
+#[test]
+fn expand_keeps_unknown_and_unterminated_braces() {
+    assert_eq!(expand("tail {", &[("name", "x")]), "tail {");
+    assert_eq!(expand("{} {missing}", &[("name", "x")]), "{} {missing}");
+    assert_eq!(expand("{name} {name", &[("name", "x")]), "x {name");
+}
+
+/// 显式 ID 模板按 root 与名字替换，未写 ID 的步骤取 `{group}:{root}:{name}` 默认值。
+#[test]
+fn id_template_replaces_group_root_and_name() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"libctest\"\nroots = [\"a\"]\n\
+             [[group.step]]\nid = \"libctest:{{root}}:dynamic:{{name}}\"\nnames = [\"alpha\"]\nexec = [\"/run\", \"{{name}}\"]\n\
+             [[group.step]]\nid = \"libctest:{{root}}:static:{{name}}\"\nnames = [\"alpha\"]\nexec = [\"/run\", \"{{name}}\"]\n\
+             [[group]]\nname = \"plain\"\nroots = [\"a\"]\n\
+             [[group.step]]\nnames = [\"beta\"]\nexec = [\"/run\", \"{{name}}\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(
+        ids(&selection),
+        [
+            "libctest:a:dynamic:alpha",
+            "libctest:a:static:alpha",
+            "plain:a:beta"
+        ]
+    );
+}
+
+/// 空白 ID 无法写进设备消息，必须报错；504 字节是单条消息允许的最大 ID，505 字节即越界。
+#[test]
+fn case_id_with_whitespace_or_overlong_is_rejected() {
+    let tree = Tree::new();
+    let plan = |id: &str| {
+        format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nid = {id:?}\nnames = [\"n\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        )
+    };
+
+    tree.put("plan.toml", &plan("bad id"));
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("invalid case ID"),
+        "unexpected error: {error}"
+    );
+
+    let fits = "a".repeat(504);
+    tree.put("plan.toml", &plan(&fits));
+    assert_eq!(first(&tree.resolve("plan.toml").unwrap()).id, fits);
+
+    let too_long = "a".repeat(505);
+    tree.put("plan.toml", &plan(&too_long));
+    let error = tree.error("plan.toml");
+    assert!(error.contains("too long"), "unexpected error: {error}");
+}
+
+/// 全局 ID 重复必须报错并指出两处来源，覆盖跨文件两个分组撞 ID、同一组内两个步骤撞 ID，以及覆盖规则无法消解的情形。
+#[test]
+fn duplicate_case_ids_report_both_sources() {
+    let tree = Tree::new();
+    tree.put(
+        "one.toml",
+        "[[group]]\nname = \"one\"\nroots = [\"a\"]\n[[group.step]]\nid = \"same\"\nnames = [\"x\"]\nexec = [\"/x\"]\n",
+    );
+    tree.put(
+        "two.toml",
+        "[[group]]\nname = \"two\"\nroots = [\"a\"]\n[[group.step]]\nid = \"same\"\nnames = [\"x\"]\nexec = [\"/x\"]\n",
+    );
+    tree.put(
+        "plan.toml",
+        &format!("files = [\"one.toml\", \"two.toml\"]\n{}", tree.roots()),
+    );
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("duplicate case ID")
+            && error.contains("one.toml group 1 step 1")
+            && error.contains("two.toml group 1 step 1"),
+        "unexpected error: {error}"
+    );
+
+    tree.put(
+        "plan.toml",
+        &format!(
+            "override_files = [\"fix.toml\"]\nfiles = [\"one.toml\", \"two.toml\"]\n{}",
+            tree.roots()
+        ),
+    );
+    tree.put(
+        "fix.toml",
+        "[[override]]\nid = \"same\"\nexec = [\"/fixed\"]\n",
+    );
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("duplicate case ID"),
+        "unexpected error: {error}"
+    );
+
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n\
+             [[group.step]]\nid = \"same\"\nnames = [\"x\"]\nexec = [\"/x\"]\n\
+             [[group.step]]\nid = \"same\"\nnames = [\"y\"]\nexec = [\"/y\"]\n",
+            tree.roots()
+        ),
+    );
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("group 1 step 1") && error.contains("group 1 step 2"),
+        "unexpected error: {error}"
+    );
+}
+
+/// 一个分组在多个 root 上展开时按 root-major 排序：每个 root 先跑完全部步骤，且每个 (分组, root) 只产生一个结果组。
+#[test]
+fn root_major_order_emits_one_group_per_root() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"order\"\nroots = [\"a\", \"b\"]\n\
+             start = \"START {{group}}-{{root}}\\n\"\nend = \"END {{group}}-{{root}}\\n\"\n\
+             [[group.step]]\nid = \"dynamic:{{root}}:{{name}}\"\nnames = [\"one\", \"two\"]\nexec = [\"/d\"]\n\
+             [[group.step]]\nid = \"static:{{root}}:{{name}}\"\nnames = [\"one\"]\nexec = [\"/s\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(selection.groups.len(), 2);
+    assert_eq!(selection.groups[0].root, "a");
+    assert_eq!(selection.groups[0].start, "START order-a\n");
+    assert_eq!(selection.groups[0].end, "END order-a\n");
+    assert_eq!(selection.groups[1].root, "b");
+    assert_eq!(selection.groups[1].start, "START order-b\n");
+    assert_eq!(
+        ids(&selection),
+        [
+            "dynamic:a:one",
+            "dynamic:a:two",
+            "static:a:one",
+            "dynamic:b:one",
+            "dynamic:b:two",
+            "static:b:one"
+        ]
+    );
+}
+
+/// 有效 cwd 依次取步骤、分组、测试根，相对目录按该 cwd 解析，绝对目录始终相对测试 root。
+#[test]
+fn cwd_precedence_drives_directory_resolution() {
+    let tree = Tree::new();
+    tree.executable("root/groupcwd/cases/fromgroup");
+    tree.executable("root/stepcwd/cases/fromstep");
+    tree.executable("root/rootcwd/cases/fromroot");
+    tree.executable("root/abs/fromabs");
+    tree.put(
+        "plan.toml",
+        &format!(
+            "[roots.a]\npath = {:?}\ncwd = \"/rootcwd\"\n\
+             [[group]]\nname = \"grouped\"\nroots = [\"a\"]\ncwd = \"/groupcwd\"\n\
+             [[group.step]]\ndirectory = \"cases\"\nexec = [\"/cases/{{name}}\"]\n\
+             [[group.step]]\ncwd = \"/stepcwd\"\ndirectory = \"cases\"\nexec = [\"/cases/{{name}}\"]\n\
+             [[group.step]]\ncwd = \"/stepcwd\"\ndirectory = \"/abs\"\nexec = [\"/abs/{{name}}\"]\n\
+             [[group]]\nname = \"rooted\"\nroots = [\"a\"]\n\
+             [[group.step]]\ndirectory = \"cases\"\nexec = [\"/cases/{{name}}\"]\n",
+            tree.path("root")
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    let names: Vec<(&str, &Path)> = cases(&selection)
+        .iter()
+        .map(|case| (case.name.as_str(), case.cwd.as_path()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("fromgroup", Path::new("/groupcwd")),
+            ("fromstep", Path::new("/stepcwd")),
+            ("fromabs", Path::new("/stepcwd")),
+            ("fromroot", Path::new("/rootcwd"))
+        ]
+    );
+}
+
+/// 环境变量按 root、分组、步骤逐层按键覆盖；步骤的超时与重复次数覆盖 defaults，未指定时仍取 defaults。
+#[test]
+fn environment_and_timing_follow_layer_priority() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "[defaults]\ntimeout_sec = 17\nrepeat = 2\n\
+             [roots.a]\npath = {:?}\nenv = {{ R = \"root\", SAME = \"root\", ROOT = \"yes\" }}\n\
+             [[group]]\nname = \"g\"\nroots = [\"a\"]\nenv = {{ G = \"group\", SAME = \"group\" }}\n\
+             [[group.step]]\nnames = [\"full\"]\nexec = [\"/x\"]\nenv = {{ S = \"step\", SAME = \"step\" }}\ntimeout_sec = 5\nrepeat = 3\n\
+             [[group.step]]\nnames = [\"plain\"]\nexec = [\"/x\"]\n",
+            tree.path("root")
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    let full = &selection.groups[0].cases[0];
+    assert_eq!(full.env["SAME"], "step");
+    assert_eq!(full.env["R"], "root");
+    assert_eq!(full.env["G"], "group");
+    assert_eq!(full.env["S"], "step");
+    assert_eq!(full.env["ROOT"], "yes");
+    assert_eq!(full.timeout_sec, 5);
+    assert_eq!(full.repeat, 3);
+    let plain = &selection.groups[0].cases[1];
+    assert_eq!(plain.env["SAME"], "group");
+    assert!(!plain.env.contains_key("S"));
+    assert_eq!(plain.timeout_sec, 17);
+    assert_eq!(plain.repeat, 2);
+}
+
+/// `--only` 只按完整 ID 缩小已选集合：不加入新用例、丢掉空组，过滤后为空或模式非法都报错。
+#[test]
+fn only_narrows_full_ids_and_rejects_empty_results() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"one\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"first\", \"second\"]\nexec = [\"/x\"]\n\
+             [[group]]\nname = \"two\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"third\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+
+    let selection = tree
+        .resolve_only("plan.toml", &only(&["one:a:first"]))
+        .unwrap();
+    assert_eq!(selection.groups.len(), 1);
+    assert_eq!(ids(&selection), ["one:a:first"]);
+
+    let selection = tree
+        .resolve_only("plan.toml", &only(&["one:a:sec*"]))
+        .unwrap();
+    assert_eq!(ids(&selection), ["one:a:second"]);
+
+    let selection = tree.resolve_only("plan.toml", &only(&["one:*"])).unwrap();
+    assert_eq!(ids(&selection), ["one:a:first", "one:a:second"]);
+
+    for pattern in ["first", "two:a:missing"] {
+        let error = tree.error_only("plan.toml", &only(&[pattern]));
+        assert!(
+            error.contains("empty selection"),
+            "unexpected error: {error}"
+        );
+    }
+    let error = tree.error_only("plan.toml", &only(&["["]));
+    assert!(
+        error.contains("invalid pattern"),
+        "unexpected error: {error}"
+    );
+}
+
+/// 目录来源只取普通且有执行位的文件并排序；include 省略等于全选，重叠模式去重，exclude 无命中不报错。
+#[test]
+fn directory_scan_sorts_executables_and_include_dedups() {
+    let tree = Tree::new();
+    tree.executable("root/cases/zeta");
+    tree.executable("root/cases/alpha");
+    tree.put("root/cases/data", "not executable");
+    fs::create_dir_all(tree.path("root/cases/nested")).unwrap();
+    tree.executable("root/cases/nested/deep");
+
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"scan\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"/cases\"\nexec = [\"/cases/{{name}}\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["scan:a:alpha", "scan:a:zeta"]);
+    assert_eq!(first(&selection).argv, ["/cases/alpha"]);
+    assert_eq!(
+        first(&selection).source.catalog.as_deref(),
+        Some(Path::new("/cases"))
+    );
+    assert_eq!(first(&selection).source.line, None);
+
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"scan\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"/cases\"\ninclude = [\"alpha*\", \"alpha\"]\nexclude = [\"missing\"]\nexec = [\"/cases/{{name}}\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["scan:a:alpha"]);
+}
+
+/// 任一 include 模式在候选里完全没有命中都必须报错并指明步骤与来源路径，避免静默少跑用例。
+#[test]
+fn include_without_match_reports_step_and_path() {
+    let tree = Tree::new();
+    tree.executable("root/cases/alpha");
+    let plan = |include: &str| {
+        format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"/cases\"\ninclude = [{include}]\nexec = [\"/cases/{{name}}\"]\n",
+            tree.roots()
+        )
+    };
+
+    tree.put("plan.toml", &plan("\"alpha\""));
+    assert_eq!(ids(&tree.resolve("plan.toml").unwrap()), ["g:a:alpha"]);
+
+    tree.put("plan.toml", &plan("\"alpha\", \"zzz\""));
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("group 1 step 1")
+            && error.contains("/cases")
+            && error.contains("matched no candidate"),
+        "unexpected error: {error}"
+    );
+}
+
+/// names 的元素就是名字本身，不展开 glob；与 include/exclude 同时出现属于双重选择，加载即拒绝。
+#[test]
+fn names_are_literal_and_reject_pattern_fields() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"open*\", \"plain\"]\nexec = [\"/cases/{{name}}\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["g:a:open*", "g:a:plain"]);
+    assert_eq!(first(&selection).name, "open*");
+
+    for extra in ["include = [\"*\"]", "exclude = [\"*\"]"] {
+        tree.put(
+            "plan.toml",
+            &format!(
+                "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"plain\"]\n{extra}\nexec = [\"/cases/{{name}}\"]\n",
+                tree.roots()
+            ),
+        );
+        let error = tree.load("plan.toml").unwrap_err();
+        assert!(
+            error.contains("group 1 step 1") && error.contains("explicit selection"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// 覆盖规则整体替换 argv、setup、cleanup 与模板，env 按键合并；未覆盖字段仍取步骤值与 defaults。
+#[test]
+fn override_replaces_arrays_and_merges_environment() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "override_files = [\"override.toml\"]\n\
+             [defaults]\ntimeout_sec = 17\nrepeat = 2\n\
+             [roots.a]\npath = {:?}\nenv = {{ R = \"root\", SAME = \"root\", ROOT = \"yes\" }}\n\
+             [[group]]\nname = \"g\"\nroots = [\"a\"]\nenv = {{ G = \"group\", SAME = \"group\" }}\n\
+             [[group.step]]\nnames = [\"case\"]\nexec = [\"/old\", \"{{name}}\"]\nenv = {{ S = \"step\", SAME = \"step\" }}\n\
+             timeout_sec = 5\nrepeat = 3\nsetup = [[\"/old-setup\"]]\ncleanup = [[\"/old-clean\"]]\n\
+             before = \"BEFORE {{name}}\\n\"\nafter = \"AFTER {{name}} {{status}}\\n\"\n\
+             [[group.step]]\nnames = [\"plain\"]\nexec = [\"/bin/plain\"]\n",
+            tree.path("root")
+        ),
+    );
+    tree.put(
+        "override.toml",
+        "[[override]]\nid = \"g:a:case\"\nexec = [\"/new\", \"{name}\", \"a b\"]\n\
+         env = { O = \"override\", SAME = \"override\" }\ntimeout_sec = 19\nrepeat = 4\n\
+         setup = []\ncleanup = [[\"/cleanup\", \"x y\"]]\nbefore = \"OVERRIDE {id}\\n\"\nafter = \"TAIL {status}\\n\"\n\
+         [[override]]\nid = \"g:a:case\"\nenv = { SAME = \"later\" }\ntimeout_sec = 23\n",
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    let case = &selection.groups[0].cases[0];
+    assert_eq!(case.id, "g:a:case");
+    assert_eq!(case.group, "g");
+    assert_eq!(case.root, "a");
+    assert_eq!(case.name, "case");
+    assert_eq!(case.argv, ["/new", "case", "a b"]);
+    assert_eq!(case.env["SAME"], "later");
+    assert_eq!(case.env["R"], "root");
+    assert_eq!(case.env["G"], "group");
+    assert_eq!(case.env["S"], "step");
+    assert_eq!(case.env["O"], "override");
+    assert!(case.setup.is_empty());
+    assert_eq!(
+        case.cleanup,
+        vec![vec!["/cleanup".to_owned(), "x y".to_owned()]]
+    );
+    assert_eq!(case.before, "OVERRIDE g:a:case\n");
+    assert_eq!(case.after, "TAIL {status}\n");
+    assert_eq!(case.timeout_sec, 23);
+    assert_eq!(case.repeat, 4);
+
+    let plain = &selection.groups[0].cases[1];
+    assert_eq!(plain.timeout_sec, 17);
+    assert_eq!(plain.repeat, 2);
+    assert!(!plain.env.contains_key("O"));
+}
+
+/// 覆盖规则指向未被选中的 ID 只记入 unmatched 且不阻止运行，命中的规则照常应用。
+#[test]
+fn unmatched_override_is_reported_without_blocking() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "override_files = [\"override.toml\"]\n{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"known\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+    tree.put(
+        "override.toml",
+        "[[override]]\nid = \"absent\"\ntimeout_sec = 5\n[[override]]\nid = \"g:a:known\"\ntimeout_sec = 9\n",
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(
+        selection.unmatched,
+        [format!(
+            "absent at {} override 1",
+            tree.path("override.toml").display()
+        )]
+    );
+    assert_eq!(first(&selection).timeout_sec, 9);
+}
+
+/// 架构不匹配的覆盖规则既不生效也不进入 unmatched；架构匹配时才应用。
+#[test]
+fn override_arch_filter_skips_rule_entirely() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "override_files = [\"override.toml\"]\n{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"known\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+    tree.put(
+        "override.toml",
+        "[[override]]\nid = \"g:a:known\"\narch = [\"loongarch64\"]\nrepeat = 9\n",
+    );
+    let config = tree.load("plan.toml").unwrap();
+    let selection = selection::resolve(&config, "riscv64", &[]).unwrap();
+    assert_eq!(first(&selection).repeat, 1);
+    assert!(selection.unmatched.is_empty());
+    let selection = selection::resolve(&config, "loongarch64", &[]).unwrap();
+    assert_eq!(first(&selection).repeat, 9);
+    assert!(selection.unmatched.is_empty());
+}
+
+/// 覆盖规则不能改变用例归属与生命周期开关，出现此类字段时加载即拒绝并指出文件。
+#[test]
+fn override_rejects_unchangeable_fields() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "override_files = [\"override.toml\"]\n{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"known\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+    for fields in ["root = \"/elsewhere\"", "hooks = true"] {
+        tree.put(
+            "override.toml",
+            &format!("[[override]]\nid = \"g:a:known\"\n{fields}\n"),
+        );
+        let error = tree.load("plan.toml").unwrap_err();
+        assert!(
+            error.contains("override.toml") && error.contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// 覆盖规则在完整选中集合上应用后才执行 `--only`；被过滤掉的用例命中覆盖时不得误报 unmatched。
+#[test]
+fn override_applies_to_full_selection_before_only_filter() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "override_files = [\"override.toml\"]\n{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"alpha\", \"beta\"]\nexec = [\"/old\"]\n",
+            tree.roots()
+        ),
+    );
+    tree.put(
+        "override.toml",
+        "[[override]]\nid = \"g:a:alpha\"\nexec = [\"/patched\", \"{name}\"]\n[[override]]\nid = \"g:a:beta\"\ntimeout_sec = 9\n",
+    );
+    let selection = tree
+        .resolve_only("plan.toml", &only(&["g:a:alpha"]))
+        .unwrap();
+    assert_eq!(ids(&selection), ["g:a:alpha"]);
+    assert_eq!(first(&selection).argv, ["/patched", "alpha"]);
+    assert!(selection.unmatched.is_empty());
+}
+
+/// 同一 (组名, root) 被两个分组声明会让同名评分组被拆成两次；加载阶段必须拒绝并指出两处来源。
+#[test]
+fn duplicate_group_root_is_rejected_at_load() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\n\
+             [[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"y\"]\nexec = [\"/y\"]\n",
+            tree.roots()
+        ),
+    );
+    let error = tree.load("plan.toml").unwrap_err();
+    assert!(
+        error.contains("duplicate group") && error.contains("group 1") && error.contains("group 2"),
+        "unexpected error: {error}"
+    );
+
+    let contest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../contest");
+    tree.put(
+        "plan.toml",
+        &format!(
+            "files = [{:?}, {:?}]\n[roots.musl]\npath = \"/\"\n[roots.glibc]\npath = \"/\"\n",
+            contest.join("sets/ltp.toml"),
+            contest.join("sets/ltp-catalog.toml")
+        ),
+    );
+    let error = tree.load("plan.toml").unwrap_err();
+    assert!(
+        error.contains("duplicate group")
+            && error.contains("ltp.toml")
+            && error.contains("ltp-catalog.toml"),
+        "unexpected error: {error}"
+    );
+}
+
+/// `..` 在测试根处被截断，相对目录不能借父组件逃逸到宿主文件系统。
+#[test]
+fn parent_components_stop_at_root() {
+    let tree = Tree::new();
+    tree.executable("outside/escaped");
+    tree.executable("root/outside/inner");
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"../outside\"\nexec = [\"/cases/{{name}}\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["g:a:inner"]);
+}
+
+/// 符号链接自环必须在受限路径解析阶段报 ELOOP，而不是无限重试或读错目录。
+#[test]
+fn symlink_loop_reports_eloop() {
+    let tree = Tree::new();
+    fs::create_dir_all(tree.path("root")).unwrap();
+    symlink("loop", tree.path("root/loop")).unwrap();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"/loop\"\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+    let error = tree.error("plan.toml");
+    let eloop = std::io::Error::from_raw_os_error(libc::ELOOP).to_string();
+    assert!(
+        error.contains("/loop") && error.contains(&eloop),
+        "unexpected error: {error}"
+    );
+}
+
+/// 清单命令只去掉行首空白，尾部空格与其他字符原样进入 `{command}` 且不再展开；after 保留原始模板。
+#[test]
+fn catalog_command_is_verbatim_and_after_stays_a_template() {
+    let tree = Tree::new();
+    tree.put("root/catalog", "fork01 FOO=1 {name} > /tmp/out  \n");
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"ltp\"\nroots = [\"a\"]\n[[group.step]]\ncatalog = \"/catalog\"\ninclude = [\"fork01\"]\n\
+             exec = [\"/busybox\", \"sh\", \"-c\", \"{{command}}\"]\nbefore = \"RUN {{name}}\\n\"\nafter = \"FAIL {{name}} : {{status}}\\n\"\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    let case = first(&selection);
+    assert_eq!(
+        case.catalog_command.as_deref(),
+        Some("FOO=1 {name} > /tmp/out  ")
+    );
+    assert_eq!(
+        case.argv,
+        ["/busybox", "sh", "-c", "FOO=1 {name} > /tmp/out  "]
+    );
+    assert_eq!(case.before, "RUN fork01\n");
+    assert_eq!(case.after, "FAIL {name} : {status}\n");
+    assert_eq!(
+        expand(&case.after, &[("name", "fork01"), ("status", "7")]),
+        "FAIL fork01 : 7\n"
+    );
+    assert_eq!(case.source.line, Some(1));
+}
+
+/// 清单行缺少命令或命令为空时报错，并带出清单路径与行号，避免坏行被静默跳过。
+#[test]
+fn catalog_line_errors_report_line_numbers() {
+    let tree = Tree::new();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\ncatalog = \"/catalog\"\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+
+    tree.put("root/catalog", "# comment\n\nlonely\n");
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("/catalog:3") && error.contains("line has no command"),
+        "unexpected error: {error}"
+    );
+
+    tree.put("root/catalog", "ok printf ok\ntag   \n");
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("/catalog:2") && error.contains("empty command"),
+        "unexpected error: {error}"
+    );
+}
+
+/// 清单缺失或指向目录时直接报错并带路径，不能悄悄回退成目录扫描。
+#[test]
+fn missing_catalog_does_not_fall_back_to_directory() {
+    let tree = Tree::new();
+    let plan = |catalog: &str| {
+        format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\ncatalog = {catalog:?}\nexec = [\"/x\"]\n",
+            tree.roots()
+        )
+    };
+
+    tree.put("plan.toml", &plan("/missing"));
+    let error = tree.error("plan.toml");
+    let enoent = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    assert!(
+        error.contains("/missing") && error.contains(&enoent),
+        "unexpected error: {error}"
+    );
+
+    tree.executable("root/list/child");
+    tree.put("plan.toml", &plan("/list"));
+    let error = tree.error("plan.toml");
+    let eisdir = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    assert!(
+        error.contains("/list") && error.contains(&eisdir),
+        "unexpected error: {error}"
+    );
+}
+
+/// 多文件按声明顺序拼接，组内按 root-major、include 顺序与清单行顺序展开，来源记录文件、条目、路径与行号。
 #[test]
 fn multifile_order_globs_exclude_and_locations() {
     let tree = Tree::new();
@@ -105,715 +810,600 @@ fn multifile_order_globs_exclude_and_locations() {
     tree.put(
         "plan.toml",
         &format!(
-            "files = ['sets/first.toml', 'sets/last.toml']\n{}",
+            "files = [\"sets/first.toml\", \"sets/last.toml\"]\n{}",
             tree.roots()
         ),
     );
-    tree.put("sets/first.toml", "# 多行 include 与注释使用 TOML 原语法\n[[step]]\nkind='ltp'\nroots=['b', 'a']\nsuite='syscalls'\ncatalog='/catalog'\ninclude=[\n 'beta', # 先精确名\n 'case[12]',\n 'case?',\n]\nexclude=['case3']\n");
+    tree.put(
+        "sets/first.toml",
+        "[[group]]\nname = \"syscalls\"\nroots = [\"b\", \"a\"]\n\
+         [[group.step]]\ncatalog = \"/catalog\"\ninclude = [\"beta\", \"case[12]\", \"case?\"]\nexclude = [\"case3\"]\n\
+         exec = [\"/bin/sh\", \"-c\", \"{command}\"]\n",
+    );
     tree.put(
         "sets/last.toml",
-        "[[step]]\nkind='exec'\nid='last'\nroot='a'\nprogram='/bin/last'\n",
+        "[[group]]\nname = \"last\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"only\"]\nexec = [\"/bin/last\"]\n",
     );
-    let cases = tree.resolve("plan.toml").unwrap();
-    let ids: Vec<&str> = cases.iter().map(|case| case.id.as_str()).collect();
+    let selection = tree.resolve("plan.toml").unwrap();
     assert_eq!(
-        ids,
+        ids(&selection),
         [
-            "ltp:b:syscalls:beta",
-            "ltp:b:syscalls:case2",
-            "ltp:b:syscalls:case1",
-            "ltp:a:syscalls:beta",
-            "ltp:a:syscalls:case2",
-            "ltp:a:syscalls:case1",
-            "last"
+            "syscalls:b:beta",
+            "syscalls:b:case2",
+            "syscalls:b:case1",
+            "syscalls:a:beta",
+            "syscalls:a:case2",
+            "syscalls:a:case1",
+            "last:a:only"
         ]
     );
-    assert_eq!(cases[1].source.file, tree.path("sets/first.toml"));
-    assert_eq!(cases[1].source.entry, 1);
-    assert_eq!(
-        cases[1].source.catalog.as_deref(),
-        Some(Path::new("/catalog"))
-    );
-    assert_eq!(cases[1].source.line, Some(2));
+    let case = &selection.groups[0].cases[1];
+    assert_eq!(case.source.file, tree.path("sets/first.toml"));
+    assert_eq!(case.source.entry, "group 1 step 1");
+    assert_eq!(case.source.catalog.as_deref(), Some(Path::new("/catalog")));
+    assert_eq!(case.source.line, Some(2));
+    assert_eq!(case.argv, ["/bin/sh", "-c", "printf two"]);
 }
 
-/// 验证命令行显式传入的子文件列表会替换顶层 `files` 字段，且子文件不允许再次嵌套声明 `files`。
-///
-/// - **测试目标**：确保 CLI 文件覆盖只替换步骤文件列表而不丢失顶层 `defaults` 与 `roots`，同时拒绝递归包含。
-/// - **场景步骤**：先用 `chosen.toml` 替换不存在的默认 `files` 并验证解析结果；再向 `chosen.toml` 写入嵌套 `files` 字段。
-/// - **预期结果**：首次解析继承了顶层 `timeout_sec = 17`；二次加载因检测到子文件中的 `files` 字段而报错。
+/// 命令行文件列表整体替换主计划的 `files` 且保留 roots/defaults；引用的分组文件不允许再嵌套文件列表。
 #[test]
 fn cli_files_replace_without_recursive_loading() {
     let tree = Tree::new();
     tree.put(
         "plan.toml",
         &format!(
-            "files=['not-present.toml']\n[defaults]\ntimeout_sec=17\n{}",
+            "files = [\"not-present.toml\"]\n[defaults]\ntimeout_sec = 17\n{}",
             tree.roots()
         ),
     );
     tree.put(
         "chosen.toml",
-        "[[step]]\nkind='exec'\nid='chosen'\nroot='b'\nprogram='/bin/true'\n",
+        "[[group]]\nname = \"chosen\"\nroots = [\"b\"]\n[[group.step]]\nnames = [\"only\"]\nexec = [\"/bin/true\"]\n",
     );
-    let config = config::load(&tree.path("plan.toml"), &[PathBuf::from("chosen.toml")]).unwrap();
-    let cases = selection::resolve(&config, "loongarch64").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].id, "chosen");
-    assert_eq!(cases[0].root, "b");
-    assert_eq!(cases[0].timeout_sec, 17);
-    tree.put("chosen.toml", "files=['nested.toml']\n");
+    let loaded = config::load(&tree.path("plan.toml"), &[PathBuf::from("chosen.toml")]).unwrap();
+    assert_eq!(loaded.defaults.timeout_sec, 17);
+    let selection = selection::resolve(&loaded, "loongarch64", &[]).unwrap();
+    let case = first(&selection);
+    assert_eq!(case.id, "chosen:b:only");
+    assert_eq!(case.root, "b");
+    assert_eq!(case.timeout_sec, 17);
+
+    tree.put("chosen.toml", "files = [\"nested.toml\"]\n");
     let error = config::load(&tree.path("plan.toml"), &[PathBuf::from("chosen.toml")]).unwrap_err();
-    assert!(error.contains("chosen.toml") && error.contains("files"));
+    assert!(
+        error.contains("chosen.toml") && error.contains("unknown field"),
+        "unexpected error: {error}"
+    );
 }
 
-/// 验证被禁用（`enabled = false`）或架构不匹配的测试步骤不会读取清单文件，且解析阶段不执行任何 `prepare`、`setup` 或 `cleanup` 命令。
-///
-/// - **测试目标**：保证配置解析与选择阶段无任何外部命令执行副作用，且未启用的步骤不要求其清单路径存在。
-/// - **场景步骤**：配置带 `touch` 副作用的 `prepare`/`setup`/`cleanup` 命令，以及指向不存在清单的禁用步骤和非当前架构步骤，调用 `resolve`。
-/// - **预期结果**：仅选中当前架构下启用的 `active` 步骤，且文件系统上未产生 `must-not-exist` 标记文件。
+/// 禁用或架构不匹配的步骤不读清单，加载与选择阶段也不执行 prepare/setup/cleanup。
 #[test]
-fn disabled_arch_and_list_have_no_side_effects() {
+fn disabled_arch_and_selection_have_no_side_effects() {
     let tree = Tree::new();
     let marker = tree.path("must-not-exist");
     tree.put(
         "plan.toml",
         &format!(
-            "files=['steps.toml']\n[roots.a]\npath={:?}\nprepare=[['/bin/sh','-c','touch {}']]\n",
+            "files = [\"steps.toml\"]\n[roots.a]\npath = {:?}\nprepare = [[\"/bin/sh\", \"-c\", \"touch {}\"]]\n",
             tree.path("root"),
             marker.display()
         ),
     );
-    tree.put("steps.toml", &format!("[[step]]\nkind='ltp'\nenabled=false\nroots=['a']\nsuite='off'\ncatalog='/missing'\ninclude=['*']\n[[step]]\nkind='ltp'\narch=['loongarch64']\nroots=['a']\nsuite='la'\ncatalog='/also-missing'\ninclude=['*']\n[[step]]\nkind='exec'\nid='active'\nroot='a'\nprogram='/bin/true'\nhooks=true\nsetup=[['/bin/sh','-c','touch {}']]\ncleanup=[['/bin/sh','-c','touch {}']]\n", marker.display(), marker.display()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert!(cases[0].hooks);
+    tree.put(
+        "steps.toml",
+        &format!(
+            "[[group]]\nname = \"g\"\nroots = [\"a\"]\n\
+             [[group.step]]\nenabled = false\ncatalog = \"/missing\"\nexec = [\"/x\"]\n\
+             [[group.step]]\narch = [\"loongarch64\"]\ncatalog = \"/also-missing\"\nexec = [\"/x\"]\n\
+             [[group.step]]\nnames = [\"active\"]\nexec = [\"/bin/true\"]\n\
+             setup = [[\"/bin/sh\", \"-c\", \"touch {}\"]]\ncleanup = [[\"/bin/sh\", \"-c\", \"touch {}\"]]\n",
+            marker.display(),
+            marker.display()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["g:a:active"]);
     assert!(!marker.exists());
 }
 
-/// 验证 `exec`、LTP `runtest` 与 `shell` 步骤混合出现时，空参数、含空格/Unicode 参数及原始 Shell 命令行文本均原样保留。
-///
-/// - **测试目标**：确保 `exec` 参数不被拆词，且 LTP 清单中的命令尾部空白、引号与管道符号不被破坏。
-/// - **场景步骤**：构造包含空字符串与多字节字符的 `exec` 步骤、带管道与尾部空格的 LTP 步骤及 `shell` 步骤并解析。
-/// - **预期结果**：各用例的 `CommandSpec` 与输入完全吻合。
+/// argv 模板保留空串、空格、Unicode 与 `$` 字面量；清单命令原文（含尾部空格）整体进入 `{command}`。
 #[test]
-fn mixed_commands_preserve_empty_arguments_and_shell_text() {
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "计划文本中的 {{command}} 经 format! 转义后是 expand 的占位符，lint 对转义花括号误报"
+)]
+fn mixed_commands_preserve_arguments_and_catalog_text() {
     let tree = Tree::new();
-    let command = "MODE='value with spaces' printf '%s\\n' '' '雪 山' | cat  ";
+    let command = "VALUES='x y' printf '%s\\n' | cat  ";
     tree.put("root/catalog", &format!("tag {command}\n"));
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='exec'\nid='first'\nroot='a'\nprogram='./probe'\nargs=['','a b','雪 山','$literal']\n[[step]]\nkind='ltp'\nroots=['a']\nsuite='mixed'\ncatalog='/catalog'\nshell='/custom/sh'\ninclude=['tag']\n[[step]]\nkind='shell'\nid='last'\nroot='a'\nshell='/bin/sh'\ncommand='echo last | cat'\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(
-        cases
-            .iter()
-            .map(|case| case.id.as_str())
-            .collect::<Vec<_>>(),
-        ["first", "ltp:a:mixed:tag", "last"]
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"mixed\"\nroots = [\"a\"]\n\
+             [[group.step]]\nid = \"argv:{{name}}\"\nnames = [\"probe\"]\nexec = [\"./probe\", \"\", \"a b\", \"雪 山\", \"$literal\"]\n\
+             [[group.step]]\ncatalog = \"/catalog\"\ninclude = [\"tag\"]\nexec = [\"/custom/sh\", \"-c\", \"{{command}}\"]\n",
+            tree.roots()
+        ),
     );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["argv:probe", "mixed:a:tag"]);
     assert_eq!(
-        cases[0].command,
-        CommandSpec::Exec {
-            program: "./probe".into(),
-            args: vec!["".into(), "a b".into(), "雪 山".into(), "$literal".into()]
-        }
+        selection.groups[0].cases[0].argv,
+        ["./probe", "", "a b", "雪 山", "$literal"]
     );
-    assert_eq!(
-        cases[1].command,
-        CommandSpec::Shell {
-            shell: "/custom/sh".into(),
-            command: command.into()
-        }
-    );
+    let case = &selection.groups[0].cases[1];
+    assert_eq!(case.catalog_command.as_deref(), Some(command));
+    assert_eq!(case.argv, ["/custom/sh", "-c", command]);
 }
 
-/// 验证从 LTP `runtest` 清单提取出的命令文本在交由 `/bin/sh -c` 执行时保持完整的 Shell 语法语义。
-///
-/// - **测试目标**：确认清单命令中的内联环境变量赋值、单双引号嵌套、空位置参数和管道可由 Shell 正常解析执行。
-/// - **场景步骤**：解析包含复杂 Shell 表达式的 LTP 条目，并实际调用 `Command::new(shell).args(["-c", command])` 运行。
-/// - **预期结果**：子进程成功退出，标准输出精确匹配 `"<two words><>"`。
+/// 清单命令交给 `sh -c` 时保持内联赋值、引号、空位置参数与管道的原始语义。
 #[test]
-fn runtest_tail_runs_with_original_shell_semantics() {
+fn catalog_command_keeps_shell_semantics() {
     let tree = Tree::new();
     tree.put(
         "root/catalog",
         "tag VALUE='two words' /bin/sh -c 'printf \"<%s><%s>\" \"$VALUE\" \"$1\"' sh '' | cat\n",
     );
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='ltp'\nroots=['a']\nsuite='shell'\ncatalog='/catalog'\nshell='/bin/sh'\ninclude=['tag']\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    let CommandSpec::Shell { shell, command } = &cases[0].command else {
-        panic!("not shell");
-    };
-    let output = Command::new(shell).args(["-c", command]).output().unwrap();
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"shell\"\nroots = [\"a\"]\n[[group.step]]\ncatalog = \"/catalog\"\ninclude = [\"tag\"]\nexec = [\"/bin/sh\", \"-c\", \"{{command}}\"]\n",
+            tree.roots()
+        ),
+    );
+    let selection = tree.resolve("plan.toml").unwrap();
+    let argv = &first(&selection).argv;
+    let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"<two words><>");
 }
 
-/// 验证精确 ID 覆盖（`[[override]]`）按层级合并环境变量，并对 `args`、`setup`、`cleanup` 等数组字段执行整体替换。
-///
-/// - **测试目标**：确认 `defaults` -> `root` -> `step` -> `override` 四层配置的合并与覆盖优先级符合设计规范。
-/// - **场景步骤**：在四层配置中分别设置同名与异名环境变量及 `setup`/`cleanup` 数组，解析并检查最终生成的 `ResolvedCase`。
-/// - **预期结果**：环境变量保留各层非冲突键且同名键取最高优先级值；数组字段完全被 `override` 中的新数组替换。
-#[test]
-fn exact_override_merges_environment_and_replaces_arrays() {
-    let tree = Tree::new();
-    tree.put("plan.toml", &format!("files=['steps.toml']\noverride_files=['override.toml']\n[defaults]\nenv={{KEEP='default',LEVEL='default'}}\nsetup=[['/default']]\ncleanup=[['/default-clean']]\n[roots.a]\npath={:?}\nenv={{LEVEL='root',ROOT='yes'}}\n", tree.path("root")));
-    tree.put("steps.toml", "[[step]]\nkind='exec'\nid='one'\nroot='a'\nprogram='/old'\nargs=['old','args']\nenv={LEVEL='step',STEP='yes'}\nsetup=[['/step']]\ncleanup=[['/step-clean']]\n");
-    tree.put("override.toml", "[[override]]\nid='one'\nprogram='/new'\nargs=['','a b']\nenv={LEVEL='override',LOCAL='yes'}\nsetup=[]\ncleanup=[['/cleanup','x y']]\ntimeout_sec=19\nrepeat=3\nhooks=true\n");
-    let cases = tree.resolve("plan.toml").unwrap();
-    let case = &cases[0];
-    assert_eq!(cases.len(), 1);
-    assert_eq!(case.id, "one");
-    assert_eq!(
-        case.command,
-        CommandSpec::Exec {
-            program: "/new".into(),
-            args: vec!["".into(), "a b".into()]
-        }
-    );
-    assert_eq!(case.env["LEVEL"], "override");
-    assert_eq!(case.env["KEEP"], "default");
-    assert_eq!(case.env["ROOT"], "yes");
-    assert_eq!(case.env["STEP"], "yes");
-    assert_eq!(case.env["LOCAL"], "yes");
-    assert!(case.setup.is_empty());
-    assert_eq!(case.cleanup, vec![vec!["/cleanup", "x y"]]);
-    assert_eq!(case.timeout_sec, 19);
-    assert_eq!(case.repeat, 3);
-    assert!(case.hooks);
-}
-
-/// 验证重复命中同一用例 ID 时的幂等去重、语义冲突报错以及通过 `[[override]]` 统一冲突字段的行为。
-///
-/// - **测试目标**：确保完全相同的重复定义保留首次来源，存在差异的重复定义显式报错，且可通过 `override` 消解冲突。
-/// - **场景步骤**：先在两个子文件中定义完全相同的 `same` 步骤；再将第二个改为不同程序路径触发冲突；最后添加 `fix.toml` 覆盖 `program`。
-/// - **预期结果**：语义相同时去重保留 `one.toml` 来源；语义不同时报错指出两个来源文件；添加覆盖后两者收敛为同一语义并通过解析。
-#[test]
-fn duplicate_semantics_conflict_and_explicit_override() {
-    let tree = Tree::new();
-    tree.put(
-        "plan.toml",
-        &format!("files=['one.toml','two.toml']\n{}", tree.roots()),
-    );
-    let one = "[[step]]\nkind='exec'\nid='same'\nroot='a'\nprogram='/one'\n";
-    tree.put("one.toml", one);
-    tree.put("two.toml", one);
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].source.file, tree.path("one.toml"));
-    tree.put("two.toml", &one.replace("/one", "/two"));
-    let error = tree.resolve("plan.toml").unwrap_err();
-    assert!(
-        error.contains("conflicting selection ID")
-            && error.contains("one.toml")
-            && error.contains("two.toml")
-    );
-    tree.put(
-        "plan.toml",
-        &format!(
-            "files=['one.toml','two.toml']\noverride_files=['fix.toml']\n{}",
-            tree.roots()
-        ),
-    );
-    tree.put("fix.toml", "[[override]]\nid='same'\nprogram='/fixed'\n");
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(
-        cases[0].command,
-        CommandSpec::Exec {
-            program: "/fixed".into(),
-            args: vec![]
-        }
-    );
-}
-
-/// 验证 `[[override]]` 拒绝未选中的目标 ID，并拒绝同一 ID 的多条覆盖规则在同一字段或环境变量上设置不同值。
-///
-/// - **测试目标**：防止拼写错误的覆盖 ID 被静默忽略，并杜绝多条覆盖规则之间的隐式先后覆盖歧义。
-/// - **场景步骤**：依次测试指向未选中 ID 的覆盖、同一字段赋予不同值的两条覆盖、同一环境变量赋予不同值的两条覆盖，以及补充不同字段（或相同值）的两条合法覆盖。
-/// - **预期结果**：前三者均返回包含具体位置与冲突字段名的错误，最后一种合法组合成功合并。
-#[test]
-fn overrides_reject_unselected_ids_and_field_conflicts() {
-    let tree = Tree::new();
-    tree.put("plan.toml", &format!("override_files=['override.toml']\n{}\n[[step]]\nkind='exec'\nid='one'\nroot='a'\nprogram='/bin/true'\n", tree.roots()));
-    tree.put("override.toml", "[[override]]\nid='missing'\nrepeat=2\n");
-    let error = tree.resolve("plan.toml").unwrap_err();
-    assert!(error.contains("override.toml") && error.contains("not selected"));
-    tree.put(
-        "override.toml",
-        "[[override]]\nid='one'\nrepeat=2\n[[override]]\nid='one'\nrepeat=3\n",
-    );
-    let error = tree.resolve("plan.toml").unwrap_err();
-    assert!(error.contains("entry 2") && error.contains("entry 1") && error.contains("repeat"));
-    tree.put(
-        "override.toml",
-        "[[override]]\nid='one'\nenv={A='one'}\n[[override]]\nid='one'\nenv={A='two'}\n",
-    );
-    assert!(tree
-        .resolve("plan.toml")
-        .unwrap_err()
-        .contains("conflicting override env"));
-    tree.put(
-        "override.toml",
-        "[[override]]\nid='one'\nrepeat=2\n[[override]]\nid='one'\ntimeout_sec=23\nrepeat=2\n",
-    );
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!((cases[0].repeat, cases[0].timeout_sec), (2, 23));
-}
-
-/// 验证清单名称未命中、通配符未命中、排除后为空以及全局无选中用例时的错误定位信息。
-///
-/// - **测试目标**：确保选择阶段的所有空结果错误都准确报告对应的步骤位置、目标 `root` 名称与清单路径。
-/// - **场景步骤**：分别使用不存在的精确名、不匹配的通配符、将唯一匹配项排除的配置以及全部禁用的步骤调用 `resolve`。
-/// - **预期结果**：每次调用均返回包含预期错误分类关键词与源文件位置的错误信息。
-#[test]
-fn selection_errors_report_the_actual_source() {
-    let tree = Tree::new();
-    tree.put("root/catalog", "known printf yes\n");
-    tree.put(
-        "plan.toml",
-        &format!("files=['select.toml']\n{}", tree.roots()),
-    );
-    for (include, exclude, expected) in [
-        ("missing", "", "name"),
-        ("absent*", "", "pattern"),
-        ("known", "known", "empty selection after exclude"),
-    ] {
-        tree.put("select.toml", &format!("[[step]]\nkind='ltp'\nroots=['a']\nsuite='s'\ncatalog='/catalog'\ninclude=[{include:?}]\nexclude=[{exclude:?}]\n").replace("exclude=[\"\"]", "exclude=[]"));
-        let error = tree.resolve("plan.toml").unwrap_err();
-        assert!(
-            error.contains("select.toml:entry 1")
-                && error.contains("root \"a\"")
-                && error.contains("/catalog")
-                && error.contains(expected),
-            "{error}"
-        );
-    }
-    tree.put(
-        "select.toml",
-        "[[step]]\nkind='exec'\nenabled=false\nid='off'\nroot='a'\nprogram='/missing'\n",
-    );
-    assert!(tree
-        .resolve("plan.toml")
-        .unwrap_err()
-        .contains("empty selection"));
-}
-
-/// 验证所有 TOML 配置层级均拒绝未知拼写错误字段，且被引入的子文件禁止再次声明 `files` 或 `override_files`。
-///
-/// - **测试目标**：确保配置反序列化启用严格字段校验（`deny_unknown_fields`），并限制文件包含关系为单层树结构。
-/// - **场景步骤**：依次向顶层、`[defaults]`、`[roots]`、`[[step]]`、`[[override]]` 注入拼写错误的字段名，并在子文件中声明 `override_files`。
-/// - **预期结果**：所有非法输入均在 `config::load` 阶段立即报错并指出具体文件名。
+/// 所有 TOML 层级都拒绝未知字段，已删除的旧字段与子文件嵌套声明在加载阶段即失败并指出文件。
 #[test]
 fn unknown_fields_and_nested_files_are_rejected_at_input() {
     let tree = Tree::new();
-    for text in [
-        "typo=true",
-        "[defaults]\ntimeuot_sec=2",
-        "[roots.a]\npath='/'\nunknown=true",
-        "[[step]]\nkind='exec'\nid='x'\nroot='a'\nprogram='/x'\nargz=[]",
+    let base = tree.roots();
+    for extra in [
+        "typo = true\n",
+        "[defaults]\nhooks = true\n",
+        "[roots.c]\npath = \"/\"\nkind = \"x\"\n",
+        "[[group]]\nname = \"g\"\nroots = [\"a\"]\nkind = \"exec\"\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\n",
+        "[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\nhooks = true\n",
+        "[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\nprogram = \"/x\"\n",
+        "[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\nargs = []\n",
+        "[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\nsuite = \"s\"\n",
+        "[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nnames = [\"x\"]\nexec = [\"/x\"]\nvariant = \"v\"\n",
     ] {
-        tree.put("plan.toml", text);
-        let error = config::load(&tree.path("plan.toml"), &[]).unwrap_err();
+        tree.put("plan.toml", &format!("{extra}{base}"));
+        let error = tree.load("plan.toml").unwrap_err();
         assert!(
             error.contains("plan.toml") && error.contains("unknown field"),
-            "{error}"
+            "unexpected error for {extra:?}: {error}"
         );
     }
+
+    tree.put("plan.toml", &format!("files = [\"nested.toml\"]\n{base}"));
+    tree.put("nested.toml", "files = [\"deeper.toml\"]\n");
+    let error = tree.load("plan.toml").unwrap_err();
+    assert!(
+        error.contains("nested.toml") && error.contains("unknown field"),
+        "unexpected error: {error}"
+    );
+
     tree.put(
         "plan.toml",
-        &format!("files=['nested.toml']\n{}", tree.roots()),
+        &format!("override_files = [\"bad.toml\"]\n{base}"),
     );
-    tree.put("nested.toml", "override_files=['deeper.toml']");
-    assert!(config::load(&tree.path("plan.toml"), &[])
-        .unwrap_err()
-        .contains("nested.toml"));
-    tree.put(
-        "plan.toml",
-        &format!("override_files=['bad.toml']\n{}", tree.roots()),
+    tree.put("bad.toml", "[[override]]\nid = \"x\"\nunknown = true\n");
+    let error = tree.load("plan.toml").unwrap_err();
+    assert!(
+        error.contains("bad.toml") && error.contains("unknown field"),
+        "unexpected error: {error}"
     );
-    tree.put("bad.toml", "[[override]]\nid='x'\nunknown=true");
-    assert!(config::load(&tree.path("plan.toml"), &[])
-        .unwrap_err()
-        .contains("unknown field"));
 }
 
-/// 验证缺失必填字段、未知 `root` 引用、零超时/零重复次数、路径穿越 `cwd`、命令类型混用及非法通配符在加载阶段被拦截。
-///
-/// - **测试目标**：确保配置语义校验在 `config::load` 阶段完成，不将非法参数留到执行阶段。
-/// - **场景步骤**：遍历 9 种典型的非法 `[[step]]` 配置片段并调用 `config::load`。
-/// - **预期结果**：所有用例均返回包含 `"plan.toml:entry 1"` 的校验错误。
+/// 加载阶段拒绝非正的超时/重复次数、逃逸路径、非法 glob/架构、空 argv、错误的来源组合与缺失的组字段。
 #[test]
-fn invalid_fields_and_missing_required_values_are_rejected() {
+fn invalid_fields_are_rejected_at_load() {
     let tree = Tree::new();
     let base = tree.roots();
-    for tail in [
-        "[[step]]\nkind='exec'\nroot='a'\nprogram='/x'",
-        "[[step]]\nkind='exec'\nid='x'\nroot='unknown'\nprogram='/x'",
-        "[[step]]\nkind='exec'\nid='x'\nroot='a'\nprogram='/x'\nrepeat=0",
-        "[[step]]\nkind='exec'\nid='x'\nroot='a'\nprogram='/x'\ntimeout_sec=0",
-        "[[step]]\nkind='exec'\nid='x'\nroot='a'\nprogram='/x'\ncwd='/../escape'",
-        "[[step]]\nkind='exec'\nid='x'\nroot='a'\nprogram='/x'\ncommand='wrong kind'",
-        "[[step]]\nkind='ltp'\nroots=['a']\nsuite='s'\ninclude=['x']",
-        "[[step]]\nkind='basic'\nroots=['a']\ninclude=['[bad']",
-        "[[step]]\nkind='libctest'\nroots=['a']\nvariant='guessed'\ninclude=['x']",
-    ] {
-        tree.put("plan.toml", &format!("{base}\n{tail}\n"));
-        let error = config::load(&tree.path("plan.toml"), &[]).unwrap_err();
-        assert!(error.contains("plan.toml:entry 1"), "{error}");
+    let step =
+        |body: &str| format!("[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\n{body}\n");
+    let rows = [
+        (
+            step("names = [\"n\"]\nexec = [\"/x\"]\nrepeat = 0"),
+            "positive",
+        ),
+        (
+            step("names = [\"n\"]\nexec = [\"/x\"]\ntimeout_sec = 0"),
+            "positive",
+        ),
+        (
+            step("names = [\"n\"]\nexec = [\"/x\"]\ncwd = \"/../escape\""),
+            "expected absolute path",
+        ),
+        (
+            step("directory = \"/\"\ninclude = [\"[bad\"]\nexec = [\"/x\"]"),
+            "invalid pattern",
+        ),
+        (
+            "[[group]]\nname = \"g\"\nroots = [\"missing\"]\n[[group.step]]\nnames = [\"n\"]\nexec = [\"/x\"]\n".to_owned(),
+            "unknown root",
+        ),
+        (
+            step("names = [\"n\"]\ndirectory = \"/\"\nexec = [\"/x\"]"),
+            "exactly one",
+        ),
+        (step("exec = [\"/x\"]"), "exactly one"),
+        (
+            step("names = [\"n\"]\ninclude = [\"*\"]\nexec = [\"/x\"]"),
+            "explicit selection",
+        ),
+        (step("names = []\nexec = [\"/x\"]"), "names must not be empty"),
+        (
+            step("names = [\"bad name\"]\nexec = [\"/x\"]"),
+            "invalid identifier",
+        ),
+        (
+            step("catalog = \"catalog\"\nexec = [\"/x\"]"),
+            "expected absolute path",
+        ),
+        (
+            step("arch = [\"x86_64\"]\nnames = [\"n\"]\nexec = [\"/x\"]"),
+            "unknown architecture",
+        ),
+        (step("names = [\"n\"]\nexec = []"), "exec must not be empty"),
+        (
+            "[[group]]\nname = \"g\"\nroots = []\n[[group.step]]\nnames = [\"n\"]\nexec = [\"/x\"]\n".to_owned(),
+            "roots must not be empty",
+        ),
+        (
+            "[[group]]\nname = \"g\"\nroots = [\"a\"]\nstep = []\n".to_owned(),
+            "step must not be empty",
+        ),
+        (
+            "[[group]]\nname = \"g\"\nroots = [\"a\"]\ncwd = \"relative\"\n[[group.step]]\nnames = [\"n\"]\nexec = [\"/x\"]\n".to_owned(),
+            "expected absolute path",
+        ),
+        (
+            step("directory = \"/\"\ncatalog = \"/catalog\"\nexec = [\"/x\"]"),
+            "exactly one",
+        ),
+    ];
+    for (tail, expected) in rows {
+        tree.put("plan.toml", &format!("{base}{tail}\n"));
+        let error = tree.load("plan.toml").unwrap_err();
+        assert!(
+            error.contains("plan.toml") && error.contains(expected),
+            "expected message {expected:?} in: {error}"
+        );
     }
 }
 
-/// 验证基于目录扫描的测试步骤（`source = 'executables'` 与 `kind = 'basic'`）仅选取具有可执行权限的普通文件并按字典序排列。
-///
-/// - **测试目标**：确认目录扫描自动跳过不可执行的数据文件与子目录，且 `basic` 步骤默认将工作目录设为该可执行目录。
-/// - **场景步骤**：在测试根目录下创建两个可执行脚本、一个普通文本文件和一个子目录，解析 `ltp`（`executables` 模式）与 `basic` 步骤。
-/// - **预期结果**：仅 `alpha`、`zeta` 与 `mmap` 被选中并按字母序排列，`basic` 用例的 `cwd` 为 `/basic` 且协议为 `Protocol::Basic`。
+/// 目录扫描跟随相对符号链接检查执行位，名字与 argv 保留链接别名而不是真实目标。
 #[test]
-fn executable_source_and_basic_use_actual_root_directories() {
-    let tree = Tree::new();
-    tree.executable("root/cases/zeta");
-    tree.executable("root/cases/alpha");
-    tree.put("root/cases/data", "not executable");
-    fs::create_dir_all(tree.path("root/cases/directory")).unwrap();
-    tree.executable("root/basic/mmap");
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='ltp'\nsource='executables'\nroots=['a']\nsuite='elf'\ndirectory='/cases'\ninclude=['*']\n[[step]]\nkind='basic'\nroots=['a']\ndirectory='/basic'\ninclude=['mmap']\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(
-        cases
-            .iter()
-            .map(|case| case.id.as_str())
-            .collect::<Vec<_>>(),
-        ["ltp:a:elf:alpha", "ltp:a:elf:zeta", "basic:a:mmap"]
-    );
-    assert_eq!(cases[2].cwd, Path::new("/basic"));
-    assert_eq!(
-        cases[2].command,
-        CommandSpec::Exec {
-            program: "/basic/mmap".into(),
-            args: vec![]
-        }
-    );
-    assert_eq!(
-        cases[2].protocol,
-        Protocol::Basic {
-            name: "mmap".into()
-        }
-    );
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='ltp'\nroots=['a']\nsuite='missing'\ncatalog='/runtest-missing'\ninclude=['*']\n", tree.roots()));
-    let error = tree.resolve("plan.toml").unwrap_err();
-    assert!(error.contains("runtest-missing") && error.contains("No such file"));
-}
-
-/// 验证 `libctest` 步骤严格解析 `./runtest.exe -w entry-<variant>.exe <SELECTOR>` 格式的清单行，并拒绝变体名称不匹配的条目。
-///
-/// - **测试目标**：确保 `libctest` 清单解析器按行序提取测试选择器（Selector），保留原始参数并校验 `entry-<variant>.exe` 一致性。
-/// - **场景步骤**：构造 `run-dynamic.sh` 与 `run-static.sh` 清单并解析；随后将 `run-dynamic.sh` 中的入口程序篡改为 `entry-static.exe` 再次解析。
-/// - **预期结果**：合法清单按序生成 `Pre2025Libctest` 协议用例；篡改后的清单在报告第 1 行位置后返回解析错误。
-#[test]
-fn fixed_libctest_preserves_variant_selector_and_original_argv() {
-    let tree = Tree::new();
-    tree.put("root/run-dynamic.sh", "#!/bin/sh\n./runtest.exe -w entry-dynamic.exe env\n./runtest.exe -w entry-dynamic.exe argv\n");
-    tree.put(
-        "root/run-static.sh",
-        "./runtest.exe -w entry-static.exe argv\n",
-    );
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='libctest'\nroots=['b']\nvariant='dynamic'\ncatalog='/run-dynamic.sh'\ninclude=['*']\n[[step]]\nkind='libctest'\nroots=['a']\nvariant='static'\ncatalog='/run-static.sh'\ninclude=['argv']\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(
-        cases
-            .iter()
-            .map(|case| case.id.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "libctest:b:dynamic:env",
-            "libctest:b:dynamic:argv",
-            "libctest:a:static:argv"
-        ]
-    );
-    assert_eq!(
-        cases[1].command,
-        CommandSpec::Exec {
-            program: "./runtest.exe".into(),
-            args: vec!["-w".into(), "entry-dynamic.exe".into(), "argv".into()]
-        }
-    );
-    assert_eq!(
-        cases[1].protocol,
-        Protocol::Pre2025Libctest {
-            variant: "dynamic".into(),
-            selector: "argv".into()
-        }
-    );
-    assert_eq!(cases[1].source.line, Some(3));
-    tree.put(
-        "root/run-dynamic.sh",
-        "./runtest.exe -w entry-static.exe argv\n",
-    );
-    assert!(tree
-        .resolve("plan.toml")
-        .unwrap_err()
-        .contains("run-dynamic.sh:1"));
-}
-
-/// 验证包含 1000 个条目的大型测试清单能够保序展开，且单条精确选择后仅执行目标命令。
-///
-/// - **测试目标**：检验清单解析器在千级条目规模下的顺序稳定性与精确筛选隔离性。
-/// - **场景步骤**：生成含 1000 条命令的清单，先用通配符全选验证数量与首尾 ID，再精确选择 `case0591` 并通过 Shell 实际运行该条命令。
-/// - **预期结果**：全选阶段不产生任何执行副作用文件；单选并运行后仅生成 `marker-0591` 一个标记文件。
-#[test]
-fn thousand_entry_catalog_and_single_selected_execution() {
-    let tree = Tree::new();
-    let mut catalog = String::new();
-    for index in 0..1000 {
-        writeln!(
-            catalog,
-            "case{index:04} printf 'case{index:04}'; : > marker-{index:04}"
-        )
-        .unwrap();
-    }
-    tree.put("root/catalog", &catalog);
-    let plan = |include: &str| {
-        format!("{}\n[[step]]\nkind='ltp'\nroots=['a']\nsuite='large'\ncatalog='/catalog'\nshell='/bin/sh'\ninclude=[{include:?}]\n", tree.roots())
-    };
-    tree.put("plan.toml", &plan("case[0-9]*"));
-    let all = tree.resolve("plan.toml").unwrap();
-    assert_eq!(all.len(), 1000);
-    assert_eq!(all[0].id, "ltp:a:large:case0000");
-    assert_eq!(all[999].id, "ltp:a:large:case0999");
-    assert!(!tree.path("root/marker-0000").exists());
-    tree.put("plan.toml", &plan("case0591"));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    let CommandSpec::Shell { shell, command } = &cases[0].command else {
-        panic!("not shell");
-    };
-    let output = Command::new(shell)
-        .args(["-c", command])
-        .current_dir(tree.path("root"))
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"case0591");
-    let markers: Vec<_> = fs::read_dir(tree.path("root"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name.to_str().unwrap().starts_with("marker-"))
-        .collect();
-    assert_eq!(markers, vec![std::ffi::OsString::from("marker-0591")]);
-}
-
-/// 验证通过 `[[override]]` 修改 `root` 字段可消解两个步骤在不同 `root` 下定义相同 ID 的冲突，并自动继承新 `root` 的默认工作目录与环境变量。
-///
-/// - **测试目标**：确认 `override` 中的 `root` 覆盖在构造 `ResolvedCase` 的环境与默认 `cwd` 之前生效。
-/// - **场景步骤**：在两个子文件中定义同名步骤 `same`（分别指向 `a` 和 `b`），通过 `override` 将 `same` 的 `root` 统一指定为 `b`；随后测试指向未声明 `root` 的覆盖。
-/// - **预期结果**：`same` 的最终 `root` 为 `b`、`cwd` 为 `/second`、环境变量仅包含 `roots.b` 的 `VIEW=b`（不含 `roots.a` 的 `OLD`）；未声明的 `root` 触发报错。
-#[test]
-fn root_override_resolves_duplicate_root_semantics_without_reselection() {
-    let tree = Tree::new();
-    tree.put("plan.toml", &format!("files=['one.toml','two.toml']\noverride_files=['override.toml']\n[roots.a]\npath={:?}\ncwd='/first'\nenv={{VIEW='a',OLD='only-a'}}\n[roots.b]\npath={:?}\ncwd='/second'\nenv={{VIEW='b'}}\n", tree.path("a"), tree.path("b")));
-    let one = "[[step]]\nkind='exec'\nid='same'\nroot='a'\nprogram='/bin/true'\n";
-    tree.put("one.toml", one);
-    tree.put("two.toml", &one.replace("root='a'", "root='b'"));
-    tree.put("override.toml", "[[override]]\nid='same'\nroot='b'\n");
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].id, "same");
-    assert_eq!(cases[0].root, "b");
-    assert_eq!(cases[0].cwd, Path::new("/second"));
-    assert_eq!(cases[0].env["VIEW"], "b");
-    assert!(!cases[0].env.contains_key("OLD"));
-    tree.put(
-        "override.toml",
-        "[[override]]\nid='same'\nroot='undeclared'\n",
-    );
-    assert!(tree
-        .resolve("plan.toml")
-        .unwrap_err()
-        .contains("unknown root"));
-}
-
-/// 验证 LTP 步骤的 `source = 'executables'` 与 `source = 'runtest'` 严格区分 `directory` 与 `catalog` 字段，即便步骤被禁用也不允许混用。
-///
-/// - **测试目标**：确保配置 schema 校验在步骤禁用时依然生效，防止 `directory` 与 `catalog` 混填或同时填写。
-/// - **场景步骤**：在 `enabled = false` 的 LTP 步骤中遍历 4 种 `source`/`directory`/`catalog` 的非法组合并调用 `config::load`；最后测试合法的禁用配置。
-/// - **预期结果**：4 种矛盾组合均在加载阶段报错；合法的禁用步骤不访问缺失目录并正常返回其余启用步骤。
-#[test]
-fn directory_and_catalog_are_not_implicit_aliases() {
-    let tree = Tree::new();
-    for fields in [
-        "source='executables'\ncatalog='/cases'",
-        "source='executables'\ndirectory='/cases'\ncatalog='/catalog'",
-        "source='runtest'\ndirectory='/cases'",
-        "source='runtest'\ncatalog='/catalog'\ndirectory='/cases'",
-    ] {
-        tree.put("plan.toml", &format!("{}\n[[step]]\nenabled=false\nkind='ltp'\nroots=['a']\nsuite='s'\ninclude=['*']\n{fields}\n", tree.roots()));
-        assert!(config::load(&tree.path("plan.toml"), &[])
-            .unwrap_err()
-            .contains("entry 1"));
-    }
-    tree.put("plan.toml", &format!("{}\n[[step]]\nenabled=false\nkind='ltp'\nsource='executables'\nroots=['a']\nsuite='s'\ndirectory='/missing'\ninclude=['*']\n[[step]]\nkind='exec'\nid='active'\nroot='a'\nprogram='/bin/true'\n", tree.roots()));
-    assert_eq!(tree.resolve("plan.toml").unwrap()[0].id, "active");
-}
-
-/// 验证 `basic` 类型测试在被 `[[override]]` 覆盖 `program` 路径后，其结果判定协议（`Protocol::Basic`）仍保留原始测试名称。
-///
-/// - **测试目标**：确保输出协议中的期望测试名与用例初始选择名绑定，不因执行程序路径被覆盖而改变。
-/// - **场景步骤**：选择 `basic:unusual:mkdir_` 并通过 `override` 将其 `program` 替换为 `/other/program`。
-/// - **预期结果**：生成的用例命令变为 `/other/program`，但 `protocol` 仍为 `Protocol::Basic { name: "mkdir_" }`。
-#[test]
-fn basic_protocol_keeps_original_name_after_command_override() {
-    let tree = Tree::new();
-    tree.executable("root/basic/mkdir_");
-    tree.put("plan.toml", &format!("override_files=['override.toml']\n[roots.unusual]\npath={:?}\n[[step]]\nkind='basic'\nroots=['unusual']\ndirectory='/basic'\ninclude=['mkdir_']\n", tree.path("root")));
-    tree.put(
-        "override.toml",
-        "[[override]]\nid='basic:unusual:mkdir_'\nprogram='/other/program'\n",
-    );
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(
-        cases[0].protocol,
-        Protocol::Basic {
-            name: "mkdir_".into()
-        }
-    );
-    assert_eq!(
-        cases[0].command,
-        CommandSpec::Exec {
-            program: "/other/program".into(),
-            args: vec![]
-        }
-    );
-}
-
-/// 验证可执行目录下的相对符号链接（Symlink）在指向有效可执行文件时可被正常选中，且用例 ID 与执行路径保留符号链接别名。
-///
-/// - **测试目标**：确认目录扫描跟随符号链接检查目标文件可执行权限，同时保留链接本身的名称与路径供子进程调用。
-/// - **场景步骤**：在 `root/cases/alias` 创建指向 `../bin/probe` 可执行文件的相对符号链接，并在 LTP `executables` 模式下选择 `alias`。
-/// - **预期结果**：生成 ID 为 `ltp:a:elf:alias`，执行程序路径为 `/cases/alias`。
-#[test]
-fn executable_relative_symlink_preserves_alias_program_and_id() {
+fn executable_relative_symlink_preserves_alias_name() {
     let tree = Tree::new();
     tree.executable("root/bin/probe");
     fs::create_dir_all(tree.path("root/cases")).unwrap();
     symlink("../bin/probe", tree.path("root/cases/alias")).unwrap();
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='ltp'\nsource='executables'\nroots=['a']\nsuite='elf'\ndirectory='/cases'\ninclude=['alias']\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].id, "ltp:a:elf:alias");
-    assert_eq!(
-        cases[0].command,
-        CommandSpec::Exec {
-            program: "/cases/alias".into(),
-            args: vec![]
-        }
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"elf\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"/cases\"\ninclude = [\"alias\"]\nexec = [\"/cases/{{name}}\"]\n",
+            tree.roots()
+        ),
     );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["elf:a:alias"]);
+    assert_eq!(first(&selection).argv, ["/cases/alias"]);
     assert_eq!(
-        cases[0].source.catalog.as_deref(),
+        first(&selection).source.catalog.as_deref(),
         Some(Path::new("/cases"))
     );
 }
 
-/// 验证指向目标根目录内部路径的绝对符号链接清单（如 `/catalog -> /sources/catalog`）会相对于目标根目录解析，而非穿透到宿主机根目录。
-///
-/// - **测试目标**：确保 `rooted_path` 在遇到绝对符号链接时将其重定根到当前选择的 `root` 下，同时 `source.catalog` 保留配置中的原始路径。
-/// - **场景步骤**：在 `root/catalog` 创建指向 `"/sources/catalog"` 的绝对符号链接，解析引用 `/catalog` 的 LTP 步骤。
-/// - **预期结果**：成功从 `root/sources/catalog` 读取到命令内容，且 `source.catalog` 仍记录为 `/catalog`。
+/// 绝对符号链接在目标根内重新定根，清单从所选 root 读取且来源保留配置路径。
 #[test]
 fn absolute_catalog_symlink_reads_from_selected_root() {
     let tree = Tree::new();
     tree.put("root/sources/catalog", "probe printf 'root catalog'\n");
     symlink("/sources/catalog", tree.path("root/catalog")).unwrap();
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='ltp'\nroots=['a']\nsuite='linked'\ncatalog='/catalog'\ninclude=['probe']\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].id, "ltp:a:linked:probe");
-    assert_eq!(
-        cases[0].command,
-        CommandSpec::Shell {
-            shell: "/bin/sh".into(),
-            command: "printf 'root catalog'".into()
-        }
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"linked\"\nroots = [\"a\"]\n[[group.step]]\ncatalog = \"/catalog\"\ninclude = [\"probe\"]\nexec = [\"/bin/sh\", \"-c\", \"{{command}}\"]\n",
+            tree.roots()
+        ),
     );
-    assert_eq!(
-        cases[0].source.catalog.as_deref(),
-        Some(Path::new("/catalog"))
-    );
-    assert_eq!(cases[0].source.line, Some(1));
+    let selection = tree.resolve("plan.toml").unwrap();
+    let case = first(&selection);
+    assert_eq!(case.id, "linked:a:probe");
+    assert_eq!(case.argv, ["/bin/sh", "-c", "printf 'root catalog'"]);
+    assert_eq!(case.source.catalog.as_deref(), Some(Path::new("/catalog")));
+    assert_eq!(case.source.line, Some(1));
 }
 
-/// 验证包含中间目录绝对符号链接的路径（如 `/linked/cases` 与 `/linked/catalog`，其中 `/linked -> /sources`）在目标根内正确解析且不改写执行路径。
-///
-/// - **测试目标**：确认路径中间组件为绝对符号链接时，无论是目录扫描还是文本清单读取都能限制在目标根目录内完成。
-/// - **场景步骤**：将 `root/linked` 设为指向 `"/sources"` 的绝对符号链接，分别通过 `/linked/cases` 和 `/linked/catalog` 选择测试。
-/// - **预期结果**：两个步骤均成功解析，且可执行路径与 `source.catalog` 均保留未展开前的 `/linked/...` 原始路径。
+/// 中间目录是绝对符号链接时，目录扫描与清单读取都限制在目标根内，路径保持配置原样。
 #[test]
-fn intermediate_directory_symlink_sources_read_from_selected_root() {
+fn intermediate_directory_symlink_reads_from_selected_root() {
     let tree = Tree::new();
     tree.executable("root/sources/cases/probe");
     tree.put("root/sources/catalog", "probe printf 'root catalog'\n");
     symlink("/sources", tree.path("root/linked")).unwrap();
-    tree.put("plan.toml", &format!("{}\n[[step]]\nkind='ltp'\nsource='executables'\nroots=['a']\nsuite='elf'\ndirectory='/linked/cases'\ninclude=['probe']\n[[step]]\nkind='ltp'\nroots=['a']\nsuite='text'\ncatalog='/linked/catalog'\ninclude=['probe']\n", tree.roots()));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(
-        cases
-            .iter()
-            .map(|case| case.id.as_str())
-            .collect::<Vec<_>>(),
-        ["ltp:a:elf:probe", "ltp:a:text:probe"]
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"elf\"\nroots = [\"a\"]\n\
+             [[group.step]]\nid = \"dir:{{root}}:{{name}}\"\ndirectory = \"/linked/cases\"\ninclude = [\"probe\"]\nexec = [\"/linked/cases/{{name}}\"]\n\
+             [[group.step]]\nid = \"cat:{{root}}:{{name}}\"\ncatalog = \"/linked/catalog\"\ninclude = [\"probe\"]\nexec = [\"/bin/sh\", \"-c\", \"{{command}}\"]\n",
+            tree.roots()
+        ),
     );
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["dir:a:probe", "cat:a:probe"]);
+    assert_eq!(selection.groups[0].cases[0].argv, ["/linked/cases/probe"]);
     assert_eq!(
-        cases[0].command,
-        CommandSpec::Exec {
-            program: "/linked/cases/probe".into(),
-            args: vec![]
-        }
-    );
-    assert_eq!(
-        cases[0].source.catalog.as_deref(),
+        selection.groups[0].cases[0].source.catalog.as_deref(),
         Some(Path::new("/linked/cases"))
     );
     assert_eq!(
-        cases[1].command,
-        CommandSpec::Shell {
-            shell: "/bin/sh".into(),
-            command: "printf 'root catalog'".into()
-        }
+        selection.groups[0].cases[1].argv,
+        ["/bin/sh", "-c", "printf 'root catalog'"]
     );
     assert_eq!(
-        cases[1].source.catalog.as_deref(),
+        selection.groups[0].cases[1].source.catalog.as_deref(),
         Some(Path::new("/linked/catalog"))
     );
 }
 
-/// 验证 `libctest` 步骤未显式指定 `cwd` 时，自动继承所属 `root` 配置的默认工作目录（如 `cwd = '/libc-test'`），使 `./runtest.exe` 相对路径得以正确定位。
-///
-/// - **测试目标**：确保 `libctest` 条目自身不强制覆盖 `cwd`，从而允许通过 `root.cwd` 或 `step.cwd` 指定 `runtest.exe` 所在的实际目录。
-/// - **场景步骤**：在 `[roots.a]` 中设置 `cwd = '/libc-test'`，并在 `root/libc-test/run-dynamic.sh` 中放置相对路径命令，解析该步骤。
-/// - **预期结果**：生成的用例 `cwd` 为 `/libc-test`，命令保持 `./runtest.exe -w entry-dynamic.exe argv`。
+/// 千级清单保序展开，精确选择后只剩目标条目且 argv 取自清单原文。
 #[test]
-fn libctest_inherits_explicit_root_cwd_and_original_command() {
+fn thousand_entry_catalog_preserves_order() {
     let tree = Tree::new();
+    let mut catalog = String::new();
+    for index in 0..1000 {
+        writeln!(catalog, "case{index:04} printf 'case{index:04}'").unwrap();
+    }
+    tree.put("root/catalog", &catalog);
+    let plan = |include: &str| {
+        format!(
+            "{}[[group]]\nname = \"large\"\nroots = [\"a\"]\n[[group.step]]\ncatalog = \"/catalog\"\ninclude = [{include}]\nexec = [\"/bin/sh\", \"-c\", \"{{command}}\"]\n",
+            tree.roots()
+        )
+    };
+
+    tree.put("plan.toml", &plan("\"case[0-9]*\""));
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(selection.groups[0].cases.len(), 1000);
+    assert_eq!(selection.groups[0].cases[0].id, "large:a:case0000");
+    assert_eq!(selection.groups[0].cases[999].id, "large:a:case0999");
+
+    tree.put("plan.toml", &plan("\"case0591\""));
+    let selection = tree.resolve("plan.toml").unwrap();
+    assert_eq!(ids(&selection), ["large:a:case0591"]);
+    assert_eq!(
+        first(&selection).argv,
+        ["/bin/sh", "-c", "printf 'case0591'"]
+    );
+}
+
+/// 排除掉全部候选或所有步骤都被禁用时，最终集合为空必须报错，避免空计划被当成成功。
+#[test]
+fn empty_selection_errors_report_the_plan() {
+    let tree = Tree::new();
+    tree.executable("root/cases/alpha");
     tree.put(
-        "root/libc-test/run-dynamic.sh",
-        "./runtest.exe -w entry-dynamic.exe argv\n",
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\ndirectory = \"/cases\"\nexclude = [\"*\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
     );
-    tree.put("plan.toml", &format!("[roots.a]\npath={:?}\ncwd='/libc-test'\n[[step]]\nkind='libctest'\nroots=['a']\nvariant='dynamic'\ncatalog='/libc-test/run-dynamic.sh'\ninclude=['argv']\n", tree.path("root")));
-    let cases = tree.resolve("plan.toml").unwrap();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0].id, "libctest:a:dynamic:argv");
-    assert_eq!(cases[0].cwd, Path::new("/libc-test"));
-    assert_eq!(
-        cases[0].command,
-        CommandSpec::Exec {
-            program: "./runtest.exe".into(),
-            args: vec!["-w".into(), "entry-dynamic.exe".into(), "argv".into()]
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("empty selection") && error.contains("plan.toml"),
+        "unexpected error: {error}"
+    );
+
+    tree.put(
+        "plan.toml",
+        &format!(
+            "{}[[group]]\nname = \"g\"\nroots = [\"a\"]\n[[group.step]]\nenabled = false\nnames = [\"x\"]\nexec = [\"/x\"]\n",
+            tree.roots()
+        ),
+    );
+    let error = tree.error("plan.toml");
+    assert!(
+        error.contains("empty selection"),
+        "unexpected error: {error}"
+    );
+}
+
+/// 仓库的现场与决赛示例计划保持脚本原样：不追加组标记，超时与解释器按集合配置生效。
+#[test]
+fn shipped_example_plans_keep_plain_scripts() {
+    let contest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../contest");
+    let onsite = config::load(&contest.join("onsite-plan.toml"), &[]).unwrap();
+    for arch in ["riscv64", "loongarch64"] {
+        let selection = selection::resolve(&onsite, arch, &[]).unwrap();
+        assert_eq!(selection.groups.len(), 1);
+        assert_eq!(
+            ids(&selection),
+            ["onsite:onsite:task_a.elf", "onsite:onsite:task_b.elf"]
+        );
+        assert_eq!(selection.groups[0].cases[0].argv, ["./task_a.elf"]);
+        assert_eq!(selection.groups[0].cases[1].argv, ["./task_b.elf"]);
+    }
+
+    let finals = config::load(&contest.join("final-plan.toml"), &[]).unwrap();
+    let selection = selection::resolve(&finals, "riscv64", &[]).unwrap();
+    assert_eq!(selection.groups.len(), 2);
+    for group in &selection.groups {
+        assert!(group.start.is_empty() && group.end.is_empty());
+        assert_eq!(group.cases.len(), 1);
+        assert_eq!(group.cases[0].name, "script");
+    }
+    assert_eq!(selection.groups[0].cases[0].argv[0], "/bin/bash");
+    assert_eq!(selection.groups[0].cases[0].timeout_sec, 120);
+    assert_eq!(selection.groups[1].cases[0].argv[0], "/bin/sh");
+    assert_eq!(selection.groups[1].cases[0].timeout_sec, 18000);
+}
+
+/// 发布默认计划在同一假盘上展开为 12 个集合、每 root 一个结果组；libctest/basic/ltp 的标记、用例数与一个脚本组互不混淆。
+#[test]
+fn shipped_default_plan_expands_twelve_groups() {
+    const BASIC: [&str; 32] = [
+        "brk",
+        "chdir",
+        "clone",
+        "close",
+        "dup2",
+        "dup",
+        "execve",
+        "exit",
+        "fork",
+        "fstat",
+        "getcwd",
+        "getdents",
+        "getpid",
+        "getppid",
+        "gettimeofday",
+        "mkdir_",
+        "mmap",
+        "mount",
+        "munmap",
+        "openat",
+        "open",
+        "pipe",
+        "read",
+        "sleep",
+        "times",
+        "umount",
+        "uname",
+        "unlink",
+        "wait",
+        "waitpid",
+        "write",
+        "yield",
+    ];
+    const SCRIPTS: [&str; 9] = [
+        "busybox",
+        "lua",
+        "iozone",
+        "unixbench",
+        "iperf",
+        "libcbench",
+        "lmbench",
+        "netperf",
+        "cyclictest",
+    ];
+    const GROUP_ORDER: [&str; 12] = [
+        "basic",
+        "busybox",
+        "lua",
+        "libctest",
+        "iozone",
+        "unixbench",
+        "iperf",
+        "libcbench",
+        "lmbench",
+        "netperf",
+        "cyclictest",
+        "ltp",
+    ];
+
+    let tree = Tree::new();
+    for name in BASIC {
+        tree.executable(&format!("root/basic/{name}"));
+    }
+    for name in ["open01", "close01", "mmap01", "open_by_handle_at01"] {
+        tree.executable(&format!("root/ltp/testcases/bin/{name}"));
+    }
+
+    let plan = Path::new(env!("CARGO_MANIFEST_DIR")).join("../contest/plan.toml");
+    let mut plan_config = config::load(&plan, &[]).unwrap();
+    for root in ["musl", "glibc"] {
+        plan_config.roots.get_mut(root).unwrap().path = tree.path("root");
+    }
+    let selection = selection::resolve(&plan_config, "riscv64", &[]).unwrap();
+
+    assert_eq!(selection.groups.len(), 24);
+    for (index, name) in GROUP_ORDER.iter().enumerate() {
+        assert_eq!(selection.groups[index * 2].name.as_str(), *name);
+        assert_eq!(selection.groups[index * 2].root, "musl");
+        assert_eq!(selection.groups[index * 2 + 1].name.as_str(), *name);
+        assert_eq!(selection.groups[index * 2 + 1].root, "glibc");
+    }
+
+    let pick = |name: &str, root: &str| {
+        selection
+            .groups
+            .iter()
+            .find(|group| group.name == name && group.root == root)
+            .unwrap()
+    };
+
+    for root in ["musl", "glibc"] {
+        let basic = pick("basic", root);
+        assert_eq!(basic.cases.len(), 32);
+        assert_eq!(
+            basic.start,
+            format!("#### OS COMP TEST GROUP START basic-{root} ####\n")
+        );
+        assert_eq!(
+            basic.end,
+            format!("#### OS COMP TEST GROUP END basic-{root} ####\n")
+        );
+
+        let libc = pick("libctest", root);
+        assert_eq!(libc.cases.len(), 217);
+        assert_eq!(libc.cases[0].id, format!("libctest:{root}:dynamic:argv"));
+        assert_eq!(libc.cases[110].id, format!("libctest:{root}:static:argv"));
+        let dynamic = format!("libctest:{root}:dynamic:");
+        let statik = format!("libctest:{root}:static:");
+        assert!(libc.cases[..110]
+            .iter()
+            .all(|case| case.id.starts_with(&dynamic)));
+        assert!(libc.cases[110..]
+            .iter()
+            .all(|case| case.id.starts_with(&statik)));
+        assert_eq!(
+            libc.start,
+            format!("#### OS COMP TEST GROUP START libctest-{root} ####\n")
+        );
+        assert_eq!(
+            libc.end,
+            format!("#### OS COMP TEST GROUP END libctest-{root} ####\n")
+        );
+
+        let ltp = pick("ltp", root);
+        let names: Vec<&str> = ltp.cases.iter().map(|case| case.name.as_str()).collect();
+        assert_eq!(names, ["open01", "close01", "mmap01"]);
+        assert_eq!(
+            ltp.start,
+            format!("#### OS COMP TEST GROUP START ltp-{root} ####\n")
+        );
+        assert_eq!(
+            ltp.end,
+            format!("#### OS COMP TEST GROUP END ltp-{root} ####\n")
+        );
+
+        for name in SCRIPTS {
+            let group = pick(name, root);
+            assert_eq!(group.cases.len(), 1);
+            assert_eq!(group.cases[0].name, "script");
+            assert!(group.start.is_empty());
+            assert!(group.end.is_empty());
         }
-    );
-    assert_eq!(
-        cases[0].protocol,
-        Protocol::Pre2025Libctest {
-            variant: "dynamic".into(),
-            selector: "argv".into()
-        }
-    );
+    }
+
+    let basic = pick("basic", "musl");
+    let mmap = basic.cases.iter().find(|case| case.name == "mmap").unwrap();
+    assert_eq!(mmap.argv, ["./mmap"]);
+    assert_eq!(mmap.cwd.as_path(), Path::new("/basic"));
+    assert_eq!(mmap.timeout_sec, 120);
+    let glibc = pick("basic", "glibc");
+    let glibc_mmap = glibc.cases.iter().find(|case| case.name == "mmap").unwrap();
+    assert_eq!(glibc_mmap.timeout_sec, 60);
 }

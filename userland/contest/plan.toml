@@ -1,22 +1,53 @@
-# 固定 pre-2025 盘的实际目录；只读取盘内原程序和库，不执行补库。
-# 缺少某个来源直接报错，应按收到的盘修改本计划，不切换备用来源。
-files = ["sets/basic.toml", "sets/libctest.toml"]
+# 正式启动默认入口：启用初赛 12 组；LTP 只按 sets/ltp.toml 的 include 运行部分用例。
+files = [
+    "sets/basic.toml",
+    "sets/busybox.toml",
+    "sets/lua.toml",
+    "sets/libctest.toml",
+    "sets/iozone.toml",
+    "sets/unixbench.toml",
+    "sets/iperf.toml",
+    "sets/libcbench.toml",
+    "sets/lmbench.toml",
+    "sets/netperf.toml",
+    "sets/cyclictest.toml",
+    "sets/ltp.toml",
+]
 override_files = ["overrides/local.toml"]
 finish = "poweroff"
 
 [defaults]
 timeout_sec = 60
 repeat = 1
-hooks = false
 
+# pre-2025 盘的 musl/glibc 子目录缺少原程序 PT_INTERP 请求的解释器路径和脚本 shebang 的 /bin/sh。
+# prepare 在每次激活该 root 时修改当前挂载的比赛盘，原始镜像由 QEMU 工作盘策略（默认 fresh 复制）保护；不同架构的名字一并建立。
 [roots.musl]
 path = "/mnt/contest/musl"
 cwd = "/"
 mounts = ["dev", "proc", "tmp"]
-env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }
+env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
+prepare = [
+    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"],
+    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64-sf.so.1"],
+    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64.so.1"],
+    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-loongarch-lp64d.so.1"],
+    # musl 根内的 basic 程序请求 glibc 解释器，复制同盘 glibc 根的 loader。
+    ["/bin/busybox", "sh", "-c", "/bin/busybox cp /mnt/contest/glibc/lib/ld-linux-*.so.1 /mnt/contest/musl/lib/"],
+    # 盘内辅助脚本的 shebang 使用 /bin/sh 与 /bin/busybox。
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/bin"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/busybox"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/sh"],
+]
 
 [roots.glibc]
 path = "/mnt/contest/glibc"
 cwd = "/"
 mounts = ["dev", "proc", "tmp"]
-env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }
+env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
+prepare = [
+    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/glibc/lib64"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/bin"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/busybox"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/sh"],
+]

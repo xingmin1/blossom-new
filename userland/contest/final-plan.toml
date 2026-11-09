@@ -1,0 +1,23 @@
+# 这里只展示参考脚本的接入方式，不宣称已核对发布镜像布局。
+# 本示例假定 /mnt/contest 是完整 Debian root，/scripts 中有两份原脚本。
+# 实际发布盘若把脚本放在 /glibc 或另一目录，只修改 path、cwd、exec。
+files = ["sets/final-scripts.toml"]
+finish = "poweroff"
+
+[defaults]
+timeout_sec = 60
+repeat = 1
+
+[roots.final]
+path = "/mnt/contest"
+cwd = "/"
+# CAgent 先使用 runner 提供的 dev/proc/tmp。
+mounts = ["dev", "proc", "tmp"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin", HOME = "/root" }
+
+[roots.debian]
+path = "/mnt/contest"
+cwd = "/"
+# BuildStorm 自己挂载，runner 不再重复挂载。
+mounts = []
+env = { PATH = "/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin", HOME = "/root" }

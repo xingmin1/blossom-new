@@ -1,0 +1,15 @@
+# 普通 ELF：没有给定评测包装格式时，不凭空添加组标记。
+[[group]]
+name = "onsite"
+roots = ["onsite"]
+
+[[group.step]]
+names = ["task_a.elf", "task_b.elf"]
+exec = ["./{name}"]
+
+# 显式解释器示例。路径/选项以实际收到的 loader 为准，不默认启用。
+[[group.step]]
+enabled = false
+arch = ["riscv64"]
+names = ["task_c.elf"]
+exec = ["/runtime/ld-linux-riscv64-lp64d.so.1", "--library-path", "/runtime/lib", "/tests/{name}", "--size", "64"]

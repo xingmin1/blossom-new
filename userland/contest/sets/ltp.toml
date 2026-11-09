@@ -1,0 +1,17 @@
+# 采用官方 pre-2025 原脚本的目录运行形态。
+# 若某一用例必须带参数，在 override 中修改 exec，或采用 ltp-catalog.toml。
+[[group]]
+name = "ltp"
+roots = ["musl", "glibc"]
+cwd = "/"
+env = { LTPROOT = "/ltp", TMPDIR = "/tmp" }
+start = "#### OS COMP TEST GROUP START ltp-{root} ####\n"
+end = "#### OS COMP TEST GROUP END ltp-{root} ####\n"
+
+[[group.step]]
+directory = "/ltp/testcases/bin"
+include = ["open*", "close*", "mmap01"]
+exclude = ["open_by_handle_at*"]
+exec = ["/ltp/testcases/bin/{name}"]
+before = "RUN LTP CASE {name}\n"
+after = "FAIL LTP CASE {name} : {status}\n"

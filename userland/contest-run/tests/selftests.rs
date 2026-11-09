@@ -4,7 +4,7 @@
 //! 本文件是 `contest-run` 工具箱中 `selftests` 子模块的集成测试套件。
 //! 上游对接命令行入口（`user-selftests` 二进制程序及 `selftests::Options` 解析器），
 //! 下游调用清单选择器 `selftests::select`、执行入口 `selftests::run`、TAP 协议流式观察器
-//! `ProtocolObserver` 以及运行汇总器 `Summary`，验证参数校验、只读清单列举及程序级退出码优先级。
+//! `TapObserver` 以及运行汇总器 `Summary`，验证参数校验、只读清单列举及程序级退出码优先级。
 //!
 //! # 核心流程与退出码优先级状态机
 //!
@@ -16,7 +16,7 @@
 //!                  │
 //!                  ├──► --list 模式：仅向输出流打印清单条目，不访问或要求测试程序文件存在
 //!                  │
-//!                  └──► 执行模式：运行选中程序 ──► ProtocolObserver (解析 TAP 输出)
+//!                  └──► 执行模式：运行选中程序 ──► TapObserver (解析 TAP 输出)
 //!                                                      │
 //!                                                      ▼
 //!                                               Summary::record
@@ -33,10 +33,9 @@
 //! # 并发与锁契约
 //! 本测试文件中的各个测试函数互相独立，通过进程 ID 与测试专属临时目录（`Scratch`）隔离文件系统副作用，不涉及跨线程共享锁。
 
-use contest_run::model::Protocol;
 use contest_run::outcome::{Execution, ExitOutcome};
-use contest_run::report::{ProtocolObserver, StreamKind};
 use contest_run::selftests::{self, Options, Summary};
+use contest_run::tap::TapObserver;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -167,13 +166,10 @@ fn program_timeout_rejects_invalid_cli_values() {
     }
 }
 
-/// 验证 `Summary` 汇总器根据 TAP 协议解析结果、进程退出码与输出 I/O 错误计算最终退出码的优先级规则。
+/// 验证 `Summary` 汇总器根据 TAP 判定结果、进程退出码与输出转发错误计算退出码的优先级规则。
 ///
-/// - **测试目标**：确保成功（0）、全部跳过（4）、测试失败（1）与协议损坏/基础设施 I/O 错误（2）按严重程度正确汇总。
-/// - **场景步骤（Given-When-Then）**：
-///   1. Given 不同类型的 TAP 标准输出与进程退出码组合（正常通过、单步跳过、0 计划跳过、单步失败、计划数未跑满、XFAIL 但进程以非零码退出）；
-///   2. When 经 `ProtocolObserver` 解析并调用 `Summary::record` 记录首次运行；Then `summary.status()` 分别返回预期的退出码（0、4、1、2）。
-///   3. When 向同一 `Execution` 追加一条输出转发 I/O 错误并再次记录到 `Summary`；Then 无论此前结果如何，最终汇总退出码均升级为最高优先级的错误码 2。
+/// 覆盖的缺陷类：全部跳过被当成失败、协议损坏被当成普通失败、失败优先级低于跳过，
+/// 以及输出转发 I/O 错误没有提升为最高优先级的错误码。
 #[test]
 fn summary_exit_codes_preserve_failure_and_skip_priorities() {
     // Step 1: 遍历典型的 TAP 输出与退出码组合，依次校验首次记录时的汇总退出码。
@@ -189,21 +185,21 @@ fn summary_exit_codes_preserve_failure_and_skip_priorities() {
             code,
             raw: code << 8,
         };
-        let mut observer = ProtocolObserver::new(&Protocol::Tap);
-        observer.feed(StreamKind::Stdout, text.as_bytes());
+        let mut observer = TapObserver::new();
+        observer.feed(text.as_bytes());
+        let result = observer.finish(&outcome);
         let mut run = Execution {
-            protocol: observer.finish(&outcome),
             outcome,
             io_errors: Vec::new(),
             elapsed: Duration::ZERO,
         };
         let mut summary = Summary::default();
-        summary.record(&run);
+        summary.record(&run, &result);
         assert_eq!(summary.status(), expected, "{text}");
         // Step 2: 注入输出转发 I/O 错误后再次汇入统计，验证 I/O 错误会将汇总退出码提升为 2。
         run.io_errors
             .push("real output could not be delivered".into());
-        summary.record(&run);
+        summary.record(&run, &result);
         assert_eq!(summary.status(), 2);
     }
 }

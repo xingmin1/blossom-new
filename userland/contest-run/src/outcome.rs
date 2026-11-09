@@ -1,23 +1,21 @@
-//! 子进程退出状态与协议判定结果的公共数据类型模块。
+//! 子进程进程事实与 TAP 自测判定结果的公共数据类型模块。
 //!
 //! ## 模块职责与架构定位
-//! 本模块定义 `process`（进程管理）、`report`/`tap`（协议解析）与 `execute`（用例执行编排）之间共享的结果数据模型。
-//! 本模块不依赖具体的执行或解析实现，作为底层进程控制与上层测试报告之间的契约边界。
+//! 本模块定义 `process`、`execute` 与 `selftests` 之间共享的结果数据模型：
+//! [`ExitOutcome`] 与 [`Execution`] 记录一次命令运行的进程事实（退出、信号、启动失败、超时、等待或管道错误）与耗时；
+//! [`ProtocolResult`] 与 [`TapSummary`] 只承载 `user-selftests` 的 TAP 结论，比赛路径不产生协议判定。
 //!
-//! ## 结果判定分层关系
+//! ## 数据流
 //!
 //! ```text
-//!   操作系统进程退出与管道状态
+//!   操作系统进程状态
 //!       │
 //!       ├─► ExitOutcome (Exited / Signaled / SpawnError / TimedOut / IoError)
-//!       ├─► io_errors: Vec<String> (管道转发、进程组信号、辅助进程回收等非致命或附加 I/O 错误)
-//!       └─► ProtocolObserver / TapObserver 流式输出解析
+//!       ├─► io_errors: Vec<String>（管道转发、进程组信号、辅助进程回收等附加错误）
+//!       └─► TapObserver（仅自测路径）
 //!               │
 //!               ▼
 //!         ProtocolResult { verdict: Verdict, tap: Option<TapSummary> }
-//!               │
-//!               ▼
-//!         Execution { outcome, io_errors, elapsed, protocol }
 //! ```
 //!
 //! ## 并发与锁契约
@@ -42,7 +40,7 @@ pub enum ExitOutcome {
         /// `waitpid` 返回的原始 32 位状态字（`wstatus`）。
         raw: i32,
     },
-    /// 子进程在 `fork`/`exec` 启动阶段（含 `pre_exec` 中的 `chroot`/`chdir`/`setpgid`）失败。
+    /// 子进程在 `fork`/`exec` 启动阶段（含 `pre_exec` 中的 `chroot`/`chdir`/`setsid`）失败。
     SpawnError {
         /// 操作系统返回的错误码（`errno`）。
         errno: Option<i32>,
@@ -56,7 +54,7 @@ pub enum ExitOutcome {
         /// 若子进程最终因信号退出，记录该信号编号（通常为 `SIGTERM` 或 `SIGKILL`）。
         signal: Option<i32>,
     },
-    /// 子进程启动后在管道设置、输出转发建立或 `waitpid` 过程中发生系统 I/O 错误。
+    /// 子进程启动后在管道设置、输出转发建立或进程组收尾过程中发生系统 I/O 错误。
     IoError {
         /// 操作系统返回的错误码（`errno`）。
         errno: Option<i32>,
@@ -67,76 +65,78 @@ pub enum ExitOutcome {
     },
 }
 
-/// 单次命令运行（主测试命令或前后置脚本命令）的完整执行记录。
+impl ExitOutcome {
+    /// 返回 shell 风格的状态码，供 `after` 模板的 `{status}` 与单命令模式透传使用。
+    ///
+    /// 正常退出取原退出码；信号终止为 `128 + signal`；执行器超时为 124；启动失败按 `errno` 区分
+    /// `ENOENT` = 127、`EACCES`/`ENOEXEC` = 126、其余 = 125；等待或管道收尾失败为 125。
+    /// 后几项是执行器约定，不代表原程序自己返回过这些码。
+    pub fn shell_status(&self) -> i32 {
+        match self {
+            Self::Exited { code, .. } => *code,
+            Self::Signaled { signal, .. } => 128 + *signal,
+            Self::TimedOut { .. } => 124,
+            Self::SpawnError { errno, .. } => match *errno {
+                Some(libc::ENOENT) => 127,
+                Some(libc::EACCES | libc::ENOEXEC) => 126,
+                _ => 125,
+            },
+            Self::IoError { .. } => 125,
+        }
+    }
+}
+
+/// 单次命令运行（主命令或准备命令）的完整进程记录。
 #[derive(Debug)]
 pub struct Execution {
     /// 子进程底层的退出分类状态。
     pub outcome: ExitOutcome,
-    /// 运行期间在标准输出/错误管道读取、转发、辅助进程回收或发送进程组信号时收集到的独立 I/O 错误列表。
+    /// 运行期间在管道读取/转发、辅助进程回收或发送进程组信号时收集到的附加 I/O 错误列表。
     pub io_errors: Vec<String>,
-    /// 命令从启动到完全结束（含输出排空）所耗费的单调时钟时长。
+    /// 命令从启动到收尾（含组内残留清理与组首回收）所耗费的单调时钟时长。
     pub elapsed: Duration,
-    /// 结合退出状态与流式输出解析得出的协议判定结果。
-    pub protocol: ProtocolResult,
 }
 
-/// 测试用例单次迭代的统一高层协议判定结论。
+/// `user-selftests` 单次 TAP 运行的判定结论；比赛路径不使用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// 测试通过（退出码及协议要求的通过标记全部满足）。
+    /// 退出码与 TAP 计划全部满足，没有失败或意外通过的子项。
     Pass,
     /// 测试被主动跳过（如 TAP 协议中全部子项均带 `# SKIP` 指令）。
     Skip,
-    /// 测试完整运行结束（用于仅检查 `START`/`END` 边界与无报错、但不输出显式 `Pass!` 标记的 `basic` 协议）。
-    Completed,
-    /// 测试断言失败、退出码非预期或缺少必要的完成标记。
+    /// 子项失败、`Bail out!`、意外通过或退出码不符合协议要求。
     Failed,
-    /// 测试程序自身执行异常或协议格式损坏（如 LTP `TBROK` 或 TAP 语法错误）。
+    /// TAP 协议格式损坏或计划数不完整，结果无法据此判定。
     Broken,
-    /// 测试运行完成但附带警告（如 LTP `TWARN`）。
-    Warning,
-    /// 当前内核或运行环境不满足测试所需的配置或特性支持（如 LTP `TCONF`）。
-    Configuration,
-    /// 测试未实际运行（如前序基础设施故障中止，或输出中从未出现协议起始标记）。
-    NotRun,
     /// 测试运行超时并被强制终止。
     TimedOut,
     /// 测试进程因未捕获信号崩溃或被杀死。
     Signaled,
-    /// 执行器自身在挂载、钩子、管道或进程控制环节发生基础设施错误。
+    /// 执行器自身在进程启动、管道转发或回收环节发生基础设施错误。
     InfrastructureError,
 }
 
 impl Verdict {
-    /// 返回报告日志中使用的固定英文状态名称字符串。
+    /// 返回自测结果行中使用的固定英文状态名称字符串。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "Pass",
             Self::Skip => "Skip",
-            Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Broken => "Broken",
-            Self::Warning => "Warning",
-            Self::Configuration => "Configuration",
-            Self::NotRun => "NotRun",
             Self::TimedOut => "TimedOut",
             Self::Signaled => "Signaled",
             Self::InfrastructureError => "InfrastructureError",
         }
     }
-
-    /// 判断该结论在执行器汇总退出码时是否视为成功（仅 `Pass` 与 `Completed` 视为成功）。
-    pub fn is_success(self) -> bool {
-        matches!(self, Self::Pass | Self::Completed)
-    }
 }
 
-/// 协议观察器在命令结束时生成的最终解析结果。
+/// TAP 观察器在命令结束时生成的最终解析结果。
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProtocolResult {
-    /// 综合进程退出状态与流式输出内容得出的高层判定结论。
+    /// 综合进程退出状态与标准输出内容得出的高层判定结论。
     pub verdict: Verdict,
-    /// 若该用例采用 TAP 协议，附带解析出的子测试统计摘要。
+    /// 解析出的 TAP 子测试统计摘要。
     pub tap: Option<TapSummary>,
 }
 

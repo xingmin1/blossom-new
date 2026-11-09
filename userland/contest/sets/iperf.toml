@@ -1,0 +1,14 @@
+# 执行盘内原脚本；脚本自己输出组标记，group 不写 start/end。
+# 原脚本用 iperf3 -D 启动服务：服务脱离进程组，而当前内核的 procfs 没有 /proc/<pid>，BusyBox 的
+# killall/pidof 找不到它，残留服务会占住测试根的 /dev 挂载，下一个 root 切换时卸载 Busy 并停止会话。
+# setup 先在 tmpfs 里生成一份把 -D 改为"同进程组后台任务并丢弃服务输出"的脚本副本，其余内容不变；
+# 服务随主命令的进程组收尾结束。
+[[group]]
+name = "iperf"
+roots = ["musl", "glibc"]
+
+[[group.step]]
+names = ["script"]
+setup = [["/busybox", "sh", "-c", "/busybox sed 's| -D$| >/dev/null 2>\\&1 \\&|' /iperf_testcode.sh > /tmp/iperf_testcode.sh"]]
+exec = ["/busybox", "sh", "/tmp/iperf_testcode.sh"]
+timeout_sec = 600

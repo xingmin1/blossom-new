@@ -1,0 +1,19 @@
+# 运行环境示例，不是内核优化开关。
+# 使用前必须已经选择这些 ID，且根内确实有 /busybox 和可写 ext4 目录。
+# 不要直接把比赛系统盘设成会被测例格式化的 LTP_DEV。
+[[override]]
+id = "ltp:musl:sendfile09"
+env = { TMPDIR = "/scratch/sendfile09", LTP_SINGLE_FS_TYPE = "ext4", LTP_DEV_FS_TYPE = "ext4" }
+setup = [["/busybox", "mkdir", "-p", "/scratch/sendfile09"]]
+cleanup = [["/busybox", "rm", "-rf", "/scratch/sendfile09"]]
+
+[[override]]
+id = "ltp:glibc:getpid01"
+timeout_sec = 150
+env = { LTP_TIMEOUT_MUL = "4" }
+
+[[override]]
+id = "ltp:musl:getrusage03"
+arch = ["loongarch64"]
+timeout_sec = 450
+env = { LTP_TIMEOUT_MUL = "14" }

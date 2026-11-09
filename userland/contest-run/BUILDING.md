@@ -28,7 +28,7 @@ make build-contest-runner ARCH=loongarch64 RUNNER_SYSROOT=/absolute/prepared/sys
 `contest-run` 是架构级通用用户态程序，仅根据 `ARCH` 编译为对应架构的 Linux-musl 静态 ELF，无需针对不同的 `TARGET_PLATFORM`（如 QEMU 与实体开发板）分别编译不同版本的执行器。其命令行接口统一为：
 
 ```text
-/sbin/contest-run DEVICE [--plan FILE] [--file FILE ...] [--list]
+/sbin/contest-run DEVICE [--plan FILE] [--file FILE]... [--list] [--only PATTERN]... [--timeout-sec N] [--repeat N] [--verbose] [--finish poweroff|return]
 /sbin/contest-run DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]
 ```
 

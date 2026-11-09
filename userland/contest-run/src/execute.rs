@@ -1,198 +1,245 @@
-//! 单个测试用例的生命周期编排：前置准备（`setup`）、内核钩子配对（`before`/`after`）、主命令执行与后置清理（`cleanup`）。
+//! 单个测例的生命周期编排：内核通知、`setup`、文本输出、主命令与 `cleanup`。
 //!
-//! ## 模块职责与架构定位
-//! 本模块位于测例选择层（`crate::selection`）与底层子进程执行器（`crate::process::run_command`）之间。
-//! 上游主运行器（`contest-run`）针对每个解析后的 [`ResolvedCase`] 按轮次调用 [`execute_case`]，也可以在初始化
-//! 根环境时直接调用 [`run_steps`] 执行一系列准备命令。本模块负责维护五阶段生命周期顺序与错误传播规则，不直接管理底层管道或信号。
+//! 本模块位于测例选择层（`crate::selection`）与子进程执行器（`crate::process`）之间，
+//! 只记录进程事实与编排错误，不做判题。一次执行的顺序固定为：
 //!
-//! ## 单轮测例执行状态机
 //! ```text
-//! [1. setup 命令序列] (stop_on_error = true)
-//!       │
-//!       ├─> 失败 ──> 记录 setup_error ──────────────────────────────────┐
-//!       ▼ 成功                                                          │
-//! [2. before 钩子] (仅当 case.hooks == true)                            │
-//!       │                                                               │
-//!       ├─> 失败 ──> 记录 before_error (before_succeeded = false) ──────┤
-//!       ▼ 成功 (或未启用 hooks)                                         │
-//! [3. 主测试命令 run_command]                                           │
-//!       │                                                               │
-//!       ▼ 无论主命令通过、失败、超时或被信号终止                        │
-//! [4. after 钩子] (仅当 before_succeeded == true 时配对执行)            │
-//!       │                                                               │
-//!       ▼                                                               │
-//! [5. cleanup 命令序列] (stop_on_error = false，始终执行以回收环境资源) ◀┘
+//! before 通知 ─> setup ─> before 文本 ─> 主命令 ─> after 文本 ─> cleanup ─> after 通知
 //! ```
 //!
-//! ## 并发与锁契约
-//! 本模块在单线程控制流中顺序推进各阶段命令，所有状态保存在栈上的 [`CaseRecord`] 中，不涉及共享锁。
+//! `before` 通知失败时不再进入本轮的其余阶段。任一命令的进程控制失败（unquiesced）时，
+//! 不再执行后续阶段或发送 `after` 通知，由上层停止会话。setup 或主命令失控时也不写 `after` 文本。
+//! 其余阶段的错误分别保留，清理与 `after` 通知仍然执行。普通非零退出不是执行错误；超时与
+//! 信号终止属于执行错误，但进程组已可靠收尾，会话可以继续下一例。
 
-use crate::model::{CommandSpec, Protocol, ResolvedCase};
+use crate::model::ResolvedCase;
 use crate::outcome::{Execution, ExitOutcome};
 use crate::process::run_command;
 use std::collections::BTreeMap;
-use std::io;
-use std::os::fd::RawFd;
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-/// 单个测例在单次迭代（Iteration）中的完整执行记录。
-#[derive(Debug)]
+/// 单个测例一次执行的完整记录。
+///
+/// 各阶段的错误分别保存，后一阶段不会覆盖前一阶段的信息；`execution` 只在主命令真正启动后存在。
+#[derive(Debug, Default)]
 pub struct CaseRecord {
-    /// 主测试命令的子进程执行结果与协议判定；若在 `setup` 或 `before` 阶段提前失败则为 `None`。
-    pub execution: Option<Execution>,
-    /// 前置准备（`setup`）阶段遇到的首个命令执行错误描述。
-    pub setup_error: Option<String>,
-    /// 主命令启动前调用内核 `before` 钩子时发生的错误描述。
+    /// 内核 `before` 通知失败的原因。
     pub before_error: Option<String>,
-    /// 主命令结束后调用内核 `after` 钩子时发生的错误描述。
-    pub after_error: Option<String>,
-    /// 后置清理（`cleanup`）阶段所有失败命令的错误描述列表。
+    /// `setup` 阶段的命令错误；`stop_on_error` 使这里最多保留首个错误。
+    pub setup_errors: Vec<String>,
+    /// `setup` 命令的进程控制已失效，其进程组可能仍在运行。
+    pub setup_unquiesced: bool,
+    /// 写出 `before`/`after` 文本时发生的 I/O 错误。
+    pub output_errors: Vec<String>,
+    /// 主命令的进程事实；未运行时为 `None`。
+    pub execution: Option<Execution>,
+    /// `cleanup` 阶段的命令错误；进程控制失效后不再执行其余命令。
     pub cleanup_errors: Vec<String>,
-    /// 当前执行所属的轮次编号（从 1 开始计数）。
-    pub iteration: u32,
+    /// `cleanup` 命令的进程控制已失效，其进程组可能仍在运行。
+    pub cleanup_unquiesced: bool,
+    /// 内核 `after` 通知失败的原因。
+    pub after_error: Option<String>,
 }
 
 impl CaseRecord {
-    /// 判断本次执行是否发生了环境或基础设施层面的致命错误，需要立即中止后续测例或轮次。
+    /// 报告准备、主命令或清理阶段是否存在无法确认已停止的进程组。
     ///
-    /// 当 `setup`、`before`、`after`、`cleanup` 任一环节报错，或主命令在执行期间遭遇底层管道/进程 I/O 错误时返回 `true`，
-    /// 防止在被污染或未知的系统状态下继续运行后续测试。
-    pub fn must_stop(&self) -> bool {
-        self.setup_error.is_some()
-            || self.before_error.is_some()
-            || self.after_error.is_some()
-            || !self.cleanup_errors.is_empty()
-            || self.execution.as_ref().is_some_and(|run| {
-                !run.io_errors.is_empty() || matches!(run.outcome, ExitOutcome::IoError { .. })
-            })
+    /// 命令以 `IoError` 结束，或执行过程中记录了进程组信号、等待等 I/O 错误时为 `true`；
+    /// 此时不能再假定进程组已静止，不能继续执行清理或恢复全局状态。
+    pub fn unquiesced(&self) -> bool {
+        self.setup_unquiesced
+            || self.cleanup_unquiesced
+            || self.execution.as_ref().is_some_and(control_lost)
     }
 
-    /// 判断本轮测例是否完全通过。
+    /// 报告本次执行是否要求停止整个会话。
     ///
-    /// 仅当未发生任何基础设施错误（`!self.must_stop()`），且主命令已实际运行并被对应输出协议判定为成功时返回 `true`。
-    pub fn is_success(&self) -> bool {
-        !self.must_stop()
-            && self
-                .execution
-                .as_ref()
-                .is_some_and(|run| run.protocol.verdict.is_success())
+    /// 通知失败、输出失败、清理失败或进程控制失败都会让后续测例在不可信的状态下运行，
+    /// 因此调用方在记录到 `true` 后不再开始下一例。
+    pub fn must_stop(&self) -> bool {
+        self.before_error.is_some()
+            || self.after_error.is_some()
+            || !self.cleanup_errors.is_empty()
+            || !self.output_errors.is_empty()
+            || self.unquiesced()
+    }
+
+    /// 报告本次执行是否计入计划状态中的执行错误。
+    ///
+    /// 除会话停止条件外，`setup` 失败、主命令未运行或主命令不是正常退出（超时、信号、启动失败）
+    /// 也算执行错误；正常非零退出码不是执行错误。
+    pub fn failed(&self) -> bool {
+        if self.must_stop() || !self.setup_errors.is_empty() {
+            return true;
+        }
+        match &self.execution {
+            Some(run) => !matches!(run.outcome, ExitOutcome::Exited { .. }),
+            None => true,
+        }
     }
 }
 
-/// 顺序执行一组环境准备或清理命令（`argv` 数组列表），并收集所有非零退出、超时或 I/O 错误。
+/// 一组准备或清理命令的执行结果。
+#[derive(Debug, Default)]
+pub struct StepReport {
+    /// 失败命令的单行诊断。
+    pub errors: Vec<String>,
+    /// 某条命令的进程控制已失效，其进程组可能仍在运行。
+    pub unquiesced: bool,
+}
+
+/// 判断一次命令执行是否丢失了进程控制：以 `IoError` 结束，或记录了信号、等待等 I/O 错误。
+fn control_lost(run: &Execution) -> bool {
+    !run.io_errors.is_empty() || matches!(run.outcome, ExitOutcome::IoError { .. })
+}
+
+/// 顺序执行一组准备或清理命令，返回失败诊断与进程控制是否失效。
 ///
-/// 调用上下文：在根环境初始化（`prepare_root`）、测例前置准备（`setup`）或后置清理（`cleanup`）阶段同步调用。
-/// 参数：
-/// - `root`：可选的 `chroot` 目标根目录；为 `None` 时在当前系统根下执行。
-/// - `cwd`：子进程的工作目录（相对于生效的根目录）。
-/// - `commands`：待执行的命令数组列表，每项为 `[program, arg1, arg2, ...]`。
-/// - `env`：附加或覆盖的环境变量映射。
-/// - `timeout`：单条命令的执行超时上限。
-/// - `outputs`：子进程标准输出和标准错误绑定的文件描述符对 `[stdout_fd, stderr_fd]`。
-/// - `stop_on_error`：若为 `true`（如 `setup` 阶段），遇到第一条失败命令即停止后续命令；若为 `false`（如 `cleanup` 阶段），继续尝试执行剩余清理命令。
-/// 返回值：所有执行失败的命令诊断信息列表；全部以退出码 0 正常结束且无 I/O 错误时返回空列表。
+/// 调用上下文：`prepare_root`、测例 `setup` 与 `cleanup` 阶段同步调用。每条命令都在
+/// `root`（可选 chroot）下的 `cwd` 运行，环境为 `env`，单条超时为 `timeout`；只有正常退出码 0
+/// 才算成功，空 argv 直接记为错误。`stop_on_error` 为 `true` 时遇到首个失败即停止；
+/// 为 `false` 时继续尝试其余命令，但进程控制一旦失效就立即停止。
 pub fn run_steps(
     root: Option<&Path>,
     cwd: &Path,
     commands: &[Vec<String>],
     env: &BTreeMap<String, String>,
     timeout: Duration,
-    outputs: [RawFd; 2],
     stop_on_error: bool,
-) -> Vec<String> {
-    let mut errors = Vec::new();
+) -> StepReport {
+    let mut report = StepReport::default();
     for argv in commands {
-        let Some((program, args)) = argv.split_first() else {
-            errors.push("empty preparation command".into());
-            break;
-        };
-        let spec = CommandSpec::Exec {
-            program: program.clone(),
-            args: args.to_vec(),
-        };
-        let run = run_command(root, cwd, &spec, env, timeout, &Protocol::Plain, outputs);
-        if !matches!(run.outcome, ExitOutcome::Exited { code: 0, .. }) || !run.io_errors.is_empty()
-        {
-            errors.push(format!(
-                "command {argv:?}: {:?}; I/O errors: {:?}",
-                run.outcome, run.io_errors
-            ));
+        if argv.is_empty() {
+            report.errors.push("empty command".into());
             if stop_on_error {
+                break;
+            }
+            continue;
+        }
+        let run = run_command(root, cwd, argv, env, timeout);
+        let lost = control_lost(&run);
+        if !matches!(run.outcome, ExitOutcome::Exited { code: 0, .. }) || lost {
+            report.errors.push(describe(argv, &run));
+            report.unquiesced |= lost;
+            if stop_on_error || lost {
                 break;
             }
         }
     }
-    errors
+    report
 }
 
-/// 执行单个测例的一轮完整生命周期（`setup` -> `before` 钩子 -> 主命令 -> `after` 钩子 -> `cleanup`）。
+/// 执行单个测例的一次完整生命周期，返回各阶段记录。
 ///
-/// 调用上下文：由测试运行器在单轮测试循环中调用。
-/// 参数 `root` 为可选的目标根目录路径，`case` 为已完成参数合并的测例规格，`iteration` 为从 1 开始的轮次号，
-/// `outputs` 为输出文件描述符对，`hook` 为触发内核测试钩子的回调函数。
-/// 返回值：包含主命令结果及各阶段基础设施错误的 [`CaseRecord`]。无论中间阶段是否失败，都会保证已成功的 `before` 钩子得到 `after` 配对，且 `cleanup` 列表始终被执行。
+/// `root` 为主命令与准备命令的 chroot 目标，`case` 为已展开的测例，`setup_timeout` 是
+/// `setup`/`cleanup` 单条命令的超时；主命令使用 `case.timeout_sec`。`out` 接收测例自身的
+/// `before`/`after` 协议文本，`notify` 接收 `before`/`after` 内核通知。
+/// 函数不判题，也不会因普通非零退出而提前结束；`before` 通知失败或任一命令的进程控制
+/// 失效时立即返回，此时调用方必须停止会话。
 pub fn execute_case(
     root: Option<&Path>,
     case: &ResolvedCase,
-    iteration: u32,
-    outputs: [RawFd; 2],
-    mut hook: impl FnMut(bool, &str) -> io::Result<()>,
+    setup_timeout: Duration,
+    out: &mut impl Write,
+    mut notify: impl FnMut(bool, &str) -> io::Result<()>,
 ) -> CaseRecord {
-    let timeout = Duration::from_secs(case.timeout_sec);
-    // Step 1: 执行 setup 准备命令序列（遇到首个错误即中止后续 setup 命令）。
-    let setup = run_steps(
-        root,
-        &case.cwd,
-        &case.setup,
-        &case.env,
-        timeout,
-        outputs,
-        true,
-    );
-    let mut record = CaseRecord {
-        execution: None,
-        setup_error: setup.into_iter().next(),
-        before_error: None,
-        after_error: None,
-        cleanup_errors: Vec::new(),
-        iteration,
-    };
-    // Step 2: 若 setup 成功且测例启用了内核钩子，触发 before 钩子并记录是否成功，以便后续严格配对 after 钩子。
-    let mut before_succeeded = false;
-    if record.setup_error.is_none() && case.hooks {
-        match hook(true, &case.id) {
-            Ok(()) => before_succeeded = true,
-            Err(error) => record.before_error = Some(error.to_string()),
+    let mut record = CaseRecord::default();
+    // Step 1: 发送 before 通知；失败时通知实现自行撤销局部操作，本轮不再执行任何阶段。
+    if let Err(error) = notify(true, &case.id) {
+        record.before_error = Some(error.to_string());
+        return record;
+    }
+    // Step 2: 执行 setup；只有全部成功才写出 before 文本并启动主命令。
+    let setup = run_steps(root, &case.cwd, &case.setup, &case.env, setup_timeout, true);
+    record.setup_errors = setup.errors;
+    record.setup_unquiesced = setup.unquiesced;
+    if record.setup_unquiesced {
+        return record;
+    }
+    if record.setup_errors.is_empty() {
+        match emit(out, &case.before) {
+            Err(error) => record.output_errors.push(error.to_string()),
+            Ok(()) => {
+                let run = run_command(
+                    root,
+                    &case.cwd,
+                    &case.argv,
+                    &case.env,
+                    Duration::from_secs(case.timeout_sec),
+                );
+                let status = run.outcome.shell_status();
+                record.execution = Some(run);
+                // 进程控制失败时工作负载可能仍在运行，此时写 after 文本或执行 cleanup 都是冒险。
+                if record.unquiesced() {
+                    return record;
+                }
+                let after = render_after(case, status);
+                if let Err(error) = emit(out, &after) {
+                    record.output_errors.push(error.to_string());
+                }
+            }
         }
     }
-    // Step 3: 仅当 setup 和 before 钩子均无错误时，启动并监控主测试命令。
-    if record.setup_error.is_none() && record.before_error.is_none() {
-        record.execution = Some(run_command(
-            root,
-            &case.cwd,
-            &case.command,
-            &case.env,
-            timeout,
-            &case.protocol,
-            outputs,
-        ));
-    }
-    // Step 4: 若先前 before 钩子已成功执行，无论主命令结果如何，必须配对执行 after 钩子以恢复内核状态。
-    if before_succeeded {
-        if let Err(error) = hook(false, &case.id) {
-            record.after_error = Some(error.to_string());
-        }
-    }
-    // Step 5: 始终执行全部 cleanup 清理命令（不因单条失败而跳过其余清理命令），汇总并返回完整记录。
-    record.cleanup_errors = run_steps(
+    // Step 3: 清理命令的普通失败不阻止后续清理；进程控制失效时不得恢复全局状态。
+    let cleanup = run_steps(
         root,
         &case.cwd,
         &case.cleanup,
         &case.env,
-        timeout,
-        outputs,
+        setup_timeout,
         false,
     );
+    record.cleanup_errors = cleanup.errors;
+    record.cleanup_unquiesced = cleanup.unquiesced;
+    if record.cleanup_unquiesced {
+        return record;
+    }
+    if let Err(error) = notify(false, &case.id) {
+        record.after_error = Some(error.to_string());
+    }
     record
+}
+
+/// 把测例协议文本原文写到输出并刷出；空文本不产生写入。
+///
+/// 返回的 I/O 错误由调用方记入 `output_errors`，不在此处忽略或重试。
+fn emit(out: &mut impl Write, text: &str) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    out.write_all(text.as_bytes())?;
+    out.flush()
+}
+
+/// 用完整上下文单次展开测例的 `after` 模板。
+///
+/// `status` 是主命令的 shell 状态码；`command` 只在 catalog 来源的测例上提供。
+/// `after` 保留原始模板到此刻才展开，避免 `{status}` 在更早的替换中被固定。
+fn render_after(case: &ResolvedCase, status: i32) -> String {
+    let status = status.to_string();
+    let mut values = vec![
+        ("group", case.group.as_str()),
+        ("root", case.root.as_str()),
+        ("name", case.name.as_str()),
+        ("id", case.id.as_str()),
+        ("status", status.as_str()),
+    ];
+    if let Some(command) = &case.catalog_command {
+        values.push(("command", command.as_str()));
+    }
+    crate::expand::expand(&case.after, &values)
+}
+
+/// 把一条准备命令的退出事实格式化为单行诊断，供 `setup`/`cleanup` 错误列表使用。
+fn describe(argv: &[String], run: &Execution) -> String {
+    if run.io_errors.is_empty() {
+        format!("command {argv:?}: {:?}", run.outcome)
+    } else {
+        format!(
+            "command {argv:?}: {:?}; I/O errors: {:?}",
+            run.outcome, run.io_errors
+        )
+    }
 }

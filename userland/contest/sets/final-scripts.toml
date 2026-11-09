@@ -1,0 +1,22 @@
+# 原脚本已负责输出分组与结果，两个 group 均不设置 start/end。
+[[group]]
+name = "cagent"
+roots = ["final"]
+
+[[group.step]]
+names = ["script"]
+exec = ["/bin/bash", "/scripts/cagent_testcode.sh"]
+timeout_sec = 120
+
+[[group]]
+name = "buildstorm"
+roots = ["debian"]
+
+[[group.step]]
+names = ["script"]
+exec = ["/bin/sh", "/scripts/buildstorm_testcode.sh"]
+# 18000 是外层预算示例，不是官方规定。脚本的正式构建自身有 14400 秒限制。
+timeout_sec = 18000
+# Debian 示例。只清理由该原脚本在独立测试根内创建的这三个挂载。
+# /proc 最后卸载；先验证镜像中的 mountpoint/umount 命令位置。
+cleanup = [["/bin/sh", "-c", "for p in /sys /dev /proc; do if mountpoint -q \"$p\"; then umount \"$p\" || exit; fi; done"]]

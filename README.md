@@ -204,6 +204,7 @@ make package-board-boot-images ARCH=riscv64 TARGET_PLATFORM=visionfive2 \
 更多详细说明请参阅仓库内的技术文档：
 
 - **[开发、测试与代码规范指南 (`docs/development.md`)](docs/development.md)**：环境准备、构建目标详解、QEMU 工作盘管理、三层测试体系、Clippy 例外规则、代码排版与注释编写规范。
+- **[比赛测试执行手册 (`docs/contest-run.md`)](docs/contest-run.md)**：比赛盘选择、计划与集合写法、路径规则、预览与临时筛选、单例覆盖与结果解读。
 - **[开发板上板与根卷指南 (`docs/boards.md`)](docs/boards.md)**：VisionFive 2 与 2K1000LA 的固件环境检查、RAM 根与 SD/SATA 持久分区部署、网络配置与实板验证说明。
 - **[源码导读与运行根说明 (`userland/runtime/development.md`)](userland/runtime/development.md)**：内核活跃模块导航表、单命令执行模式与新功能开发路线。
 - **[动态运行库准备说明 (`userland/runtime/sources.md`)](userland/runtime/sources.md)**：`musl` / `glibc` 动态链接器与共享库资产准备流程。

@@ -1,23 +1,31 @@
-//! 子进程生命周期管理、进程组超时控制与非阻塞输出流转发模块。
+//! 子进程启动、进程组超时控制与上下文收尾模块。
 //!
 //! ## 模块职责与架构定位
-//! 本模块负责在指定的测试根（`chroot`）、工作目录（`chdir`）与环境变量下启动测试命令或系统维护命令，
-//! 并在统一的单调时钟绝对截止期限（`deadline`）内完成进程监控、输出捕获转发与超时强杀回收。
-//! 上游由 `execute`、`runtime` 与 `main` 调用 `run_command`，下游将捕获到的字节流喂给 `report::ProtocolObserver` 进行协议解析。
+//! 本模块对外提供两个入口，共用同一套启动、等待与收尾机制：
+//! - [`run_command`]：比赛路径与系统维护命令使用。标准输入/输出/错误直接继承父进程，环境表先清空再只装入调用方给出的变量；
+//!   子进程在 `exec` 前依次 `chroot`（指定 root 时）、`chdir` 到工作目录并 `setsid()`：新会话没有控制终端，同时子进程成为独立进程组的组首。
+//!   不用 `setpgid(0, 0)`：它让测试留在串口控制终端的后台进程组，读终端或 `tcsetattr` 会被内核按作业控制以 `SIGTTIN`/`SIGTTOU` 停住。不捕获、不解析、不转发输出。
+//! - [`run_tap_command`]：`user-selftests` 使用。不 `chroot`，环境表沿用父进程再叠加调用方变量，标准输出/错误经管道读取：
+//!   标准输出字节喂给 `TapObserver`，两路字节经 `Relay` 辅助进程转发到调用方给定的输出描述符。
 //!
-//! ## 核心机制：双层管道与独立 Relay 辅助进程
-//! 对于需要解析输出正文的协议（`Basic`、`Pre2025Libctest`、`Tap`），不能让主进程直接阻塞写向外部标准输出/错误（如串口终端），
-//! 否则当终端写阻塞时主进程无法及时响应 `deadline` 超时信号。同时，也不能直接修改外部 `stdout`/`stderr` 的打开文件描述（OFD）为 `O_NONBLOCK`，
-//! 因为外部 `stdout`/`stderr`/`stdin` 通常共享同一个底层终端 OFD，改写 `O_NONBLOCK` 会污染被测子进程继承的 `stdin`。
+//! ## 进程组与收尾
+//! 父进程用 `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)` 观察组首退出而不回收：未回收的僵尸组首使进程组号在其残留成员清空前
+//! 不会被内核复用。期限到达时向整组发 `SIGTERM`，200 ms 后升级 `SIGKILL`，再 200 ms 仍未排空则强制收尾。循环结束时（组首已退出且
+//! 输出排空，或强制收尾）先向整组补发一次 `SIGKILL` 清理残留后台进程，再 `wait` 回收组首并据其状态生成 [`ExitOutcome`]。
 //!
-//! 因此本模块采用“主进程非阻塞环形缓冲 + 独立 `Relay` 子进程阻塞写外部终端”的双层架构：
+//! 组首退出不代表组内后台进程已经结束；普通进程组不追踪主动 `setsid` 脱离的后代，这类服务需要被测脚本或显式 cleanup 自行收尾。
+//!
+//! ## 自测路径的双层管道
+//! 不能让主进程直接阻塞写向外部标准输出/错误（如串口终端），否则终端写阻塞时主进程无法及时响应期限；也不能把外部
+//! `stdout`/`stderr` 的打开文件描述改成 `O_NONBLOCK`，因为终端上它们通常与 `stdin` 共享同一个打开文件描述。因此自测路径采用
+//! “主进程非阻塞读取 + 独立 `Relay` 辅助进程阻塞写外部终端”的两层结构：
 //!
 //! ```text
 //!   ┌────────────────┐  stdout/stderr 管道 (O_NONBLOCK)  ┌──────────────────────────────────┐
 //!   │  被测子进程组   │ ────────────────────────────────► │         contest-run 主进程        │
-//!   │ (独立 pgid=pid) │                                   │  1. 喂给 ProtocolObserver 解析    │
+//!   │ (独立 pgid=pid) │                                   │  1. 喂给 TapObserver 解析         │
 //!   └────────────────┘                                   │  2. 存入 64 KiB 背压队列 (Flow)   │
-//!                                                        │  3. 监控 deadline 并发 SIGTERM/KILL│
+//!                                                        │  3. 监控截止时间并发 SIGTERM/KILL │
 //!                                                        └────────────────┬─────────────────┘
 //!                                                                         │ relay 管道 (写端 O_NONBLOCK)
 //!                                                                         ▼
@@ -29,18 +37,18 @@
 //! ```
 //!
 //! 超时状态转换（`pump` 循环）：
-//! 1. **正常运行**：轮询子进程退出状态与管道 I/O，每轮 `poll` 超时上限 50ms。
-//! 2. **触发超时（`now >= deadline`）**：向整个被测进程组（`-pid`）发送 `SIGTERM`，设置 `terminate_at = now + 200ms`。
-//! 3. **升级强杀（`now >= terminate_at`）**：若进程组仍未退尽，向进程组发送 `SIGKILL`，设置 `kill_at = now + 200ms`。
-//! 4. **强制收尾（`now >= kill_at`）**：停止等待残留管道，强杀并回收 `Relay` 辅助进程，阻塞 `wait` 回收被测主进程。
+//! 1. **正常运行**：轮询组首退出状态与管道 I/O，每轮 `poll` 等待上限 50 ms。
+//! 2. **触发超时（`deadline <= now`）**：向整个被测进程组（`-pid`）发送 `SIGTERM`，设置 `terminate_at = now + 200ms`。
+//! 3. **升级强杀（`terminate_at <= now`）**：向进程组发送 `SIGKILL`，设置 `kill_at = now + 200ms`。
+//! 4. **强制收尾（`kill_at <= now`）**：停止等待残留管道，终止 `Relay` 辅助进程，转入统一收尾。
 //!
 //! ## 并发与锁契约
 //! - 主进程内部在单线程事件循环中通过 `poll` 复用 I/O，不持有跨线程锁。
-//! - `command.pre_exec` 闭包与 `relay_child` 运行在 `fork` 后的子进程上下文中，严禁执行堆内存分配、Rust 锁获取或任何非异步信号安全（Async-Signal-Safe）操作，遇到致命错误必须调用 `libc::_exit` 直接终止。
+//! - `command` 的 `pre_exec` 闭包与 `relay_child` 运行在 `fork` 后的子进程上下文中，严禁堆内存分配、Rust 锁获取或任何非异步信号
+//!   安全（Async-Signal-Safe）操作，遇到致命错误必须调用 `libc::_exit` 直接终止。
 
-use crate::model::{CommandSpec, Protocol};
-use crate::outcome::{Execution, ExitOutcome, Verdict};
-use crate::report::{ProtocolObserver, StreamKind};
+use crate::outcome::{Execution, ExitOutcome, ProtocolResult, Verdict};
+use crate::tap::TapObserver;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io;
@@ -64,48 +72,34 @@ fn exit_outcome(status: ExitStatus) -> ExitOutcome {
     }
 }
 
-/// 构造待执行的 `std::process::Command`，并在 `fork` 前准备好全部路径 `CString` 与标准流重定向。
+/// 根据 `argv` 构造待执行的命令，并在 `fork` 前准备好路径 `CString`。
 ///
-/// 若 `capture` 为 `true`，子进程的 `stdout`/`stderr` 重定向到匿名管道供主进程捕获解析；
-/// 若 `capture` 为 `false`，通过 `F_DUPFD_CLOEXEC` 复制 `outputs` 描述符直接交给子进程写向终端。
-/// 子进程在 `exec` 前通过 `pre_exec` 依次执行 `chroot`（若指定）、`chdir` 与 `setpgid(0, 0)` 建立独立进程组。
-fn command(
-    root: Option<&Path>,
-    cwd: &Path,
-    spec: &CommandSpec,
-    env: &BTreeMap<String, String>,
-    capture: bool,
-    outputs: [RawFd; 2],
-) -> io::Result<Command> {
+/// 标准流默认继承父进程，自测路径随后把输出改成管道。子进程在 `exec` 前先 `chroot`（`root` 为 `Some` 时），再 `chdir` 到 `cwd`，
+/// 最后 `setsid()` 成为新会话与独立进程组的组首，不再带有控制终端。空 `argv` 或空程序名不派生子进程，直接以 `EINVAL` 的 `SpawnError` 返回。
+fn command(root: Option<&Path>, cwd: &Path, argv: &[String]) -> Result<Command, ExitOutcome> {
+    let invalid = |message: &str| ExitOutcome::SpawnError {
+        errno: Some(libc::EINVAL),
+        message: message.into(),
+    };
+    let (program, args) = argv.split_first().ok_or_else(|| invalid("empty argv"))?;
+    if program.is_empty() {
+        return Err(invalid("empty program"));
+    }
     let root = root
         .map(|path| CString::new(path.as_os_str().as_bytes()))
-        .transpose()?;
-    let cwd = CString::new(cwd.as_os_str().as_bytes())?;
-    let mut command = match spec {
-        CommandSpec::Exec { program, args } => {
-            let mut command = Command::new(program);
-            command.args(args);
-            command
-        }
-        CommandSpec::Shell {
-            shell,
-            command: text,
-        } => {
-            let mut command = Command::new(shell);
-            command.arg("-c").arg(text);
-            command
-        }
-    };
-    command.envs(env).stdin(Stdio::inherit());
-    if capture {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    } else {
-        command.stdout(Stdio::from(duplicate_output(outputs[0])?));
-        command.stderr(Stdio::from(duplicate_output(outputs[1])?));
-    }
+        .transpose()
+        .map_err(|error| invalid(&error.to_string()))?;
+    let cwd =
+        CString::new(cwd.as_os_str().as_bytes()).map_err(|error| invalid(&error.to_string()))?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     // SAFETY:
     // 1. `root` 与 `cwd` 的 `CString` 已在 `fork` 前于父进程内分配并校验完毕，闭包内只读取其有效 C 字符串指针。
-    // 2. 闭包运行在 `fork` 后、`exec` 前的子进程环境中，不进行任何堆内存分配或锁操作，仅调用 POSIX 异步信号安全的 `chroot`、`chdir` 与 `setpgid`。
+    // 2. 闭包运行在 `fork` 后、`exec` 前的子进程环境中，不进行任何堆内存分配或锁操作，仅调用 POSIX 异步信号安全的 `chroot`、`chdir` 与 `setsid`；新 `fork` 出的子进程不是进程组组长，`setsid` 不会因此失败。
     unsafe {
         command.pre_exec(move || {
             if let Some(root) = &root {
@@ -116,7 +110,7 @@ fn command(
             if libc::chdir(cwd.as_ptr()) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::setpgid(0, 0) == -1 {
+            if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -125,21 +119,7 @@ fn command(
     Ok(command)
 }
 
-/// 使用 `F_DUPFD_CLOEXEC` 复制输出文件描述符（描述符编号大于等于 3）。
-///
-/// 仅复制描述符本身并设置 `FD_CLOEXEC`，不修改底层打开文件描述（OFD）的状态标志（如 `O_NONBLOCK`），
-/// 从而避免影响与之共享同一个终端 OFD 的标准输入（`stdin`）。
-fn duplicate_output(fd: RawFd) -> io::Result<OwnedFd> {
-    // SAFETY: `fd` 由调用方保证在当前进程内有效且打开；`F_DUPFD_CLOEXEC` 仅读取该描述符并分配一个 >= 3 的新文件描述符，不涉及内存指针解引用。
-    let copied = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if copied == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: 前置检查已排除 `copied == -1`，此时 `copied` 是内核刚刚分配且尚未交由任何其他包装器管理的新文件描述符，可安全移交所有权给 `OwnedFd`。
-    Ok(unsafe { OwnedFd::from_raw_fd(copied) })
-}
-
-/// 将当前进程独占的匿名管道端点设置为非阻塞模式（`O_NONBLOCK`）。
+/// 将主进程独占的匿名管道端点设置为非阻塞模式（`O_NONBLOCK`）。
 ///
 /// 仅用于本次命令新建的私有管道端点，这些端点在命令结束关闭时即销毁，无需在退出时恢复原标志。
 fn nonblocking_pipe(fd: RawFd) -> io::Result<()> {
@@ -426,17 +406,26 @@ unsafe fn relay_child(
     }
 }
 
-/// 主进程内部用于单个输出流（`stdout` 或 `stderr`）的非阻塞读取、协议观察与背压转发通道。
+/// 子进程输出流通道类型，只用于同一套流控代码区分两路输出与拼装错误文本。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stream {
+    /// 标准输出流（文件描述符 1）。
+    Stdout,
+    /// 标准错误流（文件描述符 2）。
+    Stderr,
+}
+
+/// 主进程内部用于单个输出流（`stdout` 或 `stderr`）的非阻塞读取、TAP 观察与背压转发通道。
 struct Flow {
     /// 来自被测子进程的管道读端原始描述符（已设为 `O_NONBLOCK`）。
     input: RawFd,
     /// 通往 `Relay` 辅助子进程的管道写端原始描述符（已设为 `O_NONBLOCK`）。
     output: RawFd,
     /// 标识当前通道属于标准输出（`Stdout`）还是标准错误（`Stderr`）。
-    kind: StreamKind,
+    kind: Stream,
     /// 被测子进程管道读端是否已达 EOF（或因读取错误而关闭读取）。
     eof: bool,
-    /// 向 `Relay` 管道写入是否已发生失败（若失败则丢弃后续待转发字节，但继续读取被测子进程输出以供协议观察并避免子进程写管道阻塞）。
+    /// 向 `Relay` 管道写入是否已发生失败（若失败则丢弃后续待转发字节，但继续读取被测子进程输出以避免子进程写管道阻塞）。
     failed: bool,
     /// 暂存已从被测子进程读出、但尚未写入 `Relay` 管道的字节环形队列（上限约 64 KiB）。
     queue: VecDeque<u8>,
@@ -444,7 +433,7 @@ struct Flow {
 
 impl Flow {
     /// 为指定的输出流创建预分配 64 KiB 容量的非阻塞流控通道。
-    fn new(input: RawFd, output: RawFd, kind: StreamKind) -> Self {
+    fn new(input: RawFd, output: RawFd, kind: Stream) -> Self {
         Self {
             input,
             output,
@@ -455,10 +444,10 @@ impl Flow {
         }
     }
 
-    /// 从被测子进程管道非阻塞读取至多 8 KiB 数据，立即送入 `observer` 解析，并在转发未失效时压入待写队列。
+    /// 从被测子进程管道非阻塞读取至多 8 KiB 数据，标准输出字节送入 `tap` 解析，并在转发未失效时压入待写队列。
     ///
     /// 当队列积压超过 56 KiB（`57344` 字节）时暂停读取，形成背压以限制主进程内存占用；每次最多读取一块（8 KiB），防止高频输出饿死超时检查或另一条流。
-    fn read(&mut self, observer: &mut ProtocolObserver, errors: &mut Vec<String>) {
+    fn read(&mut self, tap: Option<&mut TapObserver>, errors: &mut Vec<String>) {
         if self.eof || 57344 < self.queue.len() {
             return;
         }
@@ -469,7 +458,11 @@ impl Flow {
             self.eof = true;
         } else if 0 < count {
             let bytes = &bytes[..count as usize];
-            observer.feed(self.kind, bytes);
+            if self.kind == Stream::Stdout {
+                if let Some(tap) = tap {
+                    tap.feed(bytes);
+                }
+            }
             if !self.failed {
                 self.queue.extend(bytes);
             }
@@ -539,9 +532,9 @@ impl Flow {
 
 /// 向被测子进程所在的整个进程组（PGID 等于子进程 PID）发送指定信号。
 ///
-/// 子进程在 `pre_exec` 中已调用 `setpgid(0, 0)` 成为进程组长，因此向 `-pid` 发送信号可一并终止其派生的全部后代进程；若返回 `ESRCH` 说明进程组已完全退出，忽略该错误。
+/// 子进程在 `pre_exec` 中已调用 `setsid()` 成为新会话与进程组的组长，因此向 `-pid` 发送信号可一并终止其派生的全部后代进程；若返回 `ESRCH` 说明进程组已无成员可接收信号，忽略该错误。主动 `setsid` 脱离的后代不属于该进程组，本函数不会触及。
 fn signal_group(child: &Child, signal: i32, errors: &mut Vec<String>) {
-    // SAFETY: `child.id()` 是当前尚未完全放弃管理的被测子进程正整数 PID；取负值 `-(child.id() as i32)` 符合 POSIX `kill` 向对应进程组广播信号的语义。
+    // SAFETY: `child.id()` 是当前尚未回收的被测子进程正整数 PID；取负值 `-(child.id() as i32)` 符合 POSIX `kill` 向对应进程组广播信号的语义。
     if unsafe { libc::kill(-(child.id() as i32), signal) } == -1 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
@@ -550,17 +543,43 @@ fn signal_group(child: &Child, signal: i32, errors: &mut Vec<String>) {
     }
 }
 
-/// 在统一截止时间 `deadline` 下驱动被测子进程与可选 `Relay` 辅助进程的事件循环，完成输出采集、转发与超时终止。
+/// 用 `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)` 观察组首是否已退出，但不回收。
 ///
+/// 不回收使已退出的组首继续保持僵尸态，进程组号在其残留成员清空前不会被内核复用，后续向整组发信号不会打到别的进程组。
+/// 返回 `Ok(true)` 表示组首已退出，`Ok(false)` 表示仍在运行。
+fn child_exited(pid: libc::pid_t) -> io::Result<bool> {
+    // 无事件时 `WNOHANG` 不保证内核写回缓冲区，因此先清零再交给 `waitid`。
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: `info` 是栈上按 `siginfo_t` 布局对齐的可写缓冲区，指针在 `waitid` 返回前不与任何读取重叠；`pid` 是本进程尚未回收的直接子进程，`WNOHANG` 保证调用不阻塞。
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `info` 在调用前已整块清零；`waitid` 返回 0 时要么写入子进程事件，要么保持全零，结构体始终处于已初始化状态。
+    let info = unsafe { info.assume_init() };
+    // SAFETY: `info` 已初始化；`si_pid()` 读取子进程事件字段，空事件下为零。
+    Ok(unsafe { 0 < info.si_pid() })
+}
+
+/// 在统一截止时间 `deadline` 下驱动被测子进程与可选 `Relay` 辅助进程的事件循环，完成输出采集、转发、超时终止与进程组收尾。
+///
+/// `tap` 与 `relay` 只在自测路径同时存在：此时接管子进程的 stdout/stderr 管道并转发；比赛路径两者均为 `None`，组首一退出即收尾。
 /// 返回被测子进程的最终 `ExitOutcome`，运行期间发生的管道、信号或辅助进程错误追加到 `errors` 列表中。
 fn pump(
     child: &mut Child,
     deadline: Instant,
-    observer: &mut ProtocolObserver,
+    mut tap: Option<&mut TapObserver>,
     mut relay: Option<Relay>,
     errors: &mut Vec<String>,
 ) -> ExitOutcome {
-    // Step 1: 接管被测子进程的 stdout/stderr 管道，若启用了捕获模式则将其设为非阻塞并绑定到双通道 Flow。
+    // Step 1: 自测路径接管被测子进程的 stdout/stderr 管道，设其非阻塞并绑定到双通道 Flow；失败时强杀整组并回收。
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut flows = if let Some(relay) = &relay {
@@ -585,14 +604,15 @@ fn pump(
         }
         let outputs = relay.outputs();
         Some([
-            Flow::new(stdout.as_raw_fd(), outputs[0], StreamKind::Stdout),
-            Flow::new(stderr.as_raw_fd(), outputs[1], StreamKind::Stderr),
+            Flow::new(stdout.as_raw_fd(), outputs[0], Stream::Stdout),
+            Flow::new(stderr.as_raw_fd(), outputs[1], Stream::Stderr),
         ])
     } else {
         None
     };
+    let pid = child.id() as libc::pid_t;
     // Step 2: 进入主事件循环，按单调时钟推进正常排空、超时 SIGTERM 宽限期与 SIGKILL 强制终止阶段。
-    let mut status = None;
+    let mut exited = false;
     let mut timed_out = false;
     let mut terminate_at = None;
     let mut kill_at = None;
@@ -601,7 +621,7 @@ fn pump(
         let now = Instant::now();
         if !timed_out
             && deadline <= now
-            && status.is_some()
+            && exited
             && flows
                 .as_ref()
                 .is_none_or(|flows| flows.iter().all(|flow| flow.eof && flow.queue.is_empty()))
@@ -627,13 +647,13 @@ fn pump(
             terminate_at = None;
             kill_at = Some(now + Duration::from_millis(200));
         }
-        // Step 3: 非阻塞轮询被测主子进程的退出状态。
-        if status.is_none() && wait_error.is_none() {
-            match child.try_wait() {
-                Ok(found) => status = found,
+        // Step 3: 非阻塞观察组首是否已退出；`WNOWAIT` 只报告事件，不回收，组号继续由僵尸组首占住。
+        if !exited && wait_error.is_none() {
+            match child_exited(pid) {
+                Ok(found) => exited = found,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    errors.push(format!("try_wait: {error}"));
+                    errors.push(format!("waitid: {error}"));
                     wait_error = Some(error);
                     signal_group(child, libc::SIGKILL, errors);
                     kill_at = Some(now);
@@ -656,7 +676,7 @@ fn pump(
         if let Some(flows) = &mut flows {
             for flow in flows {
                 flow.forward(errors);
-                flow.read(observer, errors);
+                flow.read(tap.as_deref_mut(), errors);
                 flow.forward(errors);
             }
         }
@@ -671,10 +691,10 @@ fn pump(
             }
         }
         let relay_done = relay.as_ref().is_none_or(|relay| relay.pid.is_none());
-        if status.is_some() && drained && relay_done && (!timed_out || kill_at.is_some()) {
+        if exited && drained && relay_done && (!timed_out || kill_at.is_some()) {
             break;
         }
-        // Step 6: 若已到达强制终止期限（kill_at），记录未排空警告、强杀 Relay 并阻塞回收被测子进程。
+        // Step 6: 若已到达强制终止期限，记录未排空输出并终止 Relay，转入统一收尾。
         if kill_at.is_some_and(|at| at <= now) {
             if let Some(flows) = &flows {
                 for flow in flows {
@@ -697,15 +717,6 @@ fn pump(
                     errors.push("output relay did not drain before deadline".into());
                     if let Err(error) = relay.stop() {
                         errors.push(format!("stop output relay: {error}"));
-                    }
-                }
-            }
-            if status.is_none() {
-                match child.wait() {
-                    Ok(found) => status = Some(found),
-                    Err(error) => {
-                        errors.push(format!("wait after stop: {error}"));
-                        wait_error = Some(error);
                     }
                 }
             }
@@ -737,8 +748,16 @@ fn pump(
             }
         }
     }
-    // Step 8: 汇总最终的进程退出码、超时标志或等待错误，生成 ExitOutcome。
-    let raw = status.map(ExitStatusExt::into_raw);
+    // Step 8: 组首此时尚未回收，先向整组补发一次 SIGKILL 让残留后台进程退出，再回收组首并据此生成退出分类。
+    signal_group(child, libc::SIGKILL, errors);
+    let raw = match child.wait() {
+        Ok(status) => Some(status.into_raw()),
+        Err(error) => {
+            errors.push(format!("wait child: {error}"));
+            wait_error = Some(error);
+            None
+        }
+    };
     if timed_out {
         return ExitOutcome::TimedOut {
             raw,
@@ -762,76 +781,114 @@ fn pump(
     }
 }
 
-/// 启动并监控单条命令的完整执行过程，返回包含底层退出状态、I/O 错误、耗时与协议判定结果的 `Execution`。
+/// 启动并等待一条命令，返回进程事实记录。
 ///
-/// - 对于 `Plain` 与 `Ltp` 协议，不拦截输出正文，直接将被测进程的标准输出/错误绑定到 `outputs` 的复制描述符。
-/// - 对于 `Basic`、`Pre2025Libctest` 与 `Tap` 协议，建立管道捕获与 `Relay` 辅助转发进程，一边实时解析协议标记一边异步输出到终端。
-/// - 所有协议下子进程均继承当前的 `stdin`，并在 `timeout` 转换的绝对截止时间保护下运行。
+/// 标准输入/输出/错误继承父进程，环境表先清空再只装入 `env`；`root` 为 `Some` 时子进程在 `exec` 前 `chroot` 到该目录，
+/// 之后 `chdir` 到 `cwd` 并建立独立进程组。命令输出原样出现在本进程的终端上，本函数不捕获、不解析也不转发。
+///
+/// 空白 `argv` 或空程序名不派生子进程，直接返回 `SpawnError`（`EINVAL`）。
 pub fn run_command(
     root: Option<&Path>,
     cwd: &Path,
-    spec: &CommandSpec,
+    argv: &[String],
     env: &BTreeMap<String, String>,
     timeout: Duration,
-    protocol: &Protocol,
-    outputs: [RawFd; 2],
 ) -> Execution {
-    // Step 1: 计算命令的绝对截止时间戳，并初始化对应协议的流式观察器。
+    // Step 1: 计算单调时钟截止时间并准备错误收集器。
     let started = Instant::now();
     let deadline = started.checked_add(timeout);
-    let mut observer = ProtocolObserver::new(protocol);
     let mut io_errors = Vec::new();
-    // Step 2: 构造命令与可选的 Relay 辅助进程，派生子进程并进入 pump 循环直至结束或超时。
+    // Step 2: 构造继承全部标准流的命令，派生子进程后进入 pump 循环直至退出或期限到达。
     let outcome = match deadline {
         None => ExitOutcome::SpawnError {
             errno: Some(libc::EINVAL),
             message: "deadline exceeds monotonic clock range".into(),
         },
-        Some(deadline) => {
-            let capture = matches!(
-                protocol,
-                Protocol::Basic { .. } | Protocol::Pre2025Libctest { .. } | Protocol::Tap
-            );
-            match command(root, cwd, spec, env, capture, outputs) {
-                Err(error) => ExitOutcome::SpawnError {
-                    errno: error.raw_os_error(),
-                    message: error.to_string(),
-                },
-                Ok(mut command) => {
-                    let relay = if capture {
-                        Relay::new(outputs).map(Some)
-                    } else {
-                        Ok(None)
-                    };
-                    match relay {
-                        Err(error) => ExitOutcome::IoError {
-                            errno: error.raw_os_error(),
-                            message: format!("create output relay: {error}"),
-                            raw: None,
-                        },
-                        Ok(relay) => match command.spawn() {
-                            Ok(mut child) => {
-                                pump(&mut child, deadline, &mut observer, relay, &mut io_errors)
-                            }
-                            Err(error) => ExitOutcome::SpawnError {
-                                errno: error.raw_os_error(),
-                                message: error.to_string(),
-                            },
-                        },
-                    }
+        Some(deadline) => match command(root, cwd, argv) {
+            Err(outcome) => outcome,
+            Ok(mut command) => {
+                command.env_clear().envs(env);
+                match command.spawn() {
+                    Ok(mut child) => pump(&mut child, deadline, None, None, &mut io_errors),
+                    Err(error) => ExitOutcome::SpawnError {
+                        errno: error.raw_os_error(),
+                        message: error.to_string(),
+                    },
                 }
             }
-        }
+        },
     };
-    // Step 3: 闭合协议观察器得出最终判定（若 TAP 协议下发生管道 I/O 错误则降级为 InfrastructureError）。
-    let mut result = observer.finish(&outcome);
-    if matches!(protocol, Protocol::Tap) && !io_errors.is_empty() {
-        result.verdict = Verdict::InfrastructureError;
-    }
     Execution {
         outcome,
         io_errors,
         elapsed: started.elapsed(),
-        protocol: result,
     }
+}
+
+/// 启动并等待一条 TAP 自测命令，返回进程事实记录与解析结果。
+///
+/// 不 `chroot`；环境表沿用父进程并叠加 `env`（同名变量覆盖）。子进程的标准输出/错误由本进程经管道读取，标准输出字节喂给
+/// `TapObserver`，两路字节经 `Relay` 转发到 `outputs`。管道读取、转发或辅助进程回收产生任何 I/O 错误时，
+/// 判定改为 [`Verdict::InfrastructureError`]。
+pub fn run_tap_command(
+    cwd: &Path,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+    outputs: [RawFd; 2],
+) -> (Execution, ProtocolResult) {
+    // Step 1: 计算截止时间并准备 TAP 观察器与错误收集器。
+    let started = Instant::now();
+    let deadline = started.checked_add(timeout);
+    let mut observer = TapObserver::new();
+    let mut io_errors = Vec::new();
+    // Step 2: 构造捕获输出流的命令与 Relay 转发进程，派生子进程后进入 pump 循环直至退出或期限到达。
+    let outcome = match deadline {
+        None => ExitOutcome::SpawnError {
+            errno: Some(libc::EINVAL),
+            message: "deadline exceeds monotonic clock range".into(),
+        },
+        Some(deadline) => match command(None, cwd, argv) {
+            Err(outcome) => outcome,
+            Ok(mut command) => {
+                command
+                    .envs(env)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                match Relay::new(outputs) {
+                    Err(error) => ExitOutcome::IoError {
+                        errno: error.raw_os_error(),
+                        message: format!("create output relay: {error}"),
+                        raw: None,
+                    },
+                    Ok(relay) => match command.spawn() {
+                        Ok(mut child) => pump(
+                            &mut child,
+                            deadline,
+                            Some(&mut observer),
+                            Some(relay),
+                            &mut io_errors,
+                        ),
+                        Err(error) => ExitOutcome::SpawnError {
+                            errno: error.raw_os_error(),
+                            message: error.to_string(),
+                        },
+                    },
+                }
+            }
+        },
+    };
+    // Step 3: 闭合 TAP 观察器得出最终判定；管道层出现过任何 I/O 错误时按基础设施错误上报。
+    let mut result = observer.finish(&outcome);
+    if !io_errors.is_empty() {
+        result.verdict = Verdict::InfrastructureError;
+    }
+    (
+        Execution {
+            outcome,
+            io_errors,
+            elapsed: started.elapsed(),
+        },
+        result,
+    )
 }

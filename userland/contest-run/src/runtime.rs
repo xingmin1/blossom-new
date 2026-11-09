@@ -60,12 +60,11 @@
 //! 本模块在单线程控制流中顺序执行，不持有任何进程内互斥锁或自旋锁；文件系统的挂载表状态由内核 VFS 层同步维护。
 
 use crate::execute::run_steps;
-use crate::model::{CommandSpec, RootSpec};
+use crate::model::RootSpec;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -153,34 +152,31 @@ impl Mounts {
 
     /// 初始化目标系统根目录：依次执行根目录准备命令，并挂载配置声明的伪文件系统。
     ///
+    /// 调用上下文：切换到某个 root 之前由主运行器同步调用。准备命令在宿主根环境 `/` 下以空环境
+    /// 执行，任一条失败即中止；随后按 `mounts` 挂载 `dev`/`proc`/`tmp`，挂载点登记在
+    /// [`Mounts`] 中，由 [`Mounts::release`] 逆序卸载。
+    ///
     /// # 参数
     /// - `root`：目标根目录规格配置（包含宿主机路径 `path`、准备命令列表 `prepare` 及需挂载的子目录名 `mounts`）。
     /// - `timeout`：每条准备命令的执行超时时长。
-    /// - `outputs`：准备命令的子进程标准输出与标准错误重定向文件描述符。
     ///
     /// # 返回值
     /// 准备命令与所有挂载点均成功完成时返回 `Ok(())`；任意步骤失败时返回描述性错误字符串。
-    pub fn prepare_root(
-        &mut self,
-        root: &RootSpec,
-        timeout: Duration,
-        outputs: [RawFd; 2],
-    ) -> Result<(), String> {
+    pub fn prepare_root(&mut self, root: &RootSpec, timeout: Duration) -> Result<(), String> {
         // Step 1: 校验目标根路径是否已经存在且为目录。
         if !root.path.is_dir() {
             return Err(format!("root is not a directory: {}", root.path.display()));
         }
         // Step 2: 在宿主根环境 "/" 下按序执行该 root 配置的预处理命令（如解压或目录初始化）。
-        let errors = run_steps(
+        let report = run_steps(
             None,
             Path::new("/"),
             &root.prepare,
             &BTreeMap::new(),
             timeout,
-            outputs,
             true,
         );
-        if let Some(error) = errors.into_iter().next() {
+        if let Some(error) = report.errors.into_iter().next() {
             return Err(format!("root prepare: {error}"));
         }
         // Step 3: 仅按配置显式列出的挂载项（支持 dev -> devfs, proc -> proc, tmp -> tmpfs）挂载到目标根内部。
@@ -325,19 +321,18 @@ fn interpreter(path: &Path) -> io::Result<Option<Vec<u8>>> {
 
 /// 针对启动失败的命令，检查其目标可执行文件的 ELF `PT_INTERP` 动态链接器在目标根目录中是否存在。
 ///
+/// 调用上下文：主命令以 `SpawnError` 结束时由主运行器调用，用于区分“缺少动态链接器”与
+/// “缺少可执行文件本身”等环境问题。
+///
 /// # 参数
 /// - `root`：命令所属的目标根目录规格。
 /// - `cwd`：命令在目标根目录内的工作目录。
-/// - `command`：待诊断的 `Exec` 或 `Shell` 命令规格。
+/// - `program`：待诊断的执行程序路径，即主命令 argv[0]。
 ///
 /// # 返回值
-/// 返回一行人类可读的 `PT_INTERP` 诊断信息字符串，供测试报告附加到 `SpawnError` 详情中。
-pub fn diagnose(root: &RootSpec, cwd: &Path, command: &CommandSpec) -> String {
-    // Step 1: 提取待执行程序路径；若不含 '/' 则说明依赖子进程 PATH 搜索，无法直接定位文件。
-    let program = match command {
-        CommandSpec::Exec { program, .. } => program,
-        CommandSpec::Shell { shell, .. } => shell,
-    };
+/// 返回一行人类可读的 `PT_INTERP` 诊断信息字符串。
+pub fn diagnose(root: &RootSpec, cwd: &Path, program: &str) -> String {
+    // Step 1: 若程序路径不含 '/'，说明依赖子进程 PATH 搜索，无法在宿主侧直接定位文件。
     if !program.contains('/') {
         return "PT_INTERP unavailable: program requires child PATH lookup".into();
     }

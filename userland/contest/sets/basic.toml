@@ -1,8 +1,46 @@
-# basic 的 ELF 位于各族 root 的 /basic；工作目录也为 /basic。
-# 只选原盘确有的名称，不把 Completed 声明成正式判题器 Pass。
-[[step]]
-kind = "basic"
+# basic 名单与盘内 basic/run-all.sh 一致（32 个，同顺序）；日常增减只改 include。
+[[group]]
+name = "basic"
 roots = ["musl", "glibc"]
-directory = "/basic"
-include = ["brk", "getpid", "mmap", "pipe", "read"]
-arch = ["riscv64", "loongarch64"]
+cwd = "/basic"
+start = "#### OS COMP TEST GROUP START basic-{root} ####\n"
+end = "#### OS COMP TEST GROUP END basic-{root} ####\n"
+
+[[group.step]]
+directory = "."
+include = [
+    "brk",
+    "chdir",
+    "clone",
+    "close",
+    "dup2",
+    "dup",
+    "execve",
+    "exit",
+    "fork",
+    "fstat",
+    "getcwd",
+    "getdents",
+    "getpid",
+    "getppid",
+    "gettimeofday",
+    "mkdir_",
+    "mmap",
+    "mount",
+    "munmap",
+    "openat",
+    "open",
+    "pipe",
+    "read",
+    "sleep",
+    "times",
+    "umount",
+    "uname",
+    "unlink",
+    "wait",
+    "waitpid",
+    "write",
+    "yield",
+]
+exec = ["./{name}"]
+before = "Testing {name} :\n"

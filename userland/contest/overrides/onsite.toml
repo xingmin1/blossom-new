@@ -1,5 +1,0 @@
-[[override]]
-id = "onsite:libc"
-timeout_sec = 120
-repeat = 2
-env = { MODE = "onsite" }

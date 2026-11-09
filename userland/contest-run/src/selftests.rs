@@ -3,7 +3,7 @@
 //! # 模块职责与架构定位
 //! 本模块实现 `contest-run selftests` 子命令，用于在当前系统根环境下直接运行已安装的 `kselftest` 测试集：
 //! - **上游**：由 `main.rs` 在识别到 `selftests` 子命令时调用 [`Options::parse`] 与 [`run`]。
-//! - **下游**：复用 [`crate::process::run_command`] 启动子进程并指定 [`Protocol::Tap`] 解析 TAP（Test Anything Protocol）输出，最终将结构化的 `SELFTEST` 进度与汇总行写入报告流。
+//! - **下游**：复用 [`crate::process::run_tap_command`] 启动子进程并解析 TAP（Test Anything Protocol）输出，最终将结构化的 `SELFTEST` 进度与汇总行写入报告流。
 //!
 //! # 核心机制与退出码状态机
 //!
@@ -29,9 +29,8 @@
 //! # 锁获取顺序与并发契约
 //! 本模块按清单顺序串行启动每个自检测试程序，不持有任何进程内互斥锁或自旋锁。
 
-use crate::model::{CommandSpec, Protocol};
-use crate::outcome::{Execution, ExitOutcome, Verdict};
-use crate::process::run_command;
+use crate::outcome::{Execution, ExitOutcome, ProtocolResult, Verdict};
+use crate::process::run_tap_command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
@@ -234,8 +233,8 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// 根据单个测试程序的执行结果（[`Execution`]）更新分类统计计数。
-    pub fn record(&mut self, run: &Execution) {
+    /// 根据单个测试程序的进程事实与 TAP 解析结果更新分类统计计数。
+    pub fn record(&mut self, run: &Execution, result: &ProtocolResult) {
         if !run.io_errors.is_empty()
             || matches!(
                 run.outcome,
@@ -245,7 +244,7 @@ impl Summary {
             self.errors += 1;
             return;
         }
-        match run.protocol.verdict {
+        match result.verdict {
             Verdict::Pass => self.passed += 1,
             Verdict::Skip => self.skipped += 1,
             Verdict::Broken | Verdict::InfrastructureError => self.errors += 1,
@@ -296,33 +295,28 @@ pub fn run(options: &Options, output: &mut impl Write, outputs: [RawFd; 2]) -> R
         )
         .map_err(output_error)?;
         output.flush().map_err(output_error)?;
-        let spec = CommandSpec::Exec {
-            program: program
-                .executable
-                .to_str()
-                .ok_or("selftest executable path is not UTF-8")?
-                .into(),
-            args: Vec::new(),
-        };
-        let run = run_command(
-            None,
+        let argv = [program
+            .executable
+            .to_str()
+            .ok_or("selftest executable path is not UTF-8")?
+            .to_owned()];
+        let (run, result) = run_tap_command(
             &program.cwd,
-            &spec,
+            &argv,
             &BTreeMap::new(),
             options.program_timeout,
-            &Protocol::Tap,
             outputs,
         );
-        summary.record(&run);
+        summary.record(&run, &result);
         writeln!(
             output,
             "SELFTEST result id={:?} timeout_seconds={} outcome={} status={:?} elapsed_ms={} tap={:?} io_errors={:?}",
             program.id,
             options.program_timeout.as_secs(),
-            run.protocol.verdict.as_str(),
+            result.verdict.as_str(),
             run.outcome,
             run.elapsed.as_millis(),
-            run.protocol.tap,
+            result.tap,
             run.io_errors
         )
         .map_err(output_error)?;

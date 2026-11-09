@@ -1,40 +1,26 @@
-//! 内核测试钩子设备（`/dev/testhook`）的用户态写入接口。
+//! 内核测试通知设备（`/dev/testhook`）的单消息写入接口。
 //!
-//! ## 模块职责与架构定位
-//! 本模块位于 `contest-run` 执行层与内核 `/dev/testhook` 字符设备之间。当测例开启 `hooks` 开关时，
-//! 上游执行引擎（`crate::execute::execute_case`）在主命令启动前调用 `hook(true, id)`，在主命令结束后调用
-//! `hook(false, id)`，通知内核执行针对特定测例的前置准备或后置清理/追踪操作（例如 `runner:trace`）。
+//! 每个 case 自动发送 `before` 与 `after` 两条通知，消息只携带测例 ID，由内核按 ID 自行匹配
+//! 需要特别处理的目标；未知 ID 在内核侧为无操作，因此普通测例不需要额外配置。通知设备不存在
+//! 表示 BLOSSOM 组成不匹配，此时直接返回错误，不静默跳过本次会话的通知。
 //!
-//! ## 消息协议与写入契约
-//! ```text
-//! +-----------------------+-----+--------------------+------+
-//! | "before" 或 "after"   | ' ' | 测例 ID (无空白/0) | '\n' |  (总长度 <= 512 字节)
-//! +-----------------------+-----+--------------------+------+
-//!             │
-//!             ▼  单次 write() 系统调用提交到 /dev/testhook (O_WRONLY | O_CLOEXEC)
-//! +---------------------------------------------------------+
-//! | written == message.len()  ──> Ok(())                    |
-//! | written != message.len()  ──> Err(WriteZero) 拒绝重试   |
-//! +---------------------------------------------------------+
-//! ```
-//! 内核钩子操作可能具有非幂等的副作用，因此必须通过单次 `write` 系统调用完整提交；一旦出现短写（Short Write）
-//! 或中断错误，直接向调用方返回错误并中止后续测例，避免重复发送导致内核状态错乱。
-//!
-//! ## 并发与锁契约
-//! 每次调用独立打开设备文件描述符并写入单条消息，不维护跨调用的用户态全局状态或锁。
+//! 消息格式为 `before <ID>\n` 或 `after <ID>\n`，ID 不含空白与 NUL，整条消息不超过 512 字节。
+//! 每次调用独立以 `O_WRONLY | O_CLOEXEC` 打开设备并只写一次；内核操作可能非幂等，出现短写即报错，
+//! 不重发已经部分提交的消息。
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// 向指定的内核测试钩子字符设备写入单条前置（`before`）或后置（`after`）控制消息。
+/// 向指定路径的内核测试通知设备写入单条 `before` 或 `after` 消息。
 ///
-/// 调用上下文：在测例主进程启动前或退出后由用户态主线程同步调用。
-/// 参数 `path` 为目标钩子设备路径，`before` 为 `true` 表示前置钩子、为 `false` 表示后置钩子，`id` 为不含空白与 NUL 的测例标识符。
-/// 返回值：单次完整写入成功返回 `Ok(())`；若 `id` 非法、消息超过 512 字节、打开设备失败或发生部分写入，均返回 `io::Error` 且不会自动重发。
-pub fn hook_device(path: &Path, before: bool, id: &str) -> io::Result<()> {
-    // Step 1: 校验测例 ID 非空且不包含 NUL 字节或 ASCII 空白字符，防止破坏单行空格分隔协议。
+/// 调用上下文：由测例执行编排在生命周期边界同步调用。`before` 为 `true` 表示测例开始，
+/// 为 `false` 表示测例结束；`id` 为不含空白与 NUL 的测例标识符。
+/// 返回值：单次完整写入成功返回 `Ok(())`；ID 非法、消息超过 512 字节、打开设备失败或发生短写时
+/// 返回 `io::Error`，且不会自动重发。
+pub fn notify_device(path: &Path, before: bool, id: &str) -> io::Result<()> {
+    // Step 1: 校验测例 ID，避免破坏单行空格分隔的消息协议。
     if id.is_empty()
         || id
             .bytes()
@@ -42,19 +28,19 @@ pub fn hook_device(path: &Path, before: bool, id: &str) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid hook case ID",
+            "invalid case ID",
         ));
     }
-    // Step 2: 组装单行控制消息并检查 512 字节长度上限。
-    let operation = if before { "before" } else { "after" };
-    let message = format!("{operation} {id}\n");
+    // Step 2: 组装单行消息并检查 512 字节长度上限。
+    let phase = if before { "before" } else { "after" };
+    let message = format!("{phase} {id}\n");
     if 512 < message.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "hook message exceeds 512 bytes",
+            "case notification exceeds 512 bytes",
         ));
     }
-    // Step 3: 以只写和 O_CLOEXEC 标志打开设备并执行单次写入；若字节数不完整则报错退出，避免非幂等钩子被重复执行。
+    // Step 3: 打开设备并单次写入；写入字节数不完整时直接报错，不重发可能已生效的内核操作。
     let mut device = OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_CLOEXEC)
@@ -64,7 +50,7 @@ pub fn hook_device(path: &Path, before: bool, id: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,
             format!(
-                "hook short write: {written}/{}; message not replayed",
+                "short notification write: {written}/{}; message not replayed",
                 message.len()
             ),
         ));
@@ -72,10 +58,9 @@ pub fn hook_device(path: &Path, before: bool, id: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// 向系统默认的 `/dev/testhook` 内核测试钩子设备发送前置或后置控制消息。
+/// 向默认的 `/dev/testhook` 内核测试通知设备发送单条 `before` 或 `after` 消息。
 ///
-/// 调用上下文：供 `contest-run` 主程序在执行启用了 `hooks` 的测例时作为默认钩子回调传入。
-/// 参数与返回值语义同 [`hook_device`]。
-pub fn hook(before: bool, id: &str) -> io::Result<()> {
-    hook_device(Path::new("/dev/testhook"), before, id)
+/// 调用上下文：作为测例执行编排的默认通知回调传入；参数与返回值语义同 [`notify_device`]。
+pub fn notify(before: bool, id: &str) -> io::Result<()> {
+    notify_device(Path::new("/dev/testhook"), before, id)
 }
