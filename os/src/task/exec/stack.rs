@@ -5,16 +5,16 @@
 //!
 //! ## 核心机制：System V ABI 初始用户栈内存布局
 //!
-//! 初始用户栈从 [`arch::USER_STACK_TOP`] 向低地址生长，分为高地址的**字符串与随机数字节区**（由 `strings` 游标从高向低填充）和低地址的**机器字指针与辅助向量表区**（由 `pointers` 游标从 `sp` 向高地址顺序填充）：
+//! 初始用户栈从 [`arch::USER_STACK_TOP`] 向低地址生长。布局计算先确定全部字符串的低地址边界，随后 `strings` 与 `pointers` 两个游标各自向高地址填充字符串和指针表：
 //!
 //! ```text
 //!   高地址  arch::USER_STACK_TOP
 //!           +----------------------------------------------------+
 //!           | filename ("/bin/sh\0")                             | ◄── layout.execfn (AT_EXECFN 指向此处)
 //!           +----------------------------------------------------+
-//!           | argv[0] 字符串 ... argv[argc-1] 字符串 (均含 '\0')   |
+//!           | envp[0] ... envp[envc-1] (低地址向高地址排列)       |
 //!           +----------------------------------------------------+
-//!           | envp[0] 字符串 ... envp[envc-1] 字符串 (均含 '\0')   |
+//!           | argv[0] ... argv[argc-1] (低地址向高地址排列)       |
 //!           +----------------------------------------------------+
 //!           | 16 字节伪随机数 (AT_RANDOM_BYTES)                    | ◄── layout.random (AT_RANDOM 指向此处)
 //!           +----------------------------------------------------+
@@ -36,10 +36,11 @@
 //! ```
 //!
 //! ## 并发与安全契约
-//! - **双游标无额外堆分配**：[`Layout::calculate`] 预先精确计算出字符串区与指针区的边界地址，[`make_stack`] 在栈页映射完成后同时推进 `strings`（向下）和 `pointers`（向上）两个游标，无需在内核堆中额外分配临时数组保存用户态字符串地址。
+//! - **双游标无额外堆分配**：[`Layout::calculate`] 预先精确计算出字符串区与指针区的边界地址，[`make_stack`] 在栈页映射完成后分别向高地址推进 `strings` 和 `pointers`，无需在内核堆中额外分配临时数组保存用户态字符串地址。
 //! - **离线拷贝与完整校验**：所有栈数据均通过 [`copyout_exact`] 写入尚未发布的候选 `Mm`，不构造指向用户空间的 Rust 引用；任何越界或缺页失败均直接中止装载并自动回收候选 `Mm`。
 
 use core::mem::size_of;
+use core::ops::Range;
 
 use crate::arch;
 use crate::mm::space::{Mm, VmError};
@@ -152,7 +153,7 @@ impl Layout {
 
 /// 在候选地址空间 `mm` 中建立初始用户栈映射，并写入 `argc`、`argv`、`envp` 与 `auxv` 辅助向量。
 ///
-/// 成功时返回对齐后的初始用户栈顶指针 `sp`。
+/// 成功时返回对齐后的初始栈指针及包含每个参数末尾 NUL 的连续参数区间。
 #[expect(
     clippy::too_many_arguments,
     reason = "离线栈构造分别消费主映像、解释器、参数、凭据与权限，保持 auxv 和映射输入的原 ABI 关系"
@@ -166,7 +167,7 @@ pub(super) fn make_stack(
     uid: u32,
     gid: u32,
     permissions: PagePermissions,
-) -> Result<usize, ExecError> {
+) -> Result<(usize, Range<usize>), ExecError> {
     // Step 1: 计算栈布局，检查是否与主程序或动态链接器的 PT_LOAD 段重叠，并在 mm 中建立栈 VMA。
     let layout = Layout::calculate(args)?;
     if elf.overlaps(layout.bottom, arch::USER_STACK_TOP)
@@ -182,10 +183,9 @@ pub(super) fn make_stack(
         RWX,
     )?;
 
-    // Step 2: 同时推进高地址字符串游标 strings 与低地址指针游标 pointers，依次写入 filename、argc、argv[] 与 envp[]。
-    let mut strings = arch::USER_STACK_TOP;
-    let execfn = stack_string(mm, &mut strings, &args.filename)?;
-    debug_assert_eq!(execfn, layout.execfn);
+    // Step 2: 字符串从低地址开始顺序写入，指针表仍按 argv、envp 顺序向高地址填充。
+    let mut strings = layout.random + AT_RANDOM_BYTES;
+    let arg_start = strings;
 
     let mut pointers = layout.sp;
     stack_word(mm, &mut pointers, args.argv.len())?;
@@ -194,15 +194,19 @@ pub(super) fn make_stack(
         stack_word(mm, &mut pointers, address)?;
     }
     stack_word(mm, &mut pointers, 0)?;
+    let arg_end = strings;
 
     for string in &args.envp {
         let address = stack_string(mm, &mut strings, string)?;
         stack_word(mm, &mut pointers, address)?;
     }
     stack_word(mm, &mut pointers, 0)?;
+    debug_assert_eq!(strings, layout.execfn);
+    stack_string(mm, &mut strings, &args.filename)?;
+    debug_assert_eq!(strings, arch::USER_STACK_TOP);
 
     // Step 3: 在字符串区底部写入 16 字节随机数，并在指针区顺序写入 17 对辅助向量（auxv）。
-    debug_assert_eq!(strings - AT_RANDOM_BYTES, layout.random);
+    debug_assert_eq!(arg_start - AT_RANDOM_BYTES, layout.random);
     let mut random_bytes = [0; AT_RANDOM_BYTES];
     random::fill_insecure(&mut random_bytes);
     copyout_exact(mm, layout.random, &random_bytes)?;
@@ -233,15 +237,15 @@ pub(super) fn make_stack(
     }
 
     debug_assert!(pointers <= layout.random);
-    Ok(layout.sp)
+    Ok((layout.sp, arg_start..arg_end))
 }
 
-/// 将字节切片 `bytes` 及末尾 NUL 终止符写入栈字符串游标 `*cursor` 下方，并将游标更新为新字符串的起始虚拟地址。
+/// 将字符串及末尾 NUL 写入已计算好的字符串区，并向高地址推进游标。
 fn stack_string(mm: &Mm, cursor: &mut usize, bytes: &[u8]) -> Result<usize, ExecError> {
-    let address = *cursor - bytes.len() - 1;
+    let address = *cursor;
     copyout_exact(mm, address, bytes)?;
     copyout_exact(mm, address + bytes.len(), &[0])?;
-    *cursor = address;
+    *cursor += bytes.len() + 1;
     Ok(address)
 }
 

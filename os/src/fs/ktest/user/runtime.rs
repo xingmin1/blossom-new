@@ -264,6 +264,7 @@ impl UserOwner {
         let image = LoadedImage {
             mm: child.clone(),
             context: user_context,
+            comm: image.comm,
         };
         verify_image(
             context,

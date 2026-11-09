@@ -59,6 +59,7 @@ use crate::fs::{
 use crate::mm::space::{Mm, VmError};
 use crate::mm::user_table::{PagePermissions, PageTableError};
 use crate::mm::{alloc_pages, PAGE_SIZE};
+use crate::task::process::TaskComm;
 use crate::task::Credentials;
 
 use crate::fs::PATH_MAX as MAX_PATH_BYTES;
@@ -136,6 +137,8 @@ pub(crate) struct LoadedImage {
     pub mm: Arc<Mm>,
     /// 设置好程序入口地址（`sepc`/`era`）与初始用户栈指针（`sp`）的用户态陷入上下文。
     pub context: UserContext,
+    /// 由原始执行路径生成的进程名，脚本展开不改变其来源。
+    pub comm: TaskComm,
 }
 
 /// 解析可执行路径（支持 `#!` 脚本链式展开）并装载最终的 ELF 映像。
@@ -338,7 +341,7 @@ fn load_elf(
     };
 
     map_return_page(&mut mm)?;
-    let sp = stack::make_stack(
+    let (sp, arguments) = stack::make_stack(
         &mm,
         &elf,
         interpreter.as_ref().map(|(_, _, image)| image),
@@ -348,6 +351,7 @@ fn load_elf(
         credentials.gid,
         stack_permissions,
     )?;
+    mm.bind_arguments(arguments);
 
     let heap = page_end(elf.end)?;
     mm.set_heap(heap, heap)?;
@@ -360,7 +364,11 @@ fn load_elf(
     }
 
     let mm = Arc::try_new(mm).map_err(|_| ExecError::NoMemory)?;
-    Ok(LoadedImage { mm, context })
+    Ok(LoadedImage {
+        mm,
+        context,
+        comm: TaskComm::from_filename(args.filename()),
+    })
 }
 
 /// 从文件指定偏移处循环读取数据，直到填满 `bytes` 缓冲区或到达文件末尾（EOF）。

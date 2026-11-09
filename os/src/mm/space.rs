@@ -527,6 +527,8 @@ pub struct Mm {
     executable: Option<(FileRef, ExecAccess)>,
     /// 动态链接器（ELF `PT_INTERP` 解释器）文件引用及其执行期写互斥凭证。
     interpreter: Option<(FileRef, ExecAccess)>,
+    /// 执行初始栈中连续参数字符串的半开区间，发布后不可变。
+    arguments: Range<usize>,
     /// 测试专用钩子：在 `mkwrite` 完成文件页准备后、重新获取 `mmap` 写锁前触发。
     #[cfg(feature = "ktest")]
     mkwrite_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -813,6 +815,7 @@ impl Mm {
             users: AtomicUsize::new(0),
             executable: None,
             interpreter: None,
+            arguments: 0..0,
             #[cfg(feature = "ktest")]
             mkwrite_hook: SpinLock::new(None),
             #[cfg(feature = "ktest")]
@@ -836,6 +839,17 @@ impl Mm {
     pub(crate) fn bind_interpreter(&mut self, file: FileRef, access: ExecAccess) {
         assert!(self.interpreter.is_none(), "MM interpreter already bound");
         self.interpreter = Some((file, access));
+    }
+
+    /// 在地址空间发布前记录初始栈的连续参数字符串区间。
+    pub(crate) fn bind_arguments(&mut self, arguments: Range<usize>) {
+        self.arguments = arguments;
+    }
+
+    /// 返回参数字符串区间；直接创建而未装载程序的地址空间返回空区间。
+    #[expect(dead_code, reason = "参数区间是进程命令行查询接口的数据")]
+    pub(crate) fn arguments(&self) -> Range<usize> {
+        self.arguments.clone()
     }
 
     /// 返回当前绑定到该地址空间的活动用户线程数量（即存活的 [`MmUser`] 数量）。
@@ -1700,6 +1714,7 @@ impl Mm {
         let mut child = Self::try_new()?;
         child.executable = self.executable.clone();
         child.interpreter = self.interpreter.clone();
+        child.arguments = self.arguments.clone();
         let mmap = self.mmap.write();
         let snapshot = mmap.snapshot(&child.table)?;
         let addresses = self.resident_addresses(&(0..arch::USER_ADDRESS_END))?;

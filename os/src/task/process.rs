@@ -184,6 +184,34 @@ impl Pid {
     }
 }
 
+/// 进程名缓冲区长度，包含末尾 NUL 字节。
+const TASK_COMM_LEN: usize = 16;
+
+/// 不分配内存的进程名副本，最多保存十五个原始字节。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TaskComm {
+    /// 未使用字节保持为零，最后一字节始终为 NUL。
+    bytes: [u8; TASK_COMM_LEN],
+}
+
+impl TaskComm {
+    /// 从执行路径最后一个组件取得进程名，按字节截断并保留 NUL 结尾。
+    pub(crate) fn from_filename(filename: &[u8]) -> Self {
+        let basename = filename.rsplit(|byte| *byte == b'/').next().unwrap();
+        let mut comm = Self::default();
+        let length = basename.len().min(TASK_COMM_LEN - 1);
+        comm.bytes[..length].copy_from_slice(&basename[..length]);
+        comm
+    }
+
+    /// 借用首个 NUL 之前的原始进程名字节，不要求有效 UTF-8。
+    #[expect(dead_code, reason = "进程名原始字节是进程查询接口的数据")]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        let length = self.bytes.iter().position(|byte| *byte == 0).unwrap();
+        &self.bytes[..length]
+    }
+}
+
 /// 线程组（即用户态视角下的“进程”）共享的身份、信号、时间与资源配额实体。
 ///
 /// 不持有用户地址空间 `Mm`、打开文件表或内核栈，确保僵尸态进程或控制终端引用不会滞留重量级运行资源。
@@ -192,6 +220,10 @@ pub(crate) struct ThreadGroup {
     graph: Weak<TaskGraph>,
     /// 线程组不可变的 `TGID` 身份对象（在进程整个生命周期内保持不变）。
     pid: Arc<Pid>,
+    /// 最近一次执行路径生成的组进程名，由独立自旋锁保护。
+    comm: SpinLock<TaskComm>,
+    /// 创建进程身份时的单调时钟纳秒数，执行新映像时保持不变。
+    started_ns: u64,
     /// 受自旋锁保护的可变作业控制关系（`PGID`、`SID`、退出信号及控制终端）。
     relations: SpinLock<GroupRelations>,
     /// 进程所属的不可变真实用户标识符（UID），用于信号发送与 `prlimit` 权限检查。
@@ -231,6 +263,28 @@ pub(crate) struct TerminalControl {
 }
 
 impl ThreadGroup {
+    /// 读取线程组当前进程名的无分配副本。
+    pub(crate) fn comm(&self) -> TaskComm {
+        *self.comm.lock()
+    }
+
+    /// 在新进程发布前或提交新映像时替换进程名。
+    pub(crate) fn set_comm(&self, comm: TaskComm) {
+        *self.comm.lock() = comm;
+    }
+
+    /// 返回进程身份创建时记录的单调纳秒时间。
+    #[expect(dead_code, reason = "进程创建时间是进程查询接口的数据")]
+    pub(crate) fn started_ns(&self) -> u64 {
+        self.started_ns
+    }
+
+    /// 读取本进程终止时通知父进程的信号编号。
+    #[expect(dead_code, reason = "退出通知信号是进程查询接口的数据")]
+    pub(crate) fn exit_signal(&self) -> u8 {
+        self.relations.lock().exit_signal
+    }
+
     /// 返回线程组的数字标识符 `TGID`（即用户态 `getpid()` 返回的进程号）。
     pub(crate) fn tgid(&self) -> usize {
         self.pid.number
@@ -665,6 +719,8 @@ impl TaskGraph {
         let group = Arc::try_new(ThreadGroup {
             graph: Arc::downgrade(self),
             pid: pid.clone(),
+            comm: SpinLock::new(parent.map_or_else(TaskComm::default, |parent| parent.comm())),
+            started_ns: crate::time::now().as_nanos(),
             relations: SpinLock::new(GroupRelations {
                 pgid,
                 sid,

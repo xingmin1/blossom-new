@@ -481,6 +481,7 @@ impl UserThread {
             mem::take(&mut process.clear_child_tid)
         };
         clear_tid(&old_mm, clear_child_tid);
+        let group = self.identity().expect("exec has no identity").group();
 
         // Step 3: 清除上一程序的系统调用重启状态与临时信号掩码，关中断原子切换当前活动地址空间、寄存器现场与运行时绑定。
         let binding = MmUser::new(image.mm);
@@ -502,6 +503,7 @@ impl UserThread {
             let old_active = space::leave_current();
             let old_binding = self.mm.lock().replace(binding);
             *self.context.borrow_mut() = image.context;
+            group.set_comm(image.comm);
             space::enter_current(Some(active));
             (old_runtime, old_binding, old_active, completion)
         };
@@ -787,19 +789,22 @@ pub(crate) fn prepare_program(
         SignalInheritance::EMPTY,
         SIGCHLD,
     )?;
-    prepare_bound_user(identity, image, runtime, placement, None, 0)
+    let LoadedImage { mm, context, comm } = image;
+    identity.identity().group().set_comm(comm);
+    prepare_bound_user(identity, mm, context, runtime, placement, None, 0)
 }
 
-/// 将已准备好的进程或线程身份（`PreparedIdentity`）与加载好的映像、运行时资源及内核调度任务组装为 `PreparedProgram`。
+/// 将已准备好的身份、地址空间和用户现场与运行时资源及调度任务组装为待发布程序。
 pub(crate) fn prepare_bound_user(
     identity: PreparedIdentity,
-    image: LoadedImage,
+    mm: Arc<Mm>,
+    context: UserContext,
     runtime: UserRuntime,
     placement: Placement,
     child_set_tid: Option<usize>,
     clear_child_tid: usize,
 ) -> Result<PreparedProgram, ProgramError> {
-    let user = UserThread::try_new(image.mm, image.context)?;
+    let user = UserThread::try_new(mm, context)?;
     user.bind_process(identity.identity(), runtime, child_set_tid, clear_child_tid);
     let task = task::prepare_user(Arc::clone(&user), placement, run_program)?;
     let execution = PreparedExecution::try_new(task.observer())?;

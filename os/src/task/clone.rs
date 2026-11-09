@@ -40,7 +40,6 @@ use crate::fs::FsError;
 use crate::mm::space::VmError;
 use crate::sync::Completion;
 use crate::syscall::Request;
-use crate::task::exec::LoadedImage;
 use crate::task::process::ProcessError;
 use crate::task::user::{prepare_bound_user, ProgramError};
 use crate::task::{Placement, UserThread};
@@ -257,7 +256,8 @@ pub(crate) fn create(
     .map_err(CloneError::Identity)?;
     let program = prepare_bound_user(
         identity,
-        LoadedImage { mm, context },
+        mm,
+        context,
         runtime,
         Placement::Any,
         arguments.child_tid,
