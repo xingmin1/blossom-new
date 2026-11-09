@@ -194,7 +194,11 @@ timeout_sec = 600
 
 这些脚本自带组起止标记与结果行，group 不写 `start`/`end`，避免输出两套标记。`timeout_sec` 是整个脚本的外层预算，应按脚本实际耗时设置，不能套用普通短用例的 60 秒。
 
-`iperf` 集合例外：盘内脚本用 `iperf3 -s -D` 启动服务，守护进程会脱离进程组；当前内核的 procfs 没有 `/proc/<pid>`，BusyBox 的 `killall`、`pidof` 找不到它，残留服务会让下一次 root 切换卸载 `/dev` 时 Busy 并停止会话。`sets/iperf.toml` 因此在 `setup` 里把脚本中的 ` -D` 改写成 `>/dev/null 2>&1 &` 并写到 `/tmp/iperf_testcode.sh` 再执行，服务留在主命令的进程组里随组收尾；脚本的其余内容和客户端输出不变。内核补齐 `/proc/<pid>` 后可以改回直接执行原脚本。
+`iperf` 集合额外配置 `cleanup`：盘内脚本用 `iperf3 -s -D` 启动服务端，守护进程脱离主命令的进程组，脚本结束时也不停止它，主命令收尾的整组 `SIGKILL` 到不了它。`sets/iperf.toml` 直接用 `/busybox sh /iperf_testcode.sh` 原样执行脚本；cleanup 在同一个 root 内用盘内 BusyBox 执行 `killall iperf3`，再用 `pidof` 每秒检查一次，直到服务端退出后才切换 root，否则它打开的 `/dev` 文件会让卸载返回 Busy。
+
+`killall`/`pidof` 依赖内核的 `/proc/<pid>/stat` 与 `/proc/<pid>/cmdline` 查询。系统根 BusyBox 未启用这两个 applet，cleanup 必须使用比赛根内的 `/busybox`。
+
+cleanup 单条命令的超时取 `defaults.timeout_sec`（默认计划为 60 秒），不使用该 step 的 600 秒脚本预算；超时按 cleanup 错误停止会话。
 
 ## 5. 路径相对规则
 
