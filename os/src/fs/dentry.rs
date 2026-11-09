@@ -207,8 +207,10 @@ impl DentryCache {
             )
         };
         if let Some(dentry) = existing {
-            dentry.inode()?;
-            return Ok(dentry);
+            if dentry.inode()?.revalidate() {
+                return Ok(dentry);
+            }
+            self.unhash(&dentry);
         }
 
         // Step 3: 若 Dentry 缓存已满，或父目录属于磁盘文件系统且 Inode 缓存已满（闲置的正绑定 Dentry 会强引用磁盘 Inode），
@@ -218,11 +220,14 @@ impl DentryCache {
             // 回收锁外释放期间同一 (parent, name) 可能已被其他任务发布，需再次查询索引。
             let index = self.entries.lock();
             let existing = find(&index.entries, parent, name);
-            let full = self.capacity <= index.entries.len() + index.reserved;
+            let mut full = self.capacity <= index.entries.len() + index.reserved;
             drop(index);
             if let Some(dentry) = existing {
-                dentry.inode()?;
-                return Ok(dentry);
+                if dentry.inode()?.revalidate() {
+                    return Ok(dentry);
+                }
+                self.unhash(&dentry);
+                full = false;
             }
             if full {
                 return Err(FsError::NoMemory);
@@ -265,7 +270,7 @@ impl DentryCache {
         let result = directory
             .lookup(inodes, name)
             .and_then(|inode| inode.ok_or(FsError::NotFound));
-        loader.complete(result);
+        loader.complete(result, inode.cache_negative());
         drop(loader);
         candidate.inode()?;
         Ok(candidate)
@@ -743,12 +748,11 @@ impl Dentry {
 }
 
 impl LoadGuard<'_> {
-    /// 将底层目录查找结果转换为 `Binding` 状态并发布：目录返回 `NotFound` 时转为负绑定（`Binding::Negative`）保留在缓存中，
-    /// 其余错误将从缓存索引中摘除占位条目并唤醒所有等待任务。
-    fn complete(&mut self, result: Result<InodeRef, FsError>) {
+    /// 将目录查找结果发布为正绑定或允许缓存的负绑定；其余错误摘除占位并唤醒等待者。
+    fn complete(&mut self, result: Result<InodeRef, FsError>, cache_negative: bool) {
         let binding = match result {
             Ok(inode) => Ok(Binding::Positive(inode)),
-            Err(FsError::NotFound) => Ok(Binding::Negative),
+            Err(FsError::NotFound) if cache_negative => Ok(Binding::Negative),
             Err(error) => Err(error),
         };
         self.publish(binding);

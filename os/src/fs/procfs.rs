@@ -38,7 +38,7 @@
 //! - **快照生成阶段（`open`）**：在获取各子系统（VFS 挂载表、网络协议栈、内存分配器、中断控制器）内部锁时，仅拷贝标量统计数据，随后在锁外使用 [`SnapshotText`] 执行字符串格式化与堆内存扩容，缩短子系统锁的持有时间。
 //! - **快照读取阶段（`read_into` / `seek`）**：仅获取 [`SnapshotFile::cursor`]（[`SleepMutex`]）保护游标推进；`SnapshotFile` 不反向持有 `Vfs` 或 `NetStack` 引用。
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::ops::Range;
@@ -46,14 +46,19 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::boot::{self, MAX_CPUS};
 use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path};
-use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
+use crate::fs::inode::{InodeMetadata, MemoryContent, MemoryDirectory, MemoryEntry};
+use crate::fs::memfs::{MemoryFs, MemorySpecial};
 use crate::fs::{
-    DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
-    ReadBuffer, SeekFrom, Vfs, WriteBuffer, O_ACCMODE, O_RDONLY, O_TRUNC,
+    DirectoryCursor, DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError,
+    InodeKind, InodeRef, Path, ReadBuffer, SeekFrom, Vfs, WriteBuffer, O_ACCMODE, O_RDONLY,
+    O_TRUNC,
 };
 use crate::net::route::{IPV4_ADDRESS_BITS, RTF_GATEWAY, RTF_UP};
 use crate::net::{NetStack, INTERFACE_COUNT};
-use crate::sync::SleepMutex;
+use crate::sync::{SleepMutex, SpinLock};
+use crate::task::process::{Pid, ProcessStatus, TaskComm, TaskGraph, MAX_PID};
+use crate::task::time::{CpuTime, USER_HZ};
+use crate::task::State;
 use crate::{accounting, cpu, irq, mm, time};
 
 /// 生成 `/proc` 文本快照时预分配的初始缓冲区容量（单位：字节）。
@@ -64,6 +69,32 @@ const BYTES_PER_KIB: usize = 1024;
 const UPTIME_TICKS_PER_SEC: u64 = 100;
 /// `/proc/uptime` 每个百分之一秒刻度对应的纳秒数（$10^7\text{ ns}$）。
 const UPTIME_TICK_NANOS: u64 = time::NSEC_PER_SEC / UPTIME_TICKS_PER_SEC;
+/// 固定节点编号之外的进程 inode 编号起点，每个 PID 占四个编号。
+const PROCESS_INODE_BASE: u64 = 1 << 32;
+/// 根目录中数字进程项的游标起点，避免与固定节点游标重叠。
+pub(crate) const PROCESS_COOKIE_BASE: u64 = 1 << 32;
+/// 本内核不限制进程常驻内存，stat 将该限额表示为无上限。
+const RSS_LIMIT_INFINITY: u64 = u64::MAX;
+/// 进程枚举的结束游标，包含最大 PID 之后的一个位置。
+pub(crate) const PROCESS_COOKIE_END: u64 = PROCESS_COOKIE_BASE + MAX_PID as u64 + 1;
+
+/// 与一次 PID 身份绑定的动态进程节点，不持有任务图或用户运行资源。
+pub(crate) struct ProcessNode {
+    /// 原始 PID 对象，号码复用后仍指向旧身份。
+    pub(crate) pid: Arc<Pid>,
+    /// 目录或信息文件的具体角色。
+    pub(crate) role: ProcessRole,
+}
+
+/// 进程节点的数据面角色，目录复用共同内存目录格式。
+pub(crate) enum ProcessRole {
+    /// 仅包含 cmdline 与 stat 的只读目录。
+    Directory(SpinLock<MemoryDirectory>),
+    /// 按打开时间采集的进程统计文本。
+    Stat,
+    /// 按打开时间读取的 NUL 分隔用户参数字节。
+    Cmdline,
+}
 
 /// `/proc` 动态信息节点的打开文件描述（Open File Description）。
 ///
@@ -85,7 +116,7 @@ pub struct SnapshotFile {
 /// 由于 `core::fmt::Write` 接口仅能返回无载荷的 `fmt::Error`，本结构体在扩容失败或长度溢出时
 /// 将具体 [`FsError`] 暂存在 `error` 字段中，并在格式化结束调用 [`SnapshotText::finish`] 时还原。
 struct SnapshotText {
-    /// 累积已格式化 UTF-8 文本的动态字节数组。
+    /// 累积格式化文本及允许非 UTF-8 的原始字节。
     bytes: Vec<u8>,
     /// 格式化过程中首次遇到的内存分配或长度溢出错误。
     error: Option<FsError>,
@@ -99,6 +130,26 @@ impl SnapshotText {
             .try_reserve_exact(SNAPSHOT_INITIAL_CAPACITY)
             .map_err(|_| FsError::NoMemory)?;
         Ok(Self { bytes, error: None })
+    }
+
+    /// 可失败地追加原始字节，进程名不经过 UTF-8 转换。
+    fn append_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
+        let result = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(FsError::FileTooLarge)
+            .and_then(|_| {
+                self.bytes
+                    .try_reserve(bytes.len())
+                    .map_err(|_| FsError::NoMemory)
+            });
+        if let Err(error) = result {
+            self.error = Some(error);
+            return Err(fmt::Error);
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// 结束格式化并提取完整字节数组；若格式化过程中发生错误，则返回暂存的 [`FsError`]。
@@ -115,30 +166,15 @@ impl SnapshotText {
 impl Write for SnapshotText {
     /// 在追加字符串片段前先执行长度溢出检查与可失败容量预留（`try_reserve`），失败时记录具体错误并中断格式化。
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        let result = self
-            .bytes
-            .len()
-            .checked_add(text.len())
-            .ok_or(FsError::FileTooLarge)
-            .and_then(|_| {
-                self.bytes
-                    .try_reserve(text.len())
-                    .map_err(|_| FsError::NoMemory)
-            });
-        if let Err(error) = result {
-            self.error = Some(error);
-            return Err(fmt::Error);
-        }
-        self.bytes.extend_from_slice(text.as_bytes());
-        Ok(())
+        self.append_bytes(text.as_bytes())
     }
 }
 
 /// 创建并初始化只读的 `procfs` 内存文件系统实例，在 `/proc` 及 `/proc/net` 下安装固定信息节点。
 ///
 /// 各节点仅登记对应的 [`MemorySpecial`] 角色标识，不在挂载阶段提前生成任何快照文本。
-pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
-    let fs = MemoryFs::try_new(MemoryFsKind::Procfs, root_mode)?;
+pub(crate) fn try_new(root_mode: u16, graph: Weak<TaskGraph>) -> Result<Arc<MemoryFs>, FsError> {
+    let fs = MemoryFs::try_procfs(root_mode, graph)?;
     let root = fs.root();
     fs.initialize_special(&root, b"cmdline", MemorySpecial::Cmdline, 0o444, 0)?;
     fs.initialize_special(&root, b"mounts", MemorySpecial::Mounts, 0o444, 0)?;
@@ -533,4 +569,304 @@ impl FileLike for SnapshotFile {
     ) -> Result<usize, FsError> {
         Err(FsError::BadFd)
     }
+}
+
+/// 解析规范十进制 PID 名称，拒绝空名、多位前导零、非数字及算术溢出。
+fn parse_pid(name: &[u8]) -> Option<usize> {
+    if name.is_empty() || (1 < name.len() && name[0] == b'0') {
+        return None;
+    }
+    name.iter()
+        .try_fold(0u32, |number, byte| {
+            if !byte.is_ascii_digit() || (u32::MAX - 9) / 10 <= number {
+                return None;
+            }
+            Some(number * 10 + u32::from(*byte - b'0'))
+        })
+        .map(|number| number as usize)
+}
+
+/// 按进程编号及节点角色生成稳定 inode 编号，不使用内存文件系统索引额度。
+fn process_inode_number(pid: &Pid, offset: u64) -> u64 {
+    PROCESS_INODE_BASE + pid.number() as u64 * 4 + offset
+}
+
+/// 直接创建绑定 PID 对象的进程节点，节点由目录项和打开引用持有。
+fn process_inode(
+    fs: &Arc<MemoryFs>,
+    pid: Arc<Pid>,
+    role: ProcessRole,
+) -> Result<InodeRef, FsError> {
+    let (kind, mode, links, offset) = match &role {
+        ProcessRole::Directory(_) => (InodeKind::Directory, 0o040555, 2, 0),
+        ProcessRole::Cmdline => (InodeKind::Regular, 0o100444, 1, 1),
+        ProcessRole::Stat => (InodeKind::Regular, 0o100444, 1, 2),
+    };
+    let mut metadata = InodeMetadata::memory(kind, mode, 0, 0, links, 0);
+    metadata.number = process_inode_number(&pid, offset);
+    InodeRef::try_memory(
+        fs,
+        metadata,
+        MemoryContent::Process(ProcessNode { pid, role }),
+    )
+}
+
+/// 在没有文件系统索引锁的上下文中准备一个进程目录的固定子项。
+fn process_child(name: &[u8], inode: InodeRef, cookie: u64) -> Result<MemoryEntry, FsError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(name.len())
+        .map_err(|_| FsError::NoMemory)?;
+    bytes.extend_from_slice(name);
+    Ok(MemoryEntry {
+        name: Arc::try_new(bytes).map_err(|_| FsError::NoMemory)?,
+        inode: inode.memory_arc(),
+        kind: InodeKind::Regular,
+        cookie,
+    })
+}
+
+/// 从 proc 根目录按规范 PID 名称查找现存进程，并为原身份创建只读目录。
+pub(crate) fn lookup_process(fs: &Arc<MemoryFs>, name: &[u8]) -> Result<Option<InodeRef>, FsError> {
+    let Some(number) = parse_pid(name) else {
+        return Ok(None);
+    };
+    let Some(pid) = fs
+        .process_graph()
+        .and_then(|graph| graph.process_pid(number))
+    else {
+        return Ok(None);
+    };
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(2)
+        .map_err(|_| FsError::NoMemory)?;
+    entries.push(process_child(
+        b"cmdline",
+        process_inode(fs, pid.clone(), ProcessRole::Cmdline)?,
+        2,
+    )?);
+    entries.push(process_child(
+        b"stat",
+        process_inode(fs, pid.clone(), ProcessRole::Stat)?,
+        3,
+    )?);
+    let role = ProcessRole::Directory(SpinLock::new(MemoryDirectory {
+        parent: fs.root().number(),
+        next_cookie: 4,
+        entries,
+    }));
+    process_inode(fs, pid, role).map(Some)
+}
+
+/// 从固定项之后按 TGID 升序枚举进程，以 PID 数值游标续读且不重复前项。
+pub(crate) fn next_process(
+    fs: &Arc<MemoryFs>,
+    cookie: u64,
+) -> Result<Option<DirectoryEntry>, FsError> {
+    if PROCESS_COOKIE_END <= cookie {
+        return Ok(None);
+    }
+    let start = cookie.saturating_sub(PROCESS_COOKIE_BASE) as usize;
+    let Some(pid) = fs
+        .process_graph()
+        .and_then(|graph| graph.next_process(start))
+    else {
+        return Ok(None);
+    };
+    let mut text = SnapshotText::try_new()?;
+    let result = write!(text, "{}", pid.number());
+    let name = text.finish(result)?;
+    let next_cookie = PROCESS_COOKIE_BASE + pid.number() as u64 + 1;
+    Ok(Some(DirectoryEntry {
+        number: process_inode_number(&pid, 0),
+        name,
+        kind: Some(InodeKind::Directory),
+        next_cookie,
+        next_cursor: DirectoryCursor::Memory(next_cookie),
+    }))
+}
+
+/// 打开进程信息节点并冻结本次读取内容；已回收的原身份返回 ESRCH。
+pub(crate) fn open_process(path: Path, flags: u32) -> Result<FileRef, FsError> {
+    if flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0 {
+        return Err(FsError::ReadOnly);
+    }
+    let inode = path.inode()?;
+    let node = inode
+        .process_node()
+        .expect("process open has no process node");
+    let status = inode
+        .memory_fs()?
+        .process_graph()
+        .and_then(|graph| graph.process_status(&node.pid))
+        .ok_or(FsError::NoProcess)?;
+    let bytes = match node.role {
+        ProcessRole::Stat => format_process_stat(&collect_process_stat(&status))?,
+        ProcessRole::Cmdline => process_cmdline(&status)?,
+        ProcessRole::Directory(_) => return Err(FsError::IsDirectory),
+    };
+    Ok(Arc::try_new(SnapshotFile {
+        path,
+        bytes,
+        cursor: SleepMutex::new(0),
+        flags: AtomicU32::new(flags),
+    })
+    .map_err(|_| FsError::NoMemory)?)
+}
+
+/// 不持有内核对象或锁的进程统计采样，供纯文本格式化使用。
+struct ProcessStat {
+    /// 用户可见线程组编号。
+    pid: usize,
+    /// 最近执行路径生成的原始进程名字节。
+    comm: TaskComm,
+    /// 单字节运行、睡眠、停止或僵尸状态。
+    state: u8,
+    /// 父进程线程组编号。
+    parent: usize,
+    /// 当前进程组编号。
+    pgid: usize,
+    /// 当前会话编号。
+    sid: usize,
+    /// 控制终端的编码设备号，无终端时为零。
+    tty_nr: u64,
+    /// 控制终端前台进程组，无终端时为负一。
+    tpgid: i32,
+    /// 所有组成员已结算的 CPU 纳秒时间。
+    own: CpuTime,
+    /// 已回收子代的 CPU 纳秒时间。
+    children: CpuTime,
+    /// 当前尚未退出的组成员数量。
+    members: usize,
+    /// 进程身份创建时的单调纳秒数。
+    started_ns: u64,
+    /// 进程退出通知父进程的信号编号。
+    exit_signal: u8,
+}
+
+/// 在任务图锁外分别读取组关系、时间与调度状态，不把各锁的快照当作原子事务。
+fn collect_process_stat(status: &ProcessStatus) -> ProcessStat {
+    let group = &status.group;
+    let state = match status.leader.as_ref().and_then(|leader| leader.executor()) {
+        None => b'Z',
+        Some(_) if group.signals().has_stopped_jobs() => b'T',
+        Some(task) => match crate::sched::state(&task) {
+            State::Ready | State::Running(_) | State::SwitchingOut(_, _) => b'R',
+            State::Blocked => b'S',
+            State::Exited => b'Z',
+        },
+    };
+    let (tty_nr, tpgid) = group.terminal_status();
+    ProcessStat {
+        pid: group.tgid(),
+        comm: group.comm(),
+        state,
+        parent: status.parent,
+        pgid: group.pgid(),
+        sid: group.sid(),
+        tty_nr,
+        tpgid,
+        own: group.time().snapshot(),
+        children: group.time().children(),
+        members: status.members,
+        started_ns: group.started_ns(),
+        exit_signal: group.exit_signal(),
+    }
+}
+
+/// 将纳秒数转换为用户 ABI 的时钟滴答数，以除法避免乘法溢出。
+fn process_ticks(ns: u64) -> i128 {
+    i128::from(ns / (time::NSEC_PER_SEC / USER_HZ))
+}
+
+/// 只根据数值与进程名字节格式化一行五十二字段的 stat 文本，不访问内核状态。
+fn format_process_stat(stat: &ProcessStat) -> Result<Vec<u8>, FsError> {
+    let mut text = SnapshotText::try_new()?;
+    let result = (|| {
+        write!(text, "{} (", stat.pid)?;
+        text.append_bytes(stat.comm.as_bytes())?;
+        write!(text, ") {}", char::from(stat.state))?;
+        let fields: [i128; 49] = [
+            // 字段 4–8：父进程、进程组、会话与控制终端。
+            stat.parent as i128,
+            stat.pgid as i128,
+            stat.sid as i128,
+            i128::from(stat.tty_nr),
+            i128::from(stat.tpgid),
+            // 字段 9–13：标志与缺页计数。
+            0,
+            0,
+            0,
+            0,
+            0,
+            // 字段 14–22：CPU 时间、普通调度属性、成员数及创建时间。
+            process_ticks(stat.own.user_ns),
+            process_ticks(stat.own.kernel_ns),
+            process_ticks(stat.children.user_ns),
+            process_ticks(stat.children.kernel_ns),
+            20,
+            0,
+            stat.members as i128,
+            0,
+            process_ticks(stat.started_ns),
+            // 字段 23–30：地址空间计数、常驻内存上限与隐藏地址。
+            0,
+            0,
+            i128::from(RSS_LIMIT_INFINITY),
+            0,
+            0,
+            0,
+            0,
+            0,
+            // 字段 31–37：旧信号位图、等待地址与保留值。
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            // 字段 38–44：退出信号、处理器与未维护的扩展调度计数。
+            i128::from(stat.exit_signal),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            // 字段 45–52：隐藏的程序地址和退出状态。
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        for value in fields {
+            write!(text, " {}", value)?;
+        }
+        text.write_str("\n")
+    })();
+    text.finish(result)
+}
+
+/// 从组首线程当前地址空间逐页读取参数区，首个不可读页只截短结果。
+fn process_cmdline(status: &ProcessStatus) -> Result<Vec<u8>, FsError> {
+    let Some(mm) = status.leader.as_ref().and_then(|leader| leader.mm()) else {
+        return Ok(Vec::new());
+    };
+    let arguments = mm.arguments();
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(arguments.len())
+        .map_err(|_| FsError::NoMemory)?;
+    bytes.resize(arguments.len(), 0);
+    // Mm 的读取路径按目标页表取得内核直映地址，mmap 读锁先于页表锁；
+    // 缺页在锁外完成，原始指令复制允许目标 CPU 并发修改字节而不构造用户引用。
+    let progress = mm.copyin(&mut bytes, arguments.start);
+    bytes.truncate(progress.copied);
+    Ok(bytes)
 }

@@ -722,6 +722,15 @@ pub fn open_path_with_flags(
         return Err(FsError::NotDirectory);
     }
 
+    if let Some(node) = inode.process_node() {
+        if !inode.revalidate() {
+            return Err(FsError::NoProcess);
+        }
+        if !matches!(node.role, procfs::ProcessRole::Directory(_)) {
+            return procfs::open_process(path, flags);
+        }
+    }
+
     if let Some(special) = inode.memory_special() {
         return match special {
             MemorySpecial::Null | MemorySpecial::Zero | MemorySpecial::TestHook => {

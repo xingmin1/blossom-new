@@ -79,7 +79,8 @@ use crate::fs::ext4::{
     codec, finish_error, BlockMapping, Ext4Volume, InodeData, PreparedDirectoryEdit,
     PreparedDirectoryMappings, PreparedInodeMapping, PreparedInodeRelease, UnpublishedInode,
 };
-use crate::fs::memfs::{MemoryFs, MemoryPageCharge, MemorySpecial};
+use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemoryPageCharge, MemorySpecial};
+use crate::fs::procfs::{self, ProcessNode, ProcessRole};
 use crate::fs::readahead::{self, ReadaheadState};
 use crate::fs::types::{
     DirectoryCursor, DirectoryEntry, InodeKind, InodeTime, NAME_MAX, S_IALLUGO, S_IFDIR, S_IFLNK,
@@ -828,6 +829,8 @@ pub(crate) enum MemoryContent {
     Symlink(Vec<u8>),
     /// 字符设备、块设备、FIFO 或 Socket 等特殊节点描述。
     Special(MemorySpecial),
+    /// 绑定原始 PID 对象的只读进程目录或进程信息文件。
+    Process(ProcessNode),
 }
 
 /// 内存目录的权威子项表与游标状态。
@@ -3401,6 +3404,9 @@ impl DirectoryReadGuard<'_> {
 
     /// 在目录共享读锁保护下获取目录末尾的 `SEEK_END` 游标 `cookie`。
     pub(crate) fn end_cookie(&self) -> Result<u64, FsError> {
+        if self.inode.is_proc_root() {
+            return Ok(procfs::PROCESS_COOKIE_END);
+        }
         if self.inode.is_memory() {
             return Ok(self.inode.memory_directory()?.lock().next_cookie);
         }
@@ -4260,11 +4266,30 @@ impl Inode {
         }
     }
 
+    /// 返回节点绑定的进程身份与角色，其余后端没有进程绑定。
+    pub(crate) fn process_node(&self) -> Option<&ProcessNode> {
+        match &self.backend {
+            InodeBackend::Memory {
+                content: MemoryContent::Process(node),
+                ..
+            } => Some(node),
+            _ => None,
+        }
+    }
+
     /// 获取内存目录节点内部的目录项表自旋锁引用；非内存目录节点返回 `NotDirectory`。
     fn memory_directory(&self) -> Result<&SpinLock<MemoryDirectory>, FsError> {
         match &self.backend {
             InodeBackend::Memory {
                 content: MemoryContent::Directory(directory),
+                ..
+            } => Ok(directory),
+            InodeBackend::Memory {
+                content:
+                    MemoryContent::Process(ProcessNode {
+                        role: ProcessRole::Directory(directory),
+                        ..
+                    }),
                 ..
             } => Ok(directory),
             _ => Err(FsError::NotDirectory),
@@ -4273,6 +4298,30 @@ impl Inode {
 }
 
 impl InodeRef {
+    /// 核对动态进程节点绑定的身份仍存在，固定节点无需额外生命周期校验。
+    pub(crate) fn revalidate(&self) -> bool {
+        match self.process_node() {
+            Some(node) => self
+                .memory_fs()
+                .ok()
+                .and_then(|fs| fs.process_graph())
+                .is_some_and(|graph| graph.process_exists(&node.pid)),
+            None => true,
+        }
+    }
+
+    /// 判断当前节点是否为进程文件系统根，只有该目录动态解释数字名称。
+    pub(crate) fn is_proc_root(&self) -> bool {
+        self.number() == 1
+            && matches!(&self.1,
+            InodeOwner::Memory(fs) if fs.kind() == MemoryFsKind::Procfs)
+    }
+
+    /// 进程根目录不缓存查无此名，以便随后发表的 PID 立即可被查找。
+    pub(crate) fn cache_negative(&self) -> bool {
+        !self.is_proc_root()
+    }
+
     /// 将内存目录树内部持有的 `Arc<Inode>` 包装为同时保活所属 `MemoryFs` 的外部 `InodeRef` 句柄。
     pub(crate) fn from_memory(inode: Arc<Inode>, fs: Arc<MemoryFs>) -> Self {
         match &inode.backend {
@@ -4317,7 +4366,7 @@ impl InodeRef {
     }
 
     /// 获取内存节点句柄强引用的 `MemoryFs` 实例；若当前为磁盘节点则返回 `InvalidOperation`。
-    fn memory_fs(&self) -> Result<&Arc<MemoryFs>, FsError> {
+    pub(crate) fn memory_fs(&self) -> Result<&Arc<MemoryFs>, FsError> {
         match &self.1 {
             InodeOwner::Memory(fs) => Ok(fs),
             _ => Err(FsError::InvalidOperation),
@@ -4432,6 +4481,9 @@ impl InodeRef {
         if name == b"." {
             return Ok(Some(self.clone()));
         }
+        if name != b".." && !self.revalidate() {
+            return Err(FsError::NotFound);
+        }
         let (parent, child) = {
             let directory = self.memory_directory()?.lock();
             (
@@ -4446,7 +4498,13 @@ impl InodeRef {
         if name == b".." {
             return fs.find(parent).map(Some);
         }
-        Ok(child.map(|child| Self::from_memory(child, fs.clone())))
+        if let Some(child) = child {
+            return Ok(Some(Self::from_memory(child, fs.clone())));
+        }
+        if self.is_proc_root() {
+            return procfs::lookup_process(fs, name);
+        }
+        Ok(None)
     }
 
     /// 在内存文件系统初始化阶段（如挂载创建设备节点时）将子节点直接插入父目录，跳过常规只读挂载权限检查。
@@ -4885,6 +4943,9 @@ impl DirectoryWriteGuard<'_> {
 impl InodeRef {
     /// 按内存目录游标 `cookie` 读取下一个目录项：`0` 返回 `.`，`1` 返回 `..`，`>= 2` 返回 `cookie` 大于等于当前值的最小单调子项。
     fn memory_dir_next(&self, cursor: &DirectoryCursor) -> Result<Option<DirectoryEntry>, FsError> {
+        if !self.revalidate() {
+            return Err(FsError::NotFound);
+        }
         let DirectoryCursor::Memory(cookie) = *cursor else {
             return Err(FsError::InvalidOperation);
         };
@@ -4914,7 +4975,11 @@ impl InodeRef {
                         })
                 };
                 let Some((number, name, kind, next_cookie)) = entry else {
-                    return Ok(None);
+                    return if self.is_proc_root() {
+                        procfs::next_process(self.memory_fs()?, cookie)
+                    } else {
+                        Ok(None)
+                    };
                 };
                 (number, try_bytes(name.as_slice())?, kind, next_cookie)
             }

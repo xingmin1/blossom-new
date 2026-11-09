@@ -847,7 +847,6 @@ impl Mm {
     }
 
     /// 返回参数字符串区间；直接创建而未装载程序的地址空间返回空区间。
-    #[expect(dead_code, reason = "参数区间是进程命令行查询接口的数据")]
     pub(crate) fn arguments(&self) -> Range<usize> {
         self.arguments.clone()
     }

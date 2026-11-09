@@ -43,7 +43,7 @@ const NULL_RDEV: u64 = (1 << u8::BITS) | 3;
 /// `/dev/zero` 字符设备号：主设备号 1，次设备号 5。
 const ZERO_RDEV: u64 = (1 << u8::BITS) | 5;
 /// `/dev/ttyS0` 串口终端设备号：主设备号 4，次设备号 64。
-const SERIAL_RDEV: u64 = (4 << u8::BITS) | 64;
+pub(crate) const SERIAL_RDEV: u64 = (4 << u8::BITS) | 64;
 /// `/dev/console` 系统控制台设备号：主设备号 5，次设备号 1。
 const CONSOLE_RDEV: u64 = (5 << u8::BITS) | 1;
 /// `/dev/tty` 当前进程控制终端设备号：主设备号 5，次设备号 0。

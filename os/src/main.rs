@@ -60,6 +60,8 @@
 #![feature(allocator_api)]
 #![feature(naked_functions)]
 #![deny(unsafe_op_in_unsafe_fn)]
+// 文件对象经 MemoryFs 弱引用任务图后，Send/Sync 类型嵌套超过默认 128 层；仅提高编译期求解深度。
+#![recursion_limit = "256"]
 #![cfg_attr(feature = "ktest", feature(panic_can_unwind))]
 
 extern crate alloc;

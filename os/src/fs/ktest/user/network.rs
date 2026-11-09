@@ -199,7 +199,10 @@ impl UserOwner {
                 .vfs()
                 .resolve(self.path.context(), b"/plain", ResolveMode::Follow),
         )?;
-        let procfs = checked(context, crate::fs::procfs::try_new(0o755))?;
+        let procfs = checked(
+            context,
+            crate::fs::procfs::try_new(0o755, alloc::sync::Weak::new()),
+        )?;
         checked(
             context,
             self.path.vfs().mount(

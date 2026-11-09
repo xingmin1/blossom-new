@@ -708,10 +708,6 @@ pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Wak
 }
 
 /// 在全局调度锁保护下读取目标任务当前的调度状态，不改变其运行或等待关系。
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "任务状态观测属于生产调度接口")
-)]
 pub(crate) fn state(task: &Task) -> State {
     let _scheduler = SCHED_LOCK.lock();
     // SAFETY:

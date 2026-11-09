@@ -142,6 +142,11 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
+    /// 返回串口终端节点使用的设备号，与设备目录中的 rdev 取同一常量。
+    pub(crate) fn device_number(&self) -> u64 {
+        crate::fs::devfs::SERIAL_RDEV
+    }
+
     /// 返回控制终端绑定关系的自旋锁引用（由 `TaskGraph` 按 `relations -> control` 锁序访问）。
     pub(crate) fn control(&self) -> &SpinLock<Option<TerminalControl>> {
         &self.control

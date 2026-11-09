@@ -205,7 +205,6 @@ impl TaskComm {
     }
 
     /// 借用首个 NUL 之前的原始进程名字节，不要求有效 UTF-8。
-    #[expect(dead_code, reason = "进程名原始字节是进程查询接口的数据")]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         let length = self.bytes.iter().position(|byte| *byte == 0).unwrap();
         &self.bytes[..length]
@@ -274,15 +273,31 @@ impl ThreadGroup {
     }
 
     /// 返回进程身份创建时记录的单调纳秒时间。
-    #[expect(dead_code, reason = "进程创建时间是进程查询接口的数据")]
     pub(crate) fn started_ns(&self) -> u64 {
         self.started_ns
     }
 
     /// 读取本进程终止时通知父进程的信号编号。
-    #[expect(dead_code, reason = "退出通知信号是进程查询接口的数据")]
     pub(crate) fn exit_signal(&self) -> u8 {
         self.relations.lock().exit_signal
+    }
+
+    /// 在关系锁与终端控制锁内读取设备号及前台进程组；未绑定时返回零和负一。
+    pub(crate) fn terminal_status(&self) -> (u64, i32) {
+        let relations = self.relations.lock();
+        let Some(tty) = relations.controlling_tty else {
+            return (0, -1);
+        };
+        let control = tty.control().lock();
+        match control.as_ref() {
+            Some(control)
+                if Weak::ptr_eq(&control.graph, &self.graph)
+                    && Arc::ptr_eq(&control.session, &relations.sid) =>
+            {
+                (tty.device_number(), control.foreground.number() as i32)
+            }
+            _ => (0, -1),
+        }
     }
 
     /// 返回线程组的数字标识符 `TGID`（即用户态 `getpid()` 返回的进程号）。
@@ -443,6 +458,18 @@ impl PreparedExecution {
     pub(crate) fn try_new(join: JoinObserver) -> Result<Box<Self>, ProcessError> {
         Box::try_new(Self { join, next: None }).map_err(|_| ProcessError::NoMemory)
     }
+}
+
+/// 一次任务图查询得到的进程身份与组首线程副本，后续采样不再持有槽位锁。
+pub(crate) struct ProcessStatus {
+    /// 存活或尚未回收的线程组，保持原进程身份。
+    pub(crate) group: Arc<ThreadGroup>,
+    /// 与 getppid 相同规则得到的父进程 TGID。
+    pub(crate) parent: usize,
+    /// 尚未退出的组成员数量。
+    pub(crate) members: usize,
+    /// 当前 TGID 槽位中的组首线程，已退出时为空。
+    pub(crate) leader: Option<Arc<UserThread>>,
 }
 
 /// 槽位中记录单个存活线程的运行时表项（线程调用 `exit` 时即从槽位摘除）。
@@ -1096,10 +1123,59 @@ impl TaskGraph {
             .get(identity.tgid() - 1)
             .and_then(|slot| slot.process.as_ref())
             .filter(|process| Arc::ptr_eq(&process.group, &identity.group))
-            .and_then(|process| process.parent)
-            .and_then(|pid| slots[pid - 1].process.as_ref())
-            .filter(|parent| parent.members != 0)
-            .map_or(0, |parent| parent.group.tgid())
+            .map_or(0, |process| parent_tgid(&slots, process))
+    }
+
+    /// 按 TGID 查找存在的进程身份，尚未回收的僵尸也保持可见。
+    pub(crate) fn process_pid(&self, tgid: usize) -> Option<Arc<Pid>> {
+        let index = tgid.checked_sub(1)?;
+        let slots = self.slots.lock();
+        slots
+            .get(index)?
+            .process
+            .as_ref()
+            .map(|process| process.group.pid.clone())
+    }
+
+    /// 返回不小于 start 的最小现存 TGID 身份，遍历过程中不分配内存。
+    pub(crate) fn next_process(&self, start: usize) -> Option<Arc<Pid>> {
+        let slots = self.slots.lock();
+        let pid = slots.iter().skip(start.saturating_sub(1)).find_map(|slot| {
+            slot.process
+                .as_ref()
+                .map(|process| process.group.pid.clone())
+        });
+        pid
+    }
+
+    /// 核对槽位中的进程仍属于同一 PID 对象，号码复用不会使旧身份重新有效。
+    pub(crate) fn process_exists(&self, pid: &Arc<Pid>) -> bool {
+        process_entry(&self.slots.lock(), pid).is_some()
+    }
+
+    /// 在一次槽位锁内只复制标量、强引用和弱引用，释放锁后再取得组首线程。
+    pub(crate) fn process_status(&self, pid: &Arc<Pid>) -> Option<ProcessStatus> {
+        let (group, parent, members, leader) = {
+            let slots = self.slots.lock();
+            let process = process_entry(&slots, pid)?;
+            let leader = slots[pid.number - 1]
+                .thread
+                .as_ref()
+                .filter(|thread| Arc::ptr_eq(&thread.group, &process.group))
+                .map(|thread| thread.user.clone());
+            (
+                process.group.clone(),
+                parent_tgid(&slots, process),
+                process.members,
+                leader,
+            )
+        };
+        Some(ProcessStatus {
+            group,
+            parent,
+            members,
+            leader: leader.and_then(|leader| leader.upgrade()),
+        })
     }
 
     /// 查询目标进程（`pid == 0` 表示调用者自身）当前所属的进程组编号 `PGID`（对应 `getpgid`）。
@@ -2509,4 +2585,22 @@ fn notify_unlinked_children_locked(
             notify_new_orphan_locked(slots, &pgid, false);
         }
     }
+}
+
+/// 在槽位锁内按 PID 对象身份定位进程，保留尚未回收的退出记录。
+fn process_entry<'a>(slots: &'a Numbers, pid: &Arc<Pid>) -> Option<&'a ProcessEntry> {
+    slots
+        .get(pid.number.checked_sub(1)?)?
+        .process
+        .as_ref()
+        .filter(|process| Arc::ptr_eq(&process.group.pid, pid))
+}
+
+/// 在槽位锁内按 getppid 的规则取得仍有存活成员的直属父进程编号。
+fn parent_tgid(slots: &Numbers, process: &ProcessEntry) -> usize {
+    process
+        .parent
+        .and_then(|pid| slots[pid - 1].process.as_ref())
+        .filter(|parent| parent.members != 0)
+        .map_or(0, |parent| parent.group.tgid())
 }

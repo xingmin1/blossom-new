@@ -239,7 +239,7 @@ pub(crate) mod filesystems {
         mkdir(context, fixture, b"/plain/dev")?;
         mkdir(context, fixture, b"/plain/proc")?;
         let dev = checked(context, devfs::try_new(0o755))?;
-        let proc = checked(context, procfs::try_new(0o555))?;
+        let proc = checked(context, procfs::try_new(0o555, alloc::sync::Weak::new()))?;
         let dev_cover = resolve(context, fixture, b"/plain/dev")?;
         let proc_cover = resolve(context, fixture, b"/plain/proc")?;
         checked(
@@ -441,7 +441,10 @@ pub(crate) mod filesystems {
             context,
             fixture.vfs().mount(
                 &cover,
-                Filesystem::Memory(checked(context, procfs::try_new(0o555))?),
+                Filesystem::Memory(checked(
+                    context,
+                    procfs::try_new(0o555, alloc::sync::Weak::new()),
+                )?),
                 AccessMode::ReadOnly,
             ),
         )?;
@@ -576,7 +579,10 @@ pub(crate) mod filesystems {
             context,
             fixture.vfs().mount(
                 &cover,
-                Filesystem::Memory(checked(context, procfs::try_new(0o555))?),
+                Filesystem::Memory(checked(
+                    context,
+                    procfs::try_new(0o555, alloc::sync::Weak::new()),
+                )?),
                 AccessMode::ReadOnly,
             ),
         )?;
@@ -708,7 +714,10 @@ pub(crate) mod filesystems {
             context,
             fixture.vfs().mount(
                 &proc_cover,
-                Filesystem::Memory(checked(context, procfs::try_new(0o555))?),
+                Filesystem::Memory(checked(
+                    context,
+                    procfs::try_new(0o555, alloc::sync::Weak::new()),
+                )?),
                 AccessMode::ReadOnly,
             ),
         )?;

@@ -56,6 +56,8 @@
 //!   随后立即释放锁；绝不在持有 `runtime.fs` 锁期间执行路径解析、块设备 I/O 或用户空间内存拷贝。
 //! - `copyout` 和 `read_c_string` 可能触发用户页缺页异常并睡眠，调用时不得持有任何自旋锁。
 
+use alloc::sync::Arc;
+
 use crate::block::partition::DeviceSelector;
 use crate::block::AccessMode;
 use crate::fs::memfs::{FilesystemStat, MemoryFs};
@@ -329,7 +331,8 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
                 return Err(Errno::InvalidArgument);
             }
             let filesystem = if kind.as_deref() == Some(b"proc".as_slice()) {
-                procfs::try_new(0o555)?
+                let identity = user.identity().expect("proc mount has no identity");
+                procfs::try_new(0o555, Arc::downgrade(identity.graph()))?
             } else {
                 devfs::try_new(0o755)?
             };

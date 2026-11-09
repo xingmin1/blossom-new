@@ -53,6 +53,7 @@ use crate::fs::types::{InodeKind, S_IALLUGO, S_IFCHR, S_IFDIR, S_IFREG, S_IRWXUG
 use crate::fs::FsError;
 use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
+use crate::task::process::TaskGraph;
 
 mod options;
 pub use options::TmpfsOptions;
@@ -237,6 +238,8 @@ pub struct MemoryFs {
     allocation: SleepMutex<()>,
     /// 保护 Inode 弱引用槽位表、配额账本及名字缓存弱引用的内层自旋锁。
     index: SpinLock<MemoryIndex>,
+    /// procfs 绑定的任务图弱引用，不延长进程命名空间的生命周期。
+    graph: Weak<TaskGraph>,
 }
 
 /// `MemoryFs` 内部受自旋锁保护的索引与配额状态。
@@ -298,7 +301,17 @@ impl MemoryFs {
         } else {
             (0, 0)
         };
-        Self::try_with_limits(kind, root_mode, limits)
+        Self::try_with_limits(kind, root_mode, limits, Weak::new())
+    }
+
+    /// 构造绑定任务图的只读进程文件系统，其余内存文件系统构造保持无图语义。
+    pub(crate) fn try_procfs(root_mode: u16, graph: Weak<TaskGraph>) -> Result<Arc<Self>, FsError> {
+        Self::try_with_limits(MemoryFsKind::Procfs, root_mode, (0, 0), graph)
+    }
+
+    /// 尝试取得该 procfs 实例的任务图，图已退休时命名空间不再包含进程。
+    pub(crate) fn process_graph(&self) -> Option<Arc<TaskGraph>> {
+        self.graph.upgrade()
     }
 
     /// 解析 `tmpfs` 挂载选项字节串并创建对应的 `tmpfs` 文件系统实例。
@@ -311,6 +324,7 @@ impl MemoryFs {
             MemoryFsKind::Tmpfs,
             options.mode.unwrap_or(S_ISVTX | S_IRWXUGO),
             options.limits(pages),
+            Weak::new(),
         )
     }
 
@@ -319,6 +333,7 @@ impl MemoryFs {
         kind: MemoryFsKind,
         root_mode: u16,
         (max_pages, max_inodes): (usize, usize),
+        graph: Weak<TaskGraph>,
     ) -> Result<Arc<Self>, FsError> {
         let device = NEXT_DEVICE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -328,6 +343,7 @@ impl MemoryFs {
         let fs = Arc::try_new(Self {
             kind,
             device,
+            graph,
             root: Once::new(),
             rename: SleepMutex::new(()),
             allocation: SleepMutex::new(()),
