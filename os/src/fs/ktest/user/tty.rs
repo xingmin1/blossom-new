@@ -349,7 +349,7 @@ impl UserOwner {
         let blocked = !matches!(waiting, TtyWait::GateOnly);
         if blocked {
             until("TTY root did not enter production waiting", || {
-                sched::test_state(executor) == State::Blocked
+                sched::state(executor) == State::Blocked
             })?;
         }
         if matches!(waiting, TtyWait::OutputFull) {

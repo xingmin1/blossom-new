@@ -81,7 +81,7 @@ impl Fixture for EpollSuite {
         until("epoll timer services did not block", || {
             (0..cpu::count()).all(|id| {
                 crate::timer::testing::service_task(id)
-                    .is_some_and(|task| sched::test_state(&task) == State::Blocked)
+                    .is_some_and(|task| sched::state(&task) == State::Blocked)
             })
         })?;
         Ok(Self {
@@ -194,7 +194,7 @@ impl EpollOwner {
             .lock()
             .as_ref()
             .and_then(Weak::upgrade);
-        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 逐个等待所有已派生的子任务退出并断言返回值为 0，随后清空全部任务弱引用观察槽。

@@ -77,7 +77,7 @@ impl Fixture for PipeSuite {
         until("pipe timer services did not block", || {
             (0..cpu::count()).all(|id| {
                 crate::timer::testing::service_task(id)
-                    .is_some_and(|task| sched::test_state(&task) == State::Blocked)
+                    .is_some_and(|task| sched::state(&task) == State::Blocked)
             })
         })?;
         Ok(Self {
@@ -165,7 +165,7 @@ impl PipeOwner {
             .lock()
             .as_ref()
             .and_then(Weak::upgrade);
-        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 等待所有已启动的后台线程执行完毕并断言其返回值为 `0`，随后清空全部任务观察槽。

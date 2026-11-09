@@ -30,7 +30,7 @@
 //!
 //! # 锁获取顺序与并发契约
 //! - 测试状态中的自旋锁（`Scenario::account_task`、`KickSlot::task`）仅用于发布或克隆 `Arc<Task>` 句柄，
-//!   严禁在持有这些自旋锁的临界区内调用 `sched::test_state`、`Completion::complete` 或任何可能阻塞的操作。
+//!   严禁在持有这些自旋锁的临界区内调用 `sched::state`、`Completion::complete` 或任何可能阻塞的操作。
 //! - 调用 `rearm_current_quantum` 或 `arm_snapshot_overlap` 时，必须在当前 CPU 关中断（`IrqSaveGuard`）保护下执行。
 
 use super::wait;
@@ -99,7 +99,7 @@ impl KickSlot {
         let task = self.task.lock().as_ref().map(Arc::clone);
         if task
             .as_ref()
-            .is_some_and(|task| sched::test_state(task) != State::Exited)
+            .is_some_and(|task| sched::state(task) != State::Exited)
         {
             self.wake.complete();
         }
@@ -545,7 +545,7 @@ fn remote_idle(target: usize, after: usize, end: u64) {
         || {
             let published = slot.task.lock().is_some();
             published
-                && sched::test_state(&slot.task()) == State::Blocked
+                && sched::state(&slot.task()) == State::Blocked
                 && cpu::get(target).idle.load(Ordering::Acquire)
                 && after < cpu::test_idle_waits(target)
         },
@@ -725,7 +725,7 @@ fn test_accounting() {
     until(
         || {
             scenario().account_phase.load(Ordering::Acquire) == 1
-                && sched::test_state(&account_task()) == State::Blocked
+                && sched::state(&account_task()) == State::Blocked
         },
         "account-task-parked",
     );
@@ -928,7 +928,7 @@ impl Scenario {
         let account = self.account_task.lock().as_ref().map(Arc::clone);
         if account
             .as_ref()
-            .is_some_and(|task| sched::test_state(task) != State::Exited)
+            .is_some_and(|task| sched::state(task) != State::Exited)
         {
             self.account_wake.complete();
         }
@@ -1216,7 +1216,7 @@ pub(crate) mod cases {
             until(
                 || {
                     let observed = slot.task.lock().as_ref().map(Arc::clone);
-                    observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+                    observed.is_some_and(|task| sched::state(&task) == State::Blocked)
                 },
                 "idle stop worker prepared",
             );

@@ -267,7 +267,7 @@ impl ::ktest::Fixture for TtySuite {
         until("tty timer services did not block", || {
             (0..cpu::count()).all(|id| {
                 crate::timer::testing::service_task(id)
-                    .is_some_and(|task| sched::test_state(&task) == crate::task::State::Blocked)
+                    .is_some_and(|task| sched::state(&task) == crate::task::State::Blocked)
             })
         })?;
         let mut serial = SerialTtyOwner::attach()?;
@@ -360,7 +360,7 @@ impl TtyOwner {
         self.observer
             .as_ref()
             .and_then(|observer| observer.lock().as_ref().and_then(Weak::upgrade))
-            .is_some_and(|task| sched::test_state(&task) == State::Blocked)
+            .is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 为本用例创建独立的内存 `devfs` 实例、Inode 缓存与 `Vfs` 根视图，并保存在夹具中。

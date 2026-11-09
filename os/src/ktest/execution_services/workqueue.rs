@@ -50,7 +50,7 @@
 //! # 锁获取顺序（Lock Ordering）与并发契约
 //! - 测试夹具内部自旋锁（`Scenario::probes`、`Scenario::owners`、`Scenario::pressure_counts`、
 //!   `Probe::works[i]`、`Probe::tasks[i]`）均为叶子级短临界区锁。
-//! - **严禁在持有上述测试自旋锁期间调用调度器接口（如 `sched::test_state`、`sched::yield_now`）
+//! - **严禁在持有上述测试自旋锁期间调用调度器接口（如 `sched::state`、`sched::yield_now`）
 //!   或工作队列同步接口（如 `flush`、`cancel_sync`、`close_sync`）**；读取任务状态前必须先克隆
 //!   `Arc<Task>` 并释放 `Probe::tasks[i]` 锁，防止与生产调度锁发生死锁。
 
@@ -213,7 +213,7 @@ impl Probe {
     /// 检查槽位 `index` 记录的内核任务当前是否处于调度器的 `Blocked`（睡眠阻塞）状态。
     fn blocked(&self, index: usize) -> bool {
         let observed = self.tasks[index].lock().as_ref().map(Arc::clone);
-        observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        observed.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 清空所有槽位中保存的 `Work` 与 `Task` 强引用，在自旋锁临界区外释放引用计数。
@@ -766,13 +766,13 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
                 }
                 until(
                     || {
-                        sched::test_state(&original) == State::Exited
+                        sched::state(&original) == State::Exited
                             && testing::pool_stats(0).retired == before.retired + 1
                             && testing::pool_stats(0).workers == before.workers
                     },
                     "cancelled last association retired and manager joined without later work",
                 );
-                assert_eq!(sched::test_state(&original), State::Exited);
+                assert_eq!(sched::state(&original), State::Exited);
                 assert_eq!(testing::pool_stats(0).workers, before.workers);
                 assert_eq!(probe.counts[1].load(Ordering::Acquire), 1);
                 assert_eq!(probe.counts[3].load(Ordering::Acquire), 0);
@@ -1525,7 +1525,7 @@ fn paused_delayed_stop(
     assert_eq!(handle.join().unwrap(), 22);
     assert!(probe.done.load(Ordering::Acquire));
     let task = probe.tasks[7].lock().take().unwrap();
-    assert_eq!(sched::test_state(&task), State::Exited);
+    assert_eq!(sched::state(&task), State::Exited);
     assert_eq!(Arc::strong_count(&task), 1);
     drop(task);
     assert_eq!((sync_wait, inflight), (1, 1));

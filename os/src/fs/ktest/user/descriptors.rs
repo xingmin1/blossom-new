@@ -131,7 +131,7 @@ pub(crate) mod descriptor_growth {
         })?;
         context.expect_eq(ready, *b"R");
         until("descriptor poll did not block", || {
-            sched::test_state(&executor) == State::Blocked
+            sched::state(&executor) == State::Blocked
         })?;
 
         // Step 5: 并发关闭 fd=3 并立即分配新管道复用 fd=3，验证原 OFD 仍由 poll 持有且可被原写端唤醒。

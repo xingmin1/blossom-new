@@ -210,7 +210,7 @@ impl UserOwner {
                 if ready_reader.read(&mut byte) != Ok(1) || byte[0] != b'R' {
                     return 1;
                 }
-                while sched::test_state(&coordination_task) != State::Blocked {
+                while sched::state(&coordination_task) != State::Blocked {
                     if coordination_user.mm().is_none() {
                         return 1;
                     }

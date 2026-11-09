@@ -20,7 +20,7 @@
 //! ```
 //!
 //! # 锁与并发契约
-//! - 内核测试线程通过 `until` 轮询用户地址空间控制字与 `sched::test_state(&executor) == State::Blocked`；
+//! - 内核测试线程通过 `until` 轮询用户地址空间控制字与 `sched::state(&executor) == State::Blocked`；
 //! - 必须在调用 `self.wait(context)` 回收进程前显式释放 `executor` 与 `user` 强引用，并在调用 `reap_children` 前释放 `mm` 引用，确保进程退出后任务控制块与地址空间引用计数归零。
 
 use super::*;
@@ -91,7 +91,7 @@ impl UserOwner {
         for phase in 1..=3 {
             until("event root did not block in the requested syscall", || {
                 mm.load_user_u32(FUTEX_CONTROL) == Ok(phase)
-                    && sched::test_state(&executor) == State::Blocked
+                    && sched::state(&executor) == State::Blocked
             })?;
             context.expect_eq(mm.load_user_u32(FUTEX_CONTROL + 4), Ok(0));
             mm.store_user_u32(FUTEX_CONTROL + 4, 1)

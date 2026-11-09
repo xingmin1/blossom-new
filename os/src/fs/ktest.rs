@@ -564,7 +564,7 @@ impl Observation {
             return false;
         }
         let task = self.tasks.lock()[index].clone();
-        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 }
 

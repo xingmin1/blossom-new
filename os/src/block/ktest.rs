@@ -36,7 +36,7 @@
 //!
 //! # 锁获取顺序与并发契约
 //! - 全局回调定位锁 [`CALLBACK_OWNER`]、观察器内部锁（`Observation::callback`、`stop_task`、`stop_result`）与磁盘队列锁（`disk.queue`）均为独立叶级自旋锁，禁止相互嵌套持有。
-//! - 查询任务调度状态（`sched::test_state`）必须在释放 `Observation` 自旋锁之后进行，仅持有克隆出的 `Arc<Task>`。
+//! - 查询任务调度状态（`sched::state`）必须在释放 `Observation` 自旋锁之后进行，仅持有克隆出的 `Arc<Task>`。
 
 use ::ktest::{self, Fixture, TestContext, TestError, TestResult};
 use alloc::sync::Arc;
@@ -105,13 +105,13 @@ impl Observation {
     /// 检查执行 `Disk::stop()` 的独立内核线程当前是否已在调度器中进入 `State::Blocked` 阻塞态。
     fn stop_blocked(&self) -> bool {
         let task = self.stop_task.lock().clone();
-        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 检查执行 `held_callback` 的工作队列任务当前是否已在调度器中进入 `State::Blocked` 阻塞态。
     fn callback_blocked(&self) -> bool {
         let task = self.callback.lock().as_ref().map(|entry| entry.0.clone());
-        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 }
 

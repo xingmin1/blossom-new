@@ -1060,7 +1060,7 @@ pub(crate) mod native {
                     && task_slot
                         .lock()
                         .as_ref()
-                        .is_some_and(|task| sched::test_state(task) == task::State::Blocked)
+                        .is_some_and(|task| sched::state(task) == task::State::Blocked)
             },
             "native stop Task did not block on Work tail",
         )?;

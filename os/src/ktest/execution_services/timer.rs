@@ -29,7 +29,7 @@
 //!
 //! # 锁获取顺序与并发契约
 //! - 测试状态中的自旋锁（`Scenario::sleep_task`、`sleep_waker`、`cancel_task`）仅用于存取 `Arc<Task>` 或 `Waker` 克隆，
-//!   必须在释放测试自旋锁之后再调用 `sched::test_state`、`waker.notify()` 或定时器接口，严禁与定时器底座锁（Base Lock）或调度器锁嵌套。
+//!   必须在释放这些自旋锁之后再调用 `sched::state`、`waker.notify()` 或定时器接口，严禁与定时器底座锁（Base Lock）或调度器锁嵌套。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -83,7 +83,7 @@ pub(super) fn wait_services_blocked() {
         wait_before(
             || {
                 testing::service_task(id)
-                    .is_some_and(|service| sched::test_state(&service) == State::Blocked)
+                    .is_some_and(|service| sched::state(&service) == State::Blocked)
             },
             end,
             true,
@@ -217,7 +217,7 @@ fn test_sleep() {
             || {
                 let observed = scenario().sleep_task.lock().as_ref().map(Arc::clone);
                 scenario().sleep_arms.load(Ordering::Acquire) == round
-                    && observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+                    && observed.is_some_and(|task| sched::state(&task) == State::Blocked)
             },
             end,
             true,
@@ -255,7 +255,7 @@ fn test_sleep() {
 
     // Step 3: 清理测试保存的任务与唤醒器句柄，确认子任务已彻底退出且无残留强引用。
     let old_task = scenario().sleep_task.lock().take().unwrap();
-    assert_eq!(sched::test_state(&old_task), State::Exited);
+    assert_eq!(sched::state(&old_task), State::Exited);
     assert_eq!(Arc::strong_count(&old_task), 1);
     let old_waker = scenario().sleep_waker.lock().take();
     drop((old_task, old_waker));
@@ -319,7 +319,7 @@ fn paused_stop(
     wait_before(
         || {
             let observed = scenario().cancel_task.lock().as_ref().map(Arc::clone);
-            observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+            observed.is_some_and(|task| sched::state(&task) == State::Blocked)
         },
         end,
         true,
@@ -355,7 +355,7 @@ fn paused_stop(
                 return false;
             }
             let observed = Arc::clone(scenario().cancel_task.lock().as_ref().unwrap());
-            sched::test_state(&observed) == State::Blocked
+            sched::state(&observed) == State::Blocked
         },
         end,
         true,
@@ -363,7 +363,7 @@ fn paused_stop(
     );
     let sync_wait = {
         let observed = Arc::clone(scenario().cancel_task.lock().as_ref().unwrap());
-        usize::from(sched::test_state(&observed) == State::Blocked)
+        usize::from(sched::state(&observed) == State::Blocked)
     };
     assert!(!scenario().cancel_done.load(Ordering::Acquire));
     assert!(testing::snapshot(timer.as_ref()).running);
@@ -392,7 +392,7 @@ fn paused_stop(
     let state = testing::snapshot(timer.as_ref());
     assert!(!state.running && !state.queued);
     let observed = scenario().cancel_task.lock().take().unwrap();
-    assert_eq!(sched::test_state(&observed), State::Exited);
+    assert_eq!(sched::state(&observed), State::Exited);
     assert_eq!(Arc::strong_count(&observed), 1);
     drop(observed);
     assert_eq!((inflight, sync_wait), (1, 1));
@@ -1052,7 +1052,7 @@ impl Scenario {
         let cancel = self.cancel_task.lock().as_ref().map(Arc::clone);
         if cancel
             .as_ref()
-            .is_some_and(|task| sched::test_state(task) != State::Exited)
+            .is_some_and(|task| sched::state(task) != State::Exited)
         {
             self.release_cancel();
         }

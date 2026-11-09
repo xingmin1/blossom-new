@@ -150,7 +150,7 @@ fn test_records() {
                 .producer
                 .lock()
                 .as_ref()
-                .is_some_and(|task| sched::test_state(task) == State::Blocked)
+                .is_some_and(|task| sched::state(task) == State::Blocked)
         },
         "producer prepared and blocked",
     );
@@ -875,7 +875,7 @@ impl Scenario {
         let producer = self.producer.lock().as_ref().map(Arc::clone);
         if producer
             .as_ref()
-            .is_some_and(|task| sched::test_state(task) != State::Exited)
+            .is_some_and(|task| sched::state(task) != State::Exited)
         {
             self.start.complete();
             self.exit.complete();

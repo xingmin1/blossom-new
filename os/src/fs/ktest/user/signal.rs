@@ -110,7 +110,7 @@ impl UserOwner {
             let progress = mm.copyin(&mut marker_bytes, marker);
             progress.error.is_none()
                 && u64::from_le_bytes(marker_bytes) == 0x51a2
-                && sched::test_state(&executor) == State::Blocked
+                && sched::state(&executor) == State::Blocked
         })?;
         self.graph()
             .send_kernel(pid, crate::task::signal::SIGALRM)
@@ -118,7 +118,7 @@ impl UserOwner {
                 context.diagnostic(format_args!("user-file-signal-send error={:?}", error));
                 TestError("user file signal request failed")
             })?;
-        context.expect_eq(sched::test_state(&executor), State::Blocked);
+        context.expect_eq(sched::state(&executor), State::Blocked);
         let signals = user
             .signals()
             .ok_or(TestError("file reader signals disappeared"))?;
@@ -384,7 +384,7 @@ impl UserOwner {
         until(
             "sigsuspend did not register its temporary mask and wait",
             || {
-                (signals.mask() == 0x800 && sched::test_state(&executor) == State::Blocked)
+                (signals.mask() == 0x800 && sched::state(&executor) == State::Blocked)
                     || child.mm().is_none()
             },
         )?;

@@ -21,7 +21,7 @@
 //! # 锁获取顺序与并发契约
 //! - 测试观察槽位 `Slot::task`、`Slot::waker` 与 `Control::old_waker` 各自使用独立的 `SpinLock` 保护。
 //! - 锁获取顺序：先获取测试观察 `SpinLock` 克隆出 `Arc<Task>` 或 `Waker`，**立即释放测试 `SpinLock` 后**，
-//!   再调用 `Waker::notify()`、`sched::test_state()` 或执行 `drop` 释放引用，严禁在持有测试自旋锁期间重入调度器锁或等待队列锁。
+//!   再调用 `Waker::notify()`、`sched::state()` 或执行 `drop` 释放引用，严禁在持有测试自旋锁期间重入调度器锁或等待队列锁。
 //! - 在 `registration_under_oom` 用例中，所有子线程栈与内存压力容器容量均在 `Waiting::set_up`（耗尽内存之前）预先分配，
 //!   且压力块直接存放在捕获边界外的夹具 `Waiting` 中，确保测试中途即使断言失败也能在 `tear_down` 中完整归还物理页与堆对象。
 
@@ -402,7 +402,7 @@ fn blocked(slot: &Slot, phase: usize) {
                     .task
                     .lock()
                     .as_ref()
-                    .is_some_and(|task| sched::test_state(task) == State::Blocked)
+                    .is_some_and(|task| sched::state(task) == State::Blocked)
         },
         "wait-worker-blocked",
     );
@@ -437,7 +437,7 @@ fn mixed_worker(state: Arc<Control>, token: ChildToken, index: usize) -> Result<
         }
         slot.switches.fetch_add(1, Ordering::Relaxed);
         assert_eq!(
-            sched::test_state(&slot.task()),
+            sched::state(&slot.task()),
             State::Running(cpu::current().id)
         );
         assert_eq!(sched::test_ready_occurrences(&slot.task()), 0);
@@ -500,7 +500,7 @@ fn park_window(state: &Control, token: &ChildToken, slot: &Slot, waiter: &Waiter
         waiter.park();
     }
     assert_eq!(
-        sched::test_state(&slot.task()),
+        sched::state(&slot.task()),
         State::Running(cpu::current().id)
     );
     drop(registration);
@@ -777,7 +777,7 @@ pub(crate) mod queue {
         assert!(!waker.notify());
         waiter.park();
         assert_eq!(
-            sched::test_state(&task::current_task()),
+            sched::state(&task::current_task()),
             State::Running(cpu::current().id)
         );
         drop(registration);
@@ -822,7 +822,7 @@ pub(crate) mod queue {
                                 .task
                                 .lock()
                                 .as_ref()
-                                .is_some_and(|task| sched::test_state(task) == State::Ready)
+                                .is_some_and(|task| sched::state(task) == State::Ready)
                     },
                     "wait-worker-ready",
                 );
@@ -832,7 +832,7 @@ pub(crate) mod queue {
             }
             assert!(slot.notify());
             assert!(!slot.notify());
-            assert_eq!(sched::test_state(&slot.task()), State::Ready);
+            assert_eq!(sched::state(&slot.task()), State::Ready);
             assert_eq!(sched::test_ready_occurrences(&slot.task()), 1);
             assert_eq!(join(&worker)?, 1);
             assert_eq!(slot.phase.load(Ordering::Acquire), 2);
@@ -863,7 +863,7 @@ pub(crate) mod queue {
                 || {
                     state.stop.load(Ordering::Acquire)
                         || token.stop_requested()
-                        || sched::test_state(&state.slots[0].task()) == State::Blocked
+                        || sched::state(&state.slots[0].task()) == State::Blocked
                 },
                 "remote parent blocked",
             );
@@ -939,7 +939,7 @@ pub(crate) mod queue {
         let old = fixture.state.old_waker.lock().as_ref().unwrap().clone();
         assert!(!old.notify());
         assert_eq!(slot.phase.load(Ordering::Acquire), 1);
-        assert_eq!(sched::test_state(&slot.task()), State::Blocked);
+        assert_eq!(sched::state(&slot.task()), State::Blocked);
         assert_eq!(sched::test_ready_occurrences(&slot.task()), 0);
         assert!(slot.notify());
         assert_eq!(join(&fixture.handles[index])?, 2);
@@ -976,12 +976,12 @@ pub(crate) mod queue {
         // Step 3: 在零可用内存状态下唤醒子线程争用 `SleepMutex` 阻塞，随后释放锁验证子线程成功获锁更新载荷并再次阻塞于 `finish_oom`。
         state.start_oom.complete();
         blocked(&state.slots[0], 2);
-        assert_eq!(sched::test_state(&state.slots[0].task()), State::Blocked);
+        assert_eq!(sched::state(&state.slots[0].task()), State::Blocked);
         drop(guard);
         until(
             || {
                 state.oom_progress.load(Ordering::Acquire) == 1
-                    && sched::test_state(&state.slots[0].task()) == State::Blocked
+                    && sched::state(&state.slots[0].task()) == State::Blocked
             },
             "OOM-worker-progress",
         );
@@ -1137,7 +1137,7 @@ pub(crate) mod mutex {
             let worker = spawn_result_on(0, move |token| token_worker(source, token, 0))?;
             blocked(&state.slots[0], 1);
             state.tokens.complete();
-            assert_eq!(sched::test_state(&state.slots[0].task()), State::Ready);
+            assert_eq!(sched::state(&state.slots[0].task()), State::Ready);
             assert!(state.tokens.try_wait());
             blocked(&state.slots[0], 1);
             assert_eq!(state.consumed.load(Ordering::Acquire), 0);

@@ -21,7 +21,7 @@
 //! ```
 //!
 //! # 锁顺序与并发契约
-//! - 协调器轮询 `mm.load_user_u32` 与 `sched::test_state` 时分别短暂获取地址空间锁与任务状态锁，
+//! - 协调器轮询 `mm.load_user_u32` 与 `sched::state` 时分别短暂获取地址空间锁与任务状态锁，
 //!   两次调用相互独立，不存在跨锁嵌套。
 
 use super::*;
@@ -137,7 +137,7 @@ impl UserOwner {
         for phase in 1..=phases {
             until("pipe root did not block in the requested I/O", || {
                 mm.load_user_u32(FUTEX_CONTROL) == Ok(phase)
-                    && sched::test_state(&executor) == State::Blocked
+                    && sched::state(&executor) == State::Blocked
             })?;
             context.expect_eq(mm.load_user_u32(FUTEX_CONTROL + 4), Ok(0));
             mm.store_user_u32(FUTEX_CONTROL + 4, 1)

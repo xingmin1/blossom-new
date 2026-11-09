@@ -30,7 +30,7 @@
 //!
 //! # 锁获取顺序与并发契约
 //! - 全局定位锁 `ACTIVE`：仅在进入回调或清理夹具时短暂获取以克隆 `Arc<Observation>`，严禁持锁睡眠或嵌套获取其他锁。
-//! - 观测状态自旋锁（`Observation::tasks`、`peer_task`、`stop_tasks`、`stop_results`）：叶子自旋锁，仅保护各自槽位的读写，持锁期间不调用调度器查询接口（先克隆 `Arc<Task>` 释放锁后再查询 `sched::test_state`）。
+//! - 观测状态自旋锁（`Observation::tasks`、`peer_task`、`stop_tasks`、`stop_results`）：叶子自旋锁，仅保护各自槽位的读写，持锁期间不调用调度器查询接口（先克隆 `Arc<Task>` 释放锁后再查询 `sched::state`）。
 //! - 磁盘队列自旋锁 `Disk::queue`：用于读取队列阶段与槽位状态，严禁与 `Observation` 内部自旋锁交叉嵌套。
 
 use ::ktest::{self, Fixture, TestContext, TestError, TestResult};
@@ -110,7 +110,7 @@ impl Observation {
         (0..self.originals.len())
             .filter(|&ordinal| {
                 let observed = self.tasks.lock()[ordinal].clone();
-                observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+                observed.is_some_and(|task| sched::state(&task) == State::Blocked)
             })
             .count()
     }
@@ -118,7 +118,7 @@ impl Observation {
     /// 查询指定磁盘下标对应的 `Disk::stop` 任务是否已在调度器中处于 `State::Blocked` 阻塞状态。
     fn stop_blocked(&self, index: usize) -> bool {
         let task = self.stop_tasks.lock()[index].clone();
-        task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 }
 

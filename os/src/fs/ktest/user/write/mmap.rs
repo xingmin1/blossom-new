@@ -296,7 +296,7 @@ pub(super) mod cases {
             .executor()
             .ok_or(TestError("mkwrite preparer executor missing"))?;
         until("mkwrite preparer did not block at lock-free hook", || {
-            sched::test_state(&executor) == State::Blocked
+            sched::state(&executor) == State::Blocked
         })?;
         context.expect_eq(
             mm.mapping(SOURCE)

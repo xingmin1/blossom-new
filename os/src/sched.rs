@@ -687,7 +687,7 @@ pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Wak
     if let Some((task_ctx, scheduler_ctx)) = contexts {
         assert!(waker.notify(), "switching-out notification was rejected");
         assert!(matches!(
-            test_state(task),
+            state(task),
             State::SwitchingOut(_, SwitchIntent::Park(active)) if active == id
         ));
         assert_eq!(test_ready_occurrences(task), 0);
@@ -707,9 +707,12 @@ pub(crate) fn test_park_notify(task: &Task, id: WaitId, waker: &crate::wait::Wak
     }
 }
 
-/// 测试辅助函数：在全局调度锁保护下读取目标任务当前的 `State` 副本。
-#[cfg(feature = "ktest")]
-pub(crate) fn test_state(task: &Task) -> State {
+/// 在全局调度锁保护下读取目标任务当前的调度状态，不改变其运行或等待关系。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "任务状态观测属于生产调度接口")
+)]
+pub(crate) fn state(task: &Task) -> State {
     let _scheduler = SCHED_LOCK.lock();
     // SAFETY:
     // 已持有 `SCHED_LOCK`，且调用方持有 `&Task` 借用，按值读取 `state` 安全有效。

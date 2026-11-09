@@ -6,7 +6,7 @@
 //! 与用户态进程协同，验证 `futex` 系统调用在各种并发与生命周期场景下的内核语义。
 //! 上游由用户态测试入口（`fs::ktest::user`）按子模式（`w`/`p`/`n`/`a`/`t`/`s`/`d`/`r`）调度，
 //! 下游依赖虚拟内存空间（`Mm`）、任务与进程图（`TaskGraph` / `UserThread`）、
-//! 调度器状态观测（`sched::test_state`）以及 `futex` 哈希桶快照接口（`futex::test_snapshot`）。
+//! 调度器状态观测（`sched::state`）以及 `futex` 哈希桶快照接口（`futex::test_snapshot`）。
 //!
 //! # 核心协调机制与共享控制页布局
 //! 测试协调器与用户态测试程序通过映射在 `FUTEX_CONTROL` 的共享控制页交换检查点（Checkpoint）
@@ -74,7 +74,7 @@ impl UserOwner {
     /// 随后返回该 `futex` 桶的快照（包含首个等待者的 `WaitId` 与超时截止时间 `deadline`）。
     ///
     /// 共享内存中的阶段提示字只能在 `futex_wait` 系统调用发起前更新，不能直接证明线程已进入睡眠；
-    /// 必须同时观测到 `snapshot.count == 1` 与 `sched::test_state(&executor) == State::Blocked`，
+    /// 必须同时观测到 `snapshot.count == 1` 与 `sched::state(&executor) == State::Blocked`，
     /// 才能消除用户态刚写完标志但尚未真正进入内核阻塞队列的竞态窗口。
     pub(super) fn futex_waiting(
         mm: &Arc<Mm>,
@@ -89,7 +89,7 @@ impl UserOwner {
         let mut observed = None;
         until("futex user did not register and block", || {
             if let Ok(snapshot) = futex::test_snapshot(mm, address, private, mask) {
-                if snapshot.count == 1 && sched::test_state(&executor) == State::Blocked {
+                if snapshot.count == 1 && sched::state(&executor) == State::Blocked {
                     observed = Some(snapshot);
                     return true;
                 }

@@ -98,7 +98,7 @@ impl UserOwner {
             let progress = mm.copyin(&mut marker_bytes, marker);
             progress.error.is_none()
                 && u64::from_le_bytes(marker_bytes) == 0x51a2
-                && sched::test_state(&executor) == State::Blocked
+                && sched::state(&executor) == State::Blocked
                 && disk.test_snapshot().inflight != 0
                 && block::tests::used_index(&disk, legacy) != first_used
         })?;
@@ -107,7 +107,7 @@ impl UserOwner {
         context.expect_eq(before.submitted < disk.test_snapshot().submitted, true);
         context.expect_eq(mm.user_count(), 1);
         self.graph().request_root_exit(9);
-        context.expect_eq(sched::test_state(&executor), State::Blocked);
+        context.expect_eq(sched::state(&executor), State::Blocked);
         context.expect_eq(mm.user_count(), 1);
         context.expect_eq(disk.test_snapshot().inflight, inflight);
 
@@ -278,7 +278,7 @@ impl UserOwner {
                 if mode == b"n" {
                     context.expect_eq(Arc::ptr_eq(&winner, &child), true);
                     context.expect_eq(executor.id(), child_task.id());
-                    context.expect_eq(sched::test_state(&root_task), State::Exited);
+                    context.expect_eq(sched::state(&root_task), State::Exited);
                 }
                 self.running.as_mut().unwrap().expected_task = Some(executor.id());
                 context.diagnostic(format_args!(
@@ -368,9 +368,9 @@ impl UserOwner {
             let child = self.futex_child(&old_mm, 0)?;
             let executor = root.executor().ok_or(TestError("vfork父执行者已解除"))?;
             until("vfork父未在完成关系上阻塞", || {
-                sched::test_state(&executor) == State::Blocked || root.mm().is_none()
+                sched::state(&executor) == State::Blocked || root.mm().is_none()
             })?;
-            context.expect_eq(sched::test_state(&executor), State::Blocked);
+            context.expect_eq(sched::state(&executor), State::Blocked);
             context.expect_eq(old_mm.user_count(), 2);
 
             if mode == b"k" {
@@ -381,7 +381,7 @@ impl UserOwner {
                     .map_err(|_| TestError("vfork父取消信号发送失败"))?;
                 let event = self.wait(context)?;
                 context.expect_eq(event.status, 9);
-                context.expect_eq(sched::test_state(&executor), State::Exited);
+                context.expect_eq(sched::state(&executor), State::Exited);
                 context.expect_eq(root.mm().is_none(), true);
                 context.expect_eq(old_mm.user_count(), 1);
                 let identity = child.identity().ok_or(TestError("vfork取消误杀子程序"))?;
@@ -512,13 +512,13 @@ impl UserOwner {
         Self::futex_waiting(&child_mm, &child, FUTEX_CONTROL + 12, false, u32::MAX)?;
         until("两个wait未在真实图队列阻塞", || {
             (self.graph().waiters().test_members() == 2
-                && sched::test_state(&root_task) == State::Blocked
-                && sched::test_state(&worker_task) == State::Blocked)
+                && sched::state(&root_task) == State::Blocked
+                && sched::state(&worker_task) == State::Blocked)
                 || root.mm().is_none()
         })?;
         context.expect_eq(self.graph().waiters().test_members(), 2);
-        context.expect_eq(sched::test_state(&root_task), State::Blocked);
-        context.expect_eq(sched::test_state(&worker_task), State::Blocked);
+        context.expect_eq(sched::state(&root_task), State::Blocked);
+        context.expect_eq(sched::state(&worker_task), State::Blocked);
         context.diagnostic(format_args!(
             "user-wait-observers registered=2 blocked=2 child-futex=1"
         ));

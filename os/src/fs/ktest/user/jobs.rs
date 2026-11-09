@@ -45,7 +45,7 @@
 //!
 //! # 锁顺序与并发契约
 //! - 协调器通过 `mm.load_user_u32` / `mm.store_user_u32` 访问共享控制页，内部仅短暂获取 `Mm` 锁。
-//! - 观测任务阻塞与停止状态时，依次调用 `sched::test_state` 与 `group.signals().has_stopped_jobs()`，
+//! - 观测任务阻塞与停止状态时，依次调用 `sched::state` 与 `group.signals().has_stopped_jobs()`，
 //!   两把自旋锁各自独立获取并立即释放，不存在嵌套持锁。
 
 use super::*;
@@ -538,7 +538,7 @@ fn jobs_blocked(
     until(
         "jobs executor did not enter the required production wait",
         || {
-            sched::test_state(executor) == State::Blocked
+            sched::state(executor) == State::Blocked
                 && group.signals().has_stopped_jobs() == stopped
         },
     )

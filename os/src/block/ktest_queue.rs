@@ -35,7 +35,7 @@
 //!   `callback_task`、`callback_result`、`peer`）以及 `Disk::queue` 自旋锁均为叶级短临界区锁，
 //!   彼此之间**禁止嵌套获取**。
 //! - 严禁在持有上述任何 `SpinLock` 期间调用 `Completion::wait`、`BioCompletion::wait`、
-//!   `timer::sleep` 或 `sched::test_state` 等可能阻塞或查询调度器状态的操作。
+//!   `timer::sleep` 或 `sched::state` 等可能阻塞或查询调度器状态的操作。
 //! - 异步任务回调（`EndIo::Task(callback)`）在工作队列的 Worker 线程中执行，
 //!   只允许等待外部 `Observation::gate` 或无依赖的配对请求（`peer`），绝不等待自身请求完成或当前磁盘停止，从而避免工作队列死锁。
 
@@ -164,14 +164,13 @@ impl Observation {
     /// 先在短自旋锁内克隆 `Arc<Task>`，释放锁后再向调度器查询任务状态。
     fn blocked(&self, ordinal: usize) -> bool {
         let observed = self.tasks.lock()[ordinal].clone();
-        observed.is_some_and(|task| sched::test_state(&task) == State::Blocked)
+        observed.is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 检查执行 `callback` 的任务是否为工作队列的 Worker 线程且当前正处于 `State::Blocked` 阻塞态。
     fn callback_blocked(&self) -> bool {
         let observed = self.callback_task.lock().clone();
-        observed
-            .is_some_and(|task| task.worker.is_some() && sched::test_state(&task) == State::Blocked)
+        observed.is_some_and(|task| task.worker.is_some() && sched::state(&task) == State::Blocked)
     }
 }
 

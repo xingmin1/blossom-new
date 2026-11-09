@@ -208,7 +208,7 @@ fn blocked(root: &UserThread) -> TestResult {
         .executor()
         .ok_or(TestError("observation user executor disappeared"))?;
     until("observation user did not block", || {
-        sched::test_state(&executor) == State::Blocked || root.mm().is_none()
+        sched::state(&executor) == State::Blocked || root.mm().is_none()
     })?;
     if root.mm().is_none() {
         return Err(TestError("observation user exited before blocking"));

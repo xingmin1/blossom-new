@@ -1391,7 +1391,7 @@ pub(super) mod testing {
         };
         observation
             .and_then(|manager| manager.upgrade())
-            .is_some_and(|manager| crate::sched::test_state(&manager) == task::State::Blocked)
+            .is_some_and(|manager| crate::sched::state(&manager) == task::State::Blocked)
     }
 
     /// 判断当前正在运行的内核线程是否为某个工作域的专属救援线程（Rescuer，仅用于内核测试）。
@@ -1434,8 +1434,8 @@ pub(super) mod testing {
                         .upgrade()
                         .zip(manager.upgrade())
                         .is_some_and(|(worker, manager)| {
-                            crate::sched::test_state(&worker) == task::State::Blocked
-                                && crate::sched::test_state(&manager) == task::State::Blocked
+                            crate::sched::state(&worker) == task::State::Blocked
+                                && crate::sched::state(&manager) == task::State::Blocked
                         })
                 });
                 ready &= blocked;

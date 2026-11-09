@@ -581,7 +581,7 @@ mod views {
         )?;
         until("RAM endio did not block on its external gate", || {
             let task = fixture.callback.task.lock().clone();
-            task.is_some_and(|task| sched::test_state(&task) == task::State::Blocked)
+            task.is_some_and(|task| sched::state(&task) == task::State::Blocked)
         })?;
         context.expect_eq(fixture.callback.valid.load(Ordering::Acquire), true);
         // Step 3: 在回调阻塞期间释放 `claim` 句柄，验证在途回调仍保持 `root` 范围的占用保护，此时对 `root` 的裸写依然返回 `ReadOnly`。

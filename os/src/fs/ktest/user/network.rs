@@ -22,7 +22,7 @@
 //! ```
 //!
 //! # 锁获取顺序与并发契约
-//! - 用户进程与内核协调线程通过无共享锁的管道 I/O（`FileRef::read` / `write`）与任务状态快照（`sched::test_state`）通信。
+//! - 用户进程与内核协调线程通过无共享锁的管道 I/O（`FileRef::read` / `write`）与任务状态快照（`sched::state`）通信。
 //! - 测试收尾时严格按顺序执行：等待用户根进程退出并回收全部子进程 -> 汇合协调线程 -> 释放挂起的 SYN 拦截钩子 ->
 //!   等待所有活跃网络端点（`ktest_live_endpoints`）排空归零 -> 恢复网卡开关与默认路由配置。
 
@@ -496,7 +496,7 @@ fn blocked(graph: &TaskGraph, pid: usize) -> TestResult {
         .executor()
         .ok_or(TestError("network reported Task disappeared"))?;
     network_until(
-        || sched::test_state(&task) == State::Blocked || user.mm().is_none(),
+        || sched::state(&task) == State::Blocked || user.mm().is_none(),
         "network user did not block",
         5,
     )?;

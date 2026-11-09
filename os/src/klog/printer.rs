@@ -349,7 +349,7 @@ pub mod testing {
 
     /// 查询后台打印任务在调度器中的当前运行状态（如 `Running`、`Runnable`、`Blocked`）。
     pub(crate) fn service_state() -> Option<State> {
-        service_task().map(|task| sched::test_state(&task))
+        service_task().map(|task| sched::state(&task))
     }
 
     /// 武装一次性的后台打印暂停点；同一测试夹具必须等上一次停点完全恢复并复位到 `0` 后才能再次武装。

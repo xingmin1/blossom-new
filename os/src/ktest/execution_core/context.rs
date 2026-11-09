@@ -26,7 +26,7 @@
 //!
 //! # 锁获取顺序与并发契约
 //! - `Control::external` 与 `Control::notification_tasks` 各自使用独立的 `SpinLock` 保护测试观察用的 `Option<Arc<Task>>`。
-//! - 严禁在持有上述测试自旋锁期间调用 `sched::test_state`、`sched::yield_now` 或析构 `Arc<Task>`：读取时先克隆 `Arc<Task>` 并释放锁，
+//! - 严禁在持有上述测试自旋锁期间调用 `sched::state`、`sched::yield_now` 或析构 `Arc<Task>`：读取时先克隆 `Arc<Task>` 并释放锁，
 //!   清理时通过 `Option::take()` 移出引用并在锁外执行 `drop`，防止与调度器运行队列锁发生锁序反转。
 
 use crate::ktest::execution_core::{baseline, reclaimed, until, Baseline};
@@ -507,7 +507,7 @@ pub(crate) mod context {
                         .external
                         .lock()
                         .as_ref()
-                        .is_some_and(|task| sched::test_state(task) == task::State::Blocked)
+                        .is_some_and(|task| sched::state(task) == task::State::Blocked)
             },
             "exit-worker-blocked",
         )?;
@@ -523,7 +523,7 @@ pub(crate) mod context {
             .lock()
             .take()
             .expect("exit task Arc not retained");
-        assert_eq!(sched::test_state(&external), task::State::Exited);
+        assert_eq!(sched::state(&external), task::State::Exited);
         assert_eq!(Arc::strong_count(&external), 1);
         assert_eq!(
             Arc::strong_count(&external) + handle.try_join().is_some() as usize,
@@ -642,8 +642,8 @@ pub(crate) mod migration {
             // Step 2: 先在 CPU 1 上同步执行一次空 CSD 回调排空历史挂起通知，随后令线程 B 关闭 CPU 1 本地中断以捕获后续所有跨核通知位。
             let a_task = notification_task(&state, 0);
             let b_task = notification_task(&state, 1);
-            assert_eq!(sched::test_state(&a_task), task::State::Running(0));
-            assert_eq!(sched::test_state(&b_task), task::State::Running(1));
+            assert_eq!(sched::state(&a_task), task::State::Running(0));
+            assert_eq!(sched::state(&b_task), task::State::Running(1));
             // SAFETY:
             // 1. 目标核 `1` 在 `min_cpus = 3` 约束下有效且在线，此时线程 B 正处于开中断自旋等待段，能够立即响应 IPI；
             // 2. 协调线程运行在 CPU 2 上，本地中断开启且未持有任何锁，不会造成跨核等待死锁；
@@ -667,12 +667,9 @@ pub(crate) mod migration {
                 || state.steps[0].load(Ordering::Acquire) == 1,
                 "busy notification Yield returned",
             )?;
-            assert!(matches!(
-                sched::test_state(&a_task),
-                task::State::Running(_)
-            ));
+            assert!(matches!(sched::state(&a_task), task::State::Running(_)));
             assert_eq!(sched::test_ready_occurrences(&a_task), 0);
-            assert_eq!(sched::test_state(&b_task), task::State::Running(1));
+            assert_eq!(sched::state(&b_task), task::State::Running(1));
             assert_eq!(cpu::test_pending_kicks(1) & cpu::KICK_RESCHEDULE, 0);
             assert_eq!(a.try_join(), None);
             assert_eq!(b.try_join(), None);
@@ -727,7 +724,7 @@ pub(crate) mod migration {
                 &token,
                 || {
                     state.starts[1].load(Ordering::Acquire) == 1
-                        && sched::test_state(&notification_task(&state, 1)) == task::State::Blocked
+                        && sched::state(&notification_task(&state, 1)) == task::State::Blocked
                 },
                 "idle notification B blocked",
             )?;
@@ -742,13 +739,13 @@ pub(crate) mod migration {
             )?;
             let a_task = notification_task(&state, 0);
             let b_task = notification_task(&state, 1);
-            assert_eq!(sched::test_state(&a_task), task::State::Running(0));
+            assert_eq!(sched::state(&a_task), task::State::Running(0));
             assert_eq!(sched::affinity(&a_task), cpu::CpuSet::prefix(2));
             assert_eq!(sched::affinity(&b_task), cpu::CpuSet::single(0));
 
             // Step 2: 唤醒线程 B 使其进入就绪态，清空 CPU 1 既有通知后武装并触发 CPU 1 停在 `TestPause::Idle` 观察点。
             state.exit.complete();
-            assert_eq!(sched::test_state(&b_task), task::State::Ready);
+            assert_eq!(sched::state(&b_task), task::State::Ready);
             assert_eq!(sched::test_ready_occurrences(&b_task), 1);
             // SAFETY:
             // 1. 目标核 `1` 在 `min_cpus = 3` 约束下有效且在线，且此时尚未武装 `TestPause::Idle` 停点，可正常响应 IPI；
@@ -779,9 +776,9 @@ pub(crate) mod migration {
                 || state.steps[1].load(Ordering::Acquire) == 1,
                 "idle notification B running",
             )?;
-            assert_eq!(sched::test_state(&b_task), task::State::Running(0));
+            assert_eq!(sched::state(&b_task), task::State::Running(0));
             assert_eq!(sched::test_ready_occurrences(&b_task), 0);
-            assert_eq!(sched::test_state(&a_task), task::State::Ready);
+            assert_eq!(sched::state(&a_task), task::State::Ready);
             assert_eq!(sched::test_ready_occurrences(&a_task), 1);
             assert_eq!(state.steps[0].load(Ordering::Acquire), 0);
             let pending = cpu::test_pending_kicks(1);
@@ -797,7 +794,7 @@ pub(crate) mod migration {
                 || state.steps[0].load(Ordering::Acquire) == 1,
                 "idle notification A resumed",
             )?;
-            assert_eq!(sched::test_state(&a_task), task::State::Running(1));
+            assert_eq!(sched::state(&a_task), task::State::Running(1));
             assert_eq!(sched::test_ready_occurrences(&a_task), 0);
             assert_eq!(a.try_join(), None);
 

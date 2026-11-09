@@ -446,7 +446,7 @@ pub(super) mod cases {
             .executor()
             .ok_or(TestError("W20 private executor missing"))?;
         until("W20 private preparer did not really block", || {
-            sched::test_state(&executor) == State::Blocked
+            sched::state(&executor) == State::Blocked
         })?;
 
         let truncating = file.clone();
@@ -691,11 +691,11 @@ pub(super) mod cases {
         until(
             "W21 ordinary ftruncate did not block on original IO",
             || {
-                sched::test_state(&executor) == State::Blocked
+                sched::state(&executor) == State::Blocked
                     || mm.load_user_u32(SHARED_CONTROL) == Ok(2)
             },
         )?;
-        context.expect_eq(sched::test_state(&executor), State::Blocked);
+        context.expect_eq(sched::state(&executor), State::Blocked);
         context.expect_eq(mm.load_user_u32(SHARED_CONTROL), Ok(1));
         if !metadata {
             until(

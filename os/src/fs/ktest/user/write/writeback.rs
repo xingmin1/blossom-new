@@ -759,7 +759,7 @@ pub(super) mod cases {
         // Step 2: 唤醒用户态进程调用 sys_fsync (82)，确认其不会因为 dirty == 0 而直接跳过等待，而是阻塞在在途的 writeback 上。
         WriteOwner::release(&mm, 1)?;
         until("W12 sys82 did not really block on existing WB", || {
-            sched::test_state(&executor) == State::Blocked
+            sched::state(&executor) == State::Blocked
         })?;
         context.expect_eq(mm.load_user_u32(SHARED_CONTROL), Ok(1));
         context.expect_eq(folio.dirty_sectors(), 0);
@@ -1069,7 +1069,7 @@ pub(super) mod cases {
         until("O_SYNC write did not block in actual accepted WB", || {
             folio.writeback_sectors() != 0
                 && disk.test_snapshot().inflight != 0
-                && sched::test_state(&executor) == State::Blocked
+                && sched::state(&executor) == State::Blocked
         })?;
 
         // Step 2: 在用户态同步写阻塞等待 I/O 期间，并发探测同一 OFD 的游标位置（seek）并向同一 Inode 写入相邻字节，确认游标锁与 Inode 锁均已释放。

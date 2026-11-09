@@ -209,7 +209,7 @@ fn initially_blocked(index: usize, handle: &ChildHandle) -> bool {
     let observed = slot.task.lock().as_ref().map(Arc::clone);
     observed.is_some_and(|task| {
         assert_eq!(task.id(), handle.task_id());
-        sched::test_state(&task) == State::Blocked && slot.timer_done.test_waiting() == 1
+        sched::state(&task) == State::Blocked && slot.timer_done.test_waiting() == 1
     })
 }
 

@@ -74,7 +74,7 @@ impl Control {
         self.worker
             .lock()
             .as_ref()
-            .is_some_and(|worker| sched::test_state(worker) == State::Blocked)
+            .is_some_and(|worker| sched::state(worker) == State::Blocked)
     }
 
     /// 驱动工作任务连续执行 `count` 轮“阻塞等待 -> 唤醒执行 -> 完成通知”循环。

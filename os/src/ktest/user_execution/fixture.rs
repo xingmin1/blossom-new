@@ -219,6 +219,6 @@ impl Controls {
             .lock()
             .clone()
             .and_then(|task| task.upgrade());
-        task.is_some_and(|task| sched::test_state(&task) == task::State::Blocked)
+        task.is_some_and(|task| sched::state(&task) == task::State::Blocked)
     }
 }

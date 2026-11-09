@@ -114,7 +114,7 @@ impl SyncObservation {
             .lock()
             .as_ref()
             .and_then(alloc::sync::Weak::upgrade)
-            .is_some_and(|task| sched::test_state(&task) == State::Blocked)
+            .is_some_and(|task| sched::state(&task) == State::Blocked)
     }
 
     /// 读取同步调用线程已写入的最终执行结果；若调用尚未返回则返回 `None`。
