@@ -238,6 +238,74 @@ pub(crate) mod codec {
         Ok(())
     }
 
+    /// 按反射 Castagnoli 多项式逐位计算原始寄存器，不对种子或结果取反。
+    fn crc32c_bitwise(mut state: u32, bytes: &[u8]) -> u32 {
+        for &byte in bytes {
+            state ^= u32::from(byte);
+            for _ in 0..8 {
+                state = (state >> 1) ^ if state & 1 != 0 { 0x82f6_3b78 } else { 0 };
+            }
+        }
+        state
+    }
+
+    /// 测试目标：验证 CRC32C 的原始种子、字节顺序及 16 字节边界。
+    /// 场景步骤：对不同对齐、长度和种子的确定性图样分别计算整段及多种分段结果。
+    /// 预期结果：逐位参考、整段与分段计算均得到相同的未取反寄存器。
+    #[test]
+    #[ktest(tags("B12"))]
+    fn crc32c_seed_alignment_and_boundaries(context: &mut TestContext<'_>) -> TestResult {
+        let mut data = [0u8; 4096 + 15];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = ((index * 37) ^ (index >> 3) ^ 0xa5) as u8;
+        }
+        context.expect_eq(crc32c_bitwise(!0, b"123456789"), 0x1cf9_6d7c);
+
+        for offset in 0..16 {
+            for len in [0, 1, 15, 16, 17, 31, 32, 33, 512, 1024, 4096] {
+                let bytes = &data[offset..offset + len];
+                for seed in [0, !0, 0x1357_2468, 0x89ab_cdef] {
+                    let expected = crc32c_bitwise(seed, bytes);
+                    let whole = ext4_codec::crc32c(seed, bytes);
+                    context.expect_eq((offset, len, seed, whole), (offset, len, seed, expected));
+                    if whole != expected {
+                        return Ok(());
+                    }
+
+                    for split in [0, 1, 15, 16, 17, 31, 32, 33, len / 2, len] {
+                        if len < split {
+                            continue;
+                        }
+                        let prefix = ext4_codec::crc32c(seed, &bytes[..split]);
+                        let actual = ext4_codec::crc32c(prefix, &bytes[split..]);
+                        context.expect_eq(
+                            (offset, len, seed, split, actual),
+                            (offset, len, seed, split, expected),
+                        );
+                        if actual != expected {
+                            return Ok(());
+                        }
+                    }
+
+                    for chunk_len in [15, 16, 17] {
+                        let mut actual = seed;
+                        for chunk in bytes.chunks(chunk_len) {
+                            actual = ext4_codec::crc32c(actual, chunk);
+                        }
+                        context.expect_eq(
+                            (offset, len, seed, chunk_len, actual),
+                            (offset, len, seed, chunk_len, expected),
+                        );
+                        if actual != expected {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 验证超级块解码对兼容（compat）、只读兼容（ro_compat）、不兼容（incompat）特性位以及日志恢复标志的分类判定与几何参数校验。
     #[test]
     #[ktest(tags("B12"))]
@@ -1456,5 +1524,178 @@ pub(crate) mod prefix {
         );
         context.diagnostic(format_args!("ext4-prefix delivered=12288 subsequent-error=Corrupt root-valid=1 indirect-data-pointer-invalid=1 hardware-EIO-covered=0"));
         Ok(())
+    }
+}
+
+#[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", resources("scratch"), tags("block-view", "metadata", "fs-truncate"), timeout_ms = 60000)]
+pub(crate) mod resident_fragment {
+    use super::*;
+    use crate::cache::MetadataCache;
+
+    /// 测试目标：验证非页对齐视图的跨页逻辑块只驻留一侧时，失效操作仍精确清除该侧的目标扇区。
+    /// 场景步骤：在独占 scratch 盘写入已知底色，分别只加载目标块的首页或尾页窗口及同页邻块，写入不同脏图样后释放目标窗口并执行失效。
+    /// 预期结果：缺页保持未加载，目标扇区逐个失效并从设备重读底色，同页邻块的内容和脏位不变；最后丢弃私有脏数据并释放占用。
+    #[test]
+    #[case("head", false)]
+    #[case("tail", true)]
+    fn forget_split_block_with_one_resident_page(
+        context: &mut TestContext<'_>,
+        fixture: &mut Owner,
+        tail: bool,
+    ) -> TestResult {
+        let disk = fixture.disk()?;
+        if disk.limits().logical_block_size != 512 || disk.limits().readonly {
+            return Err(TestError(
+                "resident fragment requires writable 512-byte scratch",
+            ));
+        }
+        let (start, target_block, neighbor_block, target_offset, target_mask, old, neighbor_tag) =
+            if tail {
+                (3, 3, 4, 512, 0x06, 0xa2, 0xb2)
+            } else {
+                (1, 2, 1, 2560, 0x60, 0xa1, 0xb1)
+            };
+        let view = checked(
+            context,
+            BlockView::new(disk.clone(), start, 128).map_err(FsError::from),
+        )?;
+        let target_byte = checked(
+            context,
+            view.absolute_byte(2048, 2048).map_err(FsError::from),
+        )?;
+        context.expect_eq(target_byte, if tail { 3584 } else { 2560 });
+        checked(
+            context,
+            write_view_fixture(disk, target_byte, &[0x17; 2048]),
+        )?;
+        let claim = checked(
+            context,
+            Disk::claim_fs(&view, AccessMode::ReadWrite).map_err(FsError::from),
+        )?;
+        let cache = checked(
+            context,
+            MetadataCache::shared(&claim, 8).map_err(FsError::from),
+        )?;
+
+        let result = (|| -> TestResult {
+            let target = checked(
+                context,
+                cache.get(target_block, 1024, None).map_err(FsError::from),
+            )?;
+            let neighbor = checked(
+                context,
+                cache.get(neighbor_block, 1024, None).map_err(FsError::from),
+            )?;
+            context.expect_eq(target.offset(), target_offset);
+            context.expect_eq(neighbor.offset(), 1536);
+            context.expect_eq(target.folio().phys_addr(), neighbor.folio().phys_addr());
+            context.expect_eq(cache.len(), 1);
+            context.expect_eq(
+                checked(context, cache.cached_buffer(1, 2048).map_err(FsError::from))?.is_none(),
+                true,
+            );
+            context.expect_eq(
+                target.with_read(|bytes| bytes.iter().all(|byte| *byte == 0x17)),
+                Ok(true),
+            );
+            checked(
+                context,
+                target
+                    .update(&claim, |bytes| bytes.fill(old))
+                    .map_err(FsError::from),
+            )?;
+            checked(
+                context,
+                neighbor
+                    .update(&claim, |bytes| bytes.fill(neighbor_tag))
+                    .map_err(FsError::from),
+            )?;
+            context.expect_eq(
+                target.with_read(|bytes| bytes.iter().all(|byte| *byte == old)),
+                Ok(true),
+            );
+            context.expect_eq(
+                neighbor.with_read(|bytes| bytes.iter().all(|byte| *byte == neighbor_tag)),
+                Ok(true),
+            );
+            context.expect_eq(target.folio().dirty_sectors(), target_mask | 0x18);
+            context.expect_eq(target.folio().writeback_sectors(), 0);
+            {
+                let content = target.folio().lock_content();
+                for offset in [target_offset, target_offset + 512] {
+                    context.expect_eq(content.range_ready(offset, 512), Ok(()));
+                }
+            }
+
+            drop(target);
+            disk.test_flush_completions();
+            until("resident fragment reads did not finish", || {
+                disk.test_snapshot().inflight == 0
+            })?;
+            let before_forget = disk.test_snapshot().submitted;
+            // SAFETY:
+            // 1. 此独占 scratch 视图从未挂载文件系统，也没有块映射树或空闲位图；目标块未被其他结构引用或归还。
+            // 2. 目标 BufferRef 已释放，测试未启动并发消费者，全部同步读取和完成回调均已结束；邻块仅访问不重叠的窗口。
+            // 3. 读写 claim 仍占有该范围，本测试在可睡眠的 Thread 上执行，失效期间不会有新的目标块访问。
+            let forgotten = unsafe { cache.forget_resident_block(1, 2048) };
+            checked(context, forgotten.map_err(FsError::from))?;
+            context.expect_eq(disk.test_snapshot().submitted, before_forget);
+            context.expect_eq(cache.len(), 1);
+            context.expect_eq(
+                checked(context, cache.cached_buffer(1, 2048).map_err(FsError::from))?.is_none(),
+                true,
+            );
+            {
+                let content = neighbor.folio().lock_content();
+                for offset in [target_offset, target_offset + 512] {
+                    context.expect_eq(content.range_ready(offset, 512), Err(BlockError::NotReady));
+                }
+                context.expect_eq(
+                    content.range_ready(neighbor.offset(), neighbor.len()),
+                    Ok(()),
+                );
+            }
+            context.expect_eq(neighbor.folio().dirty_sectors(), 0x18);
+            context.expect_eq(neighbor.folio().writeback_sectors(), 0);
+            context.expect_eq(
+                neighbor.with_read(|bytes| bytes.iter().all(|byte| *byte == neighbor_tag)),
+                Ok(true),
+            );
+
+            let before_reload = disk.test_snapshot().submitted;
+            let reloaded = checked(
+                context,
+                cache.get(target_block, 1024, None).map_err(FsError::from),
+            )?;
+            context.expect_eq(before_reload < disk.test_snapshot().submitted, true);
+            context.expect_eq(
+                reloaded.with_read(|bytes| bytes.iter().all(|byte| *byte == 0x17)),
+                Ok(true),
+            );
+            context.expect_eq(cache.len(), 1);
+            context.expect_eq(
+                checked(context, cache.cached_buffer(1, 2048).map_err(FsError::from))?.is_none(),
+                true,
+            );
+            context.expect_eq(neighbor.folio().dirty_sectors(), 0x18);
+            context.expect_eq(
+                neighbor.with_read(|bytes| bytes.iter().all(|byte| *byte == neighbor_tag)),
+                Ok(true),
+            );
+            Ok(())
+        })();
+
+        disk.test_flush_completions();
+        until("resident fragment cleanup I/O did not finish", || {
+            disk.test_snapshot().inflight == 0
+        })?;
+        // SAFETY:
+        // 1. 测试闭包内所有 BufferRef 和页内容守卫均已释放，未启动并发生产者，设备读取及完成回调已结束。
+        // 2. 该 scratch 范围未挂载文件系统，残留脏扇区仅为本用例的私有图样，没有已承诺持久化的数据。
+        let discarded = unsafe { cache.discard_private() };
+        let cleanup = checked(context, discarded.map_err(FsError::from)).map(|_| ());
+        drop(cache);
+        drop(claim);
+        result.and(cleanup)
     }
 }

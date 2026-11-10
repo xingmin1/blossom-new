@@ -13,7 +13,7 @@ files = [
     "sets/cyclictest.toml",
     "sets/ltp.toml",
 ]
-override_files = ["overrides/local.toml"]
+override_files = ["overrides/local.toml", "overrides/basic-mount.toml"]
 finish = "poweroff"
 
 [defaults]
@@ -38,6 +38,9 @@ prepare = [
     ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/bin"],
     ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/busybox"],
     ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/sh"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/.blossom"],
+    ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/musl/.blossom/fat32.img"],
+    ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/musl/.blossom/busybox"],
 ]
 
 [roots.glibc]
@@ -50,4 +53,7 @@ prepare = [
     ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/bin"],
     ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/busybox"],
     ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/sh"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/.blossom"],
+    ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/glibc/.blossom/fat32.img"],
+    ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/glibc/.blossom/busybox"],
 ]

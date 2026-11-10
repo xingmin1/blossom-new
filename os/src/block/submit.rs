@@ -265,10 +265,6 @@ impl FsClaim {
     /// 按卷内相对字节偏移 `offset` 同步读取精确长度的数据到 `dst`（调用者位于普通可睡眠任务上下文）。
     ///
     /// 请求在在途期间持续持有 `FsClaim` 直到硬件请求槽彻底结束并收回 DMA 访问权；仅当整段范围完整读取成功时才将数据拷贝至 `dst`。
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(dead_code, reason = "文件写入和截断测试通过原 FS 占用读取实际设备字节")
-    )]
     pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         let absolute = self.view().absolute_byte(offset, dst.len())?;
         drop(task::current_task());

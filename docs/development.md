@@ -6,6 +6,8 @@
 
 所有宿主端构建与运行命令均在仓库根目录执行。开发机需准备固定版本的 Rust 工具链 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC 工具链，以及 QEMU `9.2.1`。制作 ext4 磁盘镜像需要使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；检查运行库需要使用支持目标架构 ELF 的 `readelf`。开发板设备树（DTB）从仓内源码编译生成，宿主需提供 C 预处理器（`cc`）和 `dtc`，打包 RAM 根文件系统镜像（`uInitrd`）还需提供 `fdtput`。上述工具通过 `PATH` 或显式 Make 参数提供；Makefile 不会调用系统包管理器，Nix 仅作为可选的个人开发环境。
 
+生成比赛用 FAT32 夹具还需要 `mkfs.fat`、`fsck.fat`、`mcopy` 和 `mmd`；缺少任一工具时构建会报错，不会下载依赖或改用其他文件系统。
+
 Cargo 依赖统一使用仓内 `vendor` 目录。当通过 Rustup 代理调用且允许自动安装时，Rustup 可根据根目录 `rust-toolchain.toml` 联网安装缺失的固定工具链组件和目标标准库（Cargo 的离线配置不会限制 Rustup）。但在直接单独构建用户态 `std` 执行器时，构建脚本会通过 `RUSTUP_AUTO_INSTALL=0` 禁用 Rustup 自动安装，因此所需的目标标准库必须事先准备就绪。
 
 普通内核构建与 `ktest` 测试内核构建都需要该固定工具链的 `rust-src` 组件，由 `os/.cargo/config.toml` 统一从源码重新编译 `core`、`alloc` 及 `compiler-builtins-mem`。LoongArch 架构统一关闭 `ual`（非对齐访存）特性，确保内核与标准库都生成严格对齐的访存指令；不能只对内核代码禁用非对齐访存却继续链接预编译的标准库。Makefile 会清除外部环境变量中的 `RUSTFLAGS` 与 `CARGO_ENCODED_RUSTFLAGS`，改用 Cargo 原生的 `--config` 数组合并 panic/unwind 策略与目标 ISA 约束。若直接运行 Cargo 构建内核，仍须以 `os/` 为工作目录；独立的用户态 `std` 程序则消费已准备好的目标标准库和 sysroot，不读取内核的 Cargo 配置。
@@ -189,6 +191,8 @@ make run-linux-user-selftests
 ```
 
 测试计划与集合配置位于 [userland/contest](../userland/contest/)；面向运行人员的完整说明见 [比赛测试执行手册](contest-run.md)。命令行格式为 `DEVICE [--plan FILE] [--file FILE]... [--list] [--only PATTERN]... [--timeout-sec N] [--repeat N] [--verbose] [--finish poweroff|return]`，显式单命令模式为 `DEVICE --root ROOT --cwd CWD -- COMMAND [ARG...]`。`--file` 整体替换主计划的 `files`，主计划的 `roots`、`defaults` 与 `finish` 保留；`--only` 按完整 ID 的 glob 缩小选择集；`--timeout-sec` 与 `--repeat` 覆盖全部已选用例，不作用于 setup、cleanup 与 prepare。`--list` 只挂载设备并解析、校验配置与磁盘文件，不执行 prepare/setup/cleanup、内核通知、测试子进程或关机。默认计划只加载 `files` 显式引用的集合，不会因为目录中存在其他 `.toml` 文件而自动将其纳入运行。
+
+`/dev/loop0` 是主设备号 7、次设备号 0 的块设备，支持将物理 ext4 普通文件绑定为块盘。系统根装配会加入 `build/fixtures/basic-fat32.img` 和启用 `losetup` 的静态 BusyBox；默认计划及仅运行这两个用例的 `mount-plan.toml` 均在比赛工作盘的两个 libc 根目录准备镜像副本，使用原测试 ELF 对 `/dev/loop0` 执行 `mount` 与 `umount`。当前 FAT32 集成支持真实盘面校验、根节点、容量查询及挂卸载，尚不支持通过 VFS 读写 FAT 文件或遍历目录；未实现的操作返回错误。
 
 `files` 路径相对主计划文件所在目录，只加载一层；group 文件只允许 `[[group]]`，override 文件只允许 `[[override]]`。step 的候选来源是 `names`、`directory` 或 `catalog` 三者之一：`names` 按原顺序取名字，`directory` 列出有效 `cwd` 中具有执行位的普通文件并按文件名排序，`catalog` 读取清单文件每行首个词作为名字、其余部分作为 `{command}` 原文。`include` 省略等价于 `["*"]`，某个 include 未匹配任何候选时执行器报错；`exclude` 无匹配不报错。选择按文件、group、root、step 的顺序展开，同一 root 内跑完该组全部 step 后再切换下一个 root。有效工作目录按 step、group、root 的优先级取第一个已声明值，环境变量按 root、group、step 的顺序按键合并。`override` 只修改已选中用例的字段，不会把用例重新加入计划；未命中的覆盖项在 `--list` 与 `--verbose` 中提示。最终选择集为空、ID 重复或 step 未给出或给出多个候选来源时按配置错误处理。
 

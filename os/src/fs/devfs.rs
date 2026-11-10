@@ -1,4 +1,4 @@
-//! `devfs` 设备文件系统初始化与内置虚拟字符设备实现。
+//! `devfs` 设备文件系统初始化与内置设备的打开分派。
 //!
 //! ## 模块职责与架构定位
 //! 本模块负责在内存文件系统（[`MemoryFs`]）之上构建 `/dev` 目录树（[`try_new`]），
@@ -18,7 +18,8 @@
 //!  ├── tty      (5, 0)   mode 0666 ──► MemorySpecial::ControllingTty ──► tty 子系统
 //!  ├── kmsg     (1, 11)  mode 0444 ──► MemorySpecial::Kmsg           ──► fs::kmsg::KmsgFile
 //!  ├── ktrace   (240, 1) mode 0444 ──► MemorySpecial::Ktrace         ──► ktrace 子系统
-//!  └── testhook (240, 2) mode 0200 ──► MemorySpecial::TestHook       ──► devfs::TestHookFile
+//!  ├── testhook (240, 2) mode 0200 ──► MemorySpecial::TestHook       ──► devfs::TestHookFile
+//!  └── loop0    (7, 0)   mode 0660 ──► MemorySpecial::Loop0          ──► 全局文件后端块设备
 //! ```
 //!
 //! ## 锁获取顺序与并发契约
@@ -30,6 +31,7 @@ use alloc::sync::Arc;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::block::loop_device::LOOP0_RDEV;
 use crate::contest_hooks;
 use crate::fs::file::{require_read, require_write, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
@@ -90,7 +92,7 @@ pub struct TestHookFile {
     flags: AtomicU32,
 }
 
-/// 创建并初始化一个新的 `devfs` 内存文件系统实例，在根目录下安装全部内置字符设备节点。
+/// 创建并初始化一个新的 `devfs` 内存文件系统实例，安装字符设备节点及共享全局绑定的 `loop0` 块设备节点。
 ///
 /// - 调用上下文：内核初始化或挂载路径（可睡眠上下文）。
 /// - 参数：`root_mode` 为 `/dev` 根目录的权限位（如 `0o755`）。
@@ -130,6 +132,7 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
         0o200,
         TESTHOOK_RDEV,
     )?;
+    fs.initialize_special(&root, b"loop0", MemorySpecial::Loop0, 0o660, LOOP0_RDEV)?;
     Ok(fs)
 }
 

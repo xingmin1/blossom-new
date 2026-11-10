@@ -66,6 +66,7 @@ use crate::{cpu, drivers, mm, sched, time, timer};
 
 mod concurrency;
 mod epoll;
+mod fat32;
 mod file;
 mod format;
 mod mem_mapping;
@@ -86,7 +87,7 @@ const DEEP_EXTENTS: u64 = 1500;
 
 /// 汇总并返回文件系统各子测试套件的编译期注册槽位引用，防止链接器丢弃测试段。
 pub(crate) fn anchors() -> (
-    [&'static ::ktest::SuiteSlot; 31],
+    [&'static ::ktest::SuiteSlot; 32],
     [&'static ::ktest::SuiteSlot; 7],
     [&'static ::ktest::SuiteSlot; 9],
     [&'static ::ktest::SuiteSlot; 6],
@@ -110,6 +111,7 @@ pub(crate) fn anchors() -> (
             format::bad_features::__ktest_anchor(),
             format::bad_mapping::__ktest_anchor(),
             format::prefix::__ktest_anchor(),
+            fat32::core_disk::__ktest_anchor(),
             concurrency::inode_loading::__ktest_anchor(),
             concurrency::file_loading::__ktest_anchor(),
             concurrency::failed_loading::__ktest_anchor(),

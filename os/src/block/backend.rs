@@ -1,7 +1,7 @@
-//! 块设备协议后端适配层（Block Hardware Backends）。
+//! 块设备协议与软件后端适配层。
 //!
 //! # 模块职责与架构定位
-//! 本模块位于通用块设备核心（`Disk`）与底层硬件驱动（`VirtioDevice`、`Sdmmc`、`Ahci` 以及内存盘 `Ram`）之间，
+//! 本模块位于通用块设备核心（`Disk`）与底层硬件驱动、内存盘及普通文件之间，
 //! 向上为 `Disk` 提供统一的协议控制准备、请求提交、完成结果提取、中断认领以及设备复位接口。
 //! 逻辑父请求（`Bio`）的拆分、合并、DMA 生命周期跟踪与睡眠等待均由上层 `Disk` 统一负责；
 //! 本模块只处理各设备传输协议的差异。
@@ -21,7 +21,7 @@
 //!          ▼
 //!      SlotControl::complete() 读取 1B status 并校验 used.len，返回通用 IoResult
 //!
-//!   2. 单通道工作队列后端（RAM / SDMMC / AHCI，硬件深度 1 + 8 个软件槽）
+//!   2. 单通道工作队列后端（RAM / SDMMC / AHCI 各有 8 个软件槽，File 仅有 1 个槽）
 //!      Backend::submit() ──► (Disk.queue 自旋锁内) 仅将软件槽号 tag 压入 pending 队列
 //!          │
 //!          ▼ (唤醒 Disk.progress_work，在可睡眠任务上下文锁外执行)
@@ -31,6 +31,7 @@
 //!      - RAM  : CPU 直接在保留物理内存与 Bio 页面之间复制字节
 //!      - SDMMC: 控制器内部使用 Bounce Buffer 发起单命令 DMA + IRQ 睡眠等待
 //!      - AHCI : 控制器内部构建 PRDT 对 Bio 物理页直接发起单端口 SATA DMA
+//!      - File : 经页大小以内的栈缓冲执行 ext4 文件定位读写与同步
 //! ```
 //!
 //! # VirtIO-Blk 单槽协议数据单元（PDU）布局
@@ -56,7 +57,8 @@
 //!   必须在释放 `Disk.queue` 自旋锁之后，通过 `WorkTarget` 或 `Notification` 在锁外调用。
 
 use crate::block::{
-    BlkOperation, BlockError, IoResult, QueueLimits, NATIVE_TAG_COUNT, SECTOR_BYTES,
+    loop_backing::LoopBacking, BlkOperation, BlockError, IoResult, QueueLimits, NATIVE_TAG_COUNT,
+    SECTOR_BYTES,
 };
 use crate::boot::Region;
 use crate::boot::{AhciResources, MmcResources};
@@ -68,6 +70,7 @@ use crate::drivers::virtio::{
 };
 use crate::irq::IrqNumber;
 use crate::mm::dma::{DmaDomain, KernelHal, PayloadRange};
+use crate::mm::PAGE_SIZE;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -80,9 +83,7 @@ use virtio_drivers::{DmaRegion, Hal, MappedSegment};
 const RAM_MAX_BYTES: usize = 64 * 1024;
 const RAM_MAX_SEGMENTS: usize = 16;
 
-/// 块设备的物理硬件身份标识。
-///
-/// 上层构造 `Bio` 与挂载文件系统时用该标识精确匹配目标物理磁盘，防止跨设备误交请求。
+/// 块设备身份标识，用于请求准入与 backing 依赖检查。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiskIdentity {
     /// VirtIO 块设备身份（区分 MMIO 物理基址或 PCI BDF 拓扑）。
@@ -93,6 +94,8 @@ pub enum DiskIdentity {
     Sdmmc { physical: usize },
     /// AHCI SATA 控制器块设备身份（`physical` 为 AHCI 控制器 ABAR 寄存器窗口的起始物理字节地址）。
     Ahci { physical: usize },
+    /// 全局单个 loop0 文件后端，同一绑定只发表一个活动设备实例。
+    Loop0,
 }
 
 /// 单个软件请求槽（Slot）持有的设备协议控制区视图。
@@ -103,7 +106,7 @@ pub enum DiskIdentity {
 pub(super) enum SlotControl {
     /// VirtIO 协议控制视图（`pdu` 为整块 PDU 控制区的 DMA 内存描述符，`tag` 为当前软件请求槽编号 `0..tag_count`）。
     Virtio { pdu: DmaRegion, tag: u16 },
-    /// 无需在软件槽阶段预填 DMA 协议头的后端（RAM / SDMMC / AHCI）。
+    /// 无需在软件槽阶段预填 DMA 协议头的后端（RAM / SDMMC / AHCI / File）。
     Plain,
 }
 
@@ -204,9 +207,9 @@ pub(super) struct VirtioBackend {
     requests: Vec<Option<(BlkOperation, usize)>>,
 }
 
-/// 块设备底层硬件后端枚举。
+/// 块设备底层硬件与软件后端枚举。
 ///
-/// 统一封装内核支持的四类块存储介质；嵌入在 `Disk` 的 `QueueState` 中，由 `Disk.queue` 自旋锁保护。
+/// 嵌入在 `Disk` 的 `QueueState` 中，由 `Disk.queue` 自旋锁保护。
 #[expect(
     clippy::large_enum_variant,
     reason = "Disk 内嵌后端直接拥有已准备的传输和队列，避免单独装箱增加准备期分配与失败回收分支"
@@ -245,6 +248,15 @@ pub(super) enum Backend {
         /// 等待 `Disk.progress_work` 顺序下发给控制器的软件槽号（`tag`）FIFO 队列。
         pending: VecDeque<u16>,
     },
+    /// 以普通 ext4 文件承载的单槽软件块设备。
+    File {
+        /// 保留原 OFD 的文件来源，锁外执行期间通过克隆引用保活。
+        backing: Arc<LoopBacking>,
+        /// 是否已停止接纳和提取请求，只有正在执行的任务退出后才能设置。
+        stopped: bool,
+        /// 唯一等待进度任务执行的软件槽号；不另行分配 FIFO。
+        pending: Option<u16>,
+    },
 }
 
 /// 供 `Disk.progress_work` 在释放 `Disk.queue` 自旋锁后执行单次命令的后端句柄。
@@ -257,6 +269,8 @@ pub(super) enum WorkTarget {
     Sdmmc(Arc<Sdmmc>),
     /// AHCI 控制器目标。
     Ahci(Arc<Ahci>),
+    /// 普通文件目标；文件 I/O 与同步只在设备自旋锁外调用。
+    File(Arc<LoopBacking>),
 }
 
 impl Backend {
@@ -322,6 +336,30 @@ impl Backend {
         })
     }
 
+    /// 为已校验的 backing 文件构造单槽后端及 512 字节逻辑块限额，不在准备阶段执行文件 I/O。
+    pub(super) fn file(backing: Arc<LoopBacking>) -> (Self, QueueLimits) {
+        let limits = QueueLimits {
+            capacity_sectors: backing.bytes() / SECTOR_BYTES,
+            max_bytes: PAGE_SIZE,
+            max_segments: PAGE_SIZE / SECTOR_BYTES as usize,
+            max_segment_bytes: PAGE_SIZE as u32,
+            logical_block_size: SECTOR_BYTES as u32,
+            dma_boundary_mask: u64::MAX,
+            readonly: backing.readonly(),
+            flush: true,
+            queue_depth: 1,
+            tag_count: 1,
+        };
+        (
+            Self::File {
+                backing,
+                stopped: false,
+                pending: None,
+            },
+            limits,
+        )
+    }
+
     /// 根据板级 MMC 资源初始化 SD/MMC 后端并返回对应的设备队列限额。
     ///
     /// 在普通可睡眠任务上下文调用。若卡槽检测（GPIO / CDETECT）确认物理无卡则返回 `Ok(None)`；
@@ -384,7 +422,7 @@ impl Backend {
         )))
     }
 
-    /// 返回当前后端对应的物理设备身份标识 [`DiskIdentity`]。
+    /// 返回当前后端的设备身份，供请求准入和文件 backing 依赖检查使用。
     pub(super) fn identity(&self) -> DiskIdentity {
         match self {
             Self::Virtio(v) => DiskIdentity::Virtio(v.device.identity()),
@@ -398,6 +436,7 @@ impl Backend {
             Self::Ahci { physical, .. } => DiskIdentity::Ahci {
                 physical: *physical,
             },
+            Self::File { .. } => DiskIdentity::Loop0,
         }
     }
 
@@ -422,12 +461,11 @@ impl Backend {
 
     /// 返回业务数据物理页（Payload Folio）直接进行设备 DMA 时所需的地址域 [`DmaDomain`]。
     ///
-    /// VirtIO 与 AHCI 由硬件直接 DMA 访问业务物理页，需返回对应 `DmaDomain` 以执行地址转换与缓存同步；
-    /// RAM 盘由 CPU 直接复制，SDMMC 通过控制器内部独立的 Bounce Buffer 中转，业务页均不向设备暴露 DMA 映射，因此返回 `None`。
+    /// VirtIO 与 AHCI 直接 DMA 访问业务页，返回对应地址域；RAM、File 与使用独立弹跳缓冲的 SDMMC 返回 `None`。
     pub(super) fn domain(&self) -> Option<DmaDomain> {
         match self {
             Self::Virtio(_) => Some(DmaDomain::qemu_coherent()),
-            Self::Ram { .. } | Self::Sdmmc { .. } => None,
+            Self::Ram { .. } | Self::Sdmmc { .. } | Self::File { .. } => None,
             Self::Ahci { controller, .. } => Some(controller.domain()),
         }
     }
@@ -439,15 +477,17 @@ impl Backend {
                 pdu: v.device.control_regions().1,
                 tag,
             },
-            Self::Ram { .. } | Self::Sdmmc { .. } | Self::Ahci { .. } => SlotControl::Plain,
+            Self::Ram { .. } | Self::Sdmmc { .. } | Self::Ahci { .. } | Self::File { .. } => {
+                SlotControl::Plain
+            }
         }
     }
 
-    /// 返回后端关联的硬件中断号；无物理中断的纯内存盘（`Ram`）返回 `None`。
+    /// 返回硬件中断号；不使用物理中断的 RAM 与 File 返回 `None`。
     pub(super) fn interrupt(&self) -> Option<IrqNumber> {
         match self {
             Self::Virtio(v) => Some(v.device.interrupt()),
-            Self::Ram { .. } => None,
+            Self::Ram { .. } | Self::File { .. } => None,
             Self::Sdmmc { controller, .. } => Some(controller.interrupt()),
             Self::Ahci { controller, .. } => Some(controller.interrupt()),
         }
@@ -460,7 +500,7 @@ impl Backend {
     pub(super) fn publish(&mut self) -> Result<(), BlockError> {
         match self {
             Self::Virtio(v) => v.device.publish().map_err(initialization_error),
-            Self::Ram { stopped, .. } => {
+            Self::Ram { stopped, .. } | Self::File { stopped, .. } => {
                 assert!(!*stopped);
                 Ok(())
             }
@@ -482,13 +522,16 @@ impl Backend {
             Self::Ram { stopped, .. }
             | Self::Sdmmc { stopped, .. }
             | Self::Ahci { stopped, .. } => !*stopped,
+            Self::File {
+                stopped, pending, ..
+            } => !*stopped && pending.is_none(),
         }
     }
 
     /// 在 `Disk.queue` 自旋锁保护下向后端提交一个已完成准备的软件槽请求。
     ///
     /// - 对于 `Virtio`：将物理页范围映射为设备 DMA 段并填入 VirtQueue（门铃通知留到锁外 `unplug` 执行）；
-    /// - 对于 `Ram` / `Sdmmc` / `Ahci`：仅将槽号 `tag` 推入 `pending` 队列，实际数据传输交由锁外的 `Disk.progress_work` 异步推进。
+    /// - 对于工作队列后端：仅记录槽号 `tag`，实际数据传输交由锁外的 `Disk.progress_work` 异步推进。
     pub(super) fn submit(
         &mut self,
         tag: u16,
@@ -557,6 +600,19 @@ impl Backend {
                 pending.push_back(tag);
                 Ok(())
             }
+            Self::File {
+                stopped, pending, ..
+            } => {
+                if *stopped {
+                    return Err(BlockError::QueueStopped);
+                }
+                assert_eq!(tag, 0, "file backend has only one request slot");
+                assert!(
+                    pending.replace(tag).is_none(),
+                    "file request is already pending"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -602,7 +658,7 @@ impl Backend {
             }
             Self::Sdmmc { controller, .. } => controller.set_interrupts(enabled),
             Self::Ahci { controller, .. } => controller.set_interrupts(enabled),
-            Self::Ram { .. } => {}
+            Self::Ram { .. } | Self::File { .. } => {}
         }
     }
 
@@ -615,7 +671,7 @@ impl Backend {
                 // SAFETY: 当前持有 `Disk.queue` 自旋锁独占访问 VirtQueue 的 `avail`/`used` 环标志与索引，无并发竞争。
                 unsafe { v.device.driver_mut() }.enable_interrupts_and_recheck()
             }
-            Self::Ram { .. } => false,
+            Self::Ram { .. } | Self::File { .. } => false,
             Self::Sdmmc { controller, .. } => controller.arm_and_check(),
             Self::Ahci { controller, .. } => controller.arm_and_check(),
         }
@@ -647,7 +703,7 @@ impl Backend {
                 completion: false,
                 fault: false,
             },
-            Self::Ram { .. } => IrqCause {
+            Self::Ram { .. } | Self::File { .. } => IrqCause {
                 claimed: false,
                 completion: false,
                 fault: false,
@@ -669,19 +725,20 @@ impl Backend {
 
     /// 判断该后端是否通过 `Disk.progress_work` 工作队列任务在锁外推进请求执行。
     ///
-    /// `Ram`、`Sdmmc`、`Ahci` 返回 `true`；异步环形队列驱动的 `Virtio` 返回 `false`。
+    /// RAM、SDMMC、AHCI 与 File 由同一进度任务串行执行；异步环形队列驱动的 VirtIO 返回 `false`。
     pub(super) fn uses_work(&self) -> bool {
         !matches!(self, Self::Virtio(_))
     }
 
     /// 提取供 `Disk.progress_work` 在释放 `Disk.queue` 自旋锁后执行数据传输的目标句柄 [`WorkTarget`]。
     ///
-    /// 克隆控制器 `Arc` 后，工作队列任务可在锁外可睡眠上下文执行命令，同时不阻碍硬中断继续通过 `Backend` 认领中断事件。
+    /// 克隆控制器或文件 `Arc` 后，在锁外可睡眠上下文执行命令，同时允许硬中断继续认领控制器事件。
     pub(super) fn work_target(&self) -> Option<WorkTarget> {
         match self {
             Self::Ram { region, .. } => Some(WorkTarget::Ram(*region)),
             Self::Sdmmc { controller, .. } => Some(WorkTarget::Sdmmc(Arc::clone(controller))),
             Self::Ahci { controller, .. } => Some(WorkTarget::Ahci(Arc::clone(controller))),
+            Self::File { backing, .. } => Some(WorkTarget::File(Arc::clone(backing))),
             Self::Virtio(_) => None,
         }
     }
@@ -706,6 +763,11 @@ impl Backend {
                 stopped: false,
                 ..
             } => pending.pop_front(),
+            Self::File {
+                pending,
+                stopped: false,
+                ..
+            } => pending.take(),
             _ => None,
         }
     }
@@ -716,7 +778,7 @@ impl Backend {
     pub(super) fn request_reset(&mut self) {
         match self {
             Self::Virtio(v) => v.device.request_reset(),
-            Self::Ram { stopped, .. } => *stopped = true,
+            Self::Ram { stopped, .. } | Self::File { stopped, .. } => *stopped = true,
             Self::Sdmmc {
                 controller,
                 stopped,
@@ -742,7 +804,7 @@ impl Backend {
     pub(super) fn reset_complete(&mut self) -> bool {
         match self {
             Self::Virtio(v) => v.device.reset_complete(),
-            Self::Ram { stopped, .. } => *stopped,
+            Self::Ram { stopped, .. } | Self::File { stopped, .. } => *stopped,
             Self::Sdmmc { controller, .. } => controller.reset_complete(),
             Self::Ahci { controller, .. } => controller.reset_complete(),
         }

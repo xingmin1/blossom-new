@@ -989,6 +989,68 @@ impl MetadataCache {
         }))
     }
 
+    /// 作废已摘除物理块当前驻留的元数据片段；可睡眠，缺页时不分配节点或发起读取。
+    ///
+    /// # Safety
+    /// 1. 旧块树与映射根必须已移除目标块。调用方须通过 inode 写锁与失效锁、
+    ///    mapping/root 及元数据回写同步，排空目标窗口的旧读取、修改、alias 借用和 I/O，
+    ///    并在调用期间阻止新增访问；不得用于丢弃仍有效的元数据持久化义务。
+    /// 2. 目标块尚未归还物理块位图，且调用期间不会被释放或复用。
+    /// 3. 调用期间不得并发关闭当前元数据缓存；不相交的相邻窗口允许并发访问。
+    pub(crate) unsafe fn forget_resident_block(
+        self: &Arc<Self>,
+        block: u64,
+        block_size: usize,
+    ) -> Result<(), BlockError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BlockError::QueueStopped);
+        }
+        if self.claim.mode() != AccessMode::ReadWrite {
+            return Err(BlockError::ReadOnly);
+        }
+        let (byte, offset) = self.block_range(block, block_size)?;
+        let page = byte - offset as u64;
+        let first_len = block_size.min(PAGE_SIZE - offset);
+
+        // Step 1: 在索引锁内分别保活两侧命中页，单侧缺页不会跳过另一侧的驻留片段。
+        let fragments = {
+            let entries = self.index.entries.lock();
+            if entries.closed {
+                return Err(BlockError::QueueStopped);
+            }
+            let first = entries
+                .get(page)
+                .map(|node| node.folio.clone().with_metadata_owner(Arc::clone(self)));
+            let tail = if first_len < block_size {
+                entries
+                    .get(page + PAGE_SIZE as u64)
+                    .map(|node| node.folio.clone().with_metadata_owner(Arc::clone(self)))
+            } else {
+                None
+            };
+            [
+                (first, offset, first_len),
+                (tail, 0, block_size - first_len),
+            ]
+        };
+
+        // Step 2: 释放索引锁后才等待回写，每次仅持有一个页面的内容锁。
+        for (folio, offset, len) in fragments {
+            let Some(folio) = folio else { continue };
+            folio.wait_writeback();
+            let mut content = folio.lock_content();
+            // SAFETY:
+            // 1. 调用方已摘除旧树和映射根，排空目标读写、alias 与 I/O 并阻止新增；
+            //    目标块仍占用位图，调用期间不会复用或并发关闭缓存。
+            // 2. folio 在索引自旋锁内克隆并绑定 metadata owner，保活物理页、缓存与 claim；
+            //    回写等待和内容加锁均在索引锁外，当前内容锁阻止元数据回写重新进入该页。
+            // 3. block_range 已校验分区范围与对齐，offset/len 仅覆盖所选块在本页的
+            //    sector 窗口，不修改同页邻块或相邻分区扇区。
+            unsafe { content.forget_metadata(offset, len)? };
+        }
+        Ok(())
+    }
+
     /// 校验逻辑块号 `block` 与块大小 `block_size` 是否合法且满足设备扇区对齐，返回 `(磁盘绝对字节偏移, 页内字节偏移)`。
     fn block_range(&self, block: u64, block_size: usize) -> Result<(u64, usize), BlockError> {
         if !matches!(

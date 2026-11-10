@@ -2,7 +2,7 @@
 //!
 //! # 模块职责与架构定位
 //! 本模块位于上层消费者（文件系统、页面/元数据缓存、分区发现、全局设备表 `storage`）与底层块传输后端
-//! （VirtIO-Blk、SD/MMC、AHCI、内存盘）之间，定义设备无关的块 I/O 请求协议、容量/对齐限额、错误分类与完成回调模型。
+//! （VirtIO-Blk、SD/MMC、AHCI、内存盘与普通文件）之间，定义设备无关的块 I/O 请求协议、容量/对齐限额、错误分类与完成回调模型。
 //!
 //! # 核心对象分层与请求流转
 //! ```text
@@ -18,7 +18,7 @@
 //!   Disk + SlotStorage (物理块设备实例：管理固定数量请求槽、中断与停机)
 //!          │
 //!          ▼
-//!   Backend (VirtIO / SDMMC / AHCI / RAM 传输层)
+//!   Backend (VirtIO / SDMMC / AHCI / RAM / File 传输层)
 //! ```
 //!
 //! # 锁获取顺序与并发契约
@@ -42,6 +42,9 @@ mod ktest_queue;
 mod ktest_quota;
 #[cfg(feature = "ktest")]
 mod ktest_ram;
+mod loop_abi;
+mod loop_backing;
+pub(crate) mod loop_device;
 pub mod partition;
 mod reserve;
 mod stop;

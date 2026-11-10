@@ -67,6 +67,8 @@ pub(crate) enum Errno {
     Permission = 13,
     /// 用户空间指针越界、未映射或缺少所需读写权限（`EFAULT = 14`）。
     BadAddress = 14,
+    /// 挂载源路径指向的对象不是块设备节点（`ENOTBLK = 15`）。
+    NotBlock = 15,
     /// 目标设备、挂载点或文件资源正在使用中无法卸载或独占修改（`EBUSY = 16`）。
     Busy = 16,
     /// 创建文件、目录或固定不覆盖映射（`MAP_FIXED_NOREPLACE`）时目标已存在（`EEXIST = 17`）。
@@ -192,11 +194,11 @@ impl From<FsError> for Errno {
             FsError::NameTooLong => Self::NameTooLong,
             FsError::NotDirectory => Self::NotDirectory,
             FsError::InvalidName | FsError::InvalidOperation => Self::InvalidArgument,
-            FsError::Busy => Self::Busy,
+            FsError::Busy | FsError::Io(BlockError::Busy) => Self::Busy,
             FsError::TooManySymlinks => Self::TooManySymlinks,
             FsError::BadFd => Self::BadFd,
             FsError::TooManyFiles => Self::TooManyFiles,
-            FsError::ReadOnly => Self::ReadOnly,
+            FsError::ReadOnly | FsError::Io(BlockError::ReadOnly) => Self::ReadOnly,
             FsError::IsDirectory => Self::IsDirectory,
             FsError::IllegalSeek => Self::IllegalSeek,
             FsError::NotTty => Self::NotTty,

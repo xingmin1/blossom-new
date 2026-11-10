@@ -29,6 +29,7 @@
 //! - 当输入源缓冲区本身映射到同一文件的只读页时，拷贝缺页路径（Fault-in）必须在未持有目标 Inode 排他写锁的阶段完成预取，避免同 Inode 读写自死锁。
 
 use super::*;
+use crate::fs::file::ReadBuffer;
 
 /// 校验文件 `stat` 视图与磁盘 Inode 记录中的 `mtime` 和 `ctime` 一致，且落在给定实时钟区间 `[earlier, later]` 内。
 ///
@@ -78,15 +79,15 @@ fn modified_between(
 pub(super) mod cases {
     use super::*;
 
-    /// 测试内核与用户缓冲区写入、跨未映射页的部分拷贝（Partial Progress）、共享只读映射同步可见性及同文件映射源缺页写入（W04）。
+    /// 测试内核与用户缓冲区读写、跨未映射页的部分拷贝、共享只读映射同步可见性及同文件映射源缺页写入（W04）。
     ///
-    /// - **测试目标**：验证 `write_at` / `write_from` 的文件游标语义、跨无效用户地址时的已提交前缀保留、写入对共享只读映射页的即时可见性，以及将同一文件的映射页作为写入源时的缺页处理。
+    /// - **测试目标**：验证 `write_at` / `write_from` / `read_into` 的文件游标语义、跨无效用户地址时的已提交前缀保留、写入对共享只读映射页的即时可见性，以及将同一文件的映射页作为写入源时的缺页处理。
     /// - **场景步骤（Given-When-Then）**：
     ///   1. 使用 `write_at` 跨越第一个页边界写入数据，验证文件洞区零填充、`mtime`/`ctime` 更新且文件当前游标保持为 0。
-    ///   2. 构造尾部紧邻未映射虚拟页的用户态缓冲区（仅前 17 字节有效），调用 `write_from` 写入；随后从完全未映射的地址再次调用 `write_from`。
+    ///   2. 构造尾部紧邻未映射虚拟页的用户态缓冲区，分别验证 17 字节和 1027 字节有效前缀的短写、1027 字节有效前缀的短读，以及完全未映射地址的读写错误。
     ///   3. 建立该文件的共享只读内存映射（`RO`），先后向文件已存在页与超出原大小的新偏移写入字节，通过映射虚拟地址读取验证。
     ///   4. 打开另一个文件并建立未预触发缺页的私有只读映射，将该映射区直接作为 `write_at_from` 的数据源追加写入同一文件尾部。
-    /// - **预期结果**：部分有效的用户缓冲区成功写入前 17 字节并推进游标，完全无效地址返回 `BadAddress` 且不修改时间戳；共享只读映射实时反映文件覆写与页内增长；同文件映射作为输入源时正常触发缺页加载并完成写入，不发生锁重入死锁。
+    /// - **预期结果**：部分有效的用户缓冲区按有效前缀长度读写并推进游标，文件大小不变且传输内容完整；完全无效地址返回 `BadAddress` 且不推进游标，写入错误不修改时间戳；共享只读映射实时反映文件覆写与页内增长；同文件映射作为输入源时正常触发缺页加载并完成写入，不发生锁重入死锁。
     #[test]
     #[ktest(tags("W04"))]
     fn kernel_user_prefix_and_same_file_source(
@@ -141,6 +142,60 @@ pub(super) mod cases {
             (after_fault.mtime, after_fault.ctime),
             (before_fault.mtime, before_fault.ctime),
         );
+
+        // 有效前缀超过原 512 字节分片，遇到下一用户页缺页后仍须完整提交。
+        let mut prefix = [0u8; 1027];
+        for (index, byte) in prefix.iter_mut().enumerate() {
+            *byte = (index & 255) as u8;
+        }
+        context.expect_eq(
+            address_space
+                .copyout(SOURCE + 4096 - prefix.len(), &prefix)
+                .copied,
+            prefix.len(),
+        );
+        let mut source = checked(
+            context,
+            WriteBuffer::user(
+                &address_space,
+                SOURCE + 4096 - prefix.len(),
+                prefix.len() + 17,
+            ),
+        )?;
+        context.expect_eq(
+            checked(context, file.write_from(&mut source, FileIoContext::Kernel))?,
+            1027,
+        );
+        context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 1044);
+        context.expect_eq(checked(context, file.stat())?.size, 5120);
+        bytes_at(context, &file, 17, &prefix)?;
+
+        // 读取目标跨越用户页边界时，文件游标只推进实际写入用户页的字节数。
+        context.expect_eq(checked(context, file.seek(SeekFrom::Start(0)))?, 0);
+        let mut target = checked(
+            context,
+            ReadBuffer::user(&address_space, SOURCE + 4096 - 1027, 1027 + 17),
+        )?;
+        context.expect_eq(
+            checked(context, file.read_into(&mut target, FileIoContext::Kernel))?,
+            1027,
+        );
+        context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 1027);
+        context.expect_eq(checked(context, file.stat())?.size, 5120);
+        mapped_bytes(context, &address_space, SOURCE + 4096 - 1027, &[0x72; 17]);
+        mapped_bytes(
+            context,
+            &address_space,
+            SOURCE + 4096 - 1010,
+            &prefix[..1010],
+        );
+
+        let mut target = checked(context, ReadBuffer::user(&address_space, SOURCE + 4096, 17))?;
+        context.expect_eq(
+            file.read_into(&mut target, FileIoContext::Kernel),
+            Err(FsError::BadAddress),
+        );
+        context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 1027);
 
         // Step 4: 建立共享只读文件映射，验证对已映射页的数据覆写与同页内 EOF 扩展对内存映射视图立即可见。
         let shared = vm(context, Mm::try_new().map_err(VmError::from))?;

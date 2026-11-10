@@ -1,0 +1,12 @@
+[[group]]
+name = "basic"
+roots = ["musl", "glibc"]
+cwd = "/basic"
+start = "#### OS COMP TEST GROUP START basic-{root} ####\n"
+end = "#### OS COMP TEST GROUP END basic-{root} ####\n"
+
+[[group.step]]
+directory = "."
+include = ["mount", "umount"]
+exec = ["./{name}"]
+before = "Testing {name} :\n"

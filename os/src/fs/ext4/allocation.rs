@@ -32,6 +32,9 @@
 //! ```
 //! 若任何 `active == true` 的 `Reservation` 未经 `publish` 或显式 `release_*` 直接进入 `Drop`，将触发断言崩溃以暴露所有权遗漏。
 //!
+//! 截断的数据块与已读取校验的退休树节点共用物理组位集和一份 `Reservation`，不长期钉住旧块的缓存窗口。
+//! 私有位集在准备阶段可失败地分配；新树发布后逐块失效当时驻留的准确窗口，再在分配锁内批量清位并更新当前计数。
+//!
 //! # 锁获取顺序与并发契约
 //! - VFS Inode 写序列化锁 / Extent 映射写锁 ➔ `Ext4Volume::allocation`（睡眠互斥锁 `SleepMutex`）➔ `MetadataCache` 页/内容锁（`BufferRef::with_read` / `update`）。
 //! - 在 `allocate_inode` 中等待旧内存中同号 `Inode` 彻底退场（`wait_inode_reuse`）时，必须在 `Ext4Volume::allocation` 锁**之外**睡眠等待，依靠已置位的位图阻止其他分配者重复选中同一位，防止阻塞全卷分配或与回收路径形成死锁。
@@ -42,9 +45,9 @@ use crate::fs::ext4::codec::{self, GroupState};
 use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeMetadata};
 use crate::fs::types::{S_IALLUGO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRWXUGO, S_ISGID, S_IXGRP};
 use crate::fs::{FsError, InodeKind, InodeRef};
-use crate::mm::PAGE_SIZE;
 use crate::time;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 
 /// 块组内固定元数据表项的物理块起始地址（卷打开时解码并校验一次，运行期只读）。
 #[derive(Clone, Copy)]
@@ -57,13 +60,13 @@ pub(crate) struct GroupLayout {
     pub inode_table: u64,
 }
 
-/// 单个块位或 inode 位的分配/释放事务凭证，预先持有归还所需的全部元数据缓存引用。
+/// 位图分配或释放凭证，预先持有归还所需的全部元数据缓存引用；批量块释放共用一份凭证。
 struct Reservation {
     /// 所属 `Ext4Volume` 的内核实例编号，防止跨卷误传凭证。
     volume: u32,
     /// 目标位所在的块组索引（从 `0` 开始）。
     group: u64,
-    /// 目标位在块组位图内的偏移（从 `0` 开始，单位：bit）。
+    /// 单资源凭证的目标位偏移；批量块释放使用组内私有位集，此字段不参与选位。
     bit: usize,
     /// `true` 表示管理的是 inode 位图位，`false` 表示数据/元数据块位图位。
     inode: bool,
@@ -75,9 +78,11 @@ struct Reservation {
     descriptor: BufferRef,
     /// 目标块组描述符在 `descriptor` 缓冲区内的字节偏移（单位：字节）。
     offset: usize,
-    /// 主超级块所在的第 0 页缓存窗口，用于同步更新全卷空闲块/inode 计数。
+    /// 覆盖主超级块记录的最小逻辑扇区缓存窗口，用于同步更新全卷空闲计数。
     superblock: BufferRef,
-    /// 是否负有待显式消费（`publish` 或 `release_reservation`）的位图责任；为 `true` 时禁止直接析构。
+    /// 主超级块记录在 `superblock` 窗口内的字节偏移，随逻辑扇区大小确定。
+    superblock_offset: usize,
+    /// 是否负有待显式发布或释放的位图责任；为 `true` 时禁止直接析构。
     active: bool,
 }
 
@@ -89,16 +94,20 @@ pub struct UnpublishedBlock {
     reservation: Reservation,
 }
 
-/// 准备从文件块树或外部扩展属性（EA）摘除的物理块释放上下文。
+/// 准备从文件块树或外部扩展属性（EA）摘除的单个元数据块释放上下文。
 pub(crate) struct DetachedBlock {
     /// 预先加载好的位图、组描述符与超级块缓存窗口（预备期 `active == false`）。
     reservation: Reservation,
-    /// 该物理块在 `MetadataCache` 中的元数据缓存窗口：
-    /// - 若释放的是树节点或外部 EA 块，总是持有其已读取的 `BufferRef`；
-    /// - 若释放的是普通文件数据块（曾作为目录块等进入过元数据缓存），仅保留已驻留的缓存命中窗口，未命中时为 `None`。
-    ///
-    /// 最终释放物理块前需通过该引用失效缓存中的脏状态，防止后台回写把旧数据写回已被复用的物理块。
-    alias: Option<BufferRef>,
+    /// 该元数据块的精确缓存窗口；归还位图前必须等待其写回并清除窗口有效与脏状态。
+    alias: BufferRef,
+}
+
+/// 同一物理块组内待摘除的数据块与已校验树节点，仅保留位图归还所需的窗口和私有位集。
+pub(crate) struct DetachedBlockGroup {
+    /// 预先保活本组位图、描述符与窄超级块窗口，准备阶段不承担位图归还责任。
+    reservation: Reservation,
+    /// 与本组块位图窗口等长的私有位集，准确标记本次真正摘除的数据块和树节点。
+    planned: Vec<u8>,
 }
 
 /// 已在 inode 位图中置位并完成盘面初始记录清零、但尚未加入目录或 `InodeDomain` 的新 inode 凭证。
@@ -151,6 +160,17 @@ impl DetachedBlock {
         assert!(
             !self.reservation.active,
             "ext4 detached block already armed"
+        );
+        self.reservation.active = true;
+    }
+}
+
+impl DetachedBlockGroup {
+    /// 在存活外部节点修改已提交后激活本组释放责任，调用方随后还须发表 inode 根与记录。
+    pub(crate) fn arm_release(&mut self) {
+        assert!(
+            !self.reservation.active,
+            "ext4 detached block group already armed"
         );
         self.reservation.active = true;
     }
@@ -353,49 +373,81 @@ impl Ext4Volume {
         self.allocate_inode(hint, mode, uid, gid)
     }
 
-    /// 为即将从映射树或 inode 摘除的元数据节点块（Extent 内部节点、间接块或外部 EA 块）预加载其自身缓存窗口与位图释放凭证。
+    /// 为即将从映射树或 inode 摘除的元数据节点块预加载其精确缓存窗口与位图释放凭证。
     ///
-    /// 预备期不修改位图或空闲计数；若后续操作取消，直接丢弃返回值即可无副作用释放缓存引用。
+    /// 预备期不修改位图或空闲计数；若后续操作取消，直接丢弃返回值即可释放缓存引用。
     pub(crate) fn prepare_detached_block(
         &self,
         physical: u64,
         context: Option<MetadataIoContext<'_>>,
     ) -> Result<DetachedBlock, FsError> {
-        self.geometry.validate_blocks(physical, 1)?;
-        let node = self
-            .metadata
-            .get(physical, self.geometry.block_size, context)?;
-        self.prepare_block_release(physical, Some(node), context)
-    }
-
-    /// 为即将释放的文件数据块（或目录块）准备位图释放凭证，并仅在 `MetadataCache` 已缓存该物理块时捕获其缓存窗口引用，避免无谓读盘。
-    pub(crate) fn prepare_detached_data_block(
-        &self,
-        physical: u64,
-        context: Option<MetadataIoContext<'_>>,
-    ) -> Result<DetachedBlock, FsError> {
-        self.geometry.validate_blocks(physical, 1)?;
-        let alias = self
-            .metadata
-            .cached_buffer(physical, self.geometry.block_size)?;
-        self.prepare_block_release(physical, alias, context)
-    }
-
-    /// 校验物理块地址合法性，换算其所属块组与组内位偏移，并预留归还所需的组描述符、位图与超级块缓存窗口。
-    fn prepare_block_release(
-        &self,
-        physical: u64,
-        alias: Option<BufferRef>,
-        context: Option<MetadataIoContext<'_>>,
-    ) -> Result<DetachedBlock, FsError> {
-        self.geometry.validate_blocks(physical, 1)?;
-        let group = (physical - self.geometry.first_data_block) / self.geometry.blocks_per_group;
-        let bit =
-            ((physical - self.geometry.first_data_block) % self.geometry.blocks_per_group) as usize;
+        let g = &self.geometry;
+        g.validate_blocks(physical, 1)?;
+        let alias = self.metadata.get(physical, g.block_size, context)?;
+        let group = (physical - g.first_data_block) / g.blocks_per_group;
+        let bit = ((physical - g.first_data_block) % g.blocks_per_group) as usize;
         Ok(DetachedBlock {
             reservation: self.prepare_release_reservation(group, bit, false, false, context)?,
             alias,
         })
+    }
+
+    /// 将连续物理区间加入按组排序的私有释放位集，不读取或钉住目标块的缓存窗口。
+    ///
+    /// 调用方须持有 inode 写序列化与失效保护，树节点应先由遍历路径完成读取校验；失败后整份计划可直接丢弃。
+    pub(crate) fn prepare_detached_blocks(
+        &self,
+        mut physical: u64,
+        count: u64,
+        groups: &mut Vec<DetachedBlockGroup>,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<(), FsError> {
+        let g = &self.geometry;
+        g.validate_blocks(physical, count)?;
+        let end = physical + count;
+        while physical < end {
+            let relative = physical - g.first_data_block;
+            let group = relative / g.blocks_per_group;
+            let first =
+                usize::try_from(relative % g.blocks_per_group).map_err(|_| FsError::Corrupt)?;
+            let valid = valid_bits(g, group, false);
+            if valid <= first {
+                return Err(FsError::Corrupt);
+            }
+            let len = usize::try_from((end - physical).min((valid - first) as u64))
+                .map_err(|_| FsError::Corrupt)?;
+            let slot =
+                match groups.binary_search_by_key(&group, |pending| pending.reservation.group) {
+                    Ok(slot) => slot,
+                    Err(slot) => {
+                        groups.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+                        let mut planned = Vec::new();
+                        planned
+                            .try_reserve_exact(g.block_size)
+                            .map_err(|_| FsError::NoMemory)?;
+                        planned.resize(g.block_size, 0);
+                        let reservation =
+                            self.prepare_release_reservation(group, first, false, false, context)?;
+                        groups.insert(
+                            slot,
+                            DetachedBlockGroup {
+                                reservation,
+                                planned,
+                            },
+                        );
+                        slot
+                    }
+                };
+            let pending = &mut groups[slot];
+            for bit in first..first + len {
+                if bit_is_set(&pending.planned, bit) {
+                    return Err(FsError::Corrupt);
+                }
+                set_bit(&mut pending.planned, bit, true);
+            }
+            physical += len as u64;
+        }
+        Ok(())
     }
 
     /// 失效已摘除物理块的元数据缓存脏状态，并将该块位归还到块位图与空闲计数中。
@@ -411,14 +463,119 @@ impl Ext4Volume {
             block.reservation.active,
             "ext4 block still belongs to its old tree"
         );
-        if let Some(alias) = &block.alias {
-            // SAFETY:
-            // 1. 调用方契约保证该物理块已从块映射树摘除，且不再有并发的元数据读取或新增脏写；
-            // 2. `alias` 在预备时绑定了该块精确的物理字节范围，且此时尚未清零块位图（不会被并发重分配）；
-            // 3. `BufferRef::forget` 会在等待该页在途回写彻底结束后仅清除本块范围的缓存有效与脏标志。
-            unsafe { alias.forget(&self.claim) }.expect("detached physical block invalidation");
-        }
+        let alias = &block.alias;
+        // SAFETY:
+        // 1. 调用方契约保证该物理块已从块映射树摘除，且不再有并发的元数据读取或新增脏写；
+        // 2. `alias` 在预备时绑定了该块精确的物理字节范围，且此时尚未清零块位图，不会被并发重分配；
+        // 3. `BufferRef::forget` 等待页内容锁取得写回责任后仅清除本块窗口的有效与脏标志。
+        unsafe { alias.forget(&self.claim) }.expect("detached physical block invalidation");
         self.release_reservation(&mut block.reservation);
+    }
+
+    /// 逐个失效本组计划块当前驻留的准确窗口，再在分配锁内批量归还其位图位和计数。
+    ///
+    /// 全程不分配内存或读盘；缓存未命中的页已无脏状态及外部消费者，计数与 CRC 基于锁内当前记录更新。
+    ///
+    /// # Safety
+    /// 1. 调用方持有所属 inode 的写锁、失效独占锁、映射回写锁、根写锁与 metadata 回写锁，已发表不再引用计划块的新树和 inode 记录；
+    /// 2. 两轮用户映射撤销、文件页清理及旧数据 I/O 已完成，退休树节点的临时窗口已释放，不存在目标窗口的外部借用或新增消费者；
+    /// 3. 所有计划块仍占用位图，全部驻留片段失效完成前不能归还或复用；当前卷与缓存保持开放。
+    pub(crate) unsafe fn release_detached_block_group(&self, group: DetachedBlockGroup) {
+        let DetachedBlockGroup {
+            mut reservation,
+            planned,
+        } = group;
+        assert_eq!(
+            reservation.volume, self.device,
+            "block group belongs to another volume"
+        );
+        assert!(
+            reservation.active,
+            "ext4 block group still belongs to its old tree"
+        );
+        assert!(!reservation.inode, "block group has an inode reservation");
+        let g = &self.geometry;
+        assert_eq!(planned.len(), g.block_size);
+        let valid = valid_bits(g, reservation.group, false);
+        assert!(
+            (valid..planned.len() * 8).all(|bit| !bit_is_set(&planned, bit)),
+            "ext4 block release exceeds group boundary"
+        );
+        let count = planned
+            .iter()
+            .try_fold(0u32, |count, byte| count.checked_add(byte.count_ones()))
+            .expect("block release count overflow");
+        assert!(0 < count, "empty ext4 block release");
+
+        let first = g.first_data_block + reservation.group * g.blocks_per_group;
+        for (byte, &selected) in planned.iter().enumerate() {
+            let mut pending = selected;
+            while pending != 0 {
+                let bit = byte * 8 + pending.trailing_zeros() as usize;
+                let physical = first + bit as u64;
+                // SAFETY:
+                // 1. 调用方已发表新树与 inode 记录并持有 inode 写锁、失效锁、映射回写锁、根写锁和 metadata 回写锁，目标块的旧消费者与 I/O 均已结束；
+                // 2. `planned` 仅包含已验证并真正摘除的块，且上方边界检查排除了末组之外的位，此时位图仍占用，无法并发复用；
+                // 3. 驻留窗口按首页和尾页分别失效，缓存索引仅用于锁内取得引用，等待与精确扇区清理不影响邻块或邻分区。
+                unsafe { self.metadata.forget_resident_block(physical, g.block_size) }
+                    .expect("detached physical block invalidation");
+                pending &= pending - 1;
+            }
+        }
+
+        let _allocation = self.allocation.lock();
+        let mut state = reservation
+            .descriptor
+            .with_read(|bytes| {
+                codec::group_state(
+                    g,
+                    &bytes[reservation.offset..reservation.offset + g.descriptor_size],
+                )
+            })
+            .expect("retained block group buffer")
+            .expect("retained block group descriptor");
+        state.free_blocks = state
+            .free_blocks
+            .checked_add(count)
+            .expect("block group free count overflow");
+        assert!(
+            u64::from(state.free_blocks) <= valid as u64,
+            "block group free count exceeds group boundary"
+        );
+        state.block_checksum = reservation
+            .bitmap
+            .update(&self.claim, |bits| {
+                assert_eq!(bits.len(), planned.len());
+                for (&current, &mask) in bits.iter().zip(&planned) {
+                    assert_eq!(current & mask, mask, "ext4 block double release");
+                }
+                for (current, &mask) in bits.iter_mut().zip(&planned) {
+                    *current &= !mask;
+                }
+                codec::bitmap_checksum(g, bits, false)
+            })
+            .expect("retained writable block bitmap");
+        self.commit_group(
+            reservation.group,
+            &reservation.descriptor,
+            reservation.offset,
+            state,
+        );
+        let now_ns = time::realtime();
+        reservation
+            .superblock
+            .update(&self.claim, |bytes| {
+                codec::patch_super_counts(
+                    g,
+                    &mut bytes[reservation.superblock_offset
+                        ..reservation.superblock_offset + codec::SUPERBLOCK_BYTES],
+                    i64::from(count),
+                    0,
+                    now_ns,
+                )
+            })
+            .expect("retained writable group superblock");
+        reservation.active = false;
     }
 
     /// 在 `nlink == 0` 的 inode 失去最后一个活跃引用后、正式截断数据与清除记录前，预加载并校验该 inode 本身、外部扩展属性块及所有关联 `EA_INODE` 的释放窗口。
@@ -468,15 +625,10 @@ impl Ext4Volume {
             None
         } else {
             let block = self.prepare_detached_block(inode.file_acl, context)?;
-            let (references, count) = block
-                .alias
-                .as_ref()
-                .expect("external EA buffer")
-                .with_read(|bytes| {
-                    let count =
-                        codec::verify_xattr_release(g, inode.file_acl, bytes, &mut numbers)?;
-                    Ok::<_, FsError>((codec::le32(bytes, 4)?, count))
-                })??;
+            let (references, count) = block.alias.with_read(|bytes| {
+                let count = codec::verify_xattr_release(g, inode.file_acl, bytes, &mut numbers)?;
+                Ok::<_, FsError>((codec::le32(bytes, 4)?, count))
+            })??;
             if references == 1 {
                 self.prepare_ea_references(inode.number, &numbers[..count], &mut ea, context)?;
             }
@@ -573,7 +725,7 @@ impl Ext4Volume {
         if let Some((physical, mut block)) = prepared.acl.take() {
             let shared = {
                 let _allocation = self.allocation.lock();
-                let alias = block.alias.as_ref().expect("retained external EA buffer");
+                let alias = &block.alias;
                 let references = alias
                     .with_read(|bytes| codec::le32(bytes, 4))
                     .expect("retained external EA view")
@@ -607,7 +759,7 @@ impl Ext4Volume {
         self.release_reservation(&mut prepared.reservation);
     }
 
-    /// 预加载指定块组与位偏移归还所需的组描述符、位图及主超级块缓存窗口，初始 `active` 设为 `false` 以便中途取消时可直接丢弃。
+    /// 预加载组描述符、位图及窄超级块窗口并记录其实际偏移，返回可无副作用取消的 inactive 释放凭证。
     fn prepare_release_reservation(
         &self,
         group: u64,
@@ -628,7 +780,7 @@ impl Ext4Volume {
         let bitmap = self
             .metadata
             .get(physical, self.geometry.block_size, context)?;
-        let superblock = self.metadata.get(0, PAGE_SIZE, context)?;
+        let (superblock, superblock_offset) = self.superblock_buffer(context)?;
         Ok(Reservation {
             volume: self.device,
             group,
@@ -639,20 +791,21 @@ impl Ext4Volume {
             descriptor,
             offset,
             superblock,
+            superblock_offset,
             active: false,
         })
     }
 
-    /// 在 `self.allocation` 锁保护下按提示块组循环扫描空闲位，必要时执行延迟位图初始化，置位位图并同步扣减块组描述符与超级块空闲计数。
+    /// 在分配锁内按提示组扫描和初始化位图，预先取得窄超级块窗口，再同步置位及更新当前计数与 CRC。
     fn reserve(&self, hint: u64, inode: bool, directory: bool) -> Result<Reservation, FsError> {
         self.require_write(&self.claim)?;
         // ponytail: 卷分配睡眠锁串行化计数，真实分配竞争成为瓶颈时拆每组锁。
         let _allocation = self.allocation.lock();
         let g = &self.geometry;
         // Step 1: 读取主超级块确认全卷尚有空闲块或空闲 inode，若已耗尽则直接返回 NoSpace。
-        let superblock = self.metadata.get(0, PAGE_SIZE, None)?;
+        let (superblock, superblock_offset) = self.superblock_buffer(None)?;
         let available = superblock.with_read(|bytes| -> Result<u64, FsError> {
-            let record = &bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END];
+            let record = &bytes[superblock_offset..superblock_offset + codec::SUPERBLOCK_BYTES];
             if inode {
                 return Ok(u64::from(codec::le32(record, 16)?));
             }
@@ -750,7 +903,7 @@ impl Ext4Volume {
                 .update(&self.claim, |bytes| {
                     codec::patch_super_counts(
                         g,
-                        &mut bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END],
+                        &mut bytes[superblock_offset..superblock_offset + codec::SUPERBLOCK_BYTES],
                         if inode { 0 } else { -1 },
                         if inode { -1 } else { 0 },
                         now_ns,
@@ -767,6 +920,7 @@ impl Ext4Volume {
                 descriptor,
                 offset,
                 superblock,
+                superblock_offset,
                 active: true,
             });
         }
@@ -847,7 +1001,7 @@ impl Ext4Volume {
             .expect("prepared writable group descriptor");
     }
 
-    /// 消费活动的 `Reservation`：在 `self.allocation` 锁保护下清零目标位图位，递增块组描述符与主超级块的空闲计数（及目录计数），并将 `active` 置为 `false`。
+    /// 在分配锁内消费活动凭证，清位并递增当前组及窄超级块窗口中的空闲计数，完成后解除释放责任。
     fn release_reservation(&self, reservation: &mut Reservation) {
         assert_eq!(
             reservation.volume, self.device,
@@ -899,7 +1053,8 @@ impl Ext4Volume {
             .update(&self.claim, |bytes| {
                 codec::patch_super_counts(
                     g,
-                    &mut bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END],
+                    &mut bytes[reservation.superblock_offset
+                        ..reservation.superblock_offset + codec::SUPERBLOCK_BYTES],
                     if reservation.inode { 0 } else { 1 },
                     if reservation.inode { 1 } else { 0 },
                     now_ns,

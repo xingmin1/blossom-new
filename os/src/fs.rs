@@ -51,6 +51,7 @@ mod dentry;
 pub(crate) mod devfs;
 pub(crate) mod epoll;
 pub(crate) mod ext4;
+pub(crate) mod fat32;
 mod file;
 mod file_table;
 mod inode;
@@ -77,9 +78,9 @@ pub use file::{
     SeekFrom,
 };
 pub(crate) use file::{
-    set_nonblocking, set_status_flags, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
-    O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC,
-    O_WRONLY,
+    require_read, require_write, set_nonblocking, set_status_flags, O_ACCMODE, O_APPEND, O_CLOEXEC,
+    O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_SYNC, O_TRUNC, O_WRONLY,
 };
 pub use file::{ReadBuffer, UserIoVector, WriteBuffer};
 #[cfg(feature = "ktest")]

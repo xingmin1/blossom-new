@@ -339,6 +339,14 @@ impl Disk {
         }
     }
 
+    /// 在普通任务中等待实际文件系统占用全部释放，供已关闭新挂载准入的 loop 管理任务停止旧设备。
+    ///
+    /// 该等待包含请求槽与缓存持有的 FsClaim 克隆；调用方必须保留 Disk，并且不得从本设备进度或完成任务调用。
+    pub(crate) fn wait_no_fs_claims(&self) {
+        sched::assert_switchable();
+        self.wait_quiescent_until(|queue| queue.mounts == 0);
+    }
+
     /// 申请对指定块视图（`view`）和访问模式（`mode`）的文件系统扇区占用凭证（[`FsClaim`]）。
     ///
     /// # 仲裁规则

@@ -4,8 +4,8 @@
 //! 本模块是块设备层（`crate::block`）的核心调度与资源管理枢纽：
 //! - **上游调用者**：由 `crate::block::submit`（请求拆分与合并）、`crate::block::bio`（`Bio` 生命周期）、
 //!   `crate::block::stop`（停机与 `FsClaim` 仲裁）以及系统启动/驱动初始化代码调用。
-//! - **下游依赖**：通过 `crate::block::backend::Backend` 统一对接 VirtIO-Blk、RAM 盘、SD/MMC 与 AHCI
-//!   控制器；利用 `crate::irq` 处理设备完成中断，并通过 `crate::workqueue` 异步执行后端命令或可睡眠完成回调。
+//! - **下游依赖**：通过 `crate::block::backend::Backend` 对接 VirtIO-Blk、RAM、SD/MMC、AHCI 与普通文件；
+//!   利用 `crate::irq` 处理设备完成中断，并通过 `crate::workqueue` 执行后端命令或可睡眠完成回调。
 //!
 //! ## 核心设计与关键状态机
 //!
@@ -47,7 +47,7 @@
 //! ## 锁获取顺序（Lock Ordering）与并发契约
 //! 1. `Disk::control`（`SleepMutex<()>`）：最外层睡眠锁，仅在普通任务调用 `start()` 和 `stop()` 时获取。
 //! 2. `Disk::queue`（`SpinLock<QueueState>`）：保护队列阶段、槽位状态数组、活跃计数与侵入式链表。
-//!    - 持锁期间严禁睡眠、严禁执行大块内存拷贝（如 RAM/SDMMC 数据复制）或耗时的 `Bio` 完成回调。
+//!    - 持锁期间严禁睡眠、执行大块内存复制或调用普通文件 I/O，也不得执行耗时的 `Bio` 完成回调。
 //!    - 若需同时操作 `BioInner` 内部状态锁，顺序为：`Disk::queue` ➔ `BioInner` 状态锁（如 `register_child` / `accept_child`）。
 //! 3. `Disk::irq`（`SpinLock<Option<IrqRegistration>>`）与 `Disk::metadata_cache`（`SpinLock<Weak<MetadataPages>>`）：
 //!    均为叶子自旋锁，不在持有它们时再去获取 `Disk::queue` 锁。
@@ -63,15 +63,19 @@ use crate::block::backend::{virtio_limits, Backend, SlotControl, WorkTarget};
 use virtio_drivers::Hal;
 
 use crate::block::bio::{BioArc, BioInner};
+use crate::block::loop_backing::LoopBacking;
 use crate::block::{
     AccessMode, Bio, BlkOperation, BlockError, DiskIdentity, FsClaim, QueueLimits, MAX_BATCH,
     SECTOR_BYTES,
 };
 use crate::cache::MetadataPages;
 use crate::drivers::virtio::VirtioDevice;
+use crate::fs::FsError;
 use crate::irq::{self, IrqRegistration};
 use crate::mm::dma::{DmaDomain, KernelHal, PayloadRange};
+use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SpinLock};
+use crate::task::ReclaimScope;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 use crate::workqueue::{Work, WorkQueue};
 
@@ -111,7 +115,7 @@ pub(super) enum SlotState {
     Preparing,
     /// 已通过 `try_publish` 提交给后端（写入 VirtIO avail ring 或排入 `Work` 后端队列），硬件或后端工作队列拥有访问权。
     Submitted,
-    /// 仅用于 `Work` 驱动的后端（RAM / SDMMC / AHCI）：`progress_work` 已从后端队列取出该槽位，正在锁外执行数据传输。
+    /// 仅用于工作队列后端：唯一的 `progress_work` 已取出该槽位，正在锁外执行数据传输。
     Executing,
     /// 硬件或后端已完成传输并交回软件认领者，正在执行或等待 `completion_work` 执行上层 `Bio` 完成回调与资源清理。
     Finishing,
@@ -119,7 +123,7 @@ pub(super) enum SlotState {
 
 /// 由 `Disk::queue` 自旋锁保护的队列运行期状态与统计信息。
 pub(super) struct QueueState {
-    /// 底层块设备后端实例（VirtIO / RAM / SDMMC / AHCI）；在 `Stopped` 阶段被 `take()` 释放。
+    /// 底层硬件或软件块设备；在 `Stopped` 阶段被 `take()` 释放。
     pub(super) device: Option<Backend>,
     /// 当前队列所处的生命周期阶段。
     pub(super) phase: QueuePhase,
@@ -331,13 +335,16 @@ enum TestCompletionKind {
     Flush,
     /// 普通文件数据页的读入请求。
     FileRead,
+    /// 按请求操作类型匹配完成项。
+    Operation(BlkOperation),
 }
 
 #[cfg(feature = "ktest")]
 impl TestCompletionKind {
-    /// 检查已完成传输的请求槽资源 `resources` 是否匹配当前错误注入目标类别（裸设备直接请求不参与文件数据/元数据匹配）。
+    /// 检查已完成请求的操作或文件页类型是否匹配受控错误注入目标。
     fn matches(self, resources: &SlotResources) -> bool {
         match self {
+            Self::Operation(operation) => resources.operation == operation,
             Self::Flush => resources.operation == BlkOperation::Flush,
             Self::FileRead => {
                 resources.operation == BlkOperation::Read
@@ -474,6 +481,17 @@ impl Disk {
     ) -> Result<DiskRef, BlockError> {
         let limits = Backend::ram_limits(region)?;
         Self::prepare_backend(Backend::ram(region)?, workqueue, limits)
+    }
+
+    /// 为 loop0 的 backing 文件预分配单槽 Disk；调用方须提供独立于底层物理盘的非 ordered 工作域。
+    ///
+    /// 返回值处于 `Prepared` 阶段，须由控制面启动并在最后使用者退出后从其他管理任务调用 `stop`。
+    pub(crate) fn prepare_file(
+        backing: Arc<LoopBacking>,
+        queue: &WorkQueue,
+    ) -> Result<DiskRef, BlockError> {
+        let (backend, limits) = Backend::file(backing);
+        Self::prepare_backend(backend, queue, limits)
     }
 
     /// 使用平台解析出的 SD/MMC 控制器资源初始化 SD 卡块设备实例；若卡槽未检测到介质则返回 `Ok(None)`。
@@ -1030,7 +1048,7 @@ impl Disk {
         }
         cause.claimed || cause.fault
     }
-    /// 在 `progress_work` 工作任务上下文中，按批次（最多 `IRQ_BUDGET` 个）从 `Work` 驱动后端取出已提交槽位并在锁外执行实际 I/O。
+    /// 由唯一进度任务按预算提取已提交槽位，在队列锁外串行执行后端 I/O；文件错误只结束本次请求。
     fn progress_requests(&self) {
         crate::sched::assert_switchable();
         for _ in 0..IRQ_BUDGET {
@@ -1051,13 +1069,13 @@ impl Disk {
                 q.slot_states[usize::from(tag)] = SlotState::Executing;
                 (tag, target)
             };
-            // Step 2: 在 `queue` 锁外独占访问 `SlotResources`，根据后端类型执行内存拷贝、SD/MMC 弹跳缓冲传输或 AHCI DMA 命令。
+            // Step 2: 在队列锁外独占槽位资源，执行 CPU 复制、文件 I/O 或控制器命令。
             // SAFETY:
             // 1. 上一步在 `queue` 锁下将槽位状态从 `Submitted` 切换为 `Executing`，确保当前唯一的 `progress_work` 独占拥有该槽位；
             // 2. 停机复位流程（`reset_claimed`）会等待所有 `Executing` 槽位退出，中断处理函数仅更新控制器邮箱而不触碰 `SlotResources`；
             // 3. 槽位中的 `parts` 持有上层 `Bio` 引用与 `FsClaim`，保证目标缓冲区与扇区占用在传输期间始终有效。
             let resources = unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
-            let native = !matches!(&target, WorkTarget::Ram(_));
+            let native = matches!(&target, WorkTarget::Sdmmc(_) | WorkTarget::Ahci(_));
             let result = match target {
                 WorkTarget::Ram(region) => {
                     let start = region.start + (resources.sector * SECTOR_BYTES) as usize;
@@ -1067,6 +1085,12 @@ impl Disk {
                     unsafe {
                         copy_cpu_parts(resources, crate::arch::phys_to_virt(start) as *mut u8)
                     }
+                }
+                WorkTarget::File(backing) => {
+                    // SAFETY:
+                    // 1. 当前进度任务独占 `Executing` 槽位，所有 `Bio` 的 CPU 访问期保持至完成处理；
+                    // 2. backing 引用覆盖定位 I/O 与同步等待，队列锁已在上一步释放。
+                    unsafe { execute_file(resources, &backing) }
                 }
                 WorkTarget::Sdmmc(controller) => {
                     // SAFETY:
@@ -1102,7 +1126,7 @@ impl Disk {
                 }
             };
             // Step 3: 若后端控制器因硬件复位超时返回 `StopUnconfirmed`，立即将队列转入 `Quarantined` 隔离阶段并保留槽位与物理页不释放。
-            if result.error == Some(BlockError::StopUnconfirmed) {
+            if native && result.error == Some(BlockError::StopUnconfirmed) {
                 let mut q = self.queue.lock();
                 assert_eq!(q.slot_states[usize::from(tag)], SlotState::Executing);
                 q.failure = Some(BlockError::StopUnconfirmed);
@@ -1289,15 +1313,15 @@ impl Disk {
         }
     }
 
-    /// 执行 `Finishing` 槽位的最终完成处理：按实际完成的字节前缀逐个通知上层 `Bio` 子片段完成、清空槽位资源、在 `queue` 锁下将槽位状态归还为 `Free`，最后释放 `FsClaim`。
+    /// 按真实完成前缀结算 Bio、归还槽位并释放其 FsClaim；仅物理后端的 DeviceFault 触发硬件故障处理。
     pub(super) fn finish_slot(&self, tag: u16) {
-        // Step 1: 独占读取槽位的完成结果，若检测到设备故障则触发故障状态转换。
+        // Step 1: 独占读取完成结果，物理设备故障进入复位流程，文件来源的错误保留在请求结果中。
         let slot = &self.slots[usize::from(tag)];
         // SAFETY:
         // 本函数仅由赢得 `Finishing` 状态的唯一执行流（或其调度的专属 `completion_work`）调用；在 Step 4 将状态置回 `Free` 前，本槽位不会被重新分配。
         let resources = unsafe { &mut *slot.resources.get() };
         let (completed, error) = completion_result(resources);
-        if error == Some(BlockError::DeviceFault) {
+        if self.identity != DiskIdentity::Loop0 && error == Some(BlockError::DeviceFault) {
             self.mark_fault(BlockError::DeviceFault);
         }
 
@@ -1414,6 +1438,12 @@ impl Disk {
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_flush(&self, error: BlockError) {
         self.test_arm_completion_error(TestCompletionKind::Flush, error, None);
+    }
+
+    /// 为下一次指定操作的完成项注入一次软件完成错误。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn test_fail_next_operation(&self, operation: BlkOperation, error: BlockError) {
+        self.test_arm_completion_error(TestCompletionKind::Operation(operation), error, None);
     }
 
     /// 在 `queue` 自旋锁下配置单次完成错误注入规则 `(kind, error, prefix)`。
@@ -2016,5 +2046,101 @@ unsafe fn copy_cpu_parts(resources: &SlotResources, pointer: *mut u8) -> crate::
     crate::block::IoResult {
         completed: copied,
         error: None,
+    }
+}
+
+/// 以页大小以内的栈缓冲执行文件请求，并限制内存回收不得递归发起 I/O；只累计实际成功的连续前缀。
+///
+/// # Safety
+/// 调用方必须独占处于 `Executing` 的槽位，保持所有 Bio 的 CPU 访问期，并在未持队列锁的任务上下文调用。
+unsafe fn execute_file(resources: &SlotResources, backing: &LoopBacking) -> crate::block::IoResult {
+    // 文件页分配的直接回收不得再等待 loop0 的 I/O；显式定位读写和同步仍沿原文件路径执行。
+    let _scope = ReclaimScope::noio();
+    if resources.operation == BlkOperation::Flush {
+        return crate::block::IoResult {
+            completed: 0,
+            error: backing.flush().err().map(file_error),
+        };
+    }
+    let mut scratch = [0u8; PAGE_SIZE];
+    let mut completed = 0;
+    for part in resources.parts.iter().flatten() {
+        let mut within = 0;
+        while within < part.length {
+            let requested = (part.length - within).min(scratch.len());
+            let offset = resources.sector * SECTOR_BYTES + completed as u64;
+            let length = if resources.operation == BlkOperation::Read {
+                match backing.read_at(offset, &mut scratch[..requested]) {
+                    Ok(read) => {
+                        assert!(read <= requested, "backing read exceeds its buffer");
+                        read
+                    }
+                    Err(error) => {
+                        return crate::block::IoResult {
+                            completed,
+                            error: Some(file_error(error)),
+                        };
+                    }
+                }
+            } else {
+                requested
+            };
+            // SAFETY:
+            // 1. `within + length <= part.length`，该区间由当前未完成的子请求独占；
+            // 2. scratch 为不与 Bio 负载重叠的本任务栈内存；读方向仅复制已读取的字节；
+            // 3. `copy_cpu` 对共享写回页使用 volatile 访问，不构造与用户写入冲突的 Rust 切片。
+            if let Err(error) = unsafe {
+                part.bio
+                    .copy_cpu(part.offset + within, length, scratch.as_mut_ptr())
+            } {
+                return crate::block::IoResult {
+                    completed,
+                    error: Some(error),
+                };
+            }
+            let transferred = if resources.operation == BlkOperation::Write {
+                match backing.write_at(offset, &scratch[..length]) {
+                    Ok(written) => {
+                        assert!(written <= length, "backing write exceeds its source");
+                        written
+                    }
+                    Err(error) => {
+                        return crate::block::IoResult {
+                            completed,
+                            error: Some(file_error(error)),
+                        };
+                    }
+                }
+            } else {
+                length
+            };
+            completed += transferred;
+            if transferred < requested {
+                return crate::block::IoResult {
+                    completed,
+                    error: Some(BlockError::ShortIo),
+                };
+            }
+            within += transferred;
+        }
+    }
+    crate::block::IoResult {
+        completed,
+        error: None,
+    }
+}
+
+/// 将文件来源的失败映射为块请求错误，保留真实设备错误；文件空间和文件操作错误统一报告 I/O 失败。
+fn file_error(error: FsError) -> BlockError {
+    match error {
+        FsError::Io(error) => error,
+        FsError::NoMemory => BlockError::NoMemory,
+        FsError::ReadOnly | FsError::BadFd | FsError::Permission | FsError::NotPermitted => {
+            BlockError::ReadOnly
+        }
+        FsError::Unsupported => BlockError::Unsupported,
+        FsError::Corrupt => BlockError::Corrupt,
+        FsError::Checksum => BlockError::Checksum,
+        _ => BlockError::Io,
     }
 }

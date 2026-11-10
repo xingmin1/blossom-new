@@ -58,10 +58,14 @@
 
 use alloc::sync::Arc;
 
+use crate::block::loop_device::{acquire_mount, LOOP0_RDEV};
 use crate::block::partition::DeviceSelector;
 use crate::block::AccessMode;
+use crate::fs::fat32::Fat32Volume;
 use crate::fs::memfs::{FilesystemStat, MemoryFs};
-use crate::fs::{devfs, procfs, Ext4Volume, Filesystem, Path, ResolveMode, NAME_MAX, PATH_MAX};
+use crate::fs::{
+    devfs, procfs, Ext4Volume, Filesystem, InodeKind, Path, ResolveMode, NAME_MAX, PATH_MAX,
+};
 use crate::storage::Storage;
 use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::syscall::Outcome;
@@ -251,7 +255,7 @@ fn encode_statfs(stat: FilesystemStat, mode: AccessMode) -> [u8; STATFS_SIZE] {
     bytes
 }
 
-/// `mount` 系统调用：挂载新的文件系统实例（支持 `ext4`、`tmpfs`、`proc`、`devfs`），或对已挂载的 `tmpfs` 执行重新挂载（`MS_REMOUNT`）以调整读写模式与配额选项。
+/// `mount` 系统调用：挂载 `ext4`、`vfat`、`tmpfs`、`proc` 或 `devfs`，或重新配置原 `tmpfs` 挂载。
 ///
 /// - **调用上下文**：普通可睡眠用户任务上下文，仅允许有效 UID 为 0 的特权进程调用。
 /// - **参数**：`raw[0]` 为源设备路径地址，`raw[1]` 为挂载目标目录路径地址，`raw[2]` 为文件系统类型字符串地址，`raw[3]` 为挂载标志位（`MS_*`），`raw[4]` 为挂载选项字符串地址。
@@ -309,7 +313,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         return Ok(0);
     }
 
-    // Step 4: 根据文件系统类型构造新的后端文件系统实例（打开块设备上的 ext4 卷或初始化内存文件系统）。
+    // Step 4: 根据文件系统类型打开真实磁盘卷或初始化内存文件系统；vfat 的设备身份来自当前路径视图。
     let (filesystem, mode) = match kind.as_deref().expect("new mount has no type") {
         b"ext4" => {
             if !options.is_empty() {
@@ -321,6 +325,33 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
             let view = storage.lookup(selector).ok_or(Errno::NoDevice)?;
             let volume = Ext4Volume::open(view, requested_mode, MOUNT_METADATA_CAPACITY)?;
             (Filesystem::Ext4(volume), requested_mode)
+        }
+        b"vfat" => {
+            if !options.is_empty() {
+                return Err(Errno::InvalidArgument);
+            }
+            let source = source.as_deref().ok_or(Errno::NoDevice)?;
+            let (vfs, context) = {
+                let fs = runtime.fs.lock();
+                (fs.vfs.clone(), fs.context.clone())
+            };
+            let path = vfs.resolve_from(
+                &context,
+                context.cwd(),
+                source,
+                ResolveMode::Follow,
+                Some((runtime.credentials.uid, runtime.credentials.gid)),
+            )?;
+            let metadata = path.inode()?.metadata_snapshot()?;
+            if metadata.kind != InodeKind::Block {
+                return Err(Errno::NotBlock);
+            }
+            if metadata.rdev != LOOP0_RDEV {
+                return Err(Errno::NoDevice);
+            }
+            let lease = acquire_mount()?;
+            let volume = Fat32Volume::open(lease, requested_mode)?;
+            (Filesystem::Fat32(volume), requested_mode)
         }
         b"tmpfs" => {
             let filesystem = MemoryFs::try_tmpfs(options)?;

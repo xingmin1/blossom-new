@@ -2,7 +2,7 @@
 //!
 //! ## 模块职责与架构定位
 //! 本模块承担两项核心职责：
-//! 1. 定义统一的后端枚举 [`Filesystem`]，为上层虚拟文件系统（[`crate::fs::Vfs`]）屏蔽磁盘卷（[`Ext4Volume`]）与内存卷（[`MemoryFs`]）在设备号、容量统计、同步及目录项名字缓存上的差异。
+//! 1. 定义统一的后端枚举 [`Filesystem`]，为上层虚拟文件系统（[`crate::fs::Vfs`]）分派 ext4 卷（[`Ext4Volume`]）、FAT32 卷（[`Fat32Volume`]）与内存卷（[`MemoryFs`]）的设备号、容量统计、同步及目录项名字缓存操作。
 //! 2. 实现基于内存的权威 Inode 与容量记账后端 [`MemoryFs`]，同时支撑可读写并受配额限制的 `tmpfs`、只读固定设备目录 `devfs` 以及只读系统信息目录 `procfs`。
 //!
 //! ## 核心设计与引用关系
@@ -46,10 +46,13 @@ use spin::Once;
 use crate::block::AccessMode;
 use crate::fs::dentry::{Dentry, DentryCache, DentryRef};
 use crate::fs::ext4::Ext4Volume;
+use crate::fs::fat32::Fat32Volume;
 use crate::fs::inode::{
     Inode, InodeCache, InodeMetadata, InodeRef, MemoryContent, MemoryDirectory,
 };
-use crate::fs::types::{InodeKind, S_IALLUGO, S_IFCHR, S_IFDIR, S_IFREG, S_IRWXUGO, S_ISVTX};
+use crate::fs::types::{
+    InodeKind, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFREG, S_IRWXUGO, S_ISVTX,
+};
 use crate::fs::FsError;
 use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
@@ -65,10 +68,19 @@ const DEVFS_MAGIC: u64 = 0x1373;
 /// `procfs` 文件系统魔数（对应 `PROC_SUPER_MAGIC = 0x9fa0`）。
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 
-/// 内存文件系统实例设备号（`st_dev`）的起始基址（从 $2^{32}$ 开始递增，避免与块设备号冲突）。
+/// 内存与 FAT 文件系统实例设备号（`st_dev`）的起始基址（从 $2^{32}$ 开始递增，避免与 ext4 卷设备号冲突）。
 const MEMORY_DEVICE_BASE: u64 = 1u64 << u32::BITS;
-/// 全局递增的下一个内存文件系统设备号分配器。
+/// 内存与 FAT 文件系统共用的单调递增设备号分配器。
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(MEMORY_DEVICE_BASE);
+
+/// 从内存卷与 FAT 卷共用的身份空间分配设备号；耗尽时返回 `NoSpace`，不回绕或复用旧号。
+pub(crate) fn allocate_device() -> Result<u64, FsError> {
+    NEXT_DEVICE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| FsError::NoSpace)
+}
 
 /// 文件系统容量与 Inode 使用情况统计快照（用于填充 `statfs` / `fstatfs` 系统调用结果）。
 ///
@@ -98,6 +110,8 @@ pub struct FilesystemStat {
 pub enum Filesystem {
     /// 基于块设备的 `ext4` 磁盘文件系统卷。
     Ext4(Arc<Ext4Volume>),
+    /// 基于真实块视图的 FAT32 文件系统卷。
+    Fat32(Arc<Fat32Volume>),
     /// 基于内存的 `tmpfs`、`devfs` 或 `procfs` 文件系统实例。
     Memory(Arc<MemoryFs>),
 }
@@ -107,6 +121,7 @@ impl Filesystem {
     pub fn device(&self) -> u64 {
         match self {
             Self::Ext4(fs) => fs.device(),
+            Self::Fat32(fs) => fs.device(),
             Self::Memory(fs) => fs.device(),
         }
     }
@@ -115,6 +130,7 @@ impl Filesystem {
     pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
         match self {
             Self::Ext4(fs) => fs.statfs(),
+            Self::Fat32(fs) => fs.statfs(),
             Self::Memory(fs) => fs.statfs(),
         }
     }
@@ -123,6 +139,7 @@ impl Filesystem {
     pub fn mode(&self) -> AccessMode {
         match self {
             Self::Ext4(fs) => fs.mode(),
+            Self::Fat32(fs) => fs.mode(),
             Self::Memory(fs) => fs.mode(),
         }
     }
@@ -131,6 +148,7 @@ impl Filesystem {
     pub fn sync(&self) -> Result<(), FsError> {
         match self {
             Self::Ext4(fs) => fs.sync(),
+            Self::Fat32(fs) => fs.sync(),
             Self::Memory(_) => Ok(()),
         }
     }
@@ -139,6 +157,7 @@ impl Filesystem {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Ext4(a), Self::Ext4(b)) => Arc::ptr_eq(a, b),
+            (Self::Fat32(a), Self::Fat32(b)) => Arc::ptr_eq(a, b),
             (Self::Memory(a), Self::Memory(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -148,6 +167,7 @@ impl Filesystem {
     pub(crate) fn identity_address(&self) -> usize {
         match self {
             Self::Ext4(fs) => Arc::as_ptr(fs) as usize,
+            Self::Fat32(fs) => Arc::as_ptr(fs) as usize,
             Self::Memory(fs) => Arc::as_ptr(fs) as usize,
         }
     }
@@ -160,6 +180,7 @@ impl Filesystem {
     ) -> Result<(Arc<DentryCache>, DentryRef), FsError> {
         match self {
             Self::Ext4(fs) => inodes.dentry_namespace(fs, capacity),
+            Self::Fat32(fs) => fs.dentry_namespace(capacity),
             Self::Memory(fs) => fs.dentry_namespace(capacity),
         }
     }
@@ -168,6 +189,7 @@ impl Filesystem {
     pub(crate) fn lock_rename(&self) -> SleepMutexGuard<'_, ()> {
         match self {
             Self::Ext4(fs) => fs.lock_rename(),
+            Self::Fat32(fs) => fs.lock_rename(),
             Self::Memory(fs) => fs.rename.lock(),
         }
     }
@@ -205,6 +227,8 @@ pub enum MemorySpecial {
     Ktrace,
     /// `/dev/testhook` 评测控制字符设备（仅限 root 只写）。
     TestHook,
+    /// `/dev/loop0` 文件后端块设备；所有 devfs 实例共享同一绑定。
+    Loop0,
     /// `/proc/cmdline` 内核启动命令行参数文件。
     Cmdline,
     /// `/proc/mounts` 当前可见挂载表文件。
@@ -335,11 +359,7 @@ impl MemoryFs {
         (max_pages, max_inodes): (usize, usize),
         graph: Weak<TaskGraph>,
     ) -> Result<Arc<Self>, FsError> {
-        let device = NEXT_DEVICE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| FsError::NoSpace)?;
+        let device = allocate_device()?;
         let fs = Arc::try_new(Self {
             kind,
             device,
@@ -474,7 +494,7 @@ impl MemoryFs {
         )
     }
 
-    /// 在尚未公开名字缓存的 `devfs` 或 `procfs` 父目录下创建并挂载一个特殊节点（字符设备或动态快照节点）。
+    /// 在尚未公开名字缓存的 `devfs` 或 `procfs` 父目录下创建字符设备、块设备或动态快照节点。
     ///
     /// 仅限内核在构建 `devfs` / `procfs` 阶段调用；一旦文件系统通过 `dentry_namespace` 公开，后续调用将返回 [`FsError::InvalidOperation`]。
     pub(crate) fn initialize_special(
@@ -488,6 +508,7 @@ impl MemoryFs {
         let _rename = self.rename.lock();
         self.require_initialization_parent(parent)?;
         let kind = match (self.kind, special) {
+            (MemoryFsKind::Devfs, MemorySpecial::Loop0) => InodeKind::Block,
             (
                 MemoryFsKind::Devfs,
                 MemorySpecial::Null
@@ -512,10 +533,10 @@ impl MemoryFs {
             _ => return Err(FsError::InvalidOperation),
         };
         let mode = (mode & S_IALLUGO)
-            | if kind == InodeKind::Character {
-                S_IFCHR
-            } else {
-                S_IFREG
+            | match kind {
+                InodeKind::Character => S_IFCHR,
+                InodeKind::Block => S_IFBLK,
+                _ => S_IFREG,
             };
         let inode = self.allocate(
             InodeMetadata::memory(kind, mode, 0, 0, 1, 0),

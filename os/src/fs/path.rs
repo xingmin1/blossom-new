@@ -1,7 +1,7 @@
 //! VFS 挂载拓扑、路径逐组件解析（REF-walk）与目录命名空间事务操作。
 //!
 //! # 模块职责与架构定位
-//! 本模块负责连接进程视角的文件路径与底层具体文件系统实例（`ext4` 或各类内存文件系统 `tmpfs`/`devfs`/`proc`）：
+//! 本模块负责连接进程视角的文件路径与底层 `ext4`、FAT32 或内存文件系统（`tmpfs`/`devfs`/`proc`）实例：
 //! - **上游调用者**：系统调用层（`openat`、`mkdirat`、`unlinkat`、`linkat`、`symlinkat`、`renameat2`、`getcwd`、`chdir`、`chroot`、`mount`/`umount2` 等）、进程管理（`FsContext` 继承与切换）以及内核启动挂载流程。
 //! - **下游依赖**：`DentryCache` / `DentryRef`（维护单挂载域内的目录项拓扑与名字缓存）、`InodeCache` / `InodeRef`（执行实际目录项读写、权限快照获取与节点分配）以及 `Filesystem`（提供跨实例重命名互斥与磁盘同步）。
 //!
@@ -20,6 +20,8 @@
 //! - 向下解析 (follow_mounts)：命中有子挂载覆盖的目录时，在 Vfs::mounts 自旋锁内循环跳转到最顶层子挂载的 root。
 //! - 向上回退 (parent_within)：处理 ".." 时，若当前位于子挂载 root，先沿 covered 退回父挂载被覆盖目录，再取其父 Dentry（遇到 FsContext::root 边界则原地停止）。
 //! ```
+//! FAT32 卸载先在挂载表锁内确认无外部使用并标记退役，保留覆盖关系以拒绝新的路径穿越；
+//! 锁外完成卷卸载同步，失败恢复原挂载，成功再在同一表锁内移除登记。
 //!
 //! ## 2. 逐组件引用行走（REF-walk）与“先准备、后无失败发布”目录事务
 //! - **逐组件查找**：`resolve_from_with_links` 不对 `"."` 或 `".."` 做纯字符串词法折叠，而是每走一步都先验证当前位置确实是目录并检查搜索权限（`MAY_EXEC`），避免 `"non_dir/.."` 或 `"missing/.."` 绕过目录存在性与权限校验；符号链接展开在单次查找共享的 `MAXSYMLINKS`（40 次）预算内执行。
@@ -42,6 +44,7 @@
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::block::AccessMode;
 use crate::fs::memfs::{Filesystem, MemoryFsKind};
@@ -90,7 +93,7 @@ pub struct Path {
 ///
 /// 子挂载通过 `covered` 单向强引用父挂载视图中的被覆盖目录，父挂载不反向持有子挂载，防止循环引用。
 struct Mount {
-    /// 挂载承载的底层文件系统实例（`Ext4` 磁盘卷或内存文件系统）。
+    /// 挂载承载的底层磁盘卷或内存文件系统实例。
     filesystem: Filesystem,
     /// 本挂载点独立的访问模式（`ReadOnly` 或 `ReadWrite`），可比底层文件系统自身模式更严格。
     mode: AccessMode,
@@ -100,6 +103,8 @@ struct Mount {
     root: DentryRef,
     /// 父挂载视图中被本挂载覆盖的挂载点目录路径；根挂载（`mounts[0]`）此字段为 `None`。
     covered: Option<Path>,
+    /// FAT32 正在锁外完成卸载；仅在所属 `Vfs::mounts` 锁内读写，期间保留覆盖位置但不再取得新使用者。
+    retiring: AtomicBool,
 }
 
 /// 进程或任务级的文件系统路径解析上下文。
@@ -155,6 +160,26 @@ pub struct Vfs {
     mount_capacity: usize,
 }
 
+/// FAT32 卸载失败或提前退出时，在原挂载表锁内恢复其可访问状态。
+struct FatMountRetirement<'a> {
+    /// 拥有原挂载表及其同步锁的 VFS。
+    vfs: &'a Vfs,
+    /// 借用卸载流程已持有的 Mount，不增加 Busy 检查中的引用基数。
+    mount: &'a Arc<Mount>,
+    /// 挂载成功摘除后清除此标志，避免恢复已完成卸载的实例。
+    armed: bool,
+}
+
+impl Drop for FatMountRetirement<'_> {
+    /// 失败回退只修改挂载状态，不在自旋锁内同步或释放卷对象。
+    fn drop(&mut self) {
+        if self.armed {
+            let _mounts = self.vfs.mounts.lock();
+            self.mount.retiring.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Path {
     /// 借用当前路径持有的目录项引用（仅供 `ktest` 断言缓存淘汰不会改变已有 `Path` 的对象身份）。
     #[cfg(feature = "ktest")]
@@ -192,7 +217,7 @@ impl Path {
         }
         match &self.mount.filesystem {
             Filesystem::Memory(fs) => fs.reconfigure(options),
-            Filesystem::Ext4(_) => Err(FsError::InvalidOperation),
+            Filesystem::Ext4(_) | Filesystem::Fat32(_) => Err(FsError::InvalidOperation),
         }
     }
 
@@ -349,6 +374,7 @@ impl Vfs {
             dcache: dcache.clone(),
             root,
             covered: None,
+            retiring: AtomicBool::new(false),
         })
         .map_err(|_| FsError::NoMemory)?;
         mounts.push(mount);
@@ -462,7 +488,7 @@ impl Vfs {
                 continue;
             }
             if name == b".." {
-                current = self.follow_mounts(current.parent_within(&context.root));
+                current = self.follow_mounts(current.parent_within(&context.root))?;
                 offset = end;
                 continue;
             }
@@ -475,7 +501,7 @@ impl Vfs {
             let next = self.follow_mounts(Path {
                 mount: current.mount.clone(),
                 dentry,
-            });
+            })?;
             let inode = next.inode()?;
 
             // Step 4: 若命中符号链接，且属于中间组件（end < pending.len()）或调用方要求跟随末尾链接，则在预算内展开链接目标并拼接剩余后缀。
@@ -772,7 +798,7 @@ impl Vfs {
                         return prepare
                             .take()
                             .expect("open preparation callback was consumed")(
-                            self.follow_mounts(path),
+                            self.follow_mounts(path)?,
                             false,
                         );
                     }
@@ -842,7 +868,7 @@ impl Vfs {
                     if exclusive {
                         return Err(FsError::Exists);
                     }
-                    let path = self.follow_mounts(lookup.parent.parent_within(&context.root));
+                    let path = self.follow_mounts(lookup.parent.parent_within(&context.root))?;
                     return prepare
                         .take()
                         .expect("open preparation callback was consumed")(
@@ -1653,6 +1679,7 @@ impl Vfs {
             dcache,
             root,
             covered: Some(covered.clone()),
+            retiring: AtomicBool::new(false),
         })
         .map_err(|_| FsError::NoMemory)?;
 
@@ -1699,13 +1726,36 @@ impl Vfs {
         self.retire_mount(mount)
     }
 
-    /// 同步待卸载挂载的底层文件系统，二次确认无并发新增引用或子挂载后从挂载表移除，并在锁外回收空闲缓存与卷绑定。
+    /// 同步并卸载原 Mount；FAT32 先阻止新使用者，其他后端保持同步后重查 Busy 的顺序。
     fn retire_mount(&self, mount: Arc<Mount>) -> Result<(), FsError> {
-        // Step 1: 在挂载表自旋锁外刷回底层文件系统的全部脏数据与元数据。
         let covered = mount.covered.as_ref().ok_or(FsError::InvalidOperation)?;
-        mount.filesystem.sync()?;
-        // Step 2: 重新获取挂载表自旋锁，复核同一 Mount 实例仍无其他活跃引用或子挂载后将其摘除。
-        let victim = {
+        let victim = if let Filesystem::Fat32(volume) = &mount.filesystem {
+            // Step 1: Busy 检查和退役标记共用挂载表锁；所有向下取得与快照取得均受此锁约束。
+            let mut retirement = {
+                let mounts = self.mounts.lock();
+                unmount_position(&mounts, covered, Some(&mount))?;
+                mount.retiring.store(true, Ordering::Relaxed);
+                FatMountRetirement {
+                    vfs: self,
+                    mount: &mount,
+                    armed: true,
+                }
+            };
+
+            // Step 2: 卷仍登记且持有原租约，真实同步在锁外执行；错误沿守卫恢复原挂载。
+            volume.finish_unmount()?;
+            let victim = {
+                let mut mounts = self.mounts.lock();
+                let position = mounts
+                    .iter()
+                    .position(|entry| Arc::ptr_eq(entry, &mount))
+                    .expect("retiring FAT mount left its table");
+                mounts.swap_remove(position)
+            };
+            retirement.armed = false;
+            victim
+        } else {
+            mount.filesystem.sync()?;
             let mut mounts = self.mounts.lock();
             let position = unmount_position(&mounts, covered, Some(&mount))?;
             mounts.swap_remove(position)
@@ -1727,26 +1777,38 @@ impl Vfs {
 
     /// 同步当前挂载表中所有已挂载文件系统的脏页、元数据与块设备缓存（对应 `sync` 系统调用）。
     ///
-    /// 在挂载表自旋锁外按后端实例地址去重并逐一调用 `sync()`；若途中某个卷同步出错，仍会继续同步其余卷并返回遇到的第一个错误。
+    /// 在表锁外去重后同步；FAT32 的快照同时保活 Mount，防止卸载越过尚未完成的同步使用者。
+    /// 退役卷返回 Busy，但仍同步其余实例，并优先保留实际同步错误。
     pub fn sync(&self) -> Result<(), FsError> {
         let mut filesystems = Vec::new();
         filesystems
             .try_reserve_exact(self.mount_capacity)
             .map_err(|_| FsError::NoMemory)?;
+        let mut retiring = false;
         {
             let mounts = self.mounts.lock();
-            filesystems.extend(mounts.iter().map(|mount| mount.filesystem.clone()));
+            for mount in mounts.iter() {
+                if mount.retiring.load(Ordering::Relaxed) {
+                    retiring = true;
+                    continue;
+                }
+                let held = matches!(&mount.filesystem, Filesystem::Fat32(_)).then(|| mount.clone());
+                filesystems.push((mount.filesystem.clone(), held));
+            }
         }
-        filesystems.sort_unstable_by_key(Filesystem::identity_address);
-        filesystems.dedup_by(|a, b| a.ptr_eq(b));
+        filesystems.sort_unstable_by_key(|(filesystem, _)| filesystem.identity_address());
+        filesystems.dedup_by(|(a, _), (b, _)| a.ptr_eq(b));
 
         let mut result = Ok(());
-        for filesystem in &filesystems {
+        for (filesystem, _) in &filesystems {
             if let Err(error) = filesystem.sync() {
                 if result.is_ok() {
                     result = Err(error);
                 }
             }
+        }
+        if retiring && result.is_ok() {
+            result = Err(FsError::Busy);
         }
         result
     }
@@ -1754,13 +1816,17 @@ impl Vfs {
     /// 主动收缩所有活跃挂载的空闲 `dcache`、磁盘卷元数据缓存与全局 `InodeCache`，返回累计回收的对象总数。
     ///
     /// 内存文件系统（`tmpfs`/`devfs`/`proc`）的权威目录项与文件内容驻留在其自身结构中，不属于可丢弃缓存，不会被此操作清除。
+    /// FAT32 退役期间跳过其 Mount，避免锁外收缩取得新的卸载使用者。
     pub fn prune_unused(&self) -> usize {
         let count = self.mounts.lock().len();
         let mut removed = 0;
         for position in 0..count {
             let mount = {
                 let mounts = self.mounts.lock();
-                mounts.get(position).cloned()
+                mounts
+                    .get(position)
+                    .filter(|mount| !mount.retiring.load(Ordering::Relaxed))
+                    .cloned()
             };
             if let Some(mount) = mount {
                 removed += mount.dcache.prune_unused();
@@ -1775,6 +1841,7 @@ impl Vfs {
     /// 生成相对于根边界 `root` 可见的 `/proc/mounts` 六列格式挂载表文本。
     ///
     /// 位于 `root` 子树之外的挂载点会被自动跳过；所有路径反解与字符串拼装均在 `mounts` 自旋锁外执行。
+    /// 若 FAT32 正在卸载则返回 Busy，不在退役标记后取得新的 Mount 快照引用。
     pub fn mounts_text(&self, root: &Path) -> Result<Vec<u8>, FsError> {
         let mut snapshot = Vec::new();
         snapshot
@@ -1782,6 +1849,12 @@ impl Vfs {
             .map_err(|_| FsError::NoMemory)?;
         {
             let mounts = self.mounts.lock();
+            if mounts
+                .iter()
+                .any(|mount| mount.retiring.load(Ordering::Relaxed))
+            {
+                return Err(FsError::Busy);
+            }
             snapshot.extend(mounts.iter().cloned());
         }
 
@@ -1798,6 +1871,7 @@ impl Vfs {
             };
             let kind: &[u8] = match &mount.filesystem {
                 Filesystem::Ext4(_) => b"ext4",
+                Filesystem::Fat32(_) => b"vfat",
                 Filesystem::Memory(filesystem) => match filesystem.kind() {
                     MemoryFsKind::Tmpfs => b"tmpfs",
                     MemoryFsKind::Devfs => b"devfs",
@@ -1821,7 +1895,7 @@ impl Vfs {
         Ok(text)
     }
 
-    /// 在已持有 `mounts` 自旋锁的前提下，校验被覆盖目录所属父挂载有效、同一覆盖点未被重复挂载、同一物理块区间未被另一个 `Ext4Volume` 实例占用，且挂载总数未达上限。
+    /// 持有表锁时检查父挂载、覆盖点、磁盘占用与容量；同一 FAT32 卷不能在本 VFS 建立第二个挂载。
     fn check_mount(
         &self,
         mounts: &[Arc<Mount>],
@@ -1837,6 +1911,9 @@ impl Vfs {
                 (Filesystem::Ext4(mounted), Filesystem::Ext4(candidate)) => {
                     !Arc::ptr_eq(mounted, candidate) && mounted.view().same_range(candidate.view())
                 }
+                (Filesystem::Fat32(mounted), Filesystem::Fat32(candidate)) => {
+                    mounted.view().same_range(candidate.view())
+                }
                 _ => false,
             });
         if find_mount(mounts, &covered.mount, &covered.dentry).is_some() || disk_conflict {
@@ -1848,13 +1925,16 @@ impl Vfs {
         Ok(())
     }
 
-    /// 在单次 `mounts` 自旋锁临界区内沿着挂载覆盖关系一直向下穿越到最顶层子挂载的根目录；被替换的旧 `Path` 留在锁外析构。
-    fn follow_mounts(&self, path: Path) -> Path {
+    /// 在同一表锁内向下取得最顶层挂载；遇到退役 FAT32 返回 Busy，保留其覆盖关系，旧 Path 仍在锁外释放。
+    fn follow_mounts(&self, path: Path) -> Result<Path, FsError> {
         let crossed = {
             let mounts = self.mounts.lock();
             let mut mount = &path.mount;
             let mut dentry = &path.dentry;
             while let Some(child) = find_mount(&mounts, mount, dentry) {
+                if child.retiring.load(Ordering::Relaxed) {
+                    return Err(FsError::Busy);
+                }
                 mount = child;
                 dentry = &child.root;
             }
@@ -1867,7 +1947,7 @@ impl Vfs {
                 })
             }
         };
-        crossed.unwrap_or(path)
+        Ok(crossed.unwrap_or(path))
     }
 }
 
@@ -2140,6 +2220,7 @@ fn try_raw_name(name: &[u8]) -> Result<Arc<Vec<u8>>, FsError> {
 ///
 /// `held` 表示当前卸载流程自身额外持有的那一份 `Arc<Mount>` 引用（`unmount_path` 与 `retire_mount` 为 `Some`，`unmount` 初次查找为 `None`）；
 /// 若该挂载之上还挂有下级子挂载，或者其强引用计数超过“挂载表自身 1 份 + `held` 持有的 0/1 份”（说明仍有活跃的打开文件、`cwd` 或正在解析的 `Path`），则返回 `FsError::Busy`。
+/// 已标记退役的 FAT32 仍占据原覆盖点，后续卸载请求直接返回 Busy。
 fn unmount_position(
     mounts: &[Arc<Mount>],
     covered: &Path,
@@ -2161,6 +2242,9 @@ fn unmount_position(
     if held.is_some_and(|expected| !Arc::ptr_eq(expected, mount)) {
         return Err(FsError::NotFound);
     }
+    if mount.retiring.load(Ordering::Relaxed) {
+        return Err(FsError::Busy);
+    }
     let has_children = mounts.iter().any(|child| {
         child
             .covered
@@ -2179,7 +2263,7 @@ fn contains_mount(mounts: &[Arc<Mount>], mount: &Arc<Mount>) -> bool {
     mounts.iter().any(|entry| Arc::ptr_eq(entry, mount))
 }
 
-/// 在已持有 `mounts` 自旋锁的前提下，查找直接覆盖在 `(parent, dentry)` 目录位置上的子挂载引用（不在自旋锁内克隆或释放任何 `Path`）。
+/// 持有表锁时查找直接覆盖指定位置的子挂载；退役实例仍须返回，使路径穿越不能暴露被覆盖目录。
 fn find_mount<'a>(
     mounts: &'a [Arc<Mount>],
     parent: &Arc<Mount>,

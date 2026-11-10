@@ -1,0 +1,36 @@
+# 保留原程序与 ./mnt，只改变源设备参数。
+[[override]]
+id = "basic:musl:mount"
+exec = ["./mount", "/dev/loop0"]
+setup = [
+    ["/.blossom/busybox", "mkdir", "-p", "/basic/mnt"],
+    ["/.blossom/busybox", "losetup", "/dev/loop0", "/.blossom/fat32.img"],
+]
+cleanup = [["/.blossom/busybox", "losetup", "-d", "/dev/loop0"]]
+
+[[override]]
+id = "basic:musl:umount"
+exec = ["./umount", "/dev/loop0"]
+setup = [
+    ["/.blossom/busybox", "mkdir", "-p", "/basic/mnt"],
+    ["/.blossom/busybox", "losetup", "/dev/loop0", "/.blossom/fat32.img"],
+]
+cleanup = [["/.blossom/busybox", "losetup", "-d", "/dev/loop0"]]
+
+[[override]]
+id = "basic:glibc:mount"
+exec = ["./mount", "/dev/loop0"]
+setup = [
+    ["/.blossom/busybox", "mkdir", "-p", "/basic/mnt"],
+    ["/.blossom/busybox", "losetup", "/dev/loop0", "/.blossom/fat32.img"],
+]
+cleanup = [["/.blossom/busybox", "losetup", "-d", "/dev/loop0"]]
+
+[[override]]
+id = "basic:glibc:umount"
+exec = ["./umount", "/dev/loop0"]
+setup = [
+    ["/.blossom/busybox", "mkdir", "-p", "/basic/mnt"],
+    ["/.blossom/busybox", "losetup", "/dev/loop0", "/.blossom/fat32.img"],
+]
+cleanup = [["/.blossom/busybox", "losetup", "-d", "/dev/loop0"]]

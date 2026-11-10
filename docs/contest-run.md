@@ -58,7 +58,7 @@ make run-qemu ARCH=riscv64 QEMU_ARGS='--working-disk-action refresh-system'
 | 增减 Basic | `userland/contest/sets/basic.toml` 的 `include` |
 | 增减 Libctest selector | `userland/contest/sets/libctest.toml` 的 `names` |
 | 选择 LTP 用例 | `userland/contest/sets/ltp.toml` 的 `include`/`exclude` |
-| 调整单例的超时、参数、环境或准备命令 | `userland/contest/overrides/local.toml` |
+| 调整单例的超时、参数、环境或准备命令 | `userland/contest/overrides/local.toml`；`mount`/`umount` 使用 `overrides/basic-mount.toml` |
 | 适配现场测试盘布局 | `plan.toml` 中的 `roots` 及对应集合文件 |
 
 `files` 中没有列出的集合文件不会运行。磁盘或仓库中存在某个 TOML 不代表它已启用。
@@ -80,11 +80,17 @@ files = [
     "sets/cyclictest.toml",
     "sets/ltp.toml",
 ]
-override_files = ["overrides/local.toml"]
+override_files = ["overrides/local.toml", "overrides/basic-mount.toml"]
 finish = "poweroff"
 ```
 
 从默认计划中删除某个集合文件对应的一行，就停止运行该集合。配置支持 TOML 注释和多行数组，没有 Hook、profile 或“优化名称”之类的开关。
+
+默认计划在两个 libc 根目录各准备一份 64 MiB FAT32 镜像及项目自带 BusyBox。`basic` 的 `mount`、`umount` 使用 `/dev/loop0` 作为原 ELF 的设备参数；每例开始前绑定镜像、结束后解绑，挂载点仍为原来的 `./mnt`。如需只运行这两项，可显式选择独立计划：
+
+```sh
+/sbin/contest-run /dev/vda --plan /etc/contest/mount-plan.toml
+```
 
 ## 3. 集合的写法
 

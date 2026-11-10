@@ -5,6 +5,7 @@ edition = "2018"
 
 [dependencies]
 crc = { version = "=3.4.0", default-features = false }
+fatfs = { path = "../dependency/fatfs", default-features = false, features = ["alloc", "lfn"] }
 fdt = { path = "../dependency/fdt" }
 gpt_disk_io = { version = "=0.17.0", default-features = false }
 gpt_disk_types = { version = "=0.16.1", default-features = false }

@@ -1,0 +1,43 @@
+# 此计划仅用于联调，正式启动仍使用 plan.toml。
+files = ["sets/basic-mount.toml"]
+override_files = ["overrides/basic-mount.toml"]
+finish = "poweroff"
+
+[defaults]
+timeout_sec = 60
+repeat = 1
+
+# prepare 在系统根中执行，测试根位于比赛工作盘。
+[roots.musl]
+path = "/mnt/contest/musl"
+cwd = "/"
+mounts = ["dev", "proc", "tmp"]
+env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
+prepare = [
+    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"],
+    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64-sf.so.1"],
+    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64.so.1"],
+    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-loongarch-lp64d.so.1"],
+    ["/bin/busybox", "sh", "-c", "/bin/busybox cp /mnt/contest/glibc/lib/ld-linux-*.so.1 /mnt/contest/musl/lib/"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/bin"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/busybox"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/sh"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/.blossom"],
+    ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/musl/.blossom/fat32.img"],
+    ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/musl/.blossom/busybox"],
+]
+
+[roots.glibc]
+path = "/mnt/contest/glibc"
+cwd = "/"
+mounts = ["dev", "proc", "tmp"]
+env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
+prepare = [
+    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/glibc/lib64"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/bin"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/busybox"],
+    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/sh"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/.blossom"],
+    ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/glibc/.blossom/fat32.img"],
+    ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/glibc/.blossom/busybox"],
+]

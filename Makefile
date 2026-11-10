@@ -182,8 +182,11 @@ build-qemu-artifacts:
 prepare-guest-runtime-libraries:
 	python3 userland/runtime/prepare_runtime_libraries.py --arch $(ARCH) $(if $(MUSL_LIBC),--musl-libc "$(MUSL_LIBC)") $(if $(GLIBC_LIBDIR),--glibc-libdir "$(GLIBC_LIBDIR)") --output-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)"
 
-assemble-root-filesystem: build-guest-userland prepare-guest-runtime-libraries
-	python3 tools/assemble_rootfs.py --arch $(ARCH) --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(ROOTFS_OUTPUT_DIR)" $(if $(ROOTFS_INIT_CONFIG),--init-config "$(ROOTFS_INIT_CONFIG)")
+build/fixtures/basic-fat32.img: tools/create_basic_fat32.sh
+	sh tools/create_basic_fat32.sh "$@"
+
+assemble-root-filesystem: build-guest-userland prepare-guest-runtime-libraries build/fixtures/basic-fat32.img
+	python3 tools/assemble_rootfs.py --arch $(ARCH) --guest-userland-directory "$(GUEST_USERLAND_OUTPUT_DIR)" --runtime-libraries-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)" --output-directory "$(ROOTFS_OUTPUT_DIR)" --basic-fat32-fixture "build/fixtures/basic-fat32.img" $(if $(ROOTFS_INIT_CONFIG),--init-config "$(ROOTFS_INIT_CONFIG)")
 
 create-ext4-image:
 	python3 tools/create_ext4_image.py --source-tree "$(ROOTFS_TREE_DIR)" --output-image "$(SYSTEM_ROOT_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)"
@@ -359,6 +362,7 @@ help:
 	  'prepare-guest-runtime-libraries     Copy checked local libc sources to RUNTIME_LIBRARIES_OUTPUT_DIR.' \
 	  'assemble-root-filesystem            Build userland/libraries, then replace ROOTFS_OUTPUT_DIR.' \
 	  '  ROOTFS_INIT_CONFIG optionally selects an ordinary inittab file.' \
+	  '  A FAT32 fixture is generated in build/fixtures; mkfs.fat, fsck.fat, mcopy and mmd are required.' \
 	  'create-ext4-image                   Only consume ROOTFS_TREE_DIR; write SYSTEM_ROOT_EXT4_IMAGE.' \
 	  'build-qemu-artifacts ARCH=...        Fixed release/abort QEMU kernel and one single-root disk.' \
 	  'all                                Export kernel-rv/kernel-la/disk.img/disk-la.img.' \

@@ -4,7 +4,7 @@
 //! 本模块负责将文件内的逻辑块号（Logical Block）翻译或修改为磁盘上的物理块号（Physical Block），
 //! 同时完整支持现代 **Extent B+ 树（`EXT4_EXTENTS_FL`）** 与传统 **直接/一二三级间接块指针树**：
 //! - **上游调用者**：`Ext4Volume`（`ext4.rs`）、目录扩展与 HTree 索引分裂（`directory.rs`）以及 VFS Inode 的读写、缺页可写转换（`mkwrite`）与 `truncate` 路径。
-//! - **下游依赖**：`ext4::codec`（节点头部、条目与 CRC32C 编解码）、`ext4::allocation`（未发布块 `UnpublishedBlock` 分配与待回收块 `DetachedBlock` 登记）以及 `MetadataCache` 元数据块缓存。
+//! - **下游依赖**：`ext4::codec`（节点头部、条目与 CRC32C 编解码）、`ext4::allocation`（未发布块分配、数据组与树节点释放）以及 `MetadataCache` 元数据块缓存。
 //!
 //! # 核心设计：两阶段预备与提交状态机（Prepare / Publish / Cancel）
 //! 为了保证在内存不足（OOM）、磁盘空间耗尽（ENOSPC）或元数据损坏时已生效的文件树与位图不出现半修改状态，
@@ -19,7 +19,7 @@
 //!       cancel(volume)               publish(volume, seed)
 //!   1. 失效新分配树节点的缓存别名     1. 原地更新各脏树节点字段与尾部 CRC
 //!   2. 将全部 UnpublishedBlock       2. 解除 UnpublishedBlock 临时回滚责任
-//!      归还块位图与空闲计数          3. 激活 DetachedBlock 延迟释放令牌返回给调用方，
+//!      归还块位图与空闲计数          3. 激活本次块组或单节点释放令牌并返回给调用方，
 //!   (已生效的旧块树毫发无损)             待旧数据/元数据 I/O 排空后再归还位图
 //! ```
 //!
@@ -45,12 +45,12 @@
 
 use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
-use crate::fs::ext4::allocation::DetachedBlock;
+use crate::fs::ext4::allocation::{DetachedBlock, DetachedBlockGroup};
 use crate::fs::ext4::codec::{self, EXTENTS};
 use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry, InodeData, UnpublishedBlock};
 use crate::fs::{FsError, InodeKind};
 use alloc::vec::Vec;
-use core::convert::{TryFrom, TryInto};
+use core::convert::TryInto;
 
 /// Extent 树单层节点解析后的下一步动作。
 #[derive(Clone, Copy)]
@@ -368,7 +368,7 @@ pub(crate) struct PreparedMapping {
 
 /// Extent 树单个节点（内联根或外部块节点）的内存编辑状态。
 struct NodeEdit {
-    /// 外部树节点对应的元数据块缓存句柄；内联根节点为 `None`。
+    /// 仍需发布的外部节点缓存窗口；内联根或整棵待删除子树的临时节点不保留窗口。
     buffer: Option<BufferRef>,
     /// 外部树节点的物理块号；内联根节点为 `0`。
     physical: u64,
@@ -1337,15 +1337,15 @@ fn prepare_indirect(
 
 /// 文件截断（`truncate`）操作的块树尾部裁剪计划。
 ///
-/// 准备阶段仅在私有内存中计算裁剪后的新根节点与待修补的外部节点，并为将被摘除的数据块和树节点块预留释放令牌；
-/// 若中途失败直接丢弃本结构即可释放缓存引用，不会改动已生效的块树或磁盘位图。
+/// 准备阶段只修改私有的新根和节点条目，数据块与已读取校验的退休树节点共同登记到物理组位集；
+/// 仅钉住仍需发布的存活节点，所有准备分配均可失败，中途失败不修改原树、位图或缓存窗口有效性。
 pub(crate) struct PreparedTruncate {
     /// 截断完成后将写入 inode `i_block` 的 60 字节新映射根。
     pub root: [u8; 60],
     /// 本次截断共摘除的文件系统块总数（含已初始化数据块、未写入预分配块以及被整体回收的外部树节点块）。
     pub removed_blocks: u64,
-    /// 被摘除的数据块与外部树节点块的延迟释放令牌列表。
-    retired: Vec<DetachedBlock>,
+    /// 按物理组聚合的准确释放位集，不保留已退休数据块或树节点的缓存窗口。
+    groups: Vec<DetachedBlockGroup>,
     /// 截断后仍保留在树中、但条目被缩短而需要原地更新的外部 Extent 节点列表。
     nodes: Vec<NodeEdit>,
     /// 截断后仍保留在树中、但需要将末尾指针区间 `[first * 4..]` 清零的外部传统间接块列表。
@@ -1353,10 +1353,10 @@ pub(crate) struct PreparedTruncate {
 }
 
 impl PreparedTruncate {
-    /// 在调用方持有 inode `disk_root` 写锁且旧页缓存已清理完毕后，原地提交所有剩余树节点的裁剪修改，并激活待释放块的回收责任。
+    /// 在调用方持有根写锁且旧页缓存已清理后，提交所有存活外部节点的裁剪修改，再激活块组释放责任。
     ///
-    /// 返回的 [`DetachedBlock`] 列表尚未归还块位图；调用方须在更新完 inode 记录并确认旧数据/元数据写回彻底结束后再逐一释放。
-    pub(crate) fn publish(mut self, volume: &Ext4Volume, seed: u32) -> Vec<DetachedBlock> {
+    /// 返回准备好的组容器，不分配内存或读盘；调用方发表 inode 根与记录后，再在原锁保护下逐组失效缓存并归还位图。
+    pub(crate) fn publish(mut self, volume: &Ext4Volume, seed: u32) -> Vec<DetachedBlockGroup> {
         for node in &self.nodes {
             node.buffer
                 .as_ref()
@@ -1371,10 +1371,10 @@ impl PreparedTruncate {
                 .update(volume.claim(), |bytes| bytes[*first * 4..].fill(0))
                 .expect("prepared writable truncate indirect");
         }
-        for block in &mut self.retired {
-            block.arm_release();
+        for group in &mut self.groups {
+            group.arm_release();
         }
-        self.retired
+        self.groups
     }
 }
 
@@ -1404,7 +1404,7 @@ pub(crate) fn prepare_truncate(
     let mut prepared = PreparedTruncate {
         root: inode.block,
         removed_blocks: 0,
-        retired: Vec::new(),
+        groups: Vec::new(),
         nodes: Vec::new(),
         indirect: Vec::new(),
     };
@@ -1434,44 +1434,23 @@ pub(crate) fn prepare_truncate(
             prepare_indirect_truncate(volume, inode, keep, &mut prepared, context)?;
         }
     }
-    prepared.removed_blocks = prepared.retired.len() as u64;
     Ok(prepared)
 }
 
-/// 为一段即将被截断摘除的连续数据块 `[physical, physical + count)` 预留位图释放窗口与已存在的元数据缓存别名，不触发文件数据读盘。
-fn retire_data(
+/// 将数据块或已读取校验的退休树节点加入准确物理组位集，累计真实块数，不保留目标块的缓存窗口。
+fn retire_blocks(
     volume: &Ext4Volume,
     physical: u64,
     count: u64,
     prepared: &mut PreparedTruncate,
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
-    prepared
-        .retired
-        .try_reserve(usize::try_from(count).map_err(|_| FsError::NoMemory)?)
-        .map_err(|_| FsError::NoMemory)?;
-    for block in physical..physical + count {
-        prepared
-            .retired
-            .push(volume.prepare_detached_data_block(block, context)?);
-    }
-    Ok(())
-}
-
-/// 为一棵子树已全部清空、即将从父节点摘除的外部树节点块 `physical` 预留位图释放与缓存失效令牌。
-fn retire_node(
-    volume: &Ext4Volume,
-    physical: u64,
-    prepared: &mut PreparedTruncate,
-    context: Option<MetadataIoContext<'_>>,
-) -> Result<(), FsError> {
-    prepared
-        .retired
-        .try_reserve(1)
-        .map_err(|_| FsError::NoMemory)?;
-    prepared
-        .retired
-        .push(volume.prepare_detached_block(physical, context)?);
+    let removed = prepared
+        .removed_blocks
+        .checked_add(count)
+        .ok_or(FsError::Corrupt)?;
+    volume.prepare_detached_blocks(physical, count, &mut prepared.groups, context)?;
+    prepared.removed_blocks = removed;
     Ok(())
 }
 
@@ -1504,7 +1483,7 @@ fn load_truncate_extent(
 /// 自右向左递归裁剪单个 Extent 树节点中逻辑块号 `>= keep` 的尾部区间。
 ///
 /// - 叶节点（`depth == 0`）：从末尾向前移除完全超出 `keep` 的叶条目，或缩短跨界条目的长度，登记摘除的数据块；
-/// - 索引节点（`depth > 0`）：从末尾向前递归裁剪覆盖 `keep` 右侧的子节点；完全清空的子节点直接登记回收并弹出父索引，部分保留且发生修改的最后一个跨界子节点加入 `prepared.nodes` 待写回。
+/// - 索引节点（`depth > 0`）：先读取并校验右侧子节点，完整删除的子树只保留私有条目和组位集；仍存活且修改的跨界子节点加入 `prepared.nodes` 待写回。
 fn truncate_extent_node(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -1522,7 +1501,7 @@ fn truncate_extent_node(
                 break;
             }
             let remaining = keep.saturating_sub(start).min(len);
-            retire_data(
+            retire_blocks(
                 volume,
                 physical + remaining,
                 len - remaining,
@@ -1548,9 +1527,14 @@ fn truncate_extent_node(
         let physical = index_physical(&entry);
         let mut child =
             load_truncate_extent(volume, inode, physical, node.depth - 1, low, high, context)?;
+        // 完整删除的子树只依赖私有条目，后续加载可以驱逐其干净缓存页。
+        if keep <= low {
+            child.buffer = None;
+        }
         truncate_extent_node(volume, inode, &mut child, keep, high, prepared, context)?;
         if child.entries.is_empty() {
-            retire_node(volume, physical, prepared, context)?;
+            drop(child);
+            retire_blocks(volume, physical, 1, prepared, context)?;
             node.entries.pop();
             node.dirty = true;
             high = low;
@@ -1568,7 +1552,7 @@ fn truncate_extent_node(
     Ok(())
 }
 
-/// 规划 Extent 树的尾部截断：递归裁剪根子树后，若树变空则重置为深度 0 的空叶根；若根仅剩单个子节点且其条目装得进内联根（不超过 4 项），则循环提升子节点降低树高。
+/// 裁剪 Extent 根子树，空树恢复为内联叶根；单子节点在条目装得进内联根时经读取校验后登记组位集并降低树高。
 fn prepare_extent_truncate(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -1598,7 +1582,7 @@ fn prepare_extent_truncate(
             .nodes
             .iter()
             .position(|node| node.physical == physical);
-        let child = if let Some(index) = staged {
+        let mut child = if let Some(index) = staged {
             if codec::EXTENT_ROOT_ENTRIES < prepared.nodes[index].entries.len() {
                 break;
             }
@@ -1618,7 +1602,8 @@ fn prepare_extent_truncate(
             }
             child
         };
-        retire_node(volume, physical, prepared, context)?;
+        child.buffer = None;
+        retire_blocks(volume, physical, 1, prepared, context)?;
         root.entries.clear();
         for entry in child.entries {
             root.entries.push(entry);
@@ -1653,7 +1638,7 @@ fn read_truncate_indirect(
 
 /// 自右向左递归裁剪单个传统间接指针块中覆盖 `>= keep` 逻辑块区间的尾部子树，返回该间接块裁剪后是否已完全变空。
 ///
-/// 若整块指针均归零则直接登记回收该间接块本身；若仍有前缀有效指针，则记录首个归零槽位下标 `first`，供 `publish` 阶段原地将 `[first * 4..]` 清零。
+/// 读取并校验本节点后，完整删除的子树不再钉住该窗口；空节点登记组位集，存活且须修补的节点才保留窗口供发布。
 fn truncate_indirect_node(
     volume: &Ext4Volume,
     physical: u64,
@@ -1672,6 +1657,7 @@ fn truncate_indirect_node(
         .get(physical, g.block_size, context)?;
     let mut pointers = [0u32; codec::MAX_BLOCK_BYTES / core::mem::size_of::<u32>()];
     buffer.with_read(|bytes| read_truncate_indirect(g, bytes, &mut pointers))??;
+    let buffer = (low < keep).then_some(buffer);
 
     let mut first = n;
     for index in (0..n).rev() {
@@ -1684,7 +1670,7 @@ fn truncate_indirect_node(
             continue;
         }
         let empty = if depth == 1 {
-            retire_data(volume, child, 1, prepared, context)?;
+            retire_blocks(volume, child, 1, prepared, context)?;
             true
         } else {
             truncate_indirect_node(volume, child, depth - 1, start, keep, prepared, context)?
@@ -1697,13 +1683,16 @@ fn truncate_indirect_node(
 
     let empty = pointers[..n].iter().all(|pointer| *pointer == 0);
     if empty {
-        retire_node(volume, physical, prepared, context)?;
+        drop(buffer);
+        retire_blocks(volume, physical, 1, prepared, context)?;
     } else if first < n {
         prepared
             .indirect
             .try_reserve(1)
             .map_err(|_| FsError::NoMemory)?;
-        prepared.indirect.push((buffer, first));
+        prepared
+            .indirect
+            .push((buffer.expect("surviving truncate indirect window"), first));
     }
     Ok(empty)
 }
@@ -1719,7 +1708,7 @@ fn prepare_indirect_truncate(
     for slot in (keep.min(codec::DIRECT_BLOCKS as u64) as usize..codec::DIRECT_BLOCKS).rev() {
         let physical = u64::from(codec::le32(&inode.block, slot * 4)?);
         if physical != 0 {
-            retire_data(volume, physical, 1, prepared, context)?;
+            retire_blocks(volume, physical, 1, prepared, context)?;
             codec::put32(&mut prepared.root, slot * 4, 0);
         }
     }

@@ -19,7 +19,7 @@
 //!   - WriteBuffer : Kernel(&[u8]) | User(Mm::copyin) | Vector(iovec) ──pull()──> 内核中转切片 ──> 页缓存提交
 //! ```
 //! - **用户缺页与文件锁解耦**：向用户虚拟地址复制数据（`copyin`/`copyout`）可能触发缺页异常（甚至是由同一文件 `mmap` 引起的缺页）。因此 `ReadBuffer::push` 和 `WriteBuffer::pull` 严禁在持有页缓存 Folio 内容锁、块映射锁或页表 PTE 锁时调用。
-//! - **回写错误采样推进（errseq 机制）**：磁盘上的 `InodeFile` 与 `DirectoryFile` 在打开时采样当前数据/元数据缓存的回写错误序号，调用 `fsync`/`sync_range` 时对比并推进游标，确保后台异步刷盘失败能被准确报告给执行同步的描述符。
+//! - **回写错误采样推进（errseq 机制）**：ext4 的 `InodeFile` 与 `DirectoryFile` 在打开时采样当前数据/元数据缓存的回写错误序号，调用 `fsync`/`sync_range` 时对比并推进游标；FAT 根目录直接同步其真实卷，不使用 ext4 的错误序号。
 //!
 //! # 锁获取顺序（Lock Ordering）与并发契约
 //! 1. **表锁在最外层并先行释放**：调用任何 `FileLike` 方法前，必须已释放 `FileTable` 自旋锁，仅持有克隆出的 `FileRef`。
@@ -678,7 +678,7 @@ pub struct DirectoryFile {
     cursor: SleepMutex<DirectoryCursor>,
     /// 当前目录 OFD 的打开状态标志字。
     flags: AtomicU32,
-    /// 磁盘目录所在卷元数据缓存的回写错误采样游标（供目录 `fsync` 检测异步元数据回写错误；内存目录为 `None`）。
+    /// ext4 目录所在卷元数据缓存的回写错误采样游标；内存与 FAT 目录为 `None`。
     wb_error: SpinLock<Option<u32>>,
 }
 
@@ -691,8 +691,9 @@ pub fn open_path(vfs: &Vfs, path: Path) -> Result<FileRef, FsError> {
 ///
 /// # 调用上下文与阶段说明
 /// - 在普通可睡眠任务上下文、且未持有描述符表锁时调用（路径创建逻辑已在 `Vfs` 层先行完成）。
-/// - 若节点为设备或伪文件系统特殊节点（`devfs` / `tty` / `procfs` / `kmsg` / `ktrace`），直接委派给对应后端构造专用 `FileLike`。
+/// - 若节点为设备或伪文件系统特殊节点（`devfs` / `loop0` / `tty` / `procfs` / `kmsg` / `ktrace`），直接委派给对应后端构造专用 `FileLike`。
 /// - 若带有 `O_TRUNC` 打开普通文件，会在 `InodeFile` 分配就绪并获取写准入凭证后将文件截断为 0；若为“只读 + `O_TRUNC`”组合，临时获取的 `WriteAccess` 仅用于本次截断，不会随只读 `InodeFile` 长期保留。
+/// - FAT 当前只支持打开真实根目录；返回的 `DirectoryFile` 保留完整 `Path`，不采样 ext4 的回写错误序号。
 pub fn open_path_with_flags(
     vfs: &Vfs,
     path: Path,
@@ -733,6 +734,7 @@ pub fn open_path_with_flags(
 
     if let Some(special) = inode.memory_special() {
         return match special {
+            MemorySpecial::Loop0 => crate::block::loop_device::open(path, flags, caller),
             MemorySpecial::Null | MemorySpecial::Zero | MemorySpecial::TestHook => {
                 devfs::open(path, flags, caller, special)
             }
@@ -751,7 +753,11 @@ pub fn open_path_with_flags(
         };
     }
 
-    // Step 3: 构造常规普通文件或目录的 OFD，采样初始回写错误序号，并在返回前按需执行 O_TRUNC 截断。
+    if inode.is_fat() && kind != InodeKind::Directory {
+        return Err(FsError::Unsupported);
+    }
+
+    // Step 3: 构造普通文件或目录的 OFD，仅为 ext4 采样回写错误序号，并在返回前按需执行 O_TRUNC 截断。
     match kind {
         InodeKind::Regular => {
             if access != 0 || flags & O_TRUNC != 0 {
@@ -802,7 +808,7 @@ pub fn open_path_with_flags(
                 return Err(FsError::IsDirectory);
             }
             let cursor = inode.directory_cursor(0)?;
-            let wb_error = if inode.is_memory() {
+            let wb_error = if inode.is_memory() || inode.is_fat() {
                 None
             } else {
                 Some(inode.disk_volume()?.metadata_cache().sample_wb_error())
@@ -1174,12 +1180,15 @@ impl FileLike for DirectoryFile {
         Err(FsError::InvalidOperation)
     }
 
-    /// 对磁盘目录执行同步（`fsync`）：刷回所属卷的脏元数据缓存并下发块设备 FLUSH，同时检查并推进目录的元数据回写错误游标。
+    /// 同步目录所属卷：FAT 调用真实卷同步，ext4 刷回元数据并推进错误游标，内存目录没有落盘义务。
     fn sync_range(&self, range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
         if range.end < range.start {
             return Err(FsError::InvalidOperation);
         }
         let inode = self.path.inode()?;
+        if inode.is_fat() {
+            return inode.fat_volume()?.sync();
+        }
         if inode.is_memory() {
             return Ok(());
         }

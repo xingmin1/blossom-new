@@ -6,7 +6,7 @@ C 运行库（musl 与 glibc）以及仓库内的静态系统配置合并为单�
 的完整根文件系统目录树，供后续 `create_ext4_image.py` 打包为 ext4 镜像。
 
 输入：
-- 目标架构名称、已安装的客户机用户态目录、运行库目录，以及可选的自定义 `inittab` 配置文件；
+- 目标架构名称、已安装的客户机用户态目录、运行库目录，以及可选的自定义 `inittab` 和 FAT32 夹具文件；
 - 仓库内置的 `userland/system`（系统脚本与 `/etc` 配置）和 `userland/contest`（比赛运行配置）。
 
 输出：
@@ -59,7 +59,7 @@ def copy_rootfs_entries(source_directory, destination_directory):
 
 def assemble_rootfs_tree(architecture, guest_userland_directory,
                          runtime_libraries_directory, output_directory,
-                         init_config_path=None):
+                         init_config_path=None, basic_fat32_fixture_path=None):
     """校验安装输入并在临时目录中组装完整的单架构根文件系统目录树，完成后替换到输出目录。
 
     参数：
@@ -68,6 +68,7 @@ def assemble_rootfs_tree(architecture, guest_userland_directory,
     - `runtime_libraries_directory`: 已准备好的动态运行库目录（包含 `musl` 和 `glibc` 子目录）。
     - `output_directory`: 输出根文件系统目录路径。
     - `init_config_path`: 可选的自定义 `inittab` 文件路径；若指定则覆盖默认的 `/etc/inittab`。
+    - `basic_fat32_fixture_path`: 可选的 FAT32 夹具文件；若指定则装入 `/etc/contest/fixtures/basic-fat32.img`。
 
     返回：
     - 规范化后的输出目录 `Path`。
@@ -84,6 +85,8 @@ def assemble_rootfs_tree(architecture, guest_userland_directory,
     contest = REPOSITORY_ROOT / "userland/contest"
     output = output_path(output_directory, directory=True)
     init_config = Path(init_config_path).resolve(strict=True) if init_config_path is not None else None
+    basic_fat32_fixture = (Path(basic_fat32_fixture_path).resolve(strict=True)
+                           if basic_fat32_fixture_path is not None else None)
     # 校验所有输入目录与可选配置文件存在且类型正确，并确保输出目录不与任何输入源重叠或互为硬链接
     sources = (userland, runtime, system.resolve(), contest.resolve())
     for source in sources:
@@ -94,6 +97,10 @@ def assemble_rootfs_tree(architecture, guest_userland_directory,
         if not init_config.is_file():
             raise ValueError(f"init config is not a regular file: {init_config}")
         reject_overlap(init_config, output)
+    if basic_fat32_fixture is not None:
+        if not basic_fat32_fixture.is_file():
+            raise ValueError(f"FAT32 fixture is not a regular file: {basic_fat32_fixture}")
+        reject_overlap(basic_fat32_fixture, output)
     # 检查系统启动、Shell 交互与比赛执行所必需的基础用户态程序和 C 运行库是否齐全
     for name in ("bin/busybox", "bin/sh", "sbin/init", "sbin/contest-run", "bin/libc-smoke"):
         if not (userland / name).is_file():
@@ -114,6 +121,14 @@ def assemble_rootfs_tree(architecture, guest_userland_directory,
                 raise ValueError("installed runtime parent must be a directory, not a symbolic link")
             copy_rootfs_entries(runtime / family, tree / "opt/runtime" / family)
         copy_rootfs_entries(contest, tree / "etc/contest")
+        if basic_fat32_fixture is not None:
+            fixture_directory = tree / "etc/contest/fixtures"
+            if fixture_directory.is_symlink():
+                raise ValueError("contest fixture directory must not be a symbolic link")
+            fixture_directory.mkdir(parents=True, exist_ok=True)
+            fixture_destination = fixture_directory / "basic-fat32.img"
+            fixture_destination.unlink(missing_ok=True)
+            shutil.copy2(basic_fat32_fixture, fixture_destination)
         # 若调用方提供了专用的 init 配置（例如自动化测试负载），用其覆盖默认的 /etc/inittab
         if init_config is not None:
             (tree / "etc/inittab").unlink(missing_ok=True)
@@ -157,11 +172,12 @@ def main(argv=None):
     parser.add_argument("--runtime-libraries-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--init-config", type=Path)
+    parser.add_argument("--basic-fat32-fixture", type=Path)
     args = parser.parse_args(argv)
     try:
         assemble_rootfs_tree(args.arch, args.guest_userland_directory,
                              args.runtime_libraries_directory, args.output_directory,
-                             args.init_config)
+                             args.init_config, args.basic_fat32_fixture)
     except (OSError, ValueError) as error:
         print(f"Root filesystem assembly failed: {error}", file=sys.stderr)
         return 1

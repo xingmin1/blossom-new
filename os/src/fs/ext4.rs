@@ -541,14 +541,13 @@ impl Ext4Volume {
         u64::from(self.device)
     }
 
-    /// 在 `self.allocation` 锁保护下读取主超级块的实时空闲块与空闲 inode 计数，组装 `statfs` 文件系统统计信息。
+    /// 在 `self.allocation` 锁保护下，通过最小超级块窗口读取实时空闲计数，组装 `statfs` 文件系统统计信息。
     pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
         let _allocation = self.allocation.lock();
         let g = &self.geometry;
-        // 主超级块固定位于第 0 页偏移 1024 字节处，属于保留块范围，需直接通过 MetadataCache 读取第 0 页。
-        let superblock = self.metadata.get(0, PAGE_SIZE, None)?;
+        let (superblock, offset) = self.superblock_buffer(None)?;
         superblock.with_read(|bytes| {
-            let record = codec::bytes(bytes, codec::SUPERBLOCK_OFFSET, codec::SUPERBLOCK_BYTES)?;
+            let record = codec::bytes(bytes, offset, codec::SUPERBLOCK_BYTES)?;
             let mut free = u64::from(codec::le32(record, 12)?);
             let mut reserved = u64::from(codec::le32(record, 8)?);
             if g.features_incompat & codec::FEATURE_INCOMPAT_64BIT != 0 {
@@ -593,6 +592,20 @@ impl Ext4Volume {
     /// 释放本卷元数据缓存中当前无人引用的干净缓冲区，返回回收数量。
     pub fn prune_unused(&self) -> usize {
         self.metadata.prune_unused()
+    }
+
+    /// 获取覆盖主超级块记录的最小逻辑扇区窗口，并返回记录在窗口内的字节偏移。
+    ///
+    /// 1KiB 文件系统使用准确的超级块窗口，避免引用同页内可被截断释放的数据块；跨物理页的拼接由元数据缓存处理。
+    fn superblock_buffer(
+        &self,
+        context: Option<MetadataIoContext<'_>>,
+    ) -> Result<(BufferRef, usize), FsError> {
+        let unit = (self.claim.view().limits().logical_block_size as usize)
+            .max(codec::SUPERBLOCK_END - codec::SUPERBLOCK_OFFSET);
+        let block = (codec::SUPERBLOCK_OFFSET / unit) as u64;
+        let offset = codec::SUPERBLOCK_OFFSET % unit;
+        Ok((self.metadata.get(block, unit, context)?, offset))
     }
 
     /// 校验物理块号位于合法数据区间后，从元数据缓存读取对应文件系统块。

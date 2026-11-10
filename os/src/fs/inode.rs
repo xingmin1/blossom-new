@@ -1,9 +1,10 @@
-//! VFS 权威索引节点（Canonical Inode）管理、单飞加载缓存与双后端（ext4 / 内存文件系统）同步协议。
+//! VFS 权威索引节点（Canonical Inode）管理、单飞加载缓存与 ext4、FAT、内存文件系统的同步协议。
 //!
 //! ## 模块职责与架构定位
 //! 本模块位于虚拟文件系统（VFS）核心层，为每个文件、目录、符号链接或特殊节点维护在所属挂载域内唯一的
-//! 运行态 [`Inode`] 实例，并统一封装磁盘文件系统（`ext4`）与内存文件系统（`MemoryFs`）的读写、截断、
-//! `mmap` 写缺页（`mkwrite`）、属性修改与目录项操作。
+//! 运行态 [`Inode`] 实例，并封装 `ext4` 与内存文件系统（`MemoryFs`）的读写、截断、
+//! `mmap` 写缺页（`mkwrite`）、属性修改与目录项操作。FAT 当前只提供真实卷的根目录身份；
+//! 根目录的内容访问和修改返回 `FsError::Unsupported`。
 //!
 //! - **上游调用者**：目录项缓存（`dentry`）、打开文件描述（OFD）与系统调用层、虚拟内存缺页/回写/页面回收子系统（`mm` / `cache` / `writeback`）。
 //! - **下游依赖**：`ext4` 卷与编解码器（`Ext4Volume`、`codec`）、内存文件系统（`MemoryFs`）、页面缓存映射（`FileMapping`）以及后台工作队列（`WorkQueue`）。
@@ -36,6 +37,9 @@
 //!                                                                    (挂入 FAILED_EVICTIONS 保活，
 //!                                                                     保留脏数据与删除义务防止静默丢失)
 //! ```
+//!
+//! FAT 根目录不进入 `ext4` 缓存域，也不持有内存目录项。外部 `InodeRef` 强持 `Fat32Volume`，
+//! 节点后端与页面反向引用只弱持卷；卷的名字域只弱持根目录项，避免根与卷互相保活。
 //!
 //! ### 2. 写打开计数与执行互斥（`writecount` 编码）
 //! `InodeState::writecount` 使用单个有符号整数在自旋锁内实现 POSIX `ETXTBSY` 互斥语义：
@@ -79,6 +83,7 @@ use crate::fs::ext4::{
     codec, finish_error, BlockMapping, Ext4Volume, InodeData, PreparedDirectoryEdit,
     PreparedDirectoryMappings, PreparedInodeMapping, PreparedInodeRelease, UnpublishedInode,
 };
+use crate::fs::fat32::Fat32Volume;
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemoryPageCharge, MemorySpecial};
 use crate::fs::procfs::{self, ProcessNode, ProcessRole};
 use crate::fs::readahead::{self, ReadaheadState};
@@ -100,6 +105,9 @@ use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
 
 /// 内存文件系统目录中每个目录项的记账字节大小（`.`、`..` 与普通子项均按 20 字节计入目录 `size`）。
 const MEMORY_DIRENT_BYTES: u64 = 20;
+
+/// FAT 根目录在卷内的固定节点编号；FAT 子节点编号不得复用此值。
+const FAT_ROOT_INO: u64 = 1;
 
 /// 测试专用的节点加载钩子回调类型，用于在节点占位发布后、实际读取磁盘前注入并发交错。
 #[cfg(feature = "ktest")]
@@ -687,7 +695,7 @@ impl InodeDomain {
     }
 }
 
-/// 权威 `Inode` 的外部强引用句柄（元组字段 `0` 为底层唯一运行态 `Arc<Inode>`，字段 `1` 为维护缓存域活跃计数或内存文件系统所有权的 `InodeOwner`）。
+/// 权威 `Inode` 的外部强引用句柄（字段 `0` 为稳定的 `Arc<Inode>`，字段 `1` 保活所属缓存域或实际文件系统卷）。
 pub struct InodeRef(Arc<Inode>, InodeOwner);
 
 /// `InodeRef` 持有的后端所有权标识。
@@ -702,13 +710,15 @@ enum InodeOwner {
     },
     /// 内存文件系统节点句柄，强引用所属 `MemoryFs` 实例以保活底层文件系统。
     Memory(Arc<MemoryFs>),
+    /// FAT 节点句柄，强持实际卷及其块设备挂载占用。
+    Fat(Arc<Fat32Volume>),
 }
 
 /// 供物理页（Folio）反向追踪所属文件的弱引用标识，不增加 `Inode` 的外部使用计数，也不会阻止节点回收。
 pub(crate) struct InodeWeak {
     /// 指向底层 `Inode` 的弱引用。
     inode: Weak<Inode>,
-    /// 指向所属缓存域或内存文件系统的弱引用。
+    /// 指向所属缓存域或实际文件系统卷的弱引用。
     owner: WeakInodeOwner,
 }
 
@@ -718,6 +728,8 @@ enum WeakInodeOwner {
     Disk(Weak<InodeDomain>),
     /// 内存节点所属内存文件系统的弱引用。
     Memory(Weak<MemoryFs>),
+    /// FAT 节点所属真实卷的弱引用。
+    Fat(Weak<Fat32Volume>),
 }
 
 impl InodeWeak {
@@ -733,17 +745,24 @@ impl InodeWeak {
             (WeakInodeOwner::Memory(weak), InodeOwner::Memory(fs)) => {
                 weak.as_ptr() == Arc::as_ptr(fs)
             }
+            (WeakInodeOwner::Fat(weak), InodeOwner::Fat(volume)) => {
+                weak.as_ptr() == Arc::as_ptr(volume)
+            }
             _ => false,
         }
     }
 
-    /// 尝试将页面持有的弱引用升级为有效的 `InodeRef`：内存节点需文件系统仍存活，磁盘节点需缓存域未关闭且槽位处于已加载的 `Cached` 状态。
+    /// 升级页面的弱引用；内存和 FAT 节点要求所属卷仍存活，ext4 节点还要求缓存域开放且原槽处于已加载的 `Cached` 状态。
     pub(crate) fn upgrade(&self) -> Option<InodeRef> {
         let inode = self.inode.upgrade()?;
         match &self.owner {
             WeakInodeOwner::Memory(weak) => {
                 let fs = weak.upgrade()?;
                 Some(InodeRef(inode, InodeOwner::Memory(fs)))
+            }
+            WeakInodeOwner::Fat(weak) => {
+                let volume = weak.upgrade()?;
+                Some(InodeRef(inode, InodeOwner::Fat(volume)))
             }
             WeakInodeOwner::Disk(weak) => {
                 let domain = weak.upgrade()?;
@@ -775,9 +794,9 @@ pub(crate) struct InvalidateGuard<'a> {
     _scope: ReclaimScope,
 }
 
-/// 文件系统中的唯一运行态索引节点对象；由 `InodeDomain` 或 `MemoryFs` 托管，节点内部不反向强引用缓存域以避免循环引用。
+/// 文件系统中的唯一运行态索引节点对象；FAT 和内存后端弱持所属卷，外部句柄负责保活。
 pub struct Inode {
-    /// 区分磁盘 `ext4` 与内存文件系统的后端专有状态。
+    /// 保存 ext4、FAT 或内存文件系统的后端专有状态。
     backend: InodeBackend,
     /// 文件系统内部分配的 64 位 `Inode` 编号（跨卷唯一性需结合 `device()` 或后端实例指针判定）。
     number: u64,
@@ -804,6 +823,11 @@ enum InodeBackend {
         filesystem: Weak<MemoryFs>,
         /// 内存节点的类型化内容载荷。
         content: MemoryContent,
+    },
+    /// 真实 FAT 卷上的节点，不包含 ext4 块树或内存目录内容。
+    Fat {
+        /// 外部 `InodeRef` 强持此卷，后端只保留弱引用以避免根目录与卷形成引用环。
+        filesystem: Weak<Fat32Volume>,
     },
 }
 
@@ -992,6 +1016,8 @@ enum InodeStorage {
     Disk { root: SleepRwLock<[u8; 60]> },
     /// 内存文件系统节点：无磁盘块映射树。
     Memory,
+    /// FAT 节点尚未实现 VFS 文件映射，不持有 ext4 块树根。
+    Fat,
 }
 
 /// 单节点独占写锁守卫，用于串行化普通属性变更与硬链接计数调整，并维持 `NOFS` 内存回收作用域。
@@ -1452,11 +1478,23 @@ impl InodeState {
         }
     }
 
-    /// 获取磁盘节点的 60 字节块映射根读写锁引用；若在内存节点上调用则触发 panic。
+    /// 为 FAT 根目录安装属性与同步状态，不创建 ext4 块树或内存目录。
+    fn fat(metadata: InodeMetadata) -> Self {
+        Self {
+            write: SleepRwLock::new(()),
+            invalidate: SleepRwLock::new(()),
+            metadata: SpinLock::new(metadata),
+            storage: InodeStorage::Fat,
+            writecount: SpinLock::new(0),
+        }
+    }
+
+    /// 借用仅属于 ext4 的块树根；调用方须先核对 ext4 后端或持有其准备凭据。
     fn disk_root(&self) -> &SleepRwLock<[u8; 60]> {
         match &self.storage {
             InodeStorage::Disk { root } => root,
             InodeStorage::Memory => panic!("memory inode has no disk root"),
+            InodeStorage::Fat => panic!("FAT inode entered ext4 block-root protocol"),
         }
     }
 }
@@ -2003,6 +2041,7 @@ impl InodeRef {
             owner: match &self.1 {
                 InodeOwner::Disk { domain, .. } => WeakInodeOwner::Disk(Arc::downgrade(domain)),
                 InodeOwner::Memory(fs) => WeakInodeOwner::Memory(Arc::downgrade(fs)),
+                InodeOwner::Fat(volume) => WeakInodeOwner::Fat(Arc::downgrade(volume)),
             },
         }
     }
@@ -2044,13 +2083,44 @@ impl InodeRef {
         ))
     }
 
+    /// 为已经验证的 FAT 卷构造根目录身份；外部句柄强持卷，节点后端只弱持卷。
+    pub(crate) fn try_fat_root(filesystem: &Arc<Fat32Volume>) -> Result<Self, FsError> {
+        let metadata = InodeMetadata::fat_root();
+        let inode = Arc::try_new(Inode {
+            backend: InodeBackend::Fat {
+                filesystem: Arc::downgrade(filesystem),
+            },
+            number: metadata.number,
+            data: Once::new(),
+            mapping: FileMapping::new(),
+            waiters: WaitQueue::new(),
+            #[cfg(feature = "ktest")]
+            truncate_hook: SpinLock::new(None),
+            _pinned: PhantomPinned,
+        })
+        .map_err(|_| FsError::NoMemory)?;
+        inode.data.call_once(|| Ok(InodeState::fat(metadata)));
+        Ok(Self(inode, InodeOwner::Fat(filesystem.clone())))
+    }
+
+    /// 借用当前句柄强持的真实 FAT 卷；其他后端返回 `InvalidOperation`。
+    pub fn fat_volume(&self) -> Result<&Arc<Fat32Volume>, FsError> {
+        match &self.1 {
+            InodeOwner::Fat(volume) => Ok(volume),
+            _ => Err(FsError::InvalidOperation),
+        }
+    }
+
     /// 判断两个 `InodeRef` 是否指向内存中同一个运行态 `Inode` 实例。
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// 等待节点完成加载，进入 `NOFS` 作用域并获取节点独占写锁守卫 `InodeWriteGuard`。
+    /// 等待节点加载完成后获取属性写锁；FAT 属性修改尚未实现，返回 `Unsupported`。
     pub(crate) fn inode_write(&self) -> Result<InodeWriteGuard<'_>, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let state = self.wait_loaded()?;
         let scope = ReclaimScope::nofs();
         let lock = state.write.write();
@@ -2078,8 +2148,11 @@ impl InodeRef {
         })
     }
 
-    /// 等待节点完成加载，校验其为目录类型后获取目录独占写锁守卫 `DirectoryWriteGuard`（复用 `InodeState::write` 写锁，允许持锁直接重查子项而无需递归加读锁）。
+    /// 校验目录类型并获取目录写锁；FAT 目录修改尚未实现，返回 `Unsupported`。
     pub(crate) fn directory_write(&self) -> Result<DirectoryWriteGuard<'_>, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let state = self.wait_loaded()?;
         let scope = ReclaimScope::nofs();
         let lock = state.write.write();
@@ -2126,8 +2199,11 @@ impl InodeRef {
             .notify_dirty(&disk.filesystem);
     }
 
-    /// 在数据回写释放回写锁后，按 `invalidate` 写锁 -> `mapping` 回写锁的顺序排斥新写操作并重新核定节点脏标记。
+    /// 数据回写后按失效锁、映射回写锁的顺序刷新脏义务；FAT 文件回写尚未实现。
     pub(crate) fn refresh_dirty_obligation(&self) -> Result<(), FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let _invalidate = self.wait_loaded()?.invalidate.write();
         let _writeback = self.mapping.lock_writeback();
         self.refresh_dirty_obligation_locked();
@@ -2145,7 +2221,12 @@ impl InodeRef {
     /// 申请文件写打开访问令牌 [`WriteAccess`]：
     /// - 拒绝直接写入承载扩展属性引用计数的内部隐藏 `EA_INODE`；
     /// - 若节点当前正作为可执行映像运行（`writecount < 0`），返回 `TextBusy`（`ETXTBSY`）。
+    ///
+    /// FAT 写打开尚未实现，返回 `Unsupported`。
     pub fn acquire_write(&self) -> Result<WriteAccess, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let state = self.wait_loaded()?;
         if state.metadata.lock().flags & codec::EA_INODE != 0 {
             return Err(FsError::InvalidOperation);
@@ -2161,8 +2242,11 @@ impl InodeRef {
         })
     }
 
-    /// 在加载可执行映像前申请拒绝写入令牌 [`ExecAccess`]：若当前存在任何可写打开句柄（`writecount > 0`），返回 `TextBusy`（`ETXTBSY`）。
+    /// 申请执行映像拒写令牌，活写句柄返回 `TextBusy`；FAT 映像访问尚未实现，返回 `Unsupported`。
     pub fn deny_writes(&self) -> Result<ExecAccess, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let state = self.wait_loaded()?;
         let mut count = state.writecount.lock();
         if 0 < *count {
@@ -2193,8 +2277,8 @@ impl InodeRef {
         self.truncate_locked(state, claim, new_size, false, &mut attempt, None)
     }
 
-    /// 在调用方已持有 `write` 与 `invalidate` 独占写锁的前提下，执行磁盘文件截断、扩容或 `links == 0` 删除释放：
-    /// 先更新文件 `size` 并卸载超出范围的用户态页表映射，再等待在途回写并截断页面缓存，最后摘除磁盘块树、释放物理块及（删除模式下的）`Inode` 位图。
+    /// 在 `write` 与 `invalidate` 独占保护下预备全部可失败资源，再执行截断、扩容或零链接节点删除。
+    /// 新 size、两轮页表卸载与页清理完成后发表块树，最后在根写锁及 metadata 回写锁内逐组失效并释放已摘除的数据与树节点。
     fn truncate_locked(
         &self,
         state: &InodeState,
@@ -2299,14 +2383,14 @@ impl InodeRef {
         self.mapping.unmap_range(first..u64::MAX, true);
         pages?;
 
-        // Step 5: 重新获取 `root` 写锁，提交裁剪后的新块树根与块计数，逐个作废并释放已从树上摘除的磁盘物理块。
+        // Step 5: 重新获取 `root` 写锁，提交新块树与真实块计数，再按组失效并释放已不可达的数据块和树节点。
         let mut root = state.disk_root().write();
         assert_eq!(
             *root, old_root,
             "truncate block root changed under write serialization"
         );
         let next_root = prepared.root;
-        let retired = prepared.publish(volume, old.checksum_seed);
+        let groups = prepared.publish(volume, old.checksum_seed);
         record
             .update(claim, |bytes| {
                 codec::patch_inode_mapping(
@@ -2322,12 +2406,12 @@ impl InodeRef {
         #[cfg(feature = "ktest")]
         self.truncate_phase(TruncatePhase::BeforeBlockRelease);
 
-        for block in retired {
+        for group in groups {
             // SAFETY:
-            // 1. 两轮 `unmap_range`、`truncate_pages` 与页面回写等待均已完成，没有任何页表或页面缓存仍引用被截断范围；
-            // 2. 当前持有 `root` 写锁与元数据回写锁，新块树已正式发布，旧树节点已不可达且无并发元数据回写；
-            // 3. `release_detached_block` 内部会先等待对应元数据缓冲区在途回写完成并作废缓存别名，最后才归还物理块位图。
-            unsafe { volume.release_detached_block(block) };
+            // 1. 两轮 `unmap_range`、`truncate_pages` 与原页回写等待均已完成，删除范围没有残留页表、页缓存或数据 I/O 消费者；
+            // 2. 当前持有 inode 写锁、失效独占锁、映射回写锁、`root` 写锁和 metadata 回写锁，新树与 inode 记录已发表，退休节点的临时窗口已退出准备作用域；
+            // 3. 组位图仍为占用，旧读者无法再取得计划块，释放函数逐块清除当前驻留的首页或尾页准确片段后，才在分配锁内清本次选定位。
+            unsafe { volume.release_detached_block_group(group) };
         }
         drop(root);
         drop(tail);
@@ -2679,6 +2763,9 @@ impl InodeRef {
         prepared: &PreparedMkwrite,
         content: &mut FolioContent<'_>,
     ) -> Result<bool, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let metadata = *self.loaded_state().metadata.lock();
         let start = prepared
             .index
@@ -2733,7 +2820,7 @@ impl InodeRef {
         let limit = write_limit(volume.geometry(), initial.flags);
         let remaining = source.len() - source.copied();
         let mut accepted = 0usize;
-        let mut input = [0u8; 512];
+        let mut input = [0u8; PAGE_SIZE];
         while accepted < remaining {
             // Step 1: 计算本次块内可写字节数，并在获取 `invalidate` 锁之前从源缓冲区拉取数据（允许安全处理用户态源地址缺页）。
             let position = match start.checked_add(accepted as u64) {
@@ -2886,6 +2973,9 @@ impl InodeRef {
         target: &mut ReadBuffer<'_>,
         ra: Option<&SpinLock<ReadaheadState>>,
     ) -> Result<usize, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let initial = target.copied();
         let remaining = target.len() - initial;
         if remaining == 0 {
@@ -2906,7 +2996,7 @@ impl InodeRef {
         let mut attempt = ReclaimAttempt::new();
         let len = (data.size - offset).min(remaining as u64) as usize;
         let mut copied = 0;
-        let mut staging = [0u8; 512];
+        let mut staging = [0u8; PAGE_SIZE];
         while copied < len {
             let position = offset + copied as u64;
             let index = position / PAGE_SIZE as u64;
@@ -2977,6 +3067,9 @@ impl InodeRef {
         index: u64,
         attempt: &mut ReclaimAttempt,
     ) -> Result<FolioRef, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         loop {
             let mut prepared = Some(self.mapping.prepare_file(self, index, attempt)?);
             let result = (|| {
@@ -3094,6 +3187,9 @@ impl InodeRef {
         prepared: &mut Option<PreparedFile>,
         context: Option<MetadataIoContext<'_>>,
     ) -> Result<Option<FolioRef>, FsError> {
+        if self.is_fat() {
+            return Err(FsError::Unsupported);
+        }
         let Some((folio, read)) = self.mapping.publish_file(self, index, prepared)? else {
             return Ok(None);
         };
@@ -3142,19 +3238,21 @@ impl Inode {
         self.number
     }
 
-    /// 获取磁盘节点所属的 `Ext4Volume` 引用；若当前为内存文件系统节点则返回 `InvalidOperation`。
+    /// 借用 ext4 卷；内存节点保留 `InvalidOperation`，FAT 的 ext4 专属入口返回 `Unsupported`。
     pub fn disk_volume(&self) -> Result<&Arc<Ext4Volume>, FsError> {
         match &self.backend {
             InodeBackend::Disk(disk) => Ok(&disk.filesystem),
             InodeBackend::Memory { .. } => Err(FsError::InvalidOperation),
+            InodeBackend::Fat { .. } => Err(FsError::Unsupported),
         }
     }
 
-    /// 供已确认处于磁盘分支的内部方法直接借用 `DiskInode` 状态；若误在内存节点上调用则触发 panic。
+    /// 借用已确认属于 ext4 的后端状态；普通后端分派必须先调用 `disk_volume` 核对类型。
     fn disk(&self) -> &DiskInode {
         match &self.backend {
             InodeBackend::Disk(disk) => disk,
             InodeBackend::Memory { .. } => panic!("memory inode entered disk protocol"),
+            InodeBackend::Fat { .. } => panic!("FAT inode entered ext4 inode protocol"),
         }
     }
 
@@ -3390,8 +3488,15 @@ impl DirectoryReadGuard<'_> {
         })
     }
 
-    /// 在目录共享读锁保护下将外部 64 位偏移 `cookie` 转换为内部目录遍历游标。
+    /// 转换目录偏移；FAT 仅允许初始零游标供打开根目录使用，其余偏移返回 `Unsupported`。
     pub(crate) fn cursor_at(&self, cookie: u64) -> Result<DirectoryCursor, FsError> {
+        if self.inode.is_fat() {
+            return if cookie == 0 {
+                Ok(DirectoryCursor::Byte(0))
+            } else {
+                Err(FsError::Unsupported)
+            };
+        }
         if self.inode.is_memory() {
             return Ok(DirectoryCursor::Memory(cookie));
         }
@@ -4188,6 +4293,35 @@ impl PreparedNewInode {
 }
 
 impl InodeMetadata {
+    /// FAT 根没有可提供 POSIX 属性的父目录项，使用固定身份、权限和纪元时间。
+    /// `size` 与 `blocks` 暂无目录簇统计值，均为零；目录内容访问仍须返回 `Unsupported`。
+    fn fat_root() -> Self {
+        let epoch = InodeTime {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        Self {
+            number: FAT_ROOT_INO,
+            kind: InodeKind::Directory,
+            mode: S_IFDIR | 0o755,
+            size: 0,
+            uid: 0,
+            gid: 0,
+            links: 2,
+            blocks: 0,
+            rdev: 0,
+            atime: epoch,
+            mtime: epoch,
+            ctime: epoch,
+            generation: 0,
+            flags: 0,
+            checksum_seed: 0,
+            fast_symlink: false,
+            file_acl: 0,
+            extra_isize: 0,
+        }
+    }
+
     /// 构造内存文件系统节点的初始运行态元数据（目录初始大小计入 `.` 与 `..` 两项）。
     pub(crate) fn memory(
         kind: InodeKind,
@@ -4234,14 +4368,22 @@ impl Inode {
                 .upgrade()
                 .expect("memory inode without filesystem owner")
                 .device(),
+            InodeBackend::Fat { filesystem } => filesystem
+                .upgrade()
+                .expect("FAT inode without filesystem owner")
+                .device(),
         }
     }
 
-    /// 返回节点的最佳 I/O 块字节大小（`st_blksize`：磁盘节点返回卷块大小，内存节点返回物理页大小 `PAGE_SIZE`）。
+    /// 返回最佳 I/O 块字节数：ext4 使用卷块大小，FAT 使用实际卷簇大小，内存节点使用物理页大小。
     pub fn block_size(&self) -> u32 {
         match &self.backend {
             InodeBackend::Disk(disk) => disk.filesystem.geometry().block_size as u32,
             InodeBackend::Memory { .. } => PAGE_SIZE as u32,
+            InodeBackend::Fat { filesystem } => filesystem
+                .upgrade()
+                .expect("FAT inode without filesystem owner")
+                .block_size(),
         }
     }
 
@@ -4253,6 +4395,11 @@ impl Inode {
     /// 判断当前节点是否属于内存文件系统后端。
     pub fn is_memory(&self) -> bool {
         matches!(self.backend, InodeBackend::Memory { .. })
+    }
+
+    /// 判断当前节点是否属于真实 FAT 卷。
+    pub fn is_fat(&self) -> bool {
+        matches!(self.backend, InodeBackend::Fat { .. })
     }
 
     /// 若当前节点为内存文件系统中的特殊节点（设备、FIFO、Socket 等），返回其具体角色描述。
@@ -4330,7 +4477,9 @@ impl InodeRef {
                 Arc::as_ptr(&fs),
                 "memory filesystem identity changed"
             ),
-            InodeBackend::Disk(_) => panic!("disk inode converted to memory reference"),
+            InodeBackend::Disk(_) | InodeBackend::Fat { .. } => {
+                panic!("non-memory inode converted to memory reference")
+            }
         }
         Self(inode, InodeOwner::Memory(fs))
     }
