@@ -159,7 +159,7 @@ fn validate(config: &Config) -> Result<(), String> {
         commands(&root.prepare, &at)?;
         let mut mounts = BTreeSet::new();
         for mount in &root.mounts {
-            if !matches!(mount.as_str(), "dev" | "proc" | "tmp") || !mounts.insert(mount) {
+            if !matches!(mount.as_str(), "dev" | "shm" | "proc" | "tmp") || !mounts.insert(mount) {
                 return Err(format!("{at}: invalid or repeated mount {mount:?}"));
             }
         }

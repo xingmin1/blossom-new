@@ -750,14 +750,17 @@ pub(crate) fn activate_current_cpu() {
     reprogram_current();
 }
 
-/// 在任务切入当前 CPU 执行时（关中断上下文），为其分配新的调度时间片（`QUANTUM`）并重新编程本核硬件定时器。
+/// 在任务切入时为普通策略分配时间片；FIFO 只保留维护与业务定时器事件。
 pub(crate) fn task_switch_in() {
+    let fifo = crate::sched::current_is_fifo();
     cpu::current().time_event.with_current(|event| {
         assert!(
             event.active && event.quantum.is_none(),
             "invalid task clockevent entry"
         );
-        arm_quantum(event);
+        if !fifo {
+            arm_quantum(event);
+        }
     });
     reprogram_current();
 }
@@ -771,28 +774,32 @@ pub(crate) fn task_switch_out() {
     reprogram_current();
 }
 
-/// 时钟中断处理函数：检查并推进到期的基准维护事件、清理到期的任务时间片，随后触发软件定时器回调并重编程下一次硬件中断。
-pub(crate) fn handle_timer() {
-    // Step 1: 在本核 `EventState` 短暂可变借用内检查维护期限与时间片期限，并在借用结束前释放可变引用。
-    let active = cpu::current().time_event.with_current(|event| {
+/// 在本核关中断的硬中断上下文中处理时钟事件，返回本次是否清除了已到期的任务时间片。
+///
+/// 未激活时返回 `false`；已激活时先处理时间维护与时间片，再释放本核事件借用，
+/// 执行软件定时器回调并重新编程，无论时间片是否到期。
+pub(crate) fn handle_timer() -> bool {
+    let Some(quantum_expired) = cpu::current().time_event.with_current(|event| {
         if !event.active {
-            return false;
+            return None;
         }
         let instant = now();
         if event.maintenance <= instant {
             event.maintenance = maintenance_deadline(keeper().update(arch::read_counter));
         }
-        if event.quantum.is_some_and(|deadline| deadline <= instant) {
+        let quantum_expired = event.quantum.is_some_and(|deadline| deadline <= instant);
+        if quantum_expired {
             event.quantum = None;
         }
-        true
-    });
+        Some(quantum_expired)
+    }) else {
+        return false;
+    };
 
-    // Step 2: 在释放 `EventState` 借用后执行软件定时器到期回调（允许回调内部重武装定时器），最后统一重新编程本核硬件定时器。
-    if active {
-        crate::timer::handle_interrupt();
-        reprogram_current();
-    }
+    // 软件定时器回调可以重入重编程，必须先结束本核事件的可变借用。
+    crate::timer::handle_interrupt();
+    reprogram_current();
+    quantum_expired
 }
 
 /// 重新查询当前 CPU 的维护期限、任务时间片与软件定时器最早到期时间，并将最早期限写入本核硬件定时器。

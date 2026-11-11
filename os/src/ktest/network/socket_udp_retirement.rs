@@ -44,7 +44,7 @@ pub(crate) mod socket_udp_retirement {
     /// 场景步骤：
     /// 1. 创建 IPv4 UDP `SocketFile` 并连接 `SERVER`，设置发送预算为 8193 字节；
     /// 2. 预分配 CPU 0 关中断闸门任务，调用 `HeapPressure::exhaust` 彻底耗尽物理页与堆内存，随后启动 CPU 0 关中断闸门暂停网络工作队列；
-    /// 3. 将 8193 字节载荷写入 `endpoint` 发送队列，确认发送预算已扣减（`POLLOUT` 清零）；
+    /// 3. 在内存压力与关中断闸门期间准备并向 `endpoint` 发送 8193 字节载荷，确认发送预算已扣减（`POLLOUT` 清零）；
     /// 4. 放行 CPU 0 关中断闸门并刷新工作队列，验证软中断因内存不足无法构造回环报文，向端点报告 `POLLERR` 与 `FsError::NoMemory`；
     /// 5. 在内存压力仍然存在的情况下读取 `take_error()`、丢弃 `endpoint` 与 `sender` 的全部强引用，并连续刷新工作队列以执行关闭回调与异步 reaper；
     /// 6. 释放内存压力，验证无需对已关闭端点发起任何额外操作，其弱引用 `endpoint_weak` 已失效、全局活跃端点归零，且原本地端口 `local` 可被重新预约绑定。
@@ -107,9 +107,13 @@ pub(crate) mod socket_udp_retirement {
                     "UDP OOM Work CPU did not enter IRQ gate",
                 )?;
 
-                // Step 3: 在 CPU 0 关中断期间向端点写入大报文，直接操作底层 endpoint 避免文件层额外分配，确认报文入队并耗尽发送预算。
-                if child_operation(endpoint.send(&payload, None))?
-                    != IoProgress::Ready(payload.len())
+                // Step 3: 在 CPU 0 关中断期间准备并发送大报文，直接操作底层 endpoint 避免文件层额外分配，确认报文入队并耗尽发送预算。
+                // 准备对象在发送调用返回时释放，避免影响末引用回收观察。
+                if child_operation(
+                    endpoint
+                        .prepare_send(payload.len(), None)
+                        .and_then(|prepared| endpoint.send(&prepared, &payload)),
+                )? != IoProgress::Ready(payload.len())
                 {
                     return Err(TestError("UDP OOM message was not actually accepted"));
                 }
@@ -191,7 +195,7 @@ pub(crate) mod socket_udp_retirement {
     /// 场景步骤：
     /// 1. 创建绑定在 `45682` 端口的 `receiver` 与连接到该地址的 `sender`，记录 `sender` 的初始源端口 `old`；
     /// 2. 预分配 CPU 0 关中断闸门并耗尽物理页与堆内存，随后启动闸门暂停后台工作队列；
-    /// 3. 在 `sender` 中依次入队 1 条 8193 字节大报文和 31 条零长度报文（共占满 32 个元数据槽位，使 `POLLOUT` 变为不可写）；
+    /// 3. 在内存压力与关中断闸门期间依次准备并入队 1 条 8193 字节大报文和 31 条零长度报文（共占满 32 个元数据槽位，使 `POLLOUT` 变为不可写）；
     /// 4. 放行 CPU 0 关中断闸门并刷新工作队列，验证队首 8193 字节大报文因分配失败上报 `POLLERR` 与 `FsError::NoMemory`；
     /// 5. 再次刷新工作队列以跨越单次 16 条的分派批次上限，验证后续 31 条零长度报文无需额外载荷分配即可全部送达 `receiver`，且每条报文的源地址均为 `old`，消费后 `sender` 恢复 `POLLOUT`；
     /// 6. 释放内存压力，确认 `receiver` 队列已空（失败的大报文未混入），接着在原连接上发送正常报文验证送达；
@@ -266,15 +270,24 @@ pub(crate) mod socket_udp_retirement {
                     "UDP successor Work CPU did not enter IRQ gate",
                 )?;
 
-                // Step 3: 入队 1 条 8193 字节大报文与 31 条零长度报文，占满全部 32 个发送元数据槽位。
-                if child_operation(endpoint.send(&payload, None))?
-                    != IoProgress::Ready(payload.len())
+                // Step 3: 准备并入队 1 条 8193 字节大报文与 31 条零长度报文，占满全部 32 个发送元数据槽位。
+                // 每条报文的准备对象在发送返回时释放，后续投递依赖队列持有的租约。
+                if child_operation(
+                    endpoint
+                        .prepare_send(payload.len(), None)
+                        .and_then(|prepared| endpoint.send(&prepared, &payload)),
+                )? != IoProgress::Ready(payload.len())
                 {
                     return Err(TestError("UDP successor OOM message was not accepted"));
                 }
                 // 发送队列元数据容量上限为 32；紧随大报文之后的 31 条零长度记录跨越了单批 16 条的处理配额，且不占用额外载荷空间。
                 for _ in 0..31 {
-                    if child_operation(endpoint.send(&[], None))? != IoProgress::Ready(0) {
+                    if child_operation(
+                        endpoint
+                            .prepare_send(0, None)
+                            .and_then(|prepared| endpoint.send(&prepared, &[])),
+                    )? != IoProgress::Ready(0)
+                    {
                         return Err(TestError("UDP zero successor was not actually accepted"));
                     }
                 }

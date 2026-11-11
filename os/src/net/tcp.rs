@@ -101,7 +101,7 @@ struct Input {
 
 /// 端点的绑定租约、父子关联及套接字控制属性（由 `TcpEndpoint::metadata` 自旋锁保护）。
 struct Metadata {
-    /// 当前占用的本地地址与端口绑定租约；未绑定时为 `None`，被接受的子连接与父监听端点共享同一租约。
+    /// 当前占用的本地绑定租约；被动子连接共享同一租约，关闭监听文件或中止未交付连接时释放本端引用。
     lease: Option<Arc<BindLease>>,
     /// 若当前端点为监听套接字派生的被动连接子端点，指向其父监听端点的弱引用。
     parent: Weak<TcpEndpoint>,
@@ -868,7 +868,7 @@ impl TcpEndpoint {
         let admission = net.admission()?;
         core.prepare_buffers()?;
         let lease = self.binding_or_ephemeral(&net)?;
-        let route = net.resolve_route(peer.address, lease.local().address)?;
+        let route = net.resolve_route(peer.address, lease.local().address, false)?;
         let local = InetEndpoint {
             address: route.source,
             port: lease.local().port,
@@ -928,21 +928,59 @@ impl TcpEndpoint {
         Ok(child)
     }
 
-    /// 当最后一个关联的套接字文件描述关闭时调用，关闭读写双方向并触发底层 TCP 优雅关闭挥手（FIN / `TIME_WAIT`）。
+    /// 最后一个打开文件描述关闭时，同步撤销监听索引和监听端点的租约；普通连接保留租约并继续完成 FIN 与 TIME_WAIT。
     pub fn close(&self) {
         let mut core = self.lock();
+        let listening = core.state() == State::Listen;
+        if listening {
+            if let Some(net) = self.stack.upgrade() {
+                net.tables().remove_tcp_indices(self.id);
+            }
+        }
         core.close();
-        let mut metadata = self.metadata.lock();
-        metadata.engaged = true;
-        metadata.read_closed = true;
-        metadata.write_closed = true;
+        let lease = {
+            let mut metadata = self.metadata.lock();
+            metadata.engaged = true;
+            metadata.read_closed = true;
+            metadata.write_closed = true;
+            if listening {
+                metadata.lease.take()
+            } else {
+                None
+            }
+        };
+        if !listening {
+            return;
+        }
+        let children = {
+            let mut children = self.children.lock();
+            children.limit = 0;
+            (
+                core::mem::take(&mut children.pending),
+                core::mem::take(&mut children.ready),
+            )
+        };
+        // 子连接的 Work 可能正在报告握手完成，关闭它们时不持有父端点的 core 锁。
+        drop(core);
+        for child in children.0.into_iter().chain(children.1) {
+            child.abandon();
+        }
+        drop(lease);
     }
 
-    /// 强制中止尚未被用户态接受的被动子连接，向对端触发 RST 并丢弃协议连接。
+    /// 强制中止不再向用户态交付的连接并释放本端租约，后台继续发送复位报文和回收协议对象。
     pub fn abandon(&self) {
         let mut core = self.lock();
+        if let Some(net) = self.stack.upgrade() {
+            net.tables().remove_tcp_indices(self.id);
+        }
         core.abort();
-        self.metadata.lock().engaged = true;
+        let lease = {
+            let mut metadata = self.metadata.lock();
+            metadata.engaged = true;
+            metadata.lease.take()
+        };
+        drop(lease);
     }
 
     /// 将收到的 IP/TCP 报文推入端点的有界输入队列，并调度后台 `Work` 异步消费。
@@ -1215,7 +1253,7 @@ impl TcpEndpoint {
             core.receive_capacity(),
             core.send_capacity(),
         )?;
-        let route = net.resolve_route(peer.address, local.address)?;
+        let route = net.resolve_route(peer.address, local.address, false)?;
         {
             let mut child_core = child.core.lock();
             child_core.set_ip_mtu(route.mtu);

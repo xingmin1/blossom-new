@@ -28,7 +28,7 @@
 //! 16..24   8        msg_iov         scatter/gather I/O 向量数组指针 (u64)
 //! 24..32   8        msg_iovlen      I/O 向量元素个数 (u64)
 //! 32..40   8        msg_control     辅助控制数据指针 (u64)
-//! 40..48   8        msg_controllen  辅助数据字节长度 (u64，当前不支持非零输入，recvmsg 写回 0)
+//! 40..48   8        msg_controllen  辅助数据容量；接收时写回实际输出字节数
 //! 48..52   4        msg_flags       接收消息标志输出位 (u32，输入时忽略，recvmsg 写回偏移 48)
 //! 52..56   4        (padding)       尾部对齐填充
 //! ```
@@ -45,11 +45,12 @@ use crate::net::address::{
     AddressFamily, SocketAddress, ADDRESS_FAMILY_LEN, AF_INET, AF_INET6, AF_UNIX, MAX_ADDRESS_LEN,
 };
 use crate::net::socket::{
-    SocketFile, IPPROTO_IPV6, IPPROTO_MAX, IPPROTO_TCP, IPPROTO_UDP, MSG_TRUNC, SOCK_CLOEXEC,
-    SOCK_DGRAM, SOCK_MAX, SOCK_NONBLOCK, SOCK_SEQPACKET, SOCK_STREAM, SOCK_TYPE_MASK, SOL_SOCKET,
-    SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR, SO_KEEPALIVE, SO_PROTOCOL, SO_RCVBUF, SO_RCVTIMEO,
-    SO_REUSEADDR, SO_SNDBUF, SO_SNDTIMEO, SO_TYPE,
+    SocketFile, IPPROTO_IPV6, IPPROTO_MAX, IPPROTO_TCP, IPPROTO_UDP, MSG_CTRUNC, MSG_ERRQUEUE,
+    MSG_TRUNC, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX, SOCK_NONBLOCK, SOCK_SEQPACKET, SOCK_STREAM,
+    SOCK_TYPE_MASK, SOL_SOCKET, SO_ACCEPTCONN, SO_DOMAIN, SO_DONTROUTE, SO_ERROR, SO_KEEPALIVE,
+    SO_PROTOCOL, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDTIMEO, SO_TYPE,
 };
+use crate::net::udp::UdpErrorRecord;
 use crate::net::UnixSocketType;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::file::{import_vectors, nofile, MAX_IOV_COUNT};
@@ -65,6 +66,10 @@ const TCP_NODELAY: i32 = 1;
 const TCP_MAXSEG: i32 = 2;
 const TCP_CONGESTION: i32 = 13;
 const IPV6_V6ONLY: i32 = 26;
+const SOL_IP: i32 = 0;
+const IP_RECVERR: i32 = 11;
+const CMSG_HEADER_LEN: usize = 16;
+const IPV4_ERROR_CMSG_LEN: usize = 48;
 
 const CONGESTION_NAME_LEN: usize = 16;
 const ADDRESS_STORAGE_LEN: usize = 128;
@@ -439,11 +444,14 @@ struct MessageHeader {
     vectors: usize,
     /// `msg_iov` 数组包含的元素个数（`msg_iovlen`，已校验不超过 `MAX_IOV_COUNT`）。
     vector_count: usize,
+    /// 用户辅助控制缓冲区地址，仅在领取消息后执行输出复制。
+    control: usize,
+    /// 辅助控制缓冲区可写容量。
+    control_capacity: usize,
 }
 
-/// 从用户空间一次性读取 56 字节的 LP64 `struct msghdr`，按固定字节偏移解析各字段并校验向量数量与辅助数据长度。
-///
-/// 输入时的对齐填充字节与 `msg_flags` 字段均被忽略；当前不支持非零长度的辅助控制信息（`msg_controllen != 0` 时返回 `Err(Errno::Unsupported)`）。
+/// 一次读取 LP64 消息头并校验名称长度及向量数量，不提前访问辅助输出缓冲区。
+/// 输入 msg_flags 与对齐填充均忽略，发送端另行检查尚未支持的辅助输入。
 fn message_header(mm: &Mm, address: usize) -> Result<MessageHeader, Errno> {
     let mut bytes = [0u8; 56];
     copyin(mm, &mut bytes, address)?;
@@ -451,8 +459,8 @@ fn message_header(mm: &Mm, address: usize) -> Result<MessageHeader, Errno> {
     let name_length = i32::from_ne_bytes(bytes[8..12].try_into().expect("fixed namelen field"));
     let vectors = message_word(&bytes, 16);
     let vector_count = message_word(&bytes, 24);
-    let _control = message_word(&bytes, 32);
-    let control_length = message_word(&bytes, 40);
+    let control = message_word(&bytes, 32);
+    let control_capacity = message_word(&bytes, 40);
     let _flags = u32::from_ne_bytes(bytes[48..52].try_into().expect("fixed flags field"));
     if MAX_IOV_COUNT < vector_count {
         return Err(Errno::MessageTooLarge);
@@ -465,15 +473,14 @@ fn message_header(mm: &Mm, address: usize) -> Result<MessageHeader, Errno> {
         }
         (name_length as usize).min(ADDRESS_STORAGE_LEN)
     };
-    if control_length != 0 {
-        return Err(Errno::Unsupported);
-    }
 
     Ok(MessageHeader {
         name,
         name_capacity,
         vectors,
         vector_count,
+        control,
+        control_capacity,
     })
 }
 
@@ -494,6 +501,9 @@ fn sendmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let socket = file.socket().expect("checked socket capability");
     let mm = user.mm().expect("sendmsg has no MM");
     let header = message_header(&mm, raw[1])?;
+    if header.control_capacity != 0 {
+        return Err(Errno::Unsupported);
+    }
     let destination = if header.name_capacity == 0 {
         None
     } else {
@@ -518,7 +528,7 @@ fn sendmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
 /// `recvmsg` 系统调用：从套接字接收数据填入用户态 `iovec` 向量缓冲区，并更新用户空间 `struct msghdr` 中的源地址长度、输出标志与控制数据长度。
 ///
 /// - **调用上下文**：普通可睡眠用户任务上下文。消息一旦从接收队列消费，若后续写回源地址或 `msghdr` 字段时触发 `EFAULT`，已消费的报文不会退回接收队列。
-/// - **返回值**：默认返回实际拷入用户缓冲区的字节数；若对 `SOCK_DGRAM` 或 `SOCK_SEQPACKET` 传入了 `MSG_TRUNC` 标志，则返回报文截断前的原始总长度。
+/// - **返回值**：错误队列始终返回实际复制长度；普通消息可由输入 MSG_TRUNC 请求原始长度。
 fn recvmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
     // Step 1: 解析套接字、读取 56 字节 msghdr 并导入 iovec 数组，调用底层 receive 接收数据。
     let file = socket_file(user, raw[0])?;
@@ -532,24 +542,73 @@ fn recvmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let vectors = import_vectors(&mm, header.vectors, header.vector_count, &mut fast)?;
     let mut target = ReadBuffer::user_vector(&mm, &vectors)?;
     let flags = raw[2] as u32;
-    let message = socket.receive(&mut target, flags, FileIoContext::User(user))?;
+    let (message, control_length) = if flags & MSG_ERRQUEUE != 0 {
+        let record = socket.receive_error(flags)?;
+        let mut message = record.copy_to(&mut target)?;
+        let control_length = output_error_control(&mm, &header, &record, &mut message.flags);
+        (message, control_length)
+    } else {
+        (
+            socket.receive(&mut target, flags, FileIoContext::User(user))?,
+            0,
+        )
+    };
 
     // Step 2: 若调用方提供了 msg_name 缓冲区，写出源地址并更新 msghdr 偏移 8 处的 msg_namelen。
     if header.name != 0 {
         let length = output_name(&mm, header.name, header.name_capacity, message.source)?;
         output_message_field(&mm, raw[1], 8, &(length as u32).to_ne_bytes())?;
     }
-    // Step 3: 更新 msghdr 偏移 48 处的 msg_flags 与偏移 40 处的 msg_controllen (0)，并根据 MSG_TRUNC 计算返回长度。
+    // Step 3: 按 ABI 顺序写回标志及实际辅助数据长度，失败不恢复已领取的消息。
     output_message_field(&mm, raw[1], 48, &message.flags.to_ne_bytes())?;
-    output_message_field(&mm, raw[1], 40, &0u64.to_ne_bytes())?;
+    output_message_field(&mm, raw[1], 40, &(control_length as u64).to_ne_bytes())?;
 
-    let count =
-        if matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET) && flags & MSG_TRUNC != 0 {
-            message.original_len
-        } else {
-            message.copied
-        };
+    let count = if flags & MSG_ERRQUEUE == 0
+        && matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET)
+        && flags & MSG_TRUNC != 0
+    {
+        message.original_len
+    } else {
+        message.copied
+    };
     Ok(count as isize)
+}
+
+/// 输出 IPv4 扩展错误和 offender；控制复制失败不覆盖已经成功复制的正文。
+/// 只有完整成功的辅助复制才推进 msg_controllen，短容量按实际 cmsg 长度截断。
+fn output_error_control(
+    mm: &Mm,
+    header: &MessageHeader,
+    record: &UdpErrorRecord,
+    flags: &mut u32,
+) -> usize {
+    if header.control == 0 || header.control_capacity < CMSG_HEADER_LEN {
+        *flags |= MSG_CTRUNC;
+        return 0;
+    }
+    let copied = header.control_capacity.min(IPV4_ERROR_CMSG_LEN);
+    if copied < IPV4_ERROR_CMSG_LEN {
+        *flags |= MSG_CTRUNC;
+    }
+    let mut bytes = [0u8; IPV4_ERROR_CMSG_LEN];
+    bytes[..8].copy_from_slice(&(copied as u64).to_ne_bytes());
+    bytes[8..12].copy_from_slice(&SOL_IP.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&IP_RECVERR.to_ne_bytes());
+    let error = (-Errno::from(record.error).result()) as u32;
+    bytes[16..20].copy_from_slice(&error.to_ne_bytes());
+    bytes[20] = record.origin;
+    bytes[21] = record.kind;
+    bytes[22] = record.code;
+    bytes[24..28].copy_from_slice(&record.info.to_ne_bytes());
+    if let Some(offender) = record.offender {
+        bytes[32..34].copy_from_slice(&AF_INET.to_ne_bytes());
+        bytes[36..40].copy_from_slice(&offender.octets());
+    }
+    if copyout(mm, header.control, &bytes[..copied]).is_ok() {
+        copied
+    } else {
+        0
+    }
 }
 
 /// 向用户空间 `struct msghdr`（基址为 `header`）的指定字节偏移 `offset` 处单独写回一个字段，保持其余指针、计数与填充字节不变。
@@ -574,7 +633,7 @@ fn output_name(
     Ok(length)
 }
 
-/// `recvfrom` 系统调用：从套接字接收数据到单个用户缓冲区，可选地写回发送方源地址，并根据 `MSG_TRUNC` 标志返回实际拷贝字节数或原始报文长度。
+/// 从普通队列或错误队列接收正文和地址；错误队列忽略输入 MSG_TRUNC 的长度扩展请求。
 fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mm = user.mm().expect("recvfrom has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2])?;
@@ -592,6 +651,7 @@ fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let socket = file.socket().expect("checked socket capability");
     let count = if matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET)
         && raw[3] as u32 & MSG_TRUNC != 0
+        && raw[3] as u32 & MSG_ERRQUEUE == 0
     {
         message.original_len
     } else {
@@ -604,6 +664,10 @@ fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
 fn check_option(socket: &SocketFile, level: i32, option: i32, setting: bool) -> Result<(), Errno> {
     match (level, option) {
         (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE | SO_RCVTIMEO | SO_SNDTIMEO) => Ok(()),
+        (SOL_SOCKET, SO_DONTROUTE) if socket.protocol() == IPPROTO_UDP => Ok(()),
+        (SOL_IP, IP_RECVERR) if socket.domain() == AF_INET && socket.protocol() == IPPROTO_UDP => {
+            Ok(())
+        }
         (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) if !setting || socket.domain() != AF_UNIX => Ok(()),
         (SOL_SOCKET, SO_TYPE | SO_ERROR | SO_ACCEPTCONN | SO_PROTOCOL | SO_DOMAIN) if !setting => {
             Ok(())
@@ -692,6 +756,21 @@ fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
 
     // Step 2: 特殊处理变长或非 4 字节整型选项（SO_RCVTIMEO / SO_SNDTIMEO 的 timeval 与 TCP_CONGESTION 的算法名称）。
     let mm = user.mm().expect("setsockopt has no MM");
+    if level == SOL_IP && option == IP_RECVERR {
+        let enabled = if length == 0 {
+            false
+        } else if length < 4 {
+            let mut byte = [0u8; 1];
+            copyin(&mm, &mut byte, raw[3])?;
+            byte[0] != 0
+        } else {
+            let mut bytes = [0u8; 4];
+            copyin(&mm, &mut bytes, raw[3])?;
+            i32::from_ne_bytes(bytes) != 0
+        };
+        socket.set_recv_error(enabled)?;
+        return Ok(0);
+    }
     if level == SOL_SOCKET && matches!(option, SO_RCVTIMEO | SO_SNDTIMEO) {
         let timeout = input_timeout(&mm, raw[3], length as usize)?;
         socket.set_timeout(option == SO_RCVTIMEO, timeout);
@@ -719,6 +798,7 @@ fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let value = i32::from_ne_bytes(bytes);
     match (level, option) {
         (SOL_SOCKET, SO_REUSEADDR) => socket.set_reuse_address(value != 0)?,
+        (SOL_SOCKET, SO_DONTROUTE) => socket.set_dont_route(value != 0)?,
         (SOL_SOCKET, SO_KEEPALIVE) => socket.set_keepalive(value != 0)?,
         (SOL_SOCKET, SO_SNDBUF) => socket.set_send_budget(value)?,
         (SOL_SOCKET, SO_RCVBUF) => socket.set_receive_budget(value)?,
@@ -761,6 +841,19 @@ fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     check_option(socket, level, option, false)?;
     let mm = user.mm().expect("getsockopt has no MM");
     let capacity = capacity(&mm, raw[4])?;
+    if level == SOL_IP && option == IP_RECVERR {
+        let value = i32::from(socket.recv_error()?);
+        let copied = match capacity {
+            0 => 0,
+            1..=3 => 1,
+            _ => 4,
+        };
+        copyout(&mm, raw[4], &(copied as u32).to_ne_bytes())?;
+        if copied != 0 {
+            copyout(&mm, raw[3], &value.to_ne_bytes()[..copied])?;
+        }
+        return Ok(0);
+    }
     if level == SOL_SOCKET && matches!(option, SO_RCVTIMEO | SO_SNDTIMEO) {
         let bytes = timeout_bytes(socket.timeout(option == SO_RCVTIMEO));
         return output_option(&mm, raw, capacity, &bytes);
@@ -776,6 +869,7 @@ fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         (IPPROTO_IPV6, IPV6_V6ONLY) => i32::from(socket.v6_only()?),
         (SOL_SOCKET, SO_REUSEADDR) => i32::from(socket.reuse_address()),
+        (SOL_SOCKET, SO_DONTROUTE) => i32::from(socket.dont_route()?),
         (SOL_SOCKET, SO_KEEPALIVE) => i32::from(socket.keepalive()),
         (SOL_SOCKET, SO_TYPE) => socket.socket_type() as i32,
         (SOL_SOCKET, SO_ERROR) => socket

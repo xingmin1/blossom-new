@@ -90,7 +90,13 @@ finish = "poweroff"
 
 若目标位置已有同名镜像，准备命令会先截断旧文件，再完整复制新镜像；整条命令仍受默认的 60 秒准备期限约束。
 
-如需只运行这两项，可显式选择独立计划：
+默认计划在比赛根目录的工作副本中补齐缺失的命令和输入：`sh`、`cp`、`sleep`、`true` 链接到项目 BusyBox；盘内 lmbench 脚本引用的绝对路径链接同盘 `lmbench_all`；协议名称表提供 `ip`、`icmp`、`tcp`、`udp` 的标准编号。UnixBench 的 `sort.src` 使用[上游固定输入](https://github.com/kdlucas/byte-unixbench/blob/f53eadaa3e628908fa42b2167335459e970e5ebb/UnixBench/testdir/sort.src)，许可证随文件保存在 `userland/contest/fixtures/UNIXBENCH-LICENSE`。已有文件或链接会被保留；这些准备不会修改原始比赛盘、测试程序或脚本。
+
+两个 root 都先复制项目 BusyBox 到 `/.blossom/busybox`，再补缺失的标准 `/bin/sh` 入口。项目 ash 遇到无 shebang 文本时，通过 `/bin/busybox` 重新执行盘内 BusyBox 的 ash；原 `/busybox` 和 `/bin/busybox` 的准备方式不变，显式 `/busybox sh` 仍执行盘内原 shell。已有 `/bin/sh`（包括失效符号链接）不会被替换；复制或链接失败会按准备错误返回。
+
+更新系统盘中的计划后，使用 `fresh` 才会从原比赛盘重新准备缺失的入口。`reuse` 不更新系统工作盘中的计划，`refresh-system` 虽更新计划但保留比赛工作盘；两者都不会替换比赛工作盘中已有的旧 `/bin/sh` 链接。
+
+如需只运行 `mount`、`umount`，可显式选择独立计划：
 
 ```sh
 /sbin/contest-run /dev/vda --plan /etc/contest/mount-plan.toml
@@ -204,6 +210,8 @@ timeout_sec = 600
 
 这些脚本自带组起止标记与结果行，group 不写 `start`/`end`，避免输出两套标记。`timeout_sec` 是整个脚本的外层预算，应按脚本实际耗时设置，不能套用普通短用例的 60 秒。
 
+比赛盘内的 RISC-V musl Iozone 3.506 对原脚本的 `-i 11 -i 12` 参数，在 Linux 下也提示 `Selected test not available on the version`，随后输出 initial writers 和 rewriters 测量值。评分器能够读取这两项输出，但这些分数不能证明 pwritev/preadv 模式实际运行。
+
 `iperf` 集合额外配置 `cleanup`：盘内脚本用 `iperf3 -s -D` 启动服务端，守护进程脱离主命令的进程组，脚本结束时也不停止它，主命令收尾的整组 `SIGKILL` 到不了它。`sets/iperf.toml` 直接用 `/busybox sh /iperf_testcode.sh` 原样执行脚本；cleanup 在同一个 root 内用盘内 BusyBox 执行 `killall iperf3`，再用 `pidof` 每秒检查一次，直到服务端退出后才切换 root，否则它打开的 `/dev` 文件会让卸载返回 Busy。
 
 `killall`/`pidof` 依赖内核的 `/proc/<pid>/stat` 与 `/proc/<pid>/cmdline` 查询。系统根 BusyBox 未启用这两个 applet，cleanup 必须使用比赛根内的 `/busybox`。
@@ -218,7 +226,7 @@ cleanup 单条命令的超时取 `defaults.timeout_sec`（默认计划为 60 秒
 [roots.musl]
 path = "/mnt/contest/musl"
 cwd = "/"
-mounts = ["dev", "proc", "tmp"]
+mounts = ["dev", "shm", "proc", "tmp"]
 env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }
 ```
 
@@ -238,7 +246,22 @@ env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }
 
 ## 6. 根的挂载与准备
 
-`root.mounts` 只接受 `dev`、`proc`、`tmp`，分别在测试根内挂载 devfs、procfs 与 tmpfs。该 root 激活时，执行器先运行 `root.prepare` 中的命令，再挂载这些目录；切换到下一个 root 或结束会话时按相反顺序卸载。
+`root.mounts` 接受下列显式项目，不自动补项、排序或合并挂载：
+
+| 项目 | 测试根内的挂载点 | 文件系统 |
+|---|---|---|
+| `dev` | `/dev` | devfs |
+| `shm` | `/dev/shm` | 独立 tmpfs |
+| `proc` | `/proc` | procfs |
+| `tmp` | `/tmp` | 另一份独立 tmpfs |
+
+该 root 激活时，执行器先运行 `root.prepare` 中的命令，再按 `mounts` 的声明顺序挂载。默认 musl、glibc 和显式单命令模式均使用 `["dev", "shm", "proc", "tmp"]`，切换 root 或结束会话时按 `tmp`、`proc`、`shm`、`dev` 的顺序释放。成功挂载才加入现有的 owned 栈；中途失败时，已经成功的挂载仍由该栈逆序释放。卸载遇到 `EBUSY` 立即返回带挂载点的真实错误，保留尚未卸载的所有权，不使用强制或 lazy 卸载，也不将失败记为成功。
+
+`shm` 必须单独声明；`dev` 只挂 devfs，其固定 `/shm` 目录提供挂载位置，不会隐含挂载 tmpfs。需要同时挂载两者时应把 `dev` 放在 `shm` 前，避免后挂的 `/dev` 遮住子挂载。旧配置 `["dev", "proc", "tmp"]` 仍只建立原来三项；省略 `mounts` 或写 `[]` 不建立任何伪文件系统。无需 POSIX 共享内存的配置不必增加 `shm`。
+
+Linux 的 POSIX 共享内存 `shm_open`、`shm_unlink` 使用 `/dev/shm` 中的普通文件，需要用户可见的 tmpfs；SysV 的 `shmget`、`shmat`、`shmctl` 使用内核自己的共享内存对象，不依赖这个挂载。参见 [Linux tmpfs 说明](../ref/linux/Documentation/filesystems/tmpfs.rst)。挂载 `/tmp` 或实现 SysV 共享内存都不能替代 `/dev/shm`；这里不修改测试程序，也不改变其他系统调用的真实返回值。
+
+`mlock` 和 `munlock` 对当前地址空间执行真实锁页与解锁，`RLIMIT_MEMLOCK` 默认软硬限额均为 8 MiB；当前凭据模型以 UID 0 表达锁页特权。`mlockall`、`mlock2` 和独立的 `CAP_IPC_LOCK` 尚未实现，不能将上述支持外推为完整锁页接口。
 
 `prepare` 是显式的环境准备，在父系统根 `/` 中执行，可直接操作挂载在 `/mnt/contest` 的比赛盘工作副本；默认计划的链接与复制只改这份副本，原始比赛镜像保持不变。部分旧版比赛盘的 `musl`、`glibc` 子目录缺少程序 `PT_INTERP` 请求的解释器路径，默认计划用链接和复制补齐（节选）：
 
@@ -250,7 +273,36 @@ prepare = [
 ]
 ```
 
-每个准备命令的退出码必须为 0，否则该 root 激活失败并按执行错误处理。准备超时使用 `defaults.timeout_sec`。路径以实际比赛盘为准；执行器不会自动猜测解释器、复制系统盘中的库或改写盘内文件。
+每个准备命令的退出码必须为 0，否则该 root 激活失败并按执行错误处理，后续挂载和用例不再运行。准备超时使用 `defaults.timeout_sec`；挂载失败也立即停止当前会话，并报告实际路径和系统错误。文件、命令与链接的补缺只由 `prepare` 中的明确 argv 执行：第 2 节列出的补缺入口保留已有文件及链接（包括失效链接），而解释器链接、loader 和 `/.blossom` 副本仍按各自命令执行。执行器不自动猜测解释器，不用系统盘的 libc 覆盖比赛盘，也不改写原测试脚本、ELF 或 judge。
+
+### 6.1 定向验证入口
+
+以下是验证命令，不代表已经执行。宿主合同检查使用包内离线依赖：
+
+```sh
+(cd userland/contest-run && cargo test --locked --offline root_mounts)
+```
+
+该筛选覆盖 shm 重复项和非法路径名称拒绝、空挂载列表不隐式创建目录、准备失败与目标路径错误及其先后顺序。真实 tmpfs 挂卸载及 Busy 检查被显式标为 ignored；在允许用户命名空间的 Linux 宿主运行：
+
+```sh
+(cd userland/contest-run && \
+  unshare --user --map-root-user --mount --propagation private \
+  cargo test --locked --offline --test runtime root_mounts -- --ignored --test-threads=1)
+```
+
+这两个用例在独立私有挂载命名空间中使用真实 tmpfs，检查子挂载逆序释放、`EBUSY` 后所有权保留和部分准备失败后的释放；它们用父 tmpfs 检查通用挂载生命周期，不替代客体 devfs 验证。宿主禁止命名空间或缺少挂载权限时命令会真实失败，普通合同测试不会将这两个 ignored 用例算作通过。
+
+重新构建并按第 1 节使用 `fresh` 工作盘进入客体 Shell 后，可以检查显式单命令的可写共享内存目录，再运行两个 libc 根内的原 cyclictest 脚本：
+
+```sh
+/sbin/contest-run /dev/vda --root /musl --cwd / -- /busybox sh -c \
+  'test -d /dev/shm && printf "shared memory\n" > /dev/shm/runner-check && /busybox cat /dev/shm/runner-check'
+/sbin/contest-run /dev/vda --only 'cyclictest:musl:script' \
+  --only 'cyclictest:glibc:script' --finish return
+```
+
+前一条只检查文件路径、写入与命令后的正常释放；后一条才执行原程序的 `shm_open` 路径。应保留原始输出与准备、挂载或卸载错误，并交给对应原 judge 判定，不用 runner 退出零代替程序成功或得分。
 
 ## 7. 预览与临时筛选
 

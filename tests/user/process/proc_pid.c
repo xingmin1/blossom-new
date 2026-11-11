@@ -4,10 +4,12 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include "kselftest.h"
 #include "selftest_io.h"
@@ -38,6 +40,18 @@ struct process_stat {
     char number[53][32];
 };
 
+/// 工作线程通过管道控制组首退出，并在组首退出后继续处理调度或 exec 命令。
+struct scheduling_child {
+    /// 父进程的命令读端。
+    int command;
+    /// 向父进程确认操作完成的写端。
+    int ready;
+    /// 允许组首执行 pthread_exit 的一次性写端。
+    int leader_gate;
+    /// 非组首 exec 使用的原始绝对执行路径。
+    const char *program;
+};
+
 /// 初始化所有资源为未拥有状态。
 static void child_init(struct child *child)
 {
@@ -57,45 +71,43 @@ static int child_cleanup(struct child *child)
     return result;
 }
 
-/// 读取整个有限 proc 文件并检测超过缓冲区的内容，不依赖单次 read 完成交付。
-static ssize_t read_proc(pid_t pid, const char *name, void *buffer, size_t capacity)
+/// 读取已打开的有限文件直到 EOF，容量不足或实际读取失败均返回错误。
+static ssize_t read_contents(int fd, void *buffer, size_t capacity)
 {
-    char path[80];
-    int fd = -1;
-    ssize_t result = -1;
     size_t used = 0;
-    if (snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name) <= 0)
-        return -1;
-    fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return -1;
     while (used < capacity) {
         ssize_t count = read(fd, (char *)buffer + used, capacity - used);
         if (count < 0 && errno == EINTR)
             continue;
         if (count < 0)
-            goto out;
-        if (count == 0) {
-            result = (ssize_t)used;
-            goto out;
-        }
+            return -1;
+        if (count == 0)
+            return (ssize_t)used;
         used += (size_t)count;
     }
     errno = EOVERFLOW;
-out:
+    return -1;
+}
+
+/// 每次重新打开目标 proc 文件，再读取全部内容，不复用旧文件描述符。
+static ssize_t read_proc(pid_t pid, const char *name, void *buffer, size_t capacity)
+{
+    char path[80];
+    if (snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name) <= 0)
+        return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    ssize_t result = read_contents(fd, buffer, capacity);
     if (close(fd) != 0)
         result = -1;
     return result;
 }
 
 /// 按最后一个右括号解析名字，再精确检查状态与后续四十九个数字字段。
-static int read_stat(pid_t pid, struct process_stat *stat)
+static int parse_stat(char *text, struct process_stat *stat)
 {
-    char text[4096], *end, *left, *right;
-    ssize_t count = read_proc(pid, "stat", text, sizeof(text) - 1);
-    if (count <= 0)
-        return -1;
-    text[count] = '\0';
+    char *end, *left, *right;
     left = strchr(text, '(');
     right = strrchr(text, ')');
     stat->pid = strtol(text, &end, 10);
@@ -128,10 +140,48 @@ static int read_stat(pid_t pid, struct process_stat *stat)
     return cursor[0] == '\n' && cursor[1] == '\0' ? 0 : -1;
 }
 
-/// 返回指定字段的有符号数值，只用于本用例中可由 long 表示的 PID 字段。
+/// 重新打开 stat 并解析完整的五十二字段记录。
+static int read_stat(pid_t pid, struct process_stat *stat)
+{
+    char text[4096];
+    ssize_t count = read_proc(pid, "stat", text, sizeof(text) - 1);
+    if (count <= 0)
+        return -1;
+    text[count] = '\0';
+    return parse_stat(text, stat);
+}
+
+/// 接续已经读取首字节的旧描述符，核对跨调度变化仍然保留的同一条记录。
+static int finish_stat(int fd, char first, struct process_stat *stat)
+{
+    char text[4096];
+    text[0] = first;
+    ssize_t count = read_contents(fd, text + 1, sizeof(text) - 2);
+    if (count < 0)
+        return -1;
+    text[count + 1] = '\0';
+    return parse_stat(text, stat);
+}
+
+/// 返回指定字段的有符号数值，所查 PID、策略及优先级均可由 long 表示。
 static long stat_number(const struct process_stat *stat, int field)
 {
     return strtol(stat->number[field], NULL, 10);
+}
+
+/// 同时检查 priority、rt_priority 与 policy，policy 不包含 RESET_ON_FORK。
+static int stat_policy(const struct process_stat *stat, int policy, int priority)
+{
+    long expected = policy == SCHED_FIFO ? -(priority + 1) : 20;
+    return stat_number(stat, 18) == expected &&
+           stat_number(stat, 40) == priority && stat_number(stat, 41) == policy;
+}
+
+/// 通过原始 ABI 修改目标线程的策略，不让 pthread 的属性缓存代替内核结果。
+static int set_policy(pid_t tid, int policy, int priority)
+{
+    struct sched_param param = { .sched_priority = priority };
+    return syscall(SYS_sched_setscheduler, tid, policy, &param);
 }
 
 /// 枚举一次 proc 根，核对所有数字项均唯一且目标恰好出现 expected 次。
@@ -228,6 +278,8 @@ static int spawn(struct child *child, const char *program, const char *mode, int
             execve(program, arguments, environment);
         } else {
             char *arguments[] = { "proc-pid-child", (char *)mode, child->input, child->output, NULL };
+            if (strcmp(mode, "--scheduling-child") == 0)
+                arguments[0] = (char *)program;
             execve(program, arguments, environment);
         }
         _exit(1);
@@ -268,6 +320,68 @@ static int run_child(const char *mode, const char *input, const char *output)
             return 1;
     }
     return 0;
+}
+
+/// 工作线程改变自己的策略、释放组首或接管执行映像，每次完成后才向父进程应答。
+static void *scheduling_worker(void *opaque)
+{
+    struct scheduling_child *child = opaque;
+    char command;
+    if (st_write_all(child->ready, "R", 1) != 0)
+        _exit(1);
+    while (st_read_all(child->command, &command, 1) == 0) {
+        switch (command) {
+        case 'F':
+            if (set_policy(0, SCHED_FIFO, 17) != 0)
+                _exit(1);
+            break;
+        case 'O':
+            if (set_policy(0, SCHED_OTHER, 0) != 0)
+                _exit(1);
+            break;
+        case 'L':
+            if (st_write_all(child->leader_gate, "L", 1) != 0 ||
+                st_close(&child->leader_gate) != 0)
+                _exit(1);
+            break;
+        case 'X': {
+            char input[32], output[32];
+            if (snprintf(input, sizeof(input), "%d", child->command) <= 0 ||
+                snprintf(output, sizeof(output), "%d", child->ready) <= 0)
+                _exit(1);
+            char *arguments[] = { "proc-pid-child", "--child", input, output, NULL };
+            char *environment[] = { NULL };
+            execve(child->program, arguments, environment);
+            _exit(1);
+        }
+        case 'Q':
+            return NULL;
+        default:
+            _exit(1);
+        }
+        if (st_write_all(child->ready, "R", 1) != 0)
+            _exit(1);
+    }
+    _exit(1);
+}
+
+/// 组首在独立管道上等待退出许可，静态参数在 pthread_exit 后仍由工作线程使用。
+static int run_scheduling_child(const char *program, const char *input, const char *output)
+{
+    static struct scheduling_child child;
+    int gate[2];
+    pthread_t worker;
+    char byte;
+    if (pipe(gate) != 0)
+        return 1;
+    child = (struct scheduling_child) {
+        .command = atoi(input), .ready = atoi(output),
+        .leader_gate = gate[1], .program = program,
+    };
+    if (pthread_create(&worker, NULL, scheduling_worker, &child) != 0 ||
+        st_read_all(gate[0], &byte, 1) != 0 || byte != 'L' || st_close(&gate[0]) != 0)
+        return 1;
+    pthread_exit(NULL);
 }
 
 /// 受控脚本解释器只通知就绪并等待标准输入，不修改进程名或参数存储。
@@ -322,6 +436,7 @@ static int basic_and_session(const char *program, int session)
     ST_CHECK(enumerate(child.pid, 1) == 0);
     ST_CHECK(read_stat(child.pid, &stat) == 0 && stat.pid == child.pid);
     ST_CHECK(strcmp(stat.comm, comm) == 0 && (stat.state == 'R' || stat.state == 'S'));
+    ST_CHECK(stat_policy(&stat, SCHED_OTHER, 0));
     ST_CHECK(stat_number(&stat, 4) == getpid());
     ST_CHECK(stat_number(&stat, 5) == getpgid(child.pid) && stat_number(&stat, 6) == getsid(child.pid));
     char *arguments[] = { "proc-pid-child", "--child", child.input, child.output, NULL };
@@ -404,6 +519,7 @@ static int zombie_and_reuse(const char *program, int replacement)
     old = open(directory, O_RDONLY | O_DIRECTORY);
     ST_CHECK(0 <= old);
     ST_CHECK(kill(first.pid, SIGKILL) == 0 && await_state(first.pid, 'Z', &stat) == 0);
+    ST_CHECK(stat_policy(&stat, SCHED_OTHER, 0));
     pid_t retired = first.pid;
     ST_CHECK(waitpid(first.pid, &status, 0) == first.pid);
     first.pid = -1;
@@ -442,6 +558,7 @@ static int leader_exit(const char *program)
     child_init(&child);
     ST_CHECK(spawn(&child, program, "--thread-child", 0) == 0);
     ST_CHECK(await_state(child.pid, 'Z', &stat) == 0);
+    ST_CHECK(stat_policy(&stat, SCHED_OTHER, 0));
     expected_comm(program, comm);
     ST_CHECK(strcmp(stat.comm, comm) == 0);
     ST_CHECK(read_proc(child.pid, "cmdline", &byte, 1) == 0);
@@ -452,9 +569,101 @@ out:
     return result;
 }
 
-/// 默认入口产生七项 TAP；内部子模式只执行同步协议，不重复登记自测项。
+/// 重新 open 观察 OTHER→FIFO→OTHER，并核对两份已经开始读取的旧记录不随策略变化。
+static int scheduling_changes(const char *program)
+{
+    struct child child;
+    struct process_stat stat;
+    int result = -1, old[2] = { -1, -1 };
+    char path[80], first[2];
+    child_init(&child);
+    ST_CHECK(spawn(&child, program, "--child", 0) == 0);
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_OTHER, 0));
+    ST_CHECK(0 < snprintf(path, sizeof(path), "/proc/%ld/stat", (long)child.pid));
+    old[0] = open(path, O_RDONLY);
+    ST_CHECK(0 <= old[0] && st_read_all(old[0], &first[0], 1) == 0);
+    int changed = set_policy(child.pid, SCHED_FIFO | SCHED_RESET_ON_FORK, 7);
+    if (changed == -1 && errno == EPERM) {
+        result = KSFT_SKIP;
+        goto out;
+    }
+    ST_CHECK(changed == 0);
+    ST_CHECK(syscall(SYS_sched_getscheduler, child.pid) == (SCHED_FIFO | SCHED_RESET_ON_FORK));
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_FIFO, 7));
+    old[1] = open(path, O_RDONLY);
+    ST_CHECK(0 <= old[1] && st_read_all(old[1], &first[1], 1) == 0);
+    ST_CHECK(set_policy(child.pid, SCHED_OTHER, 0) == 0);
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_OTHER, 0));
+    ST_CHECK(finish_stat(old[0], first[0], &stat) == 0 && stat_policy(&stat, SCHED_OTHER, 0));
+    ST_CHECK(finish_stat(old[1], first[1], &stat) == 0 && stat_policy(&stat, SCHED_FIFO, 7));
+    result = 0;
+out:
+    if (child_cleanup(&child) != 0)
+        result = -1;
+    for (int index = 0; index < 2; ++index)
+        if (st_close(&old[index]) != 0)
+            result = -1;
+    return result;
+}
+
+/// 成员改变策略不影响组首；组首先退出后保留其策略，直至未回收僵尸或非组首 exec 接管。
+static int leader_scheduling(const char *program, int exec)
+{
+    struct child child;
+    struct process_stat stat;
+    siginfo_t info = { 0 };
+    int result = -1;
+    child_init(&child);
+    ST_CHECK(spawn(&child, program, "--scheduling-child", 0) == 0);
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_OTHER, 0));
+    int changed = set_policy(child.pid, SCHED_FIFO | SCHED_RESET_ON_FORK, 7);
+    if (changed == -1 && errno == EPERM) {
+        result = KSFT_SKIP;
+        goto out;
+    }
+    ST_CHECK(changed == 0);
+    ST_CHECK(st_write_all(child.command[1], "F", 1) == 0 && ready(&child) == 0);
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_FIFO, 7));
+    ST_CHECK(st_write_all(child.command[1], "L", 1) == 0 && ready(&child) == 0);
+    ST_CHECK(await_state(child.pid, 'Z', &stat) == 0 && stat_policy(&stat, SCHED_FIFO, 7));
+    ST_CHECK(st_write_all(child.command[1], "O", 1) == 0 && ready(&child) == 0);
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_FIFO, 7));
+    if (exec) {
+        ST_CHECK(st_write_all(child.command[1], "X", 1) == 0 && ready(&child) == 0);
+        ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_OTHER, 0));
+        ST_CHECK(set_policy(child.pid, SCHED_FIFO, 11) == 0);
+        ST_CHECK(read_stat(child.pid, &stat) == 0 && stat_policy(&stat, SCHED_FIFO, 11));
+        ST_CHECK(kill(child.pid, SIGKILL) == 0);
+    } else {
+        ST_CHECK(st_write_all(child.command[1], "Q", 1) == 0);
+    }
+    ST_CHECK(waitid(P_PID, (id_t)child.pid, &info, WEXITED | WNOWAIT) == 0);
+    ST_CHECK(info.si_pid == child.pid);
+    ST_CHECK(info.si_code == (exec ? CLD_KILLED : CLD_EXITED));
+    ST_CHECK(info.si_status == (exec ? SIGKILL : 0));
+    ST_CHECK(read_stat(child.pid, &stat) == 0 && stat.state == 'Z');
+    ST_CHECK(stat_policy(&stat, SCHED_FIFO, exec ? 11 : 7));
+    result = 0;
+out:
+    if (child_cleanup(&child) != 0)
+        result = -1;
+    return result;
+}
+
+/// 只有实际提升 FIFO 返回 EPERM 时跳过对应子项，其余失败仍按 TAP 失败报告。
+static void report_fifo(int result, const char *name)
+{
+    if (result == KSFT_SKIP)
+        ksft_test_result_skip("%s: SCHED_FIFO denied with EPERM\n", name);
+    else
+        ksft_test_result(result == 0, "%s\n", name);
+}
+
+/// 默认入口产生十项 TAP；内部子模式只执行同步协议，不重复登记自测项。
 int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "--scheduling-child") == 0)
+        return run_scheduling_child(argv[0], argv[2], argv[3]);
     if (argc == 4 && (strcmp(argv[1], "--child") == 0 || strcmp(argv[1], "--thread-child") == 0))
         return run_child(argv[1], argv[2], argv[3]);
     if (argc == 3 && strcmp(argv[1], "--script-child") == 0)
@@ -465,7 +674,7 @@ int main(int argc, char **argv)
     char *program = realpath(argv[0], NULL);
     if (program == NULL)
         ksft_exit_fail_msg("realpath executable errno=%d\n", errno);
-    ksft_set_plan(7);
+    ksft_set_plan(10);
     ksft_test_result(basic_and_session(program, 0) == 0, "proc enumeration stat fields and exact cmdline\n");
     ksft_test_result(basic_and_session(program, 1) == 0, "setsid updates process group and session\n");
     ksft_test_result(exec_name(program, 0) == 0, "long symlink execution preserves truncated filename comm\n");
@@ -473,6 +682,9 @@ int main(int argc, char **argv)
     ksft_test_result(zombie_and_reuse(program, 0) == 0, "zombie visibility and post-wait path invalidation\n");
     ksft_test_result(leader_exit(program) == 0, "leader exit retains comm and empties cmdline\n");
     ksft_test_result(zombie_and_reuse(program, 1) == 0, "retired directory cannot address replacement process\n");
+    report_fifo(scheduling_changes(program), "stat scheduling changes, reset flag and independent snapshots");
+    report_fifo(leader_scheduling(program, 0), "leader policy survives member changes and unreaped zombie");
+    report_fifo(leader_scheduling(program, 1), "non-leader exec replaces exited leader scheduling snapshot");
     free(program);
     ksft_finished();
 }

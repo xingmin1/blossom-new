@@ -178,6 +178,16 @@ pub enum FsError {
     AddressNotAvailable,
     /// 目标网络不可达（对应 `ENETUNREACH`）。
     NetworkUnreachable,
+    /// 主机尚未接入网络（对应 `ENONET`）。
+    NoNetwork,
+    /// 收到网络协议参数错误（对应 `EPROTO`）。
+    ProtocolError,
+    /// 对端不支持所引用报文的传输协议（对应 `ENOPROTOOPT`）。
+    ProtocolOptionNotSupported,
+    /// 目的主机已停机或不可用（对应 `EHOSTDOWN`）。
+    HostDown,
+    /// 目的主机不可达（对应 `EHOSTUNREACH`）。
+    HostUnreachable,
     /// 对端重置了网络连接（对应 `ECONNRESET`）。
     ConnectionReset,
     /// 在已建立连接的套接字上重复发起连接（对应 `EISCONN`）。
@@ -250,6 +260,11 @@ impl FsError {
             | Self::AddressInUse
             | Self::AddressNotAvailable
             | Self::NetworkUnreachable
+            | Self::NoNetwork
+            | Self::ProtocolError
+            | Self::ProtocolOptionNotSupported
+            | Self::HostDown
+            | Self::HostUnreachable
             | Self::ConnectionReset
             | Self::AlreadyConnected
             | Self::NotConnected

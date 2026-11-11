@@ -113,6 +113,10 @@ pub(crate) enum Errno {
     NotEmpty = 39,
     /// 路径解析过程中符号链接嵌套跳转层数超限，或 `O_NOFOLLOW` 命中符号链接（`ELOOP = 40`）。
     TooManySymlinks = 40,
+    /// 主机尚未接入网络（`ENONET = 64`）。
+    NoNetwork = 64,
+    /// 报文中的协议参数错误（`EPROTO = 71`）。
+    ProtocolError = 71,
     /// 计算出的偏移量、文件大小或统计字段超出目标数据类型可表示范围（`EOVERFLOW = 75`）。
     Overflow = 75,
     /// 对非套接字文件描述符执行了套接字专属系统调用（`ENOTSOCK = 88`）。
@@ -147,6 +151,10 @@ pub(crate) enum Errno {
     TimedOut = 110,
     /// 目标主机端口无监听者或主动拒绝连接请求（`ECONNREFUSED = 111`）。
     ConnectionRefused = 111,
+    /// 目的主机已停机或不可用（`EHOSTDOWN = 112`）。
+    HostDown = 112,
+    /// 目的主机不可达（`EHOSTUNREACH = 113`）。
+    HostUnreachable = 113,
     /// 非阻塞套接字上已有前一次连接请求正在进行中（`EALREADY = 114`）。
     AlreadyInProgress = 114,
     /// 非阻塞套接字连接请求已发起但三次握手尚未完成（`EINPROGRESS = 115`）。
@@ -210,6 +218,11 @@ impl From<FsError> for Errno {
             FsError::AddressInUse => Self::AddressInUse,
             FsError::AddressNotAvailable => Self::AddressNotAvailable,
             FsError::NetworkUnreachable => Self::NetworkUnreachable,
+            FsError::NoNetwork => Self::NoNetwork,
+            FsError::ProtocolError => Self::ProtocolError,
+            FsError::ProtocolOptionNotSupported => Self::ProtocolOptionNotSupported,
+            FsError::HostDown => Self::HostDown,
+            FsError::HostUnreachable => Self::HostUnreachable,
             FsError::ConnectionReset => Self::ConnectionReset,
             FsError::AlreadyConnected => Self::AlreadyConnected,
             FsError::NotConnected => Self::NotConnected,
@@ -240,6 +253,7 @@ impl From<VmError> for Errno {
             VmError::NoMemory | VmError::Unmapped => Self::NoMemory,
             VmError::InvalidRange => Self::InvalidArgument,
             VmError::Occupied => Self::Exists,
+            VmError::Locked => Self::Busy,
             VmError::Permission => Self::Permission,
             VmError::NotMappable => Self::NoDevice,
             VmError::BeyondEof => Self::BadAddress,

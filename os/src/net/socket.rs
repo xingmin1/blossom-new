@@ -30,7 +30,7 @@
 //! ### 2. 锁外用户态拷贝与两阶段提交
 //! 为了避免在持有底层协议锁时触发用户态缺页异常（Page Fault）导致死锁或长时间阻塞：
 //! - **流式发送（TCP / UNIX `SOCK_STREAM`）**：先在锁外从 `WriteBuffer` 提取最多 `STREAM_PREFIX_LEN`（4096 字节）到栈缓冲区，随后在阻塞等待循环中反复尝试向端点写入这批已拷贝的字节。
-//! - **报文/记录发送（UDP / UNIX `SOCK_SEQPACKET`）**：先在锁外一次性分配并完整拷入整条消息负载（若中途遇到缺页错误则整包放弃，不向协议层提交残缺报文），在等待循环中复用同一份内核缓冲区直到协议层完整接纳。
+//! - **UDP 发送**：先由端点核对路由并领取挂起错误，保留原端口租约；释放协议锁后只复制一次正文，再以同一准备结果等待并提交。UNIX 有序记录仍在锁外准备整条负载。
 //!
 //! ## 锁获取顺序（Lock Ordering）与并发契约
 //! 1. **OFD 层自身无互斥锁**：`SocketFile` 的自身状态（`flags`、`connect_unclaimed`、`generic_keepalive`）全部使用原子变量维护，不引入覆盖协议端点的外层睡眠锁或自旋锁。
@@ -49,9 +49,9 @@ use crate::fs::{
     S_IFSOCK, S_IRWXUGO,
 };
 use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress, AF_UNIX};
-use crate::net::packet::{zeroed_bytes, MAX_IPV4_UDP_PAYLOAD_LEN};
+use crate::net::packet::zeroed_bytes;
 use crate::net::tcp::TcpEndpoint;
-use crate::net::udp::UdpEndpoint;
+use crate::net::udp::{ReceivedError, UdpEndpoint};
 use crate::net::unix::UnixEndpoint;
 use crate::net::{IoProgress, MessageResult, NetStackRef, UnixSocketType};
 use crate::task::signal::SIGPIPE;
@@ -102,6 +102,8 @@ pub(crate) const SO_REUSEADDR: i32 = 2;
 pub(crate) const SO_TYPE: i32 = 3;
 /// 套接字选项：读取并清除挂起的异步错误（`SO_ERROR`）。
 pub(crate) const SO_ERROR: i32 = 4;
+/// UDP 套接字选项：禁止 IPv4 报文经网关转发（`SO_DONTROUTE`）。
+pub(crate) const SO_DONTROUTE: i32 = 5;
 /// 套接字选项：启用或查询周期性保活探测（`SO_KEEPALIVE`）。
 pub(crate) const SO_KEEPALIVE: i32 = 9;
 /// 套接字选项：获取或设置发送缓冲区大小预算（`SO_SNDBUF`）。
@@ -121,10 +123,14 @@ pub(crate) const SO_DOMAIN: i32 = 39;
 
 /// 收发标志：窥视接收队列中的数据而不将其从缓冲区消费移除（`MSG_PEEK`）。
 pub(crate) const MSG_PEEK: u32 = 0x2;
+/// 接收标志：辅助控制数据没有完整写入用户缓冲区。
+pub(crate) const MSG_CTRUNC: u32 = 0x8;
 /// 收发标志：当数据包被截断时报告或返回报文截断标志（`MSG_TRUNC`）。
 pub(crate) const MSG_TRUNC: u32 = 0x20;
 /// 收发标志：仅将本次收发操作作为非阻塞执行（`MSG_DONTWAIT`）。
 pub(crate) const MSG_DONTWAIT: u32 = 0x40;
+/// 接收标志：领取独立的 IPv4 UDP 异步错误队列。
+pub(crate) const MSG_ERRQUEUE: u32 = 0x2000;
 /// 收发标志：向已关闭写方向的连接发送数据时不向调用进程发送 `SIGPIPE` 信号（`MSG_NOSIGNAL`）。
 pub(crate) const MSG_NOSIGNAL: u32 = 0x4000;
 
@@ -555,15 +561,20 @@ impl SocketFile {
         }
     }
 
-    /// 从套接字接收数据（支持 `MSG_PEEK`、`MSG_DONTWAIT` 以及面向消息套接字的 `MSG_TRUNC`）。
-    ///
-    /// 入口处一次性计算接收超时截止时间；在等待循环中优先尝试从底层端点读取数据，无数据且非阻塞时返回 `FsError::WouldBlock`，否则注册等待队列挂起任务。
+    /// 从普通接收队列读取数据；IPv4 UDP 的 MSG_ERRQUEUE 始终立即领取独立错误记录。
+    /// 普通接收沿原超时与等待循环，错误正文复制不持有协议锁。
     pub fn receive(
         &self,
         target: &mut ReadBuffer<'_>,
         flags: u32,
         caller: FileIoContext<'_>,
     ) -> Result<MessageResult, FsError> {
+        if flags & MSG_ERRQUEUE != 0 {
+            let record = self.receive_error(flags)?;
+            let mut message = record.copy_to(target)?;
+            message.flags |= MSG_CTRUNC;
+            return Ok(message);
+        }
         let allowed = MSG_DONTWAIT
             | MSG_PEEK
             | if self.is_message_oriented() {
@@ -712,7 +723,7 @@ impl SocketFile {
         }
     }
 
-    /// 发送单条完整的 UDP 数据报：在锁外一次性分配并拷入全部负载，若发送队列暂满则在等待循环中持同一份负载重试。
+    /// 在路由和错误检查后进行唯一一次锁外用户复制，容量竞争时保留原正文和绑定快照。
     fn send_datagram(
         &self,
         endpoint: &Arc<UdpEndpoint>,
@@ -723,13 +734,11 @@ impl SocketFile {
         deadline: Result<Option<MonotonicInstant>, FsError>,
     ) -> Result<usize, FsError> {
         let length = source.len() - source.copied();
-        if MAX_IPV4_UDP_PAYLOAD_LEN < length {
-            return Err(FsError::MessageTooLarge);
-        }
+        let prepared = endpoint.prepare_send(length, destination)?;
 
         let mut payload = zeroed_bytes(length)?;
-        let prepared = source.pull(&mut payload)?;
-        if prepared < length {
+        let copied = source.pull(&mut payload)?;
+        if copied < length {
             // WriteBuffer 内部保存了首次用户态拷贝错误；再次拉取空切片以取出并返回该错误，避免提交残缺数据报。
             source.pull(&mut [])?;
             unreachable!("incomplete datagram copy has no stored error");
@@ -741,7 +750,7 @@ impl SocketFile {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            match endpoint.send(&payload, destination)? {
+            match endpoint.send(&prepared, &payload)? {
                 IoProgress::Ready(count) => return Ok(count),
                 IoProgress::Blocked => {}
                 IoProgress::Eof => unreachable!("datagram send returned receive EOF"),
@@ -937,6 +946,55 @@ impl SocketFile {
                 self.generic_keepalive.store(enabled, Ordering::Release);
                 Ok(())
             }
+        }
+    }
+
+    /// 查询同一打开文件描述所持 UDP 端点的路由限制选项。
+    pub fn dont_route(&self) -> Result<bool, FsError> {
+        match &self.endpoint {
+            Endpoint::Udp(endpoint) => Ok(endpoint.dont_route()),
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 在 UDP 协议锁内修改路由限制，与连接和数据报接纳串行。
+    pub fn set_dont_route(&self, enabled: bool) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Udp(endpoint) => endpoint.set_dont_route(enabled),
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 查询受支持的 IPv4 UDP 错误接收开关，不为其它协议保存空配置。
+    pub(crate) fn recv_error(&self) -> Result<bool, FsError> {
+        match &self.endpoint {
+            Endpoint::Udp(endpoint) if endpoint.family() == AddressFamily::Ipv4 => {
+                Ok(endpoint.recv_error())
+            }
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 修改 IPv4 UDP 错误队列开关，关闭与并发错误交付由端点状态锁串行。
+    pub(crate) fn set_recv_error(&self, enabled: bool) -> Result<(), FsError> {
+        match &self.endpoint {
+            Endpoint::Udp(endpoint) if endpoint.family() == AddressFamily::Ipv4 => {
+                endpoint.set_recv_error(enabled)
+            }
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
+    /// 在可睡眠任务中领取 IPv4 UDP 错误并保留载荷预算；MSG_PEEK 仍消费，守卫须在协议锁外释放。
+    pub(crate) fn receive_error(&self, flags: u32) -> Result<ReceivedError<'_>, FsError> {
+        if flags & !(MSG_ERRQUEUE | MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC) != 0 {
+            return Err(FsError::Unsupported);
+        }
+        match &self.endpoint {
+            Endpoint::Udp(endpoint) if endpoint.family() == AddressFamily::Ipv4 => {
+                endpoint.receive_error()
+            }
+            _ => Err(FsError::Unsupported),
         }
     }
 

@@ -70,7 +70,7 @@ pub struct TcpTuple {
 /// 本地端口绑定的生命周期租约句柄。
 ///
 /// 当持有该租约的最后一个 `Arc<BindLease>` 被释放（Drop）时，自动从所属网络域的绑定表中移除对应记录。
-/// TCP 监听套接字派生出的子连接会共享同一个 `Arc<BindLease>`，以确保只要监听者或任意子连接存活，该端口预留就持续有效。
+/// TCP 被动子连接共享监听端点的租约；监听文件关闭后，仍存活的已接受连接独立保留其租约引用。
 pub struct BindLease {
     /// 该绑定所属的传输层协议（TCP 或 UDP）。
     protocol: TransportProtocol,
@@ -502,6 +502,13 @@ impl NetTables {
             state.listeners.push((id, local, dual_stack));
             return Ok(());
         }
+    }
+
+    /// 在端点的 core 锁保护下撤销本端四元组与监听索引，保留协议对象以完成复位发送和异步回收。
+    pub fn remove_tcp_indices(&self, id: u64) {
+        let mut state = self.state.lock();
+        state.tuples.retain(|entry| entry.0 != id);
+        state.listeners.retain(|entry| entry.0 != id);
     }
 
     /// 发布或更新指定 UDP 端点的收包匹配键（本地绑定地址与可选的远端连接地址）。

@@ -13,7 +13,8 @@
 //!   └── /plain   (挂载点 ──► tmpfs, ReadWrite, 独立 device 号与页/inode 配额)
 //!       ├── /plain/dev  (挂载点 ──► devfs, ReadOnly)
 //!       │   ├── null    (字符设备 rdev = 0x103, 写吞没 / 读立即 EOF)
-//!       │   └── zero    (字符设备 rdev = 0x105, 写吞没 / 读全零填充)
+//!       │   ├── zero    (字符设备 rdev = 0x105, 写吞没 / 读全零填充)
+//!       │   └── shm     (固定目录 ──► 独立 tmpfs, ReadWrite, mode 01777)
 //!       └── /plain/proc (挂载点 ──► procfs, ReadOnly, 每次 open 生成独立动态快照)
 //!           ├── mounts  (VFS 挂载表 6 列文本，特殊字符八进制转义)
 //!           ├── meminfo (物理内存统计 kB 文本)
@@ -335,6 +336,134 @@ pub(crate) mod filesystems {
             ),
             Err(FsError::ReadOnly),
         );
+        Ok(())
+    }
+
+    /// 验证只读 `devfs` 中的 `shm` 目录可由独立 `tmpfs` 覆盖，文件与页由子实例拥有。
+    /// 子挂载保留父路径，打开文件保留其挂载和 inode，任一拥有尚存时都不得提前卸载。
+    /// 释放零链接文件后检查页与 inode 归还，再依次卸载 `shm`、`devfs` 和外层 `tmpfs`。
+    #[test]
+    #[ktest(tags("fs-posix-shm"))]
+    fn dev_shm_is_independent_and_unmounts_before_dev(
+        context: &mut TestContext<'_>,
+        fixture: &mut PathOwner,
+    ) -> TestResult {
+        let tmp = prepare_tmp(context, fixture, b"mode=0777")?;
+        mkdir(context, fixture, b"/plain/dev")?;
+        let dev = checked(context, devfs::try_new(0o755))?;
+        let dev_cover = resolve(context, fixture, b"/plain/dev")?;
+        checked(
+            context,
+            fixture.vfs().mount(
+                &dev_cover,
+                Filesystem::Memory(dev.clone()),
+                AccessMode::ReadOnly,
+            ),
+        )?;
+
+        // 覆盖挂载前，shm 目录沿 devfs 的只读模式拒绝名字修改。
+        let shm = checked(context, MemoryFs::try_tmpfs(b""))?;
+        let initial = checked(context, shm.statfs())?;
+        {
+            let covered = resolve(context, fixture, b"/plain/dev/shm")?;
+            let inode = checked(context, covered.inode())?;
+            let metadata = checked(context, inode.metadata_snapshot())?;
+            context.expect_eq(metadata.kind, InodeKind::Directory);
+            context.expect_eq(metadata.mode & 0o7777, 0o755);
+            context.expect_eq(inode.device(), dev.device());
+            context.expect_eq(covered.check_writable(), Err(FsError::ReadOnly));
+            context.expect_eq(
+                fixture.vfs().mkdir_from(
+                    fixture.context(),
+                    fixture.context().cwd(),
+                    b"/plain/dev/shm/unregistered",
+                    0o777,
+                    (0, 0),
+                    0,
+                ),
+                Err(FsError::ReadOnly),
+            );
+            checked(
+                context,
+                fixture.vfs().mount(
+                    &covered,
+                    Filesystem::Memory(shm.clone()),
+                    AccessMode::ReadWrite,
+                ),
+            )?;
+        }
+
+        // 仅子挂载保有父挂载路径时，父挂载也必须返回 Busy。
+        context.expect_eq(fixture.vfs().unmount(&dev_cover), Err(FsError::Busy));
+        let directory = checked(
+            context,
+            open(context, fixture, b"/plain/dev/shm", 0)?.stat(),
+        )?;
+        context.expect_eq(directory.kind, InodeKind::Directory);
+        context.expect_eq(directory.mode & 0o7777, 0o1777);
+        context.expect_eq(directory.device, shm.device());
+        context.expect_eq(
+            shm.device() == dev.device() || shm.device() == tmp.device(),
+            false,
+        );
+        let file = create(context, fixture, b"/plain/dev/shm/object")?;
+        let inode = file.mapping_inode().unwrap().downgrade_for_reclaim();
+        context.expect_eq(checked(context, file.write(b"shared"))?, 6);
+        context.expect_eq(shm.used_pages(), 1);
+        context.expect_eq(tmp.used_pages(), 0);
+        context.expect_eq(
+            fixture
+                .vfs()
+                .resolve(fixture.context(), b"/plain/object", ResolveMode::Follow)
+                .err(),
+            Some(FsError::NotFound),
+        );
+        checked(
+            context,
+            fixture.vfs().unlink_from(
+                fixture.context(),
+                fixture.context().cwd(),
+                b"/plain/dev/shm/object",
+                (0, 0),
+            ),
+        )?;
+        context.expect_eq(checked(context, file.stat())?.links, 0);
+        let mut bytes = [0; 6];
+        context.expect_eq(checked(context, file.read_at(0, &mut bytes))?, bytes.len());
+        context.expect_eq(&bytes, b"shared");
+        context.expect_eq(
+            fixture
+                .vfs()
+                .unmount_path(resolve(context, fixture, b"/plain/dev/shm")?),
+            Err(FsError::Busy),
+        );
+
+        // 零链接文件的最后引用释放后，数据页和 inode 才能回收。
+        drop(file);
+        fixture.vfs().prune_unused();
+        context.expect_eq(shm.used_pages(), 0);
+        context.expect_eq(inode.upgrade().is_none(), true);
+        context.expect_eq(checked(context, shm.statfs())?.freefiles, initial.freefiles);
+        checked(
+            context,
+            fixture
+                .vfs()
+                .unmount_path(resolve(context, fixture, b"/plain/dev/shm")?),
+        )?;
+        let restored = checked(
+            context,
+            open(context, fixture, b"/plain/dev/shm", 0)?.stat(),
+        )?;
+        context.expect_eq(restored.device, dev.device());
+        context.expect_eq(restored.mode & 0o7777, 0o755);
+        checked(context, fixture.vfs().unmount(&dev_cover))?;
+        drop(dev_cover);
+        checked(
+            context,
+            fixture
+                .vfs()
+                .unmount_path(resolve(context, fixture, b"/plain")?),
+        )?;
         Ok(())
     }
 

@@ -8,6 +8,7 @@
 //! - **进程身份与会话管理**：`setpgid`（154）、`getpgid`（155）、`getsid`（156）、`setsid`（157）、
 //!   `getppid`（173）、`getuid`（174）、`geteuid`（175）、`getgid`（176）、`getegid`（177）；
 //! - **资源软硬限额**：`getrlimit`（163）、`setrlimit`（164）、`prlimit64`（261）。
+//!   当前支持 `STACK`、`NPROC`、`NOFILE`、`SIGPENDING` 和 `MEMLOCK` 五项；限额由线程组共享，`fork` 复制，`exec` 保留。
 //!
 //! ## 核心机制与布局说明
 //!
@@ -71,6 +72,8 @@ const RLIMIT_STACK: u32 = 3;
 const RLIMIT_NPROC: u32 = 6;
 /// `RLIMIT_NOFILE`：单进程最大文件描述符数量上限资源编号。
 const RLIMIT_NOFILE: u32 = 7;
+/// `RLIMIT_MEMLOCK`：地址空间允许锁定的最大字节数资源编号。
+const RLIMIT_MEMLOCK: u32 = 8;
 /// `RLIMIT_SIGPENDING`：最大挂起排队信号数量资源编号。
 const RLIMIT_SIGPENDING: u32 = 11;
 /// `RLIM_NLIMITS`：Linux ABI 定义的资源限制类别总数上限。
@@ -186,6 +189,7 @@ pub(super) fn prlimit64(user: &UserThread, raw: [usize; 6]) -> SysResult {
 ///
 /// - 所有用户空间 `copyin` / `copyout` 均在 `TaskGraph` 锁外完成；
 /// - 若同时指定了新值与旧值缓冲区，先提交新限额并取得旧限额快照，随后即使 `copyout` 写回旧值失败也不会撤销已生效的新限额。
+/// - `MEMLOCK` 与其他已支持资源使用相同的线程组限额与权限检查；UID 0 仍会读取和保存真实限额。
 fn resource_limit(
     user: &UserThread,
     pid: i32,
@@ -201,6 +205,7 @@ fn resource_limit(
         RLIMIT_STACK => Resource::Stack,
         RLIMIT_NPROC => Resource::Nproc,
         RLIMIT_NOFILE => Resource::NoFile,
+        RLIMIT_MEMLOCK => Resource::Memlock,
         RLIMIT_SIGPENDING => Resource::SigPending,
         _ => return Err(Errno::NoSyscall),
     };

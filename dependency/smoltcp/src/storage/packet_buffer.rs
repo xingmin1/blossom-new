@@ -208,6 +208,11 @@ impl<'a, H> PacketBuffer<'a, H> {
         self.metadata_ring.capacity()
     }
 
+    /// 返回已占用的元数据槽数，包含尚未跳过的绕回填充记录。
+    pub fn packet_count(&self) -> usize {
+        self.metadata_ring.len()
+    }
+
     /// Return the maximum number of bytes in the payload ring buffer.
     pub fn payload_capacity(&self) -> usize {
         self.payload_ring.capacity()

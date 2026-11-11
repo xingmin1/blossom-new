@@ -245,21 +245,19 @@ fn clock_gettime(user: &UserThread, raw: [usize; 6]) -> SysResult {
     Ok(0)
 }
 
-/// `clock_getres` 系统调用：查询指定时钟的分辨率，并在 `res` 指针非空时写入用户空间。
+/// `clock_getres` 系统调用：查询用户可见的时钟分辨率。精细时钟（实时、单调、进程与线程 CPU 时间）报告 1 纳秒，`_COARSE` 时钟报告内核基础 tick `TICK_NS`。
 ///
-/// 精细时钟的分辨率由硬件计数器频率（`counter_frequency`）向上取整为纳秒计算（至少 1 纳秒）；`_COARSE` 时钟的分辨率报告为内核定时器基础节拍周期 `TICK_NS`。
+/// 该标称值只是 ABI 层面的定时器粒度，不代表硬件计数器的精度或实际唤醒精度。`res` 为空指针时只校验时钟编号。
 fn clock_getres(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let clock = validate_clock(raw[0])?;
     if raw[1] != 0 {
-        let frequency = crate::boot::info().counter_frequency;
-        assert!(0 < frequency, "clock resolution has no counter frequency");
         let resolution = if matches!(clock, CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE) {
             timer::TICK_NS
         } else {
-            NSEC_PER_SEC / frequency + u64::from(NSEC_PER_SEC % frequency != 0)
+            1
         };
         let mm = user.mm().expect("clock_getres has no MM");
-        error::copyout(&mm, raw[1], &timespec(resolution.max(1)))?;
+        error::copyout(&mm, raw[1], &timespec(resolution))?;
     }
     Ok(0)
 }

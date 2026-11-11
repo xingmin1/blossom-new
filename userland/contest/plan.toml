@@ -25,7 +25,7 @@ repeat = 1
 [roots.musl]
 path = "/mnt/contest/musl"
 cwd = "/"
-mounts = ["dev", "proc", "tmp"]
+mounts = ["dev", "shm", "proc", "tmp"]
 env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
 prepare = [
     ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"],
@@ -37,23 +37,33 @@ prepare = [
     # 盘内辅助脚本的 shebang 使用 /bin/sh 与 /bin/busybox。
     ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/bin"],
     ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/busybox"],
-    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/sh"],
     ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/.blossom"],
     ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/musl/.blossom/fat32.img"],
     ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/musl/.blossom/busybox"],
+    ["/bin/busybox", "sh", "-c", "for name in sh cp sleep true; do target=/mnt/contest/musl/bin/$name; if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then /bin/busybox ln -s /.blossom/busybox \"$target\" || exit; fi; done"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/code/lmbench_src/bin/build"],
+    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/code/lmbench_src/bin/build/lmbench_all; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox ln -s /lmbench_all \"$target\""],
+    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/sort.src; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/unixbench-sort.src \"$target\""],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/etc"],
+    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/etc/protocols; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/protocols \"$target\""],
 ]
 
 [roots.glibc]
 path = "/mnt/contest/glibc"
 cwd = "/"
-mounts = ["dev", "proc", "tmp"]
+mounts = ["dev", "shm", "proc", "tmp"]
 env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
 prepare = [
     ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/glibc/lib64"],
     ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/bin"],
     ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/busybox"],
-    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/sh"],
     ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/.blossom"],
     ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/glibc/.blossom/fat32.img"],
     ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/glibc/.blossom/busybox"],
+    ["/bin/busybox", "sh", "-c", "for name in sh cp sleep true; do target=/mnt/contest/glibc/bin/$name; if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then /bin/busybox ln -s /.blossom/busybox \"$target\" || exit; fi; done"],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/code/lmbench_src/bin/build"],
+    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/code/lmbench_src/bin/build/lmbench_all; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox ln -s /lmbench_all \"$target\""],
+    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/sort.src; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/unixbench-sort.src \"$target\""],
+    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/etc"],
+    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/etc/protocols; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/protocols \"$target\""],
 ]

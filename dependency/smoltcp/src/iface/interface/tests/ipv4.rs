@@ -104,6 +104,7 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
 #[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
+/// 未知协议即使没有正文，也保持原来的 ICMP 目的不可达应答。
 fn test_icmp_error_no_payload(#[case] medium: Medium) {
     static NO_BYTES: [u8; 0] = [];
     let (mut iface, mut sockets, _device) = setup(medium);
@@ -125,6 +126,7 @@ fn test_icmp_error_no_payload(#[case] medium: Medium) {
     // unknown protocol
     let icmp_repr = Icmpv4Repr::DstUnreachable {
         reason: Icmpv4DstUnreachable::ProtoUnreachable,
+        next_hop_mtu: 0,
         header: Ipv4Repr {
             src_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x02),
             dst_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x01),
@@ -241,6 +243,7 @@ fn test_local_subnet_broadcasts(#[case] medium: Medium) {
 #[cfg(all(feature = "medium-ip", feature = "socket-udp"))]
 #[case(Medium::Ethernet)]
 #[cfg(all(feature = "medium-ethernet", feature = "socket-udp"))]
+/// 未绑定的 UDP 单播端口返回目的不可达，广播输入仍不发送错误。
 fn test_icmp_error_port_unreachable(#[case] medium: Medium) {
     static UDP_PAYLOAD: [u8; 12] = [
         0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x2c, 0x20, 0x57, 0x6f, 0x6c, 0x64, 0x21,
@@ -281,6 +284,7 @@ fn test_icmp_error_port_unreachable(#[case] medium: Medium) {
     // to no sockets listening on the destination port.
     let icmp_repr = Icmpv4Repr::DstUnreachable {
         reason: Icmpv4DstUnreachable::PortUnreachable,
+        next_hop_mtu: 0,
         header: Ipv4Repr {
             src_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x02),
             dst_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x01),
@@ -415,6 +419,7 @@ fn test_handle_ipv4_broadcast(#[case] medium: Medium) {
     );
 }
 
+/// 本地 ARP 请求得到应答，并把请求者保存为后续普通路由可用的邻居。
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
@@ -466,11 +471,13 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
             &mut iface.fragmenter,
+            false,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
     );
 }
 
+/// 发给其他目标的 ARP 请求不改变本地邻居缓存。
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
@@ -514,11 +521,13 @@ fn test_handle_other_arp_request(#[case] medium: Medium) {
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
             &mut iface.fragmenter,
+            false,
         ),
         Err(DispatchError::NeighborPending)
     );
 }
 
+/// 更新本地 IPv4 地址会清除原地址下学习的 ARP 邻居。
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
@@ -572,6 +581,7 @@ fn test_arp_flush_after_update_ip(#[case] medium: Medium) {
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
             &mut iface.fragmenter,
+            false,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
     );
@@ -808,7 +818,13 @@ fn test_packet_len(#[case] medium: Medium) {
 
         let token = device.transmit(Instant::ZERO).unwrap();
         assert_eq!(
-            iface.dispatch_ip(Instant::ZERO, token, PacketMeta::default(), ip_packet),
+            iface.dispatch_ip(
+                Instant::ZERO,
+                token,
+                PacketMeta::default(),
+                ip_packet,
+                false
+            ),
             Ok(())
         );
         while iface.fragmentation_pending() {
@@ -1046,6 +1062,7 @@ fn test_raw_socket_with_udp_socket(#[case] medium: Medium) {
     );
 }
 
+/// 生成的 ICMP 错误受最小 MTU 约束，引用仍保留原 IPv4 声明的正文长度。
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(all(feature = "socket-udp", feature = "medium-ip"))]
@@ -1088,6 +1105,7 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
 
     let expected_icmp_repr = Icmpv4Repr::DstUnreachable {
         reason: Icmpv4DstUnreachable::PortUnreachable,
+        next_hop_mtu: 0,
         header: ip_repr,
         data: &payload[..MAX_PAYLOAD_LEN],
     };

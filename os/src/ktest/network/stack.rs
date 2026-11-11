@@ -143,7 +143,11 @@ pub(crate) mod stack {
         ] {
             let payload: [u8; 513] = ::core::array::from_fn(pattern);
             context.expect_eq(
-                child_operation(sender.send(&payload, Some(destination)))?,
+                child_operation(
+                    sender
+                        .prepare_send(payload.len(), Some(destination))
+                        .and_then(|prepared| sender.send(&prepared, &payload)),
+                )?,
                 IoProgress::Ready(payload.len()),
             );
             receive_exact(receiver, &payload, expected_source)?;
@@ -191,7 +195,11 @@ pub(crate) mod stack {
             }))?;
             let bytes = index.to_le_bytes();
             context.expect_eq(
-                child_operation(sender.send(&bytes, Some(local)))?,
+                child_operation(
+                    sender
+                        .prepare_send(bytes.len(), Some(local))
+                        .and_then(|prepared| sender.send(&prepared, &bytes)),
+                )?,
                 IoProgress::Ready(bytes.len()),
             );
             receive_exact(&endpoint, &bytes, source)?;
@@ -248,7 +256,11 @@ pub(crate) mod stack {
                 .ok_or(TestError("UDP concurrent publication lost binding"))?;
             let bytes: [u8; 513] = ::core::array::from_fn(|offset| pattern(offset + index * 513));
             context.expect_eq(
-                child_operation(sender.send(&bytes, Some(local)))?,
+                child_operation(
+                    sender
+                        .prepare_send(bytes.len(), Some(local))
+                        .and_then(|prepared| sender.send(&prepared, &bytes)),
+                )?,
                 IoProgress::Ready(bytes.len()),
             );
             receive_exact(endpoint, &bytes, source)?;

@@ -58,7 +58,7 @@ use crate::net::{NetStack, INTERFACE_COUNT};
 use crate::sync::{SleepMutex, SpinLock};
 use crate::task::process::{Pid, ProcessStatus, TaskComm, TaskGraph, MAX_PID};
 use crate::task::time::{CpuTime, USER_HZ};
-use crate::task::State;
+use crate::task::{Policy, State};
 use crate::{accounting, cpu, irq, mm, time};
 
 /// 生成 `/proc` 文本快照时预分配的初始缓冲区容量（单位：字节）。
@@ -743,15 +743,26 @@ struct ProcessStat {
     started_ns: u64,
     /// 进程退出通知父进程的信号编号。
     exit_signal: u8,
+    /// 组首当前或退出时的调度策略，不含 fork 重置标志。
+    policy: Policy,
+    /// 组首当前或退出时的实时优先级。
+    rt_priority: u8,
 }
 
 /// 在任务图锁外分别读取组关系、时间与调度状态，不把各锁的快照当作原子事务。
 fn collect_process_stat(status: &ProcessStatus) -> ProcessStat {
     let group = &status.group;
-    let state = match status.leader.as_ref().and_then(|leader| leader.executor()) {
+    let (policy, rt_priority) = match status.leader_task.as_ref() {
+        Some(task) => {
+            let (policy, priority, _) = crate::sched::parameters(task);
+            (policy, priority)
+        }
+        None => (status.leader_policy, status.leader_priority),
+    };
+    let state = match status.leader_task.as_ref() {
         None => b'Z',
         Some(_) if group.signals().has_stopped_jobs() => b'T',
-        Some(task) => match crate::sched::state(&task) {
+        Some(task) => match crate::sched::state(task) {
             State::Ready | State::Running(_) | State::SwitchingOut(_, _) => b'R',
             State::Blocked => b'S',
             State::Exited => b'Z',
@@ -767,6 +778,8 @@ fn collect_process_stat(status: &ProcessStatus) -> ProcessStat {
         sid: group.sid(),
         tty_nr,
         tpgid,
+        policy,
+        rt_priority,
         own: group.time().snapshot(),
         children: group.time().children(),
         members: status.members,
@@ -800,12 +813,15 @@ fn format_process_stat(stat: &ProcessStat) -> Result<Vec<u8>, FsError> {
             0,
             0,
             0,
-            // 字段 14–22：CPU 时间、普通调度属性、成员数及创建时间。
+            // 字段 14–22：CPU 时间、调度属性、成员数及创建时间。
             process_ticks(stat.own.user_ns),
             process_ticks(stat.own.kernel_ns),
             process_ticks(stat.children.user_ns),
             process_ticks(stat.children.kernel_ns),
-            20,
+            match stat.policy {
+                Policy::Other => 20,
+                Policy::Fifo => -(i128::from(stat.rt_priority) + 1),
+            },
             0,
             stat.members as i128,
             0,
@@ -827,11 +843,14 @@ fn format_process_stat(stat: &ProcessStat) -> Result<Vec<u8>, FsError> {
             0,
             0,
             0,
-            // 字段 38–44：退出信号、处理器与未维护的扩展调度计数。
+            // 字段 38–44：退出信号、处理器、实时调度属性与扩展计数。
             i128::from(stat.exit_signal),
             0,
-            0,
-            0,
+            i128::from(stat.rt_priority),
+            match stat.policy {
+                Policy::Other => 0,
+                Policy::Fifo => 1,
+            },
             0,
             0,
             0,

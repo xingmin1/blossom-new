@@ -35,6 +35,7 @@ impl InterfaceInner {
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
                 let icmpv4_reply_repr = Icmpv4Repr::DstUnreachable {
                     reason: Icmpv4DstUnreachable::PortUnreachable,
+                    next_hop_mtu: 0,
                     header: ipv4_repr,
                     data: &ip_payload[0..payload_len],
                 };

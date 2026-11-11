@@ -69,7 +69,7 @@ pub struct RootSpec {
     /// 根内用例默认注入的环境变量。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// 激活该根时挂载的子目录，仅支持 `dev`、`proc`、`tmp`。
+    /// 按声明顺序挂载的项目：`dev`、`shm`（`/dev/shm`）、`proc`、`tmp`；省略时不挂载。
     #[serde(default)]
     pub mounts: Vec<String>,
     /// 激活该根时在系统根内执行的准备命令。

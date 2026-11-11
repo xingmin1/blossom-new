@@ -58,7 +58,8 @@ use crate::mm::dma::{DmaDomain, MappedPages};
 use crate::net::{
     address::{AddressFamily, InetEndpoint, SocketAddress},
     packet::OwnedPacket,
-    route::{EthernetConfig, InterfaceId},
+    route::{DefaultRouteRequest, EthernetConfig, InterfaceId},
+    table::TransportProtocol,
     udp::UdpEndpoint,
     IoProgress, NetStack, NetStackOwner, NetStackRef,
 };
@@ -617,19 +618,18 @@ impl Owner {
         self.nic.as_ref().expect("native NIC absent")
     }
 
-    /// 通过已绑定的 UDP 端点向宿主对端 `10.0.2.2:<self.port>` 投递完整报文，并断言软件发送队列一次性接纳全部字节。
+    /// 通过已绑定的 UDP 端点准备并向宿主对端 `10.0.2.2:<self.port>` 投递完整报文，并断言软件发送队列一次性接纳全部字节。
     fn send(&self, bytes: &[u8]) -> TestResult {
-        let progress = self
-            .udp
-            .as_ref()
-            .unwrap()
-            .send(
-                bytes,
+        let udp = self.udp.as_ref().unwrap();
+        let progress = udp
+            .prepare_send(
+                bytes.len(),
                 Some(InetEndpoint {
                     address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)),
                     port: self.port,
                 }),
             )
+            .and_then(|prepared| udp.send(&prepared, bytes))
             .map_err(|_| TestError("native UDP acceptance failed"))?;
         if progress != IoProgress::Ready(bytes.len()) {
             return Err(TestError(
@@ -1265,6 +1265,273 @@ pub(crate) mod native {
             held,
             nic.snapshot()?
         ));
+        Ok(())
+    }
+
+    /// 测试目标：验证 UDP 报文进入软件出口后失去默认路由时，永久派发错误报告给原端点，出口额度与绑定租约最终归还。
+    ///
+    /// 场景步骤：
+    /// 1. 预热网卡，暂停其工作项并占满 32 个硬件发送槽，向软件出口提交 31 条发往直连对端的编号报文。
+    /// 2. 在默认路由仍有效时，从夹具原 UDP 端点准备并发送一条网段外报文；等待软件出口满且端点发送预算恢复，确认报文已离开端点发送队列。
+    /// 3. 删除默认路由后放行网卡，等待原端点报告 `NetworkUnreachable`，再逐条验证先前 31 条报文的完整响应。
+    /// 4. 再次占满硬件发送槽并提交 32 条直连报文，验证软件出口全部槽位均可重新使用，随后接收全部响应。
+    /// 5. 等待硬件槽恢复，关闭原端点并重新预约其本地端口，验证在途报文不再持有该绑定。
+    /// 预期结果：原端点出现并可领取一次 `NetworkUnreachable`，直连报文无丢失或重复，全部出口槽位与原绑定均获释放。
+    #[test]
+    #[ktest(tags("N24"))]
+    fn udp_egress_no_route_reports_original_owner_and_releases_lease(
+        context: &mut TestContext<'_>,
+        fixture: &mut Owner,
+    ) -> TestResult {
+        fixture.probe()?;
+        let nic = fixture.nic();
+        let net = fixture.net.as_ref().unwrap();
+        let udp = fixture.udp.as_ref().unwrap();
+        let owner_id = udp.id();
+        let local = udp.local().ok_or(TestError("native UDP binding missing"))?;
+        if !net
+            .tables()
+            .udp_by_id(owner_id)
+            .is_some_and(|owner| Arc::ptr_eq(&owner, udp))
+        {
+            return Err(TestError("native UDP root owner differs"));
+        }
+        let destination = InetEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)),
+            port: fixture.port,
+        };
+        let before = nic.snapshot()?;
+        if before.tx.count != 32 {
+            return Err(TestError("native TX hardware pool is not 32 slots"));
+        }
+
+        nic.observation.entry.arm();
+        if !arp_reply(nic)? {
+            return Err(TestError("native route test first TX rejected"));
+        }
+        observe(
+            || nic.observation.entry.entered(),
+            "native route test Work Entry missing",
+        )?;
+        for _ in 1..32 {
+            if !arp_reply(nic)? {
+                return Err(TestError("native route test TX pool filled early"));
+            }
+        }
+        let held = nic.snapshot()?;
+        if held.tx.owned != 32 || held.tx.heads != 32 || held.tx.free != 0 {
+            return Err(TestError("native route test TX pool not full"));
+        }
+
+        for index in 0..31u16 {
+            let [low, high] = index.to_le_bytes();
+            let packet =
+                OwnedPacket::try_from_udp(local, destination, &[b'N', b'P', low, high], 1500)
+                    .map_err(|_| TestError("native route test UDP preparation failed"))?;
+            net.try_emit(packet)
+                .map_err(|_| TestError("native route test queue filled before 31 records"))?;
+        }
+        if !net
+            .egress_ready(udp.egress_wait())
+            .map_err(|_| TestError("native route test capacity query failed"))?
+        {
+            return Err(TestError("native route test has no final software slot"));
+        }
+
+        let outside = InetEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new(198, 51, 100, 42)),
+            port: fixture.port,
+        };
+        let payload = b"route removed after enqueue";
+        udp.set_send_budget(payload.len())
+            .map_err(|_| TestError("native route test send budget failed"))?;
+        let prepared = udp
+            .prepare_send(payload.len(), Some(outside))
+            .map_err(|_| TestError("native route test send preparation failed"))?;
+        let progress = udp
+            .send(&prepared, payload)
+            .map_err(|_| TestError("native route test send failed"))?;
+        drop(prepared);
+        if progress != IoProgress::Ready(payload.len()) {
+            return Err(TestError("native route test datagram not accepted"));
+        }
+
+        // 发送预算仅容纳这一条报文，恢复 POLLOUT 且软件队列满可证明它已转交根出口。
+        observe(
+            || {
+                udp.poll(None).is_ok_and(|mask| {
+                    mask.contains(PollMask::POLLOUT) && !mask.contains(PollMask::POLLERR)
+                }) && net
+                    .egress_ready(udp.egress_wait())
+                    .is_ok_and(|ready| !ready)
+            },
+            "native route test datagram did not reach the full software queue",
+        )?;
+        let route = DefaultRouteRequest {
+            interface: Some(InterfaceId::Ethernet),
+            gateway: [10, 0, 2, 2],
+        };
+        net.change_default_route(route, false)
+            .map_err(|_| TestError("native default route removal failed"))?;
+        if net
+            .route_snapshots()
+            .iter()
+            .flatten()
+            .any(|entry| entry.interface == InterfaceId::Ethernet && entry.prefix_len == 0)
+        {
+            return Err(TestError("native default route remained after removal"));
+        }
+        if udp
+            .poll(None)
+            .map_err(|_| TestError("native route test poll failed"))?
+            .contains(PollMask::POLLERR)
+        {
+            return Err(TestError("native route error preceded NIC gate release"));
+        }
+
+        nic.observation.entry.release();
+        observe(
+            || {
+                udp.poll(None)
+                    .is_ok_and(|mask| mask.contains(PollMask::POLLERR))
+            },
+            "native route dispatch did not report an error",
+        )?;
+        if !net
+            .tables()
+            .udp_by_id(owner_id)
+            .is_some_and(|owner| Arc::ptr_eq(&owner, udp))
+        {
+            return Err(TestError("native route error owner changed"));
+        }
+        context.expect_eq(udp.take_error(), Some(FsError::NetworkUnreachable));
+        context.expect_eq(udp.take_error(), None);
+        context.expect_eq(
+            udp.poll(None)
+                .map_err(|_| TestError("native route test post-error poll failed"))?
+                .contains(PollMask::POLLERR),
+            false,
+        );
+        context.expect_eq(
+            net.egress_ready(udp.egress_wait())
+                .map_err(|_| TestError("native route test recovered capacity query failed"))?,
+            true,
+        );
+        context.expect_eq(net.egress_waiting(owner_id), false);
+
+        let mut seen = 0u32;
+        for _ in 0..31 {
+            let response = fixture.receive()?;
+            let bytes = &response.0[..response.1];
+            if bytes.len() != 4 || bytes[..2] != *b"NQ" {
+                return Err(TestError("native route test response bytes differ"));
+            }
+            let index = u16::from_le_bytes([bytes[2], bytes[3]]);
+            if 31 <= index || seen & (1u32 << index) != 0 {
+                return Err(TestError(
+                    "native route test response missing or duplicated",
+                ));
+            }
+            let [low, high] = index.to_le_bytes();
+            if bytes != [b'N', b'Q', low, high] {
+                return Err(TestError("native route test full response differs"));
+            }
+            seen |= 1u32 << index;
+        }
+        context.expect_eq(seen, (1u32 << 31) - 1);
+        observe(
+            || {
+                nic.snapshot().is_ok_and(|snapshot| {
+                    snapshot.tx_completed == before.tx_completed + 63
+                        && snapshot.tx.free == 32
+                        && snapshot.pending_tx == 0
+                })
+            },
+            "native route test TX slots did not recover",
+        )?;
+
+        // 重新占满硬件并提交 32 条报文，逐槽检验软件出口没有遗留占位。
+        nic.observation.entry.arm();
+        if !arp_reply(nic)? {
+            return Err(TestError("native route recovery first TX rejected"));
+        }
+        observe(
+            || nic.observation.entry.entered(),
+            "native route recovery Work Entry missing",
+        )?;
+        for _ in 1..32 {
+            if !arp_reply(nic)? {
+                return Err(TestError("native route recovery TX pool filled early"));
+            }
+        }
+        let held = nic.snapshot()?;
+        if held.tx.owned != 32 || held.tx.heads != 32 || held.tx.free != 0 {
+            return Err(TestError("native route recovery TX pool not full"));
+        }
+        for index in 0..32u16 {
+            let [low, high] = index.to_le_bytes();
+            let packet =
+                OwnedPacket::try_from_udp(local, destination, &[b'N', b'P', low, high], 1500)
+                    .map_err(|_| TestError("native route recovery UDP preparation failed"))?;
+            net.try_emit(packet)
+                .map_err(|_| TestError("native route recovery lost a software slot"))?;
+        }
+        if net
+            .egress_ready(udp.egress_wait())
+            .map_err(|_| TestError("native route recovery capacity query failed"))?
+        {
+            return Err(TestError("native route recovery software queue not full"));
+        }
+        nic.observation.entry.release();
+        let mut recovered = 0u32;
+        for _ in 0..32 {
+            let response = fixture.receive()?;
+            let bytes = &response.0[..response.1];
+            if bytes.len() != 4 || bytes[..2] != *b"NQ" {
+                return Err(TestError("native route recovery response bytes differ"));
+            }
+            let index = u16::from_le_bytes([bytes[2], bytes[3]]);
+            if 32 <= index || recovered & (1u32 << index) != 0 {
+                return Err(TestError(
+                    "native route recovery response missing or duplicated",
+                ));
+            }
+            let [low, high] = index.to_le_bytes();
+            if bytes != [b'N', b'Q', low, high] {
+                return Err(TestError("native route recovery full response differs"));
+            }
+            recovered |= 1u32 << index;
+        }
+        context.expect_eq(recovered, u32::MAX);
+        observe(
+            || {
+                nic.snapshot().is_ok_and(|snapshot| {
+                    snapshot.tx_completed == before.tx_completed + 127
+                        && snapshot.tx.free == 32
+                        && snapshot.pending_tx == 0
+                })
+            },
+            "native route recovery TX slots did not recover",
+        )?;
+        context.expect_eq(
+            net.egress_ready(udp.egress_wait())
+                .map_err(|_| TestError("native route recovery final capacity query failed"))?,
+            true,
+        );
+        context.expect_eq(net.egress_waiting(owner_id), false);
+
+        // 原端点退休后，重新预约其端口可检查失败报文是否仍保活绑定租约。
+        udp.close();
+        observe(
+            || net.tables().udp_by_id(owner_id).is_none(),
+            "native route test original endpoint did not retire",
+        )?;
+        let binding = net
+            .tables()
+            .reserve_binding(net, owner_id, TransportProtocol::Udp, local, false, false)
+            .map_err(|_| TestError("native route test binding was not released"))?;
+        context.expect_eq(binding.local(), local);
+        drop(binding);
         Ok(())
     }
 

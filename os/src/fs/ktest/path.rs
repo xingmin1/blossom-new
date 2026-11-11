@@ -1163,7 +1163,8 @@ pub(crate) mod pruning {
         Ok(())
     }
 
-    /// 验证当 `InodeCache` 容量受限时（仅 2 个槽位：根目录占 1 个，普通文件占 1 个），关闭上一个文件后，`DentryCache` 中未使用的缓存项不会阻碍 `InodeCache` 回收旧 Inode 并加载新文件。
+    /// 验证两槽 inode 预算下空闲名字可被回收，活 Path 和加载中目录项仍保持身份。
+    /// 写锁内重查已有目录和并发加载共享结果均使用真实 ext4 节点。
     #[test]
     #[ktest(tags("B23", "fs-path-cache-budget"))]
     fn inode_budget_reclaims_unused_names(
@@ -1171,22 +1172,87 @@ pub(crate) mod pruning {
         fixture: &mut PathOwner,
     ) -> TestResult {
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
+        let vfs = fixture.vfs().clone();
+        let root = vfs.root();
         let first = fixture.resolve(context, b"/pattern")?;
         read_pattern(context, &first)?;
-        context.expect_eq(fixture.vfs().inodes().len(), 2);
+        context.expect_eq(vfs.inodes().len(), 2);
+        context.expect_eq(
+            vfs.mkdir_from(fixture.context(), &root, b"/walk", 0o755, (0, 0), 0)
+                .err(),
+            Some(FsError::NoMemory),
+        );
+        context.expect_eq(fixture.resolve(context, b"/pattern")?.ptr_eq(&first), true);
         drop(first);
 
+        // 父目录写侧不经过普通名字 miss，仍须释放空闲正目录项。
+        context.expect_eq(
+            vfs.mkdir_from(fixture.context(), &root, b"/walk", 0o755, (0, 0), 0)
+                .err(),
+            Some(FsError::Exists),
+        );
         let empty = fixture.resolve(context, b"/empty")?;
         let inode = checked(context, empty.inode())?;
         context.expect_eq(checked(context, inode.metadata_snapshot())?.size, 0);
         let mut bytes = [0xa7; 1];
         context.expect_eq(checked(context, inode.read_at(0, &mut bytes))?, 0);
-        context.expect_eq(fixture.vfs().inodes().len(), 2);
-        drop(empty);
+        context.expect_eq(vfs.inodes().len(), 2);
 
+        // 加载中的名字和被 Path 持有的 inode 均不能被满槽回收摘除。
+        let observer = fixture.owner.observer().clone();
+        let loads = vfs.dcache().ktest_load_count();
+        observer.hold_loader.store(true, Ordering::Release);
+        fixture.owner.publish(
+            0,
+            Job::Lookup {
+                vfs: vfs.clone(),
+                parent: root.dentry().clone(),
+                name: b"pattern",
+            },
+        );
+        until("budget path loader did not stop at InLookup", || {
+            observer.loader_entered.load(Ordering::Acquire) == 1 && observer.blocked(0)
+        })?;
+        context.expect_eq(
+            lookup_error(&vfs, root.dentry(), b"walk"),
+            Some(FsError::NoMemory),
+        );
+        context.expect_eq(fixture.resolve(context, b"/empty")?.ptr_eq(&empty), true);
+        context.expect_eq(vfs.dcache().len(), 2);
+        fixture.owner.publish(
+            1,
+            Job::Lookup {
+                vfs: vfs.clone(),
+                parent: root.dentry().clone(),
+                name: b"pattern",
+            },
+        );
+        until("budget path waiter did not share InLookup", || {
+            vfs.dcache().ktest_waiting(root.dentry(), b"pattern") == 1 && observer.blocked(1)
+        })?;
+        context.expect_eq(vfs.dcache().ktest_load_count(), loads + 2);
+
+        // 释放最后一个 Path 后，两个等待者应取得同一目录项。
+        drop(empty);
+        observer.hold_loader.store(false, Ordering::Release);
+        observer.gate.complete();
+        fixture.owner.join_tasks()?;
         let again = fixture.resolve(context, b"/pattern")?;
         read_pattern(context, &again)?;
-        context.expect_eq(fixture.vfs().inodes().len(), 2);
+        let [first, second, _] =
+            core::mem::replace(&mut *observer.results.lock(), [const { None }; 3]);
+        for result in [first, second] {
+            let returned = checked(
+                context,
+                result.ok_or(TestError("budget path lookup result absent"))?,
+            )?;
+            let Returned::Dentry(dentry) = returned else {
+                return Err(TestError("budget path lookup returned wrong kind"));
+            };
+            context.expect_eq(dentry.ptr_eq(again.dentry()), true);
+        }
+        context.expect_eq(vfs.dcache().ktest_load_count(), loads + 2);
+        context.expect_eq(vfs.inodes().len(), 2);
         Ok(())
     }
 }

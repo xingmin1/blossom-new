@@ -9,12 +9,14 @@ use crate::socket::{Context, PollAt};
 
 use crate::storage::Empty;
 use crate::wire::IcmpRepr;
+#[cfg(any(test, feature = "proto-ipv6"))]
+use crate::wire::UdpPacket;
+use crate::wire::UdpRepr;
 #[cfg(feature = "proto-ipv4")]
 use crate::wire::{Icmpv4Packet, Icmpv4Repr, Ipv4Repr};
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::{Icmpv6Packet, Icmpv6Repr, Ipv6Repr};
 use crate::wire::{IpAddress, IpListenEndpoint, IpProtocol, IpRepr};
-use crate::wire::{UdpPacket, UdpRepr};
 
 /// Error returned by [`Socket::bind`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -422,34 +424,27 @@ impl<'a> Socket<'a> {
         self.rx_buffer.payload_bytes_count()
     }
 
-    /// Fitler determining whether the socket accepts a given ICMPv4 packet.
-    /// Accepted packets are enqueued into the socket's receive buffer.
+    /// 判断 ICMPv4 报文是否属于本 socket；UDP 绑定按错误引用的源端口匹配。
     #[cfg(feature = "proto-ipv4")]
     #[inline]
     pub fn accepts_v4(
         &self,
-        cx: &mut Context,
+        _cx: &mut Context,
         ip_repr: &Ipv4Repr,
         icmp_repr: &Icmpv4Repr,
     ) -> bool {
         match (&self.endpoint, icmp_repr) {
-            // If we are bound to ICMP errors associated to a UDP port, only
-            // accept Destination Unreachable or Time Exceeded messages with
-            // the data containing a UDP packet send from the local port we
-            // are bound to.
+            // 错误引用通常缺少原 UDP 正文，端口匹配只解析已携带的完整首部。
             (
                 &Endpoint::Udp(endpoint),
                 &Icmpv4Repr::DstUnreachable { data, header, .. }
-                | &Icmpv4Repr::TimeExceeded { data, header, .. },
-            ) if endpoint.addr.is_none() || endpoint.addr == Some(ip_repr.dst_addr.into()) => {
-                let packet = UdpPacket::new_unchecked(data);
-                match UdpRepr::parse(
-                    &packet,
-                    &header.src_addr.into(),
-                    &header.dst_addr.into(),
-                    &cx.checksum_caps(),
-                ) {
-                    Ok(repr) => endpoint.port == repr.src_port,
+                | &Icmpv4Repr::TimeExceeded { data, header, .. }
+                | &Icmpv4Repr::ParamProblem { data, header, .. },
+            ) if header.next_header == IpProtocol::Udp
+                && (endpoint.addr.is_none() || endpoint.addr == Some(ip_repr.dst_addr.into())) =>
+            {
+                match UdpRepr::parse_quote(data) {
+                    Ok((repr, _)) => endpoint.port == repr.src_port,
                     Err(_) => false,
                 }
             }
@@ -468,12 +463,7 @@ impl<'a> Socket<'a> {
     /// Accepted packets are enqueued into the socket's receive buffer.
     #[cfg(feature = "proto-ipv6")]
     #[inline]
-    pub fn accepts_v6(
-        &self,
-        cx: &mut Context,
-        ip_repr: &Ipv6Repr,
-        icmp_repr: &Icmpv6Repr,
-    ) -> bool {
+    pub fn accepts_v6(&self, cx: &mut Context, ip_repr: &Ipv6Repr, icmp_repr: &Icmpv6Repr) -> bool {
         match (&self.endpoint, icmp_repr) {
             // If we are bound to ICMP errors associated to a UDP port, only
             // accept Destination Unreachable or Time Exceeded messages with
@@ -507,12 +497,7 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "proto-ipv4")]
-    pub fn process_v4(
-        &mut self,
-        _cx: &mut Context,
-        ip_repr: &Ipv4Repr,
-        icmp_repr: &Icmpv4Repr,
-    ) {
+    pub fn process_v4(&mut self, _cx: &mut Context, ip_repr: &Ipv4Repr, icmp_repr: &Icmpv4Repr) {
         net_trace!("icmp: receiving {} octets", icmp_repr.buffer_len());
 
         match self
@@ -533,12 +518,7 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "proto-ipv6")]
-    pub fn process_v6(
-        &mut self,
-        _cx: &mut Context,
-        ip_repr: &Ipv6Repr,
-        icmp_repr: &Icmpv6Repr,
-    ) {
+    pub fn process_v6(&mut self, _cx: &mut Context, ip_repr: &Ipv6Repr, icmp_repr: &Icmpv6Repr) {
         net_trace!("icmp: receiving {} octets", icmp_repr.buffer_len());
 
         match self
@@ -686,7 +666,9 @@ mod test_ipv4 {
     use rstest::*;
 
     use super::tests_common::*;
-    use crate::wire::{Icmpv4DstUnreachable, IpEndpoint, Ipv4Address};
+    use crate::wire::{
+        Icmpv4DstUnreachable, Icmpv4ParamProblem, Icmpv4TimeExceeded, IpEndpoint, Ipv4Address,
+    };
 
     const REMOTE_IPV4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
     const LOCAL_IPV4: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
@@ -877,6 +859,7 @@ mod test_ipv4 {
         assert!(!socket.accepts_v4(cx, &REMOTE_IPV4_REPR, &icmp_repr));
     }
 
+    /// UDP 绑定按原源端口接收三类 ICMP 错误，最短引用不要求原 UDP 正文齐全。
     #[rstest]
     #[case::ethernet(Medium::Ethernet)]
     #[cfg(feature = "medium-ethernet")]
@@ -902,15 +885,17 @@ mod test_ipv4 {
 
         let data = &*packet.into_inner();
 
+        let header = Ipv4Repr {
+            src_addr: LOCAL_IPV4,
+            dst_addr: REMOTE_IPV4,
+            next_header: IpProtocol::Udp,
+            payload_len: data.len(),
+            hop_limit: 0x40,
+        };
         let icmp_repr = Icmpv4Repr::DstUnreachable {
             reason: Icmpv4DstUnreachable::PortUnreachable,
-            header: Ipv4Repr {
-                src_addr: LOCAL_IPV4,
-                dst_addr: REMOTE_IPV4,
-                next_header: IpProtocol::Icmp,
-                payload_len: 12,
-                hop_limit: 0x40,
-            },
+            next_hop_mtu: 0,
+            header,
             data,
         };
         let ip_repr = Ipv4Repr {
@@ -937,6 +922,45 @@ mod test_ipv4 {
             Ok((&*packet.into_inner(), REMOTE_IPV4.into()))
         );
         assert!(!socket.can_recv());
+
+        for icmp_repr in [
+            Icmpv4Repr::TimeExceeded {
+                reason: Icmpv4TimeExceeded::TtlExpired,
+                header,
+                data: &data[..8],
+            },
+            Icmpv4Repr::ParamProblem {
+                reason: Icmpv4ParamProblem::AtPointer,
+                pointer: 9,
+                header,
+                data: &data[..8],
+            },
+        ] {
+            let ip_repr = Ipv4Repr {
+                payload_len: icmp_repr.buffer_len(),
+                ..ip_repr
+            };
+            assert!(socket.accepts_v4(cx, &ip_repr, &icmp_repr));
+            socket.process_v4(cx, &ip_repr, &icmp_repr);
+            let mut bytes = [0u8; 36];
+            let mut packet = Icmpv4Packet::new_unchecked(&mut bytes[..]);
+            icmp_repr.emit(&mut packet, &checksum);
+            assert_eq!(
+                socket.recv(),
+                Ok((&*packet.into_inner(), REMOTE_IPV4.into()))
+            );
+            assert!(!socket.can_recv());
+        }
+
+        let mut header = header;
+        header.next_header = IpProtocol::Tcp;
+        let wrong_protocol = Icmpv4Repr::ParamProblem {
+            reason: Icmpv4ParamProblem::AtPointer,
+            pointer: 9,
+            header,
+            data: &data[..8],
+        };
+        assert!(!socket.accepts_v4(cx, &ip_repr, &wrong_protocol));
     }
 }
 

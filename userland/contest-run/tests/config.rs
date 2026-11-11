@@ -132,6 +132,27 @@ fn only(patterns: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// shm 禁止重复，dev/shm 路径不能直接作为挂载项名称。
+#[test]
+fn root_mounts_reject_unknown_and_duplicate_entries() {
+    let tree = Tree::new();
+    for mounts in [["shm", "shm"], ["dev", "dev/shm"]] {
+        tree.put(
+            "plan.toml",
+            &format!(
+                "[roots.a]\npath = {:?}\nmounts = {mounts:?}\n",
+                tree.path("root")
+            ),
+        );
+        let error = tree.load("plan.toml").unwrap_err();
+        assert!(error.contains("plan.toml: roots.a:"), "{error}");
+        assert!(
+            error.contains(&format!("invalid or repeated mount {:?}", mounts[1])),
+            "{error}"
+        );
+    }
+}
+
 /// 单遍替换对未闭合花括号、空占位符与未知键必须原样保留，避免把普通文本当模板吞掉。
 #[test]
 fn expand_keeps_unknown_and_unterminated_braces() {

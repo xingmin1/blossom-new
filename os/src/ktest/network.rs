@@ -6,7 +6,7 @@
 //! 后台回环网络服务、TCP/UDP/Unix 域套接字）以及 `crate::fs::epoll` 等文件抽象。
 //!
 //! # 核心设计与套件划分
-//! 网络测试按照测试层级与待测组件划分为两个基础协议层套件和七个套接字行为套件，
+//! 网络测试按照测试层级与待测组件划分为两个基础协议层套件和八个套接字行为套件，
 //! 通过 `include!` 宏内联到本模块中，使每个套件拥有独立的测试夹具（Fixture）与资源泄漏基线检查：
 //!
 //! ```text
@@ -33,6 +33,7 @@
 //! |   - socket_tcp_listener   : TCP 监听套接字并发 accept 与队列管理      |
 //! |   - socket_tcp_progress   : TCP 套接字流式收发、阻塞唤醒与 Epoll 边沿 |
 //! |   - socket_udp_lease      : UDP 套接字租约分配、收发与容量边界        |
+//! |   - socket_udp_errors     : UDP 错误队列、共同接收预算与发送准备寿命  |
 //! |   - socket_udp_retirement : UDP 套接字在内存压力与关闭时的退役回收    |
 //! +-----------------------------------------------------------------------+
 //! ```
@@ -58,13 +59,14 @@ include!("network/socket_tcp_progress.rs");
 include!("network/socket_unix_seqpacket.rs");
 include!("network/socket_unix_owner.rs");
 include!("network/socket_udp_lease.rs");
+include!("network/socket_udp_errors.rs");
 include!("network/socket_udp_retirement.rs");
 
-/// 返回全部 9 个网络测试套件的静态注册槽引用数组。
+/// 返回全部 10 个网络测试套件的静态注册槽引用数组。
 ///
 /// 供上层 `ktest` 注册表显式引用，防止链接器在死代码消除（Dead Code Elimination）阶段
 /// 丢弃由宏生成的静态测试套件描述符。
-pub(super) fn anchors() -> [&'static ::ktest::SuiteSlot; 9] {
+pub(super) fn anchors() -> [&'static ::ktest::SuiteSlot; 10] {
     [
         core::__ktest_anchor(),
         stack::__ktest_anchor(),
@@ -74,6 +76,7 @@ pub(super) fn anchors() -> [&'static ::ktest::SuiteSlot; 9] {
         socket_unix_seqpacket::__ktest_anchor(),
         socket_unix_owner::__ktest_anchor(),
         socket_udp_lease::__ktest_anchor(),
+        socket_udp_errors::__ktest_anchor(),
         socket_udp_retirement::__ktest_anchor(),
     ]
 }

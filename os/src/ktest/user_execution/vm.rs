@@ -38,11 +38,229 @@ pub(crate) mod vm {
     use crate::arch::{self, UserAccess, UserContext, UserTrap};
     use crate::ktest::execution_core::{baseline, until};
     use crate::ktest::ChildToken;
-    use crate::mm::space::VmError;
+    use crate::mm::shm::{self, ShmAttachment, ShmError};
+    use crate::mm::space::{LockMemoryError, MmapAddress, MmapRequest, MmapSource, VmError};
     use crate::mm::uaccess::CStringError;
-    use crate::task::UserThread;
+    use crate::task::{Credentials, UserThread};
     use crate::{cpu, mm, sched, task};
     use ::ktest::{TestContext, TestError, TestResult};
+
+    /// 测试目标：锁页计费跟随真实 VMA，fork 不继承，最后用户退出不延长锁定或提前销毁普通映射。
+    /// 场景步骤：覆盖零长度、回绕、重叠、缩限、洞前提交、PROT_NONE、FIXED、COW 和共享 Mm 取消。
+    /// 预期结果：各阶段检查真实锁页数和 PTE，最后由用户指令确认预故障页可直接写入并自然结束绑定。
+    #[test]
+    #[ktest(tags("mlock"))]
+    fn locked_pages_follow_vma_and_last_user(
+        _: &mut TestContext<'_>,
+        fixture: &mut Users,
+    ) -> TestResult {
+        let page = mm::PAGE_SIZE;
+        let (parent, context, _) = image(arch::fault_offset(UserAccess::Read), 0)?;
+        parent.map_anonymous(TARGET, 4 * page, RO, RW).unwrap();
+        let parent = Arc::try_new(parent).map_err(|_| TestError("NoMemory: locked parent"))?;
+        let parent_user = UserThread::try_new(Arc::clone(&parent), context)
+            .map_err(|_| TestError("NoMemory: locked user"))?;
+
+        assert_eq!(parent.lock_memory(TARGET, 0, 0, false), Err(LockMemoryError::Permission));
+        assert_eq!(parent.lock_memory(TARGET + 1, usize::MAX, page as u64, false), Ok(()));
+        assert_eq!(parent.ktest_locked_pages(), 0);
+        assert!(parent.mapping(TARGET).is_none());
+        assert_eq!(parent.lock_memory(TARGET + 1, 0, page as u64, false), Ok(()));
+        assert_eq!(parent.ktest_locked_pages(), 1);
+        assert!(parent.mapping(TARGET).is_some());
+        assert_eq!(parent.lock_memory(TARGET + page / 2, page, (2 * page) as u64, false), Ok(()));
+        assert_eq!(parent.ktest_locked_pages(), 2);
+        assert_eq!(parent.lock_memory(TARGET, page, (2 * page) as u64, false), Ok(()));
+        assert_eq!(parent.lock_memory(TARGET, page, page as u64, false), Err(LockMemoryError::NoMemory));
+        assert_eq!(parent.lock_memory(usize::MAX - page + 1, page, 0, true), Err(LockMemoryError::Invalid));
+        assert_eq!(parent.unlock_memory(usize::MAX - page + 1, page), Err(LockMemoryError::Invalid));
+
+        parent.unmap(TARGET + page, page).unwrap();
+        assert_eq!(parent.ktest_locked_pages(), 1);
+        assert_eq!(parent.unlock_memory(TARGET, 3 * page), Err(LockMemoryError::NoMemory));
+        assert_eq!(parent.ktest_locked_pages(), 0);
+        assert_eq!(parent.lock_memory(TARGET + 2 * page, 3 * page, (3 * page) as u64, false), Err(LockMemoryError::NoMemory));
+        assert_eq!(parent.ktest_locked_pages(), 2);
+        assert!(parent.mapping(TARGET + 2 * page).is_none());
+        assert!(parent.mapping(TARGET + 3 * page).is_none());
+        parent.unlock_memory(TARGET + 2 * page, 2 * page).unwrap();
+        parent.protect(TARGET + 3 * page, page, crate::mm::user_table::PagePermissions {
+            read: false,
+            write: false,
+            execute: false,
+        }).unwrap();
+        assert_eq!(parent.lock_memory(TARGET + 3 * page, page, page as u64, false), Err(LockMemoryError::NoMemory));
+        assert_eq!(parent.ktest_locked_pages(), 1);
+        assert_eq!(parent.sync_mapping_range(TARGET + 3 * page..TARGET + 4 * page, false, true), Err(VmError::Locked));
+
+        parent.mmap(MmapRequest {
+            address: MmapAddress::Fixed(TARGET),
+            length: 4 * page,
+            permissions: RO,
+            maximum: RW,
+            source: MmapSource::PrivateAnonymous,
+        }).unwrap();
+        assert_eq!(parent.ktest_locked_pages(), 0);
+        parent.lock_memory(TARGET, page, page as u64, false).unwrap();
+        let child = Arc::try_new(parent.fork().unwrap())
+            .map_err(|_| TestError("NoMemory: locked fork"))?;
+        let shared = child.mapping(TARGET).unwrap().physical;
+        assert_eq!(child.ktest_locked_pages(), 0);
+        assert_eq!(parent.mapping(TARGET).unwrap().physical, shared);
+        parent.protect(TARGET, page, RW).unwrap();
+        assert_ne!(parent.mapping(TARGET).unwrap().physical, shared);
+        assert!(parent.mapping(TARGET).unwrap().permissions.write);
+        assert_eq!(parent.ktest_locked_pages(), 1);
+
+        child.lock_memory(TARGET, page, page as u64, false).unwrap();
+        let child_user = UserThread::try_new(
+            Arc::clone(&child), UserContext::new(CODE + arch::exit_offset(), STACK_TOP),
+        ).map_err(|_| TestError("NoMemory: locked child user"))?;
+        let cancelled = task::prepare_user(child_user, task::Placement::Any, |_| {
+            panic!("cancelled locked child ran")
+        }).map_err(|_| TestError("NoMemory: locked child task"))?;
+        drop(cancelled);
+        assert_eq!(child.user_count(), 0);
+        assert_eq!(child.ktest_locked_pages(), 0);
+        assert_eq!(child.mapping(TARGET).unwrap().physical, shared);
+        assert_eq!(parent.ktest_locked_pages(), 1);
+
+        let alias = UserThread::try_new(
+            Arc::clone(&parent), UserContext::new(CODE + arch::exit_offset(), STACK_TOP),
+        ).map_err(|_| TestError("NoMemory: locked shared user"))?;
+        let cancelled = task::prepare_user(alias, task::Placement::Any, |_| {
+            panic!("cancelled shared locked user ran")
+        }).map_err(|_| TestError("NoMemory: locked shared task"))?;
+        assert_eq!(parent.user_count(), 2);
+        drop(cancelled);
+        assert_eq!(parent.user_count(), 1);
+        assert_eq!(parent.ktest_locked_pages(), 1);
+        let physical = parent.mapping(TARGET).unwrap().physical;
+        fixture.start(0, Arc::clone(&parent_user), move |user, token, stop| {
+            assert_eq!(access(&user, &token, &stop, TARGET, UserAccess::Write)?.0, 0);
+            assert_eq!(access(&user, &token, &stop, TARGET, UserAccess::Read)?, (0, 0));
+            user.context().pc = CODE + arch::exit_offset();
+            assert_eq!(event(&user, &token, &stop)?, UserTrap::Syscall);
+            Ok(43)
+        })?;
+        fixture.joined(0, 43)?;
+        assert!(parent_user.mm().is_none());
+        assert_eq!(parent.user_count(), 0);
+        assert_eq!(parent.ktest_locked_pages(), 0);
+        assert_eq!(parent.mapping(TARGET).unwrap().physical, physical);
+        assert_eq!(parent.read_u64(TARGET), Ok(0));
+        Ok(())
+    }
+
+    /// 验证裸用户入口与未发表取消在真实任务上下文结束各自的 MmUser 和共享段连接。
+    ///
+    /// 保留父连接及诊断 Mm/UserThread Arc，分别取消共享 Mm 的预备用户和独立 fork 子 Mm，
+    /// 检查用户计数、两套 PTE 和父进程共享字节，再让裸用户执行退出探针并完成离栈。
+    /// 共享 Mm 取消只归还用户计数，fork 取消只撤除子 PTE，最后一个真实用户退出后连接与 ID 消失。
+    #[test]
+    fn shared_segment_entry_and_cancel_retirement(
+        _: &mut TestContext<'_>,
+        fixture: &mut Users,
+    ) -> TestResult {
+        let (parent, context, _) = image(arch::exit_offset(), 0)?;
+        let parent = Arc::try_new(parent).map_err(|_| TestError("NoMemory: shared parent MM"))?;
+        let id = shm::get(0, mm::PAGE_SIZE, 0o600, Credentials::ROOT)
+            .map_err(|_| TestError("shared segment creation failed"))?;
+        let attachment = ShmAttachment::acquire(id, Credentials::ROOT, 0o6)
+            .map_err(|_| TestError("shared segment reservation failed"))?;
+        shm::remove(id, Credentials::ROOT)
+            .map_err(|_| TestError("shared segment removal failed"))?;
+        parent
+            .attach_shm(attachment, MmapAddress::FixedNoReplace(TARGET), RW)
+            .map_err(|_| TestError("shared segment mapping failed"))?;
+        let copied = parent.copyout(TARGET, &0x9851u64.to_le_bytes());
+        if (copied.copied, copied.error) != (8, None) {
+            return Err(TestError("shared segment initialization failed"));
+        }
+        let parent_user = UserThread::try_new(Arc::clone(&parent), context)
+            .map_err(|_| TestError("NoMemory: shared parent user"))?;
+        let controls = Controls::new(fixture)?;
+        let control = Arc::clone(&controls);
+        fixture.start(0, Arc::clone(&parent_user), move |user, token, stop| {
+            assert_eq!(
+                access(&user, &token, &stop, TARGET, UserAccess::Read)?,
+                (0, 0x9851)
+            );
+            control.record(0);
+            control.gates[0].wait();
+            if stop.load(Ordering::Acquire) || token.stop_requested() {
+                return Ok(0);
+            }
+            user.context().pc = CODE + arch::exit_offset();
+            assert_eq!(event(&user, &token, &stop)?, UserTrap::Syscall);
+            Ok(43)
+        })?;
+        until(
+            || controls.blocked(0),
+            "shared segment parent did not enter its user gate",
+        )?;
+
+        // CLONE_VM 共用一个地址空间，取消预备用户不能结束原用户仍持有的连接。
+        let shared_user = UserThread::try_new(
+            Arc::clone(&parent),
+            UserContext::new(CODE + arch::exit_offset(), STACK_TOP),
+        )
+        .map_err(|_| TestError("NoMemory: shared MM user"))?;
+        assert_eq!(parent.user_count(), 2);
+        let shared_task = task::prepare_user(
+            Arc::clone(&shared_user),
+            task::Placement::Any,
+            |_| panic!("cancelled shared-MM entry ran"),
+        )
+        .map_err(|_| TestError("NoMemory: shared MM task"))?;
+        drop(shared_task);
+        assert!(shared_user.mm().is_none());
+        assert_eq!(parent.user_count(), 1);
+        assert_eq!(parent.read_u64(TARGET), Ok(0x9851));
+        let physical = parent.mapping(TARGET).unwrap().physical;
+
+        // fork 拥有独立连接与页表，取消子任务只撤除子 PTE，父进程继续持有共享原页。
+        let child = parent
+            .fork()
+            .map_err(|_| TestError("shared segment fork failed"))?;
+        let child = Arc::try_new(child)
+            .map_err(|_| TestError("NoMemory: forked shared MM"))?;
+        if child.mapping(TARGET).map(|mapping| mapping.physical) != Some(physical) {
+            return Err(TestError("fork did not share its original segment page"));
+        }
+        let child_user = UserThread::try_new(
+            Arc::clone(&child),
+            UserContext::new(CODE + arch::exit_offset(), STACK_TOP),
+        )
+        .map_err(|_| TestError("NoMemory: forked shared user"))?;
+        let child_task = task::prepare_user(
+            Arc::clone(&child_user),
+            task::Placement::Any,
+            |_| panic!("cancelled forked entry ran"),
+        )
+        .map_err(|_| TestError("NoMemory: forked shared task"))?;
+        drop(child_task);
+        assert!(child_user.mm().is_none());
+        assert_eq!(child.user_count(), 0);
+        assert!(child.mapping(TARGET).is_none());
+        assert_eq!(parent.mapping(TARGET).unwrap().physical, physical);
+        assert_eq!(parent.read_u64(TARGET), Ok(0x9851));
+        let probe = ShmAttachment::acquire(id, Credentials::ROOT, 0o4)
+            .map_err(|_| TestError("parent lost its live shared segment"))?;
+        drop(probe);
+
+        // 离栈后仍保留诊断 Arc，检查连接寿命只由真实用户绑定决定。
+        controls.gates[0].complete();
+        fixture.joined(0, 43)?;
+        assert!(parent_user.mm().is_none());
+        assert_eq!(parent.user_count(), 0);
+        assert!(parent.mapping(TARGET).is_none());
+        assert!(matches!(
+            ShmAttachment::acquire(id, Credentials::ROOT, 0o4),
+            Err(ShmError::Invalid)
+        ));
+        Ok(())
+    }
 
     /// 验证匿名映射在首次用户指令访存时才按需分配并清零物理页，且跨页 `copyin` 与 `unmap` 后访问行为符合预期。
     ///

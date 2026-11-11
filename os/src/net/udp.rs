@@ -11,18 +11,18 @@
 //!
 //! ## 1. 延迟缓冲区分配与租约旁表（`leases`）
 //! - **冷启动与延迟分配**：`UdpEndpoint::try_new` 创建时仅初始化零容量的 `udp::Socket`，不在套接字刚打开时分配
-//!   两份 128 KiB 的收发缓冲区；直到首次执行 `bind`、`connect` 或 `send` 时才通过 `State::prepare_buffers` 在堆上分配。
+//!   两份 128 KiB 的收发缓冲区；直到首次执行 `bind`、`connect` 或 `prepare_send` 时才通过 `State::prepare_buffers` 在堆上分配。
 //! - **逐包端口租约保活**：每次 `send` 成功将一条数据报写入 `udp::Socket` 发送队列时，都会在 `State::leases`
-//!   队列末尾同步推入一份当前 `BindLease` 的 `Arc` 克隆；后台 `dispatch` 取出并发送该条数据报时再从 `leases`
+//!   队列末尾同步推入本次准备结果持有的 `BindLease`；后台 `dispatch` 取出并发送该条数据报时再从 `leases`
 //!   队首弹出并附加到 `OwnedPacket` 上。这样即使应用层在数据报发出前断开重绑或关闭套接字，在途数据报占用的源端口也不会被提前复用。
 //!
 //! ```text
 //!   [用户态 send / sendto]                     [后台 Work: run_udp]
 //!             |                                         |
 //!   1. 解析路由与源端口租约 (BindLease)         1. process_input: 从 input.packets
-//!   2. prepare_buffers() 按需分配 128KiB 缓冲      取出报文写入 socket 接收队列
-//!   3. socket.send_slice(payload, meta)        2. dispatch: 从 socket 发送队列取出报文
-//!   4. leases.push_back(lease.clone())            与 leases.pop_front() 配对组装 OwnedPacket
+//!   2. prepare_send 保留源端口并释放协议锁        取出报文写入 socket 接收队列
+//!   3. 锁外复制用户正文，再提交原准备结果       2. dispatch: 从 socket 发送队列取出报文
+//!   4. socket.send_slice + leases.push_back        与 leases.pop_front() 配对组装 OwnedPacket
 //!             |                                         |
 //!             +----------------> 唤醒 / 调度 -----------+
 //! ```
@@ -48,7 +48,7 @@
 //! # 锁获取顺序（Lock Ordering）与并发契约
 //! 严禁违反以下锁层级顺序，否则会导致死锁：
 //! 1. **端点状态睡眠锁 `UdpEndpoint::state`（`SleepMutex`）**：最外层锁，保护 `udp::Socket`、端口租约与连接状态。
-//! 2. **网络栈控制准入锁 `NetStack::admission()`（`SleepMutex`）**：在 `bind`、`connect`、`send`、`set_reuse_address`
+//! 2. **网络栈控制准入锁 `NetStack::admission()`（`SleepMutex`）**：在 `bind`、`connect`、`prepare_send`、`set_reuse_address`
 //!    中更新全局绑定表或解析路由时获取，位于 `state` 锁之内、所有自旋锁之外。
 //! 3. **端点内部自旋锁（`SpinLock`）**：包括 `input`、`timeouts` 以及 `NetTables` 内部自旋锁。
 //!    自旋锁临界区极短且互不嵌套；必须在释放 `state` 与自旋锁之后才能调用 `PollWaitHead::notify` 或 `schedule`。
@@ -56,13 +56,14 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::mem;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use smoltcp::iface::IpPayload;
 use smoltcp::phy::PacketMeta;
 use smoltcp::socket::udp::{self, UdpContextState, UdpMetadata};
-use smoltcp::wire::{IpAddress, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpListenEndpoint, Ipv4Address};
 use spin::Once;
 
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
@@ -71,9 +72,9 @@ use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketA
 use crate::net::lifecycle::{EgressWait, RetirementLink};
 use crate::net::packet::{
     zeroed_bytes, OwnedPacket, IPV6_UDP_HEADER_LEN, MAX_IPV4_UDP_PAYLOAD_LEN,
-    MAX_IPV6_UDP_PAYLOAD_LEN,
+    MAX_IPV6_UDP_PAYLOAD_LEN, MAX_IP_PACKET_LEN,
 };
-use crate::net::socket::{SocketTimeouts, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR};
+use crate::net::socket::{SocketTimeouts, MSG_ERRQUEUE, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR};
 use crate::net::table::{BindLease, TransportProtocol};
 use crate::net::{EndpointSlot, IoProgress, MessageResult, NetStack, NetStackRef, PROTOCOL_BUDGET};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
@@ -81,6 +82,169 @@ use crate::workqueue::Work;
 
 const PACKET_RECORDS: usize = 32;
 const PAYLOAD_CAPACITY: usize = 128 * 1024;
+
+/// 本地 IPv4 错误的扩展错误来源编号。
+const ERROR_ORIGIN_LOCAL: u8 = 1;
+/// ICMPv4 错误的扩展错误来源编号。
+const ERROR_ORIGIN_ICMP: u8 = 2;
+
+/// 一次发送在用户复制前取得的目的地、源地址和绑定拥有。
+pub(crate) struct PreparedDatagram {
+    /// 本次必须完整提交的应用数据长度。
+    length: usize,
+    /// 原路由选出的源地址、原源端口和本次目的地。
+    metadata: UdpMetadata,
+    /// 在复制、容量等待及并发断开期间保活本次源端口。
+    lease: Arc<BindLease>,
+    /// 准备发送时的直连路由限制。
+    dont_route: bool,
+}
+
+/// IPv4 UDP 错误队列中的一条真实记录，不反向拥有端点或网络栈。
+pub(crate) struct UdpErrorRecord {
+    /// 向套接字及扩展错误字段报告的具体错误。
+    pub error: FsError,
+    /// 扩展错误来源，区分本地错误与 ICMPv4。
+    pub origin: u8,
+    /// ICMP 类型；本地错误为零。
+    pub kind: u8,
+    /// ICMP 代码；本地错误为零。
+    pub code: u8,
+    /// 实际 MTU 或参数指针，未使用时为零。
+    pub info: u32,
+    /// 错误报告对应的目的地址和端口。
+    pub destination: InetEndpoint,
+    /// ICMP 外层源地址；本地错误没有 offender 地址。
+    pub offender: Option<Ipv4Address>,
+    /// 关闭 RECVERR 时是否仍应向已连接套接字报告。
+    hard: bool,
+    /// ICMP 引用中真正携带的 UDP 正文及其拥有；本地错误没有正文。
+    packet: Option<OwnedPacket>,
+}
+
+impl UdpErrorRecord {
+    /// 按 ICMP 类型与代码构造错误元数据，忽略不交给 UDP 的控制报文。
+    pub(crate) fn icmp(
+        kind: u8,
+        code: u8,
+        info: u32,
+        destination: InetEndpoint,
+        offender: Ipv4Address,
+    ) -> Option<Self> {
+        let (error, hard) = match (kind, code) {
+            (3, 0 | 11) => (FsError::NetworkUnreachable, false),
+            (3, 1 | 12) => (FsError::HostUnreachable, false),
+            (3, 2) => (FsError::ProtocolOptionNotSupported, true),
+            (3, 3) => (FsError::ConnectionRefused, true),
+            (3, 4) => (FsError::MessageTooLarge, true),
+            (3, 5) => (FsError::Unsupported, false),
+            (3, 6 | 9) => (FsError::NetworkUnreachable, true),
+            (3, 7) => (FsError::HostDown, true),
+            (3, 8) => (FsError::NoNetwork, true),
+            (3, 10 | 13..=15) => (FsError::HostUnreachable, true),
+            (11, code) if code != 1 => (FsError::HostUnreachable, false),
+            (12, _) => (FsError::ProtocolError, true),
+            _ => return None,
+        };
+        Some(Self {
+            error,
+            origin: ERROR_ORIGIN_ICMP,
+            kind,
+            code,
+            info: if (kind == 3 && code == 4) || kind == 12 {
+                info
+            } else {
+                0
+            },
+            destination,
+            offender: Some(offender),
+            hard,
+            packet: None,
+        })
+    }
+
+    /// 保存实际 IPv4 长度拒绝产生的本地错误，不包含应用正文。
+    fn local(destination: InetEndpoint, mtu: usize) -> Self {
+        Self {
+            error: FsError::MessageTooLarge,
+            origin: ERROR_ORIGIN_LOCAL,
+            kind: 0,
+            code: 0,
+            info: mtu as u32,
+            destination,
+            offender: None,
+            hard: false,
+            packet: None,
+        }
+    }
+
+    /// 附加已经脱离接口借用的引用正文，错误记录独占其回收责任。
+    pub(crate) fn with_packet(mut self, packet: OwnedPacket) -> Self {
+        self.packet = Some(packet);
+        self
+    }
+
+    /// 借用错误引用中实际存在的正文，不使用原 IP 包声明的总长度。
+    pub(crate) fn payload(&self) -> &[u8] {
+        self.packet.as_ref().map_or(&[], |packet| {
+            packet.udp_payload().expect("UDP error payload")
+        })
+    }
+
+    /// 返回记录真正持有的载荷容量，不把捕获后备的空闲容量漏出接收账。
+    fn payload_capacity(&self) -> usize {
+        self.packet
+            .as_ref()
+            .map_or(0, OwnedPacket::payload_capacity)
+    }
+
+    /// 在领取错误并释放端点锁后复制正文，发生用户复制错误时不恢复队列记录。
+    pub(crate) fn copy_to(&self, target: &mut ReadBuffer<'_>) -> Result<MessageResult, FsError> {
+        let payload = self.payload();
+        let copied = target.push(payload)?;
+        Ok(MessageResult {
+            copied,
+            original_len: payload.len(),
+            source: Some(SocketAddress::Inet(self.destination)),
+            flags: MSG_ERRQUEUE | if copied < payload.len() { MSG_TRUNC } else { 0 },
+        })
+    }
+}
+
+/// 已领取的错误正文及其接收内存责任，只能在可睡眠任务中领取和释放。
+/// 对端点的借用覆盖锁外用户复制；预算在正文真正释放后才归还。
+pub(crate) struct ReceivedError<'a> {
+    /// 提供唯一接收账与操作守卫的原端点，借用不延长网络域生命周期。
+    endpoint: &'a UdpEndpoint,
+    /// 已从 FIFO 移出的独占记录；析构时先取出并释放其载荷。
+    record: Option<UdpErrorRecord>,
+}
+
+impl Deref for ReceivedError<'_> {
+    type Target = UdpErrorRecord;
+
+    /// 只读访问已领取记录，调用方不能把带归账责任的对象重新放回队列。
+    fn deref(&self) -> &UdpErrorRecord {
+        self.record
+            .as_ref()
+            .expect("received UDP error already released")
+    }
+}
+
+impl Drop for ReceivedError<'_> {
+    /// 先释放正文，再在原状态保护中归还实际容量；停止后的端点不会重新安排 Work。
+    fn drop(&mut self) {
+        let record = self
+            .record
+            .take()
+            .expect("received UDP error already released");
+        let capacity = record.payload_capacity();
+        drop(record);
+        let mut state = self.endpoint.operation(OperationMode::Modify);
+        state.error_payload_bytes -= capacity;
+        state.update_receive_budget();
+    }
+}
 
 /// 端点的输入数据报缓冲队列与后台调度交接标志（由 `UdpEndpoint::input` 自旋锁保护）。
 struct Input {
@@ -103,8 +267,8 @@ struct State {
     receive_budget: usize,
     /// 发送缓冲区的字节配额上限（对应 `SO_SNDBUF`，单位：字节）。
     send_budget: usize,
-    /// 与 `socket` 发送队列中待发数据报一一对应的本地端口绑定租约队列，确保在途数据报完成发送前源端口租约保持有效。
-    leases: VecDeque<Arc<BindLease>>,
+    /// 与待发数据报一一对应的原端口租约和发送时路由策略，保活旧绑定并隔离后续选项修改。
+    leases: VecDeque<(Arc<BindLease>, bool)>,
     /// 当前端点持有的本地地址与端口绑定租约（显式 `bind` 或自动分配产生）。
     binding: Option<Arc<BindLease>>,
     /// 通过 `connect` 设置的默认远端对端地址与端口；未连接时为 `None`。
@@ -117,6 +281,8 @@ struct State {
     reuse: bool,
     /// IPv6 端点是否启用 `IPV6_V6ONLY`（仅限 IPv6 通信，禁止 IPv4 映射地址）。
     v6_only: bool,
+    /// 是否限制 IPv4 使用直连路由；与发送和连接操作由同一状态锁串行。
+    dont_route: bool,
     /// 读方向是否已通过 `shutdown(SHUT_RD)` 或 `close` 关闭。
     read_closed: bool,
     /// 写方向是否已通过 `shutdown(SHUT_WR)` 或 `close` 关闭。
@@ -125,6 +291,12 @@ struct State {
     closed: bool,
     /// 待由用户态通过 `SO_ERROR` 取走的后台异步发送错误。
     error: Option<FsError>,
+    /// 是否为 IPv4 UDP 保存可由 MSG_ERRQUEUE 领取的错误记录。
+    recv_error: bool,
+    /// 与普通 RX 共用接收预算的唯一错误 FIFO，只在错误发生时分配。
+    errors: VecDeque<UdpErrorRecord>,
+    /// 队列及已领取错误真正持有的载荷容量总和，FIFO 元数据容量另行直接查询。
+    error_payload_bytes: usize,
 }
 
 impl State {
@@ -137,12 +309,12 @@ impl State {
         let rx = UdpEndpoint::packet_buffer()?;
         let tx = UdpEndpoint::packet_buffer()?;
         let mut socket = udp::Socket::new(rx, tx);
-        socket.set_recv_budget(self.receive_budget);
         socket.set_send_budget(self.send_budget);
         socket.set_hop_limit(self.socket.hop_limit());
 
         self.socket = socket;
         self.buffers_ready = true;
+        self.update_receive_budget();
         Ok(())
     }
 
@@ -169,21 +341,87 @@ impl State {
         if self.read_closed && self.write_closed {
             mask |= PollMask::POLLHUP;
         }
-        if self.error.is_some() {
+        if self.error.is_some() || !self.errors.is_empty() {
             mask |= PollMask::POLLERR;
         }
         mask
     }
 
-    /// 检查当前端点是否允许发送数据报（即便发送 0 字节数据报也必须检查关闭与 `SHUT_WR` 状态）。
-    fn check_send(&self) -> Result<(), FsError> {
+    /// 在发送合法性与路由检查后领取挂起错误，再检查写方向关闭状态。
+    fn check_send(&mut self) -> Result<(), FsError> {
         if self.closed {
             return Err(FsError::NotConnected);
+        }
+        if let Some(error) = self.error.take() {
+            return Err(error);
         }
         if self.write_closed {
             return Err(FsError::BrokenPipe);
         }
         Ok(())
+    }
+
+    /// 计算错误队列真正持有的字节，包括已分配但暂时空闲的 FIFO 元数据槽。
+    fn error_charge(&self) -> usize {
+        self.error_payload_bytes + self.errors.capacity() * mem::size_of::<UdpErrorRecord>()
+    }
+
+    /// 从总接收预算扣除错误拥有，再把剩余两维预算交给原 UDP 接收环。
+    fn update_receive_budget(&mut self) {
+        if !self.buffers_ready {
+            return;
+        }
+        let (bytes, records) = match self.receive_budget.checked_sub(self.error_charge()) {
+            Some(bytes) => (bytes, PACKET_RECORDS - self.errors.len()),
+            None => (0, 0),
+        };
+        self.socket.set_recv_budget(bytes);
+        self.socket.set_recv_packet_budget(records);
+    }
+
+    /// 尝试保存一条错误；容量或分配不足时归还原记录供状态锁外释放。
+    fn queue_error(&mut self, mut record: UdpErrorRecord) -> Option<UdpErrorRecord> {
+        if !self.recv_error || PACKET_RECORDS <= self.socket.recv_packet_count() + self.errors.len()
+        {
+            return Some(record);
+        }
+        let capacity = self.errors.capacity().max(self.errors.len() + 1);
+        let minimum = self.socket.recv_queue()
+            + self.error_payload_bytes
+            + capacity * mem::size_of::<UdpErrorRecord>()
+            + record.payload().len();
+        if self.receive_budget <= minimum {
+            return Some(record);
+        }
+        if let Some(packet) = record.packet.as_mut() {
+            if packet.compact_payload().is_err() {
+                return Some(record);
+            }
+        }
+        if self.errors.try_reserve_exact(1).is_err() {
+            return Some(record);
+        }
+        let charge = record.payload_capacity();
+        if self.receive_budget <= self.socket.recv_queue() + self.error_charge() + charge {
+            if self.errors.is_empty() {
+                self.errors = VecDeque::new();
+            }
+            self.update_receive_budget();
+            return Some(record);
+        }
+        self.error_payload_bytes += charge;
+        self.errors.push_back(record);
+        self.update_receive_budget();
+        None
+    }
+
+    /// 取出队列拥有并仅归还这些记录的预算，保留已领取正文的内存责任和独立 errno。
+    fn purge_errors(&mut self) -> VecDeque<UdpErrorRecord> {
+        let errors = mem::take(&mut self.errors);
+        let released: usize = errors.iter().map(UdpErrorRecord::payload_capacity).sum();
+        self.error_payload_bytes -= released;
+        self.update_receive_budget();
+        errors
     }
 }
 
@@ -242,6 +480,8 @@ struct OperationGuard<'a> {
     initial_write_closed: bool,
     /// 获取锁时的初始端点关闭标志。
     initial_closed: bool,
+    /// 本次真实事件必须发送的通知，即使其就绪位原先已经存在。
+    notification: PollMask,
 }
 
 impl Deref for OperationGuard<'_> {
@@ -261,13 +501,12 @@ impl DerefMut for OperationGuard<'_> {
 }
 
 impl Drop for OperationGuard<'_> {
-    /// 在持有 `state` 锁的末尾对比初始快照计算新增的轮询就绪事件，随后释放 `state` 锁，
-    /// 在锁外唤醒等待队列并按需调度后台 `Work`。
+    /// 合并就绪变化与每次真实错误的强制通知，释放状态锁后唤醒等待者并完成原 Work 接力。
     fn drop(&mut self) {
         // Step 1: 在修改模式下比对操作前后的状态差异，汇总新产生的轮询就绪掩码。
         let notification = if self.mode == OperationMode::Modify {
             let state = self.state.as_deref().unwrap();
-            let mut mask = state.mask() & !self.initial_mask;
+            let mut mask = (state.mask() & !self.initial_mask) | self.notification;
             if !self.initial_read_closed && state.read_closed {
                 mask |= PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLRDHUP;
             }
@@ -341,10 +580,14 @@ impl UdpEndpoint {
                 explicit_bind: false,
                 reuse: false,
                 v6_only: false,
+                dont_route: false,
                 read_closed: false,
                 write_closed: false,
                 closed: false,
                 error: None,
+                recv_error: false,
+                errors: VecDeque::new(),
+                error_payload_bytes: 0,
             }),
             input: SpinLock::new(Input {
                 closed: false,
@@ -415,6 +658,7 @@ impl UdpEndpoint {
             initial_read_closed,
             initial_write_closed,
             initial_closed,
+            notification: PollMask::default(),
         }
     }
 
@@ -463,6 +707,21 @@ impl UdpEndpoint {
             return Err(FsError::NotConnected);
         }
         state.v6_only = value;
+        Ok(())
+    }
+
+    /// 查询端点当前的路由限制；已经接纳的数据报保留各自的快照。
+    pub fn dont_route(&self) -> bool {
+        self.operation(OperationMode::Observe).dont_route
+    }
+
+    /// 与连接和发送串行修改路由限制；每次发送都重新查询现行路由。
+    pub fn set_dont_route(&self, enabled: bool) -> Result<(), FsError> {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
+        state.dont_route = enabled;
         Ok(())
     }
 
@@ -591,7 +850,7 @@ impl UdpEndpoint {
             .binding
             .as_ref()
             .map_or(self.family.unspecified(), |lease| lease.local().address);
-        let route = net.resolve_route(peer.address, bound)?;
+        let route = net.resolve_route(peer.address, bound, state.dont_route)?;
 
         state.prepare_buffers()?;
         let lease = match state.binding.as_ref() {
@@ -612,18 +871,20 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 将一条完整的 UDP 数据报写入端点发送队列（`send` / `sendto` / `sendmsg`）。
-    ///
-    /// 依次校验发送方向状态、目的地址与报文长度上限，解析出口路由与 MTU，按需分配缓冲区与自动端口租约，
-    /// 最后将有效载荷写入 `udp::Socket` 发送缓冲区，并将关联的端口租约推入 `state.leases` 队列。
-    pub fn send(
-        self: &Arc<Self>,
-        payload: &[u8],
+    /// 在用户复制前校验目的地和路由、领取挂起错误，并保活本次选定的源端口。
+    /// 返回后不保留协议锁，后续连接和选项变化不修改这次发送的快照。
+    pub(crate) fn prepare_send(
+        &self,
+        length: usize,
         destination: Option<InetEndpoint>,
-    ) -> Result<IoProgress, FsError> {
-        // Step 1: 校验端点写状态、目的地址有效性以及协议与发送缓冲区配额上限。
+    ) -> Result<PreparedDatagram, FsError> {
+        if MAX_IP_PACKET_LEN < length {
+            return Err(FsError::MessageTooLarge);
+        }
         let mut state = self.operation(OperationMode::Modify);
-        state.check_send()?;
+        if state.closed || self.stopped.load(Ordering::Acquire) {
+            return Err(FsError::NotConnected);
+        }
         let destination = destination
             .or(state.peer)
             .ok_or(FsError::DestinationRequired)?;
@@ -631,33 +892,38 @@ impl UdpEndpoint {
             return Err(FsError::InvalidOperation);
         }
         self.check_family(&state, destination.address, AddressOperation::Send)?;
-        let protocol_limit = match destination.address {
-            IpAddress::Ipv4(_) => MAX_IPV4_UDP_PAYLOAD_LEN,
-            IpAddress::Ipv6(_) => MAX_IPV6_UDP_PAYLOAD_LEN,
-        };
-        if protocol_limit < payload.len() || state.send_budget < payload.len() {
-            return Err(FsError::MessageTooLarge);
-        }
-
-        // Step 2: 获取网络栈准入锁，解析出口路由并检查 IPv6 不分片路径 MTU 限制。
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
-        let _admission = net.admission()?;
+        let admission = net.admission()?;
         let bound = state
             .binding
             .as_ref()
             .map_or(self.family.unspecified(), |lease| lease.local().address);
-        let route = net.resolve_route(destination.address, bound)?;
+        let route = net.resolve_route(destination.address, bound, state.dont_route)?;
+        if matches!(destination.address, IpAddress::Ipv4(_)) && MAX_IPV4_UDP_PAYLOAD_LEN < length {
+            let name = InetEndpoint {
+                address: destination.address,
+                port: state.peer.map_or(0, |peer| peer.port),
+            };
+            let queued = state.queue_error(UdpErrorRecord::local(name, route.mtu));
+            if queued.is_none() {
+                state.notification |= PollMask::POLLERR;
+            }
+            drop(admission);
+            drop(state);
+            drop(queued);
+            return Err(FsError::MessageTooLarge);
+        }
         if matches!(destination.address, IpAddress::Ipv6(_))
-            && route.mtu.saturating_sub(IPV6_UDP_HEADER_LEN) < payload.len()
+            && (MAX_IPV6_UDP_PAYLOAD_LEN < length
+                || route.mtu.saturating_sub(IPV6_UDP_HEADER_LEN) < length)
         {
             return Err(FsError::MessageTooLarge);
         }
-
-        // Step 3: 按需准备收发缓冲区，检查发送队列剩余空间，并获取或自动分配本地端口绑定租约。
-        state.prepare_buffers()?;
-        if !state.socket.can_send_size(payload.len()) {
-            return Ok(IoProgress::Blocked);
+        if state.send_budget < length {
+            return Err(FsError::MessageTooLarge);
         }
+        state.check_send()?;
+        state.prepare_buffers()?;
         let lease = match state.binding.as_ref() {
             Some(lease) => Arc::clone(lease),
             None => {
@@ -669,20 +935,43 @@ impl UdpEndpoint {
                 lease
             }
         };
-        let metadata = UdpMetadata {
-            endpoint: destination.raw(),
-            local_address: Some(route.source),
-            local_port: Some(lease.local().port),
-            meta: PacketMeta::default(),
-        };
-        // 端口绑定与路由解析已完成，提前释放网络栈全局准入锁，避免后续复制数据报载荷时阻塞其他端点的控制操作。
-        drop(_admission);
+        Ok(PreparedDatagram {
+            length,
+            metadata: UdpMetadata {
+                endpoint: destination.raw(),
+                local_address: Some(route.source),
+                local_port: Some(lease.local().port),
+                meta: PacketMeta::default(),
+            },
+            lease,
+            dont_route: state.dont_route,
+        })
+    }
 
-        // Step 4: 将数据报写入底层发送缓冲区，并在成功后将对应端口租约推入 leases 队列保活。
-        match state.socket.send_slice(payload, metadata) {
+    /// 提交已经在协议锁外准备好的完整正文；容量竞争时保留同一准备结果供调用方等待。
+    pub(crate) fn send(
+        &self,
+        prepared: &PreparedDatagram,
+        payload: &[u8],
+    ) -> Result<IoProgress, FsError> {
+        assert_eq!(prepared.lease.owner_id(), self.id);
+        assert_eq!(prepared.length, payload.len());
+        let mut state = self.operation(OperationMode::Modify);
+        state.check_send()?;
+        if self.stopped.load(Ordering::Acquire)
+            || self.stack.upgrade().is_none_or(|net| net.is_stopping())
+        {
+            return Err(FsError::NotConnected);
+        }
+        if state.send_budget < payload.len() {
+            return Err(FsError::MessageTooLarge);
+        }
+        match state.socket.send_slice(payload, prepared.metadata) {
             Ok(()) => {
                 assert!(state.leases.len() < PACKET_RECORDS);
-                state.leases.push_back(lease);
+                state
+                    .leases
+                    .push_back((Arc::clone(&prepared.lease), prepared.dont_route));
                 Ok(IoProgress::Ready(payload.len()))
             }
             Err(udp::SendError::BufferFull) => Ok(IoProgress::Blocked),
@@ -710,9 +999,8 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 从 UDP 接收队列读取一条数据报到 `target`（支持 `MSG_PEEK` 预览模式）。
-    ///
-    /// 当接收队列为空但读方向已关闭（`SHUT_RD`）时返回 0 字节结果；非预览模式下无论用户缓冲区是否发生截断或页错误，都会消费整条数据报。
+    /// 先领取挂起错误，再从普通 UDP 队列读取一条数据报（支持 MSG_PEEK）。
+    /// 普通消息非预览读取时，即使用户复制截断或失败也消费整条记录。
     pub fn receive(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -721,6 +1009,9 @@ impl UdpEndpoint {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
             return Err(FsError::NotConnected);
+        }
+        if let Some(error) = state.error.take() {
+            return Err(error);
         }
         if !state.socket.can_recv() {
             return Ok(state.read_closed.then_some(MessageResult {
@@ -834,10 +1125,8 @@ impl UdpEndpoint {
         if budget == 0 || PAYLOAD_CAPACITY < budget {
             return Err(FsError::InvalidOperation);
         }
-        if state.buffers_ready {
-            state.socket.set_recv_budget(budget);
-        }
         state.receive_budget = budget;
+        state.update_receive_budget();
         Ok(())
     }
 
@@ -870,6 +1159,97 @@ impl UdpEndpoint {
     /// 读取并清除挂起的后台异步发送错误（对应 `getsockopt(SO_ERROR)`）。
     pub fn take_error(&self) -> Option<FsError> {
         self.operation(OperationMode::Modify).error.take()
+    }
+
+    /// 查询 IPv4 UDP 异步错误队列是否启用。
+    pub(crate) fn recv_error(&self) -> bool {
+        self.operation(OperationMode::Observe).recv_error
+    }
+
+    /// 修改 IPv4 UDP 错误队列开关，关闭时仅清理队列，不清除挂起 errno。
+    pub(crate) fn set_recv_error(&self, enabled: bool) -> Result<(), FsError> {
+        if self.family != AddressFamily::Ipv4 {
+            return Err(FsError::Unsupported);
+        }
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed || self.stopped.load(Ordering::Acquire) {
+            return Err(FsError::NotConnected);
+        }
+        state.recv_error = enabled;
+        let discarded = (!enabled).then(|| state.purge_errors());
+        drop(state);
+        drop(discarded);
+        Ok(())
+    }
+
+    /// 在接口及驱动锁外提交已校验的 ICMP 错误，沿原操作守卫完成 Work 交接与错误通知。
+    pub(crate) fn report_icmp_error(&self, record: UdpErrorRecord) {
+        let mut state = self.operation(OperationMode::Modify);
+        if self.family != AddressFamily::Ipv4
+            || state.closed
+            || self.stopped.load(Ordering::Acquire)
+            || !(state.recv_error || (record.hard && state.peer.is_some()))
+        {
+            drop(state);
+            drop(record);
+            return;
+        }
+        state.error = Some(record.error);
+        state.notification |= PollMask::POLLERR;
+        let discarded = state.queue_error(record);
+        drop(state);
+        drop(discarded);
+    }
+
+    /// 在根出口归还原槽位后向原端点报告永久失败，仅真实 IPv4 长度错误附加 LOCAL 记录。
+    pub(crate) fn report_transmit_error(
+        &self,
+        error: FsError,
+        destination: InetEndpoint,
+        mtu: usize,
+    ) {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed || self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        state.error.get_or_insert(error);
+        state.notification |= PollMask::POLLERR;
+        let discarded = if self.family == AddressFamily::Ipv4 && error == FsError::MessageTooLarge {
+            let name = InetEndpoint {
+                address: destination.address,
+                port: state.peer.map_or(0, |peer| peer.port),
+            };
+            state.queue_error(UdpErrorRecord::local(name, mtu))
+        } else {
+            None
+        };
+        drop(state);
+        drop(discarded);
+    }
+
+    /// 在可睡眠任务中领取队首错误，释放状态锁后才构造携带载荷预算的只读守卫。
+    pub(crate) fn receive_error(&self) -> Result<ReceivedError<'_>, FsError> {
+        let mut state = self.operation(OperationMode::Modify);
+        if state.closed {
+            return Err(FsError::NotConnected);
+        }
+        let record = state.errors.pop_front().ok_or(FsError::WouldBlock)?;
+        match state.errors.front().map(|next| (next.origin, next.error)) {
+            Some((ERROR_ORIGIN_ICMP, error)) => state.error = Some(error),
+            _ if record.origin == ERROR_ORIGIN_ICMP => state.error = None,
+            _ => {}
+        }
+        if state.errors.is_empty() {
+            state.errors = VecDeque::new();
+        } else {
+            state.notification |= PollMask::POLLERR;
+        }
+        state.update_receive_budget();
+        drop(state);
+        Ok(ReceivedError {
+            endpoint: self,
+            record: Some(record),
+        })
     }
 
     /// 关闭指定传输方向（`SHUT_RD`、`SHUT_WR` 或 `SHUT_RDWR`）；若端点尚未通过 `connect` 关联默认对端，则在更新关闭标志后返回 `Err(FsError::NotConnected)`。
@@ -1043,7 +1423,7 @@ impl UdpEndpoint {
     ) -> Result<(), FsError> {
         let mut remaining = PROTOCOL_BUDGET;
         while 0 < remaining {
-            let Some(lease) = state.leases.front().cloned() else {
+            let Some((lease, dont_route)) = state.leases.front().cloned() else {
                 return Ok(());
             };
             remaining -= 1;
@@ -1062,7 +1442,8 @@ impl UdpEndpoint {
                             .try_reserve_exact(payload.len())
                             .map_err(|_| FsError::NoMemory)?;
                         let packet = OwnedPacket::capture_udp(&ip, &udp, payload, storage)
-                            .with_binding(lease);
+                            .with_binding(lease)
+                            .with_dont_route(dont_route);
                         net.try_emit(packet).map_err(|(error, _packet)| error)
                     })();
                     if result == Err(FsError::WouldBlock) {
@@ -1087,7 +1468,8 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 当最后一个关联的套接字文件描述关闭时调用，标记端点与读写双方向关闭并封闭输入队列，交由后台 `Work` 排空剩余待发数据报后异步退休。
+    /// 关闭末个套接字文件时封闭输入并同步撤销接收键，原 Work 继续排空已接纳的发送。
+    /// 接收键在释放状态锁后删除，端点拥有、发送记录与原绑定租约保留到正常退休。
     pub fn close(&self) {
         let mut state = self.operation(OperationMode::Modify);
         state.closed = true;
@@ -1096,6 +1478,12 @@ impl UdpEndpoint {
         state.peer = None;
         state.route_local = None;
         self.input.lock().closed = true;
+        let errors = state.purge_errors();
+        drop(state);
+        if let Some(net) = self.stack.upgrade() {
+            net.tables().unpublish_udp(self.id);
+        }
+        drop(errors);
     }
 
     /// 同步停止端点并清理所有后台活动与挂起资源。
@@ -1116,7 +1504,7 @@ impl UdpEndpoint {
             .close_sync();
 
         // Step 2: 清空协议状态、底层收发缓冲区、待发租约队列与残留输入报文。
-        let binding = {
+        let (binding, errors) = {
             let mut state = self.state.lock();
             state.closed = true;
             state.read_closed = true;
@@ -1125,7 +1513,7 @@ impl UdpEndpoint {
             state.route_local = None;
             state.socket.close();
             state.leases.clear();
-            state.binding.take()
+            (state.binding.take(), state.purge_errors())
         };
         let packets = {
             let mut input = self.input.lock();
@@ -1138,7 +1526,7 @@ impl UdpEndpoint {
             net.cancel_egress_wait(self.id);
             net.tables().unpublish_udp(self.id);
         }
-        drop((binding, packets));
+        drop((binding, packets, errors));
         self.source
             .notify(PollMask::POLLIN | PollMask::POLLOUT | PollMask::POLLERR | PollMask::POLLHUP);
     }

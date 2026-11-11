@@ -15,6 +15,7 @@
 //!      读者能够检测到序号变化并重试采样。
 //! 3. **时间片硬中断延迟抢占与上下文记账**：
 //!    - 验证时间片到期硬中断仅设置 `need_resched` 标志，直到任务主动到达调度安全点（`cond_resched`）才发生上下文切换。
+//!    - 验证早于当前时间片的精确定时器中断不会消耗时间片，且原时间片到期后仍能在安全点运行同核就绪任务。
 //!    - 验证任务在运行（On-CPU）、阻塞睡眠（Blocked）及跨核迁移（Migration）过程中的执行时间记账守恒。
 //! 4. **跨核 Idle 唤醒与 IPI 合并**：
 //!
@@ -37,6 +38,7 @@ use super::wait;
 use alloc::sync::Arc;
 use core::convert::TryFrom;
 use core::hint::{black_box, spin_loop};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// 轮询等待 `predicate` 条件成立；若超时则触发 panic 由测试框架捕获，后续清理交由 `ServiceFixture` 执行。
@@ -47,6 +49,7 @@ fn until(predicate: impl FnMut() -> bool, name: &'static str) {
 use crate::sync::{Completion, IrqSaveGuard, SpinLock};
 use crate::task::{self, State, Task};
 use crate::time::{self as clock, Duration, MonotonicInstant};
+use crate::timer::{Timer, TimerKind};
 use crate::{accounting, arch, cpu, sched};
 
 /// 单调时钟读写并发测试的总轮数。
@@ -203,6 +206,11 @@ fn deferred_worker() -> i32 {
     let irq = local.timer_interrupts.load(Ordering::Acquire) - before;
     assert!(1 <= irq);
     110
+}
+
+/// 精确定时器的硬中断回调仅记录到期事实，不唤醒任务或请求调度。
+fn early_timer_callback(_: Pin<&Timer>) {
+    scenario().early_timer_fired.store(true, Ordering::Release);
 }
 
 /// 验证定点数时间维护器（`Timekeeper`）在指定频率 `frequency` 与测试模式 `mode` 下的换算精度、掩码回绕、余数累积与最大跨度边界。
@@ -786,6 +794,8 @@ struct Scenario {
     stop: AtomicBool,
     /// 记录时间片延迟抢占测试中的同核竞争任务是否已运行。
     peer_ran: AtomicBool,
+    /// 记录早于当前时间片的精确定时器是否已在真实硬中断中到期。
+    early_timer_fired: AtomicBool,
     /// 控制单调时钟并发读写任务同时起跑的发令标志。
     time_go: AtomicBool,
     /// 已到达起跑屏障的单调时钟读写任务数量。
@@ -848,9 +858,10 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
         sched::test_migrate_to(0);
         let initial = super::baseline();
         let state = Arc::try_new(Scenario {
-            nodes: super::Nodes::new(0, 0, 0, 0)?,
+            nodes: super::Nodes::new(1, 0, 0, 0)?,
             stop: AtomicBool::new(false),
             peer_ran: AtomicBool::new(false),
+            early_timer_fired: AtomicBool::new(false),
             time_go: AtomicBool::new(false),
             time_arrived: AtomicUsize::new(0),
             write_phase: AtomicUsize::new(0),
@@ -1089,6 +1100,140 @@ pub(crate) mod cases {
         fixture.fixed(|| {
             let child = crate::ktest::spawn_result_on(0, |_| Ok(deferred_worker())).unwrap();
             assert_eq!(child.join().unwrap(), 110);
+            Ok(())
+        })
+    }
+
+    /// 验证 CPU 0 上普通任务的时间片不会被独立精确定时器的早期中断消耗。
+    ///
+    /// 发布同核竞争任务后排尽本核 IPI，重新安排时间片；早期中断后的安全点不得切换，
+    /// 同一时间片到期后的安全点必须运行并回收竞争任务。错过早期观察窗口即失败。
+    #[test]
+    fn early_timer_preserves_quantum(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(|| {
+            let local = cpu::current();
+            assert_eq!(local.id, 0);
+            assert_eq!(
+                sched::parameters(&task::current_task()).0,
+                task::Policy::Other
+            );
+            let state = scenario();
+            let timer = state
+                .nodes
+                .timer(0, TimerKind::Precise, early_timer_callback, 0);
+            let peer_state = Arc::clone(&state);
+            let prepared = crate::ktest::prepare_result_on(0, move |_| {
+                assert_eq!(cpu::current().id, 0);
+                assert_eq!(
+                    sched::parameters(&task::current_task()).0,
+                    task::Policy::Other
+                );
+                assert!(!peer_state.peer_ran.swap(true, Ordering::AcqRel));
+                Ok(101)
+            })?;
+
+            // 先处理发布任务产生的本核 IPI，再关中断复核原因位，避免旧通知污染观察窗口。
+            let (peer, ipi_before) = {
+                let _irq = IrqSaveGuard::new();
+                let before = local.ipi_interrupts.load(Ordering::Acquire);
+                (prepared.publish()?, before)
+            };
+            spin_until(
+                || {
+                    ipi_before < local.ipi_interrupts.load(Ordering::Acquire)
+                        && cpu::test_pending_kicks(0) == 0
+                },
+                "early-timer-peer-ipi-drained",
+            );
+            let (quantum, timer_before, ipis) = {
+                let _irq = IrqSaveGuard::new();
+                let ipis = local.ipi_interrupts.load(Ordering::Acquire);
+                assert!(ipi_before < ipis);
+                assert_eq!(cpu::test_pending_kicks(0), 0);
+                assert!(!state.peer_ran.load(Ordering::Acquire));
+                assert_eq!(peer.try_join(), None);
+
+                // 先记录重新安排的时间片期限，再插入早到期的业务定时器，避免混淆两者的编程期限。
+                let earliest_quantum = deadline(Duration::from_millis(10));
+                // SAFETY:
+                // 1. `fixed` 创建的普通任务固定在 CPU 0，`_irq` 已关闭本核中断，期间没有任务切换；
+                // 2. 此处未持有调度器锁或定时器底座锁，也没有时钟事件的可变借用。
+                unsafe { clock::testing::rearm_current_quantum() };
+                let latest_quantum = deadline(Duration::from_millis(10));
+                let quantum = clock::testing::last_programmed_deadline(0);
+                assert!(
+                    earliest_quantum <= quantum && quantum <= latest_quantum,
+                    "programmed event is not the freshly armed task quantum"
+                );
+                local.need_resched.store(false, Ordering::Release);
+                let early = deadline(Duration::from_millis(1));
+                assert!(early < quantum, "early timer observation window missed");
+                assert!(timer.as_ref().arm(early).unwrap());
+                assert_eq!(clock::testing::last_programmed_deadline(0), early);
+                (
+                    quantum,
+                    local.timer_interrupts.load(Ordering::Acquire),
+                    ipis,
+                )
+            };
+
+            // 等待期间不调用安全点，收到业务定时器中断后仍以原时间片期限和 IPI 基线判定。
+            spin_until(
+                || state.early_timer_fired.load(Ordering::Acquire),
+                "early-business-timer-irq",
+            );
+            {
+                let _irq = IrqSaveGuard::new();
+                assert!(timer_before < local.timer_interrupts.load(Ordering::Acquire));
+                assert_eq!(local.ipi_interrupts.load(Ordering::Acquire), ipis);
+                assert_eq!(cpu::test_pending_kicks(0), 0);
+                assert!(!state.peer_ran.load(Ordering::Acquire));
+                assert_eq!(clock::testing::last_programmed_deadline(0), quantum);
+                assert!(
+                    clock::now() < quantum,
+                    "early timer observation window missed"
+                );
+                assert_eq!(local.preempt_depth.load(Ordering::Relaxed), 0);
+            }
+            assert!(arch::irq_enabled());
+            let switched_early = sched::cond_resched();
+            let early_irqs = {
+                let _irq = IrqSaveGuard::new();
+                assert!(
+                    clock::now() < quantum,
+                    "early safe-point observation window missed"
+                );
+                assert!(!switched_early, "business timer consumed the task quantum");
+                assert!(!state.peer_ran.load(Ordering::Acquire));
+                assert_eq!(local.ipi_interrupts.load(Ordering::Acquire), ipis);
+                assert_eq!(cpu::test_pending_kicks(0), 0);
+                assert_eq!(clock::testing::last_programmed_deadline(0), quantum);
+                local.timer_interrupts.load(Ordering::Acquire)
+            };
+
+            // 保留同一时间片与其调度请求，直到真实到期中断完成后才调用安全点。
+            spin_until(
+                || {
+                    quantum <= clock::now()
+                        && early_irqs < local.timer_interrupts.load(Ordering::Acquire)
+                        && quantum < clock::testing::last_programmed_deadline(0)
+                },
+                "original-task-quantum-irq",
+            );
+            {
+                let _irq = IrqSaveGuard::new();
+                assert_eq!(local.ipi_interrupts.load(Ordering::Acquire), ipis);
+                assert_eq!(cpu::test_pending_kicks(0), 0);
+                assert!(!state.peer_ran.load(Ordering::Acquire));
+                assert!(local.need_resched.load(Ordering::Acquire));
+            }
+            assert!(sched::cond_resched());
+            assert!(state.peer_ran.load(Ordering::Acquire));
+            assert_eq!(peer.join()?, 101);
+            timer.as_ref().close_sync();
             Ok(())
         })
     }

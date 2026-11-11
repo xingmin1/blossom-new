@@ -1,7 +1,7 @@
 //! 多核任务调度器与两阶段上下文切换协议（Scheduler）。
 //!
 //! ## 模块职责与架构定位
-//! 本模块负责管理全系统所有存活任务（`live` 链表）与就绪队列（`ready` FIFO 队列），驱动每个在线 CPU 的调度主循环（`run`），并协调任务的让出（`yield_now`）、阻塞/唤醒（`park`/`notify`）、CPU 亲和性迁移（`set_affinity`）以及任务退出资源回收。
+//! 本模块管理全系统存活任务与就绪队列，按实时优先级优先、同级 FIFO 选择任务，并协调让出、抢占、阻塞唤醒、CPU 亲和性迁移与退出回收。
 //! - **上游调用者**：内核启动入口（各 CPU 调用 `sched::run()` 进入调度主循环）、`crate::task`（发布新任务 `publish`）、`crate::wait`（调用 `begin_wait` / `park` / `notify` / `end_wait` 实现睡眠队列）、系统调用与中断返回路径（调用 `cond_resched`、`set_affinity`、`request_user_work`）。
 //! - **下游依赖**：`crate::arch::switch_context`（底层寄存器切换汇编）、`crate::cpu`（读取每 CPU 状态与发送核间中断 `kick`）、`crate::mm::space`（切换用户地址空间页表）、`crate::accounting` 与 `crate::time`（执行时间统计与时间片更新）。
 //!
@@ -49,7 +49,7 @@ use core::ptr;
 use core::sync::atomic::Ordering;
 
 use crate::sync::{IrqSaveGuard, SpinLock};
-use crate::task::{ActiveWait, Resources, Scheduling, State, SwitchIntent, Task};
+use crate::task::{ActiveWait, Policy, Resources, Scheduling, State, SwitchIntent, Task};
 use crate::wait::queue::{WaitNode, WaitQueue};
 use crate::wait::{WaitId, Waiter};
 use crate::{accounting, cpu, time, trace};
@@ -58,10 +58,12 @@ use crate::{accounting, cpu, time, trace};
 struct Scheduler {
     /// 活跃任务双向链表表头（包含所有已通过 `publish` 发布且尚未通过 `Exit` 退出的任务，每个节点持有一份 `Arc<Task>` 强引用）。
     live_head: *const Task,
-    /// 就绪任务 FIFO 双向队列队头（仅包含当前处于 `State::Ready` 的任务节点）。
+    /// 按优先级降序排列的就绪双向队列队头；同级顺序由各次入队的头插或尾插决定。
     ready_head: *const Task,
-    /// 就绪任务 FIFO 双向队列队尾。
+    /// 就绪队列队尾；普通任务的优先级为零，直接在此追加。
     ready_tail: *const Task,
+    /// 以 CPU 编号索引的运行权；从 `pick` 到现场保存完成后的 `finish` 保持有效，节点由 `live` 链表保活。
+    running: [*const Task; crate::boot::MAX_CPUS],
 }
 
 // SAFETY:
@@ -73,6 +75,16 @@ unsafe impl Send for Scheduler {}
 static SCHED_LOCK: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 /// 当任务完成 CPU 亲和性迁移（离开原受限 CPU）时用于唤醒 `set_affinity` 等待者的全局等待队列。
 static AFFINITY_CHANGED: WaitQueue = WaitQueue::new();
+/// FIFO 用户 ABI 允许的最高实时优先级。
+pub(crate) const MAX_RT_PRIORITY: i32 = 99;
+
+/// 调度参数更新失败的原因，供系统调用层映射用户错误。
+pub(crate) enum SchedulingError {
+    /// 策略和优先级组合不成立。
+    Invalid,
+    /// 调用者没有提高实时优先级、修改他者或清除重置标志的权限。
+    Permission,
+}
 
 /// 统计当前全局调度器中已发布且尚未退出（仍在 `live` 链表中）的活跃任务总数。
 pub(crate) fn live_task_count() -> usize {
@@ -106,10 +118,11 @@ impl Scheduler {
             live_head: ptr::null(),
             ready_head: ptr::null(),
             ready_tail: ptr::null(),
+            running: [ptr::null(); crate::boot::MAX_CPUS],
         }
     }
 
-    /// 接收一份由 `Arc::into_raw` 转交的 `Task` 强引用，将其头插挂入 `live` 活跃链表，并尾插放入 `ready` 就绪队列。
+    /// 接收新任务的调度强引用，加入活跃链表并在同级就绪任务之后排队。
     fn publish(&mut self, task: *const Task) {
         // SAFETY:
         // 1. 调用方 `sched::publish` 刚刚将新任务的唯一调度强引用转为 `task` 裸指针，此前该节点未挂入任何链表；
@@ -122,38 +135,73 @@ impl Scheduler {
             }
             self.live_head = task;
         }
-        self.push_ready(task, true);
+        self.push_ready(task, true, false);
     }
 
-    /// 将处于 `State::Ready` 的任务节点追加到 `ready` 队列尾部，并向允许运行该任务的在线 CPU 发送唤醒或重调度核间中断（IPI）。
+    /// 按优先级降序入队，再按实际运行任务的优先级决定是否请求抢占。
     ///
-    /// 若目标 CPU 正处于 `idle` 状态，发送 `KICK_SCHED_WAKE`；若目标 CPU 正在运行其他任务且 `preempt_running` 为 `true`，
-    /// 则发送 `KICK_RESCHEDULE` 请求重调度（若目标就是本 CPU 且本 CPU 当前已在调度栈上准备直接 `pick`，则跳过自发 IPI）。
-    fn push_ready(&mut self, task: *const Task, preempt_running: bool) {
+    /// `head` 决定同级任务中的位置；普通任务直接尾插，不遍历已有队列。
+    fn push_ready(&mut self, task: *const Task, preempt_running: bool, head: bool) {
         // SAFETY:
         // 1. `&mut self` 保证已持有 `SCHED_LOCK`，且调用方保证 `task` 仍在 `live` 链表中存活、状态为 `State::Ready` 且当前不在 `ready` 队列中；
         // 2. 在 `SCHED_LOCK` 保护下更新 `ready_head`/`ready_tail` 及前驱后继指针无并发冲突。
         unsafe {
             let data = &mut *(*task).scheduling.get();
             assert_eq!(data.state, State::Ready, "enqueue task is not ready");
-            data.ready_previous = self.ready_tail;
-            data.ready_next = ptr::null();
-            if self.ready_tail.is_null() {
+            data.requeue_tail = false;
+            let mut next = ptr::null();
+            if data.priority != 0 {
+                next = self.ready_head;
+                while !next.is_null() {
+                    let ready = &*(*next).scheduling.get();
+                    if ready.priority < data.priority || (head && ready.priority == data.priority) {
+                        break;
+                    }
+                    next = ready.ready_next;
+                }
+            }
+            let previous = if next.is_null() {
+                self.ready_tail
+            } else {
+                (*(*next).scheduling.get()).ready_previous
+            };
+            data.ready_previous = previous;
+            data.ready_next = next;
+            if previous.is_null() {
                 self.ready_head = task;
             } else {
-                (*(*self.ready_tail).scheduling.get()).ready_next = task;
+                (*(*previous).scheduling.get()).ready_next = task;
             }
-            self.ready_tail = task;
+            if next.is_null() {
+                self.ready_tail = task;
+            } else {
+                (*(*next).scheduling.get()).ready_previous = task;
+            }
+        }
+        self.wake_ready(task, preempt_running);
+    }
 
-            // Step 2: 在同一把 SCHED_LOCK 保护下检查各允许 CPU 的在线与 Idle 状态，发出对应的核间通知。
-            let local = cpu::current();
+    /// 在调度锁内读取运行权索引，唤醒可用 CPU，并仅让严格较低优先级的 FIFO 执行者切出。
+    fn wake_ready(&self, task: *const Task, preempt_running: bool) {
+        // SAFETY:
+        // 1. 调用方持有 `SCHED_LOCK`，`task` 是仍由 `live` 链表保活的就绪成员；
+        // 2. `running` 的非空节点从 `pick` 到 `finish` 均有活跃引用，索引和调度字段由同一锁保护。
+        unsafe {
+            let data = &*(*task).scheduling.get();
             for owner in data.allowed.iter() {
                 let target = cpu::get(owner);
-                if allowed_on(data, owner) && target.online.load(Ordering::Acquire) {
-                    if target.idle.load(Ordering::Acquire) {
-                        cpu::kick(owner, cpu::KICK_SCHED_WAKE);
-                    } else if preempt_running
-                        && (owner != local.id || local.current_task_id.load(Ordering::Relaxed) != 0)
+                if !allowed_on(data, owner) || !target.online.load(Ordering::Acquire) {
+                    continue;
+                }
+                if target.idle.load(Ordering::Acquire) {
+                    cpu::kick(owner, cpu::KICK_SCHED_WAKE);
+                    continue;
+                }
+                let running = self.running[owner];
+                if preempt_running && !running.is_null() {
+                    let current = &*(*running).scheduling.get();
+                    if current.priority < data.priority
+                        || (current.priority == 0 && data.priority == 0)
                     {
                         cpu::kick(owner, cpu::KICK_RESCHEDULE);
                     }
@@ -165,7 +213,7 @@ impl Scheduler {
     /// 将指定的就绪任务节点从 `ready` 双向队列中摘除（不释放其 `live` 链表强引用）。
     fn remove_ready(&mut self, task: *const Task) {
         // SAFETY:
-        // 1. `&mut self` 保证已持有 `SCHED_LOCK`，且仅由 `pick` 传入当前仍在 `ready` 队列中的有效任务节点；
+        // 1. `&mut self` 保证已持有 `SCHED_LOCK`，调用方传入的节点当前仍在 `ready` 队列中；
         // 2. 锁内独占修改 `ready_head`、`ready_tail` 及相邻节点的 `ready_previous`/`ready_next` 指针。
         unsafe {
             let data = &mut *(*task).scheduling.get();
@@ -184,19 +232,21 @@ impl Scheduler {
         }
     }
 
-    /// 按 FIFO 顺序从 `ready` 队列中查找第一个允许在 `owner` CPU 上执行的任务，将其摘出就绪队列并标记为 `State::Running(owner)`。
+    /// 从优先级有序队列中取得首个允许在目标 CPU 执行的任务，同级保留原顺序。
     fn pick(&mut self, owner: usize) -> Option<*const Task> {
+        assert!(self.running[owner].is_null(), "CPU still owns a task");
         let mut task = self.ready_head;
         while !task.is_null() {
             // SAFETY:
-            // `ready` 队列中的所有节点均属于 `live` 活跃链表，且当前持有 `SCHED_LOCK` 独占访问各节点的 `scheduling` 元数据。
-            let data = unsafe { &mut *(*task).scheduling.get() };
+            // 已持有 `SCHED_LOCK`；就绪成员均由 `live` 链表保活。
+            let data = unsafe { &*(*task).scheduling.get() };
             if allowed_on(data, owner) {
                 self.remove_ready(task);
                 // SAFETY:
-                // `task` 仍由 `live` 链表持有强引用且 `SCHED_LOCK` 尚未释放；将其从 `ready` 队列摘除后赋予 `owner` CPU 独占的 `Running` 状态。
+                // 已摘除就绪成员且仍持有调度锁和活跃引用，本 CPU 唯一取得该任务运行权。
                 let data = unsafe { &mut *(*task).scheduling.get() };
                 data.state = State::Running(owner);
+                self.running[owner] = task;
                 #[cfg(feature = "ktest")]
                 {
                     data.next_cpu = None;
@@ -225,19 +275,27 @@ impl Scheduler {
 
     /// 在 CPU 已切回静态调度栈后，完成切出任务 `task` 的状态转换（结束 `State::SwitchingOut`）。
     ///
-    /// - `SwitchIntent::Yield`：将状态设为 `State::Ready` 并重新挂入就绪队列（仅当本 CPU 已不再允许运行该任务时才向其他忙核发送抢占提示）。
+    /// - `SwitchIntent::Yield`：按同级尾部重新排队；FIFO 会通知允许核上的低优先级执行者，普通任务仅在迁核时通知忙核。
+    /// - `SwitchIntent::Preempt`：FIFO 在原同级任务之前重新入队；提高优先级时按新优先级的尾部排队。
     /// - `SwitchIntent::Park(id)`：若在切换期间已收到针对 `id` 的唤醒通知（`active.notified == true`），则直接转为 `State::Ready` 重新入队；否则转为 `State::Blocked`。
     /// - `SwitchIntent::Exit(result)`：将状态设为 `State::Exited`，从 `live` 活跃链表中摘除该任务，并取出其内核栈与入口闭包资源返回给调用者在锁外释放。
     fn finish(&mut self, task: *const Task, owner: usize) -> Option<(Resources, i32)> {
+        assert_eq!(self.running[owner], task, "CPU task ownership changed");
+        self.running[owner] = ptr::null();
         // SAFETY:
         // 1. 当前 CPU 已完成 `switch_context` 回到静态调度栈，`task` 此时不再在任何内核栈上执行，且仍由 `live` 链表持有强引用保活；
         // 2. `&mut self` 保证已持有 `SCHED_LOCK`，独占访问 `task.scheduling`。
         let data = unsafe { &mut *(*task).scheduling.get() };
         match data.state {
-            State::SwitchingOut(cpu, SwitchIntent::Yield) if cpu == owner => {
+            State::SwitchingOut(cpu, intent @ (SwitchIntent::Yield | SwitchIntent::Preempt))
+                if cpu == owner =>
+            {
                 data.state = State::Ready;
-                let preempt_running = !allowed_on(data, owner);
-                self.push_ready(task, preempt_running);
+                let preempt_running = data.policy == Policy::Fifo || !allowed_on(data, owner);
+                let head = intent == SwitchIntent::Preempt
+                    && data.policy == Policy::Fifo
+                    && !data.requeue_tail;
+                self.push_ready(task, preempt_running, head);
                 None
             }
             State::SwitchingOut(cpu, SwitchIntent::Park(id)) if cpu == owner => {
@@ -249,7 +307,7 @@ impl Scheduler {
                     State::Blocked
                 };
                 if active.notified {
-                    self.push_ready(task, true);
+                    self.push_ready(task, true, false);
                 }
                 None
             }
@@ -261,7 +319,7 @@ impl Scheduler {
                 data.state = State::Exited;
                 // SAFETY:
                 // 1. 当前持有 `SCHED_LOCK`，且 `task` 已经永久退出并切回本 CPU 静态调度栈，不会再被任何 CPU 执行；
-                // 2. 在锁内安全将其从 `live` 双向链表中摘除，并从 `task.resources` 中移出独占的内核栈与入口闭包，以便稍后在锁外析构。
+                // 2. 锁内独占访问执行资源；入口已在普通任务栈释放用户绑定，此处只移出离栈后的剩余资源。
                 let resources = unsafe {
                     if data.live_previous.is_null() {
                         self.live_head = data.live_next;
@@ -274,9 +332,14 @@ impl Scheduler {
                     data.live_previous = ptr::null();
                     data.live_next = ptr::null();
                     let resources = &mut *(*task).resources.get();
+                    assert!(
+                        resources.user_binding.is_none(),
+                        "exited task retained its user binding"
+                    );
                     Resources {
                         stack: resources.stack.take(),
                         entry: resources.entry.take(),
+                        user_binding: None,
                     }
                 };
                 Some((resources, result))
@@ -352,9 +415,9 @@ pub fn yield_now() {
     resume_task();
 }
 
-/// 在内核长循环或安全点检查当前 CPU 是否存在待处理的重调度请求（`need_resched`）；若有且当前上下文允许切换，则主动让出 CPU。
+/// 在合法安全点消费重调度请求，并按非自愿切出的规则交还 CPU。
 ///
-/// 若当前处于关中断、中断处理或禁用抢占上下文，则不消费 `need_resched` 标志，留待后续恢复到可调度安全点时再处理。返回是否实际执行了让出切换。
+/// 关中断或禁用抢占时保留请求；FIFO 在恢复后仍排在同级等待者之前。
 pub fn cond_resched() -> bool {
     if !crate::arch::irq_enabled() {
         return false;
@@ -370,7 +433,8 @@ pub fn cond_resched() -> bool {
         legal && local.need_resched.swap(false, Ordering::Relaxed)
     };
     if requested {
-        yield_now();
+        switch_out(SwitchIntent::Preempt);
+        resume_task();
     }
     requested
 }
@@ -409,18 +473,122 @@ pub(crate) fn affinity(task: &Task) -> cpu::CpuSet {
     unsafe { (*task.scheduling.get()).allowed }
 }
 
-/// 在创建子任务（尚未发布到调度器）时，将父任务 `parent` 的 CPU 亲和性掩码原样复制到子任务 `child` 中。
-pub(crate) fn inherit_affinity(parent: &Task, child: &Task) {
+/// 在子任务发布前，同锁继承父任务的 CPU 许可与调度策略，并消费子任务的 fork 重置标志。
+pub(crate) fn inherit_scheduling(parent: &Task, child: &Task) {
     let _scheduler = SCHED_LOCK.lock();
     // SAFETY:
     // 1. 已持有 `SCHED_LOCK`，独占访问 `parent` 与 `child` 的 `scheduling` 字段；
     // 2. `parent` 与 `child` 均由调用方引用保活，且 `child` 尚未发布（处于初始 `State::Ready`）。
     unsafe {
-        let source = (*parent.scheduling.get()).allowed;
+        let (allowed, policy, priority) = {
+            let source = &*parent.scheduling.get();
+            if source.reset_on_fork {
+                (source.allowed, Policy::Other, 0)
+            } else {
+                (source.allowed, source.policy, source.priority)
+            }
+        };
         let target = &mut *child.scheduling.get();
         assert_eq!(target.state, State::Ready);
-        target.allowed = source;
+        target.allowed = allowed;
+        target.policy = policy;
+        target.priority = priority;
     }
+}
+
+/// 在调度锁内取得一次一致的策略、实时优先级与 fork 重置标志快照。
+pub(crate) fn parameters(task: &Task) -> (Policy, u8, bool) {
+    let _scheduler = SCHED_LOCK.lock();
+    // SAFETY:
+    // 调用方引用保活任务；调度字段的所有读写由当前持有的 `SCHED_LOCK` 串行化。
+    let data = unsafe { &*task.scheduling.get() };
+    (data.policy, data.priority, data.reset_on_fork)
+}
+
+/// 在本核关中断路径读取实际运行任务的 FIFO 策略，供时间片与时钟中断共同使用。
+pub(crate) fn current_is_fifo() -> bool {
+    assert!(
+        !crate::arch::irq_enabled(),
+        "policy lookup requires IRQ-off"
+    );
+    let scheduler = SCHED_LOCK.lock();
+    let task = scheduler.running[cpu::current().id];
+    // SAFETY:
+    // `running` 仅在同一个调度锁内更新，非空节点在 `finish` 清除索引前始终由 `live` 链表保活。
+    !task.is_null() && unsafe { (*(*task).scheduling.get()).policy == Policy::Fifo }
+}
+
+/// 同锁校验并更新真实调度参数，必要时调整就绪顺序或请求运行者在安全点切出。
+///
+/// `policy` 为 `None` 时仅修改当前策略的优先级，保留 fork 重置标志。
+/// 本内核未提供非零的实时优先级资源限额，非 root 调用者只能降低已有实时优先级。
+pub(crate) fn set_parameters(
+    task: &Task,
+    policy: Option<(Policy, bool)>,
+    priority: i32,
+    same_owner: bool,
+    privileged: bool,
+) -> Result<(), SchedulingError> {
+    let mut scheduler = SCHED_LOCK.lock();
+    // SAFETY:
+    // `task` 引用在调用期间保活控制块；当前持有的调度锁保护状态及全部参数。
+    let (old_policy, old_priority, old_reset, state, queued) = unsafe {
+        let data = &*task.scheduling.get();
+        // 关系图先发表身份，再完成父 TID 用户复制，最后才把新任务放入调度队列。
+        // 此窗口内的初始 Ready 任务仅更新参数，由随后的 publish 负责第一次入队。
+        let queued = data.state == State::Ready
+            && (ptr::eq(scheduler.ready_head, task)
+                || !data.ready_previous.is_null()
+                || !data.ready_next.is_null());
+        (
+            data.policy,
+            data.priority,
+            data.reset_on_fork,
+            data.state,
+            queued,
+        )
+    };
+    let (policy, reset) = policy.unwrap_or((old_policy, old_reset));
+    if !(0..=MAX_RT_PRIORITY).contains(&priority) || (policy == Policy::Fifo) != (priority != 0) {
+        return Err(SchedulingError::Invalid);
+    }
+    let priority = priority as u8;
+    if !privileged
+        && (!same_owner
+            || (old_reset && !reset)
+            || (policy == Policy::Fifo && (old_policy != Policy::Fifo || old_priority < priority)))
+    {
+        return Err(SchedulingError::Permission);
+    }
+
+    let changed = policy != old_policy || priority != old_priority;
+    if changed && queued {
+        scheduler.remove_ready(task);
+    }
+    // SAFETY:
+    // 仍持有调度锁，先前只读借用已结束；若任务已就绪，参数变化前已从原队列摘除。
+    let data = unsafe { &mut *task.scheduling.get() };
+    data.policy = policy;
+    data.priority = priority;
+    data.reset_on_fork = reset;
+    if !changed {
+        return Ok(());
+    }
+    data.requeue_tail = old_priority < priority;
+    match state {
+        State::Ready if queued => {
+            scheduler.push_ready(
+                task,
+                true,
+                policy == Policy::Fifo && priority < old_priority,
+            );
+        }
+        State::Running(owner) | State::SwitchingOut(owner, _) => {
+            cpu::kick(owner, cpu::KICK_RESCHEDULE);
+        }
+        State::Ready | State::Blocked | State::Exited => {}
+    }
+    Ok(())
 }
 
 /// 检查目标任务 `task` 是否已满足最新的 CPU 亲和性约束（即不再运行于被排除的 CPU 上，且未处于正在切出的 `SwitchingOut` 中间态）。
@@ -667,7 +835,7 @@ pub(crate) fn notify(task: &Task, id: WaitId) -> bool {
     active.notified = true;
     if data.state == State::Blocked {
         data.state = State::Ready;
-        scheduler.push_ready(task, true);
+        scheduler.push_ready(task, true, false);
     }
     true
 }
@@ -755,28 +923,29 @@ fn resume_task() {
 
 /// 新创建任务首次被 `switch_context` 切入时的汇编返回跳板函数（永不返回）。
 ///
-/// 负责完成首次切入记账与开中断（`resume_task`），从当前任务资源槽中取出一次性入口闭包 `entry` 并执行；
-/// 待闭包返回退出码后，调用 `switch_out(SwitchIntent::Exit(result))` 永久切回本 CPU 静态调度栈。
+/// 完成首次切入记账与开中断，再在同一次关中断区间取出入口闭包与用户绑定。
+/// 入口返回后先在普通任务栈、开中断上下文释放可能睡眠的用户绑定，随后提交退出。
 pub(crate) extern "C" fn task_trampoline() -> ! {
     resume_task();
-    let entry = {
+    let (entry, user_binding) = {
         let _irq = IrqSaveGuard::new();
         let local = cpu::current();
         // SAFETY:
         // 1. `_irq` 守卫已关闭本地中断，当前任务处于本 CPU 独占的 `Running` 状态且由 `live` 链表保活；
-        // 2. `resources.entry` 仅在新任务首次进入 `task_trampoline` 时在此处被 `take()` 取出一次，无其他并发访问。
+        // 2. 首次入口唯一访问 `resources`，在本区间一并移走闭包与用户绑定，独占借用不跨越后续调用。
         unsafe {
-            (*(*local.current_task.get()))
-                .resources
-                .get()
-                .as_mut()
-                .unwrap()
-                .entry
-                .take()
+            let resources = &mut *(*(*local.current_task.get())).resources.get();
+            (
+                resources
+                    .entry
+                    .take()
+                    .expect("task entry has already been consumed"),
+                resources.user_binding.take(),
+            )
         }
-        .expect("task entry has already been consumed")
     };
     let result = entry();
+    drop(user_binding);
     switch_out(SwitchIntent::Exit(result));
     panic!("exited task resumed");
 }
@@ -787,7 +956,7 @@ pub(crate) extern "C" fn task_trampoline() -> ! {
 /// 2. 获取 `SCHED_LOCK` 调用 `Scheduler::finish` 推进任务状态（转为 `Ready`、`Blocked` 或 `Exited`）；
 /// 3. 若有 `set_affinity` 等待者正在等待该任务离开本 CPU，唤醒 `AFFINITY_CHANGED`；
 /// 4. 若任务已退出（或刚卸下了用户地址空间 `previous_mm`），在释放 `SCHED_LOCK` 并临时开启本地中断后，
-///    安全释放用户地址空间、内核栈与 `Task` 控制块，并调用 `join.complete(result)` 唤醒等待 `join` 的观察者。
+///    释放剩余用户线程引用、旧地址空间引用、内核栈与 `Task` 控制块，并发布退出码；用户绑定已在入口栈释放。
 fn finish_current(previous_mm: Option<Arc<crate::mm::space::Mm>>) {
     // Step 1: 在关中断的静态调度栈上清空当前 CPU 的运行任务指针与任务 ID。
     let (task, owner) = {
@@ -826,10 +995,7 @@ fn finish_current(previous_mm: Option<Arc<crate::mm::space::Mm>>) {
         let user = task.user.lock().take();
         crate::arch::enable_interrupts();
         drop(previous_mm);
-        if let Some(user) = user {
-            user.release_mm();
-            drop(user);
-        }
+        drop(user);
         drop(resources);
         drop(task);
 

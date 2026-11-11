@@ -96,6 +96,8 @@ pub struct OwnedPacket {
     binding: Option<Arc<BindLease>>,
     /// 入站非空报文可选携带的捕获缓冲区归还句柄。
     capture_storage: Option<CaptureStorage>,
+    /// 本次出站报文的路由限制快照；报文入队后不再查询端点选项。
+    dont_route: bool,
 }
 
 impl fmt::Debug for OwnedPacket {
@@ -205,6 +207,7 @@ impl OwnedPacket {
             payload: storage,
             binding: None,
             capture_storage: None,
+            dont_route: false,
         }
     }
 
@@ -226,6 +229,7 @@ impl OwnedPacket {
             payload: storage,
             binding: None,
             capture_storage: None,
+            dont_route: false,
         }
     }
 
@@ -234,6 +238,17 @@ impl OwnedPacket {
         assert!(self.binding.is_none(), "packet binding replaced");
         self.binding = Some(binding);
         self
+    }
+
+    /// 在报文产生时附加路由限制，后续排队、断开和文件关闭均不改变该快照。
+    pub fn with_dont_route(mut self, dont_route: bool) -> Self {
+        self.dont_route = dont_route;
+        self
+    }
+
+    /// 读取这份报文的路由策略，供出口选择和最终邻居查询共同使用。
+    pub fn dont_route(&self) -> bool {
+        self.dont_route
     }
 
     /// 为非空入站报文关联所属接口的 [`CaptureStorage`]，以便在报文处理完毕析构时自动归还 `payload` 的堆内存容量。
@@ -296,6 +311,28 @@ impl OwnedPacket {
             return Err(FsError::Unsupported);
         }
         Ok(&self.payload)
+    }
+
+    /// 返回这份报文实际持有的载荷容量，用于接收内存记账。
+    pub(crate) fn payload_capacity(&self) -> usize {
+        self.payload.capacity()
+    }
+
+    /// 在接口锁外为长期保存的错误正文取得精确容量，并归还原接口捕获后备。
+    /// 分配失败时保留原报文及其归还责任，调用方仍须报告已经收到的错误。
+    pub(crate) fn compact_payload(&mut self) -> Result<(), FsError> {
+        if self.capture_storage.is_none() {
+            return Ok(());
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(self.payload.len())
+            .map_err(|_| FsError::NoMemory)?;
+        payload.extend_from_slice(&self.payload);
+        let captured = mem::replace(&mut self.payload, payload);
+        let owner = self.capture_storage.take().expect("packet capture owner");
+        return_capture_storage(&owner, captured);
+        Ok(())
     }
 
     /// 返回完整 IP 报文的字节总长度（含 IP 首部与传输层报文，不含以太网帧头等链路层头部）。

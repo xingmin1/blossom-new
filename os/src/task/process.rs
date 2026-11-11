@@ -38,6 +38,8 @@
 //! 3. 线程身份锁 `UserIdentity::tid` 或线程组关系锁 `ThreadGroup::relations` / 限额锁 `ThreadGroup::limits`
 //! 4. 终端控制自旋锁 `tty::Endpoint::control()` 或信号子系统锁（`Sighand` ➔ `SignalGroup` / `ThreadSignals`）
 //!
+//! 组首调度参数只在槽位锁外读取；查询先在槽位锁内保活组首及其执行任务，退出前先采样再摘除成员，避免与 `SCHED_LOCK` 嵌套。
+//!
 //! 所有堆内存预分配（`Numbers::prepare_growth`、`PreparedSignal::user`、`Arc::try_new`）、阻塞等待（`Waiter::park`）、跨核唤醒（`UserThread::kick`、`WaitQueue::wake_all`）以及可能释放最后一个强引用的对象析构都必须在 `TaskGraph::slots` 自旋锁之外执行。
 
 use self::numbers::Numbers;
@@ -66,7 +68,7 @@ use crate::task::signal::{
     CLD_KILLED, CLD_STOPPED, SIGCHLD, SIGCONT, SIGHUP, SIGNAL_COUNT, SIGTTIN, SIGTTOU, SI_TKILL,
 };
 use crate::task::time::{GroupTime, USER_HZ};
-use crate::task::{JoinObserver, TaskId, UserThread};
+use crate::task::{JoinObserver, Policy, Task, TaskId, UserThread};
 use crate::time::NSEC_PER_SEC;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
@@ -470,6 +472,12 @@ pub(crate) struct ProcessStatus {
     pub(crate) members: usize,
     /// 当前 TGID 槽位中的组首线程，已退出时为空。
     pub(crate) leader: Option<Arc<UserThread>>,
+    /// 与组首一起取得的稳定执行任务引用，供图锁外读取调度状态与参数。
+    pub(crate) leader_task: Option<Arc<Task>>,
+    /// 组首退出时的调度策略，仅在组首已从图中摘除后使用。
+    pub(crate) leader_policy: Policy,
+    /// 与退出策略同时采样的实时优先级，普通策略为零。
+    pub(crate) leader_priority: u8,
 }
 
 /// 槽位中记录单个存活线程的运行时表项（线程调用 `exit` 时即从槽位摘除）。
@@ -498,6 +506,10 @@ struct ProcessEntry {
     leader_task_id: TaskId,
     /// 组首线程先行退出时暂存的退出状态字（若进程未因组级致命信号退出，最终退出码优先采用组首状态）。
     leader_status: Option<i32>,
+    /// 组首先退出时保存的调度策略，直到身份接管或进程回收前保持不变。
+    leader_policy: Policy,
+    /// 与组首退出策略同时取得的实时优先级。
+    leader_priority: u8,
     /// 当前正在执行多线程 `execve` 收拢过程（`de_thread` ➔ `complete_exec`）的独占任务 ID。
     exec_owner: Option<TaskId>,
     /// 标记本进程自 `fork` 以来是否已成功完成过 `execve`（为 `true` 后禁止父进程再对其调用 `setpgid`）。
@@ -709,7 +721,7 @@ impl TaskGraph {
 
     /// 在锁外准备新进程（新线程组及组首线程）的身份、信号队列、时间记账与 `NPROC` 配额，并预留一个空闲 `PID` 槽位。
     ///
-    /// 若指定了 `parent`，新进程复制父进程当前的四项 `rlimit` 并在发布时继承父进程的 `PGID`、`SID` 与控制终端；若 `parent` 为 `None`，则自建进程组与会话。中途任何分配或配额检查失败都会通过 RAII 自动退费并归还预留号码。
+    /// 若指定了 `parent`，新进程复制父进程当前的资源限额并在发布时继承父进程的 `PGID`、`SID` 与控制终端；若 `parent` 为 `None`，则自建进程组与会话。中途任何分配或配额检查失败都会通过 RAII 自动退费并归还预留号码。
     pub(crate) fn prepare_process(
         self: &Arc<Self>,
         parent: Option<&Arc<ThreadGroup>>,
@@ -1153,28 +1165,33 @@ impl TaskGraph {
         process_entry(&self.slots.lock(), pid).is_some()
     }
 
-    /// 在一次槽位锁内只复制标量、强引用和弱引用，释放锁后再取得组首线程。
+    /// 在槽位锁内保活组首及其执行任务，同时复制退出快照，后续调度采样在图锁外完成。
     pub(crate) fn process_status(&self, pid: &Arc<Pid>) -> Option<ProcessStatus> {
-        let (group, parent, members, leader) = {
-            let slots = self.slots.lock();
-            let process = process_entry(&slots, pid)?;
-            let leader = slots[pid.number - 1]
-                .thread
-                .as_ref()
-                .filter(|thread| Arc::ptr_eq(&thread.group, &process.group))
-                .map(|thread| thread.user.clone());
-            (
-                process.group.clone(),
-                parent_tgid(&slots, process),
-                process.members,
-                leader,
-            )
+        let slots = self.slots.lock();
+        let process = process_entry(&slots, pid)?;
+        let (leader, leader_task) = match slots[pid.number - 1]
+            .thread
+            .as_ref()
+            .filter(|thread| Arc::ptr_eq(&thread.group, &process.group))
+        {
+            Some(thread) => {
+                let leader = thread
+                    .user
+                    .upgrade()
+                    .expect("live leader has no user thread");
+                let executor = leader.executor().expect("live leader has no executor");
+                (Some(leader), Some(executor))
+            }
+            None => (None, None),
         };
         Some(ProcessStatus {
-            group,
-            parent,
-            members,
-            leader: leader.and_then(|leader| leader.upgrade()),
+            group: process.group.clone(),
+            parent: parent_tgid(&slots, process),
+            members: process.members,
+            leader,
+            leader_task,
+            leader_policy: process.leader_policy,
+            leader_priority: process.leader_priority,
         })
     }
 
@@ -2198,6 +2215,8 @@ impl PreparedIdentity {
                     members: 1,
                     leader_task_id: task_id,
                     leader_status: None,
+                    leader_policy: Policy::Other,
+                    leader_priority: 0,
                     exec_owner: None,
                     did_exec: false,
                     user_interrupts: 0,

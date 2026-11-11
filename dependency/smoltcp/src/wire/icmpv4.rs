@@ -175,6 +175,10 @@ mod field {
     pub const CHECKSUM: Field = 2..4;
 
     pub const UNUSED: Field = 4..8;
+    pub const DST_UNUSED: Field = 4..6;
+    pub const NEXT_HOP_MTU: Field = 6..8;
+    pub const POINTER: usize = 4;
+    pub const PARAM_UNUSED: Field = 5..8;
 
     pub const ECHO_IDENT: Field = 4..6;
     pub const ECHO_SEQNO: Field = 6..8;
@@ -237,6 +241,20 @@ impl<T: AsRef<[u8]>> Packet<T> {
     pub fn checksum(&self) -> u16 {
         let data = self.buffer.as_ref();
         NetworkEndian::read_u16(&data[field::CHECKSUM])
+    }
+
+    /// 返回需要分片错误携带的下一跳 MTU，单位为字节；零表示发送方未提供 MTU。
+    #[inline]
+    pub fn next_hop_mtu(&self) -> u16 {
+        let data = self.buffer.as_ref();
+        NetworkEndian::read_u16(&data[field::NEXT_HOP_MTU])
+    }
+
+    /// 返回参数问题报文指出的原 IPv4 首部字节偏移。
+    #[inline]
+    pub fn param_problem_ptr(&self) -> u8 {
+        let data = self.buffer.as_ref();
+        data[field::POINTER]
     }
 
     /// Return the identifier field (for echo request and reply packets).
@@ -315,6 +333,20 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
         NetworkEndian::write_u16(&mut data[field::CHECKSUM], value)
     }
 
+    /// 写入需要分片错误携带的下一跳 MTU，保留零值表示未知。
+    #[inline]
+    pub fn set_next_hop_mtu(&mut self, value: u16) {
+        let data = self.buffer.as_mut();
+        NetworkEndian::write_u16(&mut data[field::NEXT_HOP_MTU], value)
+    }
+
+    /// 写入参数问题报文指出的原 IPv4 首部字节偏移。
+    #[inline]
+    pub fn set_param_problem_ptr(&mut self, value: u8) {
+        let data = self.buffer.as_mut();
+        data[field::POINTER] = value;
+    }
+
     /// Set the identifier field (for echo request and reply packets).
     ///
     /// # Panics
@@ -362,7 +394,10 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
     }
 }
 
-/// A high-level representation of an Internet Control Message Protocol version 4 packet header.
+/// ICMPv4 首部的高层表示。
+///
+/// 错误引用的 `header.payload_len` 保存原总长减真实 IHL，`data` 只借用实际携带的传输字节。
+/// 编码仍遵循 `Ipv4Repr` 的二十字节首部约定，不保存或逐字重发原 IPv4 选项。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -379,6 +414,8 @@ pub enum Repr<'a> {
     },
     DstUnreachable {
         reason: DstUnreachable,
+        /// 下一跳 MTU，单位为字节；仅 FragRequired 使用，零表示未知。
+        next_hop_mtu: u16,
         header: Ipv4Repr,
         data: &'a [u8],
     },
@@ -387,11 +424,16 @@ pub enum Repr<'a> {
         header: Ipv4Repr,
         data: &'a [u8],
     },
+    ParamProblem {
+        reason: ParamProblem,
+        pointer: u8,
+        header: Ipv4Repr,
+        data: &'a [u8],
+    },
 }
 
 impl<'a> Repr<'a> {
-    /// Parse an Internet Control Message Protocol version 4 packet and return
-    /// a high-level representation.
+    /// 解析 ICMPv4 报文并校验外层校验和，错误引用仅要求完整 IPv4 首部和八字节传输首部。
     pub fn parse<T>(
         packet: &Packet<&'a T>,
         checksum_caps: &ChecksumCapabilities,
@@ -400,8 +442,6 @@ impl<'a> Repr<'a> {
         T: AsRef<[u8]> + ?Sized,
     {
         packet.check_len()?;
-
-        // Valid checksum is expected.
         if checksum_caps.icmpv4.rx() && !packet.verify_checksum() {
             return Err(Error);
         }
@@ -420,48 +460,31 @@ impl<'a> Repr<'a> {
             }),
 
             (Message::DstUnreachable, code) => {
-                let ip_packet = Ipv4Packet::new_checked(packet.data())?;
-
-                let payload = &packet.data()[ip_packet.header_len() as usize..];
-                // RFC 792 requires exactly eight bytes to be returned.
-                // We allow more, since there isn't a reason not to, but require at least eight.
-                if payload.len() < 8 {
-                    return Err(Error);
-                }
-
+                let (header, data) = Self::parse_quoted_packet(packet)?;
                 Ok(Repr::DstUnreachable {
                     reason: DstUnreachable::from(code),
-                    header: Ipv4Repr {
-                        src_addr: ip_packet.src_addr(),
-                        dst_addr: ip_packet.dst_addr(),
-                        next_header: ip_packet.next_header(),
-                        payload_len: payload.len(),
-                        hop_limit: ip_packet.hop_limit(),
-                    },
-                    data: payload,
+                    next_hop_mtu: packet.next_hop_mtu(),
+                    header,
+                    data,
                 })
             }
 
             (Message::TimeExceeded, code) => {
-                let ip_packet = Ipv4Packet::new_checked(packet.data())?;
-
-                let payload = &packet.data()[ip_packet.header_len() as usize..];
-                // RFC 792 requires exactly eight bytes to be returned.
-                // We allow more, since there isn't a reason not to, but require at least eight.
-                if payload.len() < 8 {
-                    return Err(Error);
-                }
-
+                let (header, data) = Self::parse_quoted_packet(packet)?;
                 Ok(Repr::TimeExceeded {
                     reason: TimeExceeded::from(code),
-                    header: Ipv4Repr {
-                        src_addr: ip_packet.src_addr(),
-                        dst_addr: ip_packet.dst_addr(),
-                        next_header: ip_packet.next_header(),
-                        payload_len: payload.len(),
-                        hop_limit: ip_packet.hop_limit(),
-                    },
-                    data: payload,
+                    header,
+                    data,
+                })
+            }
+
+            (Message::ParamProblem, code) => {
+                let (header, data) = Self::parse_quoted_packet(packet)?;
+                Ok(Repr::ParamProblem {
+                    reason: ParamProblem::from(code),
+                    pointer: packet.param_problem_ptr(),
+                    header,
+                    data,
                 })
             }
 
@@ -469,26 +492,71 @@ impl<'a> Repr<'a> {
         }
     }
 
-    /// Return the length of a packet that will be emitted from this high-level representation.
+    /// 借用错误报文实际携带的引用，保留原 IPv4 声明的正文长度。
+    /// 被引用报文可能因首部错误而触发 ICMP，因此不要求其校验和有效。
+    fn parse_quoted_packet<T>(packet: &Packet<&'a T>) -> Result<(Ipv4Repr, &'a [u8])>
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let data = packet.data();
+        let ip_packet = Ipv4Packet::new_unchecked(data);
+        ip_packet.check_header_len()?;
+        if ip_packet.version() != 4 {
+            return Err(Error);
+        }
+
+        let header_len = ip_packet.header_len() as usize;
+        let total_len = ip_packet.total_len() as usize;
+        let payload = &data[header_len..cmp::min(data.len(), total_len)];
+        if payload.len() < 8 {
+            return Err(Error);
+        }
+
+        let header = Ipv4Repr {
+            src_addr: ip_packet.src_addr(),
+            dst_addr: ip_packet.dst_addr(),
+            next_header: ip_packet.next_header(),
+            payload_len: total_len - header_len,
+            hop_limit: ip_packet.hop_limit(),
+        };
+        Ok((header, payload))
+    }
+
+    /// 返回实际编码长度；错误引用的正文可以短于原 IPv4 声明长度。
     pub const fn buffer_len(&self) -> usize {
         match self {
             &Repr::EchoRequest { data, .. } | &Repr::EchoReply { data, .. } => {
                 field::ECHO_SEQNO.end + data.len()
             }
             &Repr::DstUnreachable { header, data, .. }
-            | &Repr::TimeExceeded { header, data, .. } => {
+            | &Repr::TimeExceeded { header, data, .. }
+            | &Repr::ParamProblem { header, data, .. } => {
                 field::UNUSED.end + header.buffer_len() + data.len()
             }
         }
     }
 
-    /// Emit a high-level representation into an Internet Control Message Protocol version 4
-    /// packet.
+    /// 编码 ICMPv4 报文，保留错误原因、MTU 和参数问题偏移。
+    /// 被引 IPv4 首部按既有 `Ipv4Repr` 约定规范化，带选项输入不保证原总长逐字往返。
     pub fn emit<T>(&self, packet: &mut Packet<&mut T>, checksum_caps: &ChecksumCapabilities)
     where
         T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
     {
-        packet.set_msg_code(0);
+        /// 编码被引用的 IPv4 首部，并仅复制实际提供的传输数据。
+        fn emit_contained_packet<T>(
+            packet: &mut Packet<&mut T>,
+            header: Ipv4Repr,
+            data: &[u8],
+            checksum_caps: &ChecksumCapabilities,
+        ) where
+            T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
+        {
+            let mut ip_packet = Ipv4Packet::new_unchecked(packet.data_mut());
+            header.emit(&mut ip_packet, checksum_caps);
+            let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
+            payload.copy_from_slice(data);
+        }
+
         match *self {
             Repr::EchoRequest {
                 ident,
@@ -518,16 +586,16 @@ impl<'a> Repr<'a> {
 
             Repr::DstUnreachable {
                 reason,
+                next_hop_mtu,
                 header,
                 data,
             } => {
                 packet.set_msg_type(Message::DstUnreachable);
                 packet.set_msg_code(reason.into());
 
-                let mut ip_packet = Ipv4Packet::new_unchecked(packet.data_mut());
-                header.emit(&mut ip_packet, checksum_caps);
-                let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
-                payload.copy_from_slice(data)
+                packet.buffer.as_mut()[field::DST_UNUSED].fill(0);
+                packet.set_next_hop_mtu(next_hop_mtu);
+                emit_contained_packet(packet, header, data, checksum_caps);
             }
 
             Repr::TimeExceeded {
@@ -538,10 +606,21 @@ impl<'a> Repr<'a> {
                 packet.set_msg_type(Message::TimeExceeded);
                 packet.set_msg_code(reason.into());
 
-                let mut ip_packet = Ipv4Packet::new_unchecked(packet.data_mut());
-                header.emit(&mut ip_packet, checksum_caps);
-                let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
-                payload.copy_from_slice(data)
+                packet.buffer.as_mut()[field::UNUSED].fill(0);
+                emit_contained_packet(packet, header, data, checksum_caps);
+            }
+
+            Repr::ParamProblem {
+                reason,
+                pointer,
+                header,
+                data,
+            } => {
+                packet.set_msg_type(Message::ParamProblem);
+                packet.set_msg_code(reason.into());
+                packet.set_param_problem_ptr(pointer);
+                packet.buffer.as_mut()[field::PARAM_UNUSED].fill(0);
+                emit_contained_packet(packet, header, data, checksum_caps);
             }
         }
 
@@ -577,6 +656,7 @@ impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
 }
 
 impl<'a> fmt::Display for Repr<'a> {
+    /// 格式化 ICMPv4 语义，保留错误类型与对应的原始原因。
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Repr::EchoRequest {
@@ -607,6 +687,9 @@ impl<'a> fmt::Display for Repr<'a> {
             Repr::TimeExceeded { reason, .. } => {
                 write!(f, "ICMPv4 time exceeded ({reason})")
             }
+            Repr::ParamProblem { reason, .. } => {
+                write!(f, "ICMPv4 parameter problem ({reason:?})")
+            }
         }
     }
 }
@@ -614,6 +697,7 @@ impl<'a> fmt::Display for Repr<'a> {
 use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
 
 impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
+    /// 展示 ICMPv4 报文，并继续展示支持的错误引用中的 IPv4 首部。
     fn pretty_print(
         buffer: &dyn AsRef<[u8]>,
         f: &mut fmt::Formatter,
@@ -626,7 +710,7 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
         write!(f, "{indent}{packet}")?;
 
         match packet.msg_type() {
-            Message::DstUnreachable | Message::TimeExceeded => {
+            Message::DstUnreachable | Message::TimeExceeded | Message::ParamProblem => {
                 indent.increase(f)?;
                 super::Ipv4Packet::<&[u8]>::pretty_print(&packet.data(), f, indent)
             }
@@ -700,5 +784,255 @@ mod test {
         assert_eq!(Packet::new_checked(&[]), Err(Error));
         assert_eq!(Packet::new_checked(&bytes[..4]), Err(Error));
         assert!(Packet::new_checked(&bytes[..]).is_ok());
+    }
+
+    /// 构造原长为五百三十二字节、仅引用 UDP 首部及四字节正文的 ICMP 错误。
+    fn quoted_udp_error(msg_type: Message, code: u8) -> [u8; 40] {
+        let mut bytes = [
+            0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x02, 0x14, 0x12, 0x34,
+            0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 192, 0, 2, 1, 198, 51, 100, 2, 0xc0, 0x00, 0x00,
+            0x35, 0x02, 0x00, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        Ipv4Packet::new_unchecked(&mut bytes[8..]).fill_checksum();
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_msg_type(msg_type);
+        packet.set_msg_code(code);
+        packet.fill_checksum();
+        bytes
+    }
+
+    /// 合法截短引用保留原 IPv4 长度及地址，并无分配借用实际 UDP 正文。
+    #[test]
+    fn test_error_quote_truncated_udp() {
+        let bytes = quoted_udp_error(Message::DstUnreachable, 3);
+        let packet = Packet::new_checked(&bytes[..]).unwrap();
+        assert_eq!(Ipv4Packet::new_checked(packet.data()), Err(Error));
+
+        let repr = Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap();
+        let (header, data) = match repr {
+            Repr::DstUnreachable {
+                reason: DstUnreachable::PortUnreachable,
+                next_hop_mtu: 0,
+                header,
+                data,
+            } => (header, data),
+            _ => panic!("unexpected ICMP representation"),
+        };
+        assert_eq!(header.src_addr, crate::wire::Ipv4Address::new(192, 0, 2, 1));
+        assert_eq!(
+            header.dst_addr,
+            crate::wire::Ipv4Address::new(198, 51, 100, 2)
+        );
+        assert_eq!(header.next_header, crate::wire::IpProtocol::Udp);
+        assert_eq!(header.payload_len, 512);
+        assert_eq!(header.hop_limit, 64);
+        assert_eq!(data.len(), 12);
+        assert_eq!(data.as_ptr(), bytes[28..].as_ptr());
+
+        let (udp, payload) = crate::wire::UdpRepr::parse_quote(data).unwrap();
+        assert_eq!(udp.src_port, 49152);
+        assert_eq!(udp.dst_port, 53);
+        assert_eq!(payload, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(payload.as_ptr(), bytes[36..].as_ptr());
+    }
+
+    /// 所有不足 IPv4 首部加八字节传输首部的引用均拒绝，最短合法引用的正文为空。
+    #[test]
+    fn test_error_quote_minimum_and_short_headers() {
+        let mut bytes = quoted_udp_error(Message::DstUnreachable, 3);
+        for quote_len in 0..28 {
+            let mut packet = Packet::new_unchecked(&mut bytes[..8 + quote_len]);
+            packet.fill_checksum();
+            let packet = Packet::new_unchecked(&*packet.into_inner());
+            assert_eq!(
+                Repr::parse(&packet, &ChecksumCapabilities::default()),
+                Err(Error)
+            );
+        }
+
+        let mut packet = Packet::new_unchecked(&mut bytes[..36]);
+        packet.fill_checksum();
+        let packet = Packet::new_unchecked(&*packet.into_inner());
+        match Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap() {
+            Repr::DstUnreachable { header, data, .. } => {
+                assert_eq!(header.payload_len, 512);
+                assert_eq!(data.len(), 8);
+                assert!(crate::wire::UdpRepr::parse_quote(data)
+                    .unwrap()
+                    .1
+                    .is_empty());
+            }
+            _ => panic!("unexpected ICMP representation"),
+        }
+    }
+
+    /// 原 IHL 包含选项时，引用正文从完整首部之后开始，原声明长度仍独立保存。
+    #[test]
+    fn test_error_quote_ipv4_options_and_original_length() {
+        let base = quoted_udp_error(Message::DstUnreachable, 3);
+        let mut bytes = [0u8; 44];
+        bytes[..28].copy_from_slice(&base[..28]);
+        bytes[28..32].copy_from_slice(&[1, 1, 1, 0]);
+        bytes[32..].copy_from_slice(&base[28..]);
+        let mut ip_packet = Ipv4Packet::new_unchecked(&mut bytes[8..]);
+        ip_packet.set_header_len(24);
+        ip_packet.set_total_len(536);
+        ip_packet.fill_checksum();
+        Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+
+        let packet = Packet::new_unchecked(&bytes[..]);
+        match Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap() {
+            Repr::DstUnreachable { header, data, .. } => {
+                assert_eq!(header.payload_len, 512);
+                assert_eq!(data, &base[28..]);
+                assert_eq!(data.as_ptr(), bytes[32..].as_ptr());
+            }
+            _ => panic!("unexpected ICMP representation"),
+        }
+        let quoted = Ipv4Packet::new_unchecked(packet.data());
+        assert_eq!(quoted.header_len(), 24);
+        assert_eq!(quoted.total_len(), 536);
+    }
+
+    /// 原 IPv4 总长限制有效引用范围，额外字节不能被当作原报文正文。
+    #[test]
+    fn test_error_quote_bounds_original_total_len() {
+        let mut bytes = quoted_udp_error(Message::DstUnreachable, 3);
+        let mut ip_packet = Ipv4Packet::new_unchecked(&mut bytes[8..]);
+        ip_packet.set_total_len(30);
+        ip_packet.fill_checksum();
+        Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+        let packet = Packet::new_unchecked(&bytes[..]);
+        match Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap() {
+            Repr::DstUnreachable { header, data, .. } => {
+                assert_eq!(header.payload_len, 10);
+                assert_eq!(data, &bytes[28..38]);
+            }
+            _ => panic!("unexpected ICMP representation"),
+        }
+
+        Ipv4Packet::new_unchecked(&mut bytes[8..]).set_total_len(27);
+        Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+        let packet = Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            Repr::parse(&packet, &ChecksumCapabilities::default()),
+            Err(Error)
+        );
+    }
+
+    /// 截短引用不放宽外层校验和与内层 IPv4 版本检查。
+    #[test]
+    fn test_error_quote_checks_outer_checksum_and_version() {
+        let mut bytes = quoted_udp_error(Message::DstUnreachable, 3);
+        bytes[39] ^= 1;
+        let packet = Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            Repr::parse(&packet, &ChecksumCapabilities::default()),
+            Err(Error)
+        );
+
+        Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+        let packet = Packet::new_unchecked(&bytes[..]);
+        assert!(Repr::parse(&packet, &ChecksumCapabilities::default()).is_ok());
+        Ipv4Packet::new_unchecked(&mut bytes[8..]).set_version(6);
+        Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+        let packet = Packet::new_unchecked(&bytes[..]);
+        assert_eq!(
+            Repr::parse(&packet, &ChecksumCapabilities::default()),
+            Err(Error)
+        );
+    }
+
+    /// 需要分片错误的 MTU 按真实网络字节序解析并编码，未知零值同样保留。
+    #[test]
+    fn test_frag_required_mtu_roundtrip() {
+        for mtu in [0u16, 1400] {
+            let mut bytes = quoted_udp_error(Message::DstUnreachable, 4);
+            bytes[6..8].copy_from_slice(&mtu.to_be_bytes());
+            Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+            let packet = Packet::new_unchecked(&bytes[..]);
+            let repr = Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap();
+            match repr {
+                Repr::DstUnreachable {
+                    reason: DstUnreachable::FragRequired,
+                    next_hop_mtu,
+                    ..
+                } => assert_eq!(next_hop_mtu, mtu),
+                _ => panic!("unexpected ICMP representation"),
+            }
+
+            let mut emitted = [0xa5u8; 40];
+            let mut packet = Packet::new_unchecked(&mut emitted[..]);
+            repr.emit(&mut packet, &ChecksumCapabilities::default());
+            assert_eq!(packet.next_hop_mtu(), mtu);
+            assert_eq!(&packet.as_ref()[4..6], &[0, 0]);
+            assert_eq!(&packet.as_ref()[6..8], &mtu.to_be_bytes());
+            assert!(packet.verify_checksum());
+            let packet = Packet::new_unchecked(&*packet.into_inner());
+            assert_eq!(
+                Repr::parse(&packet, &ChecksumCapabilities::default()),
+                Ok(repr)
+            );
+        }
+    }
+
+    /// 时间超限与参数问题使用同一截短引用规则，并保留原始类型、原因和偏移。
+    #[test]
+    fn test_time_exceeded_and_param_problem_roundtrip() {
+        for (msg_type, code, pointer) in
+            [(Message::TimeExceeded, 0, 0), (Message::ParamProblem, 2, 9)]
+        {
+            let mut bytes = quoted_udp_error(msg_type, code);
+            bytes[4] = pointer;
+            Packet::new_unchecked(&mut bytes[..]).fill_checksum();
+            let packet = Packet::new_unchecked(&bytes[..]);
+            let repr = Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap();
+            match repr {
+                Repr::TimeExceeded {
+                    reason: TimeExceeded::TtlExpired,
+                    header,
+                    data,
+                } => {
+                    assert_eq!(header.payload_len, 512);
+                    assert_eq!(data.len(), 12);
+                }
+                Repr::ParamProblem {
+                    reason: ParamProblem::BadLength,
+                    pointer: 9,
+                    header,
+                    data,
+                } => {
+                    assert_eq!(header.payload_len, 512);
+                    assert_eq!(data.len(), 12);
+                }
+                _ => panic!("unexpected ICMP representation"),
+            }
+
+            let mut emitted = [0xa5u8; 40];
+            let mut packet = Packet::new_unchecked(&mut emitted[..]);
+            repr.emit(&mut packet, &ChecksumCapabilities::default());
+            assert_eq!(packet.msg_type(), msg_type);
+            assert_eq!(packet.msg_code(), code);
+            assert_eq!(packet.param_problem_ptr(), pointer);
+            assert!(packet.verify_checksum());
+            let packet = Packet::new_unchecked(&*packet.into_inner());
+            assert_eq!(
+                Repr::parse(&packet, &ChecksumCapabilities::default()),
+                Ok(repr)
+            );
+        }
+    }
+
+    /// Source Quench 和 Redirect 不进入可交付的 ICMP 错误表示。
+    #[test]
+    fn test_source_quench_and_redirect_not_errors() {
+        for msg_type in [Message::Unknown(4), Message::Redirect] {
+            let bytes = quoted_udp_error(msg_type, 0);
+            let packet = Packet::new_unchecked(&bytes[..]);
+            assert_eq!(
+                Repr::parse(&packet, &ChecksumCapabilities::default()),
+                Err(Error)
+            );
+        }
     }
 }

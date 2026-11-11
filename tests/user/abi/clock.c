@@ -163,7 +163,8 @@ out:
     return result;
 }
 
-/// 六个标准 clock 与 libc 日历入口共用实际 UTC 样本，不校准 RTC 的亚秒相位。
+/// 六个标准 clock 与 libc 日历入口共用实际 UTC 样本，不校准 RTC 的亚秒相位；
+/// 四个精细时钟的 ABI 分辨率恒为 1ns，两种 COARSE 仍保持原有的真实 tick 范围。
 int runtime_clock(void)
 {
     const clockid_t clocks[] = {
@@ -173,10 +174,13 @@ int runtime_clock(void)
     struct timespec resolutions[6];
     for (size_t index = 0; index < sizeof(clocks) / sizeof(clocks[0]); ++index) {
         uint64_t sample;
+        int coarse = clocks[index] == CLOCK_REALTIME_COARSE ||
+                     clocks[index] == CLOCK_MONOTONIC_COARSE;
         if (runtime_nanoseconds(clocks[index], &sample) != EXIT_SUCCESS ||
             clock_getres(clocks[index], &resolutions[index]) != 0 ||
             resolutions[index].tv_sec != 0 || resolutions[index].tv_nsec <= 0 ||
-            10000000L < resolutions[index].tv_nsec)
+            10000000L < resolutions[index].tv_nsec ||
+            (!coarse && resolutions[index].tv_nsec != 1))
             return fail("runtime clock IDs and resolution");
     }
     uint64_t real_before, real_after, coarse_real, mono_before, mono_after, coarse_mono;

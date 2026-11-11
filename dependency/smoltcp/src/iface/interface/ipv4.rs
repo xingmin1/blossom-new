@@ -240,6 +240,7 @@ impl InterfaceInner {
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
                 let icmp_reply_repr = Icmpv4Repr::DstUnreachable {
                     reason: Icmpv4DstUnreachable::ProtoUnreachable,
+                    next_hop_mtu: 0,
                     header: ipv4_repr,
                     data: &ip_payload[0..payload_len],
                 };
@@ -314,7 +315,7 @@ impl InterfaceInner {
         }
     }
 
-    /// 无用户 ICMP socket 时仍执行原 echo 与控制处理。
+    /// 校验 ICMPv4 后同步交付 UDP 错误引用，其余控制报文保持原分派。
     pub(super) fn process_icmpv4<'frame, 's>(
         &mut self,
         _sockets: &mut impl TransportIngress<'s>,
@@ -338,6 +339,11 @@ impl InterfaceInner {
                     handled_by_icmp_socket = true;
                 }
             }
+        }
+
+        #[cfg(feature = "socket-udp")]
+        if _sockets.udp_icmpv4(ip_repr.src_addr, &icmp_repr) {
+            return None;
         }
 
         match icmp_repr {

@@ -204,6 +204,9 @@ pub trait TransportIngress<'s> {
         repr: &UdpRepr,
         payload: &[u8],
     ) -> bool;
+    #[cfg(all(feature = "proto-ipv4", feature = "socket-udp"))]
+    /// 同步借用已校验的 ICMPv4 错误引用；返回是否有 UDP 错误消费者接纳。
+    fn udp_icmpv4(&mut self, source: Ipv4Address, repr: &Icmpv4Repr<'_>) -> bool;
     /// 为库原有 raw、ICMP、DHCP 消费者提供可选视图。
     fn socket_set(&mut self) -> Option<&mut SocketSet<'s>>;
     /// 本次输入已由同域核对的本机目的；不保存到接口地址表。
@@ -267,6 +270,12 @@ impl<'s> TransportIngress<'s> for SocketSet<'s> {
                 return true;
             }
         }
+        false
+    }
+
+    #[cfg(all(feature = "proto-ipv4", feature = "socket-udp"))]
+    /// 库内 UDP socket 没有异步错误队列，ICMP socket 仍由原控制分派消费。
+    fn udp_icmpv4(&mut self, _: Ipv4Address, _: &Icmpv4Repr<'_>) -> bool {
         false
     }
 
@@ -403,10 +412,11 @@ impl Interface {
         tx_token: Tx,
         meta: PacketMeta,
         packet: Packet<'_>,
+        dont_route: bool,
     ) -> Result<(), DispatchError> {
         self.inner.now = timestamp;
         self.inner
-            .dispatch_ip(tx_token, meta, packet, &mut self.fragmenter)
+            .dispatch_ip(tx_token, meta, packet, &mut self.fragmenter, dont_route)
     }
 
     /// 只推进当前报文的尾片，不扫描 SocketSet。
@@ -462,18 +472,22 @@ impl Interface {
         self.inner.is_local(address)
     }
 
-    /// 只读本接口地址和 Routes，选择实际可用源及 IP MTU。
+    /// 只读本接口地址和 Routes，按本次报文策略选择实际可用源及 IP MTU。
     pub fn resolve_route(
         &self,
         destination: IpAddress,
         bound_source: IpAddress,
+        dont_route: bool,
     ) -> Result<(IpAddress, usize), DispatchError> {
         if destination.is_unspecified() || destination.version() != bound_source.version() {
             return Err(DispatchError::NoRoute);
         }
         if !self.is_local(destination)
             && !destination.is_multicast()
-            && self.inner.route(&destination, self.inner.now).is_none()
+            && self
+                .inner
+                .route(&destination, self.inner.now, dont_route)
+                .is_none()
         {
             return Err(DispatchError::NoRoute);
         }
@@ -496,7 +510,12 @@ impl Interface {
     }
 
     /// 针对真正待发目的返回原邻居限速状态的可重试时间。
-    pub fn egress_deadline(&self, destination: IpAddress, timestamp: Instant) -> Option<Instant> {
+    pub fn egress_deadline(
+        &self,
+        destination: IpAddress,
+        timestamp: Instant,
+        dont_route: bool,
+    ) -> Option<Instant> {
         if destination.is_multicast()
             || self.inner.is_broadcast(&destination)
             || destination.is_unspecified()
@@ -509,7 +528,7 @@ impl Interface {
             if self.inner.caps.medium == Medium::Ip {
                 return None;
             }
-            let routed = self.inner.route(&destination, timestamp)?;
+            let routed = self.inner.route(&destination, timestamp, dont_route)?;
             return self.inner.neighbor_cache.retry_deadline(&routed, timestamp);
         }
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
@@ -842,6 +861,7 @@ impl Interface {
                             PacketMeta::default(),
                             packet,
                             &mut self.fragmenter,
+                            false,
                         ) {
                             net_debug!("Failed to send response: {:?}", err);
                         }
@@ -858,6 +878,7 @@ impl Interface {
                             PacketMeta::default(),
                             packet,
                             &mut self.fragmenter,
+                            false,
                         ) {
                             net_debug!("Failed to send response: {:?}", err);
                         }
@@ -906,7 +927,7 @@ impl Interface {
                 })?;
 
                 inner
-                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
+                    .dispatch_ip(t, meta, response, &mut self.fragmenter, false)
                     .map_err(|err| match err {
                         DispatchError::Exhausted => EgressError::Exhausted,
                         _ => EgressError::Dispatch,
@@ -1147,6 +1168,7 @@ impl InterfaceInner {
         }
     }
 
+    /// 使用接口控制报文的普通路由策略发送链路应答。
     #[cfg(feature = "medium-ethernet")]
     fn dispatch<Tx>(
         &mut self,
@@ -1176,7 +1198,7 @@ impl InterfaceInner {
                 })
             }
             EthernetPacket::Ip(packet) => {
-                self.dispatch_ip(tx_token, PacketMeta::default(), packet, frag)
+                self.dispatch_ip(tx_token, PacketMeta::default(), packet, frag, false)
             }
         }
     }
@@ -1201,20 +1223,28 @@ impl InterfaceInner {
         self.ip_addrs.iter().any(|cidr| cidr.contains_addr(addr))
     }
 
-    pub fn route(&self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
-        // Send directly.
-        // note: no need to use `self.is_broadcast()` to check for subnet-local broadcast addrs
-        //       here because `in_same_network` will already return true.
+    /// 先按真实 CIDR 判断直连；仅 IPv4 的逐包限制禁止继续查询网关。
+    pub fn route(
+        &self,
+        addr: &IpAddress,
+        timestamp: Instant,
+        dont_route: bool,
+    ) -> Option<IpAddress> {
         if self.in_same_network(addr) || addr.is_broadcast() {
             return Some(*addr);
         }
-
-        // Route via a router.
+        #[cfg(feature = "proto-ipv4")]
+        if dont_route && matches!(addr, IpAddress::Ipv4(_)) {
+            return None;
+        }
+        #[cfg(not(feature = "proto-ipv4"))]
+        let _ = dont_route;
         self.routes.lookup(addr, timestamp)
     }
 
+    /// 查询原 SocketSet 普通发送路径的下一跳是否已有有效邻居。
     fn has_neighbor(&self, addr: &IpAddress) -> bool {
-        match self.route(addr, self.now) {
+        match self.route(addr, self.now, false) {
             Some(_routed_addr) => match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => self.neighbor_cache.lookup(&_routed_addr, self.now).found(),
@@ -1227,12 +1257,14 @@ impl InterfaceInner {
         }
     }
 
+    /// 按同一报文的策略决定下一跳，再查询或发起邻居解析。
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn lookup_hardware_addr<Tx>(
         &mut self,
         tx_token: Tx,
         dst_addr: &IpAddress,
         fragmenter: &mut Fragmenter,
+        dont_route: bool,
     ) -> Result<(HardwareAddress, Tx), DispatchError>
     where
         Tx: TxToken,
@@ -1294,7 +1326,7 @@ impl InterfaceInner {
         }
 
         let dst_addr = self
-            .route(dst_addr, self.now)
+            .route(dst_addr, self.now, dont_route)
             .ok_or(DispatchError::NoRoute)?;
 
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
@@ -1359,7 +1391,7 @@ impl InterfaceInner {
                 );
 
                 if let Err(e) =
-                    self.dispatch_ip(tx_token, PacketMeta::default(), packet, fragmenter)
+                    self.dispatch_ip(tx_token, PacketMeta::default(), packet, fragmenter, false)
                 {
                     net_debug!("Failed to dispatch NDISC solicit: {:?}", e);
                     return Err(DispatchError::NeighborPending);
@@ -1389,6 +1421,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
+        dont_route: bool,
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
@@ -1407,7 +1440,7 @@ impl InterfaceInner {
         #[cfg(feature = "medium-ieee802154")]
         if matches!(self.caps.medium, Medium::Ieee802154) {
             let (addr, tx_token) =
-                self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?;
+                self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag, dont_route)?;
             let addr = addr.ieee802154_or_panic();
 
             return self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
@@ -1458,7 +1491,7 @@ impl InterfaceInner {
         #[cfg(feature = "medium-ethernet")]
         let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
             Medium::Ethernet => {
-                match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
+                match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag, dont_route)? {
                     (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
                     (_, _) => unreachable!(),
                 }

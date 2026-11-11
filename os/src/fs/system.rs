@@ -41,8 +41,8 @@ use crate::mm::PAGE_SIZE;
 const METADATA_CACHE_CAPACITY: usize = 64;
 /// 系统 VFS 目录项缓存（`DentryCache`）的最大槽位容量（单位：个）。
 const DENTRY_CAPACITY: usize = 128;
-/// 系统 VFS 挂载表允许的最大挂载点数量（单位：个）。
-const MOUNT_CAPACITY: usize = 12;
+/// 系统 VFS 的挂载表容量，包含根挂载以及系统与比赛根各自的 `/dev/shm`。
+const MOUNT_CAPACITY: usize = 14;
 
 /// 从内核启动命令行（bootargs）中解析出的根文件系统与初始进程配置。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

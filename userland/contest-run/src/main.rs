@@ -191,7 +191,7 @@ fn parse_positive(value: &str, flag: &str) -> Result<u64, String> {
 
 /// 把单命令模式参数包装成最小的 [`Config`] 与单个 [`ResolvedGroup`]。
 ///
-/// 目标 root 位于比赛盘挂载点之下，挂载 `dev`/`proc`/`tmp`；case 固定 ID `command`，
+/// 目标 root 位于比赛盘挂载点之下，依次挂载 `dev`/`shm`/`proc`/`tmp`；case 固定 ID `command`，
 /// 超时 60 秒、重复一次，收尾方式为 `Finish::Return`，不触发关机。
 fn explicit_config(
     cli: &Cli,
@@ -203,7 +203,7 @@ fn explicit_config(
         path: Path::new(CONTEST_ROOT).join(root.strip_prefix("/").unwrap()),
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
-        mounts: vec!["dev".into(), "proc".into(), "tmp".into()],
+        mounts: vec!["dev".into(), "shm".into(), "proc".into(), "tmp".into()],
         prepare: Vec::new(),
     };
     let case = ResolvedCase {
@@ -334,7 +334,7 @@ fn run_groups(
         if stopped {
             break;
         }
-        // Step 1: 需要换 root 时先释放旧挂载，再运行 prepare 并挂载 dev/proc/tmp。
+        // Step 1: 需要换 root 时先释放旧挂载，再运行 prepare 并按配置顺序挂载。
         if active != Some(group.root.as_str()) {
             if let Err(error) = mounts.release() {
                 eprintln!("contest-run: {error}");

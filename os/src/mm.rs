@@ -59,6 +59,7 @@ pub(crate) mod ktest;
 mod page;
 mod pcp;
 pub(crate) mod reclaim;
+pub(crate) mod shm;
 mod slub;
 pub(crate) mod space;
 pub(crate) mod uaccess;

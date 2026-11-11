@@ -38,6 +38,9 @@
 //!                                                                     保留脏数据与删除义务防止静默丢失)
 //! ```
 //!
+//! 普通 `iget` 在发布候选时于索引锁内重查同号节点与空槽，槽满则锁外先释放空闲目录项，再执行节点回收；
+//! 回收后重查当前槽位，只有实际腾出过槽位才继续回收。内部扩展属性加载不触发同步回收。
+//!
 //! FAT 根目录不进入 `ext4` 缓存域，也不持有内存目录项。外部 `InodeRef` 强持 `Fat32Volume`，
 //! 节点后端与页面反向引用只弱持卷；卷的名字域只弱持根目录项，避免根与卷互相保活。
 //!
@@ -345,8 +348,25 @@ impl InodeDomain {
         self.waiters.wake_all();
     }
 
-    /// 阻塞等待当前已入队的回收工作执行完毕；若域内任意槽位处于回收失败状态，则返回首个记录的错误码。
+    /// 先等待已登记的派发完成入队，再等待当前回收工作结束；域内 Failed 槽位继续返回其原始错误。
     fn flush(&self) -> Result<(), FsError> {
+        loop {
+            let dispatching = self.index.lock().dispatching;
+            if dispatching == 0 {
+                break;
+            }
+            let waiter = Waiter::new();
+            let mut node = pin!(WaitNode::new(waiter.waker()));
+            // SAFETY:
+            // 1. 调用方持有缓存域的 Arc，保证 self.waiters 在等待和注销期间存活且地址稳定；
+            // 2. node 由 pin! 固定，registration 在本轮结束前先注销，随后才析构 node 和 waiter。
+            let registration = unsafe { self.waiters.register(node.as_mut()) };
+            let pending = self.index.lock().dispatching != 0;
+            if pending {
+                waiter.park();
+            }
+            drop(registration);
+        }
         self.work
             .get()
             .expect("inode eviction work is not prepared")
@@ -381,6 +401,7 @@ impl InodeDomain {
     }
 
     /// 按 `(filesystem, number)` 查找或单飞加载权威 `Inode`（需在可调度任务上下文调用）；若目标节点正在被后台回收则睡眠等待其完成后重试。
+    /// 普通调用在槽满时先回收空闲目录项，再等待节点淘汰；内部扩展属性加载不等待本域回收工作。
     pub(crate) fn iget(
         self: &Arc<Self>,
         filesystem: &Arc<Ext4Volume>,
@@ -389,36 +410,19 @@ impl InodeDomain {
         context: Option<MetadataIoContext<'_>>,
     ) -> Result<InodeRef, FsError> {
         sched::assert_switchable();
-        // Step 1: 绑定卷到本缓存域，并优先在现有缓存槽中查找。
         filesystem.bind_inode_domain(self)?;
         if let Some(inode) = self.find_loaded(filesystem, number)? {
             inode.wait_loaded()?;
             return Ok(inode);
         }
-        if self.is_full() {
-            // Step 2: 槽位已满时，仅普通外部调用者（`_cache.is_some()`）允许触发同步淘汰；
-            // 后台回收或内部扩展属性加载路径直接返回内存不足，避免工作线程递归等待自身 WorkQueue 导致死锁。
-            if _cache.is_none() {
-                return Err(FsError::NoMemory);
-            }
-            self.prune_unused();
-            if let Some(inode) = self.find_loaded(filesystem, number)? {
-                inode.wait_loaded()?;
-                return Ok(inode);
-            }
-            if self.is_full() {
-                return Err(FsError::NoMemory);
-            }
-        }
-
-        // Step 3: 在锁外预先分配候选节点，尝试在索引锁内单飞占位发布。
+        // 候选在锁外分配，publish 在索引锁内仲裁身份和空槽。
         let candidate = InodeRef::try_new(filesystem, number, self)?;
         let mut loader = LoadGuard {
             domain: self,
             inode: &candidate,
             active: false,
         };
-        let existing = self.publish(&candidate, &mut loader)?;
+        let existing = self.publish(&candidate, &mut loader, _cache.is_some())?;
         if let Some(inode) = existing {
             drop(loader);
             drop(candidate);
@@ -426,7 +430,7 @@ impl InodeDomain {
             return Ok(inode);
         }
 
-        // Step 4: 当前线程赢得单飞加载权，在锁外读取磁盘记录并唤醒所有等待该节点的并发任务。
+        // 胜出者负责完成加载结果并唤醒等待者。
         #[cfg(feature = "ktest")]
         if let Some(cache) = _cache {
             cache.loads.fetch_add(1, Ordering::Relaxed);
@@ -467,14 +471,16 @@ impl InodeDomain {
         }
     }
 
-    /// 将锁外构造的候选节点尝试发布到空闲缓存槽中：
-    /// - 若期间其他线程已抢先发布同一节点，返回 `Ok(Some(existing))`；
-    /// - 若当前候选成功占槽并激活 `loader`，返回 `Ok(None)`，此后调用方必须负责完成加载结果发布。
+    /// 在索引锁内重查同号节点并发布候选；返回已有节点，或在占槽并激活 `loader` 后返回 `None`。
+    /// 普通调用槽满时在锁外先回收目录项再淘汰 inode，回收后重查；没有实际回收进展且仍无槽位时返回 NoMemory。
+    /// 内部扩展属性加载不得触发同步回收；Failed 槽位保留原错误，只有同号查找才传播该错误。
     fn publish(
         self: &Arc<Self>,
         candidate: &InodeRef,
         loader: &mut LoadGuard<'_>,
+        may_reclaim: bool,
     ) -> Result<Option<InodeRef>, FsError> {
+        let mut reclaim = may_reclaim;
         loop {
             let mut index = self.index.lock();
             if !index
@@ -504,11 +510,21 @@ impl InodeDomain {
                 Err(error) => return Err(error),
             }
 
-            let position = index
-                .slots
-                .iter()
-                .position(Option::is_none)
-                .ok_or(FsError::NoMemory)?;
+            let Some(position) = index.slots.iter().position(Option::is_none) else {
+                if !reclaim {
+                    return Err(FsError::NoMemory);
+                }
+                // 目录项析构会递减本域 users；升级名字域后必须先放索引锁，淘汰和等待也在锁外。
+                let dcache = index.dentry_cache.upgrade();
+                drop(index);
+                if let Some(dcache) = dcache {
+                    dcache.prune_unused();
+                }
+                let evicted = self.prune_unused(false);
+                // 即使没有回收进展，也先重查同号节点和空槽；仍满时不再回收空转。
+                reclaim = 0 < evicted;
+                continue;
+            };
             loader.active = true;
             candidate.disk().wb_slot.call_once(|| position);
             index.slots[position] = Some(InodeSlot {
@@ -585,15 +601,27 @@ impl InodeDomain {
         drop(victim);
     }
 
-    /// 扫描所有无外部引用且页面缓存仅含干净缓存页的槽位，标记回收并等待后台工作线程执行完毕，返回实际腾出的槽位数。
-    fn prune_unused(self: &Arc<Self>) -> usize {
+    /// 回收无外部引用、已完成加载且页面缓存仅由自身持有的节点，返回实际腾出的槽位数。
+    /// 自动容量回收只请求 Cached；只有显式清理传入 retry_failed 才重新请求 Failed。
+    /// Requested 和 Running 沿原派发与等待协议完成，不重复安排或覆盖状态。
+    fn prune_unused(self: &Arc<Self>, retry_failed: bool) -> usize {
         sched::assert_switchable();
-        let (before, requested) = {
+        let (before, requested, pending) = {
             let mut index = self.index.lock();
             let before = index.evicted;
             let mut requested = false;
+            let mut pending = false;
             for slot in index.slots.iter_mut().flatten() {
-                if slot.users == 0
+                let reclaim = match slot.eviction {
+                    Eviction::Cached => true,
+                    Eviction::Failed(_) => retry_failed,
+                    Eviction::Requested | Eviction::Running => {
+                        pending = true;
+                        false
+                    }
+                };
+                if reclaim
+                    && slot.users == 0
                     && slot.inode.data.get().is_some()
                     && slot.inode.mapping.is_cache_only()
                 {
@@ -607,20 +635,17 @@ impl InodeDomain {
                     .checked_add(1)
                     .expect("inode eviction dispatch overflow");
             }
-            (before, requested)
+            (before, requested, pending)
         };
 
         if requested {
             self.queue();
-            // 仅统计成功清空的槽位数；若个别节点因回写错误转入 `Failed` 状态，其槽位与错误码会继续保留。
+        }
+        if requested || pending {
+            // 域内其他节点的历史错误不属于当前分配；同号错误由槽位查找原样返回。
             let _ = self.flush();
         }
         self.index.lock().evicted - before
-    }
-
-    /// 检查固定容量的缓存槽是否已全部被占用（包含正在加载、正常缓存及回收失败保留的节点）。
-    fn is_full(&self) -> bool {
-        self.index.lock().slots.iter().all(Option::is_some)
     }
 
     /// 尝试升级并返回当前缓存域关联的共享 `DentryCache`；若调用方请求的容量与现有实例不一致则返回 `InvalidOperation`。
@@ -1872,8 +1897,9 @@ impl InodeCache {
     }
 
     /// 触发淘汰当前无外部句柄引用且无共享内存映射的缓存节点，阻塞等待本轮回收完成后返回实际释放的槽位数。
+    /// 显式请求会重试满足回收条件的 Failed 槽位；失败时仍保留原存储义务，仅报告成功清空的数量。
     pub fn prune_unused(&self) -> usize {
-        self.domain.prune_unused()
+        self.domain.prune_unused(true)
     }
 
     /// 在卷显式卸载且关联节点清空后，通知底层卷解绑当前缓存域并同步停止其回写服务。
@@ -1891,11 +1917,6 @@ impl InodeCache {
     #[cfg(feature = "ktest")]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// 判断当前缓存域的固定槽位预算是否已满。
-    pub(crate) fn is_full(&self) -> bool {
-        self.domain.is_full()
     }
 
     /// 设置或清除测试专用的单飞加载停点回调，旧回调移出锁外释放。

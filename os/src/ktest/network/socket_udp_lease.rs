@@ -159,11 +159,11 @@ pub(crate) mod socket_udp_lease {
         socket_retired(&fixture.net)
     }
 
-    /// 测试目标：验证 UDP 端点在首次激活（通过 `bind`、`connect` 或未绑定直接 `send`）遭遇内存耗尽（`ENOMEM`）时具备原子回滚保证，且内存压力解除后同一端点可正常激活并收发完整报文。
+    /// 测试目标：验证 UDP 端点在首次激活（通过 `bind`、`connect` 或未绑定直接准备并发送报文）遭遇内存耗尽（`ENOMEM`）时具备原子回滚保证，且内存压力解除后同一端点可正常激活并收发完整报文。
     ///
     /// 场景步骤：
     /// 1. 创建接收端并绑定 `SERVER`，创建待激活的发送端并配置收发预算、地址复用及超时参数；
-    /// 2. 借助 `HeapPressure::exhaust` 耗尽内核堆与物理页，触发指定的首次激活路径（`bind` / `connect` / `send`）；
+    /// 2. 借助 `HeapPressure::exhaust` 耗尽内核堆与物理页，触发指定的首次激活路径（`bind` / `connect` / 准备并发送报文）；
     /// 3. 验证激活返回 `FsError::NoMemory`，且全局 UDP 表容量、端点内部缓冲区状态、本地绑定、对端地址及配置项均保持未激活前的原状；
     /// 4. 释放内存压力后重新执行激活与报文发送，验证接收端收到完整的 513 字节载荷且源地址正确。
     #[test]
@@ -199,7 +199,10 @@ pub(crate) mod socket_udp_lease {
         let result = match activation {
             0 => sender.bind(local).map(|_| ()),
             1 => sender.connect(Some(SERVER)),
-            _ => sender.send(&payload, Some(SERVER)).map(|_| ()),
+            _ => sender
+                .prepare_send(payload.len(), Some(SERVER))
+                .and_then(|prepared| sender.send(&prepared, &payload))
+                .map(|_| ()),
         };
         let after = fixture.net.tables().ktest_udp_storage();
         let storage = sender.ktest_buffer_storage();
@@ -238,7 +241,11 @@ pub(crate) mod socket_udp_lease {
         }
         let destination = (activation != 1).then_some(SERVER);
         context.expect_eq(
-            child_operation(sender.send(&payload, destination))?,
+            child_operation(
+                sender
+                    .prepare_send(payload.len(), destination)
+                    .and_then(|prepared| sender.send(&prepared, &payload)),
+            )?,
             IoProgress::Ready(payload.len()),
         );
         let source = InetEndpoint {
@@ -293,7 +300,11 @@ pub(crate) mod socket_udp_lease {
                 .local()
                 .ok_or(TestError("UDP growth binding disappeared"))?;
             context.expect_eq(
-                child_operation(sender.send(&payload, Some(local)))?,
+                child_operation(
+                    sender
+                        .prepare_send(payload.len(), Some(local))
+                        .and_then(|prepared| sender.send(&prepared, &payload)),
+                )?,
                 IoProgress::Ready(payload.len()),
             );
             let source = InetEndpoint {
@@ -398,7 +409,11 @@ pub(crate) mod socket_udp_lease {
         // Step 3: 解除内存压力后验证原租约、恢复注册的候选端点以及其余所有复用端点均可正常路由并接收报文。
         let payload = b"same id retained its original lease";
         context.expect_eq(
-            child_operation(sender.send(payload, Some(SERVER)))?,
+            child_operation(
+                sender
+                    .prepare_send(payload.len(), Some(SERVER))
+                    .and_then(|prepared| sender.send(&prepared, payload)),
+            )?,
             IoProgress::Ready(payload.len()),
         );
         receive_exact(&first, payload, source)?;
@@ -411,11 +426,16 @@ pub(crate) mod socket_udp_lease {
                 .map(|entry| entry.id()),
             Some(candidate.id()),
         );
+        let payload = b"new key recovered";
         context.expect_eq(
-            child_operation(sender.send(b"new key recovered", Some(SERVER)))?,
+            child_operation(
+                sender
+                    .prepare_send(payload.len(), Some(SERVER))
+                    .and_then(|prepared| sender.send(&prepared, payload)),
+            )?,
             IoProgress::Ready(17),
         );
-        receive_exact(&candidate, b"new key recovered", source)?;
+        receive_exact(&candidate, payload, source)?;
 
         for (index, receiver) in receivers.iter().enumerate() {
             child_operation(receiver.connect(None))?;
@@ -430,7 +450,11 @@ pub(crate) mod socket_udp_lease {
             let bytes: [u8; 37] =
                 ::core::array::from_fn(|offset| super::support::pattern(offset + index));
             context.expect_eq(
-                child_operation(sender.send(&bytes, Some(SERVER)))?,
+                child_operation(
+                    sender
+                        .prepare_send(bytes.len(), Some(SERVER))
+                        .and_then(|prepared| sender.send(&prepared, &bytes)),
+                )?,
                 IoProgress::Ready(bytes.len()),
             );
             receive_exact(receiver, &bytes, source)?;
@@ -455,7 +479,7 @@ pub(crate) mod socket_udp_lease {
     /// 场景步骤：
     /// 1. 在 CPU 0 上启动关中断闸门暂停网络工作队列分派，在 CPU 1 上让 `sender` 连接 `destination` 并发送 `old_input` 报文（此时报文携带旧端口 `old` 的租约停留在发送队列）；
     /// 2. 验证发送预算耗尽与调高预算后 `POLLOUT` 恢复，接着调用 `sender.connect(None)` 断开连接，确认 `sender` 当前本地绑定已清空，但 `contender` 尝试绑定 `old` 端口仍因在途租约未释放而返回 `AddressInUse`；
-    /// 3. 使用 `sender.send(..., Some(destination))` 发送后继报文 `input`，确认自动分配了不同于 `old` 的新临时端口 `new`；
+    /// 3. 为目标地址准备后继报文 `input` 并调用 `sender.send`，确认自动分配了不同于 `old` 的新临时端口 `new`；
     /// 4. 释放 CPU 0 关中断闸门，等待工作队列将新旧两条报文依次投递给 `receiver`，验证两条报文的载荷及源端口（分别为 `old` 与 `new`）完全匹配；
     /// 5. 验证旧报文投递完成后 `old` 端口租约释放、`contender` 可成功绑定 `old`，而 `new` 端口仍被 `sender` 占用；
     /// 6. 再次开启 CPU 0 关中断闸门，发送 `tail` 报文后立即调用 `sender.close()`，放行闸门后确认 `tail` 依然成功送达 `receiver`。
@@ -504,7 +528,12 @@ pub(crate) mod socket_udp_lease {
             let old = child_operation(sender.local_address())?;
             let old_input = b"old prepared message";
             child_operation(sender.set_send_budget(old_input.len()))?;
-            if child_operation(sender.send(old_input, None))? != IoProgress::Ready(old_input.len())
+            // 发送调用返回后释放准备对象，旧端口由已入队报文持有的租约保活。
+            if child_operation(
+                sender
+                    .prepare_send(old_input.len(), None)
+                    .and_then(|prepared| sender.send(&prepared, old_input)),
+            )? != IoProgress::Ready(old_input.len())
             {
                 return Err(TestError("UDP old record not accepted"));
             }
@@ -538,8 +567,11 @@ pub(crate) mod socket_udp_lease {
 
             // Step 4: 在未连接状态下向目标地址发送后继报文，验证自动分配了新的临时端口且新端口同样受租约保护。
             let input = b"successor prepared datagram";
-            if child_operation(sender.send(input, Some(destination)))?
-                != IoProgress::Ready(input.len())
+            if child_operation(
+                sender
+                    .prepare_send(input.len(), Some(destination))
+                    .and_then(|prepared| sender.send(&prepared, input)),
+            )? != IoProgress::Ready(input.len())
             {
                 return Err(TestError("UDP successor record not accepted"));
             }
@@ -630,8 +662,11 @@ pub(crate) mod socket_udp_lease {
                 "UDP close Work CPU did not enter actual IRQ gate",
             )?;
             let tail = b"accepted before close";
-            if child_operation(sender.send(tail, Some(destination)))?
-                != IoProgress::Ready(tail.len())
+            if child_operation(
+                sender
+                    .prepare_send(tail.len(), Some(destination))
+                    .and_then(|prepared| sender.send(&prepared, tail)),
+            )? != IoProgress::Ready(tail.len())
             {
                 return Err(TestError("UDP pre-close record not accepted"));
             }
@@ -668,6 +703,182 @@ pub(crate) mod socket_udp_lease {
             contender.close();
             third.close();
             drop((sender, receiver, contender, third));
+            socket_retired(&net)?;
+            Ok(0)
+        })?;
+        context.expect_eq(controller.join()?, 0);
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
+        Ok(())
+    }
+
+    /// 验证复用地址上较新的 UDP 端点关闭时，接收查找立即转向存活端点，且已入队报文保留原绑定直至投递。
+    ///
+    /// CPU 0 的关中断门控阻止网络工作项执行，CPU 1 在放行前检查关闭后的接收键和绑定；
+    /// 放行后检验旧报文、存活端点收包及绑定回收。
+    #[test]
+    #[ktest(min_cpus = 2)]
+    fn udp_close_releases_receive_key_before_pending_transmit_retires(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let net = Arc::clone(&fixture.net);
+        let release = Arc::clone(&fixture.release);
+        let controller = crate::ktest::spawn_result_on(1, move |_| {
+            let b = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            child_operation(b.set_reuse_address(true))?;
+            let local = child_operation(b.bind(SERVER))?;
+            let a = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            child_operation(a.set_reuse_address(true))?;
+            if child_operation(a.bind(local))? != local {
+                return Err(TestError("UDP reuse binding differs"));
+            }
+            let peer = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            let peer_address = child_operation(peer.bind(super::support::CLIENT))?;
+            let contender = child_operation(net.try_new_udp(AddressFamily::Ipv4))?;
+            let a_id = a.id();
+            let b_id = b.id();
+            let a_weak = Arc::downgrade(&a);
+            if net
+                .tables()
+                .lookup_udp(local, peer_address)
+                .map(|entry| entry.id())
+                != Some(a_id)
+            {
+                return Err(TestError("latest UDP reuse binding did not win"));
+            }
+
+            let payload = b"queued before UDP close";
+            child_operation(a.set_send_budget(payload.len()))?;
+            let before = net.tables().ktest_udp_storage();
+            if before[1].0 != 3 || before[2].0 != 3 {
+                return Err(TestError("UDP reuse bindings or receive keys missing"));
+            }
+            let entered = Arc::try_new(AtomicBool::new(false))
+                .map_err(|_| TestError("UDP close gate observation OOM"))?;
+            let held = Arc::clone(&entered);
+            let gate_release = Arc::clone(&release);
+            net.work_queue().flush();
+            let gate = crate::ktest::spawn_result_on(0, move |token| {
+                let irq = crate::sync::IrqSaveGuard::new();
+                held.store(true, Ordering::Release);
+                let end = time::now()
+                    .checked_add(time::Duration::from_secs(5))
+                    .unwrap();
+                while !gate_release.load(Ordering::Acquire) && !token.stop_requested() {
+                    if end <= time::now() {
+                        return Err(TestError("UDP close key IRQ gate release deadline"));
+                    }
+                    ::core::hint::spin_loop();
+                }
+                drop(irq);
+                Ok(0)
+            })?;
+
+            let gated = (|| -> TestResult {
+                observe(
+                    || entered.load(Ordering::Acquire),
+                    "UDP close key Work CPU did not enter IRQ gate",
+                )?;
+                if child_operation(
+                    a.prepare_send(payload.len(), Some(peer_address))
+                        .and_then(|prepared| a.send(&prepared, payload)),
+                )? != IoProgress::Ready(payload.len())
+                {
+                    return Err(TestError("UDP close key pending TX was not accepted"));
+                }
+                if child_operation(a.poll(None))?.contains(PollMask::POLLOUT) {
+                    return Err(TestError("UDP close key TX did not consume its budget"));
+                }
+                if net
+                    .tables()
+                    .lookup_udp(local, peer_address)
+                    .map(|entry| entry.id())
+                    != Some(a_id)
+                {
+                    return Err(TestError("UDP reuse winner changed before close"));
+                }
+
+                a.close();
+                let winner = net
+                    .tables()
+                    .lookup_udp(local, peer_address)
+                    .map(|entry| entry.id());
+                let after = net.tables().ktest_udp_storage();
+                if winner != Some(b_id) {
+                    return Err(TestError(
+                        "closed UDP key still shadows live reuse endpoint",
+                    ));
+                }
+                if after[1].0 != before[1].0
+                    || after[2].0 + 1 != before[2].0
+                    || net.tables().udp_by_id(a_id).is_none()
+                {
+                    return Err(TestError(
+                        "UDP close lost pending binding or wrong receive key",
+                    ));
+                }
+                if gate.try_join().is_some() {
+                    return Err(TestError(
+                        "UDP close key IRQ gate exited before observation",
+                    ));
+                }
+                Ok(())
+            })();
+            release.store(true, Ordering::Release);
+            let joined = gate.join();
+            gated?;
+            if joined? != 0 {
+                return Err(TestError("UDP close key IRQ gate child failed"));
+            }
+
+            receive_exact(&peer, payload, local)?;
+            let reply = b"delivered to surviving UDP reuse endpoint";
+            if child_operation(
+                peer.prepare_send(reply.len(), Some(local))
+                    .and_then(|prepared| peer.send(&prepared, reply)),
+            )? != IoProgress::Ready(reply.len())
+            {
+                return Err(TestError("UDP reuse survivor send was not accepted"));
+            }
+            receive_exact(&b, reply, peer_address)?;
+
+            observe(
+                || {
+                    net.tables().udp_by_id(a_id).is_none()
+                        && net.tables().ktest_udp_storage()[1].0 == before[1].0 - 1
+                },
+                "UDP closed endpoint or pending binding did not retire",
+            )?;
+            drop(a);
+            observe(
+                || a_weak.upgrade().is_none(),
+                "UDP closed endpoint retained an extra owner",
+            )?;
+            if net
+                .tables()
+                .lookup_udp(local, peer_address)
+                .map(|entry| entry.id())
+                != Some(b_id)
+                || contender.bind(local) != Err(FsError::AddressInUse)
+            {
+                return Err(TestError("UDP survivor lost its receive key or binding"));
+            }
+
+            b.close();
+            observe(
+                || {
+                    net.tables().udp_by_id(b_id).is_none()
+                        && net.tables().ktest_udp_storage()[1].0 == before[1].0 - 2
+                },
+                "UDP survivor binding did not retire",
+            )?;
+            if child_operation(contender.bind(local))? != local {
+                return Err(TestError("UDP reuse address was not returned"));
+            }
+            contender.close();
+            peer.close();
+            drop((b, peer, contender));
             socket_retired(&net)?;
             Ok(0)
         })?;

@@ -239,26 +239,27 @@ impl<T: AsRef<[u8]>> Packet<T> {
         Ok(packet)
     }
 
-    /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    /// Returns `Err(Error)` if the header length is greater
-    /// than total length.
-    ///
-    /// The result of this check is invalidated by calling [set_header_len]
-    /// and [set_total_len].
-    ///
-    /// [set_header_len]: #method.set_header_len
-    /// [set_total_len]: #method.set_total_len
-    #[allow(clippy::if_same_then_else)]
+    /// 校验完整 IPv4 报文的首部和声明总长，成功后所有只读访问器均可使用。
+    /// 修改首部长度或总长后必须重新校验。
     pub fn check_len(&self) -> Result<()> {
+        self.check_header_len()?;
+        if self.buffer.as_ref().len() < self.total_len() as usize {
+            Err(Error)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 校验完整 IPv4 首部及其声明长度，供允许正文截短的 ICMP 错误引用使用。
+    /// 成功只保证首部访问器有效，不能据此调用要求完整正文的访问器。
+    pub(crate) fn check_header_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
-        if len < field::DST_ADDR.end {
-            Err(Error)
-        } else if len < self.header_len() as usize {
-            Err(Error)
-        } else if self.header_len() as u16 > self.total_len() {
-            Err(Error)
-        } else if len < self.total_len() as usize {
+        if len < HEADER_LEN {
+            return Err(Error);
+        }
+
+        let header_len = self.header_len() as usize;
+        if header_len < HEADER_LEN || len < header_len || (self.total_len() as usize) < header_len {
             Err(Error)
         } else {
             Ok(())
@@ -805,6 +806,40 @@ pub mod test {
         Packet::new_unchecked(&mut bytes).set_total_len(128);
 
         assert_eq!(Packet::new_checked(&bytes).unwrap_err(), Error);
+    }
+
+    /// 截短引用允许缺失正文，普通 IPv4 报文仍必须覆盖原声明总长。
+    #[test]
+    fn test_quote_header_keeps_full_packet_validation() {
+        let packet = Packet::new_unchecked(&PACKET_BYTES[..HEADER_LEN]);
+        assert_eq!(packet.check_header_len(), Ok(()));
+        assert_eq!(packet.total_len(), 30);
+        assert_eq!(packet.check_len(), Err(Error));
+        assert_eq!(Packet::new_checked(&PACKET_BYTES[..HEADER_LEN]), Err(Error));
+    }
+
+    /// 引用必须具有至少二十字节的完整首部，且原总长不能小于实际 IHL。
+    #[test]
+    fn test_quote_header_rejects_invalid_lengths() {
+        assert_eq!(
+            Packet::new_unchecked(&PACKET_BYTES[..HEADER_LEN - 1]).check_header_len(),
+            Err(Error)
+        );
+
+        let mut bytes = [0u8; 24];
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_version(4);
+        packet.set_total_len(100);
+        packet.set_header_len(16);
+        assert_eq!(packet.check_header_len(), Err(Error));
+        packet.set_header_len(24);
+        assert_eq!(packet.check_header_len(), Ok(()));
+        packet.set_total_len(20);
+        assert_eq!(packet.check_header_len(), Err(Error));
+
+        packet.set_total_len(100);
+        let packet = Packet::new_unchecked(&packet.into_inner()[..20]);
+        assert_eq!(packet.check_header_len(), Err(Error));
     }
 
     static REPR_PACKET_BYTES: [u8; 24] = [

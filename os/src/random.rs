@@ -1,60 +1,77 @@
-//! 基于硬件周期计数器与 SplitMix64 算法的非密码学伪随机字节生成器（Non-Cryptographic PRNG）。
+//! 内核唯一的 ChaCha20 随机字节生成器。
 //!
-//! # 模块职责与架构定位
-//! 本模块为内核提供轻量、无锁、零阻塞的伪随机字节填充服务：
-//! - **上游调用者**：ELF 栈辅助向量（`AT_RANDOM` 16 字节种子）、系统调用 `getrandom`（在教学环境中提供非阻塞随机字节）等。
-//! - **下游依赖**：调用 [`crate::arch::read_counter`] 读取当前 CPU 硬件周期/时间计数器，结合全局原子递增序号生成种子。
+//! BSP 从只读固件设备树的 `/chosen/rng-seed` 取得至少 32 字节后，生成器才进入就绪状态。
+//! `getrandom`、`/dev/urandom` 和 ELF `AT_RANDOM` 共同消费同一个受 IRQ-save 自旋锁保护的状态。
+//! 未就绪时只允许显式不安全接口输出；计数器只用于初始状态区分，不计作可信熵。
+//! 锁内仅执行内核切片填充，调用者必须在解锁后复制用户内存、访问文件或等待。
 //!
-//! # 核心设计与生成流水线
-//! ```text
-//! arch::read_counter()        NONCE.fetch_add(1, Relaxed)
-//!          │                              │
-//!          └──────────────┬───────────────┘
-//!                         ▼ (XOR 异或合成初始 seed)
-//!                   seed_0 = counter ^ nonce
-//!                         │
-//!                         ├──► mix_random_word(seed_0) ──► 小端字节写入 chunk[0]
-//!                         │
-//!                   seed_1 = seed_0.wrapping_add(0x9e3779b97f4a7c15)
-//!                         │
-//!                         └──► mix_random_word(seed_1) ──► 小端字节写入 chunk[1] ...
-//! ```
-//!
-//! # 同步与安全契约
-//! - **无锁并发**：全局序号 [`NONCE`] 使用 `AtomicU64::fetch_add(1, Ordering::Relaxed)` 更新，
-//!   保证多核或同核连续调用不会产生完全相同的初始种子，可在任意上下文（含关中断上下文）安全调用；
-//! - **安全边界**：本模块仅对计数器与单调序号做确定性位混淆（SplitMix64），**不具备密码学安全性（CSPRNG）**，
-//!   不能用于生产级密钥生成。
+//! 当前只使用启动种子，不建立运行期熵池、周期重播种或每 CPU 副本；设备树保持只读。
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 
 use crate::arch;
+use crate::sync::SpinLock;
 
-/// SplitMix64 状态步进增量常量（源自黄金分割比 $\lfloor 2^{64} / \phi \rfloor$）。
-const WORD_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
-/// 全局单调递增调用序号，确保短时间内连续调用或跨核同时调用 [`fill_insecure`] 时获得不同的初始种子。
-static NONCE: AtomicU64 = AtomicU64::new(0);
+/// ChaCha20 密钥需要的可信种子字节数。
+const SEED_BYTES: usize = 32;
 
-/// 使用硬件计时器计数与全局单调序号生成的伪随机序列填满目标切片 `bytes`。
+/// 同一把锁保护生成器及其可信种子就绪状态。
+struct RandomState {
+    /// 首次不安全输出或可信种子安装时建立的唯一生成器。
+    generator: Option<ChaCha20Rng>,
+    /// 仅在安装足量固件种子后置位，计数器初始化不改变此字段。
+    ready: bool,
+}
+
+static RANDOM: SpinLock<RandomState> = SpinLock::new(RandomState {
+    generator: None,
+    ready: false,
+});
+
+/// 由 BSP 在固件发现完成后安装启动种子；不足 32 字节时保持未就绪。
 ///
-/// 可在任意任务或关中断上下文中无锁调用；若 `bytes` 为空则直接返回且不消耗 [`NONCE`]。
+/// 调用者负责保证种子来自可信固件随机源；本函数只读取种子，不修改或擦除设备树。
+/// 生产启动只调用一次，用户写入和测试设备树解析不得调用此入口。
+pub(crate) fn seed_from_bootloader(bytes: &[u8]) {
+    let Some(bytes) = bytes.get(..SEED_BYTES) else {
+        return;
+    };
+    let mut seed = [0; SEED_BYTES];
+    seed.copy_from_slice(bytes);
+    let mut state = RANDOM.lock();
+    assert!(!state.ready, "boot random seed installed twice");
+    state.generator = Some(ChaCha20Rng::from_seed(seed));
+    state.ready = true;
+}
+
+/// 从共同生成器填充内核切片；未就绪时仍输出，供 `AT_RANDOM` 与显式不安全读取使用。
+///
+/// 未获固件种子时，计数器初始化仅提供可预测的非阻塞输出，不使安全接口就绪。
+/// 持 IRQ-save 自旋锁期间不分配、不睡眠、不访问用户地址。
 pub(crate) fn fill_insecure(bytes: &mut [u8]) {
     if bytes.is_empty() {
         return;
     }
-
-    // ponytail: 此来源没有安全熵承诺；密钥和安全随机必须使用真实熵源。
-    let mut seed = arch::read_counter() ^ NONCE.fetch_add(1, Ordering::Relaxed);
-    for chunk in bytes.chunks_mut(core::mem::size_of::<u64>()) {
-        let word = mix_random_word(seed).to_le_bytes();
-        chunk.copy_from_slice(&word[..chunk.len()]);
-        seed = seed.wrapping_add(WORD_INCREMENT);
-    }
+    let mut state = RANDOM.lock();
+    let generator = state
+        .generator
+        .get_or_insert_with(|| ChaCha20Rng::seed_from_u64(arch::read_counter()));
+    generator.fill_bytes(bytes);
 }
 
-/// SplitMix64 64 位整数混淆函数（Stafford Variant 13）：通过三次异或移位与奇常数乘法打散输入种子的比特分布。
-fn mix_random_word(mut word: u64) -> u64 {
-    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    word ^ (word >> 31)
+/// 只在可信种子就绪后填充内核切片；未就绪返回 `false` 并保持每个目标字节不变。
+///
+/// 空切片可查询就绪状态；锁只覆盖状态检查和内核切片填充，不跨用户态复制。
+pub(crate) fn try_fill_secure(bytes: &mut [u8]) -> bool {
+    let mut state = RANDOM.lock();
+    if !state.ready {
+        return false;
+    }
+    state
+        .generator
+        .as_mut()
+        .expect("ready random generator absent")
+        .fill_bytes(bytes);
+    true
 }

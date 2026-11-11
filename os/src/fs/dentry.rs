@@ -213,9 +213,8 @@ impl DentryCache {
             self.unhash(&dentry);
         }
 
-        // Step 3: 若 Dentry 缓存已满，或父目录属于磁盘文件系统且 Inode 缓存已满（闲置的正绑定 Dentry 会强引用磁盘 Inode），
-        // 先触发一次闲置目录项回收，随后重新检查目标名字是否已被并发插入或是否有空闲槽位。
-        if full || (!inode.is_memory() && inodes.is_full()) {
+        // inode 槽位由 iget 负责回收；此处只处理名字索引自身的容量。
+        if full {
             self.prune_unused();
             // 回收锁外释放期间同一 (parent, name) 可能已被其他任务发布，需再次查询索引。
             let index = self.entries.lock();

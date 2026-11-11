@@ -70,12 +70,12 @@ use smoltcp::iface::{
 };
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken};
 use smoltcp::time::Instant;
-use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpRepr, Ipv4Address, Ipv4Cidr,
-    Ipv6Address, Ipv6Cidr, TcpRepr, UdpRepr, ETHERNET_HEADER_LEN,
-};
 #[cfg(feature = "ktest")]
-use smoltcp::wire::{IpProtocol, TcpControl};
+use smoltcp::wire::TcpControl;
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, IpRepr,
+    Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, TcpRepr, UdpRepr, ETHERNET_HEADER_LEN,
+};
 use spin::Once;
 
 use crate::cpu;
@@ -98,7 +98,7 @@ use crate::net::route::{
 use crate::net::stats::InterfaceStats;
 use crate::net::table::{BindLease, NetTables, TcpTuple};
 use crate::net::tcp::TcpEndpoint;
-use crate::net::udp::UdpEndpoint;
+use crate::net::udp::{UdpEndpoint, UdpErrorRecord};
 use crate::net::unix::{UnixEndpoint, UnixPair};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::time::{self, NSEC_PER_USEC};
@@ -411,6 +411,8 @@ enum IngressEvent {
     Tcp(Arc<TcpEndpoint>, OwnedPacket),
     /// 匹配到绑定的 UDP 端点及其入站数据报。
     Udp(Arc<UdpEndpoint>, OwnedPacket),
+    /// 原 UDP 发送端及其 ICMP 引用，解接口锁后直接提交到端点错误队列。
+    UdpError(Arc<UdpEndpoint>, UdpErrorRecord),
 }
 
 /// 实现 `smoltcp::iface::TransportIngress` 的入站传输层报文收集器。
@@ -446,11 +448,15 @@ impl<'a> IngressCollector<'a> {
         }
     }
 
-    /// 在释放接口锁之后，将捕获到的报文正式推入目标 TCP 或 UDP 端点的接收队列并唤醒等待者。
+    /// 解接口锁后投递普通 backlog；错误记录沿原端点状态锁提交，不占普通输入槽。
     fn deliver(self) -> Result<(), FsError> {
         match self.event {
             Some(IngressEvent::Tcp(endpoint, packet)) => endpoint.enqueue(packet),
             Some(IngressEvent::Udp(endpoint, packet)) => endpoint.enqueue(packet),
+            Some(IngressEvent::UdpError(endpoint, record)) => {
+                endpoint.report_icmp_error(record);
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -553,6 +559,82 @@ impl<'s> TransportIngress<'s> for IngressCollector<'_> {
             packet.with_capture_storage(self.capture.clone())
         };
         self.event = Some(IngressEvent::Udp(endpoint, packet));
+        true
+    }
+
+    /// 在库完成 ICMP 校验后反向匹配被引 UDP，捕获真实正文并保留稳定端点引用。
+    fn udp_icmpv4(&mut self, source: Ipv4Address, repr: &Icmpv4Repr<'_>) -> bool {
+        let (header, data, kind, code, info) = match repr {
+            Icmpv4Repr::DstUnreachable {
+                reason,
+                next_hop_mtu,
+                header,
+                data,
+            } => (
+                header,
+                *data,
+                3,
+                u8::from(*reason),
+                u32::from(*next_hop_mtu),
+            ),
+            Icmpv4Repr::TimeExceeded {
+                reason,
+                header,
+                data,
+            } => (header, *data, 11, u8::from(*reason), 0),
+            Icmpv4Repr::ParamProblem {
+                reason,
+                pointer,
+                header,
+                data,
+            } => (header, *data, 12, u8::from(*reason), u32::from(*pointer)),
+            _ => return false,
+        };
+        if header.next_header != IpProtocol::Udp {
+            return false;
+        }
+        let Ok((udp, payload)) = UdpRepr::parse_quote(data) else {
+            return false;
+        };
+        let local = InetEndpoint {
+            address: IpAddress::Ipv4(header.src_addr),
+            port: udp.src_port,
+        };
+        let peer = InetEndpoint {
+            address: IpAddress::Ipv4(header.dst_addr),
+            port: udp.dst_port,
+        };
+        let Some(record) = UdpErrorRecord::icmp(kind, code, info, peer, source) else {
+            return false;
+        };
+        let Some(endpoint) = self.tables.lookup_udp(local, peer) else {
+            return false;
+        };
+        assert!(
+            self.event.is_none(),
+            "multiple transports in one ingress frame"
+        );
+        let storage = if payload.is_empty() {
+            Vec::new()
+        } else {
+            self.storage
+                .take()
+                .expect("ingress capture storage missing")
+        };
+        let ip = IpRepr::new(
+            local.address,
+            peer.address,
+            IpProtocol::Udp,
+            udp.header_len() + payload.len(),
+            header.hop_limit,
+        );
+        let packet = OwnedPacket::capture_udp(&ip, &udp, payload, storage);
+        let packet = if payload.is_empty() {
+            packet
+        } else {
+            packet.with_capture_storage(self.capture.clone())
+        };
+        self.event = Some(IngressEvent::UdpError(endpoint, record.with_packet(packet)));
         true
     }
 
@@ -912,7 +994,7 @@ impl NetStack {
         false
     }
 
-    /// 为发往 `destination`（可选已绑定本地源地址 `bound_source`）的出站通信解析目标接口、源 IP 与路径 MTU。
+    /// 按报文的路由限制快照解析目标接口、源 IP 与路径 MTU；IPv4 受限时不使用网关，原生 IPv6 保持原路由行为。
     ///
     /// 路由选择规则：
     /// 1. 若显式绑定的 `bound_source` 非通配且不属于本机地址，直接返回 `AddressNotAvailable`；
@@ -922,6 +1004,7 @@ impl NetStack {
         &self,
         destination: IpAddress,
         bound_source: IpAddress,
+        dont_route: bool,
     ) -> Result<Route, FsError> {
         // Step 1: 检查网络栈停机标志与绑定源地址的合法性，并将通配源地址对齐到目标地址所属的 IP 版本。
         if self.is_stopping() {
@@ -950,7 +1033,7 @@ impl NetStack {
             }
             let (source, mtu) = state
                 .iface
-                .resolve_route(destination, bound_source)
+                .resolve_route(destination, bound_source, dont_route)
                 .map_err(dispatch_error)?;
             return Ok(Route {
                 interface: InterfaceId::Loopback,
@@ -979,7 +1062,7 @@ impl NetStack {
         }
         let (source, mtu) = state
             .iface
-            .resolve_route(destination, bound_source)
+            .resolve_route(destination, bound_source, dont_route)
             .map_err(dispatch_error)?;
         if local_destination {
             if !loopback_up {
@@ -1357,7 +1440,7 @@ impl NetStack {
     /// 为待发送报文解析出站路由；若活跃 TCP 连接仅因出口接口被管理性置为 `down` 而暂时返回 `NetworkUnreachable`，
     /// 则将其登记到 `Egress::waiting` 等待队列并转为返回 `WouldBlock`，使连接在接口重新 `up` 前保持存而不发而非报错断开。
     fn resolve_output(&self, packet: &OwnedPacket) -> Result<Route, FsError> {
-        let result = self.resolve_route(packet.destination(), packet.source());
+        let result = self.resolve_route(packet.destination(), packet.source(), packet.dont_route());
         if !matches!(result, Err(FsError::NetworkUnreachable)) {
             return result;
         }
@@ -1370,9 +1453,9 @@ impl NetStack {
 
         // 持 admission 锁重新核对路由并登记等待节点，与 set_interface_up(true) 严格串行，防止错过接口恢复唤醒。
         let _admission = self.admission()?;
-        let result = self.resolve_route(packet.destination(), packet.source());
+        let result = self.resolve_route(packet.destination(), packet.source(), packet.dont_route());
         if !matches!(result, Err(FsError::NetworkUnreachable))
-            || !self.output_paused(packet.destination(), packet.source())
+            || !self.output_paused(packet.destination(), packet.source(), packet.dont_route())
         {
             return result;
         }
@@ -1385,14 +1468,18 @@ impl NetStack {
     }
 
     /// 判断发往 `destination` 的路由不可达是否单纯由接口处于管理 `down` 状态引起（即底层地址与子网/网关路由配置本身仍然有效）。
-    fn output_paused(&self, destination: IpAddress, source: IpAddress) -> bool {
+    fn output_paused(&self, destination: IpAddress, source: IpAddress, dont_route: bool) -> bool {
         let loopback = self.loopback.lock();
         let Some(state) = loopback.as_ref() else {
             return false;
         };
         let loopback_up = state.up;
         if state.iface.is_local(destination) {
-            return !loopback_up && state.iface.resolve_route(destination, source).is_ok();
+            return !loopback_up
+                && state
+                    .iface
+                    .resolve_route(destination, source, dont_route)
+                    .is_ok();
         }
         drop(loopback);
 
@@ -1404,7 +1491,10 @@ impl NetStack {
             let local = state.iface.is_local(destination);
             let valid_source = local || source.is_unspecified() || state.iface.is_local(source);
             valid_source
-                && state.iface.resolve_route(destination, source).is_ok()
+                && state
+                    .iface
+                    .resolve_route(destination, source, dont_route)
+                    .is_ok()
                 && (!state.up || (local && !loopback_up))
         })
     }
@@ -1866,7 +1956,8 @@ impl NetStack {
             })
     }
 
-    /// 处理本地回环接口（`lo`）上已编码就绪的一帧三层 IP 报文：将输出帧缓冲与 `loopback_rx` 指针零拷贝交换后送入解析链，并投递给目标端点。
+    /// 消费已编码的回环帧并投递端点；返回 true 包含消费后因投递失败而丢弃的帧。
+    /// 只有消费前的失败才返回错误，调用方按实际消费进度计入预算。
     fn receive_loopback_frame(&self) -> Result<bool, FsError> {
         // Step 1: 读取当前待回环帧的目的 IP 地址；若无待发帧或回环接口未启用则直接返回 Ok(false)。
         let destination = {
@@ -1941,10 +2032,16 @@ impl NetStack {
 
         let udp = matches!(collector.event.as_ref(), Some(IngressEvent::Udp(_, _)));
         if let Err(error) = collector.deliver() {
-            let mut stats = self.loopback_stats.lock();
-            stats.rx_dropped = stats.rx_dropped.wrapping_add(1);
+            {
+                let mut stats = self.loopback_stats.lock();
+                stats.rx_dropped = stats.rx_dropped.wrapping_add(1);
+            }
             if !udp || error != FsError::WouldBlock {
-                return Err(error);
+                crate::klog!(
+                    crate::klog::Level::Debug,
+                    "Loopback input failed: {:?}",
+                    error
+                );
             }
         }
         Ok(true)
@@ -2058,7 +2155,7 @@ impl NetStack {
 
     /// 根 `ingress` 后台任务主循环：在单次 `PROTOCOL_BUDGET`（16 步）配额内推进回环收发、以太网帧提交、IP 分片编码与新出站报文派发。
     ///
-    /// 若遇到网卡硬件 TX 队列满或目标地址正在等待 ARP/NDP 邻居解析，本轮循环会记录阻塞状态并装填接口定时器，避免无意义的忙轮询重排。
+    /// 容量与邻居等待保留原包；永久失败在解接口锁、归还出口槽后报告给原租约拥有者。
     fn receive_egress(&self) {
         if self.is_stopping() {
             return;
@@ -2112,10 +2209,17 @@ impl NetStack {
             let Some((index, id)) = self.select_egress(blocked, &stalled) else {
                 break;
             };
-            let packet = self.egress.lock().packets[index]
-                .packet
-                .take()
-                .expect("network egress packet already claimed");
+            let (packet, mtu) = {
+                let mut egress = self.egress.lock();
+                let entry = &mut egress.packets[index];
+                (
+                    entry
+                        .packet
+                        .take()
+                        .expect("network egress packet already claimed"),
+                    entry.route.mtu,
+                )
+            };
             #[cfg(feature = "ktest")]
             let packet = if id == InterfaceId::Loopback {
                 match self.controlled_loopback_packet(packet) {
@@ -2142,6 +2246,7 @@ impl NetStack {
                             FrameTx(&mut state.frame),
                             PacketMeta::default(),
                             packet.as_packet(),
+                            packet.dont_route(),
                         );
                         if 0 < state.frame.len {
                             state.frame.destination = state.iface.last_transmit_destination();
@@ -2159,7 +2264,7 @@ impl NetStack {
                 }
             };
 
-            // Step 4: 根据接口派发结果处理报文归属：ARP 等待中记入 stalled 退回队列，槽满记入 blocked 退回队列，其余永久错误直接丢弃并归还槽位。
+            // Step 4: 临时等待退回原队列；永久失败先归还出口槽，再按租约身份报告原 UDP 端点。
             match result {
                 Ok(()) => {
                     drop(packet);
@@ -2178,6 +2283,13 @@ impl NetStack {
                 }
                 Err(error) => {
                     self.finish_egress(index);
+                    if let (Some(binding), Ok((_, destination))) =
+                        (packet.binding(), packet.udp_endpoints())
+                    {
+                        if let Some(endpoint) = self.tables.udp_by_id(binding.owner_id()) {
+                            endpoint.report_transmit_error(dispatch_error(error), destination, mtu);
+                        }
+                    }
                     drop(packet);
                     if id == InterfaceId::Loopback {
                         self.record_loopback_tx_drop();
@@ -2248,10 +2360,13 @@ impl NetStack {
         {
             let egress = self.egress.lock();
             for (index, entry) in egress.packets.iter().enumerate() {
-                destinations[index] = entry
-                    .packet
-                    .as_ref()
-                    .map(|packet| (entry.route.interface, packet.destination()));
+                destinations[index] = entry.packet.as_ref().map(|packet| {
+                    (
+                        entry.route.interface,
+                        packet.destination(),
+                        packet.dont_route(),
+                    )
+                });
             }
         }
 
@@ -2269,10 +2384,12 @@ impl NetStack {
             if !state.up {
                 continue;
             }
-            for (interface, destination) in destinations.iter().flatten() {
+            for (interface, destination, dont_route) in destinations.iter().flatten() {
                 if *interface == id {
-                    deadline =
-                        earlier_deadline(deadline, state.iface.egress_deadline(*destination, now));
+                    deadline = earlier_deadline(
+                        deadline,
+                        state.iface.egress_deadline(*destination, now, *dont_route),
+                    );
                 }
             }
         }

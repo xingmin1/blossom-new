@@ -46,7 +46,7 @@ use crate::task::{Task, UserThread};
 ///   - `pid`：目标线程 ID（`0` 表示当前调用线程自身，负数非法）。
 ///   - `changing`：是否为修改操作（`true` 时需检查调用者与目标线程的 UID 是否匹配或具备 root 权限）。
 /// - **返回值**：成功返回目标线程绑定的 `Arc<Task>`，失败返回对应的 `Errno`（如 `EINVAL`、`ESRCH`、`EPERM`）。
-fn target(user: &UserThread, pid: usize, changing: bool) -> Result<Arc<Task>, Errno> {
+pub(super) fn target(user: &UserThread, pid: usize, changing: bool) -> Result<Arc<Task>, Errno> {
     let pid = pid as i32;
     if pid < 0 {
         return Err(Errno::InvalidArgument);

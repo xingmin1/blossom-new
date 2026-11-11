@@ -676,7 +676,7 @@ impl UserThread {
         self.user_cpu_mask.take(Ordering::AcqRel)
     }
 
-    /// 单独移出并在自旋锁外释放本线程持有的 `MmUser` 地址空间引用。
+    /// 取走线程的 MmUser 并在锁外释放；真实绑定必须在入口返回前或未发表取消的可睡眠上下文结束。
     pub(crate) fn release_mm(&self) {
         let mm = self.mm.lock().take();
         drop(mm);
@@ -695,6 +695,30 @@ impl UserThread {
             executor.id(),
             "user context belongs to another task"
         );
+    }
+}
+
+/// 随任务入口资源持有的地址空间解绑责任，不受诊断 UserThread Arc 生命周期影响。
+///
+/// 未发表任务由创建者在无锁可睡眠上下文取消；已发表任务由 trampoline 取走，并在入口返回后、
+/// 仍保有 current_task 时析构。普通用户主循环和 exec 已经取走的 MmUser 不会再次递减计数。
+pub(crate) struct UserEntryBinding {
+    /// 待解绑的用户线程，直到入口返回或取消资源时均保持有效。
+    user: Arc<UserThread>,
+}
+
+impl UserEntryBinding {
+    /// 将既有用户线程的解绑责任交给唯一的未发表任务入口资源，不增加 MmUser 计数或分配对象。
+    pub(super) fn new(user: Arc<UserThread>) -> Self {
+        Self { user }
+    }
+}
+
+impl Drop for UserEntryBinding {
+    /// 在创建者或执行者的普通任务栈上结束绑定，最后一个用户随后完成共享段 PTE 与 TLB 退役。
+    fn drop(&mut self) {
+        crate::sched::assert_switchable();
+        self.user.release_mm();
     }
 }
 
@@ -1138,6 +1162,7 @@ fn fault_signal(error: VmError) -> (u8, i32) {
         }
         VmError::BeyondEof => (SIGBUS, BUS_ADRERR),
         VmError::NotMappable => panic!("user fault has no file mapping capability"),
+        VmError::Locked => panic!("user fault returned an invalidate-only error"),
         VmError::File(_) => (SIGBUS, BUS_OBJERR),
         VmError::Permission => (SIGSEGV, SEGV_ACCERR),
         VmError::InvalidRange | VmError::Occupied | VmError::Unmapped => (SIGSEGV, SEGV_MAPERR),

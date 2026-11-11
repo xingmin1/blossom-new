@@ -180,6 +180,8 @@ pub(crate) enum Placement {
 pub(crate) enum SwitchIntent {
     /// 主动让出当前 CPU（`yield_now`），切回调度栈后立即重新标记为 `State::Ready` 并放回就绪队列。
     Yield,
+    /// 在安全点响应中断或更高优先级唤醒；FIFO 任务保留原同级顺序。
+    Preempt,
     /// 阻塞等待指定序号（`WaitId`）的事件通知；切回调度栈后若期间未收到通知则进入 `State::Blocked`，否则直接回到 `State::Ready`。
     Park(WaitId),
     /// 任务执行完毕退出并携带返回值（`i32`）；切回调度栈后摘除活跃登记并释放内核栈。
@@ -201,6 +203,15 @@ pub(crate) enum State {
     Exited,
 }
 
+/// 任务实际使用的调度策略；实时任务仅支持无时间片轮转的 FIFO。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Policy {
+    /// 普通任务使用现有时间片调度，实时优先级必须为零。
+    Other,
+    /// 实时任务按 1 至 99 的优先级选取，同级只在阻塞或主动让出后换位。
+    Fifo,
+}
+
 /// 受全局调度锁 `SCHED_LOCK` 保护的任务调度元数据与侵入式双向链表指针。
 ///
 /// 一个 `Task` 同时包含两条独立的侵入式链表节点：
@@ -211,6 +222,14 @@ pub(crate) struct Scheduling {
     pub state: State,
     /// 允许执行该任务的 CPU 亲和性掩码集合。
     pub allowed: crate::cpu::CpuSet,
+    /// 实际调度策略，与优先级和就绪成员关系由同一个 `SCHED_LOCK` 保护。
+    pub policy: Policy,
+    /// 实时优先级；普通任务为 0，FIFO 任务为 1 至 99。
+    pub priority: u8,
+    /// 派生子线程时清除实时策略；该标志在子线程中同时清除。
+    pub reset_on_fork: bool,
+    /// 运行或切出期间提高优先级后，下一次入队应放在新优先级的同级尾部。
+    pub requeue_tail: bool,
     /// 标记是否有外部调用者（`set_affinity`）正在等待该任务离开不再允许的旧 CPU。
     pub affinity_pending: bool,
     /// 该任务最近一次分配的等待轮次编号（`WaitId`），用于防止过期的延迟唤醒通知误唤醒新一轮等待。
@@ -251,6 +270,8 @@ pub(crate) struct Resources {
     pub stack: Option<OwnedPages>,
     /// 任务首次启动时执行的入口闭包。
     pub entry: Option<Entry>,
+    /// 用户入口的地址空间解绑责任；trampoline 在普通任务上下文取走，入口返回后、切离任务前释放。
+    pub user_binding: Option<user::UserEntryBinding>,
 }
 
 /// 独立于 `Task` 控制块的退出状态同步块，供 `JoinHandle` 和 `JoinObserver` 共享观察。
@@ -478,11 +499,19 @@ pub(crate) struct PreparedTask {
 }
 
 impl PreparedTask {
-    /// 在任务发布到调度器之前，为其绑定关联的 `UserThread`，并在 `UserThread` 中登记指向本 `Task` 的弱引用（`Weak<Task>`）。
+    /// 在普通可睡眠任务中绑定用户线程；未发表任务也须在该上下文取消，以结束其地址空间拥有。
     pub(crate) fn bind_user(&self, user: Arc<UserThread>) {
+        crate::sched::assert_switchable();
         user.bind_executor(Arc::downgrade(&self.task));
+        let binding = user::UserEntryBinding::new(Arc::clone(&user));
         let mut slot = self.task.user.lock();
         assert!(slot.is_none(), "prepared task already has a user binding");
+        // SAFETY:
+        // 1. self 仍由 PreparedTask 借用，消耗它的 publish 无法并发执行，调度器尚未接触 resources；
+        // 2. 当前 user 锁串行化重复绑定检查和资源写入，user_binding 原为空，不在锁内释放旧绑定。
+        let resources = unsafe { &mut *self.task.resources.get() };
+        assert!(resources.user_binding.is_none());
+        resources.user_binding = Some(binding);
         *slot = Some(user);
     }
 
@@ -590,6 +619,10 @@ fn prepare(
                 Placement::Any => crate::cpu::actual_set(),
                 Placement::Cpu(owner) => crate::cpu::CpuSet::single(*owner),
             },
+            policy: Policy::Other,
+            priority: 0,
+            reset_on_fork: false,
+            requeue_tail: false,
             affinity_pending: false,
             last_wait_id: WaitId::initial(),
             active_wait: None,
@@ -603,6 +636,7 @@ fn prepare(
         resources: UnsafeCell::new(Resources {
             stack: Some(stack),
             entry: Some(entry),
+            user_binding: None,
         }),
         join: Arc::clone(&join),
         worker,
@@ -623,14 +657,21 @@ fn prepare(
     })
 }
 
-/// 为已准备好的用户态线程 `user` 分配底层内核 `Task` 并完成双向绑定，返回尚未发布到调度器的 `PreparedTask`。
+/// 在普通可睡眠任务中准备用户 Task；失败时显式解除未能交给任务资源的用户绑定。
 pub(crate) fn prepare_user(
     user: Arc<UserThread>,
     placement: Placement,
     entry: impl FnOnce(Arc<UserThread>) -> i32 + Send + 'static,
 ) -> Result<PreparedTask, AllocError> {
+    crate::sched::assert_switchable();
     let binding = Arc::clone(&user);
-    let prepared = prepare(placement, None, move || entry(user))?;
+    let prepared = match prepare(placement, None, move || entry(user)) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            binding.release_mm();
+            return Err(error);
+        }
+    };
     prepared.bind_user(binding);
     Ok(prepared)
 }

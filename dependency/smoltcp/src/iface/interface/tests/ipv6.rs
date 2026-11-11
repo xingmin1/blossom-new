@@ -766,6 +766,7 @@ fn ndsic_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
+/// 邻居请求的真实应答仍使普通 IPv6 发送找到已学习的链路地址。
 fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
     let (mut iface, mut sockets, _device) = setup(medium);
 
@@ -834,6 +835,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
             MockTxToken,
             &IpAddress::Ipv6(remote_ip_addr),
             &mut iface.fragmenter,
+            false,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
     );

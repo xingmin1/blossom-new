@@ -153,7 +153,7 @@ impl Mounts {
     /// 初始化目标系统根目录：依次执行根目录准备命令，并挂载配置声明的伪文件系统。
     ///
     /// 调用上下文：切换到某个 root 之前由主运行器同步调用。准备命令在宿主根环境 `/` 下以空环境
-    /// 执行，任一条失败即中止；随后按 `mounts` 挂载 `dev`/`proc`/`tmp`，挂载点登记在
+    /// 执行，任一条失败即中止；随后按 `mounts` 挂载 `dev`/`shm`/`proc`/`tmp`，挂载点登记在
     /// [`Mounts`] 中，由 [`Mounts::release`] 逆序卸载。
     ///
     /// # 参数
@@ -179,15 +179,16 @@ impl Mounts {
         if let Some(error) = report.errors.into_iter().next() {
             return Err(format!("root prepare: {error}"));
         }
-        // Step 3: 仅按配置显式列出的挂载项（支持 dev -> devfs, proc -> proc, tmp -> tmpfs）挂载到目标根内部。
+        // Step 3: 按配置顺序挂载；shm 在 dev 下单独挂载 tmpfs，不改变 dev 的含义。
         for name in &root.mounts {
-            let filesystem = match name.as_str() {
-                "dev" => "devfs",
-                "proc" => "proc",
-                "tmp" => "tmpfs",
+            let (filesystem, directory) = match name.as_str() {
+                "dev" => ("devfs", "dev"),
+                "shm" => ("tmpfs", "dev/shm"),
+                "proc" => ("proc", "proc"),
+                "tmp" => ("tmpfs", "tmp"),
                 _ => return Err(format!("unsupported root mount: {name}")),
             };
-            let target = rooted_path(&root.path, Path::new("/"), Path::new(name))
+            let target = rooted_path(&root.path, Path::new("/"), Path::new(directory))
                 .map_err(|error| format!("mount target {name}: {error}"))?;
             self.mount(Path::new(filesystem), &target, filesystem, false)
                 .map_err(|error| format!("mount {}: {error}", target.display()))?;

@@ -155,6 +155,8 @@ pub struct Socket<'a> {
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     rx_budget: usize,
+    /// 接收元数据槽的接纳上限，包含绕回填充记录。
+    rx_packet_budget: usize,
     tx_budget: usize,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
@@ -165,11 +167,12 @@ pub struct Socket<'a> {
 }
 
 impl<'a> Socket<'a> {
-    /// 使用同一对 PacketBuffer 构造 socket，默认预算为各自物理 payload 容量。
+    /// 使用同一对 PacketBuffer 构造 socket，默认字节与记录预算均为各自物理容量。
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
             rx_budget: rx_buffer.payload_capacity(),
+            rx_packet_budget: rx_buffer.packet_capacity(),
             tx_budget: tx_buffer.payload_capacity(),
             rx_buffer,
             tx_buffer,
@@ -337,6 +340,17 @@ impl<'a> Socket<'a> {
         self.rx_buffer.packet_capacity()
     }
 
+    /// 返回当前接收环实际占用的元数据槽，包含绕回填充记录。
+    pub fn recv_packet_count(&self) -> usize {
+        self.rx_buffer.packet_count()
+    }
+
+    /// 限制后继接收可使用的元数据槽，缩小上限不会删除旧记录。
+    pub fn set_recv_packet_budget(&mut self, budget: usize) {
+        assert!(budget <= self.rx_buffer.packet_capacity());
+        self.rx_packet_budget = budget;
+    }
+
     /// Return the maximum number packets the socket can transmit.
     #[inline]
     pub fn packet_send_capacity(&self) -> usize {
@@ -365,9 +379,9 @@ impl<'a> Socket<'a> {
         self.tx_budget
     }
 
-    /// 在物理范围内修改后继接收预算，已有消息保持完整。
+    /// 在物理范围内修改后继接收字节预算；零预算仍可由可用元数据槽接纳空消息。
     pub fn set_recv_budget(&mut self, budget: usize) {
-        assert!(1 <= budget && budget <= self.rx_buffer.payload_capacity());
+        assert!(budget <= self.rx_buffer.payload_capacity());
         self.rx_budget = budget;
     }
 
@@ -383,14 +397,14 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// 向同一 TX 环接纳完整消息并借出 payload；地址无效或空间不足时不提交记录。
+    /// 按本条元数据携带的源端口接纳完整消息，允许持原绑定的发送跨当前解绑完成。
     pub fn send(
         &mut self,
         size: usize,
         meta: impl Into<UdpMetadata>,
     ) -> Result<&mut [u8], SendError> {
         let meta = meta.into();
-        if self.endpoint.port == 0 {
+        if meta.local_port.unwrap_or(self.endpoint.port) == 0 {
             return Err(SendError::Unaddressable);
         }
         if meta.endpoint.addr.is_unspecified() {
@@ -417,7 +431,7 @@ impl<'a> Socket<'a> {
         Ok(payload_buf)
     }
 
-    /// 按 max_size 预留预算和连续空间，提交闭包实际写入的一条消息。
+    /// 按本条元数据的源端口预留 max_size，提交闭包实际写入的一条消息。
     pub fn send_with<F>(
         &mut self,
         max_size: usize,
@@ -428,7 +442,7 @@ impl<'a> Socket<'a> {
         F: FnOnce(&mut [u8]) -> usize,
     {
         let meta = meta.into();
-        if self.endpoint.port == 0 {
+        if meta.local_port.unwrap_or(self.endpoint.port) == 0 {
             return Err(SendError::Unaddressable);
         }
         if meta.endpoint.addr.is_unspecified() {
@@ -574,7 +588,7 @@ impl<'a> Socket<'a> {
         true
     }
 
-    /// 把匹配的消息复制入唯一 RX 环；返回真实接纳事实，满时只丢弃本次输入。
+    /// 在字节与元数据预算内复制完整消息；绕回所需的两种存储均计入准入。
     pub fn process<C: UdpContext, P: crate::storage::SliceLike<Item = u8>>(
         &mut self,
         cx: &mut C,
@@ -610,9 +624,12 @@ impl<'a> Socket<'a> {
             .rx_buffer
             .enqueue_payload_cost(size)
             .is_some_and(|cost| {
-                cost <= self
-                    .rx_budget
-                    .saturating_sub(self.rx_buffer.payload_bytes_count())
+                let records = 1 + usize::from(size < cost);
+                self.rx_buffer.packet_count() + records <= self.rx_packet_budget
+                    && cost
+                        <= self
+                            .rx_budget
+                            .saturating_sub(self.rx_buffer.payload_bytes_count())
                     && self.rx_buffer.payload_bytes_count() <= self.rx_budget
             });
         if fits {

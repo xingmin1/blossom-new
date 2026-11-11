@@ -590,7 +590,9 @@ unsafe fn release_unstarted_suffix(first: usize) {
     }
 }
 
-/// 本地硬件定时器硬中断入口：递增本核定时器中断计数、若当前有普通任务运行则置位 `need_resched` 抢占标志，并推进时钟子系统与软件定时器（不在中断栈上直接切换任务）。
+/// 在硬中断中处理本核时钟事件，仅在当前非 FIFO 任务的时间片到期时请求调度。
+///
+/// 保留已有重调度请求，实际任务切换由中断外的合法安全点完成。
 pub fn handle_timer() {
     let local = current();
     assert!(
@@ -598,10 +600,13 @@ pub fn handle_timer() {
         "timer handler requires hard IRQ context"
     );
     local.timer_interrupts.fetch_add(1, Ordering::Relaxed);
-    if local.current_task_id.load(Ordering::Relaxed) != 0 {
+    let quantum_expired = crate::time::handle_timer();
+    if quantum_expired
+        && local.current_task_id.load(Ordering::Relaxed) != 0
+        && !crate::sched::current_is_fifo()
+    {
         local.need_resched.store(true, Ordering::Release);
     }
-    crate::time::handle_timer();
     #[cfg(feature = "ktest")]
     crate::mm::ktest::timer_irq();
 }

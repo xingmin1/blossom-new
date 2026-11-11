@@ -164,6 +164,136 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
 }
 
 #[test]
+#[cfg(all(
+    feature = "medium-ethernet",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+/// 直连策略在地址变化后仍限制最终邻居选择，并保留广播、组播和原生 IPv6 路由。
+fn direct_route_policy_reaches_neighbor_lookup() {
+    let (mut iface, _, mut device) = setup(Medium::Ethernet);
+    let now = Instant::ZERO;
+    let local = Ipv4Address::new(192, 0, 2, 1);
+    let peer = Ipv4Address::new(192, 0, 2, 200);
+    let gateway = Ipv4Address::new(192, 0, 2, 2);
+    let hardware = EthernetAddress([2, 0, 0, 0, 0, 2]);
+    iface.update_ip_addrs(|addresses| {
+        addresses.clear();
+        addresses.push(IpCidr::new(local.into(), 24)).unwrap();
+    });
+    iface.routes_mut().add_default_ipv4_route(gateway).unwrap();
+    for destination in [
+        local,
+        peer,
+        Ipv4Address::BROADCAST,
+        Ipv4Address::new(192, 0, 2, 255),
+        Ipv4Address::new(224, 0, 0, 1),
+    ] {
+        assert!(iface
+            .resolve_route(destination.into(), local.into(), true)
+            .is_ok());
+    }
+
+    let datagram = |source, destination| {
+        Packet::new(
+            IpRepr::new(source, destination, IpProtocol::Udp, UDP_HEADER_LEN, 64),
+            IpPayload::Udp(
+                UdpRepr {
+                    src_port: 1200,
+                    dst_port: 1300,
+                },
+                &[],
+            ),
+        )
+    };
+    let packet = datagram(local.into(), peer.into());
+    iface.update_ip_addrs(|addresses| {
+        addresses.clear();
+        addresses.push(IpCidr::new(local.into(), 25)).unwrap();
+    });
+    // 已准备的报文不能因路由变化或现成的网关邻居而越过逐包限制。
+    iface
+        .inner
+        .neighbor_cache
+        .fill(gateway.into(), hardware.into(), now);
+    iface
+        .inner
+        .neighbor_cache
+        .fill(peer.into(), hardware.into(), now);
+    assert_eq!(
+        iface.resolve_route(peer.into(), local.into(), true),
+        Err(DispatchError::NoRoute)
+    );
+    let token = device.transmit(now).unwrap();
+    assert_eq!(
+        iface.dispatch_ip(now, token, PacketMeta::default(), packet, true),
+        Err(DispatchError::NoRoute)
+    );
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(iface.egress_deadline(peer.into(), now, true), None);
+    assert!(iface
+        .resolve_route(peer.into(), local.into(), false)
+        .is_ok());
+    let token = device.transmit(now).unwrap();
+    iface
+        .dispatch_ip(
+            now,
+            token,
+            PacketMeta::default(),
+            datagram(local.into(), peer.into()),
+            false,
+        )
+        .unwrap();
+    let frame = device.tx_queue.pop_front().unwrap();
+    let ethernet = EthernetFrame::new_checked(&frame[..]).unwrap();
+    assert_eq!(ethernet.dst_addr(), hardware);
+    assert_eq!(
+        Ipv4Packet::new_checked(ethernet.payload())
+            .unwrap()
+            .dst_addr(),
+        peer
+    );
+
+    #[cfg(feature = "proto-ipv6")]
+    {
+        let local = Ipv6Address::new(0xfd00, 0, 0, 1, 0, 0, 0, 1);
+        let gateway = Ipv6Address::new(0xfd00, 0, 0, 1, 0, 0, 0, 2);
+        let peer = Ipv6Address::new(0xfd00, 0, 0, 2, 0, 0, 0, 1);
+        iface.update_ip_addrs(|addresses| {
+            addresses.push(IpCidr::new(local.into(), 64)).unwrap();
+        });
+        iface.routes_mut().add_default_ipv6_route(gateway).unwrap();
+        iface
+            .inner
+            .neighbor_cache
+            .fill(gateway.into(), hardware.into(), now);
+        assert_eq!(
+            iface.resolve_route(peer.into(), local.into(), true),
+            iface.resolve_route(peer.into(), local.into(), false)
+        );
+        let token = device.transmit(now).unwrap();
+        iface
+            .dispatch_ip(
+                now,
+                token,
+                PacketMeta::default(),
+                datagram(local.into(), peer.into()),
+                true,
+            )
+            .unwrap();
+        let frame = device.tx_queue.pop_front().unwrap();
+        let ethernet = EthernetFrame::new_checked(&frame[..]).unwrap();
+        assert_eq!(ethernet.dst_addr(), hardware);
+        assert_eq!(
+            Ipv6Packet::new_checked(ethernet.payload())
+                .unwrap()
+                .dst_addr(),
+            peer
+        );
+    }
+}
+
+#[test]
 #[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
 /// 原未匹配 TCP 沿正常 RST 拒绝并保传输输入 metadata。
 pub fn tcp_not_accepted() {
@@ -339,6 +469,12 @@ mod prepared_ingress {
             true
         }
 
+        #[cfg(all(feature = "proto-ipv4", feature = "socket-udp"))]
+        /// 本消费者只捕获普通 UDP，不接纳异步错误。
+        fn udp_icmpv4(&mut self, _: Ipv4Address, _: &Icmpv4Repr<'_>) -> bool {
+            false
+        }
+
         /// 无用户 socket 视图仍保留接口控制算法。
         fn socket_set(&mut self) -> Option<&mut SocketSet<'s>> {
             None
@@ -402,6 +538,7 @@ mod prepared_ingress {
                 token,
                 PacketMeta::default(),
                 datagram(&payload, destination),
+                false,
             )
             .unwrap();
         assert_eq!(iface.last_transmit_destination(), Some(destination.into()));
@@ -416,7 +553,8 @@ mod prepared_ingress {
                 now,
                 token,
                 PacketMeta::default(),
-                datagram(&payload, destination)
+                datagram(&payload, destination),
+                false,
             ),
             Err(DispatchError::Exhausted)
         );
@@ -460,7 +598,8 @@ mod prepared_ingress {
                 Instant::ZERO,
                 token,
                 PacketMeta::default(),
-                datagram(&payload, Ipv4Address::LOCALHOST)
+                datagram(&payload, Ipv4Address::LOCALHOST),
+                false,
             ),
             Err(DispatchError::PacketTooLarge)
         );
@@ -475,6 +614,7 @@ mod prepared_ingress {
                 token,
                 PacketMeta::default(),
                 datagram(b"local", destination),
+                false,
             )
             .unwrap();
         let frame = device.0.tx_queue.pop_front().unwrap();
@@ -489,7 +629,7 @@ mod prepared_ingress {
         assert!(!iface.is_local(destination.into()));
         assert!(iface.is_local(IpAddress::v4(127, 5, 6, 7)));
         assert_eq!(
-            iface.resolve_route(destination.into(), IpAddress::v4(0, 0, 0, 0)),
+            iface.resolve_route(destination.into(), IpAddress::v4(0, 0, 0, 0), false),
             Err(DispatchError::NoRoute)
         );
     }
@@ -516,7 +656,7 @@ mod prepared_ingress {
         );
         let token = device.transmit(Instant::ZERO).unwrap();
         iface
-            .dispatch_ip(Instant::ZERO, token, PacketMeta::default(), request)
+            .dispatch_ip(Instant::ZERO, token, PacketMeta::default(), request, false)
             .unwrap();
         let frame = device.0.tx_queue.pop_front().unwrap();
         device.0.rx_queue.push_back(frame);
@@ -557,6 +697,7 @@ mod prepared_ingress {
                 token,
                 PacketMeta::default(),
                 datagram(&payload, Ipv4Address::LOCALHOST),
+                false,
             )
             .unwrap();
         let first = sender.0.tx_queue.pop_front().unwrap();
@@ -632,6 +773,12 @@ mod prepared_ingress {
                 _: &UdpRepr,
                 _: &[u8],
             ) -> bool {
+                false
+            }
+
+            #[cfg(all(feature = "proto-ipv4", feature = "socket-udp"))]
+            /// 本消费者仅有 TCP 连接，不接纳 UDP 错误。
+            fn udp_icmpv4(&mut self, _: Ipv4Address, _: &Icmpv4Repr<'_>) -> bool {
                 false
             }
 
@@ -716,6 +863,7 @@ mod prepared_ingress {
                     token,
                     PacketMeta::default(),
                     Packet::new(ip, IpPayload::Tcp(repr)),
+                    false,
                 )
                 .unwrap();
             let frame = peer_device.0.tx_queue.pop_front().unwrap();
@@ -744,6 +892,7 @@ mod prepared_ingress {
                         token,
                         PacketMeta::default(),
                         Packet::new(ip, IpPayload::Tcp(tcp)),
+                        false,
                     )
                 })
                 .unwrap();

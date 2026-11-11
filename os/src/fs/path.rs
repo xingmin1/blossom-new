@@ -815,9 +815,6 @@ impl Vfs {
                         .mount
                         .dcache
                         .try_prepare_child(&lookup.parent.dentry, name.clone())?;
-                    if !parent_inode.is_memory() && self.inodes.is_full() {
-                        lookup.parent.mount.dcache.prune_unused();
-                    }
                     let now_ns = crate::time::realtime();
                     let new_inode = self.inodes.prepare_regular_inode(
                         &parent_inode,
@@ -937,9 +934,6 @@ impl Vfs {
             .mount
             .dcache
             .try_prepare_child(&lookup.parent.dentry, name.clone())?;
-        if !parent_inode.is_memory() && self.inodes.is_full() {
-            lookup.parent.mount.dcache.prune_unused();
-        }
         let now_ns = crate::time::realtime();
         let new_inode = self.inodes.prepare_directory_inode(
             &parent_inode,
@@ -1013,9 +1007,6 @@ impl Vfs {
             .mount
             .dcache
             .try_prepare_child(&lookup.parent.dentry, name.clone())?;
-        if !parent_inode.is_memory() && self.inodes.is_full() {
-            lookup.parent.mount.dcache.prune_unused();
-        }
         let now_ns = crate::time::realtime();
         let new_inode = self.inodes.prepare_symlink_inode(
             &parent_inode,

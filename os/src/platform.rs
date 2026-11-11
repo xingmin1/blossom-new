@@ -1559,6 +1559,7 @@ fn discover_plic(
 /// 从架构启动入口传入的固件交接参数中定位并校验设备树（DTB）与启动命令行，在全局静态 [`BootInfo`] 槽位中就地完成一次性资源发现。
 ///
 /// 直接填充全局静态槽位并返回其可变引用，避免在容量受限的早期引导栈上构造或拷贝大型 `BootInfo` 结构体。
+/// 资源解析成功后，只在此生产入口读取固件随机种子；测试解析不改变全局随机状态。
 ///
 /// # Safety
 /// 1. **执行上下文与唯一性**：必须且只能由引导核（BSP）在本地中断已关闭、从核（AP）尚未唤醒、且全局 `BootInfo` 槽位尚未被借用或发布的启动早期调用一次。
@@ -1630,6 +1631,13 @@ pub unsafe fn discover(
         unsafe {
             discover_command_line(info, command_line, current() != Platform::QemuVirt)?;
         }
+    }
+    let tree = Fdt::new(bytes).expect("validated firmware DTB");
+    if let Some(seed) = tree
+        .find_node("/chosen")
+        .and_then(|chosen| chosen.property("rng-seed"))
+    {
+        crate::random::seed_from_bootloader(seed.value);
     }
     Ok(info)
 }

@@ -1,4 +1,4 @@
-//! 用户态虚拟内存管理系统调用实现（`mmap` / `munmap` / `mprotect` / `msync` / `brk`）。
+//! 用户态虚拟内存管理系统调用实现（`mmap` / `munmap` / `mprotect` / `msync` / `mlock` / `munlock` / `brk`）。
 //!
 //! # 模块职责与架构定位
 //! 本模块位于系统调用分发层与虚拟内存管理子系统（`crate::mm::space::Mm`）之间：
@@ -23,15 +23,21 @@
 //!       └─ 4. 提交至 Mm 执行 VMA 树与硬件页表更新
 //! ```
 //!
+//! `mlock`（228）将当前线程组的 `RLIMIT_MEMLOCK` 软限额与凭据中的 UID 0 特权传给当前 `Mm`。
+//! 当前凭据没有 capability 集合，不能分别授予或撤销锁页特权与调整资源硬限额的特权。
+//! `mlock` 与 `munlock`（229）均将原始地址和字节长度交给 `Mm`，由其统一处理页对齐、溢出及错误优先级。
+//!
 //! # 锁获取顺序与并发契约
 //! - 在 `mmap` 处理文件映射时，先短暂获取进程文件表锁（`runtime.files.lookup`）克隆打开文件对象（`Arc`），释放文件表锁后再检查挂载点写权限，最后进入 `Mm` 内部获取地址空间锁。
 //! - 严禁在持有 `Mm` 地址空间锁期间回调文件表锁，以避免死锁。
+//! - `mlock` 在读取线程组软限额后释放限额锁，再进入 `Mm` 完成锁定与可能阻塞的预故障。
 
 use crate::fs::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
-use crate::mm::space::{MmapAddress, MmapRequest, MmapSource};
+use crate::mm::space::{LockMemoryError, MmapAddress, MmapRequest, MmapSource};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
 use crate::syscall::error::{Errno, SysResult};
+use crate::task::process::Resource;
 use crate::task::UserThread;
 
 const SHARED: usize = 1;
@@ -218,6 +224,46 @@ pub(super) fn msync(user: &UserThread, raw: [usize; 6]) -> SysResult {
         flags & MS_INVALIDATE != 0,
     )?;
     Ok(0)
+}
+
+/// 锁定当前地址空间的指定范围，并在返回前完成所需的预故障。
+///
+/// 在普通可睡眠的用户线程上下文中调用。地址和长度保持原始 ABI 值，由 `Mm`
+/// 执行范围规范化、锁页计费与预故障；UID 0 仅提供特权标志，仍传入实际软限额。
+pub(super) fn mlock(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let mm = user.mm().expect("mlock has no MM");
+    let identity = user.identity().expect("mlock has no identity");
+    let limit = identity.group().resource_limit(Resource::Memlock).current;
+    let privileged = user
+        .runtime()
+        .expect("mlock has no runtime")
+        .credentials
+        .uid
+        == 0;
+    mm.lock_memory(raw[0], raw[1], limit, privileged)
+        .map_err(lock_memory_error)?;
+    Ok(0)
+}
+
+/// 解除当前地址空间指定范围的锁定，无须锁页特权或非零软限额。
+///
+/// 在普通可睡眠的用户线程上下文中调用；原始地址和长度由 `Mm` 规范化并退还锁页计费。
+pub(super) fn munlock(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    user.mm()
+        .expect("munlock has no MM")
+        .unlock_memory(raw[0], raw[1])
+        .map_err(lock_memory_error)?;
+    Ok(0)
+}
+
+/// 将锁页操作的领域错误逐项转换成用户态 errno，保留权限、范围和预故障失败的区别。
+fn lock_memory_error(error: LockMemoryError) -> Errno {
+    match error {
+        LockMemoryError::Invalid => Errno::InvalidArgument,
+        LockMemoryError::Permission => Errno::NotPermitted,
+        LockMemoryError::NoMemory => Errno::NoMemory,
+        LockMemoryError::Again => Errno::Again,
+    }
 }
 
 /// 处理 `brk` 系统调用：查询或调整进程数据段（堆区）的结束地址（Program Break）。

@@ -1,7 +1,7 @@
 //! 线程组资源限额（`rlimit`）与按真实用户（UID）聚合的进程/信号计费。
 //!
 //! ## 模块职责与架构定位
-//! 本模块管理进程组的四类核心资源软硬上限（`RLIMIT_STACK`、`RLIMIT_NPROC`、`RLIMIT_NOFILE`、`RLIMIT_SIGPENDING`），并按真实用户 UID 全局统计活跃线程与排队信号的用量。
+//! 本模块管理线程组的五类资源软硬上限（`RLIMIT_STACK`、`RLIMIT_NPROC`、`RLIMIT_NOFILE`、`RLIMIT_SIGPENDING`、`RLIMIT_MEMLOCK`），并按真实用户 UID 全局统计活跃线程与排队信号的用量。
 //! - **上游调用者**：`process` 模块在准备新进程/线程（`prepare_process`、`prepare_thread`）和信号入队（`charge_signal`）时申请配额；系统调用层通过 [`super::TaskGraph::prlimit`] 读取或更新指定线程组的资源限额；`exec`、虚拟内存与文件表子系统通过 `ThreadGroup::resource_limit` 查询软硬上限。
 //! - **下游依赖**：`crate::sync::SpinLock` 保护全局 UID 弱引用索引表与各线程组的限额表；`crate::task::exec::DEFAULT_STACK_BYTES` 提供初始用户栈默认软上限。
 //!
@@ -41,6 +41,9 @@ pub(crate) const DEFAULT_NOFILE: ResourceLimit = ResourceLimit {
     maximum: 4096,
 };
 
+/// 新建根进程默认允许锁定的用户地址空间字节数，软硬限额均为 8 MiB。
+const DEFAULT_MEMLOCK_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 内核支持的进程级资源限额类别（作为 [`Limits`] 固定数组的下标使用）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -53,6 +56,8 @@ pub(crate) enum Resource {
     NoFile,
     /// 同一真实用户（UID）允许同时挂起的排队信号节点总数上限（对应 `RLIMIT_SIGPENDING`，单位：个）。
     SigPending,
+    /// 地址空间允许锁定的最大字节数（对应 `RLIMIT_MEMLOCK`，单位：字节）。
+    Memlock,
 }
 
 /// 单项资源的软限额（`rlim_cur`）与硬限额（`rlim_max`）配置对。
@@ -66,12 +71,13 @@ pub(crate) struct ResourceLimit {
     pub(crate) maximum: u64,
 }
 
-/// 线程组共享的四项资源限额表（由 `ThreadGroup::limits` 自旋锁保护，`fork` 时整表复制给子进程）。
+/// 线程组共享的五项资源限额表（由 `ThreadGroup::limits` 自旋锁保护，`fork` 时整表复制给子进程）。
 #[derive(Clone, Copy)]
-pub(super) struct Limits([ResourceLimit; 4]);
+pub(super) struct Limits([ResourceLimit; 5]);
 
 impl Limits {
-    /// 构造根进程的默认资源限额表：`Stack` 软限额为 `DEFAULT_STACK_BYTES`（8 MiB）、硬限额无限制，`NoFile` 为 `1024/4096`，`Nproc` 与 `SigPending` 默认无限制（`u64::MAX`）。
+    /// 构造根进程的默认资源限额表：`Stack` 软限额为 `DEFAULT_STACK_BYTES`（8 MiB）、硬限额无限制，
+    /// `NoFile` 为 `1024/4096`，`Nproc` 与 `SigPending` 默认无限制，`Memlock` 软硬限额均为 8 MiB。
     pub(super) fn new() -> Self {
         let infinity = ResourceLimit {
             current: u64::MAX,
@@ -85,6 +91,10 @@ impl Limits {
             infinity,
             DEFAULT_NOFILE,
             infinity,
+            ResourceLimit {
+                current: DEFAULT_MEMLOCK_BYTES,
+                maximum: DEFAULT_MEMLOCK_BYTES,
+            },
         ])
     }
 

@@ -457,6 +457,254 @@ pub(crate) mod socket_tcp_listener {
         Ok(())
     }
 
+    /// 验证最后一个监听文件关闭后，不等待后台退休即可重新绑定并监听同一端口。
+    ///
+    /// 保留旧端点的强引用，分别关闭 IPv4 与双栈 IPv6 监听文件后立即重新绑定；
+    /// 原租约不能靠端点析构提前消失，新监听者也必须继续拒绝真正重叠的监听占用。
+    #[test]
+    fn listener_close_rebinds_before_endpoint_retirement(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        for (family, port) in [(AddressFamily::Ipv4, 45660), (AddressFamily::Ipv6, 45661)] {
+            let local = InetEndpoint {
+                address: family.unspecified(),
+                port,
+            };
+            let listener = operation(
+                context,
+                SocketFile::try_new_tcp(fixture.net.clone(), family, 0, 0, 0),
+            )?;
+            operation(
+                context,
+                listener.bind(SocketAddress::from_endpoint(local, family)),
+            )?;
+            operation(context, listener.listen(4))?;
+            let endpoint = operation(context, listener.tcp_endpoint())?.clone();
+            let old_lease = endpoint
+                .ktest_binding_identity()
+                .ok_or(TestError("listener has no binding lease"))?;
+            let successor = operation(
+                context,
+                SocketFile::try_new_tcp(fixture.net.clone(), family, 0, 0, 0),
+            )?;
+            let successor_endpoint = operation(context, successor.tcp_endpoint())?.clone();
+            let contender = operation(
+                context,
+                SocketFile::try_new_tcp(fixture.net.clone(), family, 0, 0, 0),
+            )?;
+
+            // 旧端点仍由本任务持有，重新绑定不能依赖其后台回收或最后一次 Arc 释放。
+            drop(listener);
+            operation(
+                context,
+                successor.bind(SocketAddress::from_endpoint(local, family)),
+            )?;
+            operation(context, successor.listen(4))?;
+            context.expect_eq(endpoint.state(), State::Closed);
+            context.expect_eq(endpoint.ktest_binding_identity(), None);
+            context.expect_eq(
+                successor_endpoint.ktest_binding_identity() != Some(old_lease),
+                true,
+            );
+            context.expect_eq(
+                fixture
+                    .net
+                    .tables()
+                    .lookup_listener(local)
+                    .is_some_and(|found| Arc::ptr_eq(&found, &successor_endpoint)),
+                true,
+            );
+            operation(context, successor_endpoint.set_reuse_address(true))?;
+            operation(
+                context,
+                operation(context, contender.tcp_endpoint())?.set_reuse_address(true),
+            )?;
+            context.expect_eq(
+                contender.bind(SocketAddress::from_endpoint(local, family)),
+                Err(FsError::AddressInUse),
+            );
+            drop((endpoint, successor_endpoint, successor, contender));
+        }
+        socket_retired(&fixture.net)?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
+        Ok(())
+    }
+
+    /// 验证关闭双栈监听文件时只撤销父端点与未接受子连接的租约，已接受连接继续占用原绑定。
+    ///
+    /// 同时保留一个已接受连接和一个就绪连接；关闭监听文件后立即核对独占绑定冲突与复用监听成功，
+    /// 再核对原连接双向数据、FIN/TIME_WAIT、后继监听者的真实新连接及最终资源回收。
+    #[test]
+    fn listener_close_preserves_accepted_child_binding(
+        context: &mut TestContext<'_>,
+        fixture: &mut StackOwner,
+    ) -> TestResult {
+        let local = InetEndpoint {
+            address: AddressFamily::Ipv6.unspecified(),
+            port: 45662,
+        };
+        let target = InetEndpoint {
+            port: local.port,
+            ..SERVER
+        };
+        let listener = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv6, 0, 0, 0),
+        )?;
+        let endpoint = operation(context, listener.tcp_endpoint())?.clone();
+        operation(context, endpoint.set_reuse_address(true))?;
+        operation(
+            context,
+            listener.bind(SocketAddress::from_endpoint(local, AddressFamily::Ipv6)),
+        )?;
+        operation(context, listener.listen(4))?;
+        let old_lease = endpoint
+            .ktest_binding_identity()
+            .ok_or(TestError("dual-stack listener has no binding lease"))?;
+        let client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
+        )?;
+        operation(
+            context,
+            client.connect(SocketAddress::Inet(target), FileIoContext::Kernel),
+        )?;
+        let server = operation(context, listener.accept(0, 0, 0, FileIoContext::Kernel))?;
+        let accepted = operation(context, server.tcp_endpoint())?.clone();
+        let accepted_peer = operation(
+            context,
+            operation(context, client.tcp_endpoint())?.local_address(),
+        )?;
+        let queued_client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
+        )?;
+        operation(
+            context,
+            queued_client.connect(SocketAddress::Inet(target), FileIoContext::Kernel),
+        )?;
+        observe(
+            || listener.poll(None).is_ok_and(|mask| mask.contains(PollMask::POLLIN)),
+            "second connection did not enter the listener ready queue",
+        )?;
+        let queued_peer = operation(
+            context,
+            operation(context, queued_client.tcp_endpoint())?.local_address(),
+        )?;
+        let queued = fixture
+            .net
+            .tables()
+            .lookup_tcp(TcpTuple {
+                local: target,
+                peer: queued_peer,
+            })
+            .ok_or(TestError("queued child has no TCP tuple"))?;
+        context.expect_eq(accepted.ktest_binding_identity(), Some(old_lease));
+        context.expect_eq(queued.ktest_binding_identity(), Some(old_lease));
+        let exclusive = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
+        )?;
+        let successor = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv6, 0, 0, 0),
+        )?;
+        operation(
+            context,
+            operation(context, successor.tcp_endpoint())?.set_reuse_address(true),
+        )?;
+
+        drop(listener);
+        context.expect_eq(
+            exclusive.bind(SocketAddress::Inet(target)),
+            Err(FsError::AddressInUse),
+        );
+        operation(
+            context,
+            successor.bind(SocketAddress::from_endpoint(local, AddressFamily::Ipv6)),
+        )?;
+        operation(context, successor.listen(4))?;
+        context.expect_eq(endpoint.ktest_binding_identity(), None);
+        context.expect_eq(accepted.ktest_binding_identity(), Some(old_lease));
+        context.expect_eq(accepted.state(), State::Established);
+        context.expect_eq(queued.ktest_binding_identity(), None);
+        context.expect_eq(queued.state(), State::Closed);
+        context.expect_eq(
+            fixture
+                .net
+                .tables()
+                .lookup_tcp(TcpTuple {
+                    local: target,
+                    peer: accepted_peer,
+                })
+                .is_some_and(|found| Arc::ptr_eq(&found, &accepted)),
+            true,
+        );
+        context.expect_eq(
+            fixture
+                .net
+                .tables()
+                .lookup_tcp(TcpTuple {
+                    local: target,
+                    peer: queued_peer,
+                })
+                .is_none(),
+            true,
+        );
+
+        socket_write_all(&client, b"old stream")?;
+        let mut output = [0u8; 10];
+        socket_read_exact(&server, &mut output)?;
+        context.expect_eq(&output, b"old stream");
+        socket_write_all(&server, b"reply kept")?;
+        socket_read_exact(&client, &mut output)?;
+        context.expect_eq(&output, b"reply kept");
+        let next_client = operation(
+            context,
+            SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
+        )?;
+        operation(
+            context,
+            next_client.connect(SocketAddress::Inet(target), FileIoContext::Kernel),
+        )?;
+        let next_server = operation(context, successor.accept(0, 0, 0, FileIoContext::Kernel))?;
+        socket_write_all(&next_client, b"new stream")?;
+        socket_read_exact(&next_server, &mut output)?;
+        context.expect_eq(&output, b"new stream");
+
+        operation(context, server.shutdown(SHUT_WR))?;
+        context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
+        operation(context, client.shutdown(SHUT_WR))?;
+        context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
+        observe(
+            || accepted.state() == State::TimeWait,
+            "accepted child did not retain its normal TIME-WAIT lifecycle",
+        )?;
+        context.expect_eq(accepted.ktest_binding_identity(), Some(old_lease));
+        socket_write_all(&next_server, b"reply kept")?;
+        socket_read_exact(&next_client, &mut output)?;
+        context.expect_eq(&output, b"reply kept");
+
+        drop((
+            endpoint,
+            accepted,
+            queued,
+            client,
+            server,
+            queued_client,
+            exclusive,
+            successor,
+            next_client,
+            next_server,
+        ));
+        socket_retired(&fixture.net)?;
+        context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
+        context.expect_eq(fixture.net.is_stopping(), false);
+        Ok(())
+    }
+
     /// 验证监听索引表支持突破初始容量上限（129 个并发监听端口）动态扩容，且关闭回收后原端口可在同一网络栈上重新绑定。
     ///
     /// - **测试目标**：确认 `NetTables` 的监听端口映射表不受固定小配额限制，能够容纳 129 个独立监听端点；

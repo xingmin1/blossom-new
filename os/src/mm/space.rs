@@ -65,6 +65,7 @@ use crate::cpu;
 use crate::fs::{ExecAccess, FileRef, FsError, InodeKind, InodeRef, O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::mm::anon::SharedAnon;
 use crate::mm::reclaim::ReclaimAttempt;
+use crate::mm::shm::ShmAttachment;
 #[cfg(feature = "ktest")]
 use crate::mm::user_table::Mapping;
 use crate::mm::user_table::{
@@ -86,6 +87,8 @@ pub enum VmError {
     InvalidRange,
     /// `MAP_FIXED_NOREPLACE` 或固定插入时目标虚拟地址区间已被占用（对应 `EEXIST`）。
     Occupied,
+    /// 锁定的虚拟区间不能执行 `MS_INVALIDATE`（对应 `EBUSY`）。
+    Locked,
     /// 访问的地址未建立映射，或操作区间内包含未映射空洞（对应 `EFAULT` / `ENOMEM`）。
     Unmapped,
     /// 访问方式违反 VMA 当前权限，或请求权限超出最大权限上限（对应 `EACCES` / `EPERM`）。
@@ -110,6 +113,19 @@ impl From<PageTableError> for VmError {
             }
         }
     }
+}
+
+/// 锁页系统调用的参数、权限、计费与实际预故障错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockMemoryError {
+    /// 对齐后的范围末端溢出。
+    Invalid,
+    /// 非特权调用者的锁页软限额为零。
+    Permission,
+    /// 超过软限额、映射存在空洞或当前权限无法预故障。
+    NoMemory,
+    /// 锁定位已经发布，但实际页或缺页元数据分配失败。
+    Again,
 }
 
 /// `mmap` 系统调用的虚拟地址选址策略。
@@ -322,11 +338,13 @@ struct PteState {
 impl PteState {
     /// 检查虚拟页基址 `address` 在当前页表中是否已就绪且允许 `access` 类型的访问。
     ///
-    /// 仅当驻留节点存在、硬件叶子 PTE 指向同一个物理页且具备相应硬件权限，并且不是触发写时复制（`cow && Write`）的写入时返回 `true`。
-    fn allows(&self, address: usize, access: UserAccess) -> bool {
+    /// 预故障的只读填页只要求同 PFN 的叶子存在，不为仅写或仅执行映射额外授予读权限；写预故障仍须完成 COW。
+    fn allows(&self, address: usize, access: UserAccess, populate: bool) -> bool {
         self.pages.find(address).is_some_and(|page| {
             self.table.lookup(address).is_some_and(|leaf| {
-                leaf.physical == page.backing.physical() && vma::allows(leaf.permissions, access)
+                leaf.physical == page.backing.physical()
+                    && (populate && access == UserAccess::Read
+                        || vma::allows(leaf.permissions, access))
             }) && !(page.cow && access == UserAccess::Write)
         })
     }
@@ -439,7 +457,7 @@ impl PteDomain {
 
     /// 针对单个文件页缓存（`offset` 与 `physical`），从当前页表域中卸载匹配的共享或未写复制文件映射叶子 PTE。
     ///
-    /// 已发生写时复制（COW）的私有匿名页或其他文件偏移的映射不受影响。返回实际卸载的页表项数量（`0` 或 `1`）。
+    /// 已发生 COW 的匿名页不受影响。返回 `(卸载数, 是否命中当前锁定映射)`；旧来源快照不能阻止回收。
     ///
     /// # Safety
     /// 1. 调用方必须持有 `source` 所属文件的范围自旋锁，并保证 `source` 及其对应的文件页 `Folio` 在调用期间存活；
@@ -451,18 +469,18 @@ impl PteDomain {
         physical: usize,
         retired_pages: &mut ResidentPages,
         retired_tables: &mut RetiredTables,
-    ) -> usize {
+    ) -> (usize, bool) {
         let Some(relative) = offset.checked_sub(source.offset) else {
-            return 0;
+            return (0, false);
         };
         if (source.range.end - source.range.start) as u64 <= relative {
-            return 0;
+            return (0, false);
         }
 
         let address = source.range.start + relative as usize;
         let mut state = self.lock();
         let Some(page) = state.pages.find(address) else {
-            return 0;
+            return (0, false);
         };
         if page.source.as_ptr() != Arc::as_ptr(source)
             || !matches!(&page.backing, ResidentBacking::File(_))
@@ -470,9 +488,12 @@ impl PteDomain {
             || state
                 .table
                 .lookup(address)
-                .is_some_and(|leaf| leaf.physical != physical)
+                .is_none_or(|leaf| leaf.physical != physical)
         {
-            return 0;
+            return (0, false);
+        }
+        if source.locked.load(Ordering::Acquire) {
+            return (0, true);
         }
         // SAFETY:
         // 1. 当前持有 `self.state` 页表自旋锁，且已核实驻留节点的 `source`、文件后备类型及硬件叶子 PTE 的物理地址均等于 `physical`；
@@ -485,7 +506,7 @@ impl PteDomain {
                 .expect("file resident disappeared under PTE lock"),
         );
         retired_tables.append(tables);
-        usize::from(old.is_some())
+        (usize::from(old.is_some()), false)
     }
 }
 
@@ -502,6 +523,8 @@ struct FaultSource {
     observed: Option<usize>,
     /// 采样时为映射该虚拟地址仍需分配的中间级页表页数量。
     needed: usize,
+    /// 按当前 VMA 确定的缺页方向；预故障仅对私有可写映射选择 Write。
+    access: UserAccess,
 }
 
 /// 缺页与 `fork` 测试注入点共用的单虚拟地址回调函数类型。
@@ -546,8 +569,12 @@ pub struct Mm {
     mkwrites: AtomicUsize,
 }
 
-/// 更新 VMA 列表后需要在锁外延迟析构的旧 VMA 列表与旧文件反向映射弱引用集合。
-type RetiredVmas = (Vec<Arc<Vma>>, Vec<(usize, Weak<FileRangeData>)>);
+/// 更新 VMA 列表后需要延迟析构的旧范围、文件来源和已无映射的共享段连接；连接保留到 TLB 同步完成。
+type RetiredVmas = (
+    Vec<Arc<Vma>>,
+    Vec<(usize, Weak<FileRangeData>)>,
+    Vec<ShmAttachment>,
+);
 
 /// 用户线程对地址空间 [`Mm`] 的绑定凭证（RAII 守卫）。
 ///
@@ -575,10 +602,19 @@ impl MmUser {
 }
 
 impl Drop for MmUser {
-    /// 递减地址空间的绑定线程计数；`Arc<Mm>` 自身的引用递减与最终析构在随后自动完成。
+    /// 递减真实线程绑定计数；最后一个绑定无分配清锁，再撤销共享段连接，普通 VMA/PTE 留给原 Mm 寿命。
     fn drop(&mut self) {
         let previous = self.mm.users.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "MM user count underflow");
+        if previous == 1 {
+            {
+                let mmap = self.mm.mmap.write();
+                for vma in &mmap.vmas {
+                    vma.clear_lock();
+                }
+            }
+            self.mm.retire_user_shm();
+        }
     }
 }
 
@@ -1026,16 +1062,111 @@ impl Mm {
         Ok(())
     }
 
+    /// 在 mmap 写侧按虚拟页核对软限额并逐段发布锁定位，随后在锁外真实预故障；失败保留已提交状态。
+    pub(crate) fn lock_memory(
+        &self,
+        address: usize,
+        length: usize,
+        limit: u64,
+        privileged: bool,
+    ) -> Result<(), LockMemoryError> {
+        if !privileged && limit == 0 {
+            return Err(LockMemoryError::Permission);
+        }
+        let (start, length) = lock_range(address, length);
+        let mut mmap = self.mmap.write();
+        let pages =
+            length / PAGE_SIZE + mmap.locked_pages_outside(&(start..start.saturating_add(length)));
+        if !privileged && limit / (PAGE_SIZE as u64) < pages as u64 {
+            return Err(LockMemoryError::NoMemory);
+        }
+        let end = start.checked_add(length).ok_or(LockMemoryError::Invalid)?;
+        let range = start..end;
+        self.apply_memory_lock(&mut mmap, &range, true)?;
+        drop(mmap);
+        self.populate_range(&range, false).map_err(population_error)
+    }
+
+    /// 逐段清除范围锁定位，不要求权限或限额；重复解锁不叠加，遇空洞保留此前已提交的解锁。
+    pub(crate) fn unlock_memory(
+        &self,
+        address: usize,
+        length: usize,
+    ) -> Result<(), LockMemoryError> {
+        let (start, length) = lock_range(address, length);
+        let end = start.checked_add(length).ok_or(LockMemoryError::Invalid)?;
+        let mut mmap = self.mmap.write();
+        self.apply_memory_lock(&mut mmap, &(start..end), false)
+    }
+
+    /// 在 mmap 写锁下顺序提交每个连续映射片段，复用普通 VMA 重写和驻留来源交接。
+    fn apply_memory_lock(
+        &self,
+        mmap: &mut MmapState,
+        range: &Range<usize>,
+        locked: bool,
+    ) -> Result<(), LockMemoryError> {
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let vma = mmap.find(cursor).ok_or(LockMemoryError::NoMemory)?;
+            let end = vma.range.end.min(range.end);
+            if vma.is_locked() != locked {
+                let vmas = mmap
+                    .rewrite(&(cursor..end), None, Some(locked))
+                    .map_err(|_| LockMemoryError::NoMemory)?;
+                let retired = self
+                    .publish_vmas(mmap, vmas, None)
+                    .map_err(|_| LockMemoryError::NoMemory)?;
+                drop(retired);
+            }
+            cursor = end;
+        }
+        Ok(())
+    }
+
+    /// 锁外预故障当前仍有映射的页；权限修改只处理当前仍锁定且私有可写的片段。
+    fn populate_range(&self, range: &Range<usize>, private_locked: bool) -> Result<(), VmError> {
+        let mut cursor = range.start;
+        while cursor < range.end {
+            {
+                let mmap = self.mmap.read();
+                let index = mmap.vmas.partition_point(|vma| vma.range.end <= cursor);
+                let Some(vma) = mmap.vmas.get(index) else {
+                    break;
+                };
+                cursor = cursor.max(vma.range.start);
+                if range.end <= cursor {
+                    break;
+                }
+                if private_locked && !(vma.is_locked() && vma.is_private() && vma.permissions.write)
+                {
+                    cursor = vma.range.end;
+                    continue;
+                }
+            }
+            self.fault_page(cursor, None)?;
+            cursor += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    /// 供内核回归读取真实 VMA 的锁页总量，不额外持有页或延长锁定寿命。
+    #[cfg(feature = "ktest")]
+    pub(crate) fn ktest_locked_pages(&self) -> usize {
+        self.mmap.read().locked_pages_outside(&(0..0))
+    }
+
     /// 将虚拟地址区间 `range` 内所有共享文件映射（`MAP_SHARED`）的脏页同步回写到底层文件（`msync` 系统调用实现）。
     ///
     /// - 逐段获取 `mmap` 读锁定位相交的 `Vma` 并克隆 [`FileRef`]，随后释放 `mmap` 读锁再执行耗时的文件范围同步，避免阻塞同进程缺页；
     /// - 若区间内包含未映射空洞，仍会继续同步后续已映射子区间并最终返回 [`VmError::Unmapped`]（若发生底层文件系统 I/O 错误则优先返回文件错误）；
     /// - 私有映射与匿名映射不回写底层文件；当 `synchronous` 为 `false`（`MS_ASYNC`）时仅校验映射范围存在性。
+    /// - `invalidate` 命中任意锁定 VMA 时返回 [`VmError::Locked`]，不因映射为匿名或私有而跳过。
     pub fn sync_mapping_range(
         &self,
         range: Range<usize>,
         synchronous: bool,
-        _invalidate: bool,
+        invalidate: bool,
     ) -> Result<(), VmError> {
         if range.end < range.start {
             return Err(VmError::InvalidRange);
@@ -1056,6 +1187,9 @@ impl Mm {
                     if range.end <= cursor {
                         return Err(VmError::Unmapped);
                     }
+                }
+                if invalidate && vma.is_locked() {
+                    return Err(VmError::Locked);
                 }
                 let end = range.end.min(vma.range.end);
                 let sync = match &vma.backing {
@@ -1163,6 +1297,122 @@ impl Mm {
         Ok(address)
     }
 
+    /// 按显式选址策略映射预留的共享段连接，准备失败时连接凭证自动归还计数。
+    pub(crate) fn attach_shm(
+        &self,
+        mut attachment: ShmAttachment,
+        address: MmapAddress,
+        permissions: PagePermissions,
+    ) -> Result<usize, VmError> {
+        let mut mmap = self.mmap.write();
+        let length = attachment.length();
+        let (base, replace) = match address {
+            MmapAddress::Hint(hint) => (mmap.choose_address(hint, length)?, false),
+            MmapAddress::Fixed(base) => (base, true),
+            MmapAddress::FixedNoReplace(base) => (base, false),
+        };
+        let range = vma::checked_range(base, length)?;
+        if !replace && !mmap.vacant(&range) {
+            return Err(VmError::InvalidRange);
+        }
+        let identity = mmap
+            .next_shm_attachment
+            .checked_add(1)
+            .ok_or(VmError::NoMemory)?;
+        attachment.identity = identity;
+        attachment.base = base;
+        let vma = Vma::try_shm(range.clone(), permissions, &attachment)?;
+        mmap.shm_attachments
+            .try_reserve(1)
+            .map_err(|_| VmError::NoMemory)?;
+
+        let retired = self.replace_range(&mut mmap, &range, Some(vma))?;
+        mmap.next_shm_attachment = identity;
+        mmap.shm_attachments.push(attachment);
+        drop(mmap);
+        drop(retired);
+        Ok(base)
+    }
+
+    /// 按原始连接基址解除该连接的全部残存片段，不撤销洞中后来建立的其他映射。
+    pub(crate) fn detach_shm(&self, address: usize) -> Result<(), VmError> {
+        if address & (PAGE_SIZE - 1) != 0 {
+            return Err(VmError::InvalidRange);
+        }
+        let mut mmap = self.mmap.write();
+        let attachment = mmap
+            .vmas
+            .iter()
+            .filter_map(|vma| vma.shm_attachment)
+            .find_map(|identity| {
+                mmap.shm_attachments.iter().find(|attachment| {
+                    attachment.identity == identity && attachment.base == address
+                })
+            })
+            .ok_or(VmError::InvalidRange)?;
+        let identity = attachment.identity;
+        let range = address..address + attachment.length();
+        let mut vmas = Vec::new();
+        vmas.try_reserve_exact(mmap.vmas.len())
+            .map_err(|_| VmError::NoMemory)?;
+        vmas.extend(
+            mmap.vmas
+                .iter()
+                .filter(|vma| vma.shm_attachment != Some(identity))
+                .cloned(),
+        );
+        let mut addresses = self.resident_addresses(&range)?;
+        addresses.retain(|address| {
+            mmap.find(*address)
+                .is_some_and(|vma| vma.shm_attachment == Some(identity))
+        });
+        let retired = self.unmap_vmas(&mut mmap, vmas, &range, addresses)?;
+        drop(mmap);
+        drop(retired);
+        Ok(())
+    }
+
+    /// 最后一个真实线程解绑时无分配地撤除共享段页表；诊断 Arc 和缺页快照不延长连接寿命。
+    fn retire_user_shm(&self) {
+        let mut mmap = self.mmap.write();
+        if mmap.shm_attachments.is_empty() {
+            return;
+        }
+        let mut discarded = ResidentPages::default();
+        let mut tables = RetiredTables::default();
+        {
+            let mut state = self.table.lock();
+            let PteState { table, pages } = &mut *state;
+            let mut link = &mut pages.head;
+            while let Some(page) = link.as_ref() {
+                let address = page.address;
+                if mmap
+                    .find(address)
+                    .is_some_and(|vma| vma.shm_attachment.is_some())
+                {
+                    let mut page = link.take().unwrap();
+                    *link = page.next.take();
+                    // SAFETY:
+                    // 1. mmap 写锁和页表锁共同阻止连接范围及驻留节点改变，page 仍持有原物理页；
+                    // 2. 摘除的页和空目录保存在退休链中，退出页表锁并完成全核失效后才释放。
+                    let (old, retired) = unsafe { table.unmap(address) };
+                    assert_eq!(old.unwrap().physical, page.backing.physical());
+                    discarded.push(page);
+                    tables.append(retired);
+                } else {
+                    link = &mut link.as_mut().unwrap().next;
+                }
+            }
+        }
+        mmap.vmas.retain(|vma| vma.shm_attachment.is_none());
+        let attachments = core::mem::take(&mut mmap.shm_attachments);
+        sync_all();
+        drop(mmap);
+        drop(discarded);
+        drop(tables);
+        drop(attachments);
+    }
+
     /// 执行 `brk` 系统调用：在持有 `mmap` 写锁时调整用户堆顶（Program Break）字节边界，并按需映射新匿名页区间或卸载收缩区间。
     ///
     /// 堆向上增长时必须避开紧邻用户栈下方的防护间隙（[`STACK_GUARD_GAP`]）；任何参数越界、冲突或内存分配失败均保持原 `heap_end` 不变并返回旧值。
@@ -1223,20 +1473,27 @@ impl Mm {
     /// 涵盖按需分配匿名页、读取文件页缓存、写时复制（COW）、共享文件首次写脏准备（`mkwrite`）以及用户栈自动向下扩展。
     /// 物理页分配、磁盘读取与中间页表预分配均在页表自旋锁之外执行；提交前重新核实 VMA 身份与观测到的物理页是否发生并发变化。
     pub fn fault(&self, address: usize, access: UserAccess) -> Result<(), VmError> {
+        self.fault_page(address, Some(access))
+    }
+
+    /// 复用普通缺页提交协议；`None` 按当前 VMA 选择预故障方向，不自动增长空洞或修改用户权限。
+    fn fault_page(&self, address: usize, requested: Option<UserAccess>) -> Result<(), VmError> {
         let base = address & !(PAGE_SIZE - 1);
         let mut attempt = ReclaimAttempt::new();
         loop {
             // Step 1: 在读锁下采样缺页位置的 VMA 与当前驻留页状态；若地址未映射则尝试作为用户栈向下扩展。
-            let source = match self.fault_source(address, access) {
+            let source = match self.fault_source(address, requested) {
                 Ok(Some(source)) => source,
                 Ok(None) => return Ok(()),
-                Err(VmError::Unmapped) => {
-                    let limit = self.current_stack_limit().ok_or(VmError::Unmapped)?;
-                    self.grow_stack(address, access, limit)?;
+                Err(VmError::Unmapped) if requested.is_some() => {
+                    let (limit, lock_limit) =
+                        self.current_stack_limit().ok_or(VmError::Unmapped)?;
+                    self.grow_stack(address, requested.unwrap(), limit, lock_limit)?;
                     continue;
                 }
                 Err(error) => return Err(error),
             };
+            let access = source.access;
 
             // Step 2: 若是共享文件映射（MAP_SHARED）的写入缺页，交由专门的 mkwrite 路径完成文件脏页准备与写权限授予。
             if access == UserAccess::Write && source.vma.is_shared_file() {
@@ -1252,7 +1509,7 @@ impl Mm {
             // Step 4: 获取 mmap 写锁并核实当前地址处的 VMA 身份与访问权限在锁外准备期间未被并发修改。
             let mmap = self.mmap.write();
             let current = mmap.find(address).ok_or(VmError::Unmapped)?;
-            if !current.allows(access) {
+            if requested.is_some() && !current.allows(access) {
                 return Err(VmError::Permission);
             }
             if !Arc::ptr_eq(current, &source.vma) {
@@ -1265,7 +1522,7 @@ impl Mm {
                 Err(error) => {
                     {
                         let state = self.table.lock();
-                        if state.allows(base, access) {
+                        if state.allows(base, access, requested.is_none()) {
                             return Ok(());
                         }
                         if state
@@ -1338,7 +1595,7 @@ impl Mm {
                     .map(|range| range.data().inode.mapping().lock_ranges());
                 let mut state = self.table.lock();
                 let resident = state.pages.find(base);
-                if state.allows(base, access) {
+                if state.allows(base, access, requested.is_none()) {
                     return Ok(());
                 }
                 if resident.map(|page| page.backing.physical()) != source.observed
@@ -1407,10 +1664,10 @@ impl Mm {
         }
     }
 
-    /// 查询当前正在执行的普通用户线程的栈软限额（`RLIMIT_STACK`）。
+    /// 查询当前真实用户的栈软限额和有效锁页限额；UID0 的锁页限额按无限处理。
     ///
     /// 仅当调用方是绑定到本 `Mm` 且当前 CPU 正在使用本 `Mm` 的活动用户线程时返回限额；内核离线操作或跨地址空间访问不会触发栈自动增长。
-    fn current_stack_limit(&self) -> Option<u64> {
+    fn current_stack_limit(&self) -> Option<(u64, u64)> {
         task::current_task_id()?;
         let task = task::current_task();
         let user = task.user_thread()?;
@@ -1423,18 +1680,31 @@ impl Mm {
             return None;
         }
         let identity = user.identity()?;
-        Some(identity.group().resource_limit(Resource::Stack).current)
+        let runtime = user.runtime()?;
+        let group = identity.group();
+        let lock_limit = if runtime.credentials.uid == 0 {
+            u64::MAX
+        } else {
+            group.resource_limit(Resource::Memlock).current
+        };
+        Some((group.resource_limit(Resource::Stack).current, lock_limit))
     }
 
     /// 在持有 `mmap` 写锁下重新核实未映射缺页地址 `address`，并将上方紧邻的用户栈 VMA 向下扩展以覆盖该页。
     ///
     /// 本函数仅发布扩展后的新栈 VMA，不直接分配物理页；返回后由 [`Mm::fault`] 下一轮循环按常规匿名页缺页流程分配并映射物理页。
-    fn grow_stack(&self, address: usize, access: UserAccess, limit: u64) -> Result<(), VmError> {
+    fn grow_stack(
+        &self,
+        address: usize,
+        access: UserAccess,
+        limit: u64,
+        lock_limit: u64,
+    ) -> Result<(), VmError> {
         let mut mmap = self.mmap.write();
         if mmap.find(address).is_some() {
             return Ok(());
         }
-        let stack = mmap.stack_growth(address, access, limit)?;
+        let stack = mmap.stack_growth(address, access, limit, lock_limit)?;
         let range = stack.range.clone();
         let vmas = mmap.replacement(&range, Some(stack))?;
         let retired = self.publish_vmas(&mut mmap, vmas, None)?;
@@ -1624,24 +1894,31 @@ impl Mm {
 
     /// 在持有 `mmap` 读锁与 `PteDomain` 自旋锁下检查缺页地址状态，若硬件页表尚未就绪则采集锁外准备所需的 [`FaultSource`] 快照。
     ///
-    /// 若目标页已驻留且硬件 PTE 权限已满足本次 `access`（例如多线程并发缺页已被其他线程修复），则直接更新文件页访问位并返回 `Ok(None)`。
+    /// 普通访问核当前权限；预故障拒绝 PROT_NONE，对私有可写页先完成 COW，共享页只填页而不标脏。
     fn fault_source(
         &self,
         address: usize,
-        access: UserAccess,
+        requested: Option<UserAccess>,
     ) -> Result<Option<FaultSource>, VmError> {
         let mmap = self.mmap.read();
         let vma = mmap.find(address).ok_or(VmError::Unmapped)?;
-        if !vma.allows(access) {
-            return Err(VmError::Permission);
-        }
+        let access = match requested {
+            Some(access) if vma.allows(access) => access,
+            Some(_) => return Err(VmError::Permission),
+            None if vma.is_private() && vma.permissions.write => UserAccess::Write,
+            None if vma.permissions.read || vma.permissions.write || vma.permissions.execute => {
+                UserAccess::Read
+            }
+            None => return Err(VmError::Permission),
+        };
         let base = address & !(PAGE_SIZE - 1);
         let state = self.table.lock();
         let resident = state.pages.find(base);
         if let Some(page) = resident {
             if state.table.lookup(base).is_some_and(|mapping| {
                 mapping.physical == page.backing.physical()
-                    && vma::allows(mapping.permissions, access)
+                    && (requested.is_none() && access == UserAccess::Read
+                        || vma::allows(mapping.permissions, access))
                     && !(page.cow && access == UserAccess::Write)
             }) {
                 if let ResidentBacking::File(folio) = &page.backing {
@@ -1660,6 +1937,7 @@ impl Mm {
             backing: resident.map(|page| page.backing.clone()),
             observed: resident.map(|page| page.backing.physical()),
             needed: state.table.needed_tables(base),
+            access,
         }))
     }
 
@@ -1855,6 +2133,7 @@ impl Mm {
     ///
     /// 先校验区间是否全部已映射且不超过各 VMA 的最大权限 `maximum`，再发布拆分/合并后的新 VMA 列表；
     /// 随后逐页更新已驻留页面的硬件叶子 PTE 权限（保留私有页的 `cow` 只读约束与共享文件页的只读约束），并在锁外完成全核 TLB 同步。
+    /// 锁定的私有只读区间增加写权限后，锁外预先完成 COW；预故障失败不撤销已经提交的权限。
     pub fn protect(
         &self,
         address: usize,
@@ -1864,7 +2143,15 @@ impl Mm {
         let range = vma::checked_range(address, length)?;
         let mut mmap = self.mmap.write();
         mmap.check_protection(&range, permissions)?;
-        let vmas = mmap.rewrite(&range, Some(permissions))?;
+        let populate = permissions.write
+            && mmap.vmas.iter().any(|vma| {
+                vma.range.start < range.end
+                    && range.start < vma.range.end
+                    && vma.is_locked()
+                    && vma.is_private()
+                    && !vma.permissions.write
+            });
+        let vmas = mmap.rewrite(&range, Some(permissions), None)?;
         let addresses = self.resident_addresses(&range)?;
         let old_vmas = self.publish_vmas(&mut mmap, vmas, None)?;
 
@@ -1888,6 +2175,9 @@ impl Mm {
         }
         drop(mmap);
         drop(old_vmas);
+        if populate {
+            let _ = self.populate_range(&range, true);
+        }
         Ok(())
     }
 
@@ -1952,6 +2242,19 @@ impl Mm {
         sources
             .try_reserve_exact(count)
             .map_err(|_| VmError::NoMemory)?;
+        let mut attachments = Vec::new();
+        let retiring_attachments = mmap
+            .shm_attachments
+            .iter()
+            .filter(|attachment| {
+                !vmas
+                    .iter()
+                    .any(|vma| vma.shm_attachment == Some(attachment.identity))
+            })
+            .count();
+        attachments
+            .try_reserve_exact(retiring_attachments)
+            .map_err(|_| VmError::NoMemory)?;
         {
             let state = self.table.lock();
             let mut cursor = state.pages.head.as_deref();
@@ -2009,7 +2312,20 @@ impl Mm {
         if changed {
             sync_all();
         }
-        Ok((old, sources))
+        let mut index = 0;
+        while index < mmap.shm_attachments.len() {
+            let identity = mmap.shm_attachments[index].identity;
+            if mmap
+                .vmas
+                .iter()
+                .any(|vma| vma.shm_attachment == Some(identity))
+            {
+                index += 1;
+            } else {
+                attachments.push(mmap.shm_attachments.swap_remove(index));
+            }
+        }
+        Ok((old, sources, attachments))
     }
 
     /// 在持有 `mmap` 写锁下移除区间 `range` 内的旧映射（可选替换为 `replacement`），摘除区间内的硬件 PTE 并刷新全核 TLB。
@@ -2023,6 +2339,17 @@ impl Mm {
     ) -> Result<(RetiredVmas, ResidentPages, RetiredTables), VmError> {
         let vmas = mmap.replacement(range, replacement)?;
         let addresses = self.resident_addresses(range)?;
+        self.unmap_vmas(mmap, vmas, range, addresses)
+    }
+
+    /// 发布已准备的 VMA 列表并只撤销 addresses 中的旧叶，所有退休拥有保留到全核失效后。
+    fn unmap_vmas(
+        &self,
+        mmap: &mut MmapState,
+        vmas: Vec<Arc<Vma>>,
+        range: &Range<usize>,
+        addresses: Vec<usize>,
+    ) -> Result<(RetiredVmas, ResidentPages, RetiredTables), VmError> {
         let mut tables = RetiredTables::default();
         let mut discarded = ResidentPages::default();
         let old_vmas = self.publish_vmas(mmap, vmas, Some(range))?;
@@ -2240,6 +2567,26 @@ fn check_file(
         return Err(VmError::File(FsError::IsDirectory));
     }
     Ok(())
+}
+
+/// 将地址向下取整，并按无符号 ABI 对长度加页内偏移后向上取整；零长度也参与该运算。
+fn lock_range(address: usize, length: usize) -> (usize, usize) {
+    let length = length
+        .wrapping_add(address & (PAGE_SIZE - 1))
+        .wrapping_add(PAGE_SIZE - 1)
+        & !(PAGE_SIZE - 1);
+    (address & !(PAGE_SIZE - 1), length)
+}
+
+/// 区分预故障的物理分配失败与不可访问映射；锁定位及此前填入的页均由原地址空间继续持有。
+fn population_error(error: VmError) -> LockMemoryError {
+    match error {
+        VmError::NoMemory
+        | VmError::File(FsError::NoMemory | FsError::Io(crate::block::BlockError::NoMemory)) => {
+            LockMemoryError::Again
+        }
+        _ => LockMemoryError::NoMemory,
+    }
 }
 
 /// 将字节地址或长度 `address` 向上按 [`PAGE_SIZE`] 取整；若发生算术溢出则返回 [`VmError::InvalidRange`]。

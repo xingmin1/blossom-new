@@ -140,11 +140,7 @@ impl Interface {
         self.inner.has_multicast_group(addr)
     }
 
-    /// Do multicast egress.
-    ///
-    /// - Send join/leave packets according to the multicast group state.
-    /// - Depending on `igmp_report_state` and the therein contained
-    ///   timeouts, send IGMP membership reports.
+    /// 按组成员状态和报告期限发送组播控制报文，不借用用户套接字的路由选项。
     pub fn multicast_egress(&mut self, device: &mut (impl Device + ?Sized)) {
         // Process multicast joins.
         while let Some((&addr, _)) = self
@@ -164,7 +160,13 @@ impl Interface {
 
                         // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
                         self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                            .dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                pkt,
+                                &mut self.fragmenter,
+                                false,
+                            )
                             .unwrap();
                     }
                 }
@@ -180,7 +182,13 @@ impl Interface {
 
                         // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
                         self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                            .dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                pkt,
+                                &mut self.fragmenter,
+                                false,
+                            )
                             .unwrap();
                     }
                 }
@@ -212,7 +220,13 @@ impl Interface {
 
                         // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
                         self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                            .dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                pkt,
+                                &mut self.fragmenter,
+                                false,
+                            )
                             .unwrap();
                     }
                 }
@@ -228,7 +242,13 @@ impl Interface {
 
                         // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
                         self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                            .dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                pkt,
+                                &mut self.fragmenter,
+                                false,
+                            )
                             .unwrap();
                     }
                 }
@@ -249,7 +269,13 @@ impl Interface {
                     if let Some(tx_token) = device.transmit(self.inner.now) {
                         // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
                         self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
+                            .dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                pkt,
+                                &mut self.fragmenter,
+                                false,
+                            )
                             .unwrap();
                         self.inner.multicast.igmp_report_state = IgmpReportState::Inactive;
                     }
@@ -285,6 +311,7 @@ impl Interface {
                                         PacketMeta::default(),
                                         pkt,
                                         &mut self.fragmenter,
+                                        false,
                                     )
                                     .unwrap();
 

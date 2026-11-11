@@ -62,6 +62,8 @@ mod futex;
 mod memory;
 mod net;
 mod poll;
+mod scheduling;
+mod shm;
 pub(crate) mod signal;
 mod system;
 mod task;
@@ -306,7 +308,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         };
     }
 
-    // Step 4: 分发其余常规文件、内存、任务、亲和性及系统管理调用，统一将错误转换为负 errno。
+    // Step 4: 分发文件、内存、调度、任务及系统管理调用。
     let result: SysResult = match request.number {
         93 => {
             return Outcome::Exit(
@@ -353,6 +355,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         83 => file::fdatasync(user, raw[0]),
         88 => file::utimensat(user, raw),
         116 => syslog(user, raw),
+        118..=121 | 125..=126 => scheduling::dispatch(user, request.number, raw),
         166 => file::umask(user, raw[0]),
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
@@ -378,6 +381,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
             } as isize)
         }
         179 => system::sysinfo(user, &raw),
+        194..=197 => shm::dispatch(user, request.number, raw),
         214 => Ok(memory::brk(user, raw[0])),
         215 => memory::munmap(user, raw),
         220 => task::clone(user, request),
@@ -385,6 +389,8 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         222 => memory::mmap(user, raw),
         226 => memory::mprotect(user, raw),
         227 => memory::msync(user, raw),
+        228 => memory::mlock(user, raw),
+        229 => memory::munlock(user, raw),
         260 => return task::wait4(user, request),
         276 => file::renameat2(user, raw),
         278 => getrandom(user, raw),
@@ -395,17 +401,11 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     Outcome::Return(result.unwrap_or_else(Errno::result))
 }
 
-/// 实现 `getrandom(buf, buflen, flags)` 系统调用（编号 278），向用户缓冲区填充伪随机字节。
+/// 向用户缓冲区提供共同随机生成器的输出。
 ///
-/// 在可睡眠的用户线程上下文中调用：
-/// - 参数 `raw[0]`：用户态输出缓冲区首地址 `buf`；
-/// - 参数 `raw[1]`：请求字节数 `buflen`（单次上限截断至 `MAX_RW_COUNT`）；
-/// - 参数 `raw[2]`：标志位 `flags`（支持 `GRND_NONBLOCK`、`GRND_RANDOM`、`GRND_INSECURE`）。
-///
-/// 当前内核仅提供非密码学 PRNG（[`random::fill_insecure`]），尚未接入硬件密码学真随机熵源：
-/// - 仅当调用方显式指定 `GRND_INSECURE` 时才填充伪随机字节；
-/// - 若未指定 `GRND_INSECURE`（请求密码学安全随机字节），非阻塞模式返回 `-EAGAIN`，阻塞模式返回 `-ENOSYS` 以避免用非安全数据冒充密码学熵源。
-/// - 若向用户空间分块拷贝途中发生缺页失败（`-EFAULT`），只要此前已成功写入至少 1 个字节就返回已成功写入的字节数（Partial Progress），仅在零字节写入时返回 `-EFAULT`。
+/// 可信启动种子不足时，`GRND_NONBLOCK` 返回 `EAGAIN`，普通请求返回
+/// `ENOSYS`；`GRND_INSECURE` 允许读取尚未就绪的输出。复制中途发生
+/// 用户地址错误时，返回已经交付的字节数。
 fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     const GRND_NONBLOCK: u32 = 1;
     const GRND_RANDOM: u32 = 2;
@@ -418,8 +418,8 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     {
         return Err(Errno::InvalidArgument);
     }
-    // 当前内核没有密码学安全熵池，拒绝为安全随机数请求填充非密码学 PRNG 数据。
-    if flags & GRND_INSECURE == 0 {
+    let secure = flags & GRND_INSECURE == 0;
+    if secure && !random::try_fill_secure(&mut []) {
         return Err(if flags & GRND_NONBLOCK != 0 {
             Errno::Again
         } else {
@@ -433,7 +433,14 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mut bytes = [0; 256];
     while target.copied() < target.len() {
         let count = bytes.len().min(target.len() - target.copied());
-        random::fill_insecure(&mut bytes[..count]);
+        if secure {
+            assert!(
+                random::try_fill_secure(&mut bytes[..count]),
+                "random generator lost readiness"
+            );
+        } else {
+            random::fill_insecure(&mut bytes[..count]);
+        }
         if let Err(error) = target.push(&bytes[..count]) {
             return if target.copied() == 0 {
                 Err(error.into())

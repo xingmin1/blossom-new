@@ -2,7 +2,7 @@
 //!
 //! ## 模块职责与架构定位
 //! 本模块负责在内存文件系统（[`MemoryFs`]）之上构建 `/dev` 目录树（[`try_new`]），
-//! 并直接实现不依赖外部硬件驱动的三个虚拟字符设备打开文件描述（[`NullFile`]、[`ZeroFile`]、[`TestHookFile`]）。
+//! 并直接实现不依赖外部硬件驱动的虚拟字符设备打开文件描述（[`NullFile`]、[`ZeroFile`]、[`UrandomFile`]、[`TestHookFile`]）。
 //! 上游调用者为 VFS 挂载与打开路径（`Vfs` 初始化挂载 `/dev`，打开节点时根据 [`MemorySpecial`] 分派到本模块或对应的终端/日志模块）；
 //! 下游依赖 [`MemoryFs`] 管理目录项与设备节点 Inode，以及 [`crate::contest_hooks`] 执行评测阶段钩子操作。
 //!
@@ -13,19 +13,22 @@
 //! /dev (MemoryFsKind::Devfs)
 //!  ├── null     (1, 3)   mode 0666 ──► MemorySpecial::Null           ──► devfs::NullFile
 //!  ├── zero     (1, 5)   mode 0666 ──► MemorySpecial::Zero           ──► devfs::ZeroFile
+//!  ├── urandom  (1, 9)   mode 0666 ──► MemorySpecial::Urandom        ──► devfs::UrandomFile
 //!  ├── ttyS0    (4, 64)  mode 0666 ──► MemorySpecial::TtySerial      ──► tty 子系统
 //!  ├── console  (5, 1)   mode 0666 ──► MemorySpecial::Console        ──► tty 子系统
 //!  ├── tty      (5, 0)   mode 0666 ──► MemorySpecial::ControllingTty ──► tty 子系统
 //!  ├── kmsg     (1, 11)  mode 0444 ──► MemorySpecial::Kmsg           ──► fs::kmsg::KmsgFile
 //!  ├── ktrace   (240, 1) mode 0444 ──► MemorySpecial::Ktrace         ──► ktrace 子系统
 //!  ├── testhook (240, 2) mode 0200 ──► MemorySpecial::TestHook       ──► devfs::TestHookFile
-//!  └── loop0    (7, 0)   mode 0660 ──► MemorySpecial::Loop0          ──► 全局文件后端块设备
+//!  ├── loop0    (7, 0)   mode 0660 ──► MemorySpecial::Loop0          ──► 全局文件后端块设备
+//!  └── shm              mode 0755 ──► 独立 tmpfs 的目录挂载点
 //! ```
 //!
 //! ## 锁获取顺序与并发契约
 //! - `NullFile`、`ZeroFile` 与 `TestHookFile` 内部仅通过 `AtomicU32` 维护打开文件状态标志，不持有任何内容锁。
 //! - 在向用户空间读写全零数据或拉取控制消息时（`zeros` / `discard` / `copy_hook_message`），均使用栈上 512 字节临时缓冲区且不持有自旋锁，允许用户空间缺页异常正常获取内存管理锁。
 //! - `TestHookFile` 进行权限校验时短暂获取当前线程运行时凭据，并在校验完毕后立即释放，随后才调用可能睡眠的 `contest_hooks::before` / `after`。
+//! - `UrandomFile` 在共同随机生成器解锁后才复制用户内存，读取不等待可信种子就绪。
 
 use alloc::sync::Arc;
 use core::ops::Range;
@@ -39,11 +42,14 @@ use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
     ReadBuffer, SeekFrom, WriteBuffer, O_ACCMODE, O_WRONLY,
 };
+use crate::random;
 
 /// `/dev/null` 字符设备号：主设备号 1，次设备号 3。
 const NULL_RDEV: u64 = (1 << u8::BITS) | 3;
 /// `/dev/zero` 字符设备号：主设备号 1，次设备号 5。
 const ZERO_RDEV: u64 = (1 << u8::BITS) | 5;
+/// `/dev/urandom` 随机字节设备号：主设备号 1，次设备号 9。
+const URANDOM_RDEV: u64 = (1 << u8::BITS) | 9;
 /// `/dev/ttyS0` 串口终端设备号：主设备号 4，次设备号 64。
 pub(crate) const SERIAL_RDEV: u64 = (4 << u8::BITS) | 64;
 /// `/dev/console` 系统控制台设备号：主设备号 5，次设备号 1。
@@ -59,7 +65,7 @@ const TESTHOOK_RDEV: u64 = (240 << u8::BITS) | 2;
 
 /// `/dev/testhook` 单次写入控制命令的最大字节数上限（单位：字节）。
 const HOOK_MESSAGE_BYTES: usize = 512;
-/// `/dev/null` 与 `/dev/zero` 分块读写用户空间时的栈缓冲区大小（单位：字节）。
+/// 虚拟字符设备分块读写用户空间时的栈缓冲区大小（单位：字节）。
 const DEVICE_IO_CHUNK: usize = 512;
 
 /// `/dev/null` 空设备的打开文件描述（Open File Description）。
@@ -82,6 +88,14 @@ pub struct ZeroFile {
     flags: AtomicU32,
 }
 
+/// `/dev/urandom` 的打开实例；所有实例消费共同生成器，不维护独立随机状态或文件位置。
+pub struct UrandomFile {
+    /// 保活设备所在挂载及节点，供属性查询使用。
+    path: Path,
+    /// 同一打开实例共享的访问模式及可变状态标志。
+    flags: AtomicU32,
+}
+
 /// `/dev/testhook` 评测控制设备的打开文件描述（Open File Description）。
 ///
 /// 仅允许 `uid == 0` 的特权上下文以只写模式（`O_WRONLY`）打开并写入完整的单条控制命令（`before <id>\n` 或 `after <id>\n`）。
@@ -92,7 +106,7 @@ pub struct TestHookFile {
     flags: AtomicU32,
 }
 
-/// 创建并初始化一个新的 `devfs` 内存文件系统实例，安装字符设备节点及共享全局绑定的 `loop0` 块设备节点。
+/// 创建只读的 `devfs` 实例，安装设备节点及供独立 `tmpfs` 覆盖的固定 `shm` 目录。
 ///
 /// - 调用上下文：内核初始化或挂载路径（可睡眠上下文）。
 /// - 参数：`root_mode` 为 `/dev` 根目录的权限位（如 `0o755`）。
@@ -100,8 +114,16 @@ pub struct TestHookFile {
 pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     let fs = MemoryFs::try_new(MemoryFsKind::Devfs, root_mode)?;
     let root = fs.root();
+    fs.initialize_directory(&root, b"shm", 0o755)?;
     fs.initialize_special(&root, b"null", MemorySpecial::Null, 0o666, NULL_RDEV)?;
     fs.initialize_special(&root, b"zero", MemorySpecial::Zero, 0o666, ZERO_RDEV)?;
+    fs.initialize_special(
+        &root,
+        b"urandom",
+        MemorySpecial::Urandom,
+        0o666,
+        URANDOM_RDEV,
+    )?;
     fs.initialize_special(
         &root,
         b"ttyS0",
@@ -136,7 +158,7 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     Ok(fs)
 }
 
-/// 打开由 `devfs` 直接托管的虚拟字符设备节点（`null`、`zero`、`testhook`）。
+/// 打开由 `devfs` 直接托管的虚拟字符设备节点（`null`、`zero`、`urandom`、`testhook`）。
 ///
 /// - 调用上下文：普通可睡眠任务上下文。
 /// - 参数：
@@ -158,6 +180,11 @@ pub fn open(
         })
         .map_err(|_| FsError::NoMemory)?),
         MemorySpecial::Zero => Ok(Arc::try_new(ZeroFile {
+            path,
+            flags: AtomicU32::new(flags),
+        })
+        .map_err(|_| FsError::NoMemory)?),
+        MemorySpecial::Urandom => Ok(Arc::try_new(UrandomFile {
             path,
             flags: AtomicU32::new(flags),
         })
@@ -269,6 +296,25 @@ fn zeros(target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
     let bytes = [0; DEVICE_IO_CHUNK];
     while target.copied() < target.len() {
         match target.push(&bytes) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if target.copied() == start => return Err(error),
+            Err(_) => break,
+        }
+    }
+    Ok(target.copied() - start)
+}
+
+/// 通过固定栈片段交付共同随机流；首错保留原错误，部分复制后返回实际字节数。
+///
+/// 每次生成完成即释放随机锁，随后才调用可能缺页或睡眠的用户内存复制。
+fn random_bytes(target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
+    let start = target.copied();
+    let mut bytes = [0; DEVICE_IO_CHUNK];
+    while target.copied() < target.len() {
+        let count = bytes.len().min(target.len() - target.copied());
+        random::fill_insecure(&mut bytes[..count]);
+        match target.push(&bytes[..count]) {
             Ok(0) => break,
             Ok(_) => {}
             Err(error) if target.copied() == start => return Err(error),
@@ -478,6 +524,111 @@ impl FileLike for ZeroFile {
     }
 
     /// 向 `/dev/zero` 指定偏移处写入同样拉取并丢弃输入数据，忽略偏移量。
+    fn write_at_from(
+        &self,
+        _offset: u64,
+        source: &mut WriteBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        self.write_from(source, caller)
+    }
+}
+
+impl FileLike for UrandomFile {
+    /// 定位读与顺序读均消费随机流，设备忽略显式偏移。
+    fn positioned_io(&self) -> bool {
+        true
+    }
+
+    /// 非阻塞交付随机字节；没有可信启动种子时仍允许不安全输出。
+    fn read_into(
+        &self,
+        target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        require_read(self.flags())?;
+        random_bytes(target)
+    }
+
+    /// 忽略偏移，不重放旧字节，也不改变设备的空操作位置。
+    fn read_at_into(
+        &self,
+        _offset: u64,
+        target: &mut ReadBuffer<'_>,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        self.read_into(target, caller)
+    }
+
+    /// 返回持有的设备路径供 VFS 查询及挂载生命周期管理使用。
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    /// 随机字符设备没有可映射的普通文件页。
+    fn mapping_inode(&self) -> Option<&InodeRef> {
+        None
+    }
+
+    /// 读取该打开实例的访问模式与状态标志。
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// 仅更新公共文件层允许改变的状态标志。
+    fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
+        set_status_flags(&self.flags, raw)
+    }
+
+    /// 原子更新 `O_NONBLOCK`，设备读取仍始终不等待种子。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
+    }
+
+    /// 字符设备不支持截断。
+    fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
+    }
+
+    /// 随机设备没有可同步的文件数据或元数据。
+    fn sync_range(&self, _range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
+    }
+
+    /// 空操作定位保持位置为零，不让 seek 或 pread 重置生成器。
+    fn seek(&self, _from: SeekFrom) -> Result<u64, FsError> {
+        Ok(0)
+    }
+
+    /// 返回真实字符节点的类型、权限及设备号。
+    fn stat(&self) -> Result<FileStat, FsError> {
+        stat_path(&self.path)
+    }
+
+    /// 字符节点不提供目录项。
+    fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 字符节点不支持目录遍历。
+    fn for_each_dirent(
+        &self,
+        _emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
+    ) -> Result<(), FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 当前没有运行期熵混合入口，可写打开实例的写请求返回 `EINVAL`。
+    fn write_from(
+        &self,
+        _source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        require_write(self.flags())?;
+        Err(FsError::InvalidOperation)
+    }
+
+    /// 定位写采用同一未支持错误，不消费或忽略用户输入。
     fn write_at_from(
         &self,
         _offset: u64,

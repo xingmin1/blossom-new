@@ -37,6 +37,7 @@
 //!    当前任务自动处于 `NoFs` / `NoIo` 作用域，回收器不得反向获取页表锁或发起块写回，从而消除重入死锁风险。
 
 use super::*;
+use crate::mm::space::LockMemoryError;
 
 /// 内核小对象堆（SLUB）半满预热夹具。
 ///
@@ -80,7 +81,173 @@ impl SmallHeapRoom {
 pub(super) mod cases {
     use super::*;
 
-    /// 测试目标：验证文件缓存未命中加载、文件映射缺页与匿名零页缺页在物理页耗尽时能回收干净文件页完成分配，且当所有文件页被外部引用钉住无进展时返回 `NoMemory`。
+    /// 测试目标：磁盘文件锁页抵抗真实回收，解锁后可卸载并释放，旧来源快照不误锁当前 PTE。
+    /// 场景步骤：锁定共享页并 fork，执行回收；暂停旧来源的 mkwrite，解锁并再次回收，再检查回写与截断。
+    /// 预期结果：父锁定页驻留、子不继承；解锁释放真实缓存，锁页仍允许清脏和 EOF 撤页。
+    #[test]
+    #[ktest(tags("mlock", "fs-reclaim", "fs-shared"), min_cpus = 2)]
+    fn locked_file_pages_reclaim_and_truncate(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        const ADDRESS: usize = 0x4b00_0000;
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        let inode = fixture.inodes.last().unwrap().clone();
+        context.expect_eq(
+            checked(context, file.write_at(0, &[0x73; PAGE_SIZE]))?,
+            PAGE_SIZE,
+        );
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
+            .map_err(|_| TestError("locked file MM OOM"))?;
+        vm(
+            context,
+            mm.map_file(ADDRESS, PAGE_SIZE, RW, RW, file.clone(), 0, false),
+        )?;
+        mm.lock_memory(ADDRESS, PAGE_SIZE, PAGE_SIZE as u64, false)
+            .map_err(|_| TestError("file mlock failed"))?;
+        let physical = mm.mapping(ADDRESS).unwrap().physical;
+        context.expect_eq(mm.mapping(ADDRESS).unwrap().permissions.write, false);
+        context.expect_eq(mm.ktest_mkwrite_count(), 0);
+        context.expect_eq(inode.mapping().cached_folio(0).unwrap().dirty_sectors(), 0);
+        let child = vm(context, mm.fork())?;
+        context.expect_eq(child.ktest_locked_pages(), 0);
+        context.expect_eq(child.mapping(ADDRESS).unwrap().physical, physical);
+        let mut rmap_checks = 0;
+        for _ in 0..4 {
+            let mut attempt = ReclaimAttempt::new();
+            let _ = attempt.reclaim();
+            rmap_checks += attempt.stats().rmap_checks;
+        }
+        context.expect_eq(0 < rmap_checks, true);
+        context.expect_eq(
+            mm.mapping(ADDRESS).map(|leaf| leaf.physical),
+            Some(physical),
+        );
+        context.expect_eq(child.mapping(ADDRESS).is_none(), true);
+        context.expect_eq(
+            inode
+                .mapping()
+                .cached_folio(0)
+                .map(|folio| folio.phys_addr()),
+            Some(physical),
+        );
+
+        // 旧 mkwrite 快照强持锁定来源；munlock 发布新来源后，rmap 必须依据当前 PTE 决定能否卸载。
+        let ready = Arc::try_new(AtomicBool::new(false))
+            .map_err(|_| TestError("locked source observation OOM"))?;
+        let gate =
+            Arc::try_new(Completion::new()).map_err(|_| TestError("locked source gate OOM"))?;
+        fixture.prepare_gate = Some(gate.clone());
+        fixture.shared_mm = Some(mm.clone());
+        let observing = ready.clone();
+        let paused = gate.clone();
+        mm.ktest_set_mkwrite_hook(Some(
+            Arc::try_new(move || {
+                if !observing.swap(true, Ordering::AcqRel) {
+                    paused.wait();
+                }
+            })
+            .map_err(|_| TestError("locked source hook OOM"))?,
+        ));
+        let writing = mm.clone();
+        let actor = fixture.consume_sync(0, move || {
+            writing
+                .fault(ADDRESS, UserAccess::Write)
+                .map_err(|_| FsError::InvalidOperation)
+        })?;
+        until("locked source mkwrite did not pause", || {
+            ready.load(Ordering::Acquire) && actor.blocked()
+        })?;
+        mm.unlock_memory(ADDRESS, PAGE_SIZE).unwrap();
+        for _ in 0..4 {
+            let mut attempt = ReclaimAttempt::new();
+            let _ = attempt.reclaim();
+            if mm.mapping(ADDRESS).is_none() {
+                break;
+            }
+        }
+        context.expect_eq(mm.mapping(ADDRESS).is_none(), true);
+        context.expect_eq(mm.ktest_locked_pages(), 0);
+        mm.ktest_set_mkwrite_hook(None);
+        gate.complete();
+        fixture.join_consumers()?;
+        context.expect_eq(actor.result(), Some(Ok(())));
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+
+        let mut freed_file = 0;
+        for _ in 0..4 {
+            let mut attempt = ReclaimAttempt::new();
+            let _ = attempt.reclaim();
+            freed_file += attempt.stats().freed_file;
+            if inode.mapping().cached_folio(0).is_none() {
+                break;
+            }
+        }
+        context.expect_eq(0 < freed_file, true);
+        context.expect_eq(inode.mapping().cached_folio(0).is_none(), true);
+        context.expect_eq(mm.mapping(ADDRESS).is_none(), true);
+        mm.lock_memory(ADDRESS, PAGE_SIZE, PAGE_SIZE as u64, false)
+            .map_err(|_| TestError("unlocked file did not refault from disk"))?;
+        mapped_bytes(context, &mm, ADDRESS, &[0x73; PAGE_SIZE]);
+        context.expect_eq(mm.copyout(ADDRESS, &[0x74]).error, None);
+        vm(
+            context,
+            mm.sync_mapping_range(ADDRESS..ADDRESS + PAGE_SIZE, true, false),
+        )?;
+        context.expect_eq(inode.mapping().cached_folio(0).unwrap().dirty_sectors(), 0);
+        context.expect_eq(mm.mapping(ADDRESS).unwrap().permissions.write, false);
+        context.expect_eq(mm.ktest_locked_pages(), 1);
+        context.expect_eq(
+            mm.sync_mapping_range(ADDRESS..ADDRESS + PAGE_SIZE, false, true),
+            Err(VmError::Locked),
+        );
+        checked(context, file.truncate(0))?;
+        context.expect_eq(mm.mapping(ADDRESS).is_none(), true);
+        context.expect_eq(child.mapping(ADDRESS).is_none(), true);
+        context.expect_eq(inode.mapping().cached_folio(0).is_none(), true);
+        context.expect_eq(mm.ktest_locked_pages(), 1);
+        context.expect_eq(
+            mm.lock_memory(ADDRESS, PAGE_SIZE, PAGE_SIZE as u64, false),
+            Err(LockMemoryError::NoMemory),
+        );
+        checked(context, file.write_at(0, &[0x75; PAGE_SIZE]))?;
+        mm.lock_memory(ADDRESS, PAGE_SIZE, PAGE_SIZE as u64, false)
+            .map_err(|_| TestError("locked truncated VMA did not refault after growth"))?;
+        mapped_bytes(context, &mm, ADDRESS, &[0x75; PAGE_SIZE]);
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        let last_physical = mm.mapping(ADDRESS).unwrap().physical;
+        let user = crate::task::UserThread::try_new(
+            mm.clone(),
+            crate::arch::UserContext::new(ADDRESS, ADDRESS + PAGE_SIZE),
+        )
+        .map_err(|_| TestError("last locked file user OOM"))?;
+        let cancelled = task::prepare_user(user, task::Placement::Any, |_| {
+            panic!("cancelled locked file user ran")
+        })
+        .map_err(|_| TestError("last locked file task OOM"))?;
+        context.expect_eq(mm.user_count(), 1);
+        drop(cancelled);
+        context.expect_eq(mm.user_count(), 0);
+        context.expect_eq(mm.ktest_locked_pages(), 0);
+        context.expect_eq(
+            mm.mapping(ADDRESS).map(|leaf| leaf.physical),
+            Some(last_physical),
+        );
+        for _ in 0..4 {
+            let mut attempt = ReclaimAttempt::new();
+            let _ = attempt.reclaim();
+            if inode.mapping().cached_folio(0).is_none() {
+                break;
+            }
+        }
+        context.expect_eq(inode.mapping().cached_folio(0).is_none(), true);
+        context.expect_eq(mm.mapping(ADDRESS).is_none(), true);
+        Ok(())
+    }
+
+    /// 测试目标：验证文件加载、文件/匿名缺页与锁页预故障在物理页耗尽时回收干净文件页；无进展时保留各自真实错误和已提交状态。
     /// 场景步骤：
     /// 1. 写入并同步 19 页文件数据，冷重开后建立只读文件映射、写时复制（COW）私有映射与匿名映射，并将前 16 页预热进页面缓存作为可回收候选页。
     /// 2. 耗尽全部空闲物理页，验证底层物理页分配快速路径不会自动偷收文件缓存；随后根据用例参数触发第 16 页读取、文件映射缺页或匿名缺页。
@@ -89,6 +256,7 @@ pub(super) mod cases {
     #[case("file_like_miss", 0u8)]
     #[case("file_fault", 1u8)]
     #[case("anonymous_zero_fault", 2u8)]
+    #[case("mlock_prepopulate", 3u8)]
     #[ktest(tags("W32", "W33", "fs-reclaim", "fs-slow-consumer"))]
     fn normal_consumers_retry_original_allocator_after_page_none(
         context: &mut TestContext<'_>,
@@ -165,6 +333,14 @@ pub(super) mod cases {
         context.expect_eq(inode.mapping().cached_folio(16).is_none(), true);
         context.expect_eq(mm.mapping(FILE).is_none(), true);
         context.expect_eq(mm.mapping(ANON).is_none(), true);
+        if consumer == 3 {
+            context.expect_eq(
+                mm.lock_memory(ANON, 3 * PAGE_SIZE, (3 * PAGE_SIZE) as u64, false),
+                Err(LockMemoryError::NoMemory),
+            );
+            context.expect_eq(mm.ktest_locked_pages(), 2);
+            context.expect_eq(mm.mapping(ANON).is_none(), true);
+        }
         let mut eof = [0xa7];
         context.expect_eq(file.read_at((19 * PAGE_SIZE) as u64, &mut eof), Ok(0));
         context.expect_eq(eof, [0xa7]);
@@ -218,6 +394,9 @@ pub(super) mod cases {
                 }
                 1 => vm(context, mm.fault(FILE, UserAccess::Read))?,
                 2 => vm(context, mm.fault(ANON, UserAccess::Read))?,
+                3 => mm
+                    .lock_memory(ANON, PAGE_SIZE, (2 * PAGE_SIZE) as u64, false)
+                    .map_err(|_| TestError("mlock did not reclaim its real anonymous page"))?,
                 _ => unreachable!(),
             }
 
@@ -226,7 +405,7 @@ pub(super) mod cases {
                 .count();
             context.expect_eq(0 < retired, true);
             // 候选页未持额外引用，被回收后由目标请求从分配器重新申请并填入新内容；校验目标页的数据内容与物理页帧号。
-            let physical = if consumer == 2 {
+            let physical = if 2 <= consumer {
                 let physical = mm
                     .mapping(ANON)
                     .ok_or(TestError("slow anonymous fault leaf absent"))?
@@ -267,7 +446,7 @@ pub(super) mod cases {
             }
             let after_io = disk.test_snapshot();
             context.expect_eq(after_io.data_submitted, before_io.data_submitted);
-            if consumer != 2 {
+            if consumer < 2 {
                 context.expect_eq(before_io.submitted < after_io.submitted, true);
                 context.expect_eq(before_io.completed < after_io.completed, true);
             }
@@ -299,6 +478,14 @@ pub(super) mod cases {
                         .err(),
                     Some(FsError::NoMemory),
                 );
+            } else if consumer == 3 {
+                context.expect_eq(
+                    mm.lock_memory(ANON + PAGE_SIZE, PAGE_SIZE, (2 * PAGE_SIZE) as u64, false),
+                    Err(LockMemoryError::Again),
+                );
+                context.expect_eq(mm.ktest_locked_pages(), 2);
+                context.expect_eq(mm.mapping(ANON).is_some(), true);
+                context.expect_eq(mm.mapping(ANON + PAGE_SIZE).is_none(), true);
             } else {
                 let address = if consumer == 1 {
                     FILE + PAGE_SIZE
@@ -328,8 +515,8 @@ pub(super) mod cases {
                 Some(private),
             );
             mapped_bytes(context, &mm, SHARED_ALIAS, &[0x93]);
-            context.diagnostic(format_args!("W33 slow consumer={} no-progress-page-none={} real-NoMemory=1 file-api-budget={:?} completed-is-not-freed=1 retained-canonical-pins={}", consumer, finite_none,
-                if consumer == 0 { Some(finite_stats) } else { None }, pins.iter().flatten().count()));
+            context.diagnostic(format_args!("W33 slow consumer={} no-progress-page-none={} expected-error={} file-api-budget={:?} completed-is-not-freed=1 retained-canonical-pins={}", consumer, finite_none,
+                if consumer == 3 { "EAGAIN" } else { "ENOMEM" }, if consumer == 0 { Some(finite_stats) } else { None }, pins.iter().flatten().count()));
             drop((pins, target));
             Ok(())
         })();

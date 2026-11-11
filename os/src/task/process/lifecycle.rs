@@ -31,6 +31,7 @@
 //!
 //! ## 锁获取顺序与并发契约
 //! - **锁层级顺序**：`TaskGraph::slots` ➔ `ThreadGroup::relations` / `UserIdentity::tid` ➔ 信号子系统内部锁（`SignalGroup` / `ThreadSignals`）。
+//! - 组首退出与 `execve` 身份接管的调度参数在获取槽位锁前采样，不在图锁内取得 `SCHED_LOCK`。
 //! - **严禁持自旋锁睡眠或等待回调**：`group.time.stop()`、`tty::hangup_session()`、`Waiter::park()`、`JoinObserver::join()` 以及可能释放最后一个强引用的 `drop()` 均必须在释放 `TaskGraph::slots` 自旋锁后执行。
 //! - **禁止嵌套 `Waiter`**：同一内核任务同一时刻只能激活一个栈上 `Waiter`。因此 `de_thread`、`wait` 与 `wait_root` 必须先结束在 `WaitQueue` 上的 `Waiter` 作用域，随后才能调用内部同样使用 `Waiter` 的 `execution.join.join()`。
 
@@ -116,6 +117,7 @@ impl TaskGraph {
         }
 
         // Step 4: 重置组首元数据与退出信号为 SIGCHLD；若调用线程原本不是组首，将其槽位迁移至 tgid 并接管组首 Pid 对象。
+        let (policy, priority, _) = sched::parameters(&crate::task::current_task());
         let released = {
             let mut slots = self.slots.lock();
             let process = self.exec_process(&mut slots, identity, owner)?;
@@ -124,6 +126,8 @@ impl TaskGraph {
             }
             process.leader_task_id = owner;
             process.leader_status = None;
+            process.leader_policy = policy;
+            process.leader_priority = priority;
             process.control_event = None;
             let leader_charge = process.leader_charge.take();
             identity.group.relations.lock().exit_signal = SIGCHLD;
@@ -235,6 +239,11 @@ impl TaskGraph {
             "invalid Linux exit status"
         );
 
+        let leader_parameters = (identity.tid() == identity.tgid()).then(|| {
+            let (policy, priority, _) = sched::parameters(&crate::task::current_task());
+            (policy, priority)
+        });
+
         // Step 1: 在关系锁内摘除当前线程槽位，归还非组首 NPROC 配额，累加统计信息并判断是否为组内最后一个成员。
         let (user, group, released, exit, stopped, parent, hangup, charge) = {
             let mut slots = self.slots.lock();
@@ -263,7 +272,9 @@ impl TaskGraph {
                 "exiting stale group"
             );
             assert!(process.exit.is_none(), "exiting a reaped process");
-            let charge = if identity.tid() == identity.tgid() {
+            let charge = if let Some((policy, priority)) = leader_parameters {
+                process.leader_policy = policy;
+                process.leader_priority = priority;
                 assert!(
                     process.leader_charge.is_none(),
                     "leader NPROC charge already retired"

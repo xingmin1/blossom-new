@@ -203,6 +203,11 @@ fn writeback_errno(error: FsError) -> u32 {
         FsError::AddressInUse => Errno::AddressInUse as u32,
         FsError::AddressNotAvailable => Errno::AddressNotAvailable as u32,
         FsError::NetworkUnreachable => Errno::NetworkUnreachable as u32,
+        FsError::NoNetwork => Errno::NoNetwork as u32,
+        FsError::ProtocolError => Errno::ProtocolError as u32,
+        FsError::ProtocolOptionNotSupported => Errno::ProtocolOptionNotSupported as u32,
+        FsError::HostDown => Errno::HostDown as u32,
+        FsError::HostUnreachable => Errno::HostUnreachable as u32,
         FsError::ConnectionReset => Errno::ConnectionReset as u32,
         FsError::AlreadyConnected => Errno::AlreadyConnected as u32,
         FsError::NotConnected => Errno::NotConnected as u32,
@@ -1523,6 +1528,8 @@ pub(crate) struct FileRangeData {
     pub(crate) offset: u64,
     /// 标记该映射是否为私有写时复制映射（`MAP_PRIVATE` 为 `true`，`MAP_SHARED` 为 `false`）。
     pub(crate) private: bool,
+    /// 当前 VMA 的锁页标志；回收器只能在 PTE 锁内确认来源和 PFN 后读取，最后用户退出时原地清除。
+    pub(crate) locked: AtomicBool,
 }
 
 impl FileRangeData {
@@ -1539,13 +1546,14 @@ pub(crate) struct FileRangeRegistration {
 }
 
 impl FileRangeRegistration {
-    /// 分配 `FileRangeData` 并将其注册到目标文件 `inode.mapping()` 的反向映射有序表中。
+    /// 分配携带锁页初态的文件范围并注册反向映射；尚未发布的范围不能影响其他来源的 PTE。
     pub(crate) fn try_new(
         inode: InodeRef,
         domain: Arc<PteDomain>,
         range: Range<usize>,
         offset: u64,
         private: bool,
+        locked: bool,
     ) -> Result<Self, BlockError> {
         let data = Arc::try_new(FileRangeData {
             inode,
@@ -1553,6 +1561,7 @@ impl FileRangeRegistration {
             range,
             offset,
             private,
+            locked: AtomicBool::new(locked),
         })
         .map_err(|_| BlockError::NoMemory)?;
         data.inode.mapping().register_range(&data)?;
@@ -1850,7 +1859,7 @@ impl FileMapping {
 
     /// 在常规内存回收（`ReclaimMode::Normal`）路径中，尝试清理并卸载指向指定干净文件页 `folio` 的所有用户态页表映射。
     ///
-    /// 若遍历过程中发现共享映射（`MAP_SHARED`）的页表项带有硬件脏位，则将其转为页缓存脏扇区并中止对该页的回收（返回 `false`）。
+    /// 共享映射的硬件脏位转为页缓存脏扇区；当前锁定的映射在 PTE 锁内拒绝卸载，两者均令该页本轮回收失败。
     fn reclaim_mappings(
         &self,
         inode: &InodeRef,
@@ -1938,7 +1947,7 @@ impl FileMapping {
                 // 1. `data` 由 `sources` 数组中的 `Arc<FileRangeData>` 强引用保活，且当前持有 `self.ranges` 自旋锁。
                 // 2. `unmap_file_folio` 仅卸载仍指向 `folio.phys_addr()` 的文件后备页表项（不影响私有匿名 COW 页），
                 //    且卸下的引用存入 `pages` 和 `tables`，在下方锁外完成 `sync_retired` 全核 TLB 同步后才释放。
-                unmapped += unsafe {
+                let (removed, locked) = unsafe {
                     data.domain.unmap_file_folio(
                         data,
                         start,
@@ -1947,6 +1956,8 @@ impl FileMapping {
                         &mut tables,
                     )
                 };
+                unmapped += removed;
+                complete &= !locked;
             }
         }
 

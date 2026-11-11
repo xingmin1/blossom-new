@@ -215,6 +215,8 @@ pub enum MemorySpecial {
     Null,
     /// `/dev/zero` 零字符设备。
     Zero,
+    /// `/dev/urandom` 非阻塞随机字节字符设备。
+    Urandom,
     /// `/dev/ttyS0` 串口终端字符设备。
     TtySerial,
     /// `/dev/console` 系统控制台字符设备。
@@ -513,6 +515,7 @@ impl MemoryFs {
                 MemoryFsKind::Devfs,
                 MemorySpecial::Null
                 | MemorySpecial::Zero
+                | MemorySpecial::Urandom
                 | MemorySpecial::TtySerial
                 | MemorySpecial::Console
                 | MemorySpecial::ControllingTty

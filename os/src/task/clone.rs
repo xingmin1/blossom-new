@@ -265,13 +265,13 @@ pub(crate) fn create(
     )
     .map_err(program_error)?;
 
-    // Step 4: 继承父任务的 CPU 亲和性掩码，并在需要 vfork 时绑定完成通知原语。
+    // 子任务发布前继承调度属性；vfork 完成通知绑定到同一子任务。
     let parent = user.executor().expect("clone has no parent executor");
     let child = program
         .user()
         .executor()
         .expect("clone has no child executor");
-    crate::sched::inherit_affinity(&parent, &child);
+    crate::sched::inherit_scheduling(&parent, &child);
     let pid = program.pid();
     let vfork = if arguments.vfork {
         let completion = Arc::try_new(Completion::new()).map_err(|_| CloneError::NoMemory)?;

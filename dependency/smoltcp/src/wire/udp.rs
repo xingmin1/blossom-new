@@ -1,5 +1,5 @@
 use byteorder::{ByteOrder, NetworkEndian};
-use core::fmt;
+use core::{cmp, fmt};
 
 use super::{Error, Result};
 use crate::phy::ChecksumCapabilities;
@@ -245,6 +245,28 @@ impl Repr {
         })
     }
 
+    /// 解析 ICMP 引用中的完整 UDP 首部，并借用实际携带的正文。
+    /// 原 UDP 长度可以超过引用范围，因此不校验完整报文长度或校验和。
+    pub fn parse_quote(data: &[u8]) -> Result<(Repr, &[u8])> {
+        if data.len() < HEADER_LEN {
+            return Err(Error);
+        }
+
+        let packet = Packet::new_unchecked(data);
+        let end = cmp::min(data.len(), packet.len() as usize);
+        if end < HEADER_LEN || packet.dst_port() == 0 {
+            return Err(Error);
+        }
+
+        Ok((
+            Repr {
+                src_port: packet.src_port(),
+                dst_port: packet.dst_port(),
+            },
+            &data[HEADER_LEN..end],
+        ))
+    }
+
     /// Return the length of the packet header that will be emitted from this high-level representation.
     pub const fn header_len(&self) -> usize {
         HEADER_LEN
@@ -480,5 +502,48 @@ mod test {
         )
         .unwrap();
         assert_eq!(repr, packet_repr());
+    }
+
+    /// 完整 UDP 首部和部分正文构成合法引用，但不能作为普通完整 UDP 报文解析。
+    #[test]
+    fn test_parse_quote_truncated_datagram() {
+        let bytes = [
+            0xbf, 0x00, 0x00, 0x35, 0x02, 0x00, 0x12, 0x4d, 0xaa, 0x00, 0x00, 0xff,
+        ];
+        let (repr, data) = Repr::parse_quote(&bytes).unwrap();
+        assert_eq!(repr.src_port, 48896);
+        assert_eq!(repr.dst_port, 53);
+        assert_eq!(data, &bytes[8..]);
+        assert_eq!(data.as_ptr(), bytes[8..].as_ptr());
+        assert_eq!(Packet::new_checked(&bytes), Err(Error));
+    }
+
+    /// 八字节 UDP 首部可形成空正文引用，缺少首部字节或声明长度非法时拒绝。
+    #[test]
+    fn test_parse_quote_minimum_header() {
+        let mut bytes = [0x00, 0x00, 0x00, 0x35, 0x02, 0x00, 0x12, 0x4d];
+        let (repr, data) = Repr::parse_quote(&bytes).unwrap();
+        assert_eq!(repr.src_port, 0);
+        assert_eq!(repr.dst_port, 53);
+        assert!(data.is_empty());
+        for len in 0..HEADER_LEN {
+            assert_eq!(Repr::parse_quote(&bytes[..len]), Err(Error));
+        }
+
+        Packet::new_unchecked(&mut bytes).set_len(7);
+        assert_eq!(Repr::parse_quote(&bytes), Err(Error));
+        Packet::new_unchecked(&mut bytes).set_len(8);
+        Packet::new_unchecked(&mut bytes).set_dst_port(0);
+        assert_eq!(Repr::parse_quote(&bytes), Err(Error));
+    }
+
+    /// 引用中的额外字节不能越过 UDP 自身声明的正文末端。
+    #[test]
+    fn test_parse_quote_excludes_trailing_bytes() {
+        let bytes = [
+            0xbf, 0x00, 0x00, 0x35, 0x00, 0x0a, 0x12, 0x4d, 0xaa, 0x00, 0x00, 0xff,
+        ];
+        let (_, data) = Repr::parse_quote(&bytes).unwrap();
+        assert_eq!(data, &bytes[8..10]);
     }
 }
