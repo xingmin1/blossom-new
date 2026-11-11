@@ -55,7 +55,7 @@ impl UserOwner {
     ///
     /// 场景步骤（Given-When-Then）：
     /// 1. Given: 挂载包含终端设备的 `devfs`，将全局终端属性重置为默认 `Termios` 并刷新输入输出队列，加载指定 `mode` 的 `/test/bin/user-tty` 程序。
-    /// 2. When: 启动用户进程，根据 `mode`（`"r"` 原始读写、`"c"` 规范行编辑、`"v"` `VMIN`/`VTIME` 组合、`"p"` 多路复用轮询、`"e"` 字符回显、`"o"` 输出满阻塞、`"t"` 属性切换刷新、`"x"` 软件流控）分阶段注入接收字节、校验发送字节并观测线程阻塞状态。
+    /// 2. When: 启动用户进程，根据 `mode`（`"r"` 原始读写、`"c"` 规范行编辑、`"v"` `VMIN`/`VTIME` 组合、`"p"` 多路复用轮询、`"e"` 字符回显、`"o"` 输出满阻塞、`"t"` 属性切换刷新、`"x"` 软件流控、`"g"` 父子分段输出）分阶段注入接收字节、校验发送字节并观测线程阻塞状态。
     /// 3. Then: 在最终关闭门控（阶段 `99`）放行用户进程关闭终端描述符并退出，验证退出状态码为 `0`，最后排空终端异步工作队列并恢复默认 `Termios`。
     pub(super) fn tty_abi(&mut self, context: &mut TestContext<'_>, mode: &[u8]) -> TestResult {
         // Step 1: 准备 TTY 测试环境并重置终端 Termios 为默认配置，加载并启动用户态测试程序。
@@ -273,6 +273,17 @@ impl UserOwner {
                     TtyWait::Blocked,
                 )?;
             }
+            b"g" => self.tty_stage(
+                context,
+                &mm,
+                &executor,
+                1,
+                b"",
+                b"cpid: 123\ncpid: 0\ncpid: x\nnext\n",
+                0,
+                0,
+                TtyWait::GateOnly,
+            )?,
             _ => return Err(TestError("unknown TTY user mode")),
         }
 

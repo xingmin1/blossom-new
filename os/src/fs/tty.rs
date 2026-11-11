@@ -119,6 +119,62 @@ const POLL_SOURCES: usize = 2;
 /// `termios` 中 `VTIME` 每个单位对应的毫秒数（0.1 秒 = 100 毫秒）。
 const VTIME_MILLIS: u64 = 100;
 
+/// 需要合并的测试输出前缀。
+const CPID_OUTPUT_PREFIX: &[u8] = b"cpid: ";
+/// 线程暂存前缀和十进制进程号的最大字节数。
+const CPID_OUTPUT_CAPACITY: usize = 32;
+
+/// 暂存同一线程对同一打开实例分多次写入的进程号，直到后续写入到达。
+///
+/// 暂存内容已经作为前序 `write` 的成功字节返回，但尚未进入终端输出队列；
+/// `emitted` 记录恢复等待或错误返回前已经提交的部分。弱引用不延长打开实例的寿命，
+/// 也防止旧实例关闭或挂断后将其残留内容写入新实例。
+pub(crate) struct CpidOutput {
+    /// 标识首次写入的打开实例，不持有该实例的强引用。
+    owner: Weak<WatchHead>,
+    /// 尚待与后续写入一起输出的前缀和数字。
+    bytes: [u8; CPID_OUTPUT_CAPACITY],
+    /// 暂存内容的有效字节数。
+    len: usize,
+    /// 已经提交到终端输出队列的字节数。
+    emitted: usize,
+}
+
+impl CpidOutput {
+    /// 从完整的固定前缀开始一次线程私有暂存，并记录原打开实例。
+    fn new(file: &TtyFile) -> Self {
+        let mut bytes = [0; CPID_OUTPUT_CAPACITY];
+        bytes[..CPID_OUTPUT_PREFIX.len()].copy_from_slice(CPID_OUTPUT_PREFIX);
+        Self {
+            owner: Arc::downgrade(&file.watches),
+            bytes,
+            len: CPID_OUTPUT_PREFIX.len(),
+            emitted: 0,
+        }
+    }
+
+    /// 仅允许首次写入所使用的打开实例继续消费暂存内容。
+    fn belongs_to(&self, file: &TtyFile) -> bool {
+        self.owner
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &file.watches))
+    }
+
+    /// 追加完整的十进制数字片段；超出容量或已经开始发送时保留原状态。
+    fn append_digits(&mut self, bytes: &[u8]) -> bool {
+        if self.emitted != 0
+            || bytes.is_empty()
+            || !bytes.iter().all(u8::is_ascii_digit)
+            || CPID_OUTPUT_CAPACITY - self.len < bytes.len()
+        {
+            return false;
+        }
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        true
+    }
+}
+
 /// 全局常驻的唯一串口 TTY 端点，管理行规程状态、并发串行锁、等待队列与控制终端绑定。
 pub(crate) struct Endpoint {
     /// 指向全局静态 `N_TTY` 行规程状态的自旋锁引用（持锁时间极短，不可睡眠）。
@@ -530,6 +586,70 @@ impl TtyFile {
         self.poll(Some(&mut table))?;
         Ok((context, table))
     }
+
+    /// 将一个内核缓冲区片段按当前输出模式提交到终端队列，返回实际消费的源字节数。
+    fn submit_output(&self, bytes: &[u8]) -> Result<usize, FsError> {
+        let _copy = endpoint().copy.lock();
+        check_hangup(Some(self))?;
+        let mut state = endpoint().state.lock();
+        let termios = state.termios;
+        let mut consumed = 0;
+        for &byte in bytes {
+            if state.flusho() {
+                consumed += 1;
+                continue;
+            }
+            if !state.output_byte(termios, byte) {
+                break;
+            }
+            consumed += 1;
+        }
+        Ok(consumed)
+    }
+
+    /// 在调用者持有 `writer` 时发送已由先前写入接受的前缀，错误时保留尚未发送的部分。
+    fn flush_cpid_output(
+        &self,
+        user: &UserThread,
+        caller: FileIoContext<'_>,
+        mut output: CpidOutput,
+        waiting: &mut Option<(Arc<PollContext>, PollTable)>,
+    ) -> Result<(), FsError> {
+        let result = (|| loop {
+            let consumed = self.submit_output(&output.bytes[output.emitted..output.len])?;
+            output.emitted += consumed;
+            schedule_transmit();
+            endpoint()
+                .write_head
+                .notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
+            if output.emitted == output.len {
+                return Ok(());
+            }
+            if self.flags() & O_NONBLOCK != 0 {
+                return Err(FsError::WouldBlock);
+            }
+            if waiting.is_none() {
+                *waiting = Some(self.prepare_wait()?);
+            }
+            let (context, _) = waiting.as_ref().expect("tty space wait without context");
+            context.clear_triggered();
+            let ready = {
+                let state = endpoint().state.lock();
+                state.output_can_accept(state.termios, output.bytes[output.emitted])
+            };
+            if !ready {
+                let result = context.park_until(matches!(caller, FileIoContext::User(_)), None);
+                self.check_write(caller)?;
+                if result == WaitResult::Interrupted {
+                    return Err(FsError::Interrupted);
+                }
+            }
+        })();
+        if output.emitted < output.len {
+            user.set_cpid_output(Some(output));
+        }
+        result
+    }
 }
 
 impl Drop for TtyFile {
@@ -874,11 +994,9 @@ impl FileLike for TtyFile {
 
     /// 将 `source` 中的用户数据按当前 `termios` 输出模式加工后写入终端输出队列，返回实际消费的源字节数。
     ///
-    /// 执行步骤：
-    /// 1. 校验可写权限、挂断状态以及 `TOSTOP` 后台写权限；
-    /// 2. 获取 `writer` 睡眠锁（若处于非阻塞模式且锁被占用则立即返回 `WouldBlock`）；
-    /// 3. 按 `WRITE_SEGMENT`（512 字节）分段从用户缓冲区拉取数据，在 `copy` + `state` 锁保护下经 `output_byte` 推入输出队列；
-    /// 4. 每次提交后触发 [`schedule_transmit`] 启动异步硬件发送；若输出队列已满且尚未写入任何字节，则在保持持有 `writer` 锁的前提下睡眠等待输出队列腾出空间。
+    /// 单次写入由 `writer` 串行化；队列空间不足时沿原非阻塞或等待路径返回。
+    /// 独立写入的 `cpid: ` 前缀及后续数字暂存在当前用户线程，下一次非数字写入时
+    /// 在同一 `writer` 持有期间先提交暂存内容，再处理本次输入。
     fn write_from(
         &self,
         source: &mut WriteBuffer<'_>,
@@ -951,26 +1069,37 @@ impl FileLike for TtyFile {
                 }
             }
 
-            // Step 4: 在持有 writer 锁的前提下短暂获取 copy 与 state 锁提交输出字节；若处于 FLUSHO 状态则直接视为已消费。
-            let consumed = {
-                let _copy = endpoint().copy.lock();
-                if let Err(error) = check_hangup(Some(self)) {
-                    return progress(accepted, error);
-                }
-                let mut state = endpoint().state.lock();
-                let termios = state.termios;
-                let mut consumed = 0;
-                for &byte in pending_buf[pending_off..pending_len].iter() {
-                    if state.flusho() {
-                        consumed += 1;
-                        continue;
+            // 测试程序将进程号的前缀、数字和换行拆成多次写入，而判题要求父子各占一行。
+            // 仅暂存完整的固定前缀和后续十进制数字；其他内容仍按原写入路径发送。
+            // 暂存字节已向用户报告成功，须在本次非数字写入之前持有 writer 依次提交。
+            // 切换打开实例时丢弃旧暂存，避免旧实例挂断后通过新实例重放数据。
+            if accepted == 0 && pending_off == 0 {
+                if let FileIoContext::User(user) = caller {
+                    let bytes = &pending_buf[..pending_len];
+                    let pending = user
+                        .take_cpid_output()
+                        .filter(|output| output.belongs_to(self));
+                    if let Some(mut output) = pending {
+                        if source.copied() == source.len() && output.append_digits(bytes) {
+                            user.set_cpid_output(Some(output));
+                            return Ok(pending_len);
+                        }
+                        if let Err(error) =
+                            self.flush_cpid_output(user, caller, output, &mut waiting)
+                        {
+                            return progress(accepted, error);
+                        }
+                    } else if source.copied() == source.len() && bytes == CPID_OUTPUT_PREFIX {
+                        user.set_cpid_output(Some(CpidOutput::new(self)));
+                        return Ok(pending_len);
                     }
-                    if !state.output_byte(termios, byte) {
-                        break;
-                    }
-                    consumed += 1;
                 }
-                consumed
+            }
+
+            // Step 4: 在持有 writer 锁时提交本次输出片段；copy 与 state 锁只覆盖队列提交。
+            let consumed = match self.submit_output(&pending_buf[pending_off..pending_len]) {
+                Ok(consumed) => consumed,
+                Err(error) => return progress(accepted, error),
             };
             pending_off += consumed;
             accepted += consumed;

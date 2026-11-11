@@ -262,6 +262,74 @@ static void flow_resume(void)
     done(2);
 }
 
+/// 单字节管道握手保留真实系统调用返回值和检查号。
+static void pipe_step(long fd, int send, long check)
+{
+    unsigned char byte = 1;
+    result(probe_sys3(send ? SYS_write : SYS_read, fd, &byte, 1), 1, check);
+}
+
+/// 子进程按父进程的管道通知分三次写入同一个 TTY OFD。
+static void cpid_child(void *argument, unsigned long entry_sp, unsigned long entry_tp)
+{
+    int *pipes = argument;
+    (void)entry_sp;
+    (void)entry_tp;
+    PROBE_CHECK(130, probe_sys1(SYS_close, pipes[1]) == 0);
+    PROBE_CHECK(131, probe_sys1(SYS_close, pipes[2]) == 0);
+    pipe_step(pipes[0], 0, 132);
+    write_bytes("cpid: ", 6, 133);
+    pipe_step(pipes[3], 1, 134);
+    pipe_step(pipes[0], 0, 135);
+    write_bytes("0", 1, 136);
+    pipe_step(pipes[3], 1, 137);
+    pipe_step(pipes[0], 0, 138);
+    write_bytes("\n", 1, 139);
+    pipe_step(pipes[3], 1, 140);
+    PROBE_CHECK(141, probe_sys1(SYS_close, pipes[0]) == 0);
+    PROBE_CHECK(142, probe_sys1(SYS_close, pipes[3]) == 0);
+    PROBE_CHECK(143, probe_sys1(SYS_close, tty_fd) == 0);
+    probe_exit(0);
+}
+
+/// 两条管道固定父子分段写入顺序，并检查非数字后继及关闭后的暂存。
+static void cpid_interleaved(void)
+{
+    int pipes[4];
+    int status = -1;
+    configure(0, 0, 0, 1, 0);
+    PROBE_CHECK(144, probe_sys2(SYS_pipe2, pipes, 0) == 0);
+    PROBE_CHECK(145, probe_sys2(SYS_pipe2, pipes + 2, 0) == 0);
+    long child = probe_clone(17, 0, 0, 0, 0, cpid_child, pipes);
+    PROBE_CHECK(146, 0 < child);
+    PROBE_CHECK(147, probe_sys1(SYS_close, pipes[0]) == 0);
+    PROBE_CHECK(148, probe_sys1(SYS_close, pipes[3]) == 0);
+    gate(1);
+    write_bytes("cpid: ", 6, 149);
+    pipe_step(pipes[1], 1, 150);
+    pipe_step(pipes[2], 0, 151);
+    write_bytes("123", 3, 152);
+    pipe_step(pipes[1], 1, 153);
+    pipe_step(pipes[2], 0, 154);
+    write_bytes("\n", 1, 155);
+    pipe_step(pipes[1], 1, 156);
+    pipe_step(pipes[2], 0, 157);
+    PROBE_CHECK(158, probe_sys1(SYS_close, pipes[1]) == 0);
+    PROBE_CHECK(159, probe_sys1(SYS_close, pipes[2]) == 0);
+    PROBE_CHECK(160, probe_sys4(SYS_wait4, child, &status, 0, 0) == child);
+    PROBE_CHECK(161, status == 0);
+    write_bytes("cpid: ", 6, 162);
+    write_bytes("x\n", 2, 163);
+    write_bytes("cpid: ", 6, 164);
+    write_bytes("7", 1, 165);
+    long next_fd = probe_sys4(SYS_openat, -100, "/dev/ttyS0", 2, 0);
+    PROBE_CHECK(166, 0 <= next_fd);
+    PROBE_CHECK(167, probe_sys1(SYS_close, tty_fd) == 0);
+    tty_fd = next_fd;
+    write_bytes("next\n", 5, 168);
+    done(1);
+}
+
 /// 原始argc和空fd表不经CRT处理，全部UART阶段核完才关闭最后OFD。
 _Noreturn void probe_main(const unsigned long *initial_stack)
 {
@@ -281,6 +349,7 @@ _Noreturn void probe_main(const unsigned long *initial_stack)
     case 'o': output_drain(); break;
     case 't': termios_atomic(); break;
     case 'x': flow_resume(); break;
+    case 'g': cpid_interleaved(); break;
     default: probe_failure(4);
     }
     gate(99);

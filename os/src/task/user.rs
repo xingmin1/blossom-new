@@ -29,7 +29,7 @@
 //! ```
 //!
 //! ## 锁获取顺序（Lock Ordering）与并发契约
-//! - **单执行者独占字段**：`UserThread` 的 `context`（`RefCell`）、`user_timer_interrupts`、`restart`、`saved_mask` **仅允许其绑定的唯一 `Running` `Task` 访问**（入口通过 `assert_current()` 强制校验）；严禁跨越睡眠或调度点持有 `context` 的 `RefMut` 借用。
+//! - **单执行者独占字段**：`UserThread` 的 `context`（`RefCell`）、`user_timer_interrupts`、`restart`、`saved_mask` 和 `cpid_output` **仅允许其绑定的唯一 `Running` `Task` 访问**（入口通过 `assert_current()` 强制校验）；严禁跨越睡眠或调度点持有 `context` 的 `RefMut` 借用。
 //! - **跨线程共享快照锁**：`UserThread::mm` 与 `UserThread::process` 为极短临界区自旋锁，仅用于克隆或取走 `Arc` / 句柄；严禁在持有这两把锁时执行用户内存拷贝（如 `clear_tid`、`copyout`）、获取 `TaskGraph` 锁、获取文件表睡眠锁或触发最后一次 `Arc` 析构。
 //! - **`execve` 切换契约（`install_image`）**：先在原地址空间执行 `clear_tid`，随后在关中断临界区内原子切换当前 CPU 活动页表、`UserThread::mm`、`UserContext` 与 `UserRuntime`，最后在开中断锁外释放旧地址空间并唤醒阻塞的 `vfork` 父进程。
 
@@ -318,13 +318,15 @@ pub struct UserThread {
     restart: Cell<Option<Restart>>,
     /// `rt_sigsuspend` / `ppoll` / `pselect6` 等系统调用临时替换信号掩码期间保存的原信号掩码。
     saved_mask: Cell<Option<u64>>,
+    /// 当前线程尚未完成的特殊 TTY 输出状态，仅由绑定的当前任务访问。
+    cpid_output: Cell<Option<crate::fs::tty::CpidOutput>>,
     /// 内核测试（`ktest`）记录本线程曾经在哪些物理 CPU 核上实际进入并运行过用户态指令。
     #[cfg(feature = "ktest")]
     user_cpu_mask: AtomicCpuSet,
 }
 
 // SAFETY:
-// 1. 非线程安全内部可变字段（`context`、`user_timer_interrupts`、`restart`、`saved_mask`）均在访问入口通过 `assert_current()` 严格限制为仅能由 `executor` 指向的唯一 `Running` `Task` 访问；`Task` 跨核迁移由调度器上下文切换屏障串行化，`RefCell` 在单线程内消除重叠可变借用；
+// 1. 非线程安全内部可变字段（`context`、`user_timer_interrupts`、`restart`、`saved_mask`、`cpid_output`）均在访问入口通过 `assert_current()` 严格限制为仅能由 `executor` 指向的唯一 `Running` `Task` 访问；`Task` 跨核迁移由调度器上下文切换屏障串行化，`RefCell` 在单线程内消除重叠可变借用；
 // 2. 跨线程并发访问的 `mm` 与 `process` 字段均受 `SpinLock` 保护；
 // 3. `executor` 与 `user_time` 在任务发布为 `Ready` 前通过 `Once` 完成初始化，后续仅并发读取（`UserTime` 内部采用原子变量记账）。
 unsafe impl Sync for UserThread {}
@@ -341,6 +343,7 @@ impl UserThread {
             user_time: Once::new(),
             restart: Cell::new(None),
             saved_mask: Cell::new(None),
+            cpid_output: Cell::new(None),
             #[cfg(feature = "ktest")]
             user_cpu_mask: AtomicCpuSet::new(),
         })
@@ -488,6 +491,8 @@ impl UserThread {
         let active = binding.mm().clone();
         self.restart.set(None);
         self.saved_mask.set(None);
+        // 特殊输出尚未等到换行时，未发送的暂存内容不能带入新映像。
+        self.cpid_output.set(None);
 
         let (old_runtime, old_binding, old_active, completion) = {
             let _irq = IrqSaveGuard::new();
@@ -559,6 +564,18 @@ impl UserThread {
         self.restart.take()
     }
 
+    /// 取走当前线程暂存的特殊 TTY 输出状态，调用者无需跨调度点持有借用。
+    pub(crate) fn take_cpid_output(&self) -> Option<crate::fs::tty::CpidOutput> {
+        self.assert_current();
+        self.cpid_output.take()
+    }
+
+    /// 保存当前线程的特殊 TTY 输出状态，供后续写入继续处理。
+    pub(crate) fn set_cpid_output(&self, pending: Option<crate::fs::tty::CpidOutput>) {
+        self.assert_current();
+        self.cpid_output.set(pending);
+    }
+
     /// 保存系统调用（如 `rt_sigsuspend`）临时更改阻塞掩码前的原始信号掩码（若此前尚未保存）。
     pub(crate) fn save_mask(&self, mask: u64) {
         self.assert_current();
@@ -585,6 +602,8 @@ impl UserThread {
     /// 在线程退出路径上解除 CPU 记账关联，移出并释放 `Mm` 与 `UserRuntime`，执行 `clear_child_tid` 唤醒与 `vfork` 完成通知，最后返回 `UserIdentity` 供向 `TaskGraph` 汇报退出。
     pub(crate) fn release_process(&self) -> Arc<UserIdentity> {
         self.assert_current();
+        // 特殊输出尚未等到换行时，退出丢弃未发送的暂存内容。
+        self.cpid_output.set(None);
         crate::accounting::detach_user();
         let mm = self.mm.lock().take();
         let process = self

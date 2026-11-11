@@ -161,6 +161,16 @@ pub(crate) mod serial_programs {
         fixture.tty_abi(context, b"x")
     }
 
+    /// 测试目标：验证父子交错写入的 cpid 行、非数字后继及关闭原 TTY 后新描述符的输出。
+    #[test]
+    #[ktest(tags("user-tty"), resources("uart"), timeout_ms = 90000)]
+    fn tty_cpid_interleaved_process_writes(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+    ) -> TestResult {
+        fixture.tty_abi(context, b"g")
+    }
+
     /// 测试目标：验证前后台进程组切换时的终端信号投递语义，包括后台读触发 `SIGTTIN`、后台写触发 `SIGTTOU`、终端输入控制字符触发组信号，以及孤儿进程组挂断时的 `SIGHUP`/`SIGCONT` 投递。
     #[test]
     #[ktest(
