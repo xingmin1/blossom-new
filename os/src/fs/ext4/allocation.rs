@@ -47,7 +47,7 @@ use crate::fs::types::{S_IALLUGO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRWXUGO, 
 use crate::fs::{FsError, InodeKind, InodeRef};
 use crate::time;
 use alloc::vec::Vec;
-use core::convert::TryFrom;
+use core::convert::{TryFrom, TryInto};
 
 /// 块组内固定元数据表项的物理块起始地址（卷打开时解码并校验一次，运行期只读）。
 #[derive(Clone, Copy)]
@@ -868,8 +868,7 @@ impl Ext4Volume {
             } else {
                 0
             };
-            let bit =
-                bitmap.with_read(|bits| (first..valid).find(|&bit| !bit_is_set(bits, bit)))?;
+            let bit = bitmap.with_read(|bits| first_free_bit(bits, first, valid))?;
             let Some(bit) = bit else {
                 return Err(FsError::Corrupt);
             };
@@ -1075,6 +1074,37 @@ fn valid_bits(g: &Geometry, group: u64, inode: bool) -> usize {
     }
 }
 
+/// 按 ext4 小端位序查找 `[first, valid)` 内的首个空闲位。
+///
+/// 位图字节长度必须为 8 的倍数，`valid` 不得超过位图容量；空范围或没有空闲位时返回 `None`。
+fn first_free_bit(bits: &[u8], first: usize, valid: usize) -> Option<usize> {
+    assert_eq!(bits.len() % 8, 0, "ext4 bitmap length is not word-aligned");
+    let capacity = bits
+        .len()
+        .checked_mul(8)
+        .expect("ext4 bitmap capacity overflow");
+    assert!(valid <= capacity, "ext4 bitmap valid bits exceed capacity");
+    if valid <= first {
+        return None;
+    }
+
+    let mut mask = u64::MAX << (first % 64);
+    for (index, bytes) in bits.chunks_exact(8).enumerate().skip(first / 64) {
+        let base = index * 64;
+        if valid <= base {
+            break;
+        }
+        let word = u64::from_le_bytes(bytes.try_into().expect("ext4 bitmap word"));
+        let free = !word & mask;
+        if free != 0 {
+            let bit = base + free.trailing_zeros() as usize;
+            return (bit < valid).then_some(bit);
+        }
+        mask = u64::MAX;
+    }
+    None
+}
+
 /// 按 ext4 盘面小端位序（字节内 LSB 对应最小编号）检查位图第 `bit` 位是否已置为占用。
 fn bit_is_set(bits: &[u8], bit: usize) -> bool {
     bits[bit / 8] & (1 << (bit % 8)) != 0
@@ -1114,5 +1144,67 @@ fn mark_metadata(g: &Geometry, layouts: &[GroupLayout], group: u64, bits: &mut [
 fn mark_range(bits: &mut [u8], first: u64, end: u64, start: u64, len: u64) {
     for physical in start.max(first)..(start + len).min(end) {
         set_bit(bits, (physical - first) as usize, true);
+    }
+}
+
+#[cfg(feature = "ktest")]
+#[::ktest::suite(context = "Boot", tags("ext4", "ext4-allocation"), timeout_ms = 1000)]
+mod checks {
+    use super::first_free_bit;
+
+    /// 验证首空位查找在非零起点、跨字和末组边界始终保持小端 first-fit。
+    #[test]
+    fn first_free_bit_boundaries() {
+        let free = [0u8; 24];
+        assert_eq!(first_free_bit(&[], 0, 0), None);
+        assert_eq!(first_free_bit(&free, 0, 0), None);
+        assert_eq!(first_free_bit(&free, 5, 5), None);
+        assert_eq!(first_free_bit(&free, 6, 5), None);
+        assert_eq!(first_free_bit(&free, 0, 192), Some(0));
+        assert_eq!(first_free_bit(&free, 5, 192), Some(5));
+        assert_eq!(first_free_bit(&free, 63, 192), Some(63));
+        assert_eq!(first_free_bit(&free, 64, 192), Some(64));
+        assert_eq!(first_free_bit(&free, 127, 128), Some(127));
+
+        let occupied = [0xffu8; 24];
+        assert_eq!(first_free_bit(&occupied, 0, 192), None);
+        assert_eq!(first_free_bit(&occupied, 63, 129), None);
+        assert_eq!(first_free_bit(&occupied, 127, 128), None);
+
+        let bits = [
+            0xfa, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xfe, 0xfd, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x7f, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+        ];
+        for (first, valid, expected) in [
+            (0, 192, Some(0)),
+            (1, 192, Some(2)),
+            (2, 192, Some(2)),
+            (3, 192, Some(8)),
+            (9, 63, None),
+            (9, 64, Some(63)),
+            (63, 64, Some(63)),
+            (64, 64, None),
+            (64, 65, Some(64)),
+            (65, 73, None),
+            (65, 74, Some(73)),
+            (74, 127, None),
+            (74, 128, Some(127)),
+            (128, 129, Some(128)),
+            (129, 191, None),
+            (129, 192, Some(191)),
+        ] {
+            assert_eq!(
+                first_free_bit(&bits, first, valid),
+                expected,
+                "first={} valid={}",
+                first,
+                valid
+            );
+        }
+
+        let mut block = [0xffu8; 1024];
+        block[1023] = 0x7f;
+        assert_eq!(first_free_bit(&block, 0, 8191), None);
+        assert_eq!(first_free_bit(&block, 0, 8192), Some(8191));
     }
 }

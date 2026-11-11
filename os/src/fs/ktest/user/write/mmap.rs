@@ -144,6 +144,94 @@ pub(super) mod cases {
         Ok(())
     }
 
+    /// 验证完整块增长时旧尾页的共享写权限及文件内容。
+    /// 同页增长撤销旧映射的写权限，跨页增长验证新页首次写授权。
+    #[test]
+    #[ktest(tags("W15", "fs-shared"), min_cpus = 2)]
+    fn shared_full_block_tail_growth(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let file = fixture.open(context, b"/test/write-reserve", 2)?;
+        let inode = fixture.inodes.last().unwrap().clone();
+        let block = fixture.volume().geometry().block_size;
+        let page_offset = checked(context, file.stat())?
+            .size
+            .div_ceil(PAGE_SIZE as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(TestError("full block tail offset overflow"))?;
+        let prefix = [0x39; PAGE_SIZE];
+        context.expect_eq(
+            checked(context, file.write_at(page_offset, &prefix[..block]))?,
+            block,
+        );
+        let before = checked(context, file.stat())?;
+        context.expect_eq(before.size, page_offset + block as u64);
+
+        let mm = shared_alias(context, &file, page_offset)?;
+        let alias = shared_alias(context, &file, page_offset)?;
+        context.expect_eq(
+            mm.mapping(SHARED_ALIAS).unwrap().physical,
+            alias.mapping(SHARED_ALIAS).unwrap().physical,
+        );
+        context.expect_eq(mm.copyout(SHARED_ALIAS, &[0x39]).copied, 1);
+        context.expect_eq(alias.copyout(SHARED_ALIAS, &[0x39]).copied, 1);
+        let target = SHARED_ALIAS + block;
+        let mut payload = [0xde; PAGE_SIZE];
+        if block < PAGE_SIZE {
+            context.expect_eq(mm.copyout(target, &payload[..block]).copied, block);
+            mapped_bytes(context, &alias, target, &payload[..block]);
+        }
+        context.expect_eq(mm.mapping(SHARED_ALIAS).unwrap().permissions.write, true);
+        context.expect_eq(alias.mapping(SHARED_ALIAS).unwrap().permissions.write, true);
+        let polluted = checked(context, file.stat())?;
+        context.expect_eq(
+            (polluted.size, polluted.blocks),
+            (before.size, before.blocks),
+        );
+
+        payload[..block].fill(0x73);
+        context.expect_eq(
+            checked(context, file.write_at(before.size, &payload[..block]))?,
+            block,
+        );
+        if block < PAGE_SIZE {
+            context.expect_eq(mm.mapping(SHARED_ALIAS).unwrap().permissions.write, false);
+            context.expect_eq(
+                alias.mapping(SHARED_ALIAS).unwrap().permissions.write,
+                false,
+            );
+        }
+        bytes_at(context, &file, page_offset, &prefix[..block])?;
+        bytes_at(context, &file, before.size, &payload[..block])?;
+        mapped_bytes(context, &mm, target, &payload[..block]);
+        mapped_bytes(context, &alias, target, &payload[..block]);
+        context.expect_eq(mm.mapping(target).unwrap().permissions.write, false);
+        context.expect_eq(alias.mapping(target).unwrap().permissions.write, false);
+
+        let grants = mm.ktest_mkwrite_count();
+        context.expect_eq(mm.copyout(target + 128, &[0x74]).copied, 1);
+        context.expect_eq(grants < mm.ktest_mkwrite_count(), true);
+        payload[128] = 0x74;
+        mapped_bytes(context, &alias, target, &payload[..block]);
+        bytes_at(context, &file, before.size, &payload[..block])?;
+        bytes_at(context, &file, page_offset, &prefix[..block])?;
+        context.expect_eq(
+            checked(context, file.stat())?.size,
+            before.size + block as u64,
+        );
+
+        drop((mm, alias));
+        checked(context, crate::fs::writeback::sync_inode(&inode))?;
+        context.diagnostic(format_args!(
+            "W15 full-block-size={} same-page-tail={} payload-and-prefix=1 renewed-mkwrite=1",
+            block,
+            block < PAGE_SIZE
+        ));
+        Ok(())
+    }
+
     /// 测试远端 CPU 持有可写 TLB 期间由另一 CPU 发起同步回写撤回写权限（`page_mkclean`），以及原 CPU 再次写入时的重触发缺页（W16）。
     ///
     /// - **测试目标**：验证当用户态线程在远端 CPU（`remote`）上已完成首次写缺页并装填了可写 TLB 后，由运行在协调 CPU（`cleaner`）上的内核任务执行 `sync_inode` 回写，能够通过跨核 IPI 撤回远端 CPU 的页表写权限与 TLB 项，使远端 CPU 的下一次内存写入重新触发 `page_mkwrite` 并置脏该页。

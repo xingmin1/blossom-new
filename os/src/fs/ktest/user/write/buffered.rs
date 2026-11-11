@@ -75,6 +75,30 @@ fn modified_between(
     Ok(())
 }
 
+/// 在文件同步完成后，按实际块映射直接读取设备上的完整块并核对内容。
+fn stored_block_at(
+    context: &mut TestContext<'_>,
+    volume: &Ext4Volume,
+    inode: &InodeRef,
+    logical: u64,
+    expected: &[u8],
+) -> TestResult {
+    let block_size = volume.geometry().block_size;
+    let BlockMapping::Mapped { physical, .. } = checked(context, inode.map_block(logical))? else {
+        return Err(TestError("buffered write block is not mapped"));
+    };
+    let mut actual = [0xa7; PAGE_SIZE];
+    checked(
+        context,
+        volume
+            .claim()
+            .read_exact_at(physical * block_size as u64, &mut actual[..block_size])
+            .map_err(FsError::Io),
+    )?;
+    context.expect_eq(&actual[..block_size], expected);
+    Ok(())
+}
+
 #[ktest::suite(fixture = WriteOwner, suite_resources = UserSuite, context = "Thread", tags("fs-write", "fs-path", "fs-oom"), resources("root"), timeout_ms = 180000)]
 pub(super) mod cases {
     use super::*;
@@ -246,6 +270,197 @@ pub(super) mod cases {
         drop(mm);
         drop(mapped);
         fixture.run(context, b"w")
+    }
+
+    /// 验证完整块覆盖和用户源缺页短写的内容、尺寸与盘面初始化。
+    /// 新建文件解除链接后由打开描述符保活，夹具负责同步和回收。
+    #[test]
+    #[ktest(tags("W04", "fs-write-block-boundary", "fs-sync"))]
+    fn full_blocks_and_faulted_user_prefix(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let volume = fixture.volume();
+        let block_size = volume.geometry().block_size;
+        if !matches!(block_size, 1024 | 2048 | 4096) {
+            return Err(TestError(
+                "buffered block boundary requires 1/2/4 KiB blocks",
+            ));
+        }
+
+        let vfs = fixture.user.path.vfs().clone();
+        let fs_context = fixture.user.path.context().clone();
+        let root = vfs.root();
+        let pathname = b"/test/write-block-boundary";
+        let file = checked(
+            context,
+            vfs.open_with(
+                &fs_context,
+                &root,
+                pathname,
+                (0, 0),
+                Some((0o600, 0)),
+                true,
+                false,
+                |path, _| open_path_with_flags(&vfs, path, 2, FileIoContext::Kernel),
+            ),
+        )?;
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
+        fixture.inodes.push(inode.clone());
+        checked(
+            context,
+            vfs.unlink_from(&fs_context, &root, pathname, (0, 0)),
+        )?;
+        context.expect_eq(checked(context, file.stat())?.size, 0);
+        context.expect_eq(checked(context, inode.map_block(0))?, BlockMapping::Eof);
+
+        let mut expected = [0x31; PAGE_SIZE];
+        context.expect_eq(
+            checked(context, file.write_at(0, &expected[..block_size]))?,
+            block_size,
+        );
+        context.expect_eq(checked(context, file.stat())?.size, block_size as u64);
+        bytes_at(context, &file, 0, &expected[..block_size])?;
+        context.expect_eq(checked(context, inode.map_block(1))?, BlockMapping::Eof);
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        stored_block_at(context, &volume, &inode, 0, &expected[..block_size])?;
+
+        // 整块覆盖中间空洞时，相邻空洞和已写块均须保持原样。
+        expected.fill(0x4f);
+        context.expect_eq(
+            checked(
+                context,
+                file.write_at((4 * block_size) as u64, &expected[..block_size]),
+            )?,
+            block_size,
+        );
+        for logical in 1..4 {
+            context.expect_eq(
+                matches!(
+                    checked(context, inode.map_block(logical))?,
+                    BlockMapping::Hole { .. }
+                ),
+                true,
+            );
+        }
+        expected.fill(0x62);
+        context.expect_eq(
+            checked(
+                context,
+                file.write_at((2 * block_size) as u64, &expected[..block_size]),
+            )?,
+            block_size,
+        );
+        context.expect_eq(checked(context, file.stat())?.size, (5 * block_size) as u64);
+        for logical in [1, 3] {
+            context.expect_eq(
+                matches!(
+                    checked(context, inode.map_block(logical))?,
+                    BlockMapping::Hole { .. }
+                ),
+                true,
+            );
+            bytes_at(
+                context,
+                &file,
+                logical * block_size as u64,
+                &[0; PAGE_SIZE][..block_size],
+            )?;
+        }
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        for (logical, marker) in [(0, 0x31), (2, 0x62), (4, 0x4f)] {
+            expected.fill(marker);
+            bytes_at(
+                context,
+                &file,
+                logical * block_size as u64,
+                &expected[..block_size],
+            )?;
+            stored_block_at(context, &volume, &inode, logical, &expected[..block_size])?;
+        }
+
+        // 两个用户页容纳最大有效前缀，其后的虚拟页始终没有映射。
+        let address_space = vm(context, Mm::try_new().map_err(VmError::from))?;
+        vm(
+            context,
+            address_space.map_anonymous(SOURCE, 2 * PAGE_SIZE, RW, RW),
+        )?;
+        let end = SOURCE + 2 * PAGE_SIZE;
+        let mut missing = [0xa7];
+        context.expect_eq(address_space.copyin(&mut missing, end).copied, 0);
+        for (blocks, marker) in [(1, 0x73), (2, 0x84)] {
+            let requested = blocks * block_size;
+            let prefix = requested - 1;
+            let logical = (3 * (blocks + 1)) as u64;
+            let offset = logical * block_size as u64;
+            expected.fill(marker);
+            for page in 0..2 {
+                context.expect_eq(
+                    address_space
+                        .copyout(SOURCE + page * PAGE_SIZE, &expected)
+                        .copied,
+                    PAGE_SIZE,
+                );
+            }
+            for part in 0..blocks {
+                context.expect_eq(
+                    checked(context, inode.map_block(logical + part as u64))?,
+                    BlockMapping::Eof,
+                );
+            }
+            let mut source = checked(
+                context,
+                WriteBuffer::user(&address_space, end - prefix, requested),
+            )?;
+            context.expect_eq(
+                checked(
+                    context,
+                    file.write_at_from(offset, &mut source, FileIoContext::Kernel),
+                )?,
+                prefix,
+            );
+            context.expect_eq(source.copied(), prefix);
+            context.expect_eq(checked(context, file.stat())?.size, offset + prefix as u64);
+
+            // 在后续增长可能再次清理旧 EOF 前读盘，单独核对本次短写留下的最后一个字节。
+            checked(context, file.sync_range(0..u64::MAX, false))?;
+            for part in 0..blocks {
+                expected.fill(marker);
+                let valid = if part + 1 == blocks {
+                    expected[block_size - 1] = 0;
+                    block_size - 1
+                } else {
+                    block_size
+                };
+                let current = logical + part as u64;
+                bytes_at(
+                    context,
+                    &file,
+                    current * block_size as u64,
+                    &expected[..valid],
+                )?;
+                stored_block_at(context, &volume, &inode, current, &expected[..block_size])?;
+            }
+            context.expect_eq(
+                matches!(
+                    checked(context, inode.map_block(logical - 1))?,
+                    BlockMapping::Hole { .. }
+                ),
+                true,
+            );
+            context.expect_eq(
+                checked(context, inode.map_block(logical + blocks as u64))?,
+                BlockMapping::Eof,
+            );
+            bytes_at(
+                context,
+                &file,
+                offset - block_size as u64,
+                &[0; PAGE_SIZE][..block_size],
+            )?;
+        }
+        Ok(())
     }
 
     /// 测试多文件描述并发追加写入（`O_APPEND`）的无损串行化，以及 `dup` 共享游标与 `pwrite` 位置语义（W05）。
@@ -1107,5 +1322,133 @@ pub(super) mod cases {
             open_path_with_flags(fixture.user.path.vfs(), path, 1, FileIoContext::Kernel),
         )?);
         fixture.run(context, b"e")
+    }
+}
+
+/// 每个实例独占工作盘，保留预分配文件的初始状态且不影响其他写入用例。
+#[ktest::suite(fixture = WriteOwner, suite_resources = UserSuite, context = "Thread", isolation = "Case", tags("fs-write", "fs-path", "fs-write-block-boundary", "fs-sync"), resources("root"), timeout_ms = 180000)]
+pub(super) mod isolated_blocks {
+    use super::*;
+
+    /// 验证未初始化块或真实空洞被完整覆盖后，相邻块和盘面内容保持正确。
+    /// 独占工作盘保留未初始化块的原始内容，不影响其他用例。
+    #[test]
+    #[ktest(tags("W04"))]
+    fn full_overwrite_of_unwritten_or_legacy_hole(
+        context: &mut TestContext<'_>,
+        fixture: &mut WriteOwner,
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        let volume = fixture.volume();
+        let block_size = volume.geometry().block_size;
+        if !matches!(block_size, 1024 | 2048 | 4096) {
+            return Err(TestError(
+                "isolated block coverage requires 1/2/4 KiB blocks",
+            ));
+        }
+        let file = fixture.open(context, b"/test/write-unwritten", 2)?;
+        let inode = checked(context, file.path().unwrap().inode())?.clone();
+        let initial = checked(context, inode.map_block(0))?;
+        let empty = matches!(initial, BlockMapping::Eof);
+        let mut expected = [0x49; PAGE_SIZE];
+
+        // 空文件先以实际写入建立有效尺寸内的空洞。
+        let original_physical = if empty {
+            context.expect_eq(checked(context, file.stat())?.size, 0);
+            context.expect_eq(initial, BlockMapping::Eof);
+            context.expect_eq(
+                checked(
+                    context,
+                    file.write_at((2 * block_size) as u64, &expected[..block_size]),
+                )?,
+                block_size,
+            );
+            context.expect_eq(
+                matches!(
+                    checked(context, inode.map_block(0))?,
+                    BlockMapping::Hole { .. }
+                ),
+                true,
+            );
+            None
+        } else {
+            context.expect_eq(checked(context, file.stat())?.size, 16384);
+            let BlockMapping::Unwritten { physical, .. } = initial else {
+                return Err(TestError("fixture first block is not unwritten"));
+            };
+            checked(
+                context,
+                volume
+                    .claim()
+                    .read_exact_at(physical * block_size as u64, &mut expected[..block_size])
+                    .map_err(FsError::Io),
+            )?;
+            context.expect_eq(
+                expected[..block_size].iter().all(|byte| *byte == 0xa7),
+                true,
+            );
+            Some(physical)
+        };
+        let neighbor = checked(context, inode.map_block(1))?;
+        context.expect_eq(
+            if empty {
+                matches!(neighbor, BlockMapping::Hole { .. })
+            } else {
+                matches!(neighbor, BlockMapping::Unwritten { .. })
+            },
+            true,
+        );
+        for logical in [0, 1] {
+            bytes_at(
+                context,
+                &file,
+                logical * block_size as u64,
+                &[0; PAGE_SIZE][..block_size],
+            )?;
+        }
+
+        // 预分配块完整覆盖后必须继续使用原物理地址。
+        expected.fill(0x96);
+        context.expect_eq(
+            checked(context, file.write_at(0, &expected[..block_size]))?,
+            block_size,
+        );
+        let BlockMapping::Mapped { physical, .. } = checked(context, inode.map_block(0))? else {
+            return Err(TestError("full overwrite did not publish a mapped block"));
+        };
+        if let Some(original) = original_physical {
+            context.expect_eq(physical, original);
+        }
+        context.expect_eq(
+            checked(context, file.stat())?.size,
+            if empty {
+                (3 * block_size) as u64
+            } else {
+                16384
+            },
+        );
+        bytes_at(context, &file, 0, &expected[..block_size])?;
+        context.expect_eq(checked(context, inode.map_block(1))?, neighbor);
+        bytes_at(
+            context,
+            &file,
+            block_size as u64,
+            &[0; PAGE_SIZE][..block_size],
+        )?;
+
+        // 同步后绕过页缓存读取盘面，核对实际持久化内容。
+        checked(context, file.sync_range(0..u64::MAX, false))?;
+        stored_block_at(context, &volume, &inode, 0, &expected[..block_size])?;
+        if empty {
+            expected.fill(0x49);
+            bytes_at(
+                context,
+                &file,
+                (2 * block_size) as u64,
+                &expected[..block_size],
+            )?;
+            stored_block_at(context, &volume, &inode, 2, &expected[..block_size])?;
+        }
+        Ok(())
     }
 }

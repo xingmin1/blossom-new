@@ -86,7 +86,11 @@ finish = "poweroff"
 
 从默认计划中删除某个集合文件对应的一行，就停止运行该集合。配置支持 TOML 注释和多行数组，没有 Hook、profile 或“优化名称”之类的开关。
 
-默认计划在两个 libc 根目录各准备一份 64 MiB FAT32 镜像及项目自带 BusyBox。`basic` 的 `mount`、`umount` 使用 `/dev/loop0` 作为原 ELF 的设备参数；每例开始前绑定镜像、结束后解绑，挂载点仍为原来的 `./mnt`。如需只运行这两项，可显式选择独立计划：
+默认计划在两个 libc 根目录各准备一份 64 MiB FAT32 镜像及项目自带 BusyBox。`basic` 的 `mount`、`umount` 使用 `/dev/loop0` 作为原 ELF 的设备参数；每例开始前绑定镜像、结束后解绑，挂载点仍为原来的 `./mnt`。
+
+若目标位置已有同名镜像，准备命令会先截断旧文件，再完整复制新镜像；整条命令仍受默认的 60 秒准备期限约束。
+
+如需只运行这两项，可显式选择独立计划：
 
 ```sh
 /sbin/contest-run /dev/vda --plan /etc/contest/mount-plan.toml

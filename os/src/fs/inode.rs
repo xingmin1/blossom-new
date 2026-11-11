@@ -2795,6 +2795,7 @@ impl InodeRef {
 
     /// 磁盘普通文件的缓冲写入主循环（仅通过绑定写权限的 [`WriteAccess`] 调用）：
     /// 每次循环先在文件锁外从用户缓冲区拉取最多一个块的数据（避免缺页重入死锁），再在 `invalidate` 写锁保护下补零跨 EOF 空洞、预留磁盘块、写入页面缓存并原子发布新块树与文件尺寸。
+    /// 新分配或未写块只有在实际拉取的字节覆盖整个文件系统块时，才无需预先清零。
     fn write_from(
         &self,
         claim: &FsClaim,
@@ -2906,12 +2907,12 @@ impl InodeRef {
                 }
             };
 
-            // Step 5: 持 `root` 写锁与页内容锁，完成新分配块清零、写入用户数据、标脏页面，并原子提交新块树根与 `inode-table` 记录。
+            // 持 `root` 写锁与页内容锁，完成新块初始化、数据写入和页面标脏，再发布块树及 `inode-table` 记录。
             let mut root = state.disk_root().write();
             let mut content = folio.lock_content();
             let block_offset = ((position / size as u64 * size as u64) % PAGE_SIZE as u64) as usize;
             self.note_dirty();
-            if prepared.zero {
+            if prepared.zero && !(position % size as u64 == 0 && pulled == size) {
                 let zeros = [0u8; 512];
                 for part in (block_offset..block_offset + size).step_by(zeros.len()) {
                     content

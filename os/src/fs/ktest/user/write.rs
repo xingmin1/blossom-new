@@ -1303,6 +1303,7 @@ fn inode_record_snapshot(
 pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
     core::hint::black_box([
         buffered::cases::__ktest_anchor(),
+        buffered::isolated_blocks::__ktest_anchor(),
         mmap::cases::__ktest_anchor(),
         writeback::cases::__ktest_anchor(),
         truncate::cases::__ktest_anchor(),

@@ -745,12 +745,12 @@ impl Ext4Volume {
                             hook(index, offset + size);
                         }
                     }
+                    if file_size < byte.saturating_add(size as u64) {
+                        let valid = min(file_size.saturating_sub(byte), size as u64) as usize;
+                        zero_range(&mut read, offset + valid, size - valid);
+                    }
                 }
                 None => zero_range(&mut read, offset, size),
-            }
-            if file_size < byte.saturating_add(size as u64) {
-                let valid = min(file_size.saturating_sub(byte), size as u64) as usize;
-                zero_range(&mut read, offset + valid, size - valid);
             }
             offset += size;
         }
