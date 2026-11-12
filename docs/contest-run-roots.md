@@ -54,13 +54,13 @@ cwd = "/"
 argv = ["/bin/busybox", "sh", "/sbin/prepare-la-musl-sched", "{test_root}/lib/libc.so"]
 ```
 
-只有选中 LoongArch 的 `cyclictest:musl:script` 才执行这条 setup；RISC-V、LoongArch glibc 和其他用例没有它。主命令不变，仍是：
+只有选中 LoongArch 的 `cyclictest:musl:script` 才执行这条 setup；RISC-V、LoongArch glibc 和其他用例没有它。显式选择 `sets/cyclictest.toml` 时，主命令是：
 
 ```toml
 exec = ["/busybox", "sh", "/cyclictest_testcode.sh"]
 ```
 
-它在 `test` 根里执行，脚本内部原样跑四项，不改脚本也不改 ELF，不必给四项分别配置。用例每重复一次就再执行一次 setup；修补脚本发现目标已是修补后的哈希时安静返回。
+它在 `test` 根里执行，脚本内部原样跑四项，不改脚本也不改 ELF。默认计划则使用同一用例 ID 执行带 `-A` 的四项同步测量，见[同步采样检查](contest-run.md#62-同步采样检查)。两种入口都不必给四项分别配置；用例每重复一次就再执行一次 setup，修补脚本发现目标已是修补后的哈希时安静返回。
 
 - 普通 setup 失败：不运行主脚本；若进程控制仍正常，按既有规则尝试本例的 cleanup 与 after 通知，计一次执行错误（状态 1）；只有清理及通知成功时才继续下一个用例。进程控制失效或清理、通知失败会停止会话；不会输出假的成功。不要把它当成“用例没被选中”。
 - `override.setup` 整体替换该用例原来的 setup，不是追加。本例原 setup 为空；给已有 setup 的用例加 override 时，要把需要保留的原命令一并写进去。
@@ -242,7 +242,7 @@ GROUP cyclictest / musl path=/mnt/contest/musl
 
 RISC-V 上预览同一例不应出现这条 setup；LoongArch 只选 glibc 也不应出现。`--only` 只缩小计划已有的选择，不会新增未配置的用例。`--file` 替换主计划的 `files` 列表，仍使用主计划的 `roots`、`defaults`、`override_files` 与 `finish`。
 
-正式自动启动使用打包进系统盘的默认计划，沿用 `make all` 和评测的启动命令，评测机不需要传新参数。只构建并启动一个架构时用 `make contest ARCH=loongarch64`。只改了宿主上的 TOML、却继续启动旧系统盘，不等于配置已更新：客体读取的是系统盘里的 `/etc/contest/`。
+正式自动启动使用打包进系统盘的默认计划，沿用 `make all` 和评测的启动命令，评测机不需要传新参数。默认 cyclictest 使用带 `-A` 的四项同步测量；本节显式选择 `sets/cyclictest.toml`，用于运行原参数脚本。只构建并启动一个架构时用 `make contest ARCH=loongarch64`。只改了宿主上的 TOML、却继续启动旧系统盘，不等于配置已更新：客体读取的是系统盘里的 `/etc/contest/`。
 
 ## 9. 工作盘、fresh 与 reuse
 

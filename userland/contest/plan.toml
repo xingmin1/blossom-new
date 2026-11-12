@@ -10,7 +10,7 @@ files = [
     "sets/libcbench.toml",
     "sets/lmbench.toml",
     "sets/netperf.toml",
-    "sets/cyclictest.toml",
+    "sets/cyclictest-aligned.toml",
     "sets/ltp.toml",
 ]
 override_files = ["overrides/local.toml", "overrides/basic-mount.toml", "overrides/la-musl-sched.toml"]

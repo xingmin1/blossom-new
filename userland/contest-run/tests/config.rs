@@ -1315,7 +1315,7 @@ fn shipped_default_plan_expands_twelve_groups() {
         "write",
         "yield",
     ];
-    const SCRIPTS: [&str; 9] = [
+    const SCRIPTS: [&str; 8] = [
         "busybox",
         "lua",
         "iozone",
@@ -1324,7 +1324,6 @@ fn shipped_default_plan_expands_twelve_groups() {
         "libcbench",
         "lmbench",
         "netperf",
-        "cyclictest",
     ];
     const GROUP_ORDER: [&str; 12] = [
         "basic",

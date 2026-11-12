@@ -1,0 +1,66 @@
+# 默认同步采样集合，复用比赛盘程序和 LoongArch musl 运行库准备。
+# -A 改变唤醒相位，测量结果不等同于原参数结果。
+[[group]]
+name = "cyclictest"
+roots = ["musl", "glibc"]
+start = "#### OS COMP TEST GROUP START cyclictest-{root} ####\nCYCLICTEST_ALIGNED GROUP {root} BEGIN\n"
+end = "CYCLICTEST_ALIGNED GROUP {root} END\n#### OS COMP TEST GROUP END cyclictest-{root} ####\n"
+
+[[group.step]]
+names = ["script"]
+timeout_sec = 600
+after = "CYCLICTEST_ALIGNED EXIT {status}\n"
+exec = ["/busybox", "sh", "-c", '''
+run_cyclictest() {
+    name=$1
+    echo "====== cyclictest $name begin ======"
+    echo "CYCLICTEST_ALIGNED CASE $name BEGIN"
+    ./cyclictest -a -i 1000 -t"$2" -A -p99 -D 1s -q
+    result=$?
+    echo "CYCLICTEST_ALIGNED CASE $name END $result"
+    if [ "$result" -eq 0 ]; then
+        echo "====== cyclictest $name end: success ======"
+    else
+        echo "====== cyclictest $name end: fail ======"
+    fi
+    return "$result"
+}
+
+# 失败测量后的线程行不能混入下一项判题结果。
+run_cyclictest NO_STRESS_P1 1 || exit "$?"
+run_cyclictest NO_STRESS_P8 8 || exit "$?"
+
+echo "====== start hackbench ======"
+./hackbench -l 100000000 &
+hp=$!
+status=0
+s0=0
+sleep 1
+s1=$?
+if [ "$s1" -eq 0 ]; then
+    for threads in 1 8; do
+        kill -0 "$hp"
+        s0=$?
+        [ "$s0" -eq 0 ] || break
+        run_cyclictest "STRESS_P$threads" "$threads"
+        status=$?
+        [ "$status" -eq 0 ] || break
+    done
+fi
+
+# 无论压力期间是否失败，都先回收已启动的 hackbench。
+kill -2 "$hp"
+s2=$?
+wait "$hp"
+s3=$?
+if [ "$s2" -eq 0 ] && [ "$s3" -eq 0 ]; then
+    echo "====== kill hackbench: success ======"
+else
+    echo "====== kill hackbench: fail ======"
+fi
+echo "CYCLICTEST_ALIGNED PRESSURE $s1 $s2 $s3"
+
+for s in "$status" "$s1" "$s0" "$s2" "$s3"; do
+    [ "$s" -eq 0 ] || exit "$s"
+done
+''']

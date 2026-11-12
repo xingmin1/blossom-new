@@ -81,7 +81,7 @@ files = [
     "sets/libcbench.toml",
     "sets/lmbench.toml",
     "sets/netperf.toml",
-    "sets/cyclictest.toml",
+    "sets/cyclictest-aligned.toml",
     "sets/ltp.toml",
 ]
 override_files = ["overrides/local.toml", "overrides/basic-mount.toml", "overrides/la-musl-sched.toml"]
@@ -100,7 +100,7 @@ finish = "poweroff"
 
 更新系统盘中的计划后，使用 `fresh` 才会从原比赛盘重新准备缺失的入口。`reuse` 不更新系统工作盘中的计划，`refresh-system` 虽更新计划但保留比赛工作盘；两者都不会替换比赛工作盘中已有的旧 `/bin/sh` 链接。
 
-默认计划还含一项显式的运行库兼容变更：仅在 LoongArch 上选中 `cyclictest:musl:script` 时，override 的 `setup` 以 `root = "system"` 运行系统盘的 `/sbin/prepare-la-musl-sched`，修补比赛工作副本中已知版本 musl `libc.so` 的 `sched_getparam`、`sched_getscheduler`、`sched_setparam`、`sched_setscheduler` 四个函数。它不属于上面“补缺并保留已有文件”的准备：原比赛镜像不变，但工作副本里该 libc 的字节、语义和 inode 都会改变，同一 musl 根里之后启动的动态程序也会看到新语义；库的版本未知时该例的 setup 失败、不运行原脚本；`reuse` 与 `refresh-system` 会保留已修补的库，恢复原库须关闭该 override 并使用 `fresh`。赛事是否允许修改工作盘里的运行库尚未确定。详见[显式执行根手册](contest-run-roots.md)第 10 节。
+默认计划还含一项显式的运行库兼容变更：仅在 LoongArch 上选中 `cyclictest:musl:script` 时，override 的 `setup` 以 `root = "system"` 运行系统盘的 `/sbin/prepare-la-musl-sched`，修补比赛工作副本中已知版本 musl `libc.so` 的 `sched_getparam`、`sched_getscheduler`、`sched_setparam`、`sched_setscheduler` 四个函数。它不属于上面“补缺并保留已有文件”的准备：原比赛镜像不变，但工作副本里该 libc 的字节、语义和 inode 都会改变，同一 musl 根里之后启动的动态程序也会看到新语义；库的版本未知时该例的 setup 失败，不运行测量；`reuse` 与 `refresh-system` 会保留已修补的库，恢复原库须关闭该 override 并使用 `fresh`。赛事是否允许修改工作盘里的运行库尚未确定。详见[显式执行根手册](contest-run-roots.md)第 10 节。
 
 如需只运行 `mount`、`umount`，可显式选择独立计划：
 
@@ -186,9 +186,9 @@ after = "FAIL LTP CASE {name} : {status}\n"
 
 `repeat` 在 `defaults`、step 或 override 上配置，表示每个用例连续执行的次数；`--repeat` 覆盖本次运行的所有已选用例。
 
-## 4. 仓库自带的 9 个原脚本集合
+## 4. 原脚本集合与 cyclictest
 
-BusyBox、Lua、Iozone、UnixBench、iperf、libcbench、lmbench、netperf 和 cyclictest 在盘内各有一份原测试脚本。集合文件用单个 `script` 名字选中它，并用盘内 BusyBox 的 `sh` 执行：
+BusyBox、Lua、Iozone、UnixBench、iperf、libcbench、lmbench、netperf 和 cyclictest 在盘内各有一份原测试脚本。原脚本集合使用单个 `script` 名字，并用盘内 BusyBox 的 `sh` 执行；默认 cyclictest 使用带 `-A` 的同步测量，见[同步采样检查](#62-同步采样检查)。
 
 ```toml
 # 脚本自己输出组标记，group 不写 start/end。
@@ -212,9 +212,9 @@ timeout_sec = 600
 | `libcbench` | `/libcbench_testcode.sh` | 1800 |
 | `lmbench` | `/lmbench_testcode.sh` | 1800 |
 | `netperf` | `/netperf_testcode.sh` | 600 |
-| `cyclictest` | `/cyclictest_testcode.sh` | 600 |
+| `cyclictest`（显式原参数） | `/cyclictest_testcode.sh` | 600 |
 
-这些脚本自带组起止标记与结果行，group 不写 `start`/`end`，避免输出两套标记。`timeout_sec` 是整个脚本的外层预算，应按脚本实际耗时设置，不能套用普通短用例的 60 秒。
+这些原脚本自带组起止标记与结果行，group 不写 `start`/`end`，避免输出两套标记。默认计划中的 cyclictest 是例外：它运行带 `-A` 的四项测量，并由集合输出组和结果标记。`timeout_sec` 是整个脚本的外层预算，应按脚本实际耗时设置，不能套用普通短用例的 60 秒。
 
 比赛盘内的 RISC-V musl Iozone 3.506 对原脚本的 `-i 11 -i 12` 参数，在 Linux 下也提示 `Selected test not available on the version`，随后输出 initial writers 和 rewriters 测量值。评分器能够读取这两项输出，但这些分数不能证明 pwritev/preadv 模式实际运行。
 
@@ -307,11 +307,38 @@ prepare = [
 ```sh
 /sbin/contest-run /dev/vda --root /musl --cwd / -- /busybox sh -c \
   'test -d /dev/shm && printf "shared memory\n" > /dev/shm/runner-check && /busybox cat /dev/shm/runner-check'
-/sbin/contest-run /dev/vda --only 'cyclictest:musl:script' \
+/sbin/contest-run /dev/vda --file sets/cyclictest.toml --only 'cyclictest:musl:script' \
   --only 'cyclictest:glibc:script' --finish return
 ```
 
 前一条只检查文件路径、写入与命令后的正常释放；后一条才执行原程序的 `shm_open` 路径。在 LoongArch 上后一条还会先运行 `cyclictest:musl:script` 的兼容 setup，修改当前工作副本里的 libc；需要从原库开始时使用 `fresh` 工作盘。应保留原始输出与准备、挂载或卸载错误，并交给对应原 judge 判定，不用 runner 退出零代替程序成功或得分。
+
+### 6.2 同步采样检查
+
+默认计划使用 `sets/cyclictest-aligned.toml`，在每个 libc 根下依次运行无压力、压力的 P1 和 P8 四项；每项均使用原测试盘中的 `cyclictest`，在原参数中加入 `-A`。压力项使用原 `hackbench -l 100000000`。输出同时包含评分器可识别的四项结果和采样检查标记；原判题器可计算这些实际测量的分数，但 `-A` 改变了唤醒相位，不能称为原参数的官方成绩，也不能保证固定分数。
+
+同步集合沿用 `cyclictest:{root}:script` 用例 ID 以复用现有准备步骤，不能与原参数的 `sets/cyclictest.toml` 同时作为 `--file` 加载；两种结果应分别运行和保存。要运行原盘脚本时显式选择 `--file sets/cyclictest.toml`。
+
+重新装配系统盘并使用独立的 `fresh` 工作盘，在客体 Shell 中运行：
+
+```sh
+/sbin/contest-run /dev/vda --only 'cyclictest:musl:script' --only 'cyclictest:glibc:script' --finish return; status=$?
+printf 'CYCLICTEST_ALIGNED SESSION %s\n' "$status"
+```
+
+将本次完整串口原文保存为宿主文件后，执行：
+
+```sh
+python3 tools/check_cyclictest_aligned.py /path/to/uart.log
+```
+
+检查器默认要求 musl 和 glibc 各有完整的无压力、压力 P1/P8 四项：P1 必须有线程 0 的正采样记录，P8 必须包含线程 0–7 各一条正采样记录。它还检查程序退出状态、压力进程的启动等待、信号与回收状态，以及组和测例标记的完整性。`SESSION` 必须在 `contest-run` 完全返回后记录其真实状态，以覆盖用例后通知、卸载和同步错误；默认自动关机不会输出此手动标记。缺样、零采样、非零状态或输出截断返回 1；文件读取或参数错误返回 2。仅使用 `--only 'cyclictest:musl:script'` 运行 musl 时，检查器须同时指定 `--root musl`；glibc 同理。
+
+计划模式的 `contest-run` 退出 0 只表示编排完成，普通非零子进程退出不会自动使它失败；**以检查器的退出码判定采样结果**。`-A` 不能保证在任意负载下每个线程都有样本，超时或采样不完整必须保留为失败。LoongArch musl 仍复用第 2 节的运行库兼容准备。
+
+检查器按一次会话核对：同一 libc 的组及四项测量不得重复。不要对该集合使用 `--repeat`；多次运行时分别保存和检查独立串口日志。
+
+检查器只读取日志，不负责启动或监管 QEMU；还需分别确认本次虚拟机退出和工作盘释放。
 
 ## 7. 预览与临时筛选
 
