@@ -4,6 +4,7 @@
 //! 目录与清单来源的 root 内解析，以及仓库实际发布的计划文件。每个测试在自己的临时目录里构造计划与
 //! 假测试根，互不共享可变状态，可并行运行。
 
+use contest_run::command::CommandSpec;
 use contest_run::config;
 use contest_run::expand::expand;
 use contest_run::model::{Config, ResolvedCase};
@@ -434,7 +435,7 @@ fn directory_scan_sorts_executables_and_include_dedups() {
     );
     let selection = tree.resolve("plan.toml").unwrap();
     assert_eq!(ids(&selection), ["scan:a:alpha", "scan:a:zeta"]);
-    assert_eq!(first(&selection).argv, ["/cases/alpha"]);
+    assert_eq!(first(&selection).exec.argv(), ["/cases/alpha"]);
     assert_eq!(
         first(&selection).source.catalog.as_deref(),
         Some(Path::new("/cases"))
@@ -539,7 +540,7 @@ fn override_replaces_arrays_and_merges_environment() {
     assert_eq!(case.group, "g");
     assert_eq!(case.root, "a");
     assert_eq!(case.name, "case");
-    assert_eq!(case.argv, ["/new", "case", "a b"]);
+    assert_eq!(case.exec.argv(), ["/new", "case", "a b"]);
     assert_eq!(case.env["SAME"], "later");
     assert_eq!(case.env["R"], "root");
     assert_eq!(case.env["G"], "group");
@@ -548,7 +549,10 @@ fn override_replaces_arrays_and_merges_environment() {
     assert!(case.setup.is_empty());
     assert_eq!(
         case.cleanup,
-        vec![vec!["/cleanup".to_owned(), "x y".to_owned()]]
+        vec![CommandSpec::Argv(vec![
+            "/cleanup".to_owned(),
+            "x y".to_owned()
+        ])]
     );
     assert_eq!(case.before, "OVERRIDE g:a:case\n");
     assert_eq!(case.after, "TAIL {status}\n");
@@ -654,7 +658,7 @@ fn override_applies_to_full_selection_before_only_filter() {
         .resolve_only("plan.toml", &only(&["g:a:alpha"]))
         .unwrap();
     assert_eq!(ids(&selection), ["g:a:alpha"]);
-    assert_eq!(first(&selection).argv, ["/patched", "alpha"]);
+    assert_eq!(first(&selection).exec.argv(), ["/patched", "alpha"]);
     assert!(selection.unmatched.is_empty());
 }
 
@@ -752,7 +756,7 @@ fn catalog_command_is_verbatim_and_after_stays_a_template() {
         Some("FOO=1 {name} > /tmp/out  ")
     );
     assert_eq!(
-        case.argv,
+        case.exec.argv(),
         ["/busybox", "sh", "-c", "FOO=1 {name} > /tmp/out  "]
     );
     assert_eq!(case.before, "RUN fork01\n");
@@ -863,7 +867,7 @@ fn multifile_order_globs_exclude_and_locations() {
     assert_eq!(case.source.entry, "group 1 step 1");
     assert_eq!(case.source.catalog.as_deref(), Some(Path::new("/catalog")));
     assert_eq!(case.source.line, Some(2));
-    assert_eq!(case.argv, ["/bin/sh", "-c", "printf two"]);
+    assert_eq!(case.exec.argv(), ["/bin/sh", "-c", "printf two"]);
 }
 
 /// 命令行文件列表整体替换主计划的 `files` 且保留 roots/defaults；引用的分组文件不允许再嵌套文件列表。
@@ -905,7 +909,7 @@ fn disabled_arch_and_selection_have_no_side_effects() {
     tree.put(
         "plan.toml",
         &format!(
-            "files = [\"steps.toml\"]\n[roots.a]\npath = {:?}\nprepare = [[\"/bin/sh\", \"-c\", \"touch {}\"]]\n",
+            "files = [\"steps.toml\"]\n[roots.a]\npath = {:?}\nprepare = [{{ root = \"system\", argv = [\"/bin/sh\", \"-c\", \"touch {}\"] }}]\n",
             tree.path("root"),
             marker.display()
         ),
@@ -949,12 +953,12 @@ fn mixed_commands_preserve_arguments_and_catalog_text() {
     let selection = tree.resolve("plan.toml").unwrap();
     assert_eq!(ids(&selection), ["argv:probe", "mixed:a:tag"]);
     assert_eq!(
-        selection.groups[0].cases[0].argv,
+        selection.groups[0].cases[0].exec.argv(),
         ["./probe", "", "a b", "雪 山", "$literal"]
     );
     let case = &selection.groups[0].cases[1];
     assert_eq!(case.catalog_command.as_deref(), Some(command));
-    assert_eq!(case.argv, ["/custom/sh", "-c", command]);
+    assert_eq!(case.exec.argv(), ["/custom/sh", "-c", command]);
 }
 
 /// 清单命令交给 `sh -c` 时保持内联赋值、引号、空位置参数与管道的原始语义。
@@ -973,7 +977,7 @@ fn catalog_command_keeps_shell_semantics() {
         ),
     );
     let selection = tree.resolve("plan.toml").unwrap();
-    let argv = &first(&selection).argv;
+    let argv = first(&selection).exec.argv();
     let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"<two words><>");
@@ -1117,7 +1121,7 @@ fn executable_relative_symlink_preserves_alias_name() {
     );
     let selection = tree.resolve("plan.toml").unwrap();
     assert_eq!(ids(&selection), ["elf:a:alias"]);
-    assert_eq!(first(&selection).argv, ["/cases/alias"]);
+    assert_eq!(first(&selection).exec.argv(), ["/cases/alias"]);
     assert_eq!(
         first(&selection).source.catalog.as_deref(),
         Some(Path::new("/cases"))
@@ -1140,7 +1144,7 @@ fn absolute_catalog_symlink_reads_from_selected_root() {
     let selection = tree.resolve("plan.toml").unwrap();
     let case = first(&selection);
     assert_eq!(case.id, "linked:a:probe");
-    assert_eq!(case.argv, ["/bin/sh", "-c", "printf 'root catalog'"]);
+    assert_eq!(case.exec.argv(), ["/bin/sh", "-c", "printf 'root catalog'"]);
     assert_eq!(case.source.catalog.as_deref(), Some(Path::new("/catalog")));
     assert_eq!(case.source.line, Some(1));
 }
@@ -1163,13 +1167,16 @@ fn intermediate_directory_symlink_reads_from_selected_root() {
     );
     let selection = tree.resolve("plan.toml").unwrap();
     assert_eq!(ids(&selection), ["dir:a:probe", "cat:a:probe"]);
-    assert_eq!(selection.groups[0].cases[0].argv, ["/linked/cases/probe"]);
+    assert_eq!(
+        selection.groups[0].cases[0].exec.argv(),
+        ["/linked/cases/probe"]
+    );
     assert_eq!(
         selection.groups[0].cases[0].source.catalog.as_deref(),
         Some(Path::new("/linked/cases"))
     );
     assert_eq!(
-        selection.groups[0].cases[1].argv,
+        selection.groups[0].cases[1].exec.argv(),
         ["/bin/sh", "-c", "printf 'root catalog'"]
     );
     assert_eq!(
@@ -1204,7 +1211,7 @@ fn thousand_entry_catalog_preserves_order() {
     let selection = tree.resolve("plan.toml").unwrap();
     assert_eq!(ids(&selection), ["large:a:case0591"]);
     assert_eq!(
-        first(&selection).argv,
+        first(&selection).exec.argv(),
         ["/bin/sh", "-c", "printf 'case0591'"]
     );
 }
@@ -1253,8 +1260,8 @@ fn shipped_example_plans_keep_plain_scripts() {
             ids(&selection),
             ["onsite:onsite:task_a.elf", "onsite:onsite:task_b.elf"]
         );
-        assert_eq!(selection.groups[0].cases[0].argv, ["./task_a.elf"]);
-        assert_eq!(selection.groups[0].cases[1].argv, ["./task_b.elf"]);
+        assert_eq!(selection.groups[0].cases[0].exec.argv(), ["./task_a.elf"]);
+        assert_eq!(selection.groups[0].cases[1].exec.argv(), ["./task_b.elf"]);
     }
 
     let finals = config::load(&contest.join("final-plan.toml"), &[]).unwrap();
@@ -1265,9 +1272,9 @@ fn shipped_example_plans_keep_plain_scripts() {
         assert_eq!(group.cases.len(), 1);
         assert_eq!(group.cases[0].name, "script");
     }
-    assert_eq!(selection.groups[0].cases[0].argv[0], "/bin/bash");
+    assert_eq!(selection.groups[0].cases[0].exec.argv()[0], "/bin/bash");
     assert_eq!(selection.groups[0].cases[0].timeout_sec, 120);
-    assert_eq!(selection.groups[1].cases[0].argv[0], "/bin/sh");
+    assert_eq!(selection.groups[1].cases[0].exec.argv()[0], "/bin/sh");
     assert_eq!(selection.groups[1].cases[0].timeout_sec, 18000);
 }
 
@@ -1421,7 +1428,7 @@ fn shipped_default_plan_expands_twelve_groups() {
 
     let basic = pick("basic", "musl");
     let mmap = basic.cases.iter().find(|case| case.name == "mmap").unwrap();
-    assert_eq!(mmap.argv, ["./mmap"]);
+    assert_eq!(mmap.exec.argv(), ["./mmap"]);
     assert_eq!(mmap.cwd.as_path(), Path::new("/basic"));
     assert_eq!(mmap.timeout_sec, 120);
     let glibc = pick("basic", "glibc");

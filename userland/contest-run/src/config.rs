@@ -8,6 +8,7 @@
 //! 准备命令的 argv 形状、同一组名与测试根被两个分组重复声明。目录内容、清单行与 glob 命中情况留给
 //! [`crate::selection`] 在挂载后检查。错误文本始终带上文件与条目来源。
 
+use crate::command::{CommandSpec, Root, SourcePath};
 use crate::model::{CaseOverride, Config, Defaults, Finish, Group, RootSpec, SourceLocation, Step};
 use glob::Pattern;
 use serde::de::DeserializeOwned;
@@ -156,6 +157,15 @@ fn validate(config: &Config) -> Result<(), String> {
         absolute(&root.path, &at)?;
         absolute(&root.cwd, &at)?;
         environment(&root.env, &at)?;
+        if root
+            .prepare
+            .iter()
+            .any(|command| matches!(command, CommandSpec::Argv(_)))
+        {
+            return Err(format!(
+                "{at}: prepare must use {{ root = \"system\", argv = [...] }} (or explicit test); migrate legacy command arrays"
+            ));
+        }
         commands(&root.prepare, &at)?;
         let mut mounts = BTreeSet::new();
         for mount in &root.mounts {
@@ -187,7 +197,7 @@ fn validate(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验分组名称、测试根引用、默认工作目录与每个步骤。
+/// 校验分组名称、测试根引用、默认环境、组准备与清理，以及每个步骤。
 fn validate_group(group: &Group, config: &Config) -> Result<(), String> {
     let at = source(&group.location);
     identifier(&group.name, &at)?;
@@ -203,6 +213,8 @@ fn validate_group(group: &Group, config: &Config) -> Result<(), String> {
         absolute(cwd, &at)?;
     }
     environment(&group.env, &at)?;
+    commands(&group.setup, &at)?;
+    commands(&group.cleanup, &at)?;
     if group.steps.is_empty() {
         return Err(format!("{at}: step must not be empty"));
     }
@@ -236,17 +248,19 @@ fn validate_step(step: &Step) -> Result<(), String> {
             return Err(format!("{at}: names is already the explicit selection"));
         }
     }
+    if let Some(directory) = &step.directory {
+        source_path(directory, false, &at)?;
+    }
     if let Some(catalog) = &step.catalog {
-        absolute(catalog, &at)?;
+        source_path(catalog, true, &at)?;
     }
     for text in step.include.iter().flatten().chain(&step.exclude) {
         pattern(text, &at)?;
     }
-    if step.exec.is_empty() {
+    if step.exec.argv().is_empty() {
         return Err(format!("{at}: exec must not be empty"));
     }
-    nonempty(&step.exec[0], &at)?;
-    strings(&step.exec, &at)?;
+    command(&step.exec, &at)?;
     if let Some(cwd) = &step.cwd {
         absolute(cwd, &at)?;
     }
@@ -268,11 +282,10 @@ fn validate_override(item: &CaseOverride) -> Result<(), String> {
         architecture(arch, &at)?;
     }
     if let Some(exec) = &item.exec {
-        if exec.is_empty() {
+        if exec.argv().is_empty() {
             return Err(format!("{at}: exec must not be empty"));
         }
-        nonempty(&exec[0], &at)?;
-        strings(exec, &at)?;
+        command(exec, &at)?;
     }
     if let Some(cwd) = &item.cwd {
         absolute(cwd, &at)?;
@@ -360,16 +373,48 @@ fn environment(env: &BTreeMap<String, String>, at: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验准备/清理命令列表：每条 argv 非空、首项非空且全部参数不含 NUL。
-fn commands(commands: &[Vec<String>], at: &str) -> Result<(), String> {
-    for command in commands {
-        nonempty(
-            command
-                .first()
-                .ok_or_else(|| format!("{at}: empty command array"))?,
-            at,
-        )?;
-        strings(command, at)?;
+/// 校验准备或清理命令列表，所有阶段均使用同一命令格式。
+fn commands(items: &[CommandSpec], at: &str) -> Result<(), String> {
+    for item in items {
+        command(item, at)?;
+    }
+    Ok(())
+}
+
+/// 校验 argv、命令局部 cwd、环境和超时，允许 cwd 显式引用当前测试根。
+fn command(item: &CommandSpec, at: &str) -> Result<(), String> {
+    let argv = item.argv();
+    nonempty(
+        argv.first()
+            .ok_or_else(|| format!("{at}: empty command array"))?,
+        at,
+    )?;
+    strings(argv, at)?;
+    if let CommandSpec::Full(command) = item {
+        if let Some(cwd) = &command.cwd {
+            let text = cwd.to_string_lossy();
+            if text == "{test_root}" || text.starts_with("{test_root}/") {
+                if cwd.components().any(|part| part == Component::ParentDir) || text.contains('\0')
+                {
+                    return Err(format!("{at}: invalid command cwd {}", cwd.display()));
+                }
+            } else {
+                absolute(cwd, at)?;
+            }
+        }
+        environment(&command.env, at)?;
+        timing(command.timeout_sec.unwrap_or(1), 1, at)?;
+    }
+    Ok(())
+}
+
+/// 校验来源路径；system 来源和所有 catalog 必须使用绝对路径。
+fn source_path(source: &SourcePath, absolute_required: bool, at: &str) -> Result<(), String> {
+    let (root, path) = source.parts();
+    if absolute_required || root == Root::System {
+        absolute(path, at)?;
+    } else if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(format!("{at}: source path contains NUL"));
     }
     Ok(())
 }

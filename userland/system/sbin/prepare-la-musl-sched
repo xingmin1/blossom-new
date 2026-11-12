@@ -1,0 +1,38 @@
+#!/bin/sh
+# 把已核验版本的 LA musl libc 中恒返回 ENOSYS 的四个调度函数改成 Linux 系统调用封装。
+# 由 system 根的静态 BusyBox 执行，唯一参数是工作副本中的 libc 路径。
+set -eu
+bb=/bin/busybox
+old=816cff1d1abbef3f1423bbce01a56f00c97b6ff8e20d49966c9d4b6d27e5e7be
+new=09b0fc7cd720c1f5dc25399733c1d203389a2de9ca90f6effe1c394c66414438
+fail() { printf '%s\n' "prepare-la-musl-sched: $*" >&2; exit 1; }
+
+[ $# -eq 1 ] || fail "usage: prepare-la-musl-sched /absolute/path/to/libc.so"
+lib=$1
+[ -f "$lib" ] && [ ! -L "$lib" ] || fail "expected a regular non-symlink libc: $lib"
+sum=$($bb sha256sum "$lib")
+sum=${sum%% *}
+[ "$sum" != "$new" ] || exit 0
+[ "$sum" = "$old" ] || fail "unsupported libc SHA256: $sum"
+
+# 先改同目录临时文件，完整 SHA256 校验通过后再 rename 发布；发布前失败只清理
+# 临时文件，原库保持不变。
+tmp=$($bb mktemp "${lib}.sched.XXXXXX")
+trap '$bb rm -f "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+$bb cp "$lib" "$tmp"
+write_at() {
+    $bb printf '%b' "$2" | $bb dd of="$tmp" bs=1 seek="$1" conv=notrunc 2>/dev/null ||
+        fail "cannot write patched bytes at offset $1"
+}
+# 四个 32 字节窗口依次是 sched_getparam(121)、sched_getscheduler(120)、
+# sched_setparam(118)、sched_setscheduler(119)。每个窗口保存返回地址后执行 syscall，
+# 再调用原 __syscall_ret，内核返回的负 errno 仍由它写入 libc 的 errno。
+write_at 345312 '\143\300\377\002\141\040\300\051\013\344\201\002\000\000\053\000\377\177\277\124\141\040\300\050\143\100\300\002\040\000\000\114'
+write_at 345344 '\143\300\377\002\141\040\300\051\013\340\201\002\000\000\053\000\377\137\277\124\141\040\300\050\143\100\300\002\040\000\000\114'
+write_at 345412 '\143\300\377\002\141\040\300\051\013\330\201\002\000\000\053\000\377\033\277\124\141\040\300\050\143\100\300\002\040\000\000\114'
+write_at 345444 '\143\300\377\002\141\040\300\051\013\334\201\002\000\000\053\000\377\373\276\124\141\040\300\050\143\100\300\002\040\000\000\114'
+sum=$($bb sha256sum "$tmp")
+[ "${sum%% *}" = "$new" ] || fail "patched libc verification failed"
+$bb chmod 755 "$tmp"
+$bb mv -f "$tmp" "$lib"

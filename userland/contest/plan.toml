@@ -13,7 +13,7 @@ files = [
     "sets/cyclictest.toml",
     "sets/ltp.toml",
 ]
-override_files = ["overrides/local.toml", "overrides/basic-mount.toml"]
+override_files = ["overrides/local.toml", "overrides/basic-mount.toml", "overrides/la-musl-sched.toml"]
 finish = "poweroff"
 
 [defaults]
@@ -28,24 +28,24 @@ cwd = "/"
 mounts = ["dev", "shm", "proc", "tmp"]
 env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
 prepare = [
-    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"],
-    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64-sf.so.1"],
-    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64.so.1"],
-    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-loongarch-lp64d.so.1"],
+    { root = "system", argv = ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64-sf.so.1"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64.so.1"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-loongarch-lp64d.so.1"] },
     # musl 根内的 basic 程序请求 glibc 解释器，复制同盘 glibc 根的 loader。
-    ["/bin/busybox", "sh", "-c", "/bin/busybox cp /mnt/contest/glibc/lib/ld-linux-*.so.1 /mnt/contest/musl/lib/"],
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "/bin/busybox cp /mnt/contest/glibc/lib/ld-linux-*.so.1 /mnt/contest/musl/lib/"] },
     # 盘内辅助脚本的 shebang 使用 /bin/sh 与 /bin/busybox。
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/bin"],
-    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/busybox"],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/.blossom"],
-    ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/musl/.blossom/fat32.img"],
-    ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/musl/.blossom/busybox"],
-    ["/bin/busybox", "sh", "-c", "for name in sh cp sleep true; do target=/mnt/contest/musl/bin/$name; if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then /bin/busybox ln -s /.blossom/busybox \"$target\" || exit; fi; done"],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/code/lmbench_src/bin/build"],
-    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/code/lmbench_src/bin/build/lmbench_all; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox ln -s /lmbench_all \"$target\""],
-    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/sort.src; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/unixbench-sort.src \"$target\""],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/etc"],
-    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/etc/protocols; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/protocols \"$target\""],
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/bin"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/musl/bin/busybox"] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/.blossom"] },
+    { root = "system", argv = ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/musl/.blossom/fat32.img"] },
+    { root = "system", argv = ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/musl/.blossom/busybox"] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "for name in sh cp sleep true; do target=/mnt/contest/musl/bin/$name; if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then /bin/busybox ln -s /.blossom/busybox \"$target\" || exit; fi; done"] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/code/lmbench_src/bin/build"] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/code/lmbench_src/bin/build/lmbench_all; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox ln -s /lmbench_all \"$target\""] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/sort.src; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/unixbench-sort.src \"$target\""] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/musl/etc"] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "target=/mnt/contest/musl/etc/protocols; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/protocols \"$target\""] },
 ]
 
 [roots.glibc]
@@ -54,16 +54,16 @@ cwd = "/"
 mounts = ["dev", "shm", "proc", "tmp"]
 env = { PATH = "/ltp/testcases/bin:/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib", HOME = "/" }
 prepare = [
-    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/glibc/lib64"],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/bin"],
-    ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/busybox"],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/.blossom"],
-    ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/glibc/.blossom/fat32.img"],
-    ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/glibc/.blossom/busybox"],
-    ["/bin/busybox", "sh", "-c", "for name in sh cp sleep true; do target=/mnt/contest/glibc/bin/$name; if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then /bin/busybox ln -s /.blossom/busybox \"$target\" || exit; fi; done"],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/code/lmbench_src/bin/build"],
-    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/code/lmbench_src/bin/build/lmbench_all; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox ln -s /lmbench_all \"$target\""],
-    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/sort.src; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/unixbench-sort.src \"$target\""],
-    ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/etc"],
-    ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/etc/protocols; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/protocols \"$target\""],
+    { root = "system", argv = ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/glibc/lib64"] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/bin"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "/busybox", "/mnt/contest/glibc/bin/busybox"] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/.blossom"] },
+    { root = "system", argv = ["/bin/busybox", "cp", "/etc/contest/fixtures/basic-fat32.img", "/mnt/contest/glibc/.blossom/fat32.img"] },
+    { root = "system", argv = ["/bin/busybox", "cp", "/bin/busybox", "/mnt/contest/glibc/.blossom/busybox"] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "for name in sh cp sleep true; do target=/mnt/contest/glibc/bin/$name; if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then /bin/busybox ln -s /.blossom/busybox \"$target\" || exit; fi; done"] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/code/lmbench_src/bin/build"] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/code/lmbench_src/bin/build/lmbench_all; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox ln -s /lmbench_all \"$target\""] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/sort.src; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/unixbench-sort.src \"$target\""] },
+    { root = "system", argv = ["/bin/busybox", "mkdir", "-p", "/mnt/contest/glibc/etc"] },
+    { root = "system", argv = ["/bin/busybox", "sh", "-c", "target=/mnt/contest/glibc/etc/protocols; [ -e \"$target\" ] || [ -L \"$target\" ] || /bin/busybox cp /etc/contest/fixtures/protocols \"$target\""] },
 ]

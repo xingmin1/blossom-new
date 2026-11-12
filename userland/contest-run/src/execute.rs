@@ -12,9 +12,9 @@
 //! 其余阶段的错误分别保留，清理与 `after` 通知仍然执行。普通非零退出不是执行错误；超时与
 //! 信号终止属于执行错误，但进程组已可靠收尾，会话可以继续下一例。
 
+use crate::command::CommandSpec;
 use crate::model::ResolvedCase;
 use crate::outcome::{Execution, ExitOutcome};
-use crate::process::run_command;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -97,31 +97,31 @@ fn control_lost(run: &Execution) -> bool {
 
 /// 顺序执行一组准备或清理命令，返回失败诊断与进程控制是否失效。
 ///
-/// 调用上下文：`prepare_root`、测例 `setup` 与 `cleanup` 阶段同步调用。每条命令都在
-/// `root`（可选 chroot）下的 `cwd` 运行，环境为 `env`，单条超时为 `timeout`；只有正常退出码 0
-/// 才算成功，空 argv 直接记为错误。`stop_on_error` 为 `true` 时遇到首个失败即停止；
-/// 为 `false` 时继续尝试其余命令，但进程控制一旦失效就立即停止。
+/// 根准备、组边界与测例阶段同步调用；每条命令按自身选择的根解析 cwd、env 和单条超时。
+/// 只有正常退出码 0 才算成功，空 argv 直接记为错误。`stop_on_error` 为真时遇首错停止；
+/// 为假时继续尝试其余命令，但进程控制一旦失效就立即停止。
 pub fn run_steps(
     root: Option<&Path>,
     cwd: &Path,
-    commands: &[Vec<String>],
+    commands: &[CommandSpec],
     env: &BTreeMap<String, String>,
     timeout: Duration,
     stop_on_error: bool,
 ) -> StepReport {
     let mut report = StepReport::default();
-    for argv in commands {
-        if argv.is_empty() {
+    for command in commands {
+        let invocation = command.resolve(root, cwd, env, timeout);
+        if invocation.argv.is_empty() {
             report.errors.push("empty command".into());
             if stop_on_error {
                 break;
             }
             continue;
         }
-        let run = run_command(root, cwd, argv, env, timeout);
+        let run = invocation.run();
         let lost = control_lost(&run);
         if !matches!(run.outcome, ExitOutcome::Exited { code: 0, .. }) || lost {
-            report.errors.push(describe(argv, &run));
+            report.errors.push(describe(invocation.argv, &run));
             report.unquiesced |= lost;
             if stop_on_error || lost {
                 break;
@@ -133,9 +133,9 @@ pub fn run_steps(
 
 /// 执行单个测例的一次完整生命周期，返回各阶段记录。
 ///
-/// `root` 为主命令与准备命令的 chroot 目标，`case` 为已展开的测例，`setup_timeout` 是
-/// `setup`/`cleanup` 单条命令的超时；主命令使用 `case.timeout_sec`。`out` 接收测例自身的
-/// `before`/`after` 协议文本，`notify` 接收 `before`/`after` 内核通知。
+/// `root`、`case.cwd` 与 `case.env` 提供 test 命令的默认上下文，system 命令不继承它们。
+/// 准备与清理默认采用 `setup_timeout`，主命令默认采用 `case.timeout_sec`；命令局部值优先。
+/// `out` 接收 before/after 文本，`notify` 接收内核通知。
 /// 函数不判题，也不会因普通非零退出而提前结束；`before` 通知失败或任一命令的进程控制
 /// 失效时立即返回，此时调用方必须停止会话。
 pub fn execute_case(
@@ -162,20 +162,22 @@ pub fn execute_case(
         match emit(out, &case.before) {
             Err(error) => record.output_errors.push(error.to_string()),
             Ok(()) => {
-                let run = run_command(
-                    root,
-                    &case.cwd,
-                    &case.argv,
-                    &case.env,
-                    Duration::from_secs(case.timeout_sec),
-                );
+                let run = case
+                    .exec
+                    .resolve(
+                        root,
+                        &case.cwd,
+                        &case.env,
+                        Duration::from_secs(case.timeout_sec),
+                    )
+                    .run();
                 let status = run.outcome.shell_status();
                 record.execution = Some(run);
                 // 进程控制失败时工作负载可能仍在运行，此时写 after 文本或执行 cleanup 都是冒险。
                 if record.unquiesced() {
                     return record;
                 }
-                let after = render_after(case, status);
+                let after = render_after(case, root, status);
                 if let Err(error) = emit(out, &after) {
                     record.output_errors.push(error.to_string());
                 }
@@ -215,13 +217,15 @@ fn emit(out: &mut impl Write, text: &str) -> io::Result<()> {
 
 /// 用完整上下文单次展开测例的 `after` 模板。
 ///
-/// `status` 是主命令的 shell 状态码；`command` 只在 catalog 来源的测例上提供。
-/// `after` 保留原始模板到此刻才展开，避免 `{status}` 在更早的替换中被固定。
-fn render_after(case: &ResolvedCase, status: i32) -> String {
+/// `status` 是主命令的 shell 状态码；`command` 仅由 catalog 提供，`test_root` 保持测试根视图。
+/// `after` 保留原始模板到此刻才展开，插入的清单命令与名字不再递归解释。
+fn render_after(case: &ResolvedCase, root: Option<&Path>, status: i32) -> String {
     let status = status.to_string();
+    let test_root = root.unwrap_or_else(|| Path::new("/")).to_string_lossy();
     let mut values = vec![
         ("group", case.group.as_str()),
         ("root", case.root.as_str()),
+        ("test_root", test_root.as_ref()),
         ("name", case.name.as_str()),
         ("id", case.id.as_str()),
         ("status", status.as_str()),

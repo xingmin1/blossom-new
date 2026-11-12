@@ -1,0 +1,10 @@
+# 显式启用工作副本运行库兼容变更。只有被选中的 LA musl 脚本 case 触发。
+# 删除 plan.toml 对本文件的引用，并使用 fresh 工作盘，可进行原库 baseline。
+[[override]]
+id = "cyclictest:musl:script"
+arch = ["loongarch64"]
+
+[[override.setup]]
+root = "system"
+cwd = "/"
+argv = ["/bin/busybox", "sh", "/sbin/prepare-la-musl-sched", "{test_root}/lib/libc.so"]

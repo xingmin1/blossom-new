@@ -4,6 +4,7 @@
 //! 两个 ignored 用例使用 Linux 的独立挂载命名空间执行真实 tmpfs 挂卸载，要求 CAP_SYS_ADMIN；
 //! 不具备权限时直接失败，不将未执行的挂载检查记为通过。
 
+use contest_run::command::{Command, CommandSpec, Root};
 use contest_run::model::RootSpec;
 use contest_run::runtime::Mounts;
 use std::collections::BTreeMap;
@@ -91,7 +92,13 @@ fn root_mounts_report_first_target_error_in_declared_order() {
 fn root_mounts_prepare_failure_does_not_mount() {
     let scratch = Scratch::new();
     let mut root = scratch.root(&["shm", "tmp"]);
-    root.prepare = vec![vec!["/bin/sh".into(), "-c".into(), "exit 7".into()]];
+    root.prepare = vec![CommandSpec::Full(Command {
+        root: Root::System,
+        argv: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+        cwd: None,
+        env: BTreeMap::new(),
+        timeout_sec: None,
+    })];
     let mut mounts = Mounts::default();
     let error = mounts
         .prepare_root(&root, Duration::from_secs(2))
@@ -99,6 +106,95 @@ fn root_mounts_prepare_failure_does_not_mount() {
     assert!(error.starts_with("root prepare: "), "{error}");
     assert!(error.contains("code: 7"), "{error}");
     assert!(!scratch.0.join("dev").exists());
+    assert!(!scratch.0.join("tmp").exists());
+    mounts.release().unwrap();
+}
+
+/// system 准备命令使用自身 cwd/env，并把含空格和占位符字面的测试根路径原样交给真实子进程。
+#[test]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "测试路径中的 {root} 与命令中的 {test_root} 是单遍展开的输入数据，不是 Rust 格式参数"
+)]
+fn root_prepare_system_defaults_and_local_values_do_not_inherit_test_root() {
+    let scratch = Scratch::new();
+    let test_root = scratch.0.join("test root {root}");
+    fs::create_dir(&test_root).unwrap();
+    let mut root = scratch.root(&[]);
+    root.path = test_root.clone();
+    root.cwd = "/missing-test-cwd".into();
+    root.env = BTreeMap::from([
+        ("LD_LIBRARY_PATH".into(), "/missing-test-libraries".into()),
+        ("ROOT_ONLY".into(), "test".into()),
+    ]);
+    root.prepare = vec![
+        CommandSpec::Full(Command {
+            root: Root::System,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "test \"$PWD\" = / && test -z \"${LD_LIBRARY_PATH+x}\" && test -z \"${ROOT_ONLY+x}\" && printf '%s' \"$1\" > \"$1/defaults\"".into(),
+                "prepare".into(),
+                "{test_root}".into(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_sec: None,
+        }),
+        CommandSpec::Full(Command {
+            root: Root::System,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "test -z \"${ROOT_ONLY+x}\" && printf '%s' \"$LOCAL\" > local".into(),
+            ],
+            cwd: Some("{test_root}".into()),
+            env: BTreeMap::from([("LOCAL".into(), "own environment".into())]),
+            timeout_sec: Some(2),
+        }),
+    ];
+
+    let mut mounts = Mounts::default();
+    mounts.prepare_root(&root, Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        fs::read_to_string(test_root.join("defaults")).unwrap(),
+        test_root.to_str().unwrap()
+    );
+    assert_eq!(
+        fs::read(test_root.join("local")).unwrap(),
+        b"own environment"
+    );
+    assert!(!test_root.join("dev").exists());
+    assert!(!test_root.join("tmp").exists());
+    mounts.release().unwrap();
+}
+
+/// 显式 test 准备命令不能在目标根缺少程序时退回系统根执行。
+#[test]
+fn root_prepare_test_command_keeps_target_chroot_failure() {
+    let scratch = Scratch::new();
+    let marker = scratch.0.join("must-not-exist");
+    let mut root = scratch.root(&["tmp"]);
+    root.prepare = vec![CommandSpec::Full(Command {
+        root: Root::Test,
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf executed > \"$1\"".into(),
+            "prepare".into(),
+            marker.to_str().unwrap().into(),
+        ],
+        cwd: None,
+        env: BTreeMap::new(),
+        timeout_sec: None,
+    })];
+    let mut mounts = Mounts::default();
+    let error = mounts
+        .prepare_root(&root, Duration::from_secs(2))
+        .unwrap_err();
+    assert!(error.starts_with("root prepare: "), "{error}");
+    assert!(error.contains("SpawnError"), "{error}");
+    assert!(!marker.exists());
     assert!(!scratch.0.join("tmp").exists());
     mounts.release().unwrap();
 }

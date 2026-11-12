@@ -17,13 +17,15 @@
 
 下载后请先校验 Release 版本、文件名及 `.xz` 压缩包的 SHA-256 摘要，随后解压得到未压缩的 raw 整盘镜像；QEMU 启动脚本的 `--contest-image` 参数只接受解压后的匹配架构 raw 镜像，不直接接受 `.xz` 压缩文件。注意：解压官方镜像并非重新制盘，严禁使用 `create-ext4-image` 或 `mke2fs -d` 重新打包生成比赛评分盘。镜像内部实际包含哪些测试 ELF、`runtest`、Shell 解释器、动态链接器（loader）或共享库（DSO），均以挂载后的真实盘面内容为准（不能仅凭 Release 名称或默认测试计划就假定某个文件必然存在）。
 
-宿主机启动入口每次仅将原始比赛盘复制为工作目录中的临时工作副本（`contest.raw`）再交给 QEMU 挂载。早期调试阶段曾使用过的名为 `original` 或 `prepared` 的本地重制盘或注入盘，仅保留其各自的哈希与历史日志作为排障参考，不作为官方原始测试盘统计成绩。
+宿主机 QEMU 启动入口默认使用 `fresh`：将原始比赛盘复制为工作目录中的工作副本（`contest.raw`）再交给 QEMU 挂载；`reuse` 和 `refresh-system` 保留已有比赛工作副本。原镜像不被该流程写入，但 runner 不提供写入隔离，不能把原镜像直接映射成可写设备。早期调试阶段曾使用过的名为 `original` 或 `prepared` 的本地重制盘或注入盘，仅保留其各自的哈希与历史日志作为排障参考，不作为官方原始测试盘统计成绩。
 
 ## supplied-first 与明确准备
 
 当前的 Rust 比赛执行器默认遵循“优先使用测试盘自带环境（supplied-first）”原则：直接使用所选子根目录（root）内自带的原始 ELF、`PT_INTERP` 解释器路径、动态链接器（loader）、共享库（DSO）与测试脚本，不再像早期 Shell 脚本那样自动执行 `prepare_family`，也不会仅因为子目录名为 `musl` 或 `glibc` 就去覆盖盘内已有的库文件。需要注意，当 ELF 的 `PT_INTERP` 动态链接器本身缺失时，单纯设置 `LD_LIBRARY_PATH` 环境变量并不能让程序启动；此时执行器会如实记录 `exec` 启动失败，而不会将其归类为支持性跳过（Skip）。
 
-`prepare_runtime_libraries.py` 仅负责在宿主机侧整理下方列出的辅助动态运行库资产：由 `make prepare-guest-runtime-libraries` 通过 `RUNTIME_LIBRARIES_OUTPUT_DIR` 指定输出目录，再由 `assemble-root-filesystem` 将其安装到系统根文件系统的 `/opt/runtime/{musl,glibc}` 下——**这一步并不会把运行库自动注入到比赛测试盘中**。如果某张旧版测试盘确实缺少运行库、需要在运行前补充，应在显式选用的测试计划中通过 `roots.NAME.prepare` 声明准备步骤（该命令在父系统根环境中执行，其目标路径参数显式指向 `/mnt/contest/...` 挂载点；而单个用例的 `case.setup` / `case.cleanup` 则在切换后的用例子根内执行）。对于已经自带匹配动态链接器与共享库的新版测试盘，直接原样运行即可，无需执行额外替换。
+`prepare_runtime_libraries.py` 仅负责在宿主机侧整理下方列出的辅助动态运行库资产：由 `make prepare-guest-runtime-libraries` 通过 `RUNTIME_LIBRARIES_OUTPUT_DIR` 指定输出目录，再由 `assemble-root-filesystem` 将其安装到系统根文件系统的 `/opt/runtime/{musl,glibc}` 下——**这一步并不会把运行库自动注入到比赛测试盘中**。如果某张旧版测试盘确实缺少运行库、需要在运行前补充，应在显式选用的测试计划中通过 `roots.NAME.prepare` 声明准备步骤：每条命令必须写成完整对象并显式选择 `root = "system"` 或 `root = "test"`（旧的裸数组会在加载阶段报迁移错误）。`root = "system"` 的命令在父系统根环境中执行，其目标路径参数显式指向 `/mnt/contest/...` 挂载点或写成 `{test_root}`。其他阶段的数组简写恒表示 `test`；完整对象写 `root = "system"` 才在系统根执行，且不继承测试根的环境，详见[显式执行根手册](../../docs/contest-run-roots.md)。已经自带匹配动态链接器与共享库的测试盘无需额外补库；若要以未修补的 LA musl 库运行，须关闭下一段所述兼容 override 并使用 fresh 工作副本，但默认计划的其他显式准备仍会修改工作副本。
+
+区分宿主侧制备与客体内兼容修补：上面的 `prepare_runtime_libraries.py` 只在宿主机上原样复制库文件到系统根的辅助目录，从不触碰比赛盘；LoongArch 的 `cyclictest:musl:script` 例则在客体内由 override 的 `setup`（`root = "system"`，执行系统盘的 `/sbin/prepare-la-musl-sched`）修补比赛盘工作副本里已知版本 musl `libc.so` 的 `sched_getparam`、`sched_getscheduler`、`sched_setparam`、`sched_setscheduler` 四个函数。两者互不调用，后者不属于 supplied-first 的“原样使用盘内库”：它是显式的 prepared 输入变更，只接受原始 SHA-256 `816cff1d1abbef3f1423bbce01a56f00c97b6ff8e20d49966c9d4b6d27e5e7be`、产出 `09b0fc7cd720c1f5dc25399733c1d203389a2de9ca90f6effe1c394c66414438`；原比赛镜像不变，fresh 工作副本中该库的字节、语义和 inode 会变；库版本未知则该例 setup 失败，不运行原脚本。赛事是否允许修改工作盘运行库尚未确定，边界见[显式执行根手册第 10 节](../../docs/contest-run-roots.md)。
 
 在调试动态链接程序时，请注意区分三种不同的准备方式：按 `PT_INTERP` 要求的路径建立符号链接、显式补充缺失的共享库文件、或者直接将动态链接器（loader）作为主程序调用以加载目标二进制。其中，直接调用 loader 启动程序会改变子进程看到的 `argv[0]` 与辅助向量（`auxv`），并不完全等价于内核直接加载动态 ELF。在项目自有的非评分测试根中可以进行上述实验；但对于官方比赛评分盘，切勿向盘内注入或替换程序、脚本、共享库、符号链接或测试断言后再将其当作原始测试盘成绩。凡经过显式环境准备的步骤，其输入状态与运行结果均应明确标注。
 
@@ -70,7 +72,7 @@ python3 userland/runtime/prepare_runtime_libraries.py --arch loongarch64 \
 
 ## 原输入与现有失败边界
 
-执行器不解析、不改写比赛输出，也不判定通过与否。当前默认计划对固定 `pre-2025` 工作盘做了显式环境准备：`roots.prepare` 补充解释器、同盘 loader 与 `/bin/sh`、`/bin/busybox` 路径；iperf 直接执行盘内原脚本，cleanup 用比赛根内 BusyBox 的 `killall`/`pidof` 结束 `-D` 守护服务端并等待其退出。原始镜像保持不变，但这些运行属于经过准备的输入，不能作为完全原样运行官方盘的成绩；具体命令见 [比赛执行器手册](../../docs/contest-run.md)。在已知的测试输入边界中：
+执行器不解析、不改写比赛输出，也不判定通过与否。当前默认计划对固定 `pre-2025` 工作盘做了显式环境准备：`roots.NAME.prepare`（完整命令对象，默认计划写 `root = "system"`）补充解释器、同盘 loader 与 `/bin/sh`、`/bin/busybox` 路径；iperf 直接执行盘内原脚本，cleanup 用比赛根内 BusyBox 的 `killall`/`pidof` 结束 `-D` 守护服务端并等待其退出。此外，默认计划在 LoongArch 选中 `cyclictest:musl:script` 时，还会由该例的 override `setup` 修补工作副本里已知版本 musl `libc.so` 的四个调度函数（`sched_getparam`、`sched_getscheduler`、`sched_setparam`、`sched_setscheduler`）：这是对运行库字节、语义和 inode 的显式改动，同一 musl 根里之后启动的动态程序也会看到新语义；库版本未知则该例 setup 失败、不运行原脚本，赛事许可未定。原始镜像保持不变，但这些运行属于经过准备的输入，不能作为完全原样运行官方盘的成绩；具体命令见 [比赛执行器手册](../../docs/contest-run.md)，兼容修补的边界见[显式执行根手册](../../docs/contest-run-roots.md)。在已知的测试输入边界中：
 - 历史 `basic` 测试集中针对 `vfat` 文件系统与 `/dev/vda2` 分区的挂载请求，与官方提供的无分区表整盘 `ext4` 镜像格式不匹配；`hwclock` 用例则依赖尚未实现的用户态 RTC 设备 ABI，因此这两类用例如实保留原始失败状态（早期 `basic` 中的 `mount`/`umount` 暂缓项同样保持非 Pass 记录）。
 - RISC-V 架构下 `gnu` 静态链接的 `clock` 原始测试程序在调用成功后会额外断言 `errno == 0`：在历史运行现场中，虽然 `clock` 相关系统调用本身成功返回了 `0`，但此前 C 运行库初始化阶段调用可选系统调用 `getrandom` 返回的 `ENOSYS` 仍保留在线程局部的 `errno` 中；内核绝不能违反 POSIX 规范在系统调用成功时主动清零用户态 `errno`，也不能返回伪造的硬件随机数去掩盖 `ENOSYS`。这一现象属于原始测试二进制与标准 ABI 交互的真实边界，不会因为更换执行器或重跑测试而自动消失。
 - 在网络测试方面，当前宿主机 WSL 环境特殊的 `127.0.0.0/8` 回环路由行为曾导致大体量 UDP 报文未能完整送达宿主机侧对端进程（客体内核协议栈成功发出 6 个合法的 IP 分片，并不等同于宿主机端到端接收成功）。在临时创建的非特权 user/net 命名空间标准 `lo` 接口上，双架构 `17`、`0`、`1472`、`8193` 字节的 UDP 报文全文收发均已实测通过；但该隔离命名空间仅用于定位问题，不作为日常公共运行入口的自动回退方案。

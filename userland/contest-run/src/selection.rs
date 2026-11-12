@@ -8,6 +8,7 @@
 //! 之后再用完整字段（含 `{id}`）单遍展开 argv 与 before。after 保留原始模板，等执行结束拿到 `{status}` 一次展开。
 //! 命令行 `--only` 只在最后缩小集合。本模块不检查 argv[0] 在目标根内是否存在。
 
+use crate::command::{Root, SourcePath};
 use crate::expand::expand;
 use crate::model::{
     CaseOverride, Config, Group, ResolvedCase, ResolvedGroup, RootSpec, SourceLocation, Step,
@@ -94,7 +95,7 @@ pub fn resolve(config: &Config, arch: &str, only: &[String]) -> Result<Selection
                         root: root_name.clone(),
                         name: candidate.name,
                         catalog_command: candidate.command,
-                        argv: step.exec.clone(),
+                        exec: step.exec.clone(),
                         cwd: cwd.clone(),
                         env: env.clone(),
                         timeout_sec: step.timeout_sec.unwrap_or(config.defaults.timeout_sec),
@@ -117,6 +118,14 @@ pub fn resolve(config: &Config, arch: &str, only: &[String]) -> Result<Selection
                 root: root_name.clone(),
                 start: group_text(&group.start, &group.name, root_name),
                 end: group_text(&group.end, &group.name, root_name),
+                cwd: group.cwd.clone().unwrap_or_else(|| root.cwd.clone()),
+                env: {
+                    let mut env = root.env.clone();
+                    env.extend(group.env.clone());
+                    env
+                },
+                setup: group.setup.clone(),
+                cleanup: group.cleanup.clone(),
                 cases,
             });
         }
@@ -132,11 +141,6 @@ pub fn resolve(config: &Config, arch: &str, only: &[String]) -> Result<Selection
             None => unmatched.push(format!("{} at {}", rule.id, located(&rule.location))),
         }
     }
-    for group in &mut groups {
-        for case in &mut group.cases {
-            expand_case(case);
-        }
-    }
     if !only.is_empty() {
         let at = config.plan.display().to_string();
         let patterns = patterns(only, &at)?;
@@ -146,6 +150,27 @@ pub fn resolve(config: &Config, arch: &str, only: &[String]) -> Result<Selection
                 .retain(|case| patterns.iter().any(|pattern| pattern.matches(&case.id)));
         }
         groups.retain(|group| !group.cases.is_empty());
+    }
+    for group in &mut groups {
+        let test_root = config.roots[&group.root].path.to_string_lossy();
+        let pairs = [
+            ("group", group.name.as_str()),
+            ("root", group.root.as_str()),
+            ("test_root", test_root.as_ref()),
+        ];
+        group.setup = group
+            .setup
+            .iter()
+            .map(|command| command.expanded(&pairs))
+            .collect();
+        group.cleanup = group
+            .cleanup
+            .iter()
+            .map(|command| command.expanded(&pairs))
+            .collect();
+        for case in &mut group.cases {
+            expand_case(case, &test_root);
+        }
     }
     if groups.is_empty() {
         return Err(format!(
@@ -231,10 +256,11 @@ fn candidates(
             .collect());
     }
     if let Some(directory) = &step.directory {
+        let (source_root, source_cwd, path) = source_view(directory, root, cwd);
         return select(
             step,
-            directory_entries(root, cwd, directory, at)?,
-            directory,
+            directory_entries(source_root, source_cwd, path, at)?,
+            path,
             at,
         );
     }
@@ -242,17 +268,36 @@ fn candidates(
         .catalog
         .as_ref()
         .expect("step declares exactly one source");
-    select(step, catalog_entries(root, cwd, catalog, at)?, catalog, at)
+    let (source_root, source_cwd, path) = source_view(catalog, root, cwd);
+    select(
+        step,
+        catalog_entries(source_root, source_cwd, path, at)?,
+        path,
+        at,
+    )
 }
 
-/// 列出 root 内目录中普通且有任一执行位的文件，按名字升序返回。
+/// 为读取来源选择根视图，不改变测例所属根或命令的执行根。
+fn source_view<'a>(
+    source: &'a SourcePath,
+    root: &'a RootSpec,
+    cwd: &'a Path,
+) -> (&'a Path, &'a Path, &'a Path) {
+    let (scope, path) = source.parts();
+    match scope {
+        Root::System => (Path::new("/"), Path::new("/"), path),
+        Root::Test => (&root.path, cwd, path),
+    }
+}
+
+/// 列出所选来源根内普通且有任一执行位的文件，按名字升序返回。
 fn directory_entries(
-    root: &RootSpec,
+    root: &Path,
     cwd: &Path,
     directory: &Path,
     at: &SourceLocation,
 ) -> Result<Vec<Candidate>, String> {
-    let listing = rooted_path(&root.path, cwd, directory)
+    let listing = rooted_path(root, cwd, directory)
         .and_then(fs::read_dir)
         .map_err(|error| format!("{at}: {}: {error}", directory.display()))?;
     let source = SourceLocation {
@@ -266,7 +311,7 @@ fn directory_entries(
             .file_name()
             .into_string()
             .map_err(|_| format!("{at}: non-UTF-8 file name in {}", directory.display()))?;
-        let metadata = rooted_path(&root.path, cwd, &directory.join(&name))
+        let metadata = rooted_path(root, cwd, &directory.join(&name))
             .and_then(fs::metadata)
             .map_err(|error| format!("{at}: {}: {error}", directory.display()))?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
@@ -282,14 +327,14 @@ fn directory_entries(
     Ok(entries)
 }
 
-/// 读取清单：跳过空行与 `#` 注释行，首个空白分隔词为名字，其余去掉前导空白后为命令原文。
+/// 在所选来源根内读取清单，保留声明路径、行号和命令原文。
 fn catalog_entries(
-    root: &RootSpec,
+    root: &Path,
     cwd: &Path,
     catalog: &Path,
     at: &SourceLocation,
 ) -> Result<Vec<Candidate>, String> {
-    let text = rooted_path(&root.path, cwd, catalog)
+    let text = rooted_path(root, cwd, catalog)
         .and_then(fs::read_to_string)
         .map_err(|error| format!("{at}: {}: {error}", catalog.display()))?;
     let mut entries = Vec::new();
@@ -375,7 +420,7 @@ fn patterns(texts: &[String], at: &str) -> Result<Vec<Pattern>, String> {
 /// 把命中的覆盖规则整字段替换到用例上，环境变量按键合并，多条规则按声明顺序覆盖前者。
 fn apply(case: &mut ResolvedCase, rule: &CaseOverride) {
     if let Some(exec) = &rule.exec {
-        case.argv.clone_from(exec);
+        case.exec.clone_from(exec);
     }
     if let Some(cwd) = &rule.cwd {
         case.cwd.clone_from(cwd);
@@ -401,17 +446,30 @@ fn apply(case: &mut ResolvedCase, rule: &CaseOverride) {
     case.env.extend(rule.env.clone());
 }
 
-/// 用完整字段单遍展开 argv 与 before 模板；after 保持原始模板，执行结束时再展开。
-fn expand_case(case: &mut ResolvedCase) {
-    let pairs = fields(
+/// 用完整字段单遍展开所有命令与 before；after 保持原始模板，执行结束时再展开。
+fn expand_case(case: &mut ResolvedCase, test_root: &str) {
+    let mut pairs = fields(
         &case.group,
         &case.root,
         &case.name,
         case.catalog_command.as_deref(),
         Some(&case.id),
     );
-    let argv: Vec<String> = case.argv.iter().map(|arg| expand(arg, &pairs)).collect();
+    pairs.push(("test_root", test_root));
+    let exec = case.exec.expanded(&pairs);
+    let setup = case
+        .setup
+        .iter()
+        .map(|command| command.expanded(&pairs))
+        .collect();
+    let cleanup = case
+        .cleanup
+        .iter()
+        .map(|command| command.expanded(&pairs))
+        .collect();
     let before = expand(&case.before, &pairs);
-    case.argv = argv;
+    case.exec = exec;
+    case.setup = setup;
+    case.cleanup = cleanup;
     case.before = before;
 }

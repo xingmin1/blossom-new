@@ -1,5 +1,7 @@
 # 比赛测试执行手册
 
+> 命令执行根已统一：prepare、setup、主命令与 cleanup 各自选择 `system`（执行器自己的系统根）或 `test`（所选测试根）。数组简写恒表示 `test`，`roots.NAME.prepare` 必须写完整对象，旧数组会在加载阶段报迁移错误。完整规则、group 级 setup/cleanup、`--list` 的命令明细和 LA musl 调度兼容见[显式执行根手册](contest-run-roots.md)。
+
 本手册说明如何在比赛测试盘上选择、预览和执行用例，以及如何阅读输出文本与退出码。执行器为客体系统中的 `/sbin/contest-run`，测试计划与集合文件位于仓库的 `userland/contest/`。增减程序、修改参数或运行环境都不需要改动 Rust 代码。
 
 ## 1. 第一次运行
@@ -37,9 +39,9 @@ QEMU 默认使用 `fresh` 工作盘：每次把系统源镜像和比赛源镜像
 
 | 策略 | 行为 |
 |---|---|
-| `fresh` | 重新复制系统盘和比赛盘，源镜像保持不变 |
-| `reuse` | 直接复用工作目录中已有的副本，不读取源镜像，也不自动更新其中的配置 |
-| `refresh-system` | 只用最新系统源镜像替换系统工作盘，保留比赛工作盘的已有数据 |
+| `fresh` | 重新复制系统盘和比赛盘，源镜像保持不变；此前对工作副本的修改全部丢弃 |
+| `reuse` | 直接复用工作目录中已有的副本，不读取源镜像，也不自动更新其中的配置；比赛工作盘里此前的修改原样保留 |
+| `refresh-system` | 只用最新系统源镜像替换系统工作盘，保留比赛工作盘的已有数据（含此前的修改） |
 
 例如在交互式会话中明确指定策略：
 
@@ -48,7 +50,7 @@ make run-qemu ARCH=riscv64 QEMU_ARGS='--working-disk-action fresh'
 make run-qemu ARCH=riscv64 QEMU_ARGS='--working-disk-action refresh-system'
 ```
 
-`roots.prepare` 修改的是比赛盘的工作副本；原始比赛镜像不会被写入。
+项目 QEMU 启动工具使用比赛盘工作副本，原始比赛镜像不被写入；默认计划的准备和被测程序可能修改工作副本。runner 本身不隔离写入，自行指定设备或编写 `system` 命令时必须确保目标是工作副本，不能把原镜像直接映射为可写设备。`reuse` 与 `refresh-system` 保留比赛工作盘的改动，`fresh` 才从原始镜像重新开始。默认计划里唯一改变运行库内容的步骤是 LoongArch musl 的 `cyclictest:musl:script` 兼容 override，见[显式执行根手册](contest-run-roots.md)第 9、10 节。
 
 ## 2. 修改哪个文件
 
@@ -59,6 +61,8 @@ make run-qemu ARCH=riscv64 QEMU_ARGS='--working-disk-action refresh-system'
 | 增减 Libctest selector | `userland/contest/sets/libctest.toml` 的 `names` |
 | 选择 LTP 用例 | `userland/contest/sets/ltp.toml` 的 `include`/`exclude` |
 | 调整单例的超时、参数、环境或准备命令 | `userland/contest/overrides/local.toml`；`mount`/`umount` 使用 `overrides/basic-mount.toml` |
+| 在选中用例之前或之后执行准备、清理命令 | step 或 override 的 `setup`/`cleanup`；整组共用一次的用 group 的 `setup`/`cleanup`。写法见[显式执行根手册](contest-run-roots.md) |
+| 启用或关闭 LA musl 调度兼容 | `plan.toml` 的 `override_files` 是否引用 `overrides/la-musl-sched.toml`；改后重新打包，并用 `fresh` 工作盘启动 |
 | 适配现场测试盘布局 | `plan.toml` 中的 `roots` 及对应集合文件 |
 
 `files` 中没有列出的集合文件不会运行。磁盘或仓库中存在某个 TOML 不代表它已启用。
@@ -80,7 +84,7 @@ files = [
     "sets/cyclictest.toml",
     "sets/ltp.toml",
 ]
-override_files = ["overrides/local.toml", "overrides/basic-mount.toml"]
+override_files = ["overrides/local.toml", "overrides/basic-mount.toml", "overrides/la-musl-sched.toml"]
 finish = "poweroff"
 ```
 
@@ -95,6 +99,8 @@ finish = "poweroff"
 两个 root 都先复制项目 BusyBox 到 `/.blossom/busybox`，再补缺失的标准 `/bin/sh` 入口。项目 ash 遇到无 shebang 文本时，通过 `/bin/busybox` 重新执行盘内 BusyBox 的 ash；原 `/busybox` 和 `/bin/busybox` 的准备方式不变，显式 `/busybox sh` 仍执行盘内原 shell。已有 `/bin/sh`（包括失效符号链接）不会被替换；复制或链接失败会按准备错误返回。
 
 更新系统盘中的计划后，使用 `fresh` 才会从原比赛盘重新准备缺失的入口。`reuse` 不更新系统工作盘中的计划，`refresh-system` 虽更新计划但保留比赛工作盘；两者都不会替换比赛工作盘中已有的旧 `/bin/sh` 链接。
+
+默认计划还含一项显式的运行库兼容变更：仅在 LoongArch 上选中 `cyclictest:musl:script` 时，override 的 `setup` 以 `root = "system"` 运行系统盘的 `/sbin/prepare-la-musl-sched`，修补比赛工作副本中已知版本 musl `libc.so` 的 `sched_getparam`、`sched_getscheduler`、`sched_setparam`、`sched_setscheduler` 四个函数。它不属于上面“补缺并保留已有文件”的准备：原比赛镜像不变，但工作副本里该 libc 的字节、语义和 inode 都会改变，同一 musl 根里之后启动的动态程序也会看到新语义；库的版本未知时该例的 setup 失败、不运行原脚本；`reuse` 与 `refresh-system` 会保留已修补的库，恢复原库须关闭该 override 并使用 `fresh`。赛事是否允许修改工作盘里的运行库尚未确定。详见[显式执行根手册](contest-run-roots.md)第 10 节。
 
 如需只运行 `mount`、`umount`，可显式选择独立计划：
 
@@ -176,7 +182,7 @@ after = "FAIL LTP CASE {name} : {status}\n"
 
 ### 3.4 通配符、顺序与重复
 
-`include`、`exclude` 和 `--only` 支持 `*`、`?`、字符集合等 glob。执行顺序为：`files` 中的文件顺序、组声明顺序、`roots` 顺序、step 顺序。每个 root 内完整执行该组的全部 step，然后切换到下一个 root。同一组内不同 step 的候选不会合并去重。
+`include`、`exclude` 和 `--only` 支持 `*`、`?`、字符集合等 glob。执行顺序为：`files` 中的文件顺序、组声明顺序、`roots` 顺序、step 顺序。每个 root 内完整执行该组的全部 step，然后切换到下一个 root。每个非空的（组，root）实例开始前执行一次 group 的 `setup`，结束后执行一次 group 的 `cleanup`；用例自己的 `setup`、`cleanup` 则每次执行（含 `repeat` 的每一次）都会运行。同一组内不同 step 的候选不会合并去重。
 
 `repeat` 在 `defaults`、step 或 override 上配置，表示每个用例连续执行的次数；`--repeat` 覆盖本次运行的所有已选用例。
 
@@ -212,11 +218,11 @@ timeout_sec = 600
 
 比赛盘内的 RISC-V musl Iozone 3.506 对原脚本的 `-i 11 -i 12` 参数，在 Linux 下也提示 `Selected test not available on the version`，随后输出 initial writers 和 rewriters 测量值。评分器能够读取这两项输出，但这些分数不能证明 pwritev/preadv 模式实际运行。
 
-`iperf` 集合额外配置 `cleanup`：盘内脚本用 `iperf3 -s -D` 启动服务端，守护进程脱离主命令的进程组，脚本结束时也不停止它，主命令收尾的整组 `SIGKILL` 到不了它。`sets/iperf.toml` 直接用 `/busybox sh /iperf_testcode.sh` 原样执行脚本；cleanup 在同一个 root 内用盘内 BusyBox 执行 `killall iperf3`，再用 `pidof` 每秒检查一次，直到服务端退出后才切换 root，否则它打开的 `/dev` 文件会让卸载返回 Busy。
+`iperf` 集合额外配置 `cleanup`：盘内脚本用 `iperf3 -s -D` 启动服务端，守护进程脱离主命令的进程组，脚本结束时也不停止它，主命令收尾的整组 `SIGKILL` 到不了它。`sets/iperf.toml` 直接用 `/busybox sh /iperf_testcode.sh` 原样执行脚本；cleanup 用数组简写，即在同一个测试 root 内用盘内 BusyBox 执行 `killall iperf3`，再用 `pidof` 每秒检查一次，直到服务端退出后才切换 root，否则它打开的 `/dev` 文件会让卸载返回 Busy。
 
 `killall`/`pidof` 依赖内核的 `/proc/<pid>/stat` 与 `/proc/<pid>/cmdline` 查询。系统根 BusyBox 未启用这两个 applet，cleanup 必须使用比赛根内的 `/busybox`。
 
-cleanup 单条命令的超时取 `defaults.timeout_sec`（默认计划为 60 秒），不使用该 step 的 600 秒脚本预算；超时按 cleanup 错误停止会话。
+cleanup 单条命令的超时取 `defaults.timeout_sec`（默认计划为 60 秒），不使用该 step 的 600 秒脚本预算；命令用完整对象写了自己的 `timeout_sec` 时以它为准。超时按 cleanup 错误停止会话。
 
 ## 5. 路径相对规则
 
@@ -238,9 +244,12 @@ env = { PATH = "/bin:/usr/bin:/", LD_LIBRARY_PATH = "/lib" }
 | `exec = ["/basic/getpid"]` | 相对测试 root 的绝对路径，不是系统辅助盘的 `/basic` |
 | `directory = "/ltp/testcases/bin"` | 绝对路径按测试 root 解析；相对路径按有效 `cwd` 解析 |
 | `catalog = "/ltp/runtest/syscalls"` | 测试 root 内的清单文件 |
+| `exec = { root = "system", argv = ["/bin/busybox", "true"] }` | 不换根，路径按执行器自己的系统根 `/` 解析 |
+| `argv` 里的 `{test_root}`（常用于 `root = "system"` 的命令） | 选择阶段单次展开成 `roots.NAME.path`，仍是普通字符串，不改写、不追踪符号链接 |
+| `catalog = { root = "system", path = "/etc/contest/selected.txt" }` | 系统根内的清单；只决定读取位置，不改变命令的执行根，`system` 来源必须写绝对路径 |
 | `files = ["sets/basic.toml"]` | 相对主计划文件所在目录，与测试 root 无关 |
 
-有效工作目录的优先级为 step 的 `cwd`、group 的 `cwd`、root 的 `cwd`。环境变量按 root、group、step 的顺序按键覆盖。`musl`、`glibc` 只是配置中的根名字，程序与库来自 `path`、`exec` 和 `env` 的实际取值。
+有效工作目录的优先级为 step 的 `cwd`、group 的 `cwd`、root 的 `cwd`。环境变量按 root、group、step 的顺序按键覆盖。这是 `test` 命令（数组简写）的默认值；完整对象可用自己的 `cwd`、`env` 再覆盖，`env` 按键合并。`root = "system"` 的命令不继承这些默认值：cwd 默认为 `/`，环境默认为空，需要的变量写在该命令的 `env` 里。`musl`、`glibc` 只是配置中的根名字，程序与库来自 `path`、`exec` 和 `env` 的实际取值。
 
 测试 root 不是写入隔离机制：用例会修改比赛盘中对应目录的文件。
 
@@ -263,17 +272,17 @@ Linux 的 POSIX 共享内存 `shm_open`、`shm_unlink` 使用 `/dev/shm` 中的�
 
 `mlock` 和 `munlock` 对当前地址空间执行真实锁页与解锁，`RLIMIT_MEMLOCK` 默认软硬限额均为 8 MiB；当前凭据模型以 UID 0 表达锁页特权。`mlockall`、`mlock2` 和独立的 `CAP_IPC_LOCK` 尚未实现，不能将上述支持外推为完整锁页接口。
 
-`prepare` 是显式的环境准备，在父系统根 `/` 中执行，可直接操作挂载在 `/mnt/contest` 的比赛盘工作副本；默认计划的链接与复制只改这份副本，原始比赛镜像保持不变。部分旧版比赛盘的 `musl`、`glibc` 子目录缺少程序 `PT_INTERP` 请求的解释器路径，默认计划用链接和复制补齐（节选）：
+`prepare` 是显式的环境准备：每条命令都写成完整对象，用 `root` 选择执行根，旧的裸数组会在加载阶段报迁移错误（见[显式执行根手册](contest-run-roots.md)第 7 节）。下列默认计划命令写 `root = "system"`，在父系统根 `/` 中执行，可直接操作挂载在 `/mnt/contest` 的比赛盘工作副本；默认计划的链接与复制只改这份副本，原始比赛镜像保持不变。部分旧版比赛盘的 `musl`、`glibc` 子目录缺少程序 `PT_INTERP` 请求的解释器路径，默认计划用链接和复制补齐（节选）：
 
 ```toml
 prepare = [
-    ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"],
-    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64.so.1"],
-    ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-loongarch-lp64d.so.1"],
+    { root = "system", argv = ["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-riscv64.so.1"] },
+    { root = "system", argv = ["/bin/busybox", "ln", "-sf", "libc.so", "/mnt/contest/musl/lib/ld-musl-loongarch-lp64d.so.1"] },
 ]
 ```
 
-每个准备命令的退出码必须为 0，否则该 root 激活失败并按执行错误处理，后续挂载和用例不再运行。准备超时使用 `defaults.timeout_sec`；挂载失败也立即停止当前会话，并报告实际路径和系统错误。文件、命令与链接的补缺只由 `prepare` 中的明确 argv 执行：第 2 节列出的补缺入口保留已有文件及链接（包括失效链接），而解释器链接、loader 和 `/.blossom` 副本仍按各自命令执行。执行器不自动猜测解释器，不用系统盘的 libc 覆盖比赛盘，也不改写原测试脚本、ELF 或 judge。
+每个准备命令的退出码必须为 0，否则该 root 激活失败并按执行错误处理，后续挂载和用例不再运行。准备命令默认使用 `defaults.timeout_sec`，完整对象可用自己的 `timeout_sec` 覆盖；命令行 `--timeout-sec` 不改变它。挂载失败也立即停止当前会话，并报告实际路径和系统错误。文件、命令与链接的补缺只由 `prepare` 中的明确 argv 执行：第 2 节列出的补缺入口保留已有文件及链接（包括失效链接），而解释器链接、loader 和 `/.blossom` 副本仍按各自命令执行。执行器不自动猜测解释器，不用系统盘的 libc 覆盖比赛盘，也不改写原测试脚本、测试程序（cyclictest、hackbench 等 ELF）或 judge；唯一改变比赛盘运行库的步骤是被显式选中的 LA musl 兼容 override，它只在工作副本里修补已知版本 libc 的四个调度函数，见第 2 节与[显式执行根手册](contest-run-roots.md)第 10 节。
 
 ### 6.1 定向验证入口
 
@@ -302,7 +311,7 @@ prepare = [
   --only 'cyclictest:glibc:script' --finish return
 ```
 
-前一条只检查文件路径、写入与命令后的正常释放；后一条才执行原程序的 `shm_open` 路径。应保留原始输出与准备、挂载或卸载错误，并交给对应原 judge 判定，不用 runner 退出零代替程序成功或得分。
+前一条只检查文件路径、写入与命令后的正常释放；后一条才执行原程序的 `shm_open` 路径。在 LoongArch 上后一条还会先运行 `cyclictest:musl:script` 的兼容 setup，修改当前工作副本里的 libc；需要从原库开始时使用 `fresh` 工作盘。应保留原始输出与准备、挂载或卸载错误，并交给对应原 judge 判定，不用 runner 退出零代替程序成功或得分。
 
 ## 7. 预览与临时筛选
 
@@ -319,15 +328,20 @@ make run-qemu ARCH=riscv64 QEMU_ARGS='--shell'
 /sbin/contest-run /dev/vda --list
 ```
 
-预览每组输出一行组信息，组内每个用例输出一行：
+预览每组输出一行组信息；root 的 `prepare` 与 group 的 `setup`、`cleanup` 按执行位置列出；每个用例先给出一行 `CASE`（完整 ID、重复次数、来源位置），其下列出它的 `setup`、`exec`、`cleanup` 命令。输出形如下例：
 
 ```text
 GROUP basic / musl path=/mnt/contest/musl
-basic:musl:brk cwd=/basic timeout=60s repeat=1 argv=["./brk"] source=sets/basic.toml group 1 step 1
-basic:musl:getpid cwd=/basic timeout=60s repeat=1 argv=["./getpid"] source=sets/basic.toml group 1 step 1
+  root.prepare root=system path=/ cwd=/ timeout=60s argv=["/bin/busybox", "ln", "-sfn", "lib", "/mnt/contest/musl/lib64"] env={}
+  ……（其余 prepare 命令）
+  CASE basic:musl:brk repeat=1 source=/etc/contest/sets/basic.toml group 1 step 1 (.)
+    exec root=test path=/mnt/contest/musl cwd=/basic timeout=60s argv=["./brk"] env={"HOME": "/", "LD_LIBRARY_PATH": "/lib", "PATH": "/ltp/testcases/bin:/bin:/usr/bin:/"}
+  ……（其他用例）
+  CASE basic:musl:getpid repeat=1 source=/etc/contest/sets/basic.toml group 1 step 1 (.)
+    exec root=test path=/mnt/contest/musl cwd=/basic timeout=60s argv=["./getpid"] env={"HOME": "/", "LD_LIBRARY_PATH": "/lib", "PATH": "/ltp/testcases/bin:/bin:/usr/bin:/"}
 ```
 
-每行包含完整 ID、工作目录、超时、重复次数、未拆分的 argv 数组和来源位置。`--list` 只挂载设备并解析、校验选择和磁盘文件，不运行 `prepare`、setup、cleanup、内核通知或 `finish`，也不执行测试程序。它证明选择结果，不证明程序与内核 ABI 能运行。
+每条命令一行，包含执行根（`root=system` 或 `root=test`）、真正执行根的路径 `path`（`system` 为 `/`，`test` 为该测试根的路径）、有效 cwd、超时、未拆分的 argv 数组和环境，`{test_root}` 等模板已展开。`--list` 只挂载设备并解析、校验选择和磁盘文件，显示将要运行的命令，但不运行 `prepare`、setup、cleanup、内核通知或 `finish`，也不执行测试程序。它证明选择结果，不证明程序与内核 ABI 能运行。
 
 只运行一例：
 
@@ -351,7 +365,7 @@ basic:musl:getpid cwd=/basic timeout=60s repeat=1 argv=["./getpid"] source=sets/
   --timeout-sec 120 --repeat 3 --verbose --finish return
 ```
 
-命令行参数只作用于本次运行，不写回 TOML。`--timeout-sec` 和 `--repeat` 必须为正整数，优先于计划中的对应字段，作用范围为全部已选用例，不改变 setup、cleanup 与 prepare 的超时。`--verbose` 额外打印每次执行的退出状态与耗时、未命中的 override 以及最终状态。
+命令行参数只作用于本次运行，不写回 TOML。`--timeout-sec` 和 `--repeat` 必须为正整数，优先于计划中的对应字段，作用范围为全部已选用例。`--timeout-sec` 覆盖主命令的超时，包括 `exec` 对象自己写的 `timeout_sec`，但不改变 prepare、group 与用例的 setup、cleanup 的超时。`--verbose` 额外打印每次执行的退出状态与耗时、未命中的 override 以及最终状态。
 
 `--plan` 指定另一份主计划；`--file` 替换主计划的 `files`，不是追加，多个 `--file` 按给出顺序加载，主计划的 `roots`、`defaults` 和 `finish` 保留：
 
@@ -374,7 +388,7 @@ timeout_sec = 120
 env = { LTP_TIMEOUT_MUL = "4" }
 ```
 
-可以修改 `exec`、`cwd`、`env`、`timeout_sec`、`repeat`、`setup`、`cleanup`、`before`、`after`。不能修改 root、group 或 ID。`arch` 非空时只对列出的架构生效：
+可以修改 `exec`、`cwd`、`env`、`timeout_sec`、`repeat`、`setup`、`cleanup`、`before`、`after`；其中 `exec`、`setup`、`cleanup` 是整体替换，不是追加。不能修改用例所属的 root、group 或 ID；命令自己的执行根在 `exec`、`setup`、`cleanup` 里用 `root = "system"` 或 `root = "test"` 的完整对象选择，数组简写表示 `test`。`arch` 非空时只对列出的架构生效：
 
 ```toml
 [[override]]
@@ -386,6 +400,21 @@ env = { LTP_TIMEOUT_MUL = "14" }
 
 覆盖项按声明顺序应用，后者覆盖前者同一字段；`env` 按键合并。覆盖只作用于已被选中的用例，不会把用例重新加入计划。目标未被选中时，`--list` 与 `--verbose` 提示 `override {item} matched no selected case`，运行本身不受影响。`overrides/ltp-environment.toml` 是没有启用的示例。
 
+在选中用例之前运行系统根里的准备命令，同样写在 override 的 `setup` 里。默认计划引用的 `overrides/la-musl-sched.toml` 就是这样写的，它只对 LoongArch 的 `cyclictest:musl:script` 生效，修改的内容和风险见[显式执行根手册](contest-run-roots.md)第 10 节：
+
+```toml
+[[override]]
+id = "cyclictest:musl:script"
+arch = ["loongarch64"]
+
+[[override.setup]]
+root = "system"
+cwd = "/"
+argv = ["/bin/busybox", "sh", "/sbin/prepare-la-musl-sched", "{test_root}/lib/libc.so"]
+```
+
+`{test_root}` 展开成该用例所属测试根的路径（这里是 `/mnt/contest/musl`）。setup 普通失败时不运行主脚本、计一次执行错误；进程控制、清理及通知均正常时继续下一例，否则停止会话。
+
 有些用例不能在 tmpfs 中运行，需要真实 ext4 目录，可以用 setup 和 cleanup 准备、删除：
 
 ```toml
@@ -396,7 +425,7 @@ setup = [["/busybox", "mkdir", "-p", "/scratch/sendfile09"]]
 cleanup = [["/busybox", "rm", "-rf", "/scratch/sendfile09"]]
 ```
 
-该写法要求 `/scratch` 已经是容量足够的可写 ext4；`mkdir` 不会把 tmpfs 变成 ext4。需要 `LTP_DEV` 的用例必须使用可格式化的专用测试设备，不能指向承载比赛文件的系统盘。
+这两条数组简写在测试根内执行。该写法要求 `/scratch` 已经是容量足够的可写 ext4；`mkdir` 不会把 tmpfs 变成 ext4。需要 `LTP_DEV` 的用例必须使用可格式化的专用测试设备，不能指向承载比赛文件的系统盘。
 
 外层超时与 LTP 自身的内部超时无关。只改 `timeout_sec` 不会修改 LTP 的内部时限，需要时同时设置 `LTP_TIMEOUT_MUL`。
 
@@ -413,7 +442,7 @@ before = "RUN LTP CASE {name}\n"
 after = "FAIL LTP CASE {name} : {status}\n"
 ```
 
-清单每行第一个空白分隔词是名字，其余部分是 `{command}` 原文；`{command}` 整段作为一个参数传入，不按空格重新拆分。此处显式使用盘内 `/busybox sh`，不能假定测试根中存在 `/bin/sh`。
+清单每行第一个空白分隔词是名字，其余部分是 `{command}` 原文；`{command}` 整段作为一个参数传入，不按空格重新拆分。此处显式使用盘内 `/busybox sh`，不能假定测试根中存在 `/bin/sh`。清单也可以放在系统根里：`catalog = { root = "system", path = "/etc/contest/ltp-selected.txt" }`，命令仍在测试根执行；选择发生在 prepare 之前，清单必须已经存在。
 
 `sets/ltp.toml` 与 `sets/ltp-catalog.toml` 是两种替代方式，不能同时启用而生成同一个 ltp/root 分组。选择清单模式前先确认镜像内确实有该清单文件；不存在时执行器报错，不会回退去扫描目录。
 
@@ -521,7 +550,7 @@ contest-run: basic:musl:mmap: timed out after 120s
 | 退出码 | 含义 |
 |---|---|
 | 0 | 编排完成，没有执行错误 |
-| 1 | 存在执行错误：启动失败、超时、信号终止、setup 失败、清理、挂载或 `finish` 失败等 |
+| 1 | 存在执行错误：启动失败、超时、信号终止、prepare、group 或用例的 setup 失败、清理、挂载或 `finish` 失败等 |
 | 2 | 命令行、配置或选择错误 |
 
 单命令模式透传主命令的 shell 风格状态：正常退出取原退出码，信号为 `128 + signal`，超时为 124，命令不存在为 127，权限或格式错误为 126，其他执行错误为 125。
@@ -541,6 +570,9 @@ contest-run: basic:musl:mmap: timed out after 120s
 | 测试做完不退出 | 是否有后台服务或脱离进程组的守护进程；脚本与 cleanup 是否等待并结束它 |
 | 分数被覆盖或少了一半 | 同一 group/root 是否打印了多次同名分组，例如拆开的 dynamic/static |
 | 编排返回 0 | 只说明调度完成，不代表所有测试通过 |
+| 加载时报 prepare 必须写成 `{ root = "system", argv = [...] }` | 残留旧的 `prepare` 数组；按[显式执行根手册](contest-run-roots.md)第 7 节迁移，退出码 2 |
+| LA musl cyclictest 的 setup 失败，主脚本没有运行 | 工作副本里的 libc 不是已核验的原版（`unsupported libc SHA256`）、是软链接，或系统 BusyBox 缺 applet；不会回退成不修补直接运行，也不要删除哈希检查硬套偏移，见[显式执行根手册](contest-run-roots.md)第 10 节 |
+| 关掉了 LA musl 兼容，行为仍是修补后的库 | 复用了保留改动的比赛工作盘（`reuse` 或 `refresh-system`）；改用 `fresh` |
 
 ## 14. 内核专属处理
 

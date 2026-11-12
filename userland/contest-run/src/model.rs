@@ -4,9 +4,10 @@
 //! 含一个或多个 Step 与分组首尾文本；Step 按 `names`、`directory`、`catalog` 三种来源之一展开成具体用例。
 //! 展开后的 [`ResolvedCase`] 只保留执行数据：argv、cwd、env、超时、重复轮数、setup/cleanup 与 before/after 文本。
 //!
-//! 模板字段固定为 `{group}`、`{root}`、`{name}`、`{id}`、清单来源的 `{command}`，以及 after 文本执行结束时
-//! 才提供的 `{status}`；单次替换，插入的文本不再展开。after 保持原始模板，避免先插入命令名再被二次替换。
+//! 模板字段固定为 `{group}`、`{root}`、`{test_root}`、`{name}`、`{id}`、清单来源的 `{command}`，
+//! 以及 after 文本执行结束时才提供的 `{status}`；单次替换，插入的文本不再展开。
 
+use crate::command::{CommandSpec, SourcePath};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,7 +20,7 @@ pub struct SourceLocation {
     pub file: PathBuf,
     /// 条目在文件内的位置，如 `group 2`、`group 2 step 1`、`override 3`（序号从 1 起）。
     pub entry: String,
-    /// 目录或清单来源在测试 root 内的路径；`names` 来源没有此项。
+    /// 目录或清单在配置中声明的路径；保留符号链接别名，`names` 来源没有此项。
     pub catalog: Option<PathBuf>,
     /// 清单来源的行号（从 1 起）；目录来源没有行号。
     pub line: Option<usize>,
@@ -61,7 +62,7 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RootSpec {
-    /// 根目录在宿主文件系统中的绝对路径。
+    /// 根目录在 runner 系统根中的绝对路径。
     pub path: PathBuf,
     /// 根内用例的默认工作目录（chroot 后解释，默认为 `"/"`）。
     #[serde(default = "root_cwd")]
@@ -72,9 +73,9 @@ pub struct RootSpec {
     /// 按声明顺序挂载的项目：`dev`、`shm`（`/dev/shm`）、`proc`、`tmp`；省略时不挂载。
     #[serde(default)]
     pub mounts: Vec<String>,
-    /// 激活该根时在系统根内执行的准备命令。
+    /// 激活该根时按命令显式选择的执行根运行，必须使用完整命令对象。
     #[serde(default)]
-    pub prepare: Vec<Vec<String>>,
+    pub prepare: Vec<CommandSpec>,
 }
 
 /// 提供 `RootSpec::cwd` 的默认值 `"/"`。
@@ -132,6 +133,12 @@ pub struct Group {
     /// 组结束时输出的文本。
     #[serde(default)]
     pub end: String,
+    /// 每个非空的组与测试根实例开始前同步执行一次。
+    #[serde(default)]
+    pub setup: Vec<CommandSpec>,
+    /// 每个组与测试根实例结束后同步执行一次，进程失控时跳过。
+    #[serde(default)]
+    pub cleanup: Vec<CommandSpec>,
     /// 组内步骤，按声明顺序展开。
     #[serde(rename = "step")]
     pub steps: Vec<Step>,
@@ -152,17 +159,17 @@ pub struct Step {
     pub arch: Vec<String>,
     /// 显式名字列表，名字即数据，不要求存在同名文件。
     pub names: Option<Vec<String>>,
-    /// 扫描该目录中的普通可执行文件，相对路径基于有效 cwd。
-    pub directory: Option<PathBuf>,
-    /// 读取该清单文件（每行首个词为名字，其余为命令原文），必须为绝对路径。
-    pub catalog: Option<PathBuf>,
+    /// 读取指定根视图下的普通可执行文件；test 相对路径基于有效 cwd。
+    pub directory: Option<SourcePath>,
+    /// 读取指定根视图下的清单，路径必须为绝对路径。
+    pub catalog: Option<SourcePath>,
     /// 按顺序取匹配项的模式列表，省略等于 `["*"]`。
     pub include: Option<Vec<String>>,
     /// 最后剔除匹配这些模式的候选。
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// 用例 argv 模板，首项即解释器或程序。
-    pub exec: Vec<String>,
+    /// 用例主命令模板，数组简写始终在测试根执行。
+    pub exec: CommandSpec,
     /// 用例 ID 模板，省略时为 `{group}:{root}:{name}`。
     pub id: Option<String>,
     /// 用例工作目录，覆盖组与根的默认值。
@@ -176,10 +183,10 @@ pub struct Step {
     pub repeat: Option<u32>,
     /// 每轮主命令前执行的准备命令。
     #[serde(default)]
-    pub setup: Vec<Vec<String>>,
+    pub setup: Vec<CommandSpec>,
     /// 每轮主命令后执行的清理命令。
     #[serde(default)]
-    pub cleanup: Vec<Vec<String>>,
+    pub cleanup: Vec<CommandSpec>,
     /// 主命令运行前输出的文本模板。
     #[serde(default)]
     pub before: String,
@@ -205,8 +212,8 @@ pub struct CaseOverride {
     /// 仅在这些架构上生效，空表示不限制。
     #[serde(default)]
     pub arch: Vec<String>,
-    /// 整体替换的 argv 模板。
-    pub exec: Option<Vec<String>>,
+    /// 整体替换的主命令模板。
+    pub exec: Option<CommandSpec>,
     /// 整体替换的工作目录。
     pub cwd: Option<PathBuf>,
     /// 按键合并进用例环境变量。
@@ -217,9 +224,9 @@ pub struct CaseOverride {
     /// 整体替换的重复次数。
     pub repeat: Option<u32>,
     /// 整体替换的准备命令。
-    pub setup: Option<Vec<Vec<String>>>,
+    pub setup: Option<Vec<CommandSpec>>,
     /// 整体替换的清理命令。
-    pub cleanup: Option<Vec<Vec<String>>>,
+    pub cleanup: Option<Vec<CommandSpec>>,
     /// 整体替换的 before 模板。
     pub before: Option<String>,
     /// 整体替换的 after 模板。
@@ -242,8 +249,8 @@ pub struct ResolvedCase {
     pub name: String,
     /// 清单来源的 `{command}` 原文；其他来源为 `None`。
     pub catalog_command: Option<String>,
-    /// 已展开的 exec 模板。
-    pub argv: Vec<String>,
+    /// 已单次展开的主命令及其局部运行参数。
+    pub exec: CommandSpec,
     /// 根内工作目录，chroot 后解释。
     pub cwd: PathBuf,
     /// 合并后的环境变量。
@@ -253,9 +260,9 @@ pub struct ResolvedCase {
     /// 重复执行次数。
     pub repeat: u32,
     /// 每轮主命令前执行的准备命令。
-    pub setup: Vec<Vec<String>>,
+    pub setup: Vec<CommandSpec>,
     /// 每轮主命令后执行的清理命令。
-    pub cleanup: Vec<Vec<String>>,
+    pub cleanup: Vec<CommandSpec>,
     /// 已展开的 before 文本。
     pub before: String,
     /// 原始 after 模板，执行结束时连同 `{status}` 一次展开。
@@ -275,6 +282,14 @@ pub struct ResolvedGroup {
     pub start: String,
     /// 已展开的组结束文本。
     pub end: String,
+    /// 组内 test 准备和清理命令继承的工作目录。
+    pub cwd: PathBuf,
+    /// 根与组按键合并后的 test 环境，不包含 step 环境。
+    pub env: BTreeMap<String, String>,
+    /// 该组实例开始前同步执行一次的已展开命令。
+    pub setup: Vec<CommandSpec>,
+    /// 该组实例结束后同步执行一次的已展开命令。
+    pub cleanup: Vec<CommandSpec>,
     /// 按 root-major 顺序展开的全部用例。
     pub cases: Vec<ResolvedCase>,
 }

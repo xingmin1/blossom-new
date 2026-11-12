@@ -16,8 +16,8 @@
 //!         │
 //!         ├─ 计划模式: selection::resolve（失败 → 2，仍卸载并按模式收尾）
 //!         ├─ --list: 打印分组/测例/未命中覆盖项，不执行任何准备或通知
-//!         └─ 运行: 逐组激活 root → 组 start 文本 → 逐 case 逐 repeat 执行 → 组 end 文本
-//!                  会话停止时立即结束，已开始的组仍尽量写 end
+//!         └─ 运行: 激活 root → group.setup → start → 逐 case/repeat → end → group.cleanup
+//!                  会话停止时不再开始后续组；进程失控时跳过准备与清理命令
 //!         │
 //!         ▼
 //! 卸载比赛盘（失败 → 1）→ 非 --list 时 sync 与可选 poweroff
@@ -26,9 +26,10 @@
 //! 默认只输出协议文本与必要错误；`--verbose` 额外给出每次执行的 outcome/elapsed、
 //! 未命中的覆盖项与最终状态。
 
+use contest_run::command::{CommandSpec, Root as CommandRoot};
 use contest_run::config;
 use contest_run::custom;
-use contest_run::execute::{execute_case, CaseRecord};
+use contest_run::execute::{execute_case, run_steps, CaseRecord};
 use contest_run::model::{
     Config, Defaults, Finish, ResolvedCase, ResolvedGroup, RootSpec, SourceLocation,
 };
@@ -212,7 +213,7 @@ fn explicit_config(
         root: "command".into(),
         name: "command".into(),
         catalog_command: None,
-        argv: argv.to_vec(),
+        exec: CommandSpec::Argv(argv.to_vec()),
         cwd: cwd.into(),
         env: BTreeMap::new(),
         timeout_sec: 60,
@@ -241,6 +242,10 @@ fn explicit_config(
         root: "command".into(),
         start: String::new(),
         end: String::new(),
+        cwd: cwd.to_path_buf(),
+        env: BTreeMap::new(),
+        setup: Vec::new(),
+        cleanup: Vec::new(),
         cases: vec![case],
     };
     (config, Some(vec![group]))
@@ -265,6 +270,9 @@ fn execute_plan(config: &Config, cli: &Cli, explicit: Option<Vec<ResolvedGroup>>
         for case in &mut group.cases {
             if let Some(timeout) = cli.timeout_sec {
                 case.timeout_sec = timeout;
+                if let CommandSpec::Full(command) = &mut case.exec {
+                    command.timeout_sec = Some(timeout);
+                }
             }
             if let Some(repeat) = cli.repeat {
                 case.repeat = repeat;
@@ -286,8 +294,10 @@ fn execute_plan(config: &Config, cli: &Cli, explicit: Option<Vec<ResolvedGroup>>
 
 /// 打印选中分组、用例与未命中的覆盖项。
 ///
-/// 每组一行头信息，每个用例一行给出 ID、cwd、超时、重复次数、完整 argv 与来源位置。
+/// 展示所有阶段实际采用的根、cwd、env、argv、超时，以及用例重复次数和来源，不运行命令。
 fn list(config: &Config, groups: &[ResolvedGroup], unmatched: &[String]) {
+    let timeout = Duration::from_secs(config.defaults.timeout_sec);
+    let mut active = None;
     for group in groups {
         let root = &config.roots[&group.root];
         println!(
@@ -296,15 +306,59 @@ fn list(config: &Config, groups: &[ResolvedGroup], unmatched: &[String]) {
             group.root,
             root.path.display()
         );
+        if active != Some(group.root.as_str()) {
+            let path = root.path.to_string_lossy();
+            for command in &root.prepare {
+                let command = command.expanded(&[("test_root", path.as_ref())]);
+                list_command(
+                    "  root.prepare",
+                    &command,
+                    root,
+                    &root.cwd,
+                    &root.env,
+                    timeout,
+                );
+            }
+            active = Some(group.root.as_str());
+        }
+        for command in &group.setup {
+            list_command(
+                "  group.setup",
+                command,
+                root,
+                &group.cwd,
+                &group.env,
+                timeout,
+            );
+        }
         for case in &group.cases {
             println!(
-                "{} cwd={} timeout={}s repeat={} argv={:?} source={}",
-                case.id,
-                case.cwd.display(),
-                case.timeout_sec,
-                case.repeat,
-                case.argv,
-                case.source
+                "  CASE {} repeat={} source={}",
+                case.id, case.repeat, case.source
+            );
+            for command in &case.setup {
+                list_command("    setup", command, root, &case.cwd, &case.env, timeout);
+            }
+            list_command(
+                "    exec",
+                &case.exec,
+                root,
+                &case.cwd,
+                &case.env,
+                Duration::from_secs(case.timeout_sec),
+            );
+            for command in &case.cleanup {
+                list_command("    cleanup", command, root, &case.cwd, &case.env, timeout);
+            }
+        }
+        for command in &group.cleanup {
+            list_command(
+                "  group.cleanup",
+                command,
+                root,
+                &group.cwd,
+                &group.env,
+                timeout,
             );
         }
     }
@@ -313,12 +367,35 @@ fn list(config: &Config, groups: &[ResolvedGroup], unmatched: &[String]) {
     }
 }
 
+/// 与运行阶段使用同一参数解析，打印命令的实际执行视图。
+fn list_command(
+    label: &str,
+    command: &CommandSpec,
+    root: &RootSpec,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) {
+    let run = command.resolve(Some(&root.path), cwd, env, timeout);
+    let scope = match command.root() {
+        CommandRoot::System => "system",
+        CommandRoot::Test => "test",
+    };
+    println!(
+        "{label} root={scope} path={} cwd={} timeout={}s argv={:?} env={:?}",
+        run.root.unwrap_or_else(|| Path::new("/")).display(),
+        run.cwd.display(),
+        run.timeout.as_secs(),
+        run.argv,
+        run.env
+    );
+}
+
 /// 按分组顺序执行全部选中用例，返回计划状态码。
 ///
-/// 组切换时先卸载上一个 root 的挂载再 [`Mounts::prepare_root`] 新 root；准备或卸载失败时置
-/// 状态 1 并停止。组开始后写出 `start` 文本，跑完全部 case 与 repeat 后写出 `end` 文本；
-/// 出现会话停止条件时立即停止后续执行，但已开始的组仍尽量写 `end`。`explicit` 为真时退出码
-/// 透传主命令的 `shell_status()`。
+/// 切换测试根前先卸载旧挂载，再执行准备与新挂载；失败即停止会话。
+/// 每个非空组实例由 [`run_group`] 执行一次组准备与清理，挂载始终由原 owned 栈逆序释放。
+/// `explicit` 为真时透传唯一主命令的 shell 状态码。
 fn run_groups(
     config: &Config,
     groups: &[ResolvedGroup],
@@ -329,11 +406,7 @@ fn run_groups(
     let mut mounts = Mounts::default();
     let mut active: Option<&str> = None;
     let mut status = 0;
-    let mut stopped = false;
     for group in groups {
-        if stopped {
-            break;
-        }
         // Step 1: 需要换 root 时先释放旧挂载，再运行 prepare 并按配置顺序挂载。
         if active != Some(group.root.as_str()) {
             if let Err(error) = mounts.release() {
@@ -352,19 +425,75 @@ fn run_groups(
             active = Some(&group.root);
         }
         let root = &config.roots[&group.root];
-        // Step 2: 写出组开始文本；无法写出时协议已不可维持，按会话停止处理。
-        if let Err(error) = emit(&group.start) {
-            eprintln!("contest-run: {}: write start: {error}", group.name);
-            status = 1;
+        let (group_status, stopped) = run_group(config, group, root, explicit, verbose);
+        if group_status != 0 {
+            status = group_status;
+        }
+        if stopped {
             break;
         }
-        // Step 3: 逐 case 逐 repeat 执行；会话停止条件立即跳出两层循环。
+    }
+    // Step 2: 卸下最后一个 root 的挂载，并给出可选的运行诊断。
+    if let Err(error) = mounts.release() {
+        eprintln!("contest-run: {error}");
+        status = 1;
+    }
+    if verbose {
+        for item in unmatched {
+            eprintln!("contest-run: override {item} matched no selected case");
+        }
+        eprintln!("contest-run: status {status}");
+    }
+    status
+}
+
+/// 运行一个非空组与测试根实例；普通失败仍尝试组清理，进程失控时停止后续命令。
+fn run_group(
+    config: &Config,
+    group: &ResolvedGroup,
+    root: &RootSpec,
+    explicit: bool,
+    verbose: bool,
+) -> (i32, bool) {
+    let timeout = Duration::from_secs(config.defaults.timeout_sec);
+    let setup = run_steps(
+        Some(&root.path),
+        &group.cwd,
+        &group.setup,
+        &group.env,
+        timeout,
+        true,
+    );
+    for error in &setup.errors {
+        eprintln!(
+            "contest-run: {}:{}: group.setup: {error}",
+            group.name, group.root
+        );
+    }
+    if setup.unquiesced {
+        return (1, true);
+    }
+    let mut status = if setup.errors.is_empty() { 0 } else { 1 };
+    let mut stopped = status != 0;
+    let mut unquiesced = false;
+    let mut started = false;
+    if status == 0 {
+        match emit(&group.start) {
+            Ok(()) => started = true,
+            Err(error) => {
+                eprintln!("contest-run: {}: write start: {error}", group.name);
+                status = 1;
+                stopped = true;
+            }
+        }
+    }
+    if started {
         'cases: for case in &group.cases {
             for _ in 0..case.repeat {
                 let record = execute_case(
                     Some(&root.path),
                     case,
-                    Duration::from_secs(config.defaults.timeout_sec),
+                    timeout,
                     &mut io::stdout(),
                     custom::notify,
                 );
@@ -380,30 +509,40 @@ fn run_groups(
                     status = 1;
                 }
                 if record.must_stop() {
+                    unquiesced = record.unquiesced();
                     stopped = true;
                     break 'cases;
                 }
             }
         }
-        // Step 4: 无论本组是否提前停止，都尽量闭合已经写出的组标记。
+        // 已开始的组尽量输出结束文本，进程失控只禁止后续命令。
         if let Err(error) = emit(&group.end) {
             eprintln!("contest-run: {}: write end: {error}", group.name);
             status = 1;
             stopped = true;
         }
     }
-    // Step 5: 卸下最后一个 root 的挂载，并给出可选的运行诊断。
-    if let Err(error) = mounts.release() {
-        eprintln!("contest-run: {error}");
-        status = 1;
-    }
-    if verbose {
-        for item in unmatched {
-            eprintln!("contest-run: override {item} matched no selected case");
+    if !unquiesced {
+        let cleanup = run_steps(
+            Some(&root.path),
+            &group.cwd,
+            &group.cleanup,
+            &group.env,
+            timeout,
+            false,
+        );
+        for error in &cleanup.errors {
+            eprintln!(
+                "contest-run: {}:{}: group.cleanup: {error}",
+                group.name, group.root
+            );
         }
-        eprintln!("contest-run: status {status}");
+        if !cleanup.errors.is_empty() || cleanup.unquiesced {
+            status = 1;
+            stopped = true;
+        }
     }
-    status
+    (status, stopped)
 }
 
 /// 把组 `start`/`end` 协议文本原文写到标准输出并刷出；空文本不写入。
@@ -418,7 +557,7 @@ fn emit(text: &str) -> io::Result<()> {
 
 /// 把一次执行的阶段错误与主命令异常按行写到标准错误。
 ///
-/// 正常非零退出不是错误，默认不输出；`verbose` 为真时额外打印主命令 outcome 与耗时。
+/// 启动失败按命令实际根与 cwd 诊断；正常非零退出不报错，verbose 才打印 outcome 与耗时。
 fn report(case: &ResolvedCase, root: &RootSpec, record: &CaseRecord, verbose: bool) {
     for (phase, error) in [
         ("before", &record.before_error),
@@ -444,16 +583,35 @@ fn report(case: &ResolvedCase, root: &RootSpec, record: &CaseRecord, verbose: bo
         return;
     };
     match &run.outcome {
-        ExitOutcome::SpawnError { errno, message } => eprintln!(
-            "contest-run: {}: spawn failed ({errno:?}): {message}; {}",
-            case.id,
-            diagnose(root, &case.cwd, &case.argv[0])
-        ),
+        ExitOutcome::SpawnError { errno, message } => {
+            let command = case.exec.resolve(
+                Some(&root.path),
+                &case.cwd,
+                &case.env,
+                Duration::from_secs(case.timeout_sec),
+            );
+            eprintln!(
+                "contest-run: {}: spawn failed ({errno:?}): {message}; {}",
+                case.id,
+                diagnose(
+                    command.root.unwrap_or_else(|| Path::new("/")),
+                    command.cwd,
+                    command.argv.first().map(String::as_str).unwrap_or(""),
+                )
+            );
+        }
         ExitOutcome::TimedOut { .. } => {
+            let command = case.exec.resolve(
+                Some(&root.path),
+                &case.cwd,
+                &case.env,
+                Duration::from_secs(case.timeout_sec),
+            );
             eprintln!(
                 "contest-run: {}: timed out after {}s",
-                case.id, case.timeout_sec
-            )
+                case.id,
+                command.timeout.as_secs()
+            );
         }
         ExitOutcome::Signaled { signal, .. } => {
             eprintln!("contest-run: {}: signaled by {signal}", case.id)

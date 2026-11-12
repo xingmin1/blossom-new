@@ -61,7 +61,7 @@
 
 use crate::execute::run_steps;
 use crate::model::RootSpec;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -150,15 +150,12 @@ impl Mounts {
         Ok(())
     }
 
-    /// 初始化目标系统根目录：依次执行根目录准备命令，并挂载配置声明的伪文件系统。
+    /// 激活测试根：先同步执行显式准备命令，再按声明顺序挂载伪文件系统。
     ///
-    /// 调用上下文：切换到某个 root 之前由主运行器同步调用。准备命令在宿主根环境 `/` 下以空环境
-    /// 执行，任一条失败即中止；随后按 `mounts` 挂载 `dev`/`shm`/`proc`/`tmp`，挂载点登记在
-    /// [`Mounts`] 中，由 [`Mounts::release`] 逆序卸载。
-    ///
-    /// # 参数
-    /// - `root`：目标根目录规格配置（包含宿主机路径 `path`、准备命令列表 `prepare` 及需挂载的子目录名 `mounts`）。
-    /// - `timeout`：每条准备命令的执行超时时长。
+    /// test 命令继承根的 cwd/env，system 命令默认 cwd 为 `/` 且不继承测试环境。
+    /// 准备期间 dev/shm/proc/tmp 尚未挂载，test 命令依赖的解释器必须已经存在。
+    /// `timeout` 是单条准备命令的默认期限，命令局部值可覆盖；任一失败立即停止。
+    /// 成功挂载由本实例登记并通过 [`Mounts::release`] 逆序卸载。
     ///
     /// # 返回值
     /// 准备命令与所有挂载点均成功完成时返回 `Ok(())`；任意步骤失败时返回描述性错误字符串。
@@ -167,12 +164,18 @@ impl Mounts {
         if !root.path.is_dir() {
             return Err(format!("root is not a directory: {}", root.path.display()));
         }
-        // Step 2: 在宿主根环境 "/" 下按序执行该 root 配置的预处理命令（如解压或目录初始化）。
+        // Step 2: 单遍展开当前测试根路径，随后按每条命令的执行根同步准备。
+        let root_path = root.path.to_string_lossy();
+        let prepare: Vec<_> = root
+            .prepare
+            .iter()
+            .map(|command| command.expanded(&[("test_root", root_path.as_ref())]))
+            .collect();
         let report = run_steps(
-            None,
-            Path::new("/"),
-            &root.prepare,
-            &BTreeMap::new(),
+            Some(&root.path),
+            &root.cwd,
+            &prepare,
+            &root.env,
             timeout,
             true,
         );
@@ -326,26 +329,24 @@ fn interpreter(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// “缺少可执行文件本身”等环境问题。
 ///
 /// # 参数
-/// - `root`：命令所属的目标根目录规格。
+/// - `root`：命令实际执行根在系统视图中的路径，system 命令传 `/`。
 /// - `cwd`：命令在目标根目录内的工作目录。
 /// - `program`：待诊断的执行程序路径，即主命令 argv[0]。
 ///
 /// # 返回值
 /// 返回一行人类可读的 `PT_INTERP` 诊断信息字符串。
-pub fn diagnose(root: &RootSpec, cwd: &Path, program: &str) -> String {
+pub fn diagnose(root: &Path, cwd: &Path, program: &str) -> String {
     // Step 1: 若程序路径不含 '/'，说明依赖子进程 PATH 搜索，无法在宿主侧直接定位文件。
     if !program.contains('/') {
         return "PT_INTERP unavailable: program requires child PATH lookup".into();
     }
     // Step 2: 在目标根内解析程序路径并提取其 ELF `PT_INTERP` 段，再检查该解释器路径在目标根内是否存在。
-    let result =
-        rooted_path(&root.path, cwd, Path::new(program)).and_then(|path| interpreter(&path));
+    let result = rooted_path(root, cwd, Path::new(program)).and_then(|path| interpreter(&path));
     match result {
         Ok(None) => "PT_INTERP none (ELF static or non-ELF input)".into(),
         Ok(Some(bytes)) => {
             let interp = Path::new(std::ffi::OsStr::from_bytes(&bytes));
-            let availability =
-                rooted_path(&root.path, Path::new("/"), interp).and_then(fs::metadata);
+            let availability = rooted_path(root, Path::new("/"), interp).and_then(fs::metadata);
             match availability {
                 Ok(_) => format!("PT_INTERP {:?} present in target root", interp),
                 Err(error) => format!("PT_INTERP {:?}: {error}", interp),

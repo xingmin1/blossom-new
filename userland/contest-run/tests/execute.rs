@@ -11,11 +11,12 @@
 //! `execute_case`，以及共享控制台用例里的自举进程）串行化；锁中毒时用 `into_inner` 继续，让后续
 //! 用例独立执行。
 
+use contest_run::command::{Command, CommandSpec, Root};
 use contest_run::custom::notify_device;
 use contest_run::execute::{
     execute_case as execute_real_case, run_steps as execute_real_steps, CaseRecord, StepReport,
 };
-use contest_run::model::{ResolvedCase, RootSpec, SourceLocation};
+use contest_run::model::{ResolvedCase, SourceLocation};
 use contest_run::outcome::{Execution, ExitOutcome, Verdict};
 use contest_run::process::{
     run_command as execute_real_command, run_tap_command as execute_real_tap_command,
@@ -73,7 +74,7 @@ fn run_tap_command(
 fn run_steps(
     root: Option<&Path>,
     cwd: &Path,
-    commands: &[Vec<String>],
+    commands: &[CommandSpec],
     env: &BTreeMap<String, String>,
     timeout: Duration,
     stop_on_error: bool,
@@ -155,6 +156,11 @@ fn shell(text: &str) -> Vec<String> {
     vec!["/bin/sh".into(), "-c".into(), text.into()]
 }
 
+/// 构造沿测试根默认值运行的 shell 命令，供各生命周期阶段共用。
+fn shell_step(text: &str) -> CommandSpec {
+    CommandSpec::Argv(shell(text))
+}
+
 /// 构造带 setup、cleanup 与 before/after 文本的基准用例；主命令默认指向不存在的程序，用于覆盖启动失败路径。
 ///
 /// setup 与 cleanup 各向 cwd 下的 `order` 文件追加一行，供生命周期顺序断言使用。
@@ -165,13 +171,13 @@ fn case(scratch: &Scratch) -> ResolvedCase {
         root: "host".into(),
         name: "trace".into(),
         catalog_command: None,
-        argv: vec![scratch.0.join("absent").to_str().unwrap().into()],
+        exec: CommandSpec::Argv(vec![scratch.0.join("absent").to_str().unwrap().into()]),
         cwd: scratch.0.clone(),
         env: BTreeMap::new(),
         timeout_sec: 2,
         repeat: 1,
-        setup: vec![shell("printf 'setup\\n' >> order")],
-        cleanup: vec![shell("printf 'cleanup\\n' >> order")],
+        setup: vec![shell_step("printf 'setup\\n' >> order")],
+        cleanup: vec![shell_step("printf 'cleanup\\n' >> order")],
         before: "BEFORE\n".into(),
         after: "AFTER {status}\n".into(),
         source: SourceLocation {
@@ -728,7 +734,7 @@ fn lifecycle_runs_notify_setup_texts_main_cleanup_and_notify() {
     let order = scratch.0.join("order");
     let journal = Journal::new();
     let mut case = case(&scratch);
-    case.argv = shell("printf 'main\\n' >> order");
+    case.exec = shell_step("printf 'main\\n' >> order");
     let mut out = TextRecorder::new(journal.clone(), order.clone());
     let record = execute_case(
         None,
@@ -807,7 +813,7 @@ fn setup_failure_skips_main_but_still_cleans_and_notifies_after() {
     let order = scratch.0.join("order");
     let journal = Journal::new();
     let mut case = case(&scratch);
-    case.setup = vec![shell("exit 3")];
+    case.setup = vec![shell_step("exit 3")];
     let mut out = TextRecorder::new(journal.clone(), order.clone());
     let record = execute_case(
         None,
@@ -846,8 +852,8 @@ fn spawn_failure_writes_status_127_and_still_cleans_and_notifies_after() {
     let journal = Journal::new();
     let mut case = case(&scratch);
     case.cleanup = vec![
-        shell("printf 'cleanup\\n' >> order; exit 9"),
-        shell("touch cleaned"),
+        shell_step("printf 'cleanup\\n' >> order; exit 9"),
+        shell_step("touch cleaned"),
     ];
     let mut out = TextRecorder::new(journal.clone(), order.clone());
     let record = execute_case(
@@ -891,7 +897,7 @@ fn main_timeout_writes_status_124_and_finishes_lifecycle() {
     let order = scratch.0.join("order");
     let journal = Journal::new();
     let mut case = case(&scratch);
-    case.argv = shell("sleep 30");
+    case.exec = shell_step("sleep 30");
     case.before = String::new();
     case.timeout_sec = 1;
     let mut out = TextRecorder::new(journal.clone(), order.clone());
@@ -926,9 +932,9 @@ fn cleanup_failure_is_recorded_and_after_notify_still_runs() {
     let scratch = Scratch::new();
     let journal = Journal::new();
     let mut case = case(&scratch);
-    case.argv = shell("exit 0");
+    case.exec = shell_step("exit 0");
     case.before = String::new();
-    case.cleanup = vec![shell("exit 9"), shell("touch cleaned")];
+    case.cleanup = vec![shell_step("exit 9"), shell_step("touch cleaned")];
     let mut out = Vec::new();
     let record = execute_case(
         None,
@@ -1002,9 +1008,9 @@ fn cleanup_control_loss_stops_commands_and_skips_after_notification() {
 
     let scratch = Scratch::new();
     let mut case = case(&scratch);
-    case.argv = shell("exit 0");
+    case.exec = shell_step("exit 0");
     case.before.clear();
-    case.cleanup = vec![shell("exit 0"), shell("touch later-cleanup")];
+    case.cleanup = vec![shell_step("exit 0"), shell_step("touch later-cleanup")];
     let mut notifications = Vec::new();
     let record = execute_case(
         None,
@@ -1029,7 +1035,7 @@ fn cleanup_control_loss_stops_commands_and_skips_after_notification() {
 fn after_notify_failure_does_not_replace_primary_outcome() {
     let scratch = Scratch::new();
     let mut case = case(&scratch);
-    case.argv = shell("exit 7");
+    case.exec = shell_step("exit 7");
     let mut out = Vec::new();
     let record = execute_case(
         None,
@@ -1062,7 +1068,7 @@ fn after_notify_failure_does_not_replace_primary_outcome() {
 fn after_template_expands_name_and_status_once() {
     let scratch = Scratch::new();
     let mut case = case(&scratch);
-    case.argv = shell("exit 0");
+    case.exec = shell_step("exit 0");
     case.name = "literal-{status}".into();
     case.before = String::new();
     case.after = "{name} : {status}\n".into();
@@ -1077,7 +1083,7 @@ fn after_template_expands_name_and_status_once() {
 fn ltp_after_template_keeps_literal_fail_on_success() {
     let scratch = Scratch::new();
     let mut case = case(&scratch);
-    case.argv = shell("exit 0");
+    case.exec = shell_step("exit 0");
     case.name = "x".into();
     case.before = String::new();
     case.after = "FAIL LTP CASE {name} : {status}\n".into();
@@ -1228,14 +1234,7 @@ fn interpreter_diagnostic_resolves_absolute_links_inside_target_root() {
     fs::write(scratch.0.join("bin/app"), elf).unwrap();
     std::os::unix::fs::symlink("/bin/app", scratch.0.join("application")).unwrap();
     // Step 2: 以该临时目录为 root 诊断绝对符号链接入口，验证链接与解释器都只在目标根内解析。
-    let root = RootSpec {
-        path: scratch.0.clone(),
-        cwd: "/".into(),
-        env: BTreeMap::new(),
-        mounts: Vec::new(),
-        prepare: Vec::new(),
-    };
-    let diagnostic = contest_run::runtime::diagnose(&root, Path::new("/"), "/application");
+    let diagnostic = contest_run::runtime::diagnose(&scratch.0, Path::new("/"), "/application");
     assert!(
         diagnostic.contains("present in target root"),
         "{diagnostic}"
@@ -1408,10 +1407,10 @@ fn shared_console_ofd_preserves_blocking_stdin() {
 fn run_steps_records_failures_and_continues_when_not_stopping() {
     let scratch = Scratch::new();
     let commands = vec![
-        shell("touch first"),
-        Vec::new(),
-        shell("exit 5"),
-        shell("touch last"),
+        shell_step("touch first"),
+        CommandSpec::Argv(Vec::new()),
+        shell_step("exit 5"),
+        shell_step("touch last"),
     ];
     let report = run_steps(
         None,
@@ -1433,7 +1432,7 @@ fn run_steps_records_failures_and_continues_when_not_stopping() {
 #[test]
 fn run_steps_stops_at_first_failure_when_requested() {
     let scratch = Scratch::new();
-    let commands = vec![shell("exit 5"), shell("touch after")];
+    let commands = vec![shell_step("exit 5"), shell_step("touch after")];
     let report = run_steps(
         None,
         &scratch.0,
@@ -1445,4 +1444,102 @@ fn run_steps_stops_at_first_failure_when_requested() {
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(!report.unquiesced);
     assert!(!scratch.0.join("after").exists());
+}
+
+/// 同一准备列表按每条命令选择根，简写不能因相邻 system 命令而改在系统根执行。
+#[test]
+fn run_steps_keeps_command_scopes_and_local_defaults_separate() {
+    let scratch = Scratch::new();
+    let mut system_argv =
+        shell("test \"$PWD\" = / && test -z \"${ROOT_ONLY+x}\" && printf '%s' \"$1\" > \"$2\"");
+    system_argv.extend([
+        "scope".to_owned(),
+        "system defaults".to_owned(),
+        scratch.0.join("system").to_str().unwrap().to_owned(),
+    ]);
+    let commands = vec![
+        CommandSpec::Full(Command {
+            root: Root::System,
+            argv: system_argv,
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_sec: None,
+        }),
+        shell_step("touch must-not-run"),
+        CommandSpec::Full(Command {
+            root: Root::System,
+            argv: shell("test -z \"${ROOT_ONLY+x}\" && printf '%s' \"$LOCAL\" > local"),
+            cwd: Some(scratch.0.clone()),
+            env: BTreeMap::from([("LOCAL".into(), "command environment".into())]),
+            timeout_sec: Some(2),
+        }),
+    ];
+    let report = run_steps(
+        Some(&scratch.0),
+        Path::new("/"),
+        &commands,
+        &BTreeMap::from([("ROOT_ONLY".into(), "test environment".into())]),
+        Duration::from_secs(2),
+        false,
+    );
+    assert_eq!(report.errors.len(), 1, "{report:?}");
+    assert!(report.errors[0].contains("SpawnError"), "{report:?}");
+    assert!(!report.unquiesced);
+    assert_eq!(
+        fs::read(scratch.0.join("system")).unwrap(),
+        b"system defaults"
+    );
+    assert_eq!(
+        fs::read(scratch.0.join("local")).unwrap(),
+        b"command environment"
+    );
+    assert!(!scratch.0.join("must-not-run").exists());
+}
+
+/// 完整主命令的局部时限由真实进程控制消费；超时后仍按既有默认值清理并发送 after。
+#[test]
+fn detailed_main_timeout_is_used_by_the_case_lifecycle() {
+    let scratch = Scratch::new();
+    let mut case = case(&scratch);
+    case.env = BTreeMap::from([("CASE_ONLY".into(), "test".into())]);
+    case.timeout_sec = 5;
+    case.exec = CommandSpec::Full(Command {
+        root: Root::System,
+        argv: shell("test -z \"${CASE_ONLY+x}\" && sleep 30"),
+        cwd: Some(scratch.0.clone()),
+        env: BTreeMap::new(),
+        timeout_sec: Some(1),
+    });
+    case.setup = vec![shell_step(
+        "test \"$CASE_ONLY\" = test && printf 'setup\\n' >> order",
+    )];
+    let mut out = Vec::new();
+    let mut notifications = Vec::new();
+    let record = execute_case(
+        None,
+        &case,
+        Duration::from_secs(2),
+        &mut out,
+        |before, _| {
+            notifications.push(before);
+            Ok(())
+        },
+    );
+    let run = record.execution.as_ref().unwrap();
+    assert!(
+        matches!(run.outcome, ExitOutcome::TimedOut { .. }),
+        "{record:?}"
+    );
+    assert!(run.elapsed < Duration::from_secs(3), "{record:?}");
+    assert!(
+        record.setup_errors.is_empty() && record.cleanup_errors.is_empty(),
+        "{record:?}"
+    );
+    assert!(!record.must_stop() && record.failed(), "{record:?}");
+    assert_eq!(notifications, [true, false]);
+    assert_eq!(out, b"BEFORE\nAFTER 124\n");
+    assert_eq!(
+        fs::read_to_string(scratch.0.join("order")).unwrap(),
+        "setup\ncleanup\n"
+    );
 }
