@@ -155,34 +155,26 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 测试目标：验证父子两个用户进程通过 `fork` 与 `dup` 共享同一个管道打开文件描述（OFD）时，读者在读完最后一个写者写入的全部尾部数据并关闭所有写端后才观察到 EOF。
+    /// 验证五类用户态管道 ABI。
+    ///
+    /// - `fork_dup_stream_eof` 检查父子进程通过 `fork` 与 `dup` 共享管道 OFD，读完全部尾部数据并关闭所有写端后才观察到 EOF。
+    /// - `atomic_writev_records` 检查两个并发写进程各自通过 `writev` 提交总长不超过 `PIPE_BUF`（4096 字节）的多段向量，读出的原子记录互不交错。
+    /// - `nonblocking_capacity_fault` 检查非阻塞管道容量不足时返回 `EAGAIN`、零长度读写成功，以及跨页拷贝发生 `EFAULT` 时保留已传输的前缀。
+    /// - `pipe2_fault_fd_exhaustion` 检查 `pipe2` 写回用户数组发生 `EFAULT` 或第二个文件描述符槽耗尽返回 `EMFILE` 时，回滚预留的描述符与管道对象。
+    /// - `creator_credentials` 检查非 root 进程创建的匿名管道端点记录创建者的 `uid`/`gid`，并可通过 `fstat` 读取。
     #[test]
+    #[case("fork_dup_stream_eof", b"d" as &[u8])]
+    #[case("atomic_writev_records", b"a" as &[u8])]
+    #[case("nonblocking_capacity_fault", b"n" as &[u8])]
+    #[case("pipe2_fault_fd_exhaustion", b"f" as &[u8])]
+    #[case("creator_credentials", b"u" as &[u8])]
     #[ktest(tags("fs-pipe", "fs-pipe-user"))]
-    fn pipe_fork_dup_full_stream_tail_and_eof(
+    fn pipe_user_abi(
         context: &mut TestContext<'_>,
         fixture: &mut UserOwner,
+        mode: &[u8],
     ) -> TestResult {
-        fixture.pipe_abi(context, b"d")
-    }
-
-    /// 测试目标：验证两个并发写进程各自通过 `writev` 提交总长不超过 `PIPE_BUF`（4096 字节）的多段向量写入时，每次 `writev` 作为原子记录写入管道，读者读出的数据块互不交错。
-    #[test]
-    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
-    fn pipe_small_writev_records_across_writers(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.pipe_abi(context, b"a")
-    }
-
-    /// 测试目标：验证非阻塞管道（`O_NONBLOCK`）在剩余容量不足时返回 `EAGAIN`，以及零长度读写与跨页内存拷贝故障（`EFAULT`）时保留已成功传输的前缀字节数。
-    #[test]
-    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
-    fn pipe_nonblocking_capacity_zero_and_fault_prefix(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.pipe_abi(context, b"n")
+        fixture.pipe_abi(context, mode)
     }
 
     /// 测试目标：验证 `readv`/`writev` 导入 `iovec` 数组后作为单次文件操作执行，正确处理长度溢出边界并按实际传输字节数推进共享文件偏移量。
@@ -220,26 +212,6 @@ pub(crate) mod programs {
         mode: &[u8],
     ) -> TestResult {
         fixture.pipe_abi(context, mode)
-    }
-
-    /// 测试目标：验证 `pipe2` 在写回用户态数组发生缺页故障（`EFAULT`）或第二个文件描述符槽位耗尽（`EMFILE`）时，完整回滚本次预留的描述符与管道对象，不污染原有描述符表。
-    #[test]
-    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
-    fn pipe2_output_fault_and_second_slot_exhaustion(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.pipe_abi(context, b"f")
-    }
-
-    /// 测试目标：验证非 root 凭据进程创建的匿名管道端点记录创建者自身的 `uid`/`gid`，并可通过 `fstat` 准确读取。
-    #[test]
-    #[ktest(tags("fs-pipe", "fs-pipe-user"))]
-    fn pipe_creator_credentials_in_anonymous_stat(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.pipe_abi(context, b"u")
     }
 
     /// 测试目标：验证对管道文件描述符调用带偏移量的 `pread64`/`pwrite64` 时，优先根据不支持随机寻址的 OFD 能力返回 `ESPIPE`，先于文件读写方向与用户缓冲区地址检查。
@@ -352,30 +324,19 @@ pub(crate) mod programs {
         fixture.runtime_clock(context)
     }
 
-    /// 测试目标：验证具有 root 凭据的用户态 C 程序查询与修改 `RLIMIT_STACK` 资源限额，并验证该限额对 `fork` 与 `execve` 后新主栈自动增长范围的约束。
+    /// 验证 root 与非 root 凭据下的 `RLIMIT_STACK` 查询、修改和继承。
+    /// 非 root 凭据使用 uid 1000、gid 2000；用户程序检查提高硬限额时的 `EPERM`，
+    /// 以及非法地址、软硬限额顺序、`fork`、线程共享和 `execve` 后的栈边界。
     #[test]
+    #[case("root", Credentials::ROOT)]
+    #[case("nonroot", Credentials { uid: 1000, gid: 2000 })]
     #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
-    fn runtime_stack_limits_root(
+    fn runtime_stack_limits(
         context: &mut TestContext<'_>,
         fixture: &mut UserOwner,
+        credentials: Credentials,
     ) -> TestResult {
-        fixture.runtime_limits(context, Credentials::ROOT)
-    }
-
-    /// 测试目标：验证非 root 凭据的用户态 C 程序修改 `RLIMIT_STACK` 硬限额时的权限拒绝（`EPERM`）以及软限额下调后对 `execve` 栈空间的约束。
-    #[test]
-    #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
-    fn runtime_stack_limits_nonroot(
-        context: &mut TestContext<'_>,
-        fixture: &mut UserOwner,
-    ) -> TestResult {
-        fixture.runtime_limits(
-            context,
-            Credentials {
-                uid: 1000,
-                gid: 2000,
-            },
-        )
+        fixture.runtime_limits(context, credentials)
     }
 
     /// 测试目标：验证静态链接的 C 标准库（libc）程序从磁盘启动，完成线程局部存储（TLS）初始化、主栈访问、标准输入输出流读写及基础文件操作。

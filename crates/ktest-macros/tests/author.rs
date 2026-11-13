@@ -8,11 +8,15 @@ use std::cell::RefCell;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ktest::{
     CaseDesc, CaseOutcome, CaseRunner, Caught, Context, Failure, Fixture, Isolation, JoinOutcome,
     PanicMessage, Phase, Resource, Services, Status, TestContext, TestError, TestResult,
 };
+
+/// 记录 `simple` 套件无参用例的实际执行次数。
+static PLAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// 包含套件级共享资源（`Base`）、用例级独立夹具（`Device`）及参数化测试实例的示例测试套件。
 #[ktest_macros::suite(context = "Boot", fixture = Device, suite_resources = Base, tags("block"), min_cpus = 2, timeout_ms = 500, resources("scratch"))]
@@ -72,10 +76,12 @@ mod typed {
 /// 覆盖无参函数、独立静态参数、局部上下文捕获、`#[should_panic]` 与 `#[ignore]` 元数据的基础测试套件。
 #[ktest_macros::suite]
 mod simple {
-    /// 测试目标：验证无参数且默认返回 `()` 的基础测试函数可正常展开并执行标准 `assert_eq!`。
+    use super::{Ordering, PLAIN_CALLS};
+
+    /// 验证无参数且默认返回 `()` 的用例能由生成的包装函数执行。
     #[test]
     fn plain() {
-        assert_eq!(2 + 2, 4);
+        PLAIN_CALLS.fetch_add(1, Ordering::SeqCst);
     }
 
     /// 测试目标：验证不声明 `TestContext` 或 `Fixture` 时，测试函数仍可单独接收 `#[case]` 静态参数。
@@ -108,10 +114,7 @@ mod simple {
 }
 
 /// 宿主测试环境下用于驱动 `ktest` 生命周期的最小 `Services` 实现。
-struct Runtime {
-    /// 收集测试运行期间通过 `Services::diagnostic` 输出的诊断日志列表。
-    diagnostics: RefCell<Vec<String>>,
-}
+struct Runtime;
 impl Services for Runtime {
     /// 使用宿主标准库的 `std::panic::catch_unwind` 捕获测试回调中的 Panic 并提取消息字符串。
     fn catch(&self, callback: &mut dyn FnMut() -> TestResult) -> Caught {
@@ -127,10 +130,8 @@ impl Services for Runtime {
             }
         }
     }
-    /// 将格式化诊断消息追加到内存日志列表中。
-    fn diagnostic(&self, message: fmt::Arguments<'_>) {
-        self.diagnostics.borrow_mut().push(message.to_string());
-    }
+    /// 本宿主测试只检查用例结果，不保留诊断文本。
+    fn diagnostic(&self, _message: fmt::Arguments<'_>) {}
     /// 忽略生命周期阶段切换通知。
     fn phase(&self, _phase: Phase) {}
     /// 本测试无后台子任务，无需发出停止信号。
@@ -192,9 +193,7 @@ fn typed_parameter_instances_have_fresh_fixture_and_effective_metadata() {
             .starts_with(concat!(module_path!(), "::typed::parameter[")));
         assert!(case.source.ends_with("author.rs"));
     }
-    let runtime = Runtime {
-        diagnostics: RefCell::new(Vec::new()),
-    };
+    let runtime = Runtime;
     let mut suite_context = TestContext::new(&runtime, &cases[0], 0, 0);
     let mut runner = Runner {
         runtime: &runtime,
@@ -216,21 +215,21 @@ fn typed_parameter_instances_have_fresh_fixture_and_effective_metadata() {
 }
 
 /// 测试目标：验证无参测试、单参数测试、`TestContext` 测试、`#[should_panic]` 测试以及 `#[ignore]`/`expected_fatal` 元数据在展开后行为正确。
-/// 场景步骤：通过 `Runner` 执行 `simple` 套件的前 4 个用例（索引 `0..=3`），并检查第 5 个用例（`fatal_metadata`）的静态描述符字段。
-/// 预期结果：前 4 个用例全部返回 `Status::Pass`（其中 `expected` 用例的受控 Panic 被正确消化），第 5 个用例的隔离级别自动提升为 `Isolation::Case` 且完整保留 `expected_fatal`、`fatal_message` 与 `ignore` 信息。
+/// 场景步骤：通过 `Runner` 执行 `simple` 套件的前 4 个用例（索引 `0..=3`），并检查无参用例的调用次数与第 5 个用例（`fatal_metadata`）的静态描述符字段。
+/// 预期结果：无参用例执行一次，前 4 个用例全部返回 `Status::Pass`（其中 `expected` 用例的受控 Panic 被正确消化），第 5 个用例的隔离级别自动提升为 `Isolation::Case` 且完整保留 `expected_fatal`、`fatal_message` 与 `ignore` 信息。
 #[test]
 fn simple_author_signatures_and_expected_panic_execute() {
     let cases = simple::__KTEST_SUITE.cases;
-    let runtime = Runtime {
-        diagnostics: RefCell::new(Vec::new()),
-    };
+    let runtime = Runtime;
     let mut context = TestContext::new(&runtime, &cases[0], 0, 0);
     let mut runner = Runner {
         runtime: &runtime,
         selected: &[0, 1, 2, 3],
         outcomes: Vec::new(),
     };
+    PLAIN_CALLS.store(0, Ordering::SeqCst);
     let result = (simple::__KTEST_SUITE.run)(&mut context, &mut runner);
+    assert_eq!(PLAIN_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(result.execution, None);
     assert_eq!(
         runner

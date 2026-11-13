@@ -154,14 +154,6 @@ fn root_mounts_reject_unknown_and_duplicate_entries() {
     }
 }
 
-/// 单遍替换对未闭合花括号、空占位符与未知键必须原样保留，避免把普通文本当模板吞掉。
-#[test]
-fn expand_keeps_unknown_and_unterminated_braces() {
-    assert_eq!(expand("tail {", &[("name", "x")]), "tail {");
-    assert_eq!(expand("{} {missing}", &[("name", "x")]), "{} {missing}");
-    assert_eq!(expand("{name} {name", &[("name", "x")]), "x {name");
-}
-
 /// 显式 ID 模板按 root 与名字替换，未写 ID 的步骤取 `{group}:{root}:{name}` 默认值。
 #[test]
 fn id_template_replaces_group_root_and_name() {
@@ -503,7 +495,9 @@ fn names_are_literal_and_reject_pattern_fields() {
         );
         let error = tree.load("plan.toml").unwrap_err();
         assert!(
-            error.contains("group 1 step 1") && error.contains("explicit selection"),
+            error.contains("plan.toml")
+                && error.contains("group 1 step 1")
+                && error.contains("explicit selection"),
             "unexpected error: {error}"
         );
     }
@@ -1060,10 +1054,6 @@ fn invalid_fields_are_rejected_at_load() {
             "exactly one",
         ),
         (step("exec = [\"/x\"]"), "exactly one"),
-        (
-            step("names = [\"n\"]\ninclude = [\"*\"]\nexec = [\"/x\"]"),
-            "explicit selection",
-        ),
         (step("names = []\nexec = [\"/x\"]"), "names must not be empty"),
         (
             step("names = [\"bad name\"]\nexec = [\"/x\"]"),

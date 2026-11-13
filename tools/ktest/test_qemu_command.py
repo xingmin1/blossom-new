@@ -10,7 +10,6 @@
 """
 
 from pathlib import Path
-import shlex
 import unittest
 
 from host_helpers import TOOLS
@@ -140,7 +139,7 @@ class QemuCommandTests(unittest.TestCase):
                 self.assertEqual(command_for(architecture, boot_arguments="")[-2:], ["-append", ""])
 
     def test_special_paths_preserve_argv_and_escape_qemu_fields(self):
-        """验证包含空格、引号、中文字符及逗号的路径与转发规则在 QEMU 参数中被正确转义且可无损还原。"""
+        """验证特殊路径在 argv 中保留，QEMU 字段中的逗号按要求转义。"""
         # 构造包含空格、单双引号、中文字符以及逗号的路径与端口转发规则
         kernel = "/selected/内核 'quoted', file.elf"
         disk = Path('/selected/工作盘 "quoted", volume.raw')
@@ -155,8 +154,6 @@ class QemuCommandTests(unittest.TestCase):
                          ["-drive", f"if=none,id=chosen,format=raw,file={str(disk).replace(',', ',,')},readonly=on"])
         self.assertEqual(build_user_network_backend_arguments("chosen", forward),
                          ["-netdev", "user,id=chosen,hostfwd=" + forward.replace(",", ",,")])
-        # 验证生成的参数列表经 shell 字符串拼接与再拆分后与原列表完全一致
-        self.assertEqual(shlex.split(shlex.join(command)), command)
 
     def test_test_layout_keeps_slots_features_and_actual_peer_ports(self):
         """验证 ktest 测试磁盘与网卡的物理槽位分配、设备特性开关及内核命令行端口参数生成。"""

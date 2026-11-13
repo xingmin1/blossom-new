@@ -388,7 +388,7 @@ def execute(args, kernel, catalog, groups, directory):
     """使用线程池并发执行多个测试批次，并按原始调用顺序汇总返回所有结果。
 
     并发粒度为独立的 QEMU 虚拟机批次（`vm-00000`、`vm-00001` 等）；每个批次内部
-    仍按顺序串行执行，若收到 Ctrl-C 中断则设置全局取消标志并标记未启动批次为 `NotRun`。
+    仍按顺序串行执行。收到 Ctrl-C 时取消未启动批次，并在有结果时将中断信息附在排序前的第一条结果上。
     """
     completed = {}
     pool = ThreadPoolExecutor(max_workers=args.jobs)
@@ -425,8 +425,7 @@ def execute(args, kernel, catalog, groups, directory):
                 target = directory / f"vm-{index:05d}"
                 completed[index] = [result_row(item, "NotRun", "host interrupted before VM start", target)
                                     for item in group]
-        results = [row for rows in completed.values() for row in rows]
-        if results:
-            results[0]["infrastructure_error"] = "host run interrupted"
     results = [row for rows in completed.values() for row in rows]
+    if interrupted and results:
+        results[0]["infrastructure_error"] = "host run interrupted"
     return sorted(results, key=lambda row: row["order"])

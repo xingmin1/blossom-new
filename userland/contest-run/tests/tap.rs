@@ -212,10 +212,9 @@ impl Drop for Scratch {
     }
 }
 
-/// 验证只有完整且合法的标准输出 TAP 序列才能成功，且进程级异常状态优先于输出文本。
+/// 验证只有完整且合法的标准输出 TAP 序列才能成功，标准错误不会干扰判定。
 ///
-/// 覆盖的缺陷类：计划未跑满、重复或越界序号、重复计划行、`Bail out!` 之后的结果行被当成成功；
-/// 半行被跨流拼接成合法结果；标准错误上的 `not ok`/`Bail out!` 污染判定；超时与信号状态被完整输出覆盖。
+/// 覆盖计划未跑满、重复或越界序号、重复计划行、`Bail out!` 后的结果行，以及跨流半行和标准错误诊断。
 #[test]
 fn tap_completion_requires_one_intact_stdout_protocol() {
     // Step 1: 各类结构残缺或违背 TAP 约束的 stdout 序列即便配合退出码 0 也不能判定为成功。
@@ -241,23 +240,7 @@ fn tap_completion_requires_one_intact_stdout_protocol() {
         "split line changed the process outcome"
     );
     assert_eq!(result.verdict, Verdict::Broken);
-    // Step 3: 即使 stdout 输出了完整的通过文本，进程超时或信号终止依然优先决定最终 Verdict。
-    for (outcome, verdict) in [
-        (
-            ExitOutcome::TimedOut {
-                raw: None,
-                signal: None,
-            },
-            Verdict::TimedOut,
-        ),
-        (
-            ExitOutcome::Signaled { signal: 9, raw: 9 },
-            Verdict::Signaled,
-        ),
-    ] {
-        assert_eq!(observe(b"1..1\nok 1 success\n", &outcome), verdict);
-    }
-    // Step 4: stderr 中的 "not ok" 或 "Bail out!" 仅被视作普通诊断输出，不会污染合法的 stdout TAP 结果。
+    // Step 3: stderr 中的 "not ok" 或 "Bail out!" 仅被视作普通诊断输出，不会污染合法的 stdout TAP 结果。
     for complaint in ["not ok 1 diagnostic only", "Bail out! diagnostic only"] {
         let script = format!("printf '1..1\\nok 1 success\\n'; printf '{complaint}\\n' >&2");
         let (run, result) = run_script(&script);

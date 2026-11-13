@@ -144,6 +144,8 @@ make run-kernel-tests ARCH=riscv64 CPUS=2 TEST='*final_address'
 
 宿主机驱动脚本为 `tools/run_kernel_tests.py`。未显式传入 `--kernel` 参数时，脚本会调用内部目标 `build-kernel-test-elf` 构建测试内核；`KERNEL_BUILD_PROFILE` 与 `KTEST_PANIC_STRATEGY` 控制内核编译选项，而 `CPUS` 与 `MEMORY` 仅控制 QEMU 虚拟机资源。`TEST` 支持通配符（glob）过滤，`KTEST_ARGS` 可进一步传递精确用例名、分片（shard）等参数。建议先通过 `list-kernel-tests` 查看当前测试 ELF 中的完整用例名称列表：目录中标记为 `ignore` 的用例会展示跳过原因，执行测试时默认排除 `ignore` 用例；若命令行指定的任意精确用例名不存在，脚本会直接报错退出，不会将其静默缩减为部分成功。
 
+部分用例在一次执行内遍历多组输入：LoongArch FCC 用例在每个在线 CPU 上检查全部 256 种位图，时间换算用例检查四种频率与五种模式。各组共享该用例的 fixture 和期限，不能按单组输入选择、分片或重试；失败报告也不再为每组提供独立结果。管道 ABI 的五种场景和栈限额的 root、非 root 场景仍是各自独立的参数实例。这些用例的旧精确名称已失效，应先通过目录查询当前名称。
+
 超时参数 `--startup-timeout`、`--setup-timeout`、`--case-timeout`、`--cleanup-timeout`、`--build-timeout` 均以**秒**为单位（脚本内部变量均带有明确的 `_seconds` 后缀，而公开 CLI 选项名以及客体测试目录导出的 `timeout_ms` 协议字段保持不变）。
 
 磁盘、UART 与网络等外部设备资源均按各测试用例声明的契约按需挂载；若宿主机缺少用例必需的输入文件，测试会直接报错失败，而不会当作普通 Skip 放行。常规测试的最终判定依据来自完整的 KTAP 协议输出及宿主机侧的外部观测校验；无法识别的杂乱日志不会生成通过结果。仅当某个用例输出了完整的中止/清理记录、且宿主机确认当前 QEMU 进程已彻底退出后，测试驱动才会为剩余尚未开始的用例启动新的 QEMU 实例继续执行；进度存疑的用例保持 `NotRun` 状态，不会在后台静默重跑。

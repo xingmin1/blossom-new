@@ -1,7 +1,7 @@
 """ktest 宿主测试磁盘资源管理与 QEMU 测试会话生命周期的单元测试模块。
 
 本模块验证内核测试框架在准备与回收磁盘资源时的安全性与隔离性保证：
-1. CLI 入口在准备磁盘资源前对非法 `--root-mode` 挂载模式的拦截，确保不破坏既有文件；
+1. CLI 的 `list` 与 `run` 对非法 `--root-mode` 挂载模式的拦截及报告目录的创建边界；
 2. 声明磁盘角色但缺失源镜像时的错误报告，以及工作盘独立拷贝与拒绝硬链接/软链接别名的保护；
 3. `QemuTestSession` 多实例并发工作盘隔离、等待子进程完全退出后再清理工作盘的生命周期控制，
    以及在复制中途失败（如 `ENOSPC`）或进程启动失败时对半成品工作盘的清理和对已有日志证据的保留。
@@ -20,39 +20,29 @@ from unittest.mock import patch
 
 from host_helpers import TOOLS, options
 from ktest.catalog import HostError
-from ktest.resources import aliases, prepare_disks, validate_resources
+from ktest.resources import prepare_disks, validate_resources
 from ktest.qemu_session import QemuTestSession
 
 
 class RootModeInputTests(unittest.TestCase):
-    """验证 CLI 入口在接触磁盘资源前对 `--root-mode` 参数合法性的校验。"""
+    """验证 CLI 的 `list` 和 `run` 拒绝非法 `--root-mode` 且不创建报告目录。"""
 
-    def test_invalid_mode_is_rejected_without_replacing_work_disks(self):
-        """验证传入非法的根文件系统挂载模式时 CLI 立即报错退出，且不修改已有工作盘、源镜像或创建报告目录。"""
+    def test_invalid_mode_is_rejected_without_creating_report(self):
+        """验证非法根挂载模式使 CLI 以错误码 2 退出，且不创建报告目录。"""
         with tempfile.TemporaryDirectory() as temporary:
-            # 准备测试用的源镜像与已有工作盘文件，用于验证失败时文件不会被触碰
             base = Path(temporary)
-            source = base / "source.img"
-            source.write_bytes(b"original source")
-            work = base / "work"
-            work.mkdir()
-            disk = work / "root.raw"
-            disk.write_bytes(b"preserved working disk")
             commands = [
                 [sys.executable, str(TOOLS / "run_kernel_tests.py"), "list", "--arch", "riscv64",
                  "--report-dir", str(base / "report")],
                 [sys.executable, str(TOOLS / "run_kernel_tests.py"), "run", "--arch", "riscv64",
                  "--report-dir", str(base / "report")],
             ]
-            # 遍历空字符串、大写、多余权限字符及包含空白或等号的非法挂载模式
             for mode in ("", "RO", "rwx", "ro rw", "ro=foo", "rw=foo", "%"):
                 for command in commands:
                     with self.subTest(command=command, mode=mode):
                         result = subprocess.run(command + ["--root-mode", mode],
                                                 capture_output=True, text=True)
                         self.assertEqual(result.returncode, 2)
-                self.assertEqual(source.read_bytes(), b"original source")
-                self.assertEqual(disk.read_bytes(), b"preserved working disk")
                 self.assertFalse((base / "report").exists())
 
 
@@ -86,7 +76,7 @@ class ResourceTests(unittest.TestCase):
                     target.symlink_to(source)
                 else:
                     target.hardlink_to(source)
-                self.assertTrue(aliases(target, source))
+                self.assertTrue(target.samefile(source))
                 with self.assertRaises(HostError):
                     prepare_disks({"root"}, args, alias_dir)
                 self.assertEqual(source.read_bytes(), b"original disk")

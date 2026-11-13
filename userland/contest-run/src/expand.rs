@@ -49,13 +49,16 @@ mod tests {
         );
     }
 
-    /// Shell 变量与普通花括号保持原样，只有 `{name}` 被替换。
+    /// Shell 变量、空花括号、未知键与未闭合花括号保持原样，只有已知字段被替换。
     #[test]
     fn preserve_shell_variables_and_literal_braces() {
         assert_eq!(
             expand("echo ${name}; { echo ok; }; {name}", &[("name", "x")]),
             "echo ${name}; { echo ok; }; x"
         );
+        assert_eq!(expand("tail {", &[("name", "x")]), "tail {");
+        assert_eq!(expand("{} {missing}", &[("name", "x")]), "{} {missing}");
+        assert_eq!(expand("{name} {name", &[("name", "x")]), "x {name");
     }
 
     /// 插入的清单命令原文不再展开。

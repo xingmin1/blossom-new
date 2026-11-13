@@ -7,7 +7,6 @@
 """
 
 import hashlib
-from pathlib import Path
 import shutil
 import stat
 from qemu_command import (build_block_backend_arguments,
@@ -16,12 +15,6 @@ from qemu_command import (build_block_backend_arguments,
 from .catalog import require
 
 RESOURCES = {"uart", "scratch", "root", "extra", "ap-freeze", "virtio-access-platform", "net-user"}
-
-
-def aliases(path, target):
-    """判断两个路径在解析符号链接后是否指向同一位置，或是否为指向同一底层文件的硬链接。"""
-    path, target = Path(path), Path(target)
-    return path.resolve() == target.resolve() or (path.exists() and target.exists() and path.samefile(target))
 
 
 def regular_file(path):

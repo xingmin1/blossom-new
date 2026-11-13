@@ -176,7 +176,6 @@ fn recovered(
     if after != before {
         return Err(TestError(label));
     }
-    context.expect_eq(after, before);
     Ok(())
 }
 

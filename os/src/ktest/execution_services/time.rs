@@ -1238,39 +1238,24 @@ pub(crate) mod cases {
         })
     }
 
-    /// **测试目标**：验证定点数时间维护器（`Timekeeper`）在多种计数器频率下的掩码回绕、长计数、亚纳秒余数累积与最大差值边界。
-    /// - **Given**：分别指定 1.000003MHz、10MHz、24MHz 与 1GHz 四种频率，以及对应的五种测试模式（0..=4）；
-    /// - **When**：调用 `arithmetic_case(frequency, mode)` 执行定点数换算与更新；
-    /// - **Then**：换算结果与 128 位精确参考值一致，余数在连续单步更新中精确累积，超出 `max_delta` 的差值被安全拒绝。
+    /// 在共享 `ServiceFixture` 的 CPU 0 协调子任务中，逐组验证四种频率与五种模式的定点时间边界。
+    /// 频率为 1_000_003、10_000_000、24_000_000 和 1_000_000_000 Hz，模式为 0..=4。
+    /// 每组先记录频率和模式，再检查掩码回绕、长计数、余数累积及最大差值；首个断言失败即终止后续组合。
     #[test]
-    #[case("1000003_full_wrap", 1_000_003, 0)]
-    #[case("1000003_mask_wrap", 1_000_003, 1)]
-    #[case("1000003_long", 1_000_003, 2)]
-    #[case("1000003_fraction", 1_000_003, 3)]
-    #[case("1000003_max_delta", 1_000_003, 4)]
-    #[case("10mhz_full_wrap", 10_000_000, 0)]
-    #[case("10mhz_mask_wrap", 10_000_000, 1)]
-    #[case("10mhz_long", 10_000_000, 2)]
-    #[case("10mhz_fraction", 10_000_000, 3)]
-    #[case("10mhz_max_delta", 10_000_000, 4)]
-    #[case("24mhz_full_wrap", 24_000_000, 0)]
-    #[case("24mhz_mask_wrap", 24_000_000, 1)]
-    #[case("24mhz_long", 24_000_000, 2)]
-    #[case("24mhz_fraction", 24_000_000, 3)]
-    #[case("24mhz_max_delta", 24_000_000, 4)]
-    #[case("1ghz_full_wrap", 1_000_000_000, 0)]
-    #[case("1ghz_mask_wrap", 1_000_000_000, 1)]
-    #[case("1ghz_long", 1_000_000_000, 2)]
-    #[case("1ghz_fraction", 1_000_000_000, 3)]
-    #[case("1ghz_max_delta", 1_000_000_000, 4)]
     fn fixed_point_boundaries(
         _: &mut ::ktest::TestContext<'_>,
         fixture: &mut ServiceFixture,
-        frequency: u64,
-        mode: u8,
     ) -> ::ktest::TestResult {
-        fixture.fixed(move || {
-            arithmetic_case(frequency, mode);
+        fixture.fixed(|| {
+            for frequency in [1_000_003, 10_000_000, 24_000_000, 1_000_000_000] {
+                for mode in 0..=4 {
+                    crate::ktest::report::diagnostic(format_args!(
+                        "fixed-point frequency={} mode={}",
+                        frequency, mode
+                    ));
+                    arithmetic_case(frequency, mode);
+                }
+            }
             Ok(())
         })
     }

@@ -128,9 +128,9 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(sequences[0], sequences[1])
 
     def test_no_match_is_error(self):
-        """验证筛选结果为空时必须抛出 HostError，防止无匹配时静默返回成功。"""
-        with self.assertRaises(HostError):
-            select(catalog_of([case_record()]), options(exact=["missing"]), execution=True)
+        """验证 glob 没有匹配用例时报告空选择错误。"""
+        with self.assertRaisesRegex(HostError, "selection matched no cases"):
+            select(catalog_of([case_record()]), options(include=["*missing*"]), execution=True)
 
     def test_shard_partition_and_fixed_hash(self):
         """验证哈希分片使用规定的 SHA-256 大端前缀，并将全部用例无重叠、无遗漏地划分到各分片。"""

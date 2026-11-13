@@ -1061,9 +1061,9 @@ fn after_notify_failure_does_not_replace_primary_outcome() {
     assert!(record.must_stop() && record.failed());
 }
 
-/// 验证 after 模板的 `{name}` 与 `{status}` 在同一次展开中各自替换一次：插入的文本不再二次展开。
+/// 验证 LTP 风格的 after 模板只展开一遍，成功退出时仍保留 `FAIL` 标记。
 ///
-/// 用例名本身含 `{status}` 字面量时，插入后保持字面量；只有模板自己的 `{status}` 变成退出码。
+/// 用例名内的 `{status}` 保持字面量，模板中的 `{status}` 则替换为退出码。
 #[test]
 fn after_template_expands_name_and_status_once() {
     let scratch = Scratch::new();
@@ -1071,26 +1071,11 @@ fn after_template_expands_name_and_status_once() {
     case.exec = shell_step("exit 0");
     case.name = "literal-{status}".into();
     case.before = String::new();
-    case.after = "{name} : {status}\n".into();
-    let mut out = Vec::new();
-    let record = execute_case(None, &case, Duration::from_secs(1), &mut out, |_, _| Ok(()));
-    assert!(record.output_errors.is_empty());
-    assert_eq!(out.as_slice(), b"literal-{status} : 0\n");
-}
-
-/// 验证 LTP 风格的 after 模板在退出码 0 时仍输出字面量 `FAIL LTP CASE x : 0`，runner 不改写失败标记。
-#[test]
-fn ltp_after_template_keeps_literal_fail_on_success() {
-    let scratch = Scratch::new();
-    let mut case = case(&scratch);
-    case.exec = shell_step("exit 0");
-    case.name = "x".into();
-    case.before = String::new();
     case.after = "FAIL LTP CASE {name} : {status}\n".into();
     let mut out = Vec::new();
     let record = execute_case(None, &case, Duration::from_secs(1), &mut out, |_, _| Ok(()));
     assert!(record.output_errors.is_empty());
-    assert_eq!(out.as_slice(), b"FAIL LTP CASE x : 0\n");
+    assert_eq!(out.as_slice(), b"FAIL LTP CASE literal-{status} : 0\n");
 }
 
 /// 验证通知设备不存在时返回错误而不是静默跳过，合法 ID 在普通文件上分别写入恰好一行
@@ -1170,46 +1155,35 @@ fn relay_drain_deadline_preserves_completed_child_status() {
     assert!(run.elapsed < Duration::from_secs(3));
 }
 
-/// 验证 `/dev/full` 写入失败时 TAP 路径保留退出码 0，并把判定降为 InfrastructureError。
-#[test]
-fn tap_output_error_preserves_wait_and_fails_result() {
-    let scratch = Scratch::new();
-    let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
-    let argv = shell("printf 'TAP version 13\\n1..1\\nok 1 completed\\n'");
-    let (run, result) = run_tap_command(
-        &scratch.0,
-        &argv,
-        &BTreeMap::new(),
-        Duration::from_secs(2),
-        [full.as_raw_fd(), full.as_raw_fd()],
-    );
-    assert_eq!(run.outcome, exited(0));
-    assert!(!run.io_errors.is_empty());
-    assert_eq!(result, Verdict::InfrastructureError);
-}
-
-/// 验证输出转发失败不会修改调用方共享输出描述符的打开状态标志，主进程退出码保持 7。
+/// 验证 `/dev/full` 转发失败时，真实退出码 0 和 7 均被保留，判定为基础设施错误且共享输出状态标志不变。
 #[test]
 fn output_error_preserves_wait_and_shared_output_flags() {
     let scratch = Scratch::new();
     let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
     // SAFETY: `full` 在整个用例期间保持打开；`F_GETFL` 只读取该描述符的状态标志。
     let initial = unsafe { libc::fcntl(full.as_raw_fd(), libc::F_GETFL) };
-    let argv = shell("printf '1..1\\nok 1 output\\n'; exit 7");
-    let (run, _) = run_tap_command(
-        &scratch.0,
-        &argv,
-        &BTreeMap::new(),
-        Duration::from_secs(2),
-        [full.as_raw_fd(), full.as_raw_fd()],
-    );
-    assert_eq!(run.outcome, exited(7));
-    assert!(!run.io_errors.is_empty());
-    // SAFETY: `full` 仍然打开，再次读取其打开文件描述的状态标志。
-    assert_eq!(
-        unsafe { libc::fcntl(full.as_raw_fd(), libc::F_GETFL) },
-        initial
-    );
+    assert_ne!(initial, -1);
+    for (script, code) in [
+        ("printf 'TAP version 13\\n1..1\\nok 1 completed\\n'", 0),
+        ("printf '1..1\\nok 1 output\\n'; exit 7", 7),
+    ] {
+        let argv = shell(script);
+        let (run, result) = run_tap_command(
+            &scratch.0,
+            &argv,
+            &BTreeMap::new(),
+            Duration::from_secs(2),
+            [full.as_raw_fd(), full.as_raw_fd()],
+        );
+        assert_eq!(run.outcome, exited(code));
+        assert!(!run.io_errors.is_empty());
+        assert_eq!(result, Verdict::InfrastructureError);
+        // SAFETY: `full` 仍然打开，再次读取其打开文件描述的状态标志。
+        assert_eq!(
+            unsafe { libc::fcntl(full.as_raw_fd(), libc::F_GETFL) },
+            initial
+        );
+    }
 }
 
 /// 验证 `diagnose` 在目标根内解析绝对符号链接与 ELF `PT_INTERP`，不会到宿主根读取同名路径。

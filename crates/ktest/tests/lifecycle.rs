@@ -53,8 +53,6 @@ static EXPECTED_FATAL: CaseDesc = CaseDesc {
 struct Runtime {
     /// 按发生顺序记录 `Services::phase` 收到的所有生命周期阶段。
     phases: RefCell<Vec<Phase>>,
-    /// 按输出顺序保存 `Services::diagnostic` 收到的诊断消息文本。
-    messages: RefCell<Vec<String>>,
     /// 预设在 `Services::join_children` 阶段返回的后台子任务失败结果。
     child: Option<Failure>,
 }
@@ -63,7 +61,6 @@ impl Runtime {
     fn new() -> Self {
         Self {
             phases: RefCell::new(Vec::new()),
-            messages: RefCell::new(Vec::new()),
             child: None,
         }
     }
@@ -87,10 +84,8 @@ impl Services for Runtime {
             }
         }
     }
-    /// 将诊断文本推入 `messages` 向量以便测试断言检查。
-    fn diagnostic(&self, message: fmt::Arguments<'_>) {
-        self.messages.borrow_mut().push(message.to_string());
-    }
+    /// 本宿主测试只检查结果和阶段，不保留诊断文本。
+    fn diagnostic(&self, _message: fmt::Arguments<'_>) {}
     /// 将当前进入的 `Phase` 追加到 `phases` 轨迹列表中。
     fn phase(&self, phase: Phase) {
         self.phases.borrow_mut().push(phase);
