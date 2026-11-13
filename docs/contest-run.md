@@ -17,6 +17,8 @@ make run-qemu ARCH=riscv64
 make run-qemu ARCH=loongarch64
 ```
 
+默认构建使用仓内匹配的 locale 和官方容器中的运行库；其他本地工具链的覆盖参数见[运行库来源](../userland/runtime/sources.md)。
+
 系统启动后由 `init` 调用 `/sbin/contest-run /dev/vda`；执行器默认读取 `/etc/contest/plan.toml`，执行计划中选中的用例，最后关机。
 
 只调试一种架构时使用便捷目标，它依次执行该架构的打包和 QEMU 启动：
@@ -50,7 +52,7 @@ make run-qemu ARCH=riscv64 QEMU_ARGS='--working-disk-action fresh'
 make run-qemu ARCH=riscv64 QEMU_ARGS='--working-disk-action refresh-system'
 ```
 
-项目 QEMU 启动工具使用比赛盘工作副本，原始比赛镜像不被写入；默认计划的准备和被测程序可能修改工作副本。runner 本身不隔离写入，自行指定设备或编写 `system` 命令时必须确保目标是工作副本，不能把原镜像直接映射为可写设备。`reuse` 与 `refresh-system` 保留比赛工作盘的改动，`fresh` 才从原始镜像重新开始。默认计划里唯一改变运行库内容的步骤是 LoongArch musl 的 `cyclictest:musl:script` 兼容 override，见[显式执行根手册](contest-run-roots.md)第 9、10 节。
+项目 QEMU 启动工具使用比赛盘工作副本，原始比赛镜像不被写入；默认计划的准备和被测程序可能修改工作副本。runner 本身不隔离写入，自行指定设备或编写 `system` 命令时必须确保目标是工作副本，不能把原镜像直接映射为可写设备。`reuse` 与 `refresh-system` 保留比赛工作盘的改动，`fresh` 才从原始镜像重新开始。默认计划会向 glibc 工作副本补缺失的 libgcc 和 locale；唯一改变已有运行库内容的步骤是 LoongArch musl 的 `cyclictest:musl:script` 兼容 override，见[显式执行根手册](contest-run-roots.md)第 9、10 节。
 
 ## 2. 修改哪个文件
 
@@ -94,9 +96,11 @@ finish = "poweroff"
 
 若目标位置已有同名镜像，准备命令会先截断旧文件，再完整复制新镜像；整条命令仍受默认的 60 秒准备期限约束。
 
-默认计划在比赛根目录的工作副本中补齐缺失的命令和输入：`sh`、`cp`、`sleep`、`true` 链接到项目 BusyBox；盘内 lmbench 脚本引用的绝对路径链接同盘 `lmbench_all`；协议名称表提供 `ip`、`icmp`、`tcp`、`udp` 的标准编号。UnixBench 的 `sort.src` 使用[上游固定输入](https://github.com/kdlucas/byte-unixbench/blob/f53eadaa3e628908fa42b2167335459e970e5ebb/UnixBench/testdir/sort.src)，许可证随文件保存在 `userland/contest/fixtures/UNIXBENCH-LICENSE`。已有文件或链接会被保留；这些准备不会修改原始比赛盘、测试程序或脚本。
+默认计划在比赛根目录的工作副本中补齐缺失的命令和输入：`sh`、`cp`、`sleep`、`true`、`ls` 链接到项目 BusyBox；盘内 lmbench 脚本引用的绝对路径链接同盘 `lmbench_all`；协议名称表提供 `ip`、`icmp`、`tcp`、`udp` 的标准编号。UnixBench 的 `sort.src` 使用[上游固定输入](https://github.com/kdlucas/byte-unixbench/blob/f53eadaa3e628908fa42b2167335459e970e5ebb/UnixBench/testdir/sort.src)，许可证随文件保存在 `userland/contest/fixtures/UNIXBENCH-LICENSE`。已有文件或链接会被保留；这些准备不会修改原始比赛盘、测试程序或脚本。
 
 两个 root 都先复制项目 BusyBox 到 `/.blossom/busybox`，再补缺失的标准 `/bin/sh` 入口。项目 ash 遇到无 shebang 文本时，通过 `/bin/busybox` 重新执行盘内 BusyBox 的 ash；原 `/busybox` 和 `/bin/busybox` 的准备方式不变，显式 `/busybox sh` 仍执行盘内原 shell。已有 `/bin/sh`（包括失效符号链接）不会被替换；复制或链接失败会按准备错误返回。
+
+glibc 根另外通过 `/sbin/prepare-glibc-runtime` 补缺 `lib/libgcc_s.so.1` 和架构对应路径的 `C.utf8` 数据。来源为系统盘 `/opt/runtime/glibc`，需要补入时系统和测试根的 `libc.so.6` SHA-256 必须相同；已有目标保留，失效链接或补入时 libc 不匹配会使 root 准备失败。该步骤修改比赛工作副本，不修改原盘和原测试 ELF；参赛环境是否允许此准备仍需由赛事规则确认。
 
 更新系统盘中的计划后，使用 `fresh` 才会从原比赛盘重新准备缺失的入口。`reuse` 不更新系统工作盘中的计划，`refresh-system` 虽更新计划但保留比赛工作盘；两者都不会替换比赛工作盘中已有的旧 `/bin/sh` 链接。
 
@@ -282,7 +286,7 @@ prepare = [
 ]
 ```
 
-每个准备命令的退出码必须为 0，否则该 root 激活失败并按执行错误处理，后续挂载和用例不再运行。准备命令默认使用 `defaults.timeout_sec`，完整对象可用自己的 `timeout_sec` 覆盖；命令行 `--timeout-sec` 不改变它。挂载失败也立即停止当前会话，并报告实际路径和系统错误。文件、命令与链接的补缺只由 `prepare` 中的明确 argv 执行：第 2 节列出的补缺入口保留已有文件及链接（包括失效链接），而解释器链接、loader 和 `/.blossom` 副本仍按各自命令执行。执行器不自动猜测解释器，不用系统盘的 libc 覆盖比赛盘，也不改写原测试脚本、测试程序（cyclictest、hackbench 等 ELF）或 judge；唯一改变比赛盘运行库的步骤是被显式选中的 LA musl 兼容 override，它只在工作副本里修补已知版本 libc 的四个调度函数，见第 2 节与[显式执行根手册](contest-run-roots.md)第 10 节。
+每个准备命令的退出码必须为 0，否则该 root 激活失败并按执行错误处理，后续挂载和用例不再运行。准备命令默认使用 `defaults.timeout_sec`，完整对象可用自己的 `timeout_sec` 覆盖；命令行 `--timeout-sec` 不改变它。挂载失败也立即停止当前会话，并报告实际路径和系统错误。文件、命令与链接的补缺只由 `prepare` 中的明确 argv 执行：第 2 节列出的补缺入口保留已有文件及链接，而解释器链接、loader 和 `/.blossom` 副本仍按各自命令执行。glibc 的 libgcc/locale 安装对失效目标链接直接报错。执行器不自动猜测解释器，不用系统盘的 libc 覆盖比赛盘，也不改写原测试脚本、测试程序或 judge；唯一改变已有比赛盘运行库内容的是被显式选中的 LA musl 兼容 override，见第 2 节与[显式执行根手册](contest-run-roots.md)第 10 节。
 
 ### 6.1 定向验证入口
 

@@ -12,7 +12,7 @@ Cargo 依赖统一使用仓内 `vendor` 目录。当通过 Rustup 代理调用�
 
 普通内核构建与 `ktest` 测试内核构建都需要该固定工具链的 `rust-src` 组件，由 `os/.cargo/config.toml` 统一从源码重新编译 `core`、`alloc` 及 `compiler-builtins-mem`。LoongArch 架构统一关闭 `ual`（非对齐访存）特性，确保内核与标准库都生成严格对齐的访存指令；不能只对内核代码禁用非对齐访存却继续链接预编译的标准库。Makefile 会清除外部环境变量中的 `RUSTFLAGS` 与 `CARGO_ENCODED_RUSTFLAGS`，改用 Cargo 原生的 `--config` 数组合并 panic/unwind 策略与目标 ISA 约束。若直接运行 Cargo 构建内核，仍须以 `os/` 为工作目录；独立的用户态 `std` 程序则消费已准备好的目标标准库和 sysroot，不读取内核的 Cargo 配置。
 
-单架构构建默认根据 `ARCH` 选择交叉工具链前缀 `MUSL_CROSS_RV` 或 `MUSL_CROSS_LA`，默认值分别为 `riscv64-linux-musl-` 和 `loongarch64-linux-musl-`；运行库路径参数 `MUSL_LIBC`、`GLIBC_LIBDIR` 同样默认选择对应的 `_RV` 或 `_LA` 变量。显式传入单架构参数（包括设为空值）优先于上述默认值；`make all` 则分别读取两套架构的专属参数。未显式指定运行库来源时，准备脚本会查找其文档中列出的固定默认容器路径，若文件缺失则立即报错退出。当本地工具链命名或安装路径与默认值不同时，应显式覆盖对应的前缀与运行库路径参数。
+单架构构建根据 `ARCH` 选择交叉工具链前缀 `MUSL_CROSS_RV` 或 `MUSL_CROSS_LA`，默认值分别为 `riscv64-linux-musl-` 和 `loongarch64-linux-musl-`；运行库参数 `MUSL_LIBC`、`GLIBC_LIBDIR`、`LIBGCC_S` 和 `GLIBC_LOCALE_DIR` 同样选择对应的 `_RV` 或 `_LA` 变量。显式传入单架构参数优先；`make all` 分别读取两套架构专属参数。默认 locale 与官方 libc 的完整哈希绑定，若更换 libc 须提供兼容的 `GLIBC_LOCALE_DIR`；固定来源和失败规则见[运行库来源](../userland/runtime/sources.md)。
 
 ```sh
 make help
@@ -47,8 +47,12 @@ make all \
   MUSL_CROSS_LA=/srv/toolchains/loongarch64/bin/loongarch64-linux-musl- \
   MUSL_LIBC_RV=/srv/contest-runtime/riscv64/musl/libc.so \
   GLIBC_LIBDIR_RV=/srv/contest-runtime/riscv64/glibc/lib \
+  LIBGCC_S_RV=/srv/contest-runtime/riscv64/glibc/libgcc_s.so.1 \
+  GLIBC_LOCALE_DIR_RV=/srv/contest-runtime/riscv64/glibc/C.utf8 \
   MUSL_LIBC_LA=/srv/contest-runtime/loongarch64/musl/libc.so \
   GLIBC_LIBDIR_LA=/srv/contest-runtime/loongarch64/glibc/lib \
+  LIBGCC_S_LA=/srv/contest-runtime/loongarch64/glibc/libgcc_s.so.1 \
+  GLIBC_LOCALE_DIR_LA=/srv/contest-runtime/loongarch64/glibc/C.utf8 \
   RUNNER_SYSROOT_RV=/srv/rust-std/nightly-2025-01-18 \
   RUNNER_SYSROOT_LA=/srv/rust-std/nightly-2025-01-18
 ```

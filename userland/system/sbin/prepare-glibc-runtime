@@ -1,0 +1,139 @@
+#!/bin/sh
+# 在比赛工作根中补充与原 libc 匹配的 libgcc 和 C.UTF-8 locale。
+# 由系统根的静态 BusyBox 执行；测试根须已准备 /.blossom/busybox。
+set -eu
+
+bb=/bin/busybox
+runtime=/opt/runtime/glibc
+lib_tmp=
+locale_tmp=
+
+# 保留原始失败状态，并只清理本次创建的临时文件。
+cleanup() {
+    status=$?
+    trap - EXIT
+    [ -z "$lib_tmp" ] || "$bb" rm -f "$lib_tmp" || status=1
+    [ -z "$locale_tmp" ] || "$bb" rm -rf "$locale_tmp" || status=1
+    exit "$status"
+}
+
+# 所有准备失败都向执行器传递非零状态。
+fail() {
+    printf 'prepare-glibc-runtime: %s\n' "$*" >&2
+    exit 1
+}
+
+# 禁止沿工作根内的父目录符号链接写入其他位置。
+check_parent() {
+    [ ! -L "$1" ] || fail "target parent is a symbolic link: $1"
+    if [ -e "$1" ] && [ ! -d "$1" ]; then
+        fail "target parent is not a directory: $1"
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+[ "$#" -eq 1 ] || fail "usage: prepare-glibc-runtime /absolute/test/root"
+root=$1
+case "$root" in
+    /) fail "test root must not be /" ;;
+    /*/) root=${root%/} ;;
+    /*) ;;
+    *) fail "test root must be an absolute path: $root" ;;
+esac
+case "$root/" in
+    *'/../'*|*'/./'*|*'//'*) fail "test root must not contain . or .. components: $root" ;;
+esac
+[ ! -L "$root" ] && [ -d "$root" ] || fail "test root is not a non-symlink directory: $root"
+check_parent "$root/lib"
+[ -d "$root/lib" ] || fail "test root has no lib directory: $root/lib"
+
+lib_source=$runtime/lib/libgcc_s.so.1
+[ -f "$lib_source" ] && [ ! -L "$lib_source" ] && [ -s "$lib_source" ] ||
+    fail "missing or invalid libgcc source: $lib_source"
+
+locale_rel=
+for candidate in usr/lib/locale usr/lib64/locale; do
+    source=$runtime/$candidate/C.utf8
+    if [ -e "$source" ] || [ -L "$source" ]; then
+        [ -z "$locale_rel" ] || fail "multiple C.utf8 locale sources in $runtime"
+        locale_rel=$candidate/C.utf8
+    fi
+done
+[ -n "$locale_rel" ] || fail "missing C.utf8 locale source in $runtime"
+locale_source=$runtime/$locale_rel
+[ -d "$locale_source" ] && [ ! -L "$locale_source" ] ||
+    fail "invalid C.utf8 locale source: $locale_source"
+[ -d "$locale_source/LC_MESSAGES" ] && [ ! -L "$locale_source/LC_MESSAGES" ] ||
+    fail "invalid locale category: $locale_source/LC_MESSAGES"
+for category in LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY \
+    LC_MESSAGES/SYS_LC_MESSAGES LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE \
+    LC_MEASUREMENT LC_IDENTIFICATION; do
+    file=$locale_source/$category
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] ||
+        fail "missing or invalid locale category: $file"
+done
+
+locale_parent=${locale_rel%/C.utf8}
+check_parent "$root/usr"
+check_parent "$root/${locale_parent%/locale}"
+check_parent "$root/$locale_parent"
+lib_target=$root/lib/libgcc_s.so.1
+locale_target=$root/$locale_rel
+need_lib=0
+need_locale=0
+
+# 绝对链接必须在测试根内解析；在系统根直接 stat 会误判其目标。
+if [ -L "$lib_target" ]; then
+    "$bb" chroot "$root" /.blossom/busybox sh -c '[ -f "$1" ]' sh /lib/libgcc_s.so.1 ||
+        fail "invalid or dangling libgcc target: $lib_target"
+elif [ -e "$lib_target" ]; then
+    [ -f "$lib_target" ] || fail "libgcc target is not a regular file: $lib_target"
+else
+    need_lib=1
+fi
+if [ -L "$locale_target" ]; then
+    "$bb" chroot "$root" /.blossom/busybox sh -c '[ -d "$1" ]' sh "/$locale_rel" ||
+        fail "invalid or dangling locale target: $locale_target"
+elif [ -e "$locale_target" ]; then
+    [ -d "$locale_target" ] || fail "locale target is not a directory: $locale_target"
+else
+    need_locale=1
+fi
+
+if [ "$need_lib" -eq 1 ] || [ "$need_locale" -eq 1 ]; then
+    libc_source=$runtime/lib/libc.so.6
+    libc_target=$root/lib/libc.so.6
+    [ -f "$libc_source" ] && [ ! -L "$libc_source" ] || fail "invalid system libc: $libc_source"
+    source_sum=$("$bb" sha256sum "$libc_source") || fail "cannot hash system libc: $libc_source"
+    if [ -L "$libc_target" ]; then
+        target_sum=$("$bb" chroot "$root" /.blossom/busybox sha256sum /lib/libc.so.6) ||
+            fail "cannot hash test-root libc: $libc_target"
+    else
+        [ -f "$libc_target" ] || fail "invalid test-root libc: $libc_target"
+        target_sum=$("$bb" sha256sum "$libc_target") || fail "cannot hash test-root libc: $libc_target"
+    fi
+    [ "${source_sum%% *}" = "${target_sum%% *}" ] || fail "system and test-root libc SHA256 differ"
+fi
+
+if [ "$need_lib" -eq 1 ]; then
+    lib_tmp=$("$bb" mktemp "$root/lib/.libgcc_s.so.1.XXXXXX") || fail "cannot create temporary libgcc"
+    "$bb" cp "$lib_source" "$lib_tmp" || fail "cannot copy libgcc"
+    "$bb" chmod 644 "$lib_tmp" || fail "cannot set libgcc permissions"
+    # 硬链接只在目标不存在时发表，避免覆盖后来出现的文件或符号链接。
+    "$bb" ln -T "$lib_tmp" "$lib_target" || fail "cannot publish libgcc: $lib_target"
+    "$bb" rm -f "$lib_tmp" || fail "cannot remove temporary libgcc: $lib_tmp"
+    lib_tmp=
+fi
+if [ "$need_locale" -eq 1 ]; then
+    "$bb" mkdir -p "$root/$locale_parent" || fail "cannot create locale parent: $root/$locale_parent"
+    locale_tmp=$("$bb" mktemp -d "$root/$locale_parent/.C.utf8.XXXXXX") ||
+        fail "cannot create temporary locale directory"
+    "$bb" cp -R "$locale_source/." "$locale_tmp" || fail "cannot copy C.utf8 locale"
+    "$bb" chmod 755 "$locale_tmp" || fail "cannot set locale directory permissions"
+    [ ! -e "$locale_target" ] && [ ! -L "$locale_target" ] || fail "locale target appeared: $locale_target"
+    "$bb" mv -nT "$locale_tmp" "$locale_target" || fail "cannot publish locale: $locale_target"
+    [ ! -e "$locale_tmp" ] || fail "locale target appeared: $locale_target"
+    locale_tmp=
+fi

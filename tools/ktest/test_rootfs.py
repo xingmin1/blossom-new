@@ -9,6 +9,7 @@
 """
 
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -24,6 +25,12 @@ import assemble_rootfs
 from assemble_rootfs import assemble_rootfs_tree
 from create_ext4_image import PROFILES, create_ext4_image
 from ktest.ext4_fixtures import create_writable_fixture_image
+
+RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "prepare_runtime_libraries", TOOLS.parent / "userland/runtime/prepare_runtime_libraries.py",
+)
+runtime_libraries = importlib.util.module_from_spec(RUNTIME_SPEC)
+RUNTIME_SPEC.loader.exec_module(runtime_libraries)
 
 
 def tree_contents(directory):
@@ -187,6 +194,110 @@ class RootfsAssemblyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assemble_rootfs_tree("riscv64", self.userland, self.runtime, alias / "nested")
         self.assertFalse((self.userland / "nested").exists())
+
+
+class RuntimeLocalePublicationTests(unittest.TestCase):
+    """检查内置 locale 身份、更新失败恢复和只读目录清理。"""
+
+    def test_builtin_locale_rejects_corruption_and_unknown_libc(self):
+        """内置 locale 数据损坏或 libc 身份不匹配时不得继续使用。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            libc = base / "libc.so.6"
+            libc.write_bytes(b"matching libc")
+            locale = base / "locale/riscv64/C.utf8"
+            shutil.copytree(TOOLS.parent / "userland/runtime/locale/riscv64/C.utf8", locale)
+            libc_hash = hashlib.sha256(libc.read_bytes()).hexdigest()
+            _, locale_hash = runtime_libraries.BUILTIN_LOCALE_HASHES["riscv64"]
+            with patch.object(runtime_libraries, "__file__", str(base / "prepare.py")), \
+                    patch.dict(runtime_libraries.BUILTIN_LOCALE_HASHES,
+                               {"riscv64": (libc_hash, locale_hash)}):
+                self.assertEqual(runtime_libraries.builtin_locale_directory("riscv64", libc), locale)
+                category = locale / "LC_CTYPE"
+                data = bytearray(category.read_bytes())
+                data[32] ^= 1
+                category.write_bytes(data)
+                with self.assertRaisesRegex(ValueError, "manifest SHA-256 mismatch"):
+                    runtime_libraries.builtin_locale_directory("riscv64", libc)
+                libc.write_bytes(b"different libc")
+                with self.assertRaisesRegex(ValueError, "matching official libc"):
+                    runtime_libraries.builtin_locale_directory("riscv64", libc)
+
+    def test_interrupt_restores_previous_locale(self):
+        """旧目录移动或新目录发表后中断时，原内容仍位于原路径。"""
+        rename = Path.rename
+        for interrupt_after in ("old", "new"):
+            with self.subTest(interrupt_after=interrupt_after), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                source = base / "source"
+                destination = base / "C.utf8"
+                source.mkdir()
+                destination.mkdir()
+                (source / "category").write_bytes(b"new locale")
+                (destination / "category").write_bytes(b"previous locale")
+                previous = tree_contents(destination)
+
+                def interrupt(path, target):
+                    """在指定的真实 rename 完成后模拟中断。"""
+                    result = rename(path, target)
+                    moved_old = path == destination
+                    published_new = (
+                        path.name.startswith(".C.utf8.")
+                        and not path.name.endswith(".previous")
+                        and target == destination
+                    )
+                    if (interrupt_after == "old" and moved_old) or (
+                            interrupt_after == "new" and published_new):
+                        raise KeyboardInterrupt
+                    return result
+
+                with patch.object(Path, "rename", interrupt), self.assertRaises(KeyboardInterrupt):
+                    runtime_libraries.publish_locale_directory(source, destination)
+                self.assertEqual(tree_contents(destination), previous)
+                self.assertEqual((source / "category").read_bytes(), b"new locale")
+
+    def test_failed_restore_preserves_previous_locale(self):
+        """发表与恢复均失败时，旧数据保留在明确的备份目录中。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            destination = base / "C.utf8"
+            source.mkdir()
+            destination.mkdir()
+            (source / "category").write_bytes(b"new locale")
+            (destination / "category").write_bytes(b"previous locale")
+            rename = Path.rename
+
+            def fail_publication_and_restore(path, target):
+                """注入目标目录发表与旧目录恢复失败。"""
+                if target == destination:
+                    raise OSError("rename failed")
+                return rename(path, target)
+
+            with patch.object(Path, "rename", fail_publication_and_restore):
+                with self.assertRaises(OSError):
+                    runtime_libraries.publish_locale_directory(source, destination)
+            backups = list(base.glob(".C.utf8.*.previous"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / "category").read_bytes(), b"previous locale")
+            self.assertEqual((source / "category").read_bytes(), b"new locale")
+
+    @unittest.skipIf(os.geteuid() == 0, "root 能绕过目录写权限")
+    def test_readonly_locale_can_be_replaced(self):
+        """源目录只读时可重复更新，且不改变源目录权限。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            destination = base / "C.utf8"
+            (source / "messages").mkdir(parents=True)
+            (source / "messages/category").write_bytes(b"locale data")
+            (source / "messages").chmod(0o555)
+            source.chmod(0o555)
+            runtime_libraries.publish_locale_directory(source, destination)
+            runtime_libraries.publish_locale_directory(source, destination)
+            self.assertEqual((destination / "messages/category").read_bytes(), b"locale data")
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o555)
+            self.assertEqual(stat.S_IMODE((source / "messages").stat().st_mode), 0o555)
 
 
 @unittest.skipUnless(all(shutil.which(binary) for binary in ("mke2fs", "dumpe2fs", "debugfs", "e2fsck")),
