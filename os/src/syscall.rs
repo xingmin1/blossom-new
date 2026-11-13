@@ -359,6 +359,8 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         166 => file::umask(user, raw[0]),
         95 => return task::waitid(user, request),
         96 => Ok(user.set_tid_address(raw[0]) as isize),
+        99 => futex::set_robust_list(user, raw),
+        100 => futex::get_robust_list(user, raw),
         154..=157 | 173..=177 => task::identity(user, request.number, raw),
         160 => system::uname(user, &raw),
         163 => task::getrlimit(user, raw),

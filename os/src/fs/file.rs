@@ -738,6 +738,7 @@ pub fn open_path_with_flags(
             MemorySpecial::Null
             | MemorySpecial::Zero
             | MemorySpecial::Urandom
+            | MemorySpecial::Rtc
             | MemorySpecial::TestHook => devfs::open(path, flags, caller, special),
             MemorySpecial::TtySerial | MemorySpecial::Console | MemorySpecial::ControllingTty => {
                 crate::fs::tty::open(path, flags, caller, special)

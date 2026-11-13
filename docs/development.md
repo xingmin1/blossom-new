@@ -194,6 +194,10 @@ make run-linux-user-selftests
 
 `/dev/loop0` 是主设备号 7、次设备号 0 的块设备，支持将物理 ext4 普通文件绑定为块盘。系统根装配会加入 `build/fixtures/basic-fat32.img` 和启用 `losetup` 的静态 BusyBox；默认计划及仅运行这两个用例的 `mount-plan.toml` 均在比赛工作盘的两个 libc 根目录准备镜像副本，使用原测试 ELF 对 `/dev/loop0` 执行 `mount` 与 `umount`。当前 FAT32 集成支持真实盘面校验、根节点、容量查询及挂卸载，尚不支持通过 VFS 读写 FAT 文件或遍历目录；未实现的操作返回错误。
 
+已完成初始化的硬件 RTC 会在 devfs 中提供 `/dev/rtc0`（mode `0600`）。`RTC_RD_TIME` 读取真实硬件日历；独立打开会独占设备，`dup` 共享同一个打开实例，最后一次关闭后才可重新打开。当前不支持设置 RTC、闹钟或中断事件；没有可用 RTC 时不创建设备节点。
+
+内核支持 64 位 `set_robust_list` / `get_robust_list` 和非 PI robust futex 的持有线程退出清理，供线程库检测 owner death。查询其他线程的权限目前只实现既有的 UID 0 或同 UID 规则，不等同于 Linux 完整的 ptrace、capability 与 LSM 权限检查；PI futex 尚未实现。
+
 `files` 路径相对主计划文件所在目录，只加载一层；group 文件只允许 `[[group]]`，override 文件只允许 `[[override]]`。step 的候选来源是 `names`、`directory` 或 `catalog` 三者之一：`names` 按原顺序取名字，`directory` 列出有效 `cwd` 中具有执行位的普通文件并按文件名排序，`catalog` 读取清单文件每行首个词作为名字、其余部分作为 `{command}` 原文。`include` 省略等价于 `["*"]`，某个 include 未匹配任何候选时执行器报错；`exclude` 无匹配不报错。选择按文件、group、root、step 的顺序展开，同一 root 内跑完该组全部 step 后再切换下一个 root。有效工作目录按 step、group、root 的优先级取第一个已声明值，环境变量按 root、group、step 的顺序按键合并。`override` 只修改已选中用例的字段，不会把用例重新加入计划；未命中的覆盖项在 `--list` 与 `--verbose` 中提示。最终选择集为空、ID 重复或 step 未给出或给出多个候选来源时按配置错误处理。
 
 每个展开后的用例按 `setup` → `before` 文本 → 主命令 → `after` 文本 → `cleanup` 的顺序执行。用例开始前向执行器所在系统根中的 `/dev/testhook` 发送 `before <case-id>`，执行结束后发送 `after <case-id>`；[contest_hooks.rs](../os/src/contest_hooks.rs) 对未知 ID 直接返回成功，不执行操作。通知失败、cleanup 失败、输出失败或 setup/主命令的进程控制未收尾会停止会话；进程控制失败时不再写 `after` 文本、执行 cleanup 或发送 `after` 通知。setup 命令非零退出、超时与信号终止只结束当前用例，清理后继续下一例。`after` 文本以主命令的 shell 风格状态展开 `{status}`。

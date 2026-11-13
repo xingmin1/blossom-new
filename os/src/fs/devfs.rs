@@ -2,7 +2,7 @@
 //!
 //! ## 模块职责与架构定位
 //! 本模块负责在内存文件系统（[`MemoryFs`]）之上构建 `/dev` 目录树（[`try_new`]），
-//! 并直接实现不依赖外部硬件驱动的虚拟字符设备打开文件描述（[`NullFile`]、[`ZeroFile`]、[`UrandomFile`]、[`TestHookFile`]）。
+//! 并实现内置虚拟字符设备与真实硬件 RTC 的打开文件描述（[`NullFile`]、[`ZeroFile`]、[`UrandomFile`]、[`RtcFile`]、[`TestHookFile`]）。
 //! 上游调用者为 VFS 挂载与打开路径（`Vfs` 初始化挂载 `/dev`，打开节点时根据 [`MemorySpecial`] 分派到本模块或对应的终端/日志模块）；
 //! 下游依赖 [`MemoryFs`] 管理目录项与设备节点 Inode，以及 [`crate::contest_hooks`] 执行评测阶段钩子操作。
 //!
@@ -14,6 +14,7 @@
 //!  ├── null     (1, 3)   mode 0666 ──► MemorySpecial::Null           ──► devfs::NullFile
 //!  ├── zero     (1, 5)   mode 0666 ──► MemorySpecial::Zero           ──► devfs::ZeroFile
 //!  ├── urandom  (1, 9)   mode 0666 ──► MemorySpecial::Urandom        ──► devfs::UrandomFile
+//!  ├── rtc0     (254, 0) mode 0600 ──► MemorySpecial::Rtc            ──► devfs::RtcFile（硬件就绪时）
 //!  ├── ttyS0    (4, 64)  mode 0666 ──► MemorySpecial::TtySerial      ──► tty 子系统
 //!  ├── console  (5, 1)   mode 0666 ──► MemorySpecial::Console        ──► tty 子系统
 //!  ├── tty      (5, 0)   mode 0666 ──► MemorySpecial::ControllingTty ──► tty 子系统
@@ -29,10 +30,11 @@
 //! - 在向用户空间读写全零数据或拉取控制消息时（`zeros` / `discard` / `copy_hook_message`），均使用栈上 512 字节临时缓冲区且不持有自旋锁，允许用户空间缺页异常正常获取内存管理锁。
 //! - `TestHookFile` 进行权限校验时短暂获取当前线程运行时凭据，并在校验完毕后立即释放，随后才调用可能睡眠的 `contest_hooks::before` / `after`。
 //! - `UrandomFile` 在共同随机生成器解锁后才复制用户内存，读取不等待可信种子就绪。
+//! - `RtcFile` 按实际打开实例独占同一个硬件设备；`dup` 共享该实例，最后释放时才归还占用。硬件采样锁不跨用户复制。
 
 use alloc::sync::Arc;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::block::loop_device::LOOP0_RDEV;
 use crate::contest_hooks;
@@ -43,6 +45,7 @@ use crate::fs::{
     ReadBuffer, SeekFrom, WriteBuffer, O_ACCMODE, O_WRONLY,
 };
 use crate::random;
+use crate::time;
 
 /// `/dev/null` 字符设备号：主设备号 1，次设备号 3。
 const NULL_RDEV: u64 = (1 << u8::BITS) | 3;
@@ -50,6 +53,14 @@ const NULL_RDEV: u64 = (1 << u8::BITS) | 3;
 const ZERO_RDEV: u64 = (1 << u8::BITS) | 5;
 /// `/dev/urandom` 随机字节设备号：主设备号 1，次设备号 9。
 const URANDOM_RDEV: u64 = (1 << u8::BITS) | 9;
+/// 本内核 `/dev/rtc0` 的字符设备号：主设备号 254，次设备号 0。
+const RTC_RDEV: u64 = 254 << u8::BITS;
+/// 读取九个 32 位日历字段的 RTC 控制命令。
+const RTC_RD_TIME: u32 = 0x8024_7009;
+/// `rtc_time` 的固定用户 ABI 长度，单位为字节。
+const RTC_TIME_BYTES: usize = 9 * core::mem::size_of::<i32>();
+/// 全部 devfs 挂载共用同一个物理 RTC，实际打开实例独占此设备。
+static RTC_OPEN: AtomicBool = AtomicBool::new(false);
 /// `/dev/ttyS0` 串口终端设备号：主设备号 4，次设备号 64。
 pub(crate) const SERIAL_RDEV: u64 = (4 << u8::BITS) | 64;
 /// `/dev/console` 系统控制台设备号：主设备号 5，次设备号 1。
@@ -96,6 +107,21 @@ pub struct UrandomFile {
     flags: AtomicU32,
 }
 
+/// 真实 RTC 的独占打开实例；共享引用全部释放后归还设备占用。
+pub struct RtcFile {
+    /// 保活实际字符节点及其挂载，供属性查询使用。
+    path: Path,
+    /// 同一打开实例共享的访问模式及可变状态标志。
+    flags: AtomicU32,
+}
+
+impl Drop for RtcFile {
+    /// 最后一份打开实例或分配失败时的未发表实例释放设备占用。
+    fn drop(&mut self) {
+        RTC_OPEN.store(false, Ordering::Release);
+    }
+}
+
 /// `/dev/testhook` 评测控制设备的打开文件描述（Open File Description）。
 ///
 /// 仅允许 `uid == 0` 的特权上下文以只写模式（`O_WRONLY`）打开并写入完整的单条控制命令（`before <id>\n` 或 `after <id>\n`）。
@@ -124,6 +150,9 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
         0o666,
         URANDOM_RDEV,
     )?;
+    if time::rtc_available() {
+        fs.initialize_special(&root, b"rtc0", MemorySpecial::Rtc, 0o600, RTC_RDEV)?;
+    }
     fs.initialize_special(
         &root,
         b"ttyS0",
@@ -158,7 +187,7 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     Ok(fs)
 }
 
-/// 打开由 `devfs` 直接托管的虚拟字符设备节点（`null`、`zero`、`urandom`、`testhook`）。
+/// 打开由 `devfs` 直接托管的字符设备节点；RTC 按实际打开实例独占设备。
 ///
 /// - 调用上下文：普通可睡眠任务上下文。
 /// - 参数：
@@ -189,6 +218,17 @@ pub fn open(
             flags: AtomicU32::new(flags),
         })
         .map_err(|_| FsError::NoMemory)?),
+        MemorySpecial::Rtc => {
+            RTC_OPEN
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .map_err(|_| FsError::Busy)?;
+            // 分配失败会释放尚未发表的 RtcFile，由其析构归还设备占用。
+            Ok(Arc::try_new(RtcFile {
+                path,
+                flags: AtomicU32::new(flags),
+            })
+            .map_err(|_| FsError::NoMemory)?)
+        }
         MemorySpecial::TestHook => {
             if flags & O_ACCMODE != O_WRONLY {
                 return Err(FsError::InvalidOperation);
@@ -636,6 +676,133 @@ impl FileLike for UrandomFile {
         caller: FileIoContext<'_>,
     ) -> Result<usize, FsError> {
         self.write_from(source, caller)
+    }
+}
+
+impl FileLike for RtcFile {
+    /// 当前没有 RTC 中断事件读取能力。
+    fn read_into(
+        &self,
+        _target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        require_read(self.flags())?;
+        Err(FsError::InvalidOperation)
+    }
+
+    /// RTC 设备没有可定位的字节数据。
+    fn read_at_into(
+        &self,
+        _offset: u64,
+        _target: &mut ReadBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        Err(FsError::IllegalSeek)
+    }
+
+    /// 返回实际设备节点路径及挂载拥有。
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    /// RTC 寄存器不向用户提供文件页映射。
+    fn mapping_inode(&self) -> Option<&InodeRef> {
+        None
+    }
+
+    /// 只处理硬件日历读取；其余命令保留 `ENOTTY`。
+    fn ioctl(
+        &self,
+        command: u32,
+        argument: usize,
+        caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        if command != RTC_RD_TIME {
+            return Err(FsError::NotTty);
+        }
+        let fields = time::read_rtc_time().map_err(|_| FsError::InvalidOperation)?;
+        let mut bytes = [0; RTC_TIME_BYTES];
+        for (field, target) in fields.iter().zip(bytes.chunks_exact_mut(4)) {
+            target.copy_from_slice(&field.to_ne_bytes());
+        }
+
+        let FileIoContext::User(user) = caller else {
+            return Err(FsError::BadAddress);
+        };
+        let mm = user.mm().ok_or(FsError::BadAddress)?;
+        let progress = mm.copyout(argument, &bytes);
+        if progress.error.is_some() || progress.copied != bytes.len() {
+            return Err(FsError::BadAddress);
+        }
+        Ok(0)
+    }
+
+    /// 读取该打开实例的访问模式和状态标志。
+    fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// 按共同文件规则更新可变状态标志。
+    fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
+        set_status_flags(&self.flags, raw)
+    }
+
+    /// 更新共享的非阻塞标志，不改变硬件读取职责。
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
+        set_nonblocking(&self.flags, enabled)
+    }
+
+    /// RTC 字符设备不支持截断。
+    fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
+    }
+
+    /// RTC 没有可同步的文件数据或元数据。
+    fn sync_range(&self, _range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
+        Err(FsError::InvalidOperation)
+    }
+
+    /// RTC 没有可定位的字节位置。
+    fn seek(&self, _from: SeekFrom) -> Result<u64, FsError> {
+        Err(FsError::IllegalSeek)
+    }
+
+    /// 返回真实字符节点类型、设备号与权限。
+    fn stat(&self) -> Result<FileStat, FsError> {
+        stat_path(&self.path)
+    }
+
+    /// 字符节点没有目录项。
+    fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 不为字符设备提供目录遍历。
+    fn for_each_dirent(
+        &self,
+        _emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
+    ) -> Result<(), FsError> {
+        Err(FsError::NotDirectory)
+    }
+
+    /// 当前不支持 RTC 数据写入或校时。
+    fn write_from(
+        &self,
+        _source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        require_write(self.flags())?;
+        Err(FsError::InvalidOperation)
+    }
+
+    /// RTC 不支持定位写。
+    fn write_at_from(
+        &self,
+        _offset: u64,
+        _source: &mut WriteBuffer<'_>,
+        _caller: FileIoContext<'_>,
+    ) -> Result<usize, FsError> {
+        Err(FsError::IllegalSeek)
     }
 }
 

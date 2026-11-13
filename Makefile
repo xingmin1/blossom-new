@@ -50,6 +50,7 @@ PROBE_EXTRA_lifecycle := tests/user/probes/lifecycle_wait.c tests/user/probes/li
 PROBE_EXTRA_write := $(addprefix tests/user/probes/write_,buffered.c mmap.c sync.c truncate.c namespace.c)
 PROBE_HEADERS_io := tests/user/probes/io_private.h tests/user/probes/io_wire.h
 PROBE_HEADERS_writeback := tests/user/probes/io_wire.h
+PROBE_HEADERS_device-map := tests/user/probes/io_wire.h
 PROBE_HEADERS_write := tests/user/probes/write.h
 PROBE_HEADERS_lifecycle := tests/user/probes/lifecycle.h
 PROBE_HEADERS_signal := tests/user/probes/signal.h

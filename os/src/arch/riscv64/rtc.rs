@@ -1,10 +1,8 @@
 //! RISC-V 64 板级实时时钟（StarFive JH7110 RTC）初始化与日历读取驱动。
 //!
 //! # 模块职责与架构定位
-//! 本模块位于 `arch::riscv64` 架构抽象层，在系统启动早期由主核（BSP）的时间子系统初始化路径调用，
-//! 负责根据设备树（FDT）解析出的 `BootInfo` 硬件资源使能 AON（Always-On）域的 RTC 时钟与复位控制器，
-//! 并从板载 RTC 硬件寄存器读取当前的年、月、日、时、分、秒日历值，用于建立内核真实世界时间（Wall-clock Epoch）。
-//! 若目标平台（如未配置 AON RTC 的虚拟平台）未声明相应资源，则返回 `Ok(None)`。
+//! 本模块在系统启动时根据设备树资源准备板载 AON RTC 的时钟与复位，并提供运行期只读日历采样。
+//! 启动时间层与 RTC 字符设备共用 BCD 解码和一致性采样；设备缺席或准备失败时不提供运行期读取。
 //!
 //! # 核心设计与寄存器位域布局
 //! StarFive JH7110 RTC 位于 AON 电源域，其时间（`RTC_TIME`，偏移 `0x3c`）与日期（`RTC_DATE`，偏移 `0x40`）
@@ -41,8 +39,10 @@
 //! ```
 //!
 //! # 锁获取顺序与并发契约
-//! - 本模块不持有任何锁。`board_rtc_calendar` 仅在引导阶段由主核（BSP）在本地中断关闭、从核（AP）尚未唤醒前单线程调用，
-//!   依靠启动阶段的单核执行顺序天然保证对 AON CRG 与 RTC MMIO 寄存器的独占访问。
+//! - `board_rtc_calendar` 由 BSP 在关中断且 AP 尚未释放时独占准备 AON CRG 与 RTC。
+//! - `read_rtc_calendar` 不修改寄存器；准备完成后允许并发读取，调用期间不得配置或复位设备。
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::{dma_barrier, mmio_address};
 use crate::boot::{BootInfo, Region};
@@ -108,15 +108,25 @@ const RTC_MINUTE_MASK: u32 = (1 << RTC_MINUTE_SHIFT) - 1;
 /// `RTC_TIME` 寄存器中秒字段的 7 比特掩码（位 `0..7`）。
 const RTC_SECOND_MASK: u32 = (1 << RTC_MINUTE_SHIFT) - 1;
 
+/// 原启动准备已完成的板载 RTC 状态，与 BCD 日历是否合法无关。
+static BOARD_RTC_READY: AtomicBool = AtomicBool::new(false);
+
+/// 查询板载 RTC 是否已完成时钟、复位与日历计数器的启动准备。
+pub fn board_rtc_ready() -> bool {
+    BOARD_RTC_READY.load(Ordering::Acquire)
+}
+
 /// 从已建立内核 MMIO 映射的设备区域读取一个 4 字节对齐的 32 位寄存器。
 ///
-/// 调用前必须处于 `board_rtc_calendar` 的启动期上下文，若 `offset` 未按 4 字节对齐或越出 `region` 边界则触发断言。
+/// 仅由本模块满足永久映射契约的启动或只读采样入口调用；越出寄存器边界时触发断言。
 fn read(region: Region, offset: usize) -> u32 {
     assert!(offset % 4 == 0 && offset + 4 <= region.end - region.start);
     // SAFETY:
     // 1. 前置 `assert!` 已验证 `offset` 按 4 字节对齐且 `[offset, offset + 4)` 完全落在 `region` 物理范围内；
-    // 2. `board_rtc_calendar` 的调用契约保证 `region` 对应的 MMIO 窗口已完成永久映射，且无并发访问。
-    unsafe { ((mmio_address(region.start) + offset) as *const u32).read_volatile() }
+    // 2. 本模块硬件入口的调用契约保证永久 MMIO 映射有效，且不存在并发配置写入。
+    let value = unsafe { ((mmio_address(region.start) + offset) as *const u32).read_volatile() };
+    dma_barrier();
+    value
 }
 
 /// 向已建立内核 MMIO 映射的设备区域写入一个 4 字节对齐的 32 位寄存器，并执行设备 I/O 屏障。
@@ -223,22 +233,42 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
         return Err("RTC AON reset deassertion timed out");
     }
 
-    // Step 4: 置位 RTC_CONTROL 启动日历计数器与 24 小时模式，并使用“时间-日期-时间”夹心重读法消除跨秒进位撕裂，解码 BCD 后返回。
+    // Step 4: 启动日历计数器与 24 小时模式，完成准备后再读取日历。
     let config = read(info.rtc, RTC_CONTROL);
     write(info.rtc, RTC_CONTROL, config | RTC_CALENDAR_CONTROL);
+    let enabled = read(info.rtc, RTC_CONTROL) & RTC_CALENDAR_CONTROL == RTC_CALENDAR_CONTROL;
+    BOARD_RTC_READY.store(enabled, Ordering::Release);
+    // SAFETY:
+    // 1. 调用方保证 RTC 永久映射有效，上方已完成时钟使能与复位释放；
+    // 2. BSP 仍独占设备，日历控制配置已经完成，后续仅执行只读采样。
+    unsafe { read_rtc_calendar(info.rtc).map(Some) }
+}
+
+/// 从已准备的板载 RTC 只读采样日历，不重复使能时钟、解除复位或写控制寄存器。
+///
+/// # Safety
+/// 1. `region` 必须是已永久映射的当前 JH7110 RTC 资源，且启动准备已完成。
+/// 2. 采样期间不得配置或复位该设备；其他执行流可以并发读取日历寄存器。
+pub unsafe fn read_rtc_calendar(region: Region) -> Result<[u32; 6], &'static str> {
+    if region.start & (core::mem::align_of::<u32>() - 1) != 0
+        || region.end.saturating_sub(region.start) < RTC_DATE + core::mem::size_of::<u32>()
+    {
+        return Err("RTC resource window is invalid");
+    }
+    // 时间寄存器前后相等时，日期与时分秒属于同一个完整样本。
     for _ in 0..CALENDAR_READ_ATTEMPTS {
-        let before = read(info.rtc, RTC_TIME);
-        let date = read(info.rtc, RTC_DATE);
-        let after = read(info.rtc, RTC_TIME);
+        let before = read(region, RTC_TIME);
+        let date = read(region, RTC_DATE);
+        let after = read(region, RTC_TIME);
         if before == after {
-            return Ok(Some([
+            return Ok([
                 RTC_YEAR_BASE + bcd((date >> RTC_YEAR_SHIFT) & RTC_YEAR_MASK)?,
                 bcd((date >> RTC_MONTH_SHIFT) & RTC_MONTH_MASK)?,
                 bcd(date & RTC_DAY_MASK)?,
                 bcd((before >> RTC_HOUR_SHIFT) & RTC_HOUR_MASK)?,
                 bcd((before >> RTC_MINUTE_SHIFT) & RTC_MINUTE_MASK)?,
                 bcd(before & RTC_SECOND_MASK)?,
-            ]));
+            ]);
         }
     }
     Err("RTC calendar did not stabilize")

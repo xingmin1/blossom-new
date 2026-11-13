@@ -83,13 +83,13 @@ pub use mmu::{
 };
 #[cfg(feature = "ktest")]
 use registers::rv_register_roundtrip;
-pub use rtc::board_rtc_calendar;
+pub use rtc::{board_rtc_calendar, board_rtc_ready, read_rtc_calendar};
 pub(crate) use signal::SIGNAL_MIN_STACK;
 use switch::rv_switch_context;
 #[cfg(feature = "ktest")]
 use switch::rv_task_context_roundtrip;
 use trap::rv_trap_entry;
-pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
+pub use uaccess::{compare_exchange_user_u32, copy_user_bytes, load_user_u32, store_user_u32};
 #[cfg(feature = "ktest")]
 pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
 pub use user::{run_user, signal_return_code, UserContext};

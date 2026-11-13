@@ -2,7 +2,7 @@
 //!
 //! ## 模块职责与架构定位
 //! 本模块实现非优先级继承（非 PI）的 Futex 核心操作，负责当用户态原子同步发生竞争时在内核中阻塞等待、按位掩码（Bitset）唤醒以及跨键重排（Requeue）。
-//! - **上游调用者**：系统调用层（处理 `futex` 的 `FUTEX_WAIT`、`FUTEX_WAKE`、`FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE` 等子命令）与线程退出清理路径（`os/src/task/user.rs` 中的 `clear_tid`）。
+//! - **上游调用者**：系统调用层处理等待、唤醒与重排；线程退出及 exec 路径处理 `clear_tid` 与 robust owner 清理。
 //! - **下游依赖**：`crate::mm::space`（解析虚拟地址背后的物理/文件后备身份 `FutexKey` 并在页表锁保护下读取用户 32 位字）、`crate::wait`（可被信号打断的任务挂起与唤醒器）、`crate::timer`（处理带超时的精确唤醒）。
 //!
 //! ## 核心设计与关键状态机
@@ -48,6 +48,16 @@ use crate::wait::{WaitId, Waiter, Waker};
 const BUCKETS: usize = 32;
 /// 单次唤醒操作在栈上内联暂存的最大 `Detached` 通知数；超出此数量时在锁外向堆 `Vec` 扩容。
 const INLINE_NOTIFICATIONS: usize = 64;
+/// native 64 位 robust 链表头由 next、带符号偏移和 pending 三个机器字组成。
+pub(crate) const ROBUST_LIST_HEAD_SIZE: usize = 3 * core::mem::size_of::<usize>();
+/// 退出清理最多处理的链表节点数，限制循环链表占用当前执行流的时间。
+const ROBUST_LIST_LIMIT: usize = 2048;
+/// 用户同步字的等待者标志。
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+/// 用户同步字的持有线程已退出标志。
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+/// 用户同步字内保存持有线程 TID 的位掩码。
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
 /// Futex 核心操作错误类型；保留语义化的失败原因，由系统调用 ABI 层统一映射为 POSIX errno。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,6 +609,81 @@ pub fn wake(
         let selected = notifications.count;
         notifications.notify();
         return Ok(selected);
+    }
+}
+
+/// 在旧地址空间仍绑定当前线程时清理其 robust 链，用户访问失败即停止遍历。
+///
+/// 调用者已取空线程登记，且不得持有进程、任务图或 futex 桶锁。
+pub(crate) fn exit_robust_list(mm: &Arc<Mm>, head: usize, tid: u32) {
+    let _ = walk_robust_list(mm, head, tid);
+}
+
+/// 从用户机器字中分离 robust 节点地址和低位 PI 标志。
+fn robust_entry(mm: &Mm, address: usize) -> Result<(usize, bool), VmError> {
+    let raw = mm.read_usize(address)?;
+    Ok((raw & !1, raw & 1 != 0))
+}
+
+/// 逐项读取旧 Mm 中的链指针，先取得后继，再处理当前锁，pending 最后且仅处理一次。
+fn walk_robust_list(mm: &Arc<Mm>, head: usize, tid: u32) -> Result<(), VmError> {
+    let word = core::mem::size_of::<usize>();
+    let (mut entry, mut pi) = robust_entry(mm, head)?;
+    let offset = mm.read_usize(head.wrapping_add(word))? as isize;
+    let (pending, pending_pi) = robust_entry(mm, head.wrapping_add(2 * word))?;
+    for index in 0..ROBUST_LIST_LIMIT {
+        if entry == head {
+            break;
+        }
+        // 即使后继读取失败，当前锁仍应先完成处理；失败后不再访问后续节点或 pending。
+        let next = robust_entry(mm, entry);
+        if entry != pending {
+            handle_robust_death(mm, entry.wrapping_add_signed(offset), tid, pi, false)?;
+        }
+        (entry, pi) = next?;
+        if index + 1 < ROBUST_LIST_LIMIT {
+            crate::sched::cond_resched();
+        }
+    }
+    if pending != 0 {
+        handle_robust_death(
+            mm,
+            pending.wrapping_add_signed(offset),
+            tid,
+            pending_pi,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+/// 仅当同步字仍属于退出线程时 CAS 标记死亡，并按旧 WAITERS 状态唤醒共享等待者。
+fn handle_robust_death(
+    mm: &Arc<Mm>,
+    address: usize,
+    tid: u32,
+    pi: bool,
+    pending: bool,
+) -> Result<(), VmError> {
+    loop {
+        let old = mm.load_user_u32(address)?;
+        let owner = old & FUTEX_TID_MASK;
+        // pending 可能记录已释放却未完成 wake 的锁，此时不能引入 OWNER_DIED。
+        if pending && !pi && owner == 0 {
+            let _ = wake(mm, address, false, 1, u32::MAX);
+            return Ok(());
+        }
+        if owner != tid {
+            return Ok(());
+        }
+        let new = (old & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if mm.compare_exchange_user_u32(address, old, new)? != old {
+            continue;
+        }
+        if !pi && old & FUTEX_WAITERS != 0 {
+            let _ = wake(mm, address, false, 1, u32::MAX);
+        }
+        return Ok(());
     }
 }
 

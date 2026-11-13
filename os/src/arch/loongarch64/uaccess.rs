@@ -3,7 +3,7 @@
 //! # 模块职责与架构定位
 //! 本模块位于 `arch::loongarch64` 硬件抽象层，提供对已驻留物理内存页（通过内核 `PLV0` 可缓存直接映射窗口 `DMW1` 访问）的底层汇编访存函数。
 //! - **上游调用者**：
-//!   - `mm::uaccess`（`copyin`、`copyout`、`load_user_u32`、`store_user_u32`）：在页表锁/页面引用保护下逐页读写用户空间内存；
+//!   - `mm::uaccess`：在映射与物理页保护下逐页复制字节，执行 32 位原子读取、写入与比较交换；
 //!   - `mm::folio` 与 `mm::space`：对页缓存（Page Cache / Folio）和写时复制（COW）物理页执行原始字节复制或清零；
 //!   - `task::user`（`AleMemory`）：在非对齐访存模拟（ALE）期间逐字节读写用户内存。
 //! - **下游依赖**：依赖 `register` 模块定义的 `dbar` 内存屏障提示字（`DBAR_ACQUIRE`、`DBAR_RELEASE`）。
@@ -153,4 +153,42 @@ pub unsafe fn store_user_u32(dst: *mut u32, value: u32) {
             options(nostack),
         );
     }
+}
+
+/// 对已保活的用户页执行 32 位原子比较交换，返回交换前观察到的值。
+///
+/// 成功交换具有 Acquire/Release 语义，比较失败具有 Acquire 语义。
+///
+/// # Safety
+/// 1. `dst` 必须按 4 字节对齐，完整指向单页内已初始化的 DMW1 普通可缓存 RAM。
+/// 2. 调用方必须验证用户写权限、完成 COW，并在调用期间保活物理页及直映。
+/// 3. 该范围不得存在冲突 Rust 引用，并发同步访问必须使用对齐的原子指令。
+pub unsafe fn compare_exchange_user_u32(dst: *mut u32, old: u32, new: u32) -> u32 {
+    let observed: usize;
+    // SAFETY:
+    // 1. 调用方保证 `dst` 对齐、可写且物理页存活，LL/SC 只访问这一个 32 位字。
+    // 2. `ll.w` 将结果符号扩展到寄存器宽度，期望值同样经 i32 扩展，WAITERS 不会造成永久比较失败。
+    // 3. SC 失败时重新 LL；两端 dbar 和默认汇编内存副作用保证硬件及编译器排序。
+    unsafe {
+        asm!(
+            "dbar {release}",
+            "2:",
+            "ll.w {observed}, {dst}, 0",
+            "bne {observed}, {old}, 3f",
+            "or {status}, {new}, $zero",
+            "sc.w {status}, {dst}, 0",
+            "beqz {status}, 2b",
+            "3:",
+            "dbar {acquire}",
+            release = const reg::DBAR_RELEASE,
+            acquire = const reg::DBAR_ACQUIRE,
+            dst = in(reg) dst,
+            old = in(reg) old as i32 as isize,
+            new = in(reg) new as usize,
+            observed = out(reg) observed,
+            status = out(reg) _,
+            options(nostack),
+        );
+    }
+    observed as u32
 }

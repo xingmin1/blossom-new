@@ -434,6 +434,9 @@ impl Timekeeper {
 static TIMEKEEPER: Once<Timekeeper> = Once::new();
 /// 系统启动时刻对应的 Unix 墙钟基准时间（单位：纳秒；未校时状态下为 `0`）。
 static REALTIME_BASE: Once<u64> = Once::new();
+/// Goldfish 的低字读取会改变设备级高字锁存状态，所有完整采样共用此关中断锁。
+#[cfg(target_arch = "riscv64")]
+static GOLDFISH_READ_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// 读取已映射 RTC 设备窗口内 4 字节对齐的 32 位寄存器，并在读取后插入设备内存屏障。
 ///
@@ -507,6 +510,25 @@ unsafe fn boot_realtime(info: &BootInfo) -> u64 {
     }
 }
 
+/// 串行读取 Goldfish 的低字与锁存高字；返回后已经释放设备锁。
+///
+/// # Safety
+/// `region` 必须是当前 Goldfish RTC 的已验证资源，且永久 MMIO 映射已经建立。
+#[cfg(target_arch = "riscv64")]
+unsafe fn goldfish_realtime(region: Region) -> u64 {
+    const TIME_LOW: usize = 0;
+    const TIME_HIGH: usize = TIME_LOW + core::mem::size_of::<u32>();
+    let _sample = GOLDFISH_READ_LOCK.lock();
+    // SAFETY:
+    // 1. 调用方保证 Goldfish 资源与永久映射有效，两个偏移均为设备的只读寄存器；
+    // 2. `_sample` 保持本核中断关闭并串行化全部锁存访问，低字读取后才读取高字。
+    unsafe {
+        let low = rtc_register(region, TIME_LOW);
+        let high = rtc_register(region, TIME_HIGH);
+        (u64::from(high) << u32::BITS) | u64::from(low)
+    }
+}
+
 /// 读取 QEMU `virt` 平台的虚拟 RTC（RISC-V Goldfish RTC 或 LoongArch LS7A TOY），返回 Unix 纳秒时间戳。
 ///
 /// # Safety
@@ -515,17 +537,8 @@ unsafe fn boot_realtime(info: &BootInfo) -> u64 {
 unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
     #[cfg(target_arch = "riscv64")]
     {
-        const TIME_LOW: usize = 0;
-        const TIME_HIGH: usize = TIME_LOW + core::mem::size_of::<u32>();
-        // Goldfish RTC 规定读取 `TIME_LOW` 会同时锁存同一时刻的 `TIME_HIGH`；因此必须先读低 32 位再读高 32 位。
-        // SAFETY:
-        // 1. 调用方保证当前独占已永久映射的 Goldfish RTC MMIO 窗口；
-        // 2. `TIME_LOW` (0x0) 与 `TIME_HIGH` (0x4) 均为合法的 32 位只读寄存器偏移，`rtc_register` 内部会校验窗口边界并插入设备屏障。
-        unsafe {
-            let low = rtc_register(info.rtc, TIME_LOW);
-            let high = rtc_register(info.rtc, TIME_HIGH);
-            (u64::from(high) << u32::BITS) | u64::from(low)
-        }
+        // SAFETY: 调用方保证当前已映射 Goldfish 资源有效，采样函数自行串行化设备锁存状态。
+        unsafe { goldfish_realtime(info.rtc) }
     }
     #[cfg(target_arch = "loongarch64")]
     {
@@ -576,6 +589,11 @@ fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
 
 /// 将公历 `[年, 月, 日, 时, 分, 秒]` 校验并转换为自 1970-01-01 00:00:00 UTC 起的 Unix 纳秒数；日期非法或溢出时返回 `None`。
 fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
+    calendar_seconds(calendar)?.checked_mul(NSEC_PER_SEC)
+}
+
+/// 校验公历日期并转换为非负 Unix 秒数，供启动纳秒换算和硬件 RTC 日期校验共用。
+fn calendar_seconds(calendar: [u32; 6]) -> Option<u64> {
     const HOURS_PER_DAY: i64 = 24;
     const MINUTES_PER_HOUR: i64 = 60;
     const SECONDS_PER_MINUTE: i64 = 60;
@@ -622,7 +640,7 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
         - UNIX_EPOCH_DAY_OFFSET;
     let seconds =
         ((days * HOURS_PER_DAY + hour) * MINUTES_PER_HOUR + minute) * SECONDS_PER_MINUTE + second;
-    u64::try_from(seconds).ok()?.checked_mul(NSEC_PER_SEC)
+    u64::try_from(seconds).ok()
 }
 
 /// 初始化全局时间子系统：采样平台 RTC 建立墙钟基准 [`REALTIME_BASE`]，并注册全局单调时间维护器 [`TIMEKEEPER`]。
@@ -646,6 +664,98 @@ pub unsafe fn initialize(info: &BootInfo) {
         REALTIME_BASE.call_once(|| realtime);
         Timekeeper::new(info.counter_frequency, u64::MAX, cycle)
     });
+}
+
+/// 查询当前平台的真实 RTC 是否完成硬件准备，不以日历内容是否有效决定设备是否存在。
+pub(crate) fn rtc_available() -> bool {
+    match crate::boot::info().platform {
+        Platform::QemuVirt => TIMEKEEPER.get().is_some(),
+        Platform::VisionFive2 | Platform::Ls2k1000la => arch::board_rtc_ready(),
+    }
+}
+
+/// 重新读取已准备的硬件 RTC，返回九个 `rtc_time` ABI 字段；日历或设备状态无效时返回错误。
+///
+/// Goldfish 锁只覆盖寄存器采样；日期换算与调用方的用户复制均在释放锁后执行。
+pub(crate) fn read_rtc_time() -> Result<[i32; 9], &'static str> {
+    if !rtc_available() {
+        return Err("RTC is unavailable");
+    }
+    let info = crate::boot::info();
+    #[cfg(target_arch = "riscv64")]
+    if info.platform == Platform::QemuVirt {
+        // SAFETY:
+        // 1. `rtc_available` 确认 QEMU 时间初始化已完成，原启动路径已验证并永久映射此资源；
+        // 2. 读取函数持设备锁串行化低字与高字，不执行寄存器配置写入。
+        let nanoseconds = unsafe { goldfish_realtime(info.rtc) };
+        return Ok(goldfish_rtc_time(nanoseconds));
+    }
+
+    // SAFETY:
+    // 1. 板载 RTC 的 Release 就绪位或 QEMU 已完成的初始化证明原硬件准备和永久映射有效；
+    // 2. 启动之后没有 RTC 配置或复位写入，本入口与同类调用仅并发读取日历寄存器。
+    let calendar = unsafe { arch::read_rtc_calendar(info.rtc)? };
+    if (i32::MAX as u32) < calendar[0] || calendar_seconds(calendar).is_none() {
+        return Err("RTC calendar is invalid or out of range");
+    }
+    let [year, month, day, hour, minute, second] = calendar.map(|field| field as i32);
+    Ok([second, minute, hour, day, month - 1, year - 1900, 0, 0, 0])
+}
+
+/// 将 Goldfish 的非负 Unix 纳秒读数转换为完整 UTC 日历字段，不读取软件墙钟。
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_time(nanoseconds: u64) -> [i32; 9] {
+    const SECONDS_PER_MINUTE: u32 = 60;
+    const SECONDS_PER_HOUR: u32 = 60 * SECONDS_PER_MINUTE;
+    const SECONDS_PER_DAY: u32 = 24 * SECONDS_PER_HOUR;
+    const MARCH_EPOCH_OFFSET: u32 = 719_468;
+    const DAYS_PER_400_YEARS: u32 = 146_097;
+    const YEAR_MULTIPLIER: u32 = 2_939_745;
+    const MONTH_MULTIPLIER: u32 = 2_141;
+    const MONTH_OFFSET: u32 = 132_377;
+    const MARCH_TO_JANUARY: u32 = 306;
+
+    // u64 纳秒最多覆盖 213503 个完整 Unix 日，以下 u32 公历运算均可表示。
+    let seconds = nanoseconds / NSEC_PER_SEC;
+    let days = (seconds / u64::from(SECONDS_PER_DAY)) as u32;
+    let remaining = (seconds % u64::from(SECONDS_PER_DAY)) as u32;
+    let scaled_days = 4 * (days + MARCH_EPOCH_OFFSET) + 3;
+    let century = scaled_days / DAYS_PER_400_YEARS;
+    let day_of_century = scaled_days % DAYS_PER_400_YEARS / 4;
+    let scaled_year = u64::from(YEAR_MULTIPLIER) * u64::from(4 * day_of_century + 3);
+    let year_of_century = (scaled_year >> u32::BITS) as u32;
+    let march_day = scaled_year as u32 / YEAR_MULTIPLIER / 4;
+    let leap = if year_of_century == 0 {
+        century % 4 == 0
+    } else {
+        year_of_century % 4 == 0
+    };
+    let scaled_month = MONTH_MULTIPLIER * march_day + MONTH_OFFSET;
+    let march_month = scaled_month >> u16::BITS;
+    let january_or_february = MARCH_TO_JANUARY <= march_day;
+    let year = 100 * century + year_of_century + u32::from(january_or_february);
+    let month = if january_or_february {
+        march_month - 12
+    } else {
+        march_month
+    };
+    let day = u32::from(scaled_month as u16) / MONTH_MULTIPLIER + 1;
+    let year_day = if january_or_february {
+        march_day - MARCH_TO_JANUARY
+    } else {
+        march_day + 31 + 28 + u32::from(leap)
+    };
+    [
+        (remaining % SECONDS_PER_MINUTE) as i32,
+        (remaining % SECONDS_PER_HOUR / SECONDS_PER_MINUTE) as i32,
+        (remaining / SECONDS_PER_HOUR) as i32,
+        day as i32,
+        month as i32,
+        year as i32 - 1900,
+        ((days + 4) % 7) as i32,
+        (year_day + 1) as i32,
+        0,
+    ]
 }
 
 /// 获取已初始化的全局 [`Timekeeper`] 引用；若在 [`initialize`] 完成前调用则直接 panic。

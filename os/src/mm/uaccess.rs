@@ -3,7 +3,7 @@
 //! # 模块职责与架构定位
 //! 本模块作为虚拟内存管理器（[`Mm`]）的扩展实现，提供内核态读写用户态虚拟地址空间的统一安全通道：
 //! - **上游调用者**：系统调用分发层、信号投递、ELF 加载器、Futex 同步原语及文件系统读写路径。
-//! - **下游依赖**：`Mm::with_page`（驻留页查询与短期锁保护）、`Mm::fault`（缺页异常与写时复制处理）以及体系结构原语 `arch::copy_user_bytes` / `arch::load_user_u32` / `arch::store_user_u32`。
+//! - **下游依赖**：`Mm::with_page`（驻留页查询与短期锁保护）、`Mm::fault`（缺页与 COW）及架构层的原始字节复制、32 位原子读取、写入和比较交换。
 //!
 //! # 核心设计与两阶段逐页访问状态机
 //! 为避免在持有页表锁或禁止调度的状态下触发可睡眠的缺页 I/O，所有用户内存访问均按 4KiB 页边界切分，并遵循以下两阶段循环（参见 [`Mm::access_page`]）：
@@ -207,13 +207,6 @@ impl Mm {
     /// 对 4 字节自然对齐的用户虚拟地址 `address` 执行一次 32 位 Acquire 原子加载。
     ///
     /// 若目标页尚未驻留，会先在锁外处理缺页（可睡眠），随后在页面映射保护期内执行单条硬件原子读指令。
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "futex 和事件测试读取用户共享控制字的真实 Acquire 状态"
-        )
-    )]
     pub fn load_user_u32(&self, address: usize) -> Result<u32, VmError> {
         check_atomic_u32(address)?;
         self.access_page(address, UserAccess::Read, |source| {
@@ -232,6 +225,25 @@ impl Mm {
             // 1. 前置 `check_atomic_u32(address)` 已验证 `address` 4 字节自然对齐且完全位于单个 4KiB 页内；
             // 2. `self.access_page` 保证目标物理页存活且具备可写（非 COW）映射，`arch::store_user_u32` 仅在回调内执行单次原子写。
             unsafe { arch::store_user_u32(target as *mut u32, value) };
+        })
+    }
+
+    /// 对用户态 32 位字执行原子比较交换，返回交换前观察到的值。
+    ///
+    /// 写权限检查和 COW 沿普通写访问执行；缺页处理在映射与页表保护外完成。
+    pub fn compare_exchange_user_u32(
+        &self,
+        address: usize,
+        old: u32,
+        new: u32,
+    ) -> Result<u32, VmError> {
+        check_atomic_u32(address)?;
+        self.access_page(address, UserAccess::Write, |target| {
+            // SAFETY:
+            // 1. `check_atomic_u32` 已验证完整用户范围、4 字节对齐及页内边界。
+            // 2. `access_page(Write)` 保持物理页和映射存活，已验证写权限并完成 COW。
+            // 3. 架构原语只在保护期内通过原始指针执行 CAS，不构造或泄露用户内存引用。
+            unsafe { arch::compare_exchange_user_u32(target as *mut u32, old, new) }
         })
     }
 

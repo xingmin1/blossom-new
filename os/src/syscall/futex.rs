@@ -35,7 +35,7 @@
 //! - 实际的哈希桶锁与地址空间页表访问顺序由下游 `crate::task::futex` 统一管理。
 
 use crate::syscall::error::{self, Errno};
-use crate::syscall::{time, Outcome, Request, Restart};
+use crate::syscall::{time, Outcome, Request, Restart, SysResult};
 use crate::task::futex::{self, WaitOutcome};
 use crate::task::UserThread;
 use crate::time::{self as clock, MonotonicInstant, NSEC_PER_SEC};
@@ -59,6 +59,27 @@ const PRIVATE: u32 = 0x80;
 const CLOCK_REALTIME: u32 = 0x100;
 /// 用于从 `futex_op` 中剥离 `PRIVATE` 与 `CLOCK_REALTIME` 修饰位、提取基础命令码的掩码。
 const COMMAND_MASK: u32 = !(PRIVATE | CLOCK_REALTIME);
+
+/// 登记当前线程的 native robust 链表头，仅检查 ABI 长度，不预读用户地址。
+pub(super) fn set_robust_list(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    if raw[1] != futex::ROBUST_LIST_HEAD_SIZE {
+        return Err(Errno::InvalidArgument);
+    }
+    user.set_robust_list(raw[0]);
+    Ok(0)
+}
+
+/// 先核对目标 TID 与 UID 权限，再依次向用户空间写出头长度和登记地址。
+pub(super) fn get_robust_list(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    let identity = user.identity().expect("get_robust_list has no identity");
+    let head = identity
+        .graph()
+        .robust_list(&identity, raw[0] as u32 as usize)?;
+    let mm = user.mm().expect("get_robust_list has no MM");
+    error::copyout(&mm, raw[2], &futex::ROBUST_LIST_HEAD_SIZE.to_le_bytes())?;
+    error::copyout(&mm, raw[1], &head.to_le_bytes())?;
+    Ok(0)
+}
 
 /// 分发并执行 `futex` 系统调用的各个非优先级继承（non-PI）子命令。
 ///

@@ -869,6 +869,23 @@ pub(crate) mod programs {
         fixture.futex_program(context, b"t")
     }
 
+    /// 测试目标：验证 robust owner 的普通退出、exec 和 pending 已解锁状态能唤醒另一 Mm 的共享等待者。
+    /// 场景步骤：真实 fork 子进程登记带负 offset 的链，父进程进入 futex Blocked 后才放行子进程退出或 exec。
+    /// 预期结果：WAITERS 保留、owner 清零并标记死亡；pending owner 为零时仅唤醒，查询及 wait/reap 均保真实状态。
+    #[test]
+    #[case("exit", b"o" as &[u8])]
+    #[case("exec", b"e" as &[u8])]
+    #[case("pending_unlock", b"z" as &[u8])]
+    #[ktest(tags("user-futex", "robust-futex"), min_cpus = 2)]
+    fn futex_robust_owner_exit_exec_and_pending_unlock(
+        context: &mut TestContext<'_>,
+        fixture: &mut UserOwner,
+        mode: &[u8],
+    ) -> TestResult {
+        fixture.prepare(context)?;
+        fixture.futex_program(context, mode)
+    }
+
     /// 测试目标：验证 `futex` 等待被带 `SA_RESTART` 的信号中断后能按原参数自动重启，且被停止/继续信号打断的相对超时等待在重启时保留首次计算的绝对到期时间，不会重新读取用户空间中可能已被解除映射的 `timespec` 参数页。
     #[test]
     #[ktest(min_cpus = 2)]

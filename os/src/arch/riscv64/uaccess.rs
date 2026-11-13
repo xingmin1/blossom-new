@@ -2,8 +2,7 @@
 //!
 //! # 模块职责与架构定位
 //! 本模块位于 `arch::riscv64` 架构抽象层，向上为 `mm` 地址空间管理（如 `copyin`、`copyout`、
-//! `load_user_u32`、`store_user_u32`）及 `futex` / 线程生命周期管理提供底层的跨页内字节拷贝与
-//! 32 位 Acquire/Release 访存原语。
+//! `load_user_u32`、`store_user_u32`、`compare_exchange_user_u32`）及线程生命周期管理提供底层访存原语。
 //!
 //! # 核心设计与访存路径
 //! 内核访问用户态内存时不依赖 RISC-V `sstatus.SUM` 位直接解引用用户虚拟地址，而是由上层 `Mm`
@@ -152,4 +151,37 @@ pub unsafe fn store_user_u32(dst: *mut u32, value: u32) {
             options(nostack),
         );
     }
+}
+
+/// 对已保活的用户页执行 32 位原子比较交换，返回交换前观察到的值。
+///
+/// 成功交换具有 Acquire/Release 语义，比较失败具有 Acquire 语义。
+///
+/// # Safety
+/// 1. `dst` 必须按 4 字节对齐，完整指向单页内已初始化的普通可缓存 RAM。
+/// 2. 调用方必须验证用户写权限、完成 COW，并在调用期间保活物理页及直映。
+/// 3. 该范围不得存在冲突 Rust 引用，并发同步访问必须使用对齐的原子指令。
+pub unsafe fn compare_exchange_user_u32(dst: *mut u32, old: u32, new: u32) -> u32 {
+    let observed: usize;
+    // SAFETY:
+    // 1. 调用方保证 `dst` 对齐、可写且物理页存活，LR/SC 只访问这一个 32 位字。
+    // 2. `lr.w` 将结果符号扩展到 XLEN，期望值同样先经 i32 扩展，保留 WAITERS 高位的比较语义。
+    // 3. LR/SC 重试只针对保留失效；默认汇编内存副作用和 aq/rl 共同约束编译器及硬件排序。
+    unsafe {
+        asm!(
+            "2:",
+            "lr.w.aq {observed}, ({dst})",
+            "bne {observed}, {old}, 3f",
+            "sc.w.rl {status}, {new}, ({dst})",
+            "bnez {status}, 2b",
+            "3:",
+            dst = in(reg) dst,
+            old = in(reg) old as i32 as isize,
+            new = in(reg) new as usize,
+            observed = out(reg) observed,
+            status = out(reg) _,
+            options(nostack),
+        );
+    }
+    observed as u32
 }

@@ -913,6 +913,54 @@ impl TaskGraph {
         user.upgrade()
     }
 
+    /// 按 TID 查询 robust 登记，并保留尚未 reap 的退出组首的空登记。
+    ///
+    /// 权限沿现有真实 UID 模型：UID 0 或相同 UID 可查询。图锁内只采集登记，
+    /// 不访问用户内存；升级得到的线程拥有在图锁外释放。
+    pub(crate) fn robust_list(
+        &self,
+        caller: &UserIdentity,
+        tid: usize,
+    ) -> Result<usize, ProcessError> {
+        let caller_tid = caller.tid_object();
+        let (target, head) = {
+            let slots = self.slots.lock();
+            let caller_slot = slots
+                .get(caller_tid.number - 1)
+                .ok_or(ProcessError::NoProcess)?;
+            if !has_role(&slots, &caller_tid, TID)
+                || !caller_slot.thread.as_ref().is_some_and(|thread| {
+                    Arc::ptr_eq(&thread.group, &caller.group)
+                        && Arc::ptr_eq(&thread.signals, &caller.signals)
+                })
+            {
+                return Err(ProcessError::NoProcess);
+            }
+            let tid = if tid == 0 { caller_tid.number } else { tid };
+            let slot = slots.get(tid - 1).ok_or(ProcessError::NoProcess)?;
+            let group = slot
+                .thread
+                .as_ref()
+                .map(|thread| &thread.group)
+                .or_else(|| slot.process.as_ref().map(|process| &process.group))
+                .ok_or(ProcessError::NoProcess)?;
+            if caller.group.uid != 0 && caller.group.uid != group.uid {
+                return Err(ProcessError::Permission);
+            }
+            let target = slot.thread.as_ref().map(|thread| {
+                thread
+                    .user
+                    .upgrade()
+                    .expect("live robust-list target has no user thread")
+            });
+            // Graph → UserProcess 的短临界区阻止 de_thread 同时替换目标身份。
+            let head = target.as_ref().map_or(0, |user| user.robust_list());
+            (target, head)
+        };
+        drop(target);
+        Ok(head)
+    }
+
     /// 按 `Arc<Pid>` 身份对象精确查找对应的存活线程；若该数字已被新线程复用（`Pid` 指针不同）则返回 `None`。
     #[cfg_attr(
         not(feature = "ktest"),

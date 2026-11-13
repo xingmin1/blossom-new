@@ -217,6 +217,8 @@ pub enum MemorySpecial {
     Zero,
     /// `/dev/urandom` 非阻塞随机字节字符设备。
     Urandom,
+    /// `/dev/rtc0` 已完成硬件准备的实时时钟字符设备。
+    Rtc,
     /// `/dev/ttyS0` 串口终端字符设备。
     TtySerial,
     /// `/dev/console` 系统控制台字符设备。
@@ -516,6 +518,7 @@ impl MemoryFs {
                 MemorySpecial::Null
                 | MemorySpecial::Zero
                 | MemorySpecial::Urandom
+                | MemorySpecial::Rtc
                 | MemorySpecial::TtySerial
                 | MemorySpecial::Console
                 | MemorySpecial::ControllingTty

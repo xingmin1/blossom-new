@@ -31,7 +31,7 @@
 //! ## 锁获取顺序（Lock Ordering）与并发契约
 //! - **单执行者独占字段**：`UserThread` 的 `context`（`RefCell`）、`user_timer_interrupts`、`restart`、`saved_mask` 和 `cpid_output` **仅允许其绑定的唯一 `Running` `Task` 访问**（入口通过 `assert_current()` 强制校验）；严禁跨越睡眠或调度点持有 `context` 的 `RefMut` 借用。
 //! - **跨线程共享快照锁**：`UserThread::mm` 与 `UserThread::process` 为极短临界区自旋锁，仅用于克隆或取走 `Arc` / 句柄；严禁在持有这两把锁时执行用户内存拷贝（如 `clear_tid`、`copyout`）、获取 `TaskGraph` 锁、获取文件表睡眠锁或触发最后一次 `Arc` 析构。
-//! - **`execve` 切换契约（`install_image`）**：先在原地址空间执行 `clear_tid`，随后在关中断临界区内原子切换当前 CPU 活动页表、`UserThread::mm`、`UserContext` 与 `UserRuntime`，最后在开中断锁外释放旧地址空间并唤醒阻塞的 `vfork` 父进程。
+//! - **`execve` 切换契约（`install_image`）**：先在原地址空间清理 robust 锁并执行 `clear_tid`，随后在关中断临界区内原子切换当前 CPU 活动页表、`UserThread::mm`、`UserContext` 与 `UserRuntime`，最后在开中断锁外释放旧地址空间并唤醒阻塞的 `vfork` 父进程。
 
 #[cfg(feature = "ktest")]
 use crate::cpu::AtomicCpuSet;
@@ -59,6 +59,7 @@ use crate::net::NetStackRef;
 use crate::sync::{Completion, IrqSaveGuard, SleepMutex, SpinLock};
 use crate::syscall::Restart;
 use crate::task::exec::{ExecError, LoadedImage};
+use crate::task::futex;
 use crate::task::process::{
     PreparedExecution, PreparedIdentity, ProcessError, TaskGraph, ThreadGroup, UserIdentity,
 };
@@ -296,6 +297,8 @@ struct UserProcess {
     child_set_tid: Option<usize>,
     /// `CLONE_CHILD_CLEARTID` 或 `set_tid_address` 注册的用户态地址；线程退出或 `execve` 脱离旧地址空间时向其写 0 并唤醒 1 个 Futex 等待者。
     clear_child_tid: usize,
+    /// 当前线程登记的 robust 链表头用户地址；新线程为空，退出与 exec 在旧 Mm 中处理后取空。
+    robust_list: usize,
     /// `vfork` 创建子进程时绑定的完成同步量；子进程执行 `execve` 或退出释放旧地址空间后触发 `complete()` 唤醒父进程。
     vfork: Option<Arc<Completion>>,
 }
@@ -384,6 +387,7 @@ impl UserThread {
             runtime: RuntimeBinding::new(runtime),
             child_set_tid,
             clear_child_tid,
+            robust_list: 0,
             vfork: None,
         });
     }
@@ -408,6 +412,39 @@ impl UserThread {
             .expect("set_tid_address has no user process");
         process.clear_child_tid = address;
         process.identity.tid()
+    }
+
+    /// 保存当前线程的 robust 链表头原始地址，登记时不读取用户内存。
+    pub(crate) fn set_robust_list(&self, head: usize) {
+        self.assert_current();
+        self.process
+            .lock()
+            .as_mut()
+            .expect("set_robust_list has no user process")
+            .robust_list = head;
+    }
+
+    /// 在已核对任务图身份后读取线程登记；已解除运行资源的退出线程返回空地址。
+    pub(crate) fn robust_list(&self) -> usize {
+        self.process
+            .lock()
+            .as_ref()
+            .map_or(0, |process| process.robust_list)
+    }
+
+    /// 在当前线程脱离旧 Mm 和身份之前取空 robust 登记，并在所有短期锁外清理用户链表。
+    fn release_robust_list(&self) {
+        let (head, tid) = {
+            let mut process = self.process.lock();
+            let process = process.as_mut().expect("robust cleanup has no process");
+            let head = mem::take(&mut process.robust_list);
+            if head == 0 {
+                return;
+            }
+            (head, process.identity.tid())
+        };
+        let mm = self.mm().expect("robust cleanup has no MM");
+        futex::exit_robust_list(&mm, head, tid as u32);
     }
 
     /// 向当前用户线程自身发送由内核事件触发的线程定向信号（如 `SIGPIPE`）。
@@ -476,8 +513,9 @@ impl UserThread {
             .expect("exec has no signals")
             .reset_for_exec(runtime.0.sighand.clone());
 
-        // Step 2: 在脱离旧地址空间之前，向旧 MM 中注册的 clear_child_tid 地址写 0 并执行 futex 唤醒。
+        // Step 2: 在脱离旧地址空间前清理 robust 锁，再处理 clear_child_tid。
         let old_mm = self.mm().expect("exec has no old MM");
+        self.release_robust_list();
         let clear_child_tid = {
             let mut process = self.process.lock();
             let process = process.as_mut().expect("exec has no process");
@@ -599,9 +637,10 @@ impl UserThread {
         self.saved_mask.take().unwrap_or(selected)
     }
 
-    /// 在线程退出路径上解除 CPU 记账关联，移出并释放 `Mm` 与 `UserRuntime`，执行 `clear_child_tid` 唤醒与 `vfork` 完成通知，最后返回 `UserIdentity` 供向 `TaskGraph` 汇报退出。
+    /// 在线程退出时先清理旧 Mm 中的 robust 锁，再解除 CPU 记账、Mm 与运行资源，并完成 TID/vfork 通知。
     pub(crate) fn release_process(&self) -> Arc<UserIdentity> {
         self.assert_current();
+        self.release_robust_list();
         // 特殊输出尚未等到换行时，退出丢弃未发送的暂存内容。
         self.cpid_output.set(None);
         crate::accounting::detach_user();

@@ -24,6 +24,20 @@ struct RawTime {
 _Static_assert(sizeof(struct RawAction) == 24, "raw action size");
 _Static_assert(sizeof(struct RawTime) == 16, "raw timespec size");
 
+/* /// native robust 头按三个 64 位机器字排列，offset 保留有符号位移。 */
+struct RawRobustHead {
+    unsigned long next;
+    long offset;
+    unsigned long pending;
+};
+_Static_assert(sizeof(struct RawRobustHead) == 24, "raw robust head size");
+
+/* /// 共享页中的节点位于同步字之后，以负 offset 检查内核地址计算。 */
+#define ROBUST_HEAD (CONTROL + 128)
+#define ROBUST_NODE (CONTROL + 160)
+#define FUTEX_WAITERS 0x80000000U
+#define FUTEX_OWNER_DIED 0x40000000U
+
 static unsigned char stacks[2][16384] __attribute__((aligned(16)));
 static unsigned char info[128] __attribute__((aligned(8)));
 static struct RawAction action;
@@ -145,6 +159,31 @@ static void reap(unsigned slot, long expected, long check)
         result(24 + 4 * slot, expected, check + 5);
 }
 
+/* /// fork 子进程保有独立 Mm，在真实退出或 exec 脱离旧 Mm 时释放已登记的锁。 */
+static _Noreturn void robust_owner(void)
+{
+    unsigned long head = ~0UL, length = 0;
+    PROBE_CHECK(10, probe_sys3(SYS_get_robust_list, 0, &head, &length) == 0);
+    PROBE_CHECK(11, head == 0 && length == 24);
+    struct RawRobustHead *list = (void *)ROBUST_HEAD;
+    list->next = mode == 'z' ? ROBUST_HEAD : ROBUST_NODE;
+    list->offset = (long)WORD0 - (long)ROBUST_NODE;
+    list->pending = mode == 'z' ? ROBUST_NODE : 0;
+    *(unsigned long *)ROBUST_NODE = ROBUST_HEAD;
+    unsigned owner = (unsigned)probe_sys0(SYS_gettid);
+    PROBE_CHECK(12, owner != 0);
+    store_word(WORD0, mode == 'z' ? 0 : owner | FUTEX_WAITERS);
+    PROBE_CHECK(13, probe_sys2(SYS_set_robust_list, ROBUST_HEAD, 24) == 0);
+    store_word(CONTROL + 8, 1);
+    go(1);
+    if (mode == 'e') {
+        const char *argv[] = { "/test/bin/user-futex", "R", 0 };
+        probe_sys3(SYS_execve, argv[0], argv, 0);
+        probe_failure(14);
+    }
+    probe_exit(0);
+}
+
 /* /// 每个子回调在共享 clone 桥捕获的新栈上运行，父方只在真实 reap 后复用栈。 */
 static _Noreturn void child_entry(void *argument, unsigned long entry_sp,
                                   unsigned long entry_tp)
@@ -155,6 +194,10 @@ static _Noreturn void child_entry(void *argument, unsigned long entry_sp,
     (void)entry_sp;
     (void)entry_tp;
     switch (mode) {
+    case 'o':
+    case 'e':
+    case 'z':
+        robust_owner();
     case 'w':
         value = futex(0x46000000, 128, 7, 0, 0, 0);
         store_word(CONTROL + 24, value);
@@ -267,6 +310,43 @@ static void spawn(unsigned long flags, unsigned slot, unsigned role,
     publish_tid(slot, tid);
 }
 
+/* /// 注册、查询、注销和部分 copyout 均经过 native 系统调用，不依赖 libc 缓存。 */
+static void robust_registration(void)
+{
+    unsigned long head = ~0UL, length = 0;
+    PROBE_CHECK(100, probe_sys3(SYS_get_robust_list, 0, &head, &length) == 0);
+    PROBE_CHECK(101, head == 0 && length == 24);
+    CHECK(28, 36, probe_sys2(SYS_set_robust_list, ROBUST_HEAD, 24) == 0);
+    PROBE_CHECK(102, probe_sys2(SYS_set_robust_list, 0, 23) == -EINVAL);
+    long tid = probe_sys0(SYS_gettid);
+    PROBE_CHECK(103, probe_sys3(SYS_get_robust_list, tid, &head, &length) == 0);
+    PROBE_CHECK(104, head == ROBUST_HEAD && length == 24);
+    PROBE_CHECK(105, probe_sys2(SYS_set_robust_list, ~0UL, 24) == 0);
+    PROBE_CHECK(106, probe_sys3(SYS_get_robust_list, 0, &head, &length) == 0);
+    PROBE_CHECK(107, head == ~0UL);
+    PROBE_CHECK(108, probe_sys2(SYS_set_robust_list, ROBUST_HEAD, 24) == 0);
+    head = 123;
+    PROBE_CHECK(109, probe_sys3(SYS_get_robust_list, 0, &head, 0) == -EFAULT);
+    PROBE_CHECK(110, head == 123);
+    length = 0;
+    PROBE_CHECK(111, probe_sys3(SYS_get_robust_list, 0, 0, &length) == -EFAULT);
+    PROBE_CHECK(112, length == 24);
+    PROBE_CHECK(113, probe_sys3(SYS_get_robust_list, -1, 0, 0) == -ESRCH);
+    PROBE_CHECK(114, probe_sys3(SYS_get_robust_list, 0x7fffffff, 0, 0) == -ESRCH);
+    store_word(CONTROL + 4092, 0);
+    PROBE_CHECK(115, probe_sys3(SYS_get_robust_list, 0, CONTROL + 4092, &length) == -EFAULT);
+    PROBE_CHECK(116, load_word(CONTROL + 4092) == (unsigned)ROBUST_HEAD);
+    head = 123;
+    store_word(CONTROL + 4092, 0);
+    PROBE_CHECK(117, probe_sys3(SYS_get_robust_list, 0, &head, CONTROL + 4092) == -EFAULT);
+    PROBE_CHECK(118, head == 123 && load_word(CONTROL + 4092) == 24);
+    PROBE_CHECK(119, probe_sys3(SYS_get_robust_list, 0, &head, &head) == 0);
+    PROBE_CHECK(120, head == ROBUST_HEAD);
+    PROBE_CHECK(121, probe_sys2(SYS_set_robust_list, 0, 24) == 0);
+    PROBE_CHECK(122, probe_sys3(SYS_get_robust_list, 0, &head, &length) == 0);
+    PROBE_CHECK(123, head == 0 && length == 24);
+}
+
 /* /// 比较失败、原始错误优先级及私有 WAKE 都实际经过 futex 系统调用。 */
 static void wait_wake(void)
 {
@@ -276,7 +356,7 @@ static void wait_wake(void)
     CHECK(13, 23, futex(WORD0, 137, 7, 0, 0, 0) == -22);
     CHECK(26, 34, futex(WORD0, 134, 0, 0, 0, 0) == -38);
     CHECK(27, 35, futex(WORD0, 133, 1, 0, 0, 0) == -38);
-    CHECK(28, 36, probe_sys2(SYS_set_robust_list, CONTROL, 24) == -38);
+    robust_registration();
     CHECK(29, 37, futex(WORD0, 129, -1, 0, 0, 0) == 0);
     map_page(0x46000000, 0x32, ISA_CHECK(30, 38));
     store_word(0x46000000, 7);
@@ -464,6 +544,34 @@ static void stopped_deadline(void)
     }
 }
 
+/* /// 父在独立 Mm 的共享键上等待，夹具确认真实 Blocked 后才允许 owner 退出。 */
+static void robust_wait(void)
+{
+    PROBE_CHECK(20, probe_sys2(SYS_set_robust_list, ~0UL, 24) == 0);
+    spawn(17, 0, 0, 0, 21);
+    while (load_word(CONTROL + 8) < 1)
+        ;
+    unsigned long head = 0, length = 0;
+    PROBE_CHECK(22, probe_sys3(SYS_get_robust_list, child_tid(0), &head, &length) == 0);
+    PROBE_CHECK(23, head == ROBUST_HEAD && length == 24);
+    PROBE_CHECK(24, probe_sys3(SYS_get_robust_list, 0, &head, &length) == 0);
+    PROBE_CHECK(25, head == ~0UL);
+    PROBE_CHECK(26, probe_sys2(SYS_set_robust_list, 0, 24) == 0);
+    unsigned expected = mode == 'z' ? 0 : (unsigned)child_tid(0) | FUTEX_WAITERS;
+    PROBE_CHECK(27, load_word(WORD0) == expected);
+    long value = futex(WORD0, 0, expected, 0, 0, 0);
+    store_word(CONTROL + 24, value);
+    PROBE_CHECK(28, value == 0);
+    PROBE_CHECK(29, load_word(WORD0) ==
+                    (mode == 'z' ? 0 : FUTEX_WAITERS | FUTEX_OWNER_DIED));
+    PROBE_CHECK(30, probe_sys5(SYS_waitid, 1, child_tid(0), info, 4 | 0x01000000, 0) == 0);
+    head = ~0UL;
+    PROBE_CHECK(31, probe_sys3(SYS_get_robust_list, child_tid(0), &head, &length) == 0);
+    PROBE_CHECK(32, head == 0 && length == 24);
+    reap(0, 0, 40);
+    PROBE_CHECK(46, probe_sys3(SYS_get_robust_list, child_tid(0), 0, 0) == -ESRCH);
+}
+
 /* /// 原始初始栈只读解析；无 CRT、fd/TLS 或 BSS 初始化改变被测前提。 */
 _Noreturn void probe_main(const unsigned long *initial_stack)
 {
@@ -473,6 +581,12 @@ _Noreturn void probe_main(const unsigned long *initial_stack)
     CHECK(1, 3, RV ? argument != 0 : 0 < (long)argument);
     CHECK(1, 4, argument[1] == 0);
     mode = argument[0];
+    if (mode == 'R') {
+        unsigned long head = ~0UL, length = 0;
+        PROBE_CHECK(60, probe_sys3(SYS_get_robust_list, 0, &head, &length) == 0);
+        PROBE_CHECK(61, head == 0 && length == 24);
+        probe_exit(0);
+    }
     map_page(CONTROL, 0x31, ISA_CHECK(2, 5));
     for (unsigned offset = 0; offset < 4096; offset += 4)
         store_word(CONTROL + offset, 0);
@@ -491,6 +605,9 @@ _Noreturn void probe_main(const unsigned long *initial_stack)
     case 't': clear_tid(); break;
     case 's': restart(); break;
     case 'd': stopped_deadline(); break;
+    case 'o':
+    case 'e':
+    case 'z': robust_wait(); break;
     default: probe_failure(ISA_CHECK(3, 6));
     }
     probe_exit(0);

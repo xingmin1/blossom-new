@@ -4,7 +4,7 @@
 //! 本模块位于文件系统与用户态运行时集成测试层（`fs::ktest::user`），
 //! 负责加载并运行用户态测试程序 `/test/bin/user-futex`，通过内核测试协调器（`UserOwner`）
 //! 与用户态进程协同，验证 `futex` 系统调用在各种并发与生命周期场景下的内核语义。
-//! 上游由用户态测试入口（`fs::ktest::user`）按子模式（`w`/`p`/`n`/`a`/`t`/`s`/`d`/`r`）调度，
+//! 上游由用户态测试入口（`fs::ktest::user`）按等待、重排、退出与 robust 子模式调度，
 //! 下游依赖虚拟内存空间（`Mm`）、任务与进程图（`TaskGraph` / `UserThread`）、
 //! 调度器状态观测（`sched::state`）以及 `futex` 哈希桶快照接口（`futex::test_snapshot`）。
 //!
@@ -103,7 +103,7 @@ impl UserOwner {
     ///
     /// - **测试目标**：验证私有/共享 `futex` 唤醒、跨进程键隔离、共享匿名映射别名（Alias）、
     ///   线程退出 `clear_child_tid`、信号中断自动重启（`ERESTARTSYS`）、`SIGSTOP`/`SIGCONT` 期间超时参数页卸载，
-    ///   以及 `FUTEX_CMP_REQUEUE` / `FUTEX_WAIT_BITSET` 在重排队与取消时的 `WaitId` 和 `deadline` 保持语义。
+    ///   robust owner 退出/exec 的跨 Mm 共享唤醒，以及重排/取消时的 `WaitId` 和 `deadline` 保持语义。
     /// - **场景步骤（Given-When-Then）**：
     ///   1. 加载并启动 `/test/bin/user-futex`，等待根线程发布阶段 1 检查点并解析受测子线程；
     ///   2. 根据 `mode[0]` 分支观测子线程阻塞状态、注入跨地址空间映射或内核信号、核对哈希桶快照与等待者元数据；
@@ -134,9 +134,12 @@ impl UserOwner {
         } else {
             FUTEX_CONTROL + 64
         };
-        if mode[0] == b't' {
-            Self::futex_waiting(&mm, &root, address, false, u32::MAX)?;
-        }
+        // robust 阶段由子进程发布；根进程入队前已发布 clone 返回的子 TID。
+        let root_waiting = if matches!(mode[0], b't' | b'o' | b'e' | b'z') {
+            Some(Self::futex_waiting(&mm, &root, address, false, u32::MAX)?)
+        } else {
+            None
+        };
         let child = self.futex_child(&mm, 0)?;
         let child_mm = child.mm().ok_or(TestError("futex child MM disappeared"))?;
 
@@ -197,6 +200,26 @@ impl UserOwner {
                 context.expect_eq(mm.user_count(), 2);
                 mm.store_user_u32(FUTEX_CONTROL + 12, 1)
                     .map_err(|_| TestError("futex child exit release failed"))?;
+            }
+            b'o' | b'e' | b'z' => {
+                // owner 没有其他 Mm 用户；其退出清理仍须唤醒另一 Mm 中的共享等待者。
+                context.expect_eq(Arc::ptr_eq(&mm, &child_mm), false);
+                context.expect_eq(mm.user_count(), 1);
+                context.expect_eq(child_mm.user_count(), 1);
+                let waiting = root_waiting.expect("robust root waiter was not observed");
+                let shared = futex::test_snapshot(&child_mm, address, false, u32::MAX)
+                    .map_err(|_| TestError("robust owner shared key lookup failed"))?;
+                context.expect_eq(shared.count, 1);
+                context.expect_eq(shared.first_wait_id, waiting.first_wait_id);
+                let private = futex::test_snapshot(&child_mm, address, true, u32::MAX)
+                    .map_err(|_| TestError("robust owner private key lookup failed"))?;
+                context.expect_eq(private.count, 0);
+                context.diagnostic(format_args!(
+                    "user-futex-robust mode={:?} separate-mm=1 owner-mm-users=1 shared-wait-id={:?}",
+                    mode, waiting.first_wait_id
+                ));
+                mm.store_user_u32(FUTEX_CONTROL + 12, 1)
+                    .map_err(|_| TestError("robust owner exit gate is not writable"))?;
             }
             b's' => {
                 // 模式 's'：验证无超时的 futex_wait 被安装有 SA_RESTART 的 SIGUSR1 中断后，
@@ -378,6 +401,9 @@ impl UserOwner {
         self.reap_children(context, cancelling)?;
 
         context.expect_eq(mm.user_count(), 0);
+        if matches!(mode[0], b'o' | b'e' | b'z') {
+            context.expect_eq(child_mm.user_count(), 0);
+        }
         context.diagnostic(format_args!(
             "user-futex-result mode={:?} status={} joined=1 mm-users={}",
             mode,

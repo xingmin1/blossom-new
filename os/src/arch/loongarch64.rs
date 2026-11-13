@@ -142,7 +142,7 @@ mod uaccess;
 mod user;
 use crate::arch::loongarch64::trap::{la_kernel_refill, la_kernel_trap};
 pub use counter::{apply_counter_epoch, establish_counter_epoch};
-pub use rtc::board_rtc_calendar;
+pub use rtc::{board_rtc_calendar, board_rtc_ready, read_rtc_calendar};
 use switch::la_switch_context;
 #[cfg(feature = "ktest")]
 use {register_test::la_test_register_preservation, switch::la_test_task_context_preservation};
@@ -154,7 +154,7 @@ pub use mmu::{
     SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS, USER_STACK_TOP,
 };
 pub(crate) use signal::SIGNAL_MIN_STACK;
-pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
+pub use uaccess::{compare_exchange_user_u32, copy_user_bytes, load_user_u32, store_user_u32};
 pub use user::{run_user, signal_return_code, UserContext};
 
 #[cfg(feature = "ktest")]

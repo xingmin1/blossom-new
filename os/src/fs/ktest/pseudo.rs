@@ -339,6 +339,49 @@ pub(crate) mod filesystems {
         Ok(())
     }
 
+    /// 测试目标：验证 RTC 打开实例分配失败时归还独占占用。
+    /// 场景步骤：挂载真实 devfs 并预备 RTC 路径，耗尽现有堆后打开，再释放压力并重新打开。
+    /// 预期结果：真实分配失败返回 NoMemory，恢复后可打开同一个 RTC 字符节点。
+    #[test]
+    #[ktest(tags("fs-rtc", "fs-oom"))]
+    fn rtc_open_allocation_failure_releases_exclusive_device(
+        context: &mut TestContext<'_>,
+        fixture: &mut PathOwner,
+    ) -> TestResult {
+        fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
+        let covered = resolve(context, fixture, b"/plain")?;
+        let device = checked(context, devfs::try_new(0o755))?;
+        checked(
+            context,
+            fixture
+                .vfs()
+                .mount(&covered, Filesystem::Memory(device), AccessMode::ReadOnly),
+        )?;
+        let path = resolve(context, fixture, b"/plain/rtc0")?;
+        let opened = checked(
+            context,
+            open_path_with_flags(fixture.vfs(), path.clone(), 0, FileIoContext::Kernel),
+        )?;
+        context.expect_eq(checked(context, opened.stat())?.kind, InodeKind::Character);
+        drop(opened);
+
+        let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
+        let probes = pressure.exhaust();
+        let result = open_path_with_flags(fixture.vfs(), path.clone(), 0, FileIoContext::Kernel);
+        drop(pressure);
+        context.expect_eq(probes, (true, true));
+        context.expect_eq(result.err(), Some(FsError::NoMemory));
+        let reopened = checked(
+            context,
+            open_path_with_flags(fixture.vfs(), path, 0, FileIoContext::Kernel),
+        )?;
+        context.expect_eq(
+            checked(context, reopened.stat())?.kind,
+            InodeKind::Character,
+        );
+        Ok(())
+    }
+
     /// 验证只读 `devfs` 中的 `shm` 目录可由独立 `tmpfs` 覆盖，文件与页由子实例拥有。
     /// 子挂载保留父路径，打开文件保留其挂载和 inode，任一拥有尚存时都不得提前卸载。
     /// 释放零链接文件后检查页与 inode 归还，再依次卸载 `shm`、`devfs` 和外层 `tmpfs`。
