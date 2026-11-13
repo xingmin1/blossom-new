@@ -1,15 +1,19 @@
-"""根文件系统目录树装配与 ext4 磁盘镜像制作的宿主端单元测试模块。
+"""根文件系统目录树装配、运行库准备边界与 ext4 磁盘镜像制作的宿主端单元测试模块。
 
-本模块验证从用户态构建产物装配根文件系统目录树（`assemble_rootfs`）以及调用 `e2fsprogs`
-生成 ext4 磁盘镜像（`create_ext4_image` 和 `ext4_fixtures`）的完整流程与异常回滚边界：
-1. 用户态可执行文件、musl/glibc 运行库、系统启动脚本（`inittab`、`start-session`）与评测配置的完整拷贝；
+本模块验证从用户态构建产物装配根文件系统目录树（`assemble_rootfs`）、运行库准备脚本对来源的校验，
+以及调用 `e2fsprogs` 生成 ext4 磁盘镜像（`create_ext4_image` 和 `ext4_fixtures`）的完整流程与异常回滚边界：
+1. 用户态可执行文件、运行库准备输出（libgcc、测试根身份记录、C.utf8，可经符号链接到达并被解引用）、系统启动脚本（`inittab`、`start-session`）
+   与评测配置的完整拷贝，目标处预置的外部目录链接被安全替换，且复用的旧运行库目录中的 musl/glibc 全库不会进入系统根；
 2. 重复装配时对已删文件的清理与自定义 `init` 配置覆盖的重置；
-3. 缺失输入、输出路径与输入树重叠、软硬链接别名等非法场景下的原子性保护（不损坏源目录与已发布产物）；
-4. 使用 `e2fsprogs` 制作多种规格（profile 与容量）的 ext4 镜像及可写测试夹具镜像时的内容一致性与失败隔离。
+3. 缺失输入、身份记录格式不符、输出路径与输入树重叠、软硬链接别名等非法场景下的原子性保护（不损坏源目录与已发布产物）；
+4. 内置 locale 的固定清单对内容变异与跨架构来源的拒绝，libgcc 来源身份未知或不可得时运行库准备对已发布输出的保护，以及 locale 更新失败时的恢复语义；
+5. 使用 `e2fsprogs` 制作多种规格（profile 与容量）的 ext4 镜像及可写测试夹具镜像时的内容一致性与失败隔离。
 """
 
+from contextlib import redirect_stderr
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
@@ -63,11 +67,85 @@ def tree_contents(directory):
     return result
 
 
+# 各架构测试根的动态加载器与旧版准备脚本留下的 musl 加载器文件名，以及 C.utf8 在运行库准备输出中的位置，
+# 与 `userland/runtime/sources.md` 记录的布局一致。
+RUNTIME_FIXTURES = {
+    "riscv64": {
+        "loader": "ld-linux-riscv64-lp64d.so.1",
+        "locale": "glibc/usr/lib/locale/C.utf8",
+        "musl_loader": "ld-musl-riscv64-sf.so.1",
+    },
+    "loongarch64": {
+        "loader": "ld-linux-loongarch-lp64d.so.1",
+        "locale": "glibc/usr/lib64/locale/C.utf8",
+        "musl_loader": "ld-musl-loongarch-lp64d.so.1",
+    },
+}
+ARCHITECTURES = tuple(RUNTIME_FIXTURES)
+
+
+def content_map(directory):
+    """采集目录树中每个条目的相对路径与内容摘要，忽略权限位与修改时间。
+
+    普通文件取内容 SHA-256，符号链接取链接目标，目录取 `None`；用于比较复制得到的目录树
+    是否与输入逐项相同，元数据由 `tree_contents` 单独负责。
+    """
+    return {name: entry[2] for name, entry in tree_contents(directory).items()}
+
+
+def builtin_locale(architecture):
+    """返回仓内指定架构的内置 C.utf8 目录。"""
+    return TOOLS.parent / "userland/runtime/locale" / architecture / "C.utf8"
+
+
+def write_runtime_assets(runtime, architecture):
+    """按运行库准备脚本的输出布局写入 libgcc、测试根身份记录与内置 C.utf8，作为装配与准备测试的输入。
+
+    身份记录是共享合同规定的单行 ASCII 文本，依次为 libc SHA-256、加载器 SHA-256 与加载器文件名，
+    以空格分隔并以换行结束；两个摘要由架构名派生，装配只核对记录格式。libgcc 的字节只需与其他资产区分。
+    """
+    fixture = RUNTIME_FIXTURES[architecture]
+    libgcc = runtime / "glibc/lib/libgcc_s.so.1"
+    libgcc.parent.mkdir(parents=True, exist_ok=True)
+    libgcc.write_bytes(b"libgcc fixture for " + architecture.encode())
+    libc_sha256 = hashlib.sha256(b"test-root libc " + architecture.encode()).hexdigest()
+    loader_sha256 = hashlib.sha256(b"test-root loader " + architecture.encode()).hexdigest()
+    identity = f"{libc_sha256} {loader_sha256} {fixture['loader']}\n"
+    (runtime / "glibc/identity").write_bytes(identity.encode("ascii"))
+    shutil.copytree(builtin_locale(architecture), runtime / fixture["locale"])
+
+
+def write_stale_runtime(runtime, architecture):
+    """在运行库目录中补写旧版准备脚本输出的 musl 与 glibc 全库，以及一个与迁移无关的用户文件。
+
+    模拟复用旧的 `build/runtime-*` 目录：这些旧库不得进入系统根，用户文件也不属于运行库输入。
+    """
+    fixture = RUNTIME_FIXTURES[architecture]
+    for relative in ("musl/lib/libc.so", "glibc/lib/libc.so.6", "glibc/lib/libm.so.6",
+                     f"glibc/lib/{fixture['loader']}"):
+        path = runtime / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale runtime: " + relative.encode())
+    (runtime / "musl/lib" / fixture["musl_loader"]).symlink_to("libc.so")
+    if architecture == "loongarch64":
+        (runtime / "musl/lib64").symlink_to("lib")
+        (runtime / "glibc/lib64").symlink_to("lib")
+    (runtime / "glibc/user-notes.txt").write_bytes(b"unrelated user data")
+
+
+def corrupt_locale(locale):
+    """翻转 C.utf8 中 LC_CTYPE 索引区的一个比特，使数据与固定清单不符。"""
+    category = locale / "LC_CTYPE"
+    data = bytearray(category.read_bytes())
+    data[32] ^= 1
+    category.write_bytes(data)
+
+
 class RootfsAssemblyTests(unittest.TestCase):
     """验证 `assemble_rootfs_tree` 从用户态安装树、运行库与系统配置装配根文件系统目录树的行为与异常隔离。"""
 
     def setUp(self):
-        """在临时目录中构造模拟的用户态安装树、musl/glibc 运行库及仓库系统配置目录。"""
+        """在临时目录中构造模拟的用户态安装树、运行库准备输出（libgcc、身份记录、C.utf8）及仓库系统配置目录。"""
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name)
@@ -84,12 +162,7 @@ class RootfsAssemblyTests(unittest.TestCase):
             path.chmod(0o755 if "share" not in name else 0o640)
         (self.userland / "bin/sh").symlink_to("busybox")
         (self.userland / "sbin/init").symlink_to("../bin/busybox")
-        for family, names in (("musl", ("libc.so",)), ("glibc", ("libc.so.6", "libm.so.6"))):
-            for name in names:
-                path = self.runtime / family / "lib" / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(f"{family}:{name}".encode())
-        (self.runtime / "musl/lib/loader.so").symlink_to("libc.so")
+        write_runtime_assets(self.runtime, "riscv64")
         self.root_patch = patch.object(assemble_rootfs, "REPOSITORY_ROOT", self.project)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
@@ -99,8 +172,8 @@ class RootfsAssemblyTests(unittest.TestCase):
         return assemble_rootfs_tree(architecture, self.userland, self.runtime,
                                     self.output, init_config)
 
-    def test_installed_tree_libraries_system_assets_and_full_configuration_are_copied(self):
-        """验证用户态程序、符号链接、musl/glibc 运行库、系统启动配置及权限位均完整拷贝到目标根目录，且源目录不被修改。"""
+    def test_installed_tree_runtime_assets_system_assets_and_full_configuration_are_copied(self):
+        """验证用户态程序、符号链接、运行库准备输出、系统启动配置及权限位均完整拷贝到目标根目录，且源目录不被修改。"""
         # 记录装配前所有输入目录树的快照，以便验证装配过程只读不改源
         inputs = tuple(tree_contents(path) for path in (self.userland, self.runtime, self.project))
         self.assemble()
@@ -109,8 +182,8 @@ class RootfsAssemblyTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.output / "usr/share/installed-data").stat().st_mode), 0o640)
         self.assertEqual(os.readlink(self.output / "bin/sh"), "busybox")
         self.assertEqual(os.readlink(self.output / "sbin/init"), "../bin/busybox")
-        self.assertEqual(os.readlink(self.output / "opt/runtime/musl/lib/loader.so"), "libc.so")
-        self.assertEqual((self.output / "opt/runtime/glibc/lib/libm.so.6").read_bytes(), b"glibc:libm.so.6")
+        # 系统根的运行库目录与准备输出逐项相同：libgcc、身份记录与 C.utf8
+        self.assertEqual(content_map(self.output / "opt/runtime"), content_map(self.runtime))
         for relative in ("etc/inittab", "sbin/start-session"):
             source = self.project / "userland/system" / relative
             destination = self.output / relative
@@ -123,7 +196,7 @@ class RootfsAssemblyTests(unittest.TestCase):
         self.assertEqual(inputs, tuple(tree_contents(path) for path in (self.userland, self.runtime, self.project)))
 
     def test_reassembly_reflects_deletions_and_resets_explicit_init_override(self):
-        """验证重新装配时会清理已删除的源文件与残留文件，并在未指定自定义 `init_config` 时恢复默认 `inittab`。"""
+        """验证重新装配时会清理已删除的源文件与残留文件，换用其他架构的运行库时不残留上一轮的 locale，并在未指定自定义 `init_config` 时恢复默认 `inittab`。"""
         # 首次装配：带入一个待删配置并使用自定义 inittab 覆盖默认配置
         removed = self.project / "userland/contest/deleted.toml"
         removed.write_text("old = true\n", encoding="utf-8")
@@ -131,11 +204,13 @@ class RootfsAssemblyTests(unittest.TestCase):
         custom.write_text("::once:/bin/sh\n", encoding="utf-8")
         self.assemble(init_config=custom)
         self.assertEqual((self.output / "etc/inittab").read_bytes(), custom.read_bytes())
-        # 删除旧文件、新增安装文件并在输出目录植入多余文件后重新执行默认装配
+        # 删除旧文件、新增安装文件、换用另一架构的运行库并在输出目录植入多余文件后重新执行默认装配
         removed.unlink()
         (self.userland / "usr/share/installed-data").unlink()
         (self.userland / "usr/share/new-data").write_bytes(b"new installation")
         (self.output / "stale-output-only").touch()
+        shutil.rmtree(self.runtime)
+        write_runtime_assets(self.runtime, "loongarch64")
         self.assemble("loongarch64")
         self.assertFalse((self.output / "etc/contest/deleted.toml").exists())
         self.assertFalse((self.output / "usr/share/installed-data").exists())
@@ -144,27 +219,103 @@ class RootfsAssemblyTests(unittest.TestCase):
         self.assertEqual((self.output / "etc/inittab").read_bytes(),
                          (self.project / "userland/system/etc/inittab").read_bytes())
         self.assertEqual(custom.read_text(encoding="utf-8"), "::once:/bin/sh\n")
+        # 换架构后输出中只保留新架构的运行库
+        self.assertEqual(content_map(self.output / "opt/runtime"), content_map(self.runtime))
 
     def test_missing_input_and_overlapping_output_leave_published_tree_unchanged(self):
         """验证缺少必需源文件、复制中途失败或输出目录与输入目录重叠时，已发布的根目录树和源文件保持原状。"""
         # 先完成一次正常发布并保存输出目录快照
         self.assemble()
         previous = tree_contents(self.output)
-        # 缺失运行库文件或系统目录时应抛出异常，且已发布的输出目录不被破坏
-        (self.runtime / "musl/lib/libc.so").unlink()
-        with self.assertRaises(ValueError):
-            self.assemble()
-        self.assertEqual(tree_contents(self.output), previous)
-        (self.runtime / "musl/lib/libc.so").write_bytes(b"restored source")
+        # 缺失运行库准备输出中的任一资产（libgcc、身份记录、C.utf8）都应抛出异常，且已发布的输出目录不被破坏
+        for relative in ("glibc/lib/libgcc_s.so.1", "glibc/identity", RUNTIME_FIXTURES["riscv64"]["locale"]):
+            asset = self.runtime / relative
+            hidden = asset.with_name(asset.name + ".hidden")
+            asset.rename(hidden)
+            with self.subTest(missing=relative), self.assertRaises(ValueError):
+                self.assemble()
+            hidden.rename(asset)
+            self.assertEqual(tree_contents(self.output), previous)
+        # 缺失系统配置目录属于复制阶段失败，同样不能破坏已发布的输出目录
         (self.project / "userland/system/sbin").rename(self.project / "userland/system/missing-sbin")
         with self.assertRaises(OSError):
             self.assemble()
         self.assertEqual(tree_contents(self.output), previous)
-        # 输出路径指向输入目录本身、其子目录或包含输入目录的父目录时，应直接拒绝
+        # 输出路径指向输入目录本身、其子目录或包含输入目录的父目录时，应直接拒绝，且不改写任何输入
+        inputs = tuple(tree_contents(path) for path in (self.userland, self.runtime))
         for output in (self.userland, self.userland / "nested", self.base):
             with self.subTest(output=output), self.assertRaises(ValueError):
                 assemble_rootfs_tree("riscv64", self.userland, self.runtime, output)
-        self.assertEqual((self.runtime / "musl/lib/libc.so").read_bytes(), b"restored source")
+        self.assertEqual(tuple(tree_contents(path) for path in (self.userland, self.runtime)), inputs)
+
+    def test_stale_runtime_fixtures_are_not_carried_into_system_root(self):
+        """验证复用旧运行库目录时，旧 musl 与 glibc 全库、加载器链接及无关文件不会进入系统根，输入保持不变。"""
+        for architecture in ARCHITECTURES:
+            with self.subTest(architecture=architecture):
+                fixture = RUNTIME_FIXTURES[architecture]
+                runtime = self.base / f"reused runtime {architecture}"
+                write_runtime_assets(runtime, architecture)
+                required = content_map(runtime)
+                write_stale_runtime(runtime, architecture)
+                inputs = tree_contents(runtime)
+                assemble_rootfs_tree(architecture, self.userland, runtime, self.output)
+                # 系统根的 /opt/runtime 只含准备输出的三类资产，整个根里也找不到旧库与用户文件的名称
+                self.assertEqual(content_map(self.output / "opt/runtime"), required)
+                carried = {Path(name).name for name in tree_contents(self.output)}
+                stale_names = {"libc.so", "libc.so.6", "libm.so.6", "user-notes.txt",
+                               fixture["loader"], fixture["musl_loader"]}
+                self.assertEqual(carried & stale_names, set())
+                self.assertEqual(tree_contents(runtime), inputs)
+
+    def test_linked_runtime_sources_are_dereferenced_and_target_links_are_replaced(self):
+        """验证 libgcc 经目录链接、identity 与 locale 的一个类别经文件链接到达时，系统根得到解引用后的普通文件与目录；安装树里预置的外部目录链接被替换而不被写入，外部目录与输入保持不变。"""
+        required = content_map(self.runtime)
+        # 源侧：libgcc 所在的 lib 经目录链接，identity 与 C.utf8 的 LC_NAME 类别经文件链接到达真实数据
+        real = self.base / "real runtime data"
+        real.mkdir()
+        glibc = self.runtime / "glibc"
+        category = self.runtime / RUNTIME_FIXTURES["riscv64"]["locale"] / "LC_NAME"
+        (glibc / "lib").rename(real / "lib")
+        (glibc / "lib").symlink_to(real / "lib", target_is_directory=True)
+        (glibc / "identity").rename(real / "identity")
+        (glibc / "identity").symlink_to(real / "identity")
+        category.rename(real / "LC_NAME")
+        category.symlink_to(real / "LC_NAME")
+        # 目标侧：安装树里的 /opt/runtime/glibc/lib 预置为指向外部目录的链接，外部目录放一个哨兵
+        external = self.base / "external lib"
+        external.mkdir()
+        (external / "sentinel").write_bytes(b"external sentinel")
+        (self.userland / "opt/runtime/glibc").mkdir(parents=True)
+        (self.userland / "opt/runtime/glibc/lib").symlink_to(external, target_is_directory=True)
+        inputs = tuple(tree_contents(path) for path in (self.userland, self.runtime, real, external))
+        self.assemble()
+        # 系统根的运行库目录逐项等于链接前的真实数据：全是普通文件与目录，没有链接，也没有外部目录的内容
+        self.assertEqual(content_map(self.output / "opt/runtime"), required)
+        self.assertEqual((external / "sentinel").read_bytes(), b"external sentinel")
+        self.assertEqual(tuple(tree_contents(path) for path in (self.userland, self.runtime, real, external)),
+                         inputs)
+
+    def test_malformed_runtime_identity_is_rejected_and_keeps_published_tree(self):
+        """验证身份记录不是单行 `<libc SHA-256> <加载器 SHA-256> <加载器文件名>` 时，装配报错且已发布的根目录树保持原状。"""
+        self.assemble()
+        previous = tree_contents(self.output)
+        identity = self.runtime / "glibc/identity"
+        valid = identity.read_text(encoding="ascii")
+        libc, _, loader = valid.split()
+        malformed = {
+            "key-value fields": valid.replace(libc, f"libc={libc}"),
+            "missing newline": valid[:-1],
+            "two lines": valid + valid,
+            "uppercase digest": valid.replace(libc, libc.upper()),
+            "short digest": valid.replace(libc, libc[:-1]),
+            "path as loader": valid.replace(loader, f"lib/{loader}"),
+        }
+        for label, text in malformed.items():
+            with self.subTest(identity=label):
+                identity.write_text(text, encoding="ascii")
+                with self.assertRaises(ValueError):
+                    self.assemble()
+                self.assertEqual(tree_contents(self.output), previous)
 
     def test_existing_output_link_does_not_replace_its_source_directory(self):
         """验证当输出路径本身是指向外部目录的符号链接时，装配操作报错拒绝且不修改外部目录内容。"""
@@ -197,31 +348,43 @@ class RootfsAssemblyTests(unittest.TestCase):
 
 
 class RuntimeLocalePublicationTests(unittest.TestCase):
-    """检查内置 locale 身份、更新失败恢复和只读目录清理。"""
+    """检查内置 locale 的固定清单、更新失败恢复和只读目录清理。"""
 
-    def test_builtin_locale_rejects_corruption_and_unknown_libc(self):
-        """内置 locale 数据损坏或 libc 身份不匹配时不得继续使用。"""
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            libc = base / "libc.so.6"
-            libc.write_bytes(b"matching libc")
-            locale = base / "locale/riscv64/C.utf8"
-            shutil.copytree(TOOLS.parent / "userland/runtime/locale/riscv64/C.utf8", locale)
-            libc_hash = hashlib.sha256(libc.read_bytes()).hexdigest()
-            _, locale_hash = runtime_libraries.BUILTIN_LOCALE_HASHES["riscv64"]
-            with patch.object(runtime_libraries, "__file__", str(base / "prepare.py")), \
-                    patch.dict(runtime_libraries.BUILTIN_LOCALE_HASHES,
-                               {"riscv64": (libc_hash, locale_hash)}):
-                self.assertEqual(runtime_libraries.builtin_locale_directory("riscv64", libc), locale)
-                category = locale / "LC_CTYPE"
-                data = bytearray(category.read_bytes())
-                data[32] ^= 1
-                category.write_bytes(data)
-                with self.assertRaisesRegex(ValueError, "manifest SHA-256 mismatch"):
-                    runtime_libraries.builtin_locale_directory("riscv64", libc)
-                libc.write_bytes(b"different libc")
-                with self.assertRaisesRegex(ValueError, "matching official libc"):
-                    runtime_libraries.builtin_locale_directory("riscv64", libc)
+    def test_relocated_locale_must_match_manifest_exactly(self):
+        """原样复制到其他路径的 C.utf8 可作为来源，翻转字节、缺少类别文件或多出文件的副本都被拒绝。"""
+        def remove_category(locale):
+            """删除 LC_NAME 类别文件。"""
+            (locale / "LC_NAME").unlink()
+
+        def add_file(locale):
+            """加入固定清单之外的文件。"""
+            (locale / "LC_EXTRA").write_bytes(b"outside the manifest")
+
+        for architecture in runtime_libraries.RUNTIME_PROFILES:
+            with tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                source = builtin_locale(architecture)
+                relocated = base / "relocated/C.utf8"
+                shutil.copytree(source, relocated)
+                # 原样复制的副本必须被接受，下面的拒绝用例才能与“一律拒绝”区分开
+                with self.subTest(architecture=architecture, change="exact copy"):
+                    runtime_libraries.builtin_locale_directory(architecture, locale_directory=relocated)
+                for mutate in (corrupt_locale, remove_category, add_file):
+                    with self.subTest(architecture=architecture, change=mutate.__name__):
+                        altered = base / mutate.__name__ / "C.utf8"
+                        shutil.copytree(source, altered)
+                        mutate(altered)
+                        with self.assertRaises(ValueError):
+                            runtime_libraries.builtin_locale_directory(
+                                architecture, locale_directory=altered)
+
+    def test_locale_manifest_is_pinned_to_its_architecture(self):
+        """一个架构的内置 C.utf8 不能当作另一架构的来源。"""
+        for architecture, other in (("riscv64", "loongarch64"), ("loongarch64", "riscv64")):
+            with self.subTest(architecture=architecture, source=other):
+                with self.assertRaises(ValueError):
+                    runtime_libraries.builtin_locale_directory(
+                        architecture, locale_directory=builtin_locale(other))
 
     def test_interrupt_restores_previous_locale(self):
         """旧目录移动或新目录发表后中断时，原内容仍位于原路径。"""
@@ -298,6 +461,59 @@ class RuntimeLocalePublicationTests(unittest.TestCase):
             self.assertEqual((destination / "messages/category").read_bytes(), b"locale data")
             self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o555)
             self.assertEqual(stat.S_IMODE((source / "messages").stat().st_mode), 0o555)
+
+
+class RuntimePreparationFailureTests(unittest.TestCase):
+    """验证运行库准备在 libgcc 来源身份未知、缺失或不可得时，不改动已发布的运行库输出。
+
+    固定身份的 libgcc 字节无法在没有交叉工具链的环境中伪造，这里只走来源错误路径，
+    以退出码和输出目录的状态为准。
+    """
+
+    def setUp(self):
+        """创建内容不属于任何固定身份的 libgcc 来源，并设置自动清理的临时目录。"""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.libgcc = self.base / "unpinned libgcc_s.so.1"
+        self.libgcc.write_bytes(b"not a pinned libgcc build")
+
+    def publish_previous_runtime(self, architecture):
+        """写出一份含旧版全库与用户文件的已发布运行库输出，返回其路径与快照。"""
+        output = self.base / f"published runtime {architecture}"
+        write_runtime_assets(output, architecture)
+        write_stale_runtime(output, architecture)
+        return output, tree_contents(output)
+
+    def prepare(self, architecture, output, *options):
+        """通过命令行入口准备运行库并返回退出码，错误输出被丢弃。"""
+        with redirect_stderr(io.StringIO()):
+            return runtime_libraries.main(
+                ["--arch", architecture, "--output-directory", str(output), *options])
+
+    def test_unknown_libgcc_identity_is_rejected_before_any_output_changes(self):
+        """未知字节身份的 libgcc 被拒绝，已发布输出（含旧库与用户文件）和来源文件保持原样。"""
+        for architecture in ARCHITECTURES:
+            with self.subTest(architecture=architecture):
+                output, published = self.publish_previous_runtime(architecture)
+                self.assertEqual(self.prepare(architecture, output, "--libgcc-s", str(self.libgcc)), 1)
+                self.assertEqual(tree_contents(output), published)
+                self.assertEqual(self.libgcc.read_bytes(), b"not a pinned libgcc build")
+
+    def test_unavailable_libgcc_sources_are_rejected_before_any_output_changes(self):
+        """显式 libgcc 路径不存在，或未指定路径而 PATH 上没有 GNU 编译器时，已发布输出保持原样。"""
+        empty_path = self.base / "empty path"
+        empty_path.mkdir()
+        absent = self.base / "absent libgcc_s.so.1"
+        for architecture in ARCHITECTURES:
+            output, published = self.publish_previous_runtime(architecture)
+            for source, options, environment in (
+                    ("missing explicit path", ("--libgcc-s", str(absent)), {}),
+                    ("no GNU compiler on PATH", (), {"PATH": str(empty_path)})):
+                with self.subTest(architecture=architecture, source=source):
+                    with patch.dict(os.environ, environment):
+                        self.assertEqual(self.prepare(architecture, output, *options), 1)
+                    self.assertEqual(tree_contents(output), published)
 
 
 @unittest.skipUnless(all(shutil.which(binary) for binary in ("mke2fs", "dumpe2fs", "debugfs", "e2fsck")),

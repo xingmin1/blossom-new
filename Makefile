@@ -26,14 +26,8 @@ GUEST_USERLAND_OUTPUT_DIR ?= build/userland-$(ARCH)
 USER_SELFTEST_BUILD_DIR ?= build/user-selftest-cache/$(ARCH)
 RUNTIME_LIBRARIES_OUTPUT_DIR ?= build/runtime-$(ARCH)
 BUSYBOX_BUILD_DIR ?= build/busybox-$(ARCH)
-MUSL_LIBC ?= $(if $(filter riscv64,$(ARCH)),$(MUSL_LIBC_RV),$(MUSL_LIBC_LA))
-GLIBC_LIBDIR ?= $(if $(filter riscv64,$(ARCH)),$(GLIBC_LIBDIR_RV),$(GLIBC_LIBDIR_LA))
 LIBGCC_S ?= $(if $(filter riscv64,$(ARCH)),$(LIBGCC_S_RV),$(LIBGCC_S_LA))
 GLIBC_LOCALE_DIR ?= $(if $(filter riscv64,$(ARCH)),$(GLIBC_LOCALE_DIR_RV),$(GLIBC_LOCALE_DIR_LA))
-MUSL_LIBC_RV ?=
-MUSL_LIBC_LA ?=
-GLIBC_LIBDIR_RV ?=
-GLIBC_LIBDIR_LA ?=
 LIBGCC_S_RV ?=
 LIBGCC_S_LA ?=
 GLIBC_LOCALE_DIR_RV ?=
@@ -168,8 +162,8 @@ endif
 .PHONY: build-linux-user-selftests run-linux-user-selftests
 
 all:
-	$(MAKE) build-qemu-artifacts ARCH=riscv64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_RV)" MUSL_LIBC="$(MUSL_LIBC_RV)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_RV)" LIBGCC_S="$(LIBGCC_S_RV)" GLIBC_LOCALE_DIR="$(GLIBC_LOCALE_DIR_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)" ROOTFS_OUTPUT_DIR=build/rootfs/riscv64 GUEST_USERLAND_OUTPUT_DIR=build/userland-riscv64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-riscv64 BUSYBOX_BUILD_DIR=build/busybox-riscv64
-	$(MAKE) build-qemu-artifacts ARCH=loongarch64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_LA)" MUSL_LIBC="$(MUSL_LIBC_LA)" GLIBC_LIBDIR="$(GLIBC_LIBDIR_LA)" LIBGCC_S="$(LIBGCC_S_LA)" GLIBC_LOCALE_DIR="$(GLIBC_LOCALE_DIR_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)" ROOTFS_OUTPUT_DIR=build/rootfs/loongarch64 GUEST_USERLAND_OUTPUT_DIR=build/userland-loongarch64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-loongarch64 BUSYBOX_BUILD_DIR=build/busybox-loongarch64
+	$(MAKE) build-qemu-artifacts ARCH=riscv64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_RV)" LIBGCC_S="$(LIBGCC_S_RV)" GLIBC_LOCALE_DIR="$(GLIBC_LOCALE_DIR_RV)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_RV)" RUNNER_LINKER="$(RUNNER_LINKER_RV)" ROOTFS_OUTPUT_DIR=build/rootfs/riscv64 GUEST_USERLAND_OUTPUT_DIR=build/userland-riscv64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-riscv64 BUSYBOX_BUILD_DIR=build/busybox-riscv64
+	$(MAKE) build-qemu-artifacts ARCH=loongarch64 TARGET_PLATFORM=qemu-virt MUSL_CROSS="$(MUSL_CROSS_LA)" LIBGCC_S="$(LIBGCC_S_LA)" GLIBC_LOCALE_DIR="$(GLIBC_LOCALE_DIR_LA)" RUNNER_SYSROOT="$(RUNNER_SYSROOT_LA)" RUNNER_LINKER="$(RUNNER_LINKER_LA)" ROOTFS_OUTPUT_DIR=build/rootfs/loongarch64 GUEST_USERLAND_OUTPUT_DIR=build/userland-loongarch64 RUNTIME_LIBRARIES_OUTPUT_DIR=build/runtime-loongarch64 BUSYBOX_BUILD_DIR=build/busybox-loongarch64
 
 build-kernel:
 	cd os && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS BLOSSOM_PLATFORM="$(TARGET_PLATFORM)" CARGO_TARGET_DIR="$(call absolute-path,$(KERNEL_CARGO_TARGET_DIR))" cargo --config 'target.$(TARGET).rustflags=["-Cpanic=abort"]' build --locked --target $(TARGET) $(CARGO_PROFILE_ARG)
@@ -187,7 +181,7 @@ build-qemu-artifacts:
 	mv -fT -- "$$temporary" "$(QEMU_KERNEL_EXPORT)" || exit $$?
 
 prepare-guest-runtime-libraries:
-	python3 userland/runtime/prepare_runtime_libraries.py --arch $(ARCH) $(if $(MUSL_LIBC),--musl-libc "$(MUSL_LIBC)") $(if $(GLIBC_LIBDIR),--glibc-libdir "$(GLIBC_LIBDIR)") $(if $(LIBGCC_S),--libgcc-s "$(LIBGCC_S)") $(if $(GLIBC_LOCALE_DIR),--glibc-locale-dir "$(GLIBC_LOCALE_DIR)") --output-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)"
+	python3 userland/runtime/prepare_runtime_libraries.py --arch $(ARCH) $(if $(LIBGCC_S),--libgcc-s "$(LIBGCC_S)") $(if $(GLIBC_LOCALE_DIR),--glibc-locale-dir "$(GLIBC_LOCALE_DIR)") --output-directory "$(RUNTIME_LIBRARIES_OUTPUT_DIR)"
 
 build/fixtures/basic-fat32.img: tools/create_basic_fat32.sh
 	sh tools/create_basic_fat32.sh "$@"
@@ -366,10 +360,12 @@ help:
 	  'run-linux-user-selftests            Run every native program in its collection cwd; preserve TAP/exit.' \
 	  '  LINUX_USER_SELFTEST_OUTPUT_DIR defaults to build/user-selftests-linux; not target-ISA evidence.' \
 	  '  LINUX_USER_SELFTEST_CFLAGS selects native flags; no kernel, BusyBox, runner or PID1 execution.' \
-	  'prepare-guest-runtime-libraries     Copy checked local libc sources to RUNTIME_LIBRARIES_OUTPUT_DIR.' \
-	  '  LIBGCC_S overrides the default libgcc_s.so.1 source; GLIBC_LOCALE_DIR overrides the built-in locale matched to libc.' \
-	  '  Use LIBGCC_S_RV/LA and GLIBC_LOCALE_DIR_RV/LA for per-architecture overrides in all.' \
+	  'prepare-guest-runtime-libraries     Check GNU libgcc, C.utf8 and the test-root libc identity, then write them to RUNTIME_LIBRARIES_OUTPUT_DIR.' \
+	  '  The default libgcc_s.so.1 comes from the architecture GNU cross compiler; no system libc or loader is prepared.' \
+	  '  LIBGCC_S and GLIBC_LOCALE_DIR only relocate byte-identical assets; any other content is rejected.' \
+	  '  Use LIBGCC_S_RV/LA and GLIBC_LOCALE_DIR_RV/LA for per-architecture relocation in all.' \
 	  'assemble-root-filesystem            Build userland/libraries, then replace ROOTFS_OUTPUT_DIR.' \
+	  '  Only libgcc_s.so.1, identity and C.utf8 enter /opt/runtime/glibc; no system musl, libc or loader is installed.' \
 	  '  ROOTFS_INIT_CONFIG optionally selects an ordinary inittab file.' \
 	  '  A FAT32 fixture is generated in build/fixtures; mkfs.fat, fsck.fat, mcopy and mmd are required.' \
 	  'create-ext4-image                   Only consume ROOTFS_TREE_DIR; write SYSTEM_ROOT_EXT4_IMAGE.' \

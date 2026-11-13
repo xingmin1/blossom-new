@@ -2,7 +2,7 @@
 
 关于日常构建、三类测试体系、评测计划配置与工作盘管理命令，请参阅 [公共操作指南](../../docs/development.md)；关于当前源码模块结构与单次命令运行方式，请参阅 [运行根导读](development.md)。本文档专门说明动态运行库资产的准备流程、官方比赛测试盘的版本与哈希身份，以及历史测试输入的已知边界。运行库准备逻辑由同目录下的脚本 [prepare_runtime_libraries.py](prepare_runtime_libraries.py) 实现（注意：在宿主机上成功准备运行库资产，并不等同于客体系统内的测试已经运行通过）。
 
-运行库与原始测试程序固定采用官方仓库 [oscomp/testsuits-for-oskernel（提交 `8b58dd16d26d30f7c74d48d5832d870d3051b703`）](https://github.com/oscomp/testsuits-for-oskernel/tree/8b58dd16d26d30f7c74d48d5832d870d3051b703) 以及官方评测容器 `docker.educg.net/cg/os-contest:20250624`。`prepare_runtime_libraries.py` 从固定容器路径或显式指定的本地路径复制库，默认使用仓内按 libc 身份绑定的 locale；不会搜索其他版本、联网下载或安装工具链，也不会重新编译或修改原始测试的 ELF、`PT_INTERP` 或共享库。
+比赛测试输入以 [oscomp/testsuits-for-oskernel（提交 `8b58dd16d26d30f7c74d48d5832d870d3051b703`）](https://github.com/oscomp/testsuits-for-oskernel/tree/8b58dd16d26d30f7c74d48d5832d870d3051b703) 为基准。系统盘不再复制整套 musl 和 glibc：`prepare_runtime_libraries.py` 从对应架构的 GNU 交叉编译器取得固定身份的 `libgcc_s.so.1`，结合仓内 locale 与测试根运行库身份记录生成辅助资产；不搜索其他版本、不下载库，也不重编或修改原始测试 ELF。
 
 正式的比赛执行器 `/sbin/contest-run` 是由 `userland/contest-run` 编译生成的 Rust `std` 静态链接程序，固定使用 `nightly-2025-01-18` 工具链；Makefile 直接调用 `PATH` 中已就绪的 `cargo`/`rustc`（不传 `+toolchain` 参数，也不启用自动安装），因此对应架构的 Linux musl 目标标准库（sysroot）与交叉链接器必须事先准备就绪。`userland/contest-run` 目录下的 `Cargo.lock` 与包含 17 个依赖包的 `vendor/` 目录是由 Cargo 正式生成的离线输入（其中锁定了 `toml_edit 0.22.20`）。**请特别注意：本文下方准备的客体动态运行库输出目录并非 `RUNNER_SYSROOT`，不能用来替代编译 `contest-run` 所需的 Rust 目标标准库。** `contest-run` 自身采用静态链接，与被测程序采用动态链接完全互不冲突；内核的裸机编译 target 与用户态 Linux target 各司其职，日常 Make 构建也不依赖 Nix 环境。
 
@@ -23,60 +23,40 @@
 
 当前的 Rust 比赛执行器默认遵循“优先使用测试盘自带环境（supplied-first）”原则：直接使用所选子根目录（root）内自带的原始 ELF、`PT_INTERP` 解释器路径、动态链接器（loader）、共享库（DSO）与测试脚本，不再像早期 Shell 脚本那样自动执行 `prepare_family`，也不会仅因为子目录名为 `musl` 或 `glibc` 就去覆盖盘内已有的库文件。需要注意，当 ELF 的 `PT_INTERP` 动态链接器本身缺失时，单纯设置 `LD_LIBRARY_PATH` 环境变量并不能让程序启动；此时执行器会如实记录 `exec` 启动失败，而不会将其归类为支持性跳过（Skip）。
 
-`prepare_runtime_libraries.py` 在宿主机侧整理运行库和 locale 资产：由 `make prepare-guest-runtime-libraries` 通过 `RUNTIME_LIBRARIES_OUTPUT_DIR` 指定输出目录，再由 `assemble-root-filesystem` 安装到系统根的 `/opt/runtime/{musl,glibc}`。这一步不修改比赛盘。默认计划在激活 glibc 测试根时，显式运行系统根的 `/sbin/prepare-glibc-runtime {test_root}`：仅在工作副本缺少 `lib/libgcc_s.so.1` 或对应架构的 `C.utf8` 数据时补入，并在需要补入时比较系统根与测试根的 `libc.so.6` SHA-256。已有普通文件、目录及分别指向它们的有效链接保留，不校验已有目标的 ABI 或数据内容；失效链接或补入时的 libc 不匹配会使准备失败。
+`prepare_runtime_libraries.py` 在宿主机侧准备 libgcc、locale 和测试根运行库身份记录，经 `assemble-root-filesystem` 安装到系统根的 `/opt/runtime/glibc`。默认计划在激活 glibc 测试根时运行 `/sbin/prepare-glibc-runtime {test_root}`：仅在工作副本缺少 `lib/libgcc_s.so.1` 或对应架构的 `C.utf8` 数据时补入；补入前将测试根的 libc 和加载器 SHA-256 与系统盘记录的固定身份比较。已有普通文件、目录及分别指向它们的有效链接保留，不校验已有目标的 ABI 或数据内容；失效链接或需要补入时身份不匹配会使准备失败。
 
 区分宿主侧制备与客体内兼容修补：上面的 `prepare_runtime_libraries.py` 只在宿主机上原样复制库文件到系统根的辅助目录，从不触碰比赛盘；LoongArch 的 `cyclictest:musl:script` 例则在客体内由 override 的 `setup`（`root = "system"`，执行系统盘的 `/sbin/prepare-la-musl-sched`）修补比赛盘工作副本里已知版本 musl `libc.so` 的 `sched_getparam`、`sched_getscheduler`、`sched_setparam`、`sched_setscheduler` 四个函数。两者互不调用，后者不属于 supplied-first 的“原样使用盘内库”：它是显式的 prepared 输入变更，只接受原始 SHA-256 `816cff1d1abbef3f1423bbce01a56f00c97b6ff8e20d49966c9d4b6d27e5e7be`、产出 `09b0fc7cd720c1f5dc25399733c1d203389a2de9ca90f6effe1c394c66414438`；原比赛镜像不变，fresh 工作副本中该库的字节、语义和 inode 会变；库版本未知则该例 setup 失败，不运行原脚本。赛事是否允许修改工作盘运行库尚未确定，边界见[显式执行根手册第 10 节](../../docs/contest-run-roots.md)。
 
 在调试动态链接程序时，请注意区分三种不同的准备方式：按 `PT_INTERP` 要求的路径建立符号链接、显式补充缺失的共享库文件、或者直接将动态链接器（loader）作为主程序调用以加载目标二进制。其中，直接调用 loader 启动程序会改变子进程看到的 `argv[0]` 与辅助向量（`auxv`），并不完全等价于内核直接加载动态 ELF。在项目自有的非评分测试根中可以进行上述实验；但对于官方比赛评分盘，切勿向盘内注入或替换程序、脚本、共享库、符号链接或测试断言后再将其当作原始测试盘成绩。凡经过显式环境准备的步骤，其输入状态与运行结果均应明确标注。
 
-## 四组固定路径与真实请求
+## 运行库来源与身份
 
-下表列出了官方评测容器内的四组运行库路径（同时也是 `prepare_runtime_libraries.py` 在未传入显式路径参数时按架构查找的默认源路径），以及比赛盘内原始动态 ELF 程序头（`PT_INTERP`）所请求的动态链接器路径：
+比赛盘的动态程序使用测试根自己的 libc 和 `PT_INTERP` 加载器。RISC-V musl 程序请求 `/lib/ld-musl-riscv64-sf.so.1`，glibc 程序请求 `/lib/ld-linux-riscv64-lp64d.so.1`；LoongArch 对应 `/lib64/ld-musl-loongarch-lp64d.so.1` 和 `/lib64/ld-linux-loongarch-lp64d.so.1`。系统盘不提供这些 libc、libm 或加载器；依赖原系统盘 `/opt/runtime/musl` 或完整 `/opt/runtime/glibc` 的手动用法不再适用。
 
-| 架构与 libc 族 | 官方容器内源文件路径 | 原始动态 ELF 请求的 `PT_INTERP` 解释器路径 |
+| 架构 | 默认 libgcc 来源 | 固定 libgcc SHA-256 |
 |---|---|---|
-| RV `musl` | `/opt/riscv64--musl--bleeding-edge-2020.08-1/riscv64-buildroot-linux-musl/sysroot/lib/libc.so` | `/lib/ld-musl-riscv64-sf.so.1` |
-| RV `glibc` | `/usr/riscv64-linux-gnu/lib` | `/lib/ld-linux-riscv64-lp64d.so.1` |
-| LA `musl` | `/opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib/libc.so` | `/lib64/ld-musl-loongarch-lp64d.so.1` |
-| LA `glibc` | `/opt/gcc-13.2.0-loongarch64-linux-gnu/sysroot/usr/lib64` | `/lib64/ld-linux-loongarch-lp64d.so.1` |
+| RISC-V | `riscv64-linux-gnu-gcc -print-file-name=libgcc_s.so.1` | `e217643d8315bddf37281cc8bf048ceaf39ad25fd82521a47876164010f05372` |
+| LoongArch | `loongarch64-linux-gnu-gcc -print-file-name=libgcc_s.so.1` | `767f7804e011b0111f542c0ce6b86e5eb78ce440d3540b36f3bb41254ca53743` |
 
-在 `musl` 族中，原始动态程序依赖 `libc.so`，且 `PT_INTERP` 解释器符号链接直接指向同一份 `libc.so`。在 `glibc` 族中，辅助资产包括 `libc.so.6`、`libm.so.6`、对应架构的 `ld-linux-*.so.1`、`libgcc_s.so.1` 和完整的 `C.utf8` 目录。libgcc 与 locale 必须来自与所选 glibc 兼容的工具链或运行环境；脚本原样复制，不修改共享库字节。RISC-V 原始动态程序还在动态段中显式声明了对 glibc loader 的依赖。
+宿主准备入口为 `python3 userland/runtime/prepare_runtime_libraries.py --arch ARCH --output-directory DIR`。可用 `--libgcc-s`、`--glibc-locale-dir` 指定同一组资产的其他路径，但文件或 locale 清单的 SHA-256 必须与固定身份一致；未知版本直接失败。`--musl-libc` 与 `--glibc-libdir` 已删除，不再支持任意 libc 来源。
 
-## 显式本地来源
+脚本在写出前核对 libgcc 的 SHA-256、ELF 类型、目标架构、浮点 ABI、SONAME、依赖及 unwind 导出，并核对 locale 的 12 个类别和完整清单。系统盘身份记录将测试根的 libc、加载器与这组资产绑定。此前对任意显式 glibc provider 的逐符号检查不再作为构建入口；新增组合前必须用实际 libc 与加载器重新检查符号并运行客体验证。静态检查不能代替实际的 `setlocale`、动态加载与线程退出验证。
 
-若不使用官方容器中的固定运行库，可显式指定本地来源。内置 `C.utf8` 只接受下方记录的官方 libc SHA-256；其他 libc 必须显式提供兼容的 locale。以下路径是示例：
+| 架构 | 测试根 libc SHA-256 | 测试根加载器 SHA-256 | locale 清单 SHA-256 |
+|---|---|---|---|
+| RISC-V | `81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c` | `10ac4a073b52a6b05e383ae6b47be92375436174a857fd6299faea1257495eaa` | `a4e5d1d829d11772d53e0a889ee1424c3659eecc712844fb1d5e6ede0e5dd993` |
+| LoongArch | `b0622d832bf9531bf9d7ada63a04b084f6082f76673e0d16b3dc058c82d4aeb8` | `5201d1507ebcdaebc2ec2e728c68ba2fdca503b9e1e7a95cc177ce576ebdc2bb` | `5360b639bb89d4649bcaabb5ff84dc951c1d325daf943672a67702dddde28794` |
 
-```sh
-python3 userland/runtime/prepare_runtime_libraries.py --arch riscv64 \
-  --musl-libc /srv/contest-runtime/riscv64/musl/libc.so \
-  --glibc-libdir /srv/contest-runtime/riscv64/glibc/lib \
-  --libgcc-s /srv/contest-runtime/riscv64/glibc/libgcc_s.so.1 \
-  --glibc-locale-dir /srv/contest-runtime/riscv64/glibc/C.utf8 \
-  --output-directory build/runtime-riscv64
-python3 userland/runtime/prepare_runtime_libraries.py --arch loongarch64 \
-  --musl-libc /srv/contest-runtime/loongarch64/musl/libc.so \
-  --glibc-libdir /srv/contest-runtime/loongarch64/glibc/lib \
-  --libgcc-s /srv/contest-runtime/loongarch64/glibc/libgcc_s.so.1 \
-  --glibc-locale-dir /srv/contest-runtime/loongarch64/glibc/C.utf8 \
-  --output-directory build/runtime-loongarch64
-```
+locale 清单按相对路径排序，每行由文件 SHA-256、两个空格、相对路径及换行组成，再对完整 ASCII 清单计算 SHA-256。
 
-命令行中的 `--arch` 与 `--output-directory` 必填，所有长选项均不接受缩写。省略 `--musl-libc` 或 `--glibc-libdir` 时使用上一节固定容器路径；未显式指定 glibc 目录和 libgcc 时，libgcc 使用各架构的固定官方路径，其中 LoongArch 为 `/opt/gcc-13.2.0-loongarch64-linux-gnu/loongarch64-linux-gnu/lib64/libgcc_s.so.1`。显式指定 glibc 目录而不指定 libgcc 时，只读取该目录下的 `libgcc_s.so.1`，不搜索其他工具链。省略 `--glibc-locale-dir` 时，脚本按架构及选中 libc 的完整 SHA-256 选择仓内 locale，并校验 12 个文件的清单散列；未知 libc 或内置数据损坏时在写出前失败。显式 locale 仍需由调用者确认兼容性。
+## locale 数据来源
 
-`PATH` 中必须提供支持两架构的 `readelf`。脚本在写出前检查文件、ELF 架构与类型、libgcc 浮点 ABI、SONAME、依赖、必需的 unwind 导出和版本化 glibc 符号，并检查 12 类 locale 数据的头部和索引。来源不匹配、文件缺失或工具失败时返回非零。静态检查不能证明 locale 与 glibc 运行时兼容，也不能替代客体中的 `setlocale`、动态加载与线程退出验证。
-
-本次定向验证使用官方评测容器内对应架构的 `libgcc_s.so.1`：RISC-V SHA-256 为 `d5c9791ca8b75d2cfaf3861f162e8406c243c192db51add9b583bae7662b108f`，LoongArch 为 `767f7804e011b0111f542c0ce6b86e5eb78ce440d3540b36f3bb41254ca53743`。内置 RV locale 来自容器 Ubuntu glibc `2.35-0ubuntu3.10` 的预制目录，原盘 libc 为 `2.35-0ubuntu3`；两者修订不同。内置 LA locale 用官方工具链 glibc 2.38 的目标 `localedef` 和字符集源数据在客体生成，并非独立重新生成验证。两次运行分别与测试根的 libc 字节核对，12 类 locale 与安装源逐字节相同。详细身份及实测边界见 `.trellis/spec/os/backend/userland.md` 的“比赛工作副本的 glibc 运行环境”。
-
-内置数据的选择与完整性绑定如下。locale 清单按相对路径排序，每行是 `文件 SHA-256`、两个空格、相对路径及换行，再对完整 ASCII 清单计算 SHA-256：
-
-| 架构 | 对应 libc SHA-256 | locale 清单 SHA-256 |
-|---|---|---|
-| RISC-V | `81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c` | `a4e5d1d829d11772d53e0a889ee1424c3659eecc712844fb1d5e6ede0e5dd993` |
-| LoongArch | `b0622d832bf9531bf9d7ada63a04b084f6082f76673e0d16b3dc058c82d4aeb8` | `5360b639bb89d4649bcaabb5ff84dc951c1d325daf943672a67702dddde28794` |
-
-两套数据的固定输入为官方容器镜像 `docker.educg.net/cg/os-contest:20250624`，本次检查的镜像 digest 为 `sha256:2fd432100bd2bc2cf8647d67b887ef1bb7300f2843f87c7658ce97ac3dac2ad5`。RV 目录直接取该镜像 `/usr/lib/locale/C.utf8`；对应 Ubuntu glibc 源包的 [原始归档](https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/glibc/2.35-0ubuntu3.10/glibc_2.35.orig.tar.xz) SHA-256 为 `5123732f6b67ccd319305efd399971d58592122bcc2a6518a1bd2510dd0cf52e`，[发行版补丁归档](https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/glibc/2.35-0ubuntu3.10/glibc_2.35-0ubuntu3.10.debian.tar.xz) 为 `c6d111273ddb76464035493a1c2cb56d10626ce03053d590cb10af48b543704d`。
+以下为仓内 locale 数据的历史来源；当前构建不依赖旧镜像。
+历史生成输入为官方容器镜像 `docker.educg.net/cg/os-contest:20250624`，当时检查的镜像 digest 为 `sha256:2fd432100bd2bc2cf8647d67b887ef1bb7300f2843f87c7658ce97ac3dac2ad5`。RV 目录直接取该镜像 `/usr/lib/locale/C.utf8`；对应 Ubuntu glibc 源包的 [原始归档](https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/glibc/2.35-0ubuntu3.10/glibc_2.35.orig.tar.xz) SHA-256 为 `5123732f6b67ccd319305efd399971d58592122bcc2a6518a1bd2510dd0cf52e`，[发行版补丁归档](https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/glibc/2.35-0ubuntu3.10/glibc_2.35-0ubuntu3.10.debian.tar.xz) 为 `c6d111273ddb76464035493a1c2cb56d10626ce03053d590cb10af48b543704d`。
 
 LA 数据由 [GCC 13.2.0 工具链归档](https://gitlab.educg.net/wangmingjian/os-contest-2024-image/-/raw/aa2122f118f9d50e6c378000bd2a102915c8b87c/gcc-13.2.0-loongarch64-linux-gnu.tgz)的目标 `localedef` 生成；归档 SHA-256 为 `1acd6c2ae79d6e8c80ea6d5b20d6ee3d6f52944bc473c833047aa717e05a0380`，实际使用的 `localedef` SHA-256 为 `f98a8e29753878dfad3b04aa23fdc36b0e432917e41f1b6d4b2b58fa474e2c5a`。生成环境中的命令为：
+
+下列命令是当时的生成记录；其中的系统加载器路径不再由当前系统盘提供。
 
 ```sh
 I18NPATH=/opt/locale-tools/i18n /opt/runtime/glibc/lib/ld-linux-loongarch-lp64d.so.1 \
@@ -89,15 +69,9 @@ I18NPATH=/opt/locale-tools/i18n /opt/runtime/glibc/lib/ld-linux-loongarch-lp64d.
 
 ## 输出与更新责任
 
-脚本生成的目录结构为标准用户态文件树：
-- `DIR/musl/lib/libc.so`，以及同目录下指向上表 `musl` 解释器名称的相对符号链接；
-- `DIR/glibc/lib/{libc.so.6,libm.so.6,libgcc_s.so.1,对应架构的 glibc loader}`；
-- `DIR/glibc/usr/lib/locale/C.utf8`（RISC-V）或 `DIR/glibc/usr/lib64/locale/C.utf8`（LoongArch）；
-- 在 `loongarch64` 架构下，`musl` 与 `glibc` 子目录内还会分别创建 `lib64 -> lib` 符号链接，使原始程序请求的 `/lib64/...` 路径能够解析到 `lib/` 目录。
+准备脚本输出 `DIR/glibc/lib/libgcc_s.so.1`、`DIR/glibc/identity` 和对应架构的 `DIR/glibc/usr/lib{,64}/locale/C.utf8`。`identity` 一行依次保存测试根 libc SHA-256、加载器 SHA-256 与加载器文件名，由空格分隔。
 
-后续执行 `assemble-root-filesystem` 时，会将这两个运行库目录组装进项目管理的系统根文件树；而 `create-ext4-image` 仅负责将组装好的完整根文件树打包为镜像，不会触发运行库准备，也不会在内核中添加硬编码路径重写逻辑。
-
-重复运行时，脚本更新五个具名共享库、当前架构的解释器链接和对应的 locale 目录，不递归删除输出目录中的其他文件。共享库使用同目录临时文件后替换；locale 先在同文件系统暂存，发布失败时尝试恢复旧目录，恢复也失败时保留旧目录并报告位置。多项输出不是整体事务，调用者必须以当次退出码判断成功与否，不能凭旧文件存在继续打包。
+`assemble-root-filesystem` 将这些资产装入系统根 `/opt/runtime/glibc`；`create-ext4-image` 只负责打包完整根目录，不读取比赛盘。单文件与 locale 更新沿各自的暂存和发布路径；多项输出不构成整体事务，调用者必须以当次退出码判断是否可以继续打包。
 
 ## 原输入与现有失败边界
 

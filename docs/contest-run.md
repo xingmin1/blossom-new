@@ -100,7 +100,7 @@ finish = "poweroff"
 
 两个 root 都先复制项目 BusyBox 到 `/.blossom/busybox`，再补缺失的标准 `/bin/sh` 入口。项目 ash 遇到无 shebang 文本时，通过 `/bin/busybox` 重新执行盘内 BusyBox 的 ash；原 `/busybox` 和 `/bin/busybox` 的准备方式不变，显式 `/busybox sh` 仍执行盘内原 shell。已有 `/bin/sh`（包括失效符号链接）不会被替换；复制或链接失败会按准备错误返回。
 
-glibc 根另外通过 `/sbin/prepare-glibc-runtime` 补缺 `lib/libgcc_s.so.1` 和架构对应路径的 `C.utf8` 数据。来源为系统盘 `/opt/runtime/glibc`，需要补入时系统和测试根的 `libc.so.6` SHA-256 必须相同；已有目标保留，失效链接或补入时 libc 不匹配会使 root 准备失败。该步骤修改比赛工作副本，不修改原盘和原测试 ELF；参赛环境是否允许此准备仍需由赛事规则确认。
+glibc 根另外通过 `/sbin/prepare-glibc-runtime` 补缺 `lib/libgcc_s.so.1` 和架构对应路径的 `C.utf8` 数据。来源为系统盘 `/opt/runtime/glibc`；需要补入时，测试根的 `libc.so.6` 和加载器 SHA-256 必须匹配系统盘内的身份记录。已有有效目标保留；失效链接，或需要补入时身份记录无效、不匹配，都会使 root 准备失败。该步骤修改比赛工作副本，不修改原盘和原测试 ELF；参赛环境是否允许此准备仍需由赛事规则确认。
 
 更新系统盘中的计划后，使用 `fresh` 才会从原比赛盘重新准备缺失的入口。`reuse` 不更新系统工作盘中的计划，`refresh-system` 虽更新计划但保留比赛工作盘；两者都不会替换比赛工作盘中已有的旧 `/bin/sh` 链接。
 

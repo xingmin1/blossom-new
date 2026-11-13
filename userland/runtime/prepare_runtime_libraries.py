@@ -1,173 +1,163 @@
 #!/usr/bin/env python3
-"""从宿主机交叉工具链提取并校验 musl 与 glibc 动态运行库，安装到目标运行库目录并建立加载器符号链接。"""
+"""为系统盘准备 glibc 补充资产：校验 GNU 工具链的 libgcc_s.so.1 与仓内 C.utf8 locale 后写出，并记录比赛测试根 libc 与动态链接器的固定身份。"""
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
 
 
-# 各架构默认的交叉工具链运行库路径、期望的 readelf Machine 标识及动态链接器文件名。
-RUNTIME_LIBRARY_SOURCES = {
-    "riscv64": (
-        "/opt/riscv64--musl--bleeding-edge-2020.08-1/"
-        "riscv64-buildroot-linux-musl/sysroot/lib/libc.so",
-        "/usr/riscv64-linux-gnu/lib",
-        "RISC-V",
-        "ld-musl-riscv64-sf.so.1",
-        "ld-linux-riscv64-lp64d.so.1",
+@dataclass(frozen=True)
+class RuntimeProfile:
+    """一个目标架构的 GNU 编译器、ELF 约束以及系统盘需要的全部固定身份。"""
+
+    # 查询 libgcc_s.so.1 路径的 GNU 交叉编译器。
+    compiler: str
+    # ELF 头的 e_machine，以及 e_flags 中浮点调用约定位的掩码与取值。
+    machine: int
+    abi_mask: int
+    abi_value: int
+    # 比赛盘测试根的 libc 与动态链接器的 SHA-256；loader 是动态链接器的文件名。
+    libc_sha256: str
+    loader: str
+    loader_sha256: str
+    # libgcc_s.so.1 的 SHA-256，locale 清单的 SHA-256 及其在 glibc 目录下的相对路径。
+    libgcc_sha256: str
+    locale_sha256: str
+    locale_path: str
+
+
+# 两个架构的固定身份，编译器、ELF 约束和全部 SHA-256 以此为唯一来源。
+# 浮点 ABI 与测试根加载器名中的 lp64d 一致，均为双精度。
+RUNTIME_PROFILES = {
+    "riscv64": RuntimeProfile(
+        compiler="riscv64-linux-gnu-gcc",
+        machine=243,
+        abi_mask=0x6,
+        abi_value=0x4,
+        libc_sha256="81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c",
+        loader="ld-linux-riscv64-lp64d.so.1",
+        loader_sha256="10ac4a073b52a6b05e383ae6b47be92375436174a857fd6299faea1257495eaa",
+        libgcc_sha256="e217643d8315bddf37281cc8bf048ceaf39ad25fd82521a47876164010f05372",
+        locale_sha256="a4e5d1d829d11772d53e0a889ee1424c3659eecc712844fb1d5e6ede0e5dd993",
+        locale_path="usr/lib/locale/C.utf8",
     ),
-    "loongarch64": (
-        "/opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib/libc.so",
-        "/opt/gcc-13.2.0-loongarch64-linux-gnu/sysroot/usr/lib64",
-        "LoongArch",
-        "ld-musl-loongarch-lp64d.so.1",
-        "ld-linux-loongarch-lp64d.so.1",
+    "loongarch64": RuntimeProfile(
+        compiler="loongarch64-linux-gnu-gcc",
+        machine=258,
+        abi_mask=0x7,
+        abi_value=0x3,
+        libc_sha256="b0622d832bf9531bf9d7ada63a04b084f6082f76673e0d16b3dc058c82d4aeb8",
+        loader="ld-linux-loongarch-lp64d.so.1",
+        loader_sha256="5201d1507ebcdaebc2ec2e728c68ba2fdca503b9e1e7a95cc177ce576ebdc2bb",
+        libgcc_sha256="767f7804e011b0111f542c0ce6b86e5eb78ce440d3540b36f3bb41254ca53743",
+        locale_sha256="5360b639bb89d4649bcaabb5ff84dc951c1d325daf943672a67702dddde28794",
+        locale_path="usr/lib64/locale/C.utf8",
     ),
 }
 
-# 默认工具链中的 libgcc 与内置 locale 分别绑定官方 libc 和数据清单。
-DEFAULT_LIBGCC_S = {
-    "riscv64": "/usr/riscv64-linux-gnu/lib/libgcc_s.so.1",
-    "loongarch64": (
-        "/opt/gcc-13.2.0-loongarch64-linux-gnu/"
-        "loongarch64-linux-gnu/lib64/libgcc_s.so.1"
-    ),
-}
-BUILTIN_LOCALE_HASHES = {
-    "riscv64": (
-        "81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c",
-        "a4e5d1d829d11772d53e0a889ee1424c3659eecc712844fb1d5e6ede0e5dd993",
-    ),
-    "loongarch64": (
-        "b0622d832bf9531bf9d7ada63a04b084f6082f76673e0d16b3dc058c82d4aeb8",
-        "5360b639bb89d4649bcaabb5ff84dc951c1d325daf943672a67702dddde28794",
-    ),
-}
+# ELF 头 e_type 中共享库的取值。
+ET_DYN = 3
 
-# LC_ALL 不是独立的 locale 数据类别。
-LOCALE_CATEGORIES = (
-    ("LC_CTYPE", 0), ("LC_NUMERIC", 1), ("LC_TIME", 2), ("LC_COLLATE", 3),
-    ("LC_MONETARY", 4), ("LC_MESSAGES", 5), ("LC_PAPER", 7), ("LC_NAME", 8),
-    ("LC_ADDRESS", 9), ("LC_TELEPHONE", 10), ("LC_MEASUREMENT", 11),
-    ("LC_IDENTIFICATION", 12),
+# glibc 通过 dlopen 载入 libgcc_s 后解析的异常展开入口。
+UNWIND_EXPORTS = frozenset((
+    "_Unwind_Backtrace", "_Unwind_ForcedUnwind", "_Unwind_GetCFA",
+    "_Unwind_Resume", "__gcc_personality_v0",
+))
+
+# 旧版工具写入输出目录的 musl 与 glibc 库。第二项为符号链接的旧目标，None 表示普通文件；
+# 复用输出目录时只清除仍保持这种形态的条目。
+STALE_RUNTIME_ENTRIES = (
+    ("musl/lib/libc.so", None),
+    ("musl/lib/ld-musl-riscv64-sf.so.1", "libc.so"),
+    ("musl/lib/ld-musl-loongarch-lp64d.so.1", "libc.so"),
+    ("musl/lib64", "lib"),
+    ("glibc/lib/libc.so.6", None),
+    ("glibc/lib/libm.so.6", None),
+    ("glibc/lib/ld-linux-riscv64-lp64d.so.1", None),
+    ("glibc/lib/ld-linux-loongarch-lp64d.so.1", None),
+    ("glibc/lib64", "lib"),
 )
 
 
-def check_runtime_library_elf(source_path, expected_machine):
-    """调用 `readelf` 检查源库文件并透传原始输出，验证其为匹配目标架构的 `ET_DYN` 共享库。"""
-    print(f"Checking ELF source: {source_path}", flush=True)
+def toolchain_libgcc_s(compiler):
+    """向 GNU 交叉编译器查询 libgcc_s.so.1 的安装路径；编译器没有给出绝对路径时视为库不存在。"""
     result = subprocess.run(
-        ["readelf", "-h", "-l", str(source_path)],
+        [compiler, "-print-file-name=libgcc_s.so.1"],
         stdout=subprocess.PIPE,
-        env={**os.environ, "LC_ALL": "C"},
-        check=False,
+        text=True,
+        check=True,
     )
-    sys.stdout.buffer.write(result.stdout)
-    sys.stdout.buffer.flush()
-    result.check_returncode()
-    header = result.stdout.decode("utf-8", errors="replace")
-    kind = re.search(r"^\s*Type:\s+(\S+)", header, re.MULTILINE)
-    actual_machine = re.search(r"^\s*Machine:\s+(.+)$", header, re.MULTILINE)
-    if kind is None or kind.group(1) != "DYN":
-        raise ValueError(f"expected ET_DYN runtime library: {source_path}")
-    if actual_machine is None or actual_machine.group(1).strip() != expected_machine:
-        raise ValueError(f"expected {expected_machine} runtime library: {source_path}")
+    reported = result.stdout.strip()
+    if not os.path.isabs(reported):
+        raise ValueError(f"{compiler} did not report an installed libgcc_s.so.1: {reported!r}")
+    return Path(reported)
 
 
-def read_dynamic_symbols(source_path):
-    """读取动态符号的名称、版本、绑定、可见性及定义状态。"""
-    print(f"Checking dynamic symbols: {source_path}", flush=True)
+def readelf_output(path, option):
+    """以 C locale 运行 `readelf` 读取一类 ELF 信息并返回文本，工具缺失或读取失败时抛出异常。"""
     result = subprocess.run(
-        ["readelf", "--dyn-syms", "--wide", str(source_path)],
+        ["readelf", "-W", option, str(path)],
         stdout=subprocess.PIPE,
         env={**os.environ, "LC_ALL": "C"},
-        check=False,
+        check=True,
     )
-    result.check_returncode()
-    symbols = []
-    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def exported_symbols(path):
+    """读取共享库对外导出的动态符号名，只计已定义的全局、弱和唯一符号，并去掉版本后缀。"""
+    names = set()
+    for line in readelf_output(path, "--dyn-syms").splitlines():
         fields = line.split()
-        if len(fields) < 8 or not fields[0].endswith(":") or not fields[0][:-1].isdigit():
+        if len(fields) < 8 or not fields[0][:-1].isdigit() or not fields[0].endswith(":"):
             continue
-        name, _, version = fields[7].partition("@")
-        symbols.append((name, version.lstrip("@"), fields[4], fields[5], fields[6]))
-    if not symbols:
-        raise ValueError(f"no readable dynamic symbols: {source_path}")
-    return symbols
+        binding, visibility, index, name = fields[4:8]
+        if (index != "UND" and binding in ("GLOBAL", "WEAK", "UNIQUE")
+                and visibility in ("DEFAULT", "PROTECTED")):
+            names.add(name.partition("@")[0])
+    return names
 
 
-def check_libgcc_s(source_path, libc_path, loader_path, architecture):
-    """检查 libgcc 的动态链接身份、浮点 ABI 和必需的动态符号。"""
-    def floating_abi(path):
-        """读取目标小端 ELF64 文件头中的架构浮点调用约定。"""
-        with path.open("rb") as stream:
-            header = stream.read(64)
-        if len(header) != 64 or header[:6] != b"\x7fELF\x02\x01":
-            raise ValueError(f"expected little-endian ELF64 runtime library: {path}")
-        flags = int.from_bytes(header[48:52], "little")
-        abi = flags & (0x6 if architecture == "riscv64" else 0x7)
-        if architecture == "loongarch64" and abi not in (1, 2, 3):
-            raise ValueError(f"unknown LoongArch floating-point ABI: {path}")
-        return abi
-
-    if floating_abi(source_path) != floating_abi(libc_path):
-        raise ValueError(f"libgcc floating-point ABI does not match glibc: {source_path}")
-    result = subprocess.run(
-        ["readelf", "-W", "-d", str(source_path)],
-        stdout=subprocess.PIPE,
-        env={**os.environ, "LC_ALL": "C"},
-        check=False,
-    )
-    sys.stdout.buffer.write(result.stdout)
-    sys.stdout.buffer.flush()
-    result.check_returncode()
+def check_libgcc_s(path, profile):
+    """检查 libgcc 是目标架构且浮点 ABI 一致的小端 ELF64 共享库，SONAME、依赖和异常展开导出齐全。"""
+    print(f"Checking libgcc: {path}", flush=True)
+    with path.open("rb") as stream:
+        header = stream.read(64)
+    if len(header) != 64 or header[:6] != b"\x7fELF\x02\x01":
+        raise ValueError(f"expected little-endian ELF64 libgcc: {path}")
+    elf_type = int.from_bytes(header[16:18], "little")
+    machine = int.from_bytes(header[18:20], "little")
+    flags = int.from_bytes(header[48:52], "little")
+    if elf_type != ET_DYN:
+        raise ValueError(f"expected ET_DYN libgcc: {path}")
+    if machine != profile.machine:
+        raise ValueError(f"libgcc ELF machine {machine} does not match {profile.machine}: {path}")
+    if (flags & profile.abi_mask) != profile.abi_value:
+        raise ValueError(
+            f"libgcc floating-point ABI flags {flags & profile.abi_mask:#x} "
+            f"do not match {profile.abi_value:#x}: {path}"
+        )
     entries = re.findall(
         r"^\s*0x[0-9a-fA-F]+\s+\((SONAME|NEEDED)\)[^\[\r\n]*\[([^\]]+)\]",
-        result.stdout.decode("utf-8", errors="replace"),
+        readelf_output(path, "-d"),
         re.MULTILINE,
     )
     sonames = [name for tag, name in entries if tag == "SONAME"]
     needed = [name for tag, name in entries if tag == "NEEDED"]
     if sonames != ["libgcc_s.so.1"]:
-        raise ValueError(f"expected libgcc_s.so.1 SONAME: {source_path}")
+        raise ValueError(f"expected libgcc_s.so.1 SONAME: {path}")
     if "libc.so.6" not in needed:
-        raise ValueError(f"libgcc must have DT_NEEDED libc.so.6: {source_path}")
-    libgcc_symbols = read_dynamic_symbols(source_path)
-    provider_symbols = read_dynamic_symbols(libc_path) + read_dynamic_symbols(loader_path)
-    provided = {
-        (name, version) for name, version, binding, visibility, index in provider_symbols
-        if index != "UND" and binding in ("GLOBAL", "WEAK", "UNIQUE")
-        and visibility in ("DEFAULT", "PROTECTED")
-    }
-    required = {
-        (name, version) for name, version, binding, _, index in libgcc_symbols
-        if index == "UND" and binding != "WEAK" and version.startswith("GLIBC_")
-    }
-    missing = sorted(required - provided)
+        raise ValueError(f"libgcc must have DT_NEEDED libc.so.6: {path}")
+    missing = sorted(UNWIND_EXPORTS - exported_symbols(path))
     if missing:
-        names = ", ".join(f"{name}@{version}" for name, version in missing)
-        raise ValueError(
-            f"libgcc requires unavailable glibc symbols: {names}; "
-            f"checked {libc_path} and {loader_path}"
-        )
-    unwind_exports = {
-        name for name, _, binding, visibility, index in libgcc_symbols
-        if index != "UND" and binding in ("GLOBAL", "WEAK", "UNIQUE")
-        and visibility in ("DEFAULT", "PROTECTED")
-    }
-    missing_unwind = sorted({
-        "_Unwind_Backtrace", "_Unwind_ForcedUnwind", "_Unwind_GetCFA",
-        "_Unwind_Resume", "__gcc_personality_v0",
-    } - unwind_exports)
-    if missing_unwind:
-        raise ValueError(f"libgcc missing unwinder exports: {', '.join(missing_unwind)}")
+        raise ValueError(f"libgcc missing unwinder exports: {', '.join(missing)}")
 
 
 def reject_source_overlap(source, outputs):
@@ -178,100 +168,41 @@ def reject_source_overlap(source, outputs):
             raise ValueError(f"source and output overlap or alias: {source}, {output}")
 
 
-def file_sha256(path):
-    """流式计算源文件的 SHA-256，不修改源文件。"""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
+def builtin_locale_directory(architecture, locale_directory=None):
+    """返回清单与固定身份一致的 locale 来源目录，未指定目录时使用仓内数据。
 
-
-def builtin_locale_directory(architecture, libc_path):
-    """确认内置 locale 的文件清单及其绑定的官方 libc 身份。"""
-    libc_hash, locale_hash = BUILTIN_LOCALE_HASHES[architecture]
-    if file_sha256(libc_path) != libc_hash:
-        raise ValueError(
-            f"built-in {architecture} locale requires the matching official libc: {libc_path}; "
-            "specify --glibc-locale-dir for a different libc"
-        )
-    source = Path(__file__).resolve().parent
-    for component in ("locale", architecture, "C.utf8"):
-        source = source / component
-        if source.is_symlink() or not source.is_dir():
-            raise ValueError(f"built-in locale path must be an ordinary directory: {source}")
+    指定的目录只是同一份数据的另一处存放位置。目录树内只能有目录和普通文件，不得含符号链接或
+    特殊文件。清单按相对路径排序，每行写 `文件 SHA-256`、两个空格、相对路径及换行，
+    其 SHA-256 必须等于该架构的固定值。
+    """
+    if locale_directory is None:
+        locale_directory = Path(__file__).resolve().parent / "locale" / architecture / "C.utf8"
+    source = Path(locale_directory).resolve(strict=True)
+    if not source.is_dir():
+        raise ValueError(f"locale source is not a directory: {source}")
     files = []
     pending = [source]
     while pending:
         path = pending.pop()
         if path.is_symlink():
-            raise ValueError(f"built-in locale contains a symbolic link: {path}")
+            raise ValueError(f"locale contains a symbolic link: {path}")
         if path.is_dir():
             pending.extend(path.iterdir())
         elif path.is_file():
             files.append(path)
         else:
-            raise ValueError(f"built-in locale contains a non-regular entry: {path}")
-    if len(files) != len(LOCALE_CATEGORIES):
-        raise ValueError(f"built-in locale must contain 12 category files: {source}")
+            raise ValueError(f"locale contains a non-regular entry: {path}")
     files.sort(key=lambda path: path.relative_to(source).as_posix())
     manifest = "".join(
-        f"{file_sha256(path)}  {path.relative_to(source).as_posix()}\n" for path in files
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(source).as_posix()}\n"
+        for path in files
     )
     try:
         manifest_hash = hashlib.sha256(manifest.encode("ascii")).hexdigest()
     except UnicodeEncodeError as error:
-        raise ValueError(f"built-in locale contains a non-ASCII path: {source}") from error
-    if manifest_hash != locale_hash:
-        raise ValueError(f"built-in locale manifest SHA-256 mismatch: {source}")
-    return source
-
-
-def check_locale_tree(source, outputs, ancestors):
-    """检查待复制树及链接目标，拒绝循环、特殊文件和输入输出重叠。"""
-    source = source.resolve(strict=True)
-    reject_source_overlap(source, outputs)
-    if source.is_dir():
-        if source in ancestors:
-            raise ValueError(f"locale directory contains a symbolic-link cycle: {source}")
-        for entry in source.iterdir():
-            check_locale_tree(entry, outputs, ancestors | {source})
-    elif source.is_file():
-        with source.open("rb") as stream:
-            stream.read(1)
-    else:
-        raise ValueError(f"locale source is not a regular file or directory: {source}")
-
-
-def check_locale_directory(source, outputs):
-    """验证 glibc locale 的十二个类别及可复制的完整目录树。"""
-    source = source.resolve(strict=True)
-    if not source.is_dir():
-        raise ValueError(f"locale source is not a directory: {source}")
-    check_locale_tree(source, outputs, set())
-    for name, category in LOCALE_CATEGORIES:
-        path = source / name
-        if name == "LC_MESSAGES":
-            if not path.is_dir():
-                raise ValueError(f"locale category must be a directory: {path}")
-            path = path / "SYS_LC_MESSAGES"
-        if not path.is_file():
-            raise ValueError(f"locale category is not a regular file: {path}")
-        with path.open("rb") as stream:
-            header = stream.read(8)
-            size = os.fstat(stream.fileno()).st_size
-            if len(header) != 8:
-                raise ValueError(f"invalid locale category header: {path}")
-            magic, count = struct.unpack("<II", header)
-            base = 0x20090720 if category == 0 else (
-                0x20051014 if category == 3 else 0x20031115
-            )
-            if magic != base ^ category or count == 0 or size <= 8 + count * 4:
-                raise ValueError(f"invalid locale category header: {path}")
-            indexes = stream.read(count * 4)
-            if (len(indexes) != count * 4
-                    or any(size < offset for (offset,) in struct.iter_unpack("<I", indexes))):
-                raise ValueError(f"invalid locale category indexes: {path}")
+        raise ValueError(f"locale contains a non-ASCII path: {source}") from error
+    if manifest_hash != RUNTIME_PROFILES[architecture].locale_sha256:
+        raise ValueError(f"locale manifest SHA-256 mismatch: {source}")
     return source
 
 
@@ -339,110 +270,115 @@ def publish_locale_directory(source, destination):
     print(f"Copied locale: {source} -> {destination}")
 
 
-def copy_runtime_library(source_path, destination_path):
-    """通过同目录临时文件复制并原子替换目标运行库，避免跟随目标路径上可能已有的符号链接。"""
+def publish_file(destination, content):
+    """通过同目录临时文件原子替换目标文件并固定权限为 0644，不跟随目标路径上已有的符号链接。"""
+    destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        dir=destination_path.parent, prefix=f".{destination_path.name}.", delete=False
+        dir=destination.parent, prefix=f".{destination.name}.", delete=False
     ) as stream:
         temporary_path = Path(stream.name)
     try:
-        shutil.copy2(source_path, temporary_path)
-        temporary_path.replace(destination_path)
+        temporary_path.write_bytes(content)
+        temporary_path.chmod(0o644)
+        temporary_path.replace(destination)
     finally:
         temporary_path.unlink(missing_ok=True)
-    print(f"Copied: {source_path} -> {destination_path}")
+    print(f"Wrote: {destination}")
 
 
-def install_loader_link(link_path, target):
-    """在 `link_path` 创建指向 `target` 的符号链接；若原路径为普通文件或符号链接则先移除。"""
-    if link_path.is_symlink() or link_path.is_file():
-        link_path.unlink()
-    link_path.symlink_to(target)
-    print(f"Linked: {link_path} -> {target}")
+def reject_linked_parents(output_directory, paths):
+    """拒绝父级含符号链接或非目录的输出路径，使写入和清理都不会越出输出目录。"""
+    for path in paths:
+        parent = output_directory
+        for name in path.relative_to(output_directory).parts[:-1]:
+            parent = parent / name
+            if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                raise ValueError(f"runtime output parent must be an ordinary directory: {parent}")
 
 
-def prepare_runtime_libraries(architecture, musl_libc_path, glibc_library_directory,
-                              output_directory, glibc_locale_directory=None, libgcc_s_path=None):
-    """校验指定来源并安装动态库及 locale，默认 locale 仅匹配固定身份的官方 libc。"""
-    if architecture not in RUNTIME_LIBRARY_SOURCES:
-        raise ValueError(f"unsupported architecture: {architecture}")
-    _, _, expected_machine, musl_loader, glibc_loader = RUNTIME_LIBRARY_SOURCES[architecture]
-    glibc_library_directory = Path(glibc_library_directory).resolve(strict=True)
-    if not glibc_library_directory.is_dir():
-        raise ValueError(f"glibc source is not a directory: {glibc_library_directory}")
+def is_stale_entry(path, link_target):
+    """判断路径是否仍是旧版工具写出的库：link_target 为 None 时要求普通文件，否则要求指向该目标的符号链接。"""
+    if link_target is None:
+        return path.is_file() and not path.is_symlink()
+    return path.is_symlink() and os.readlink(path) == link_target
+
+
+def read_libgcc_s(profile, libgcc_s_path, outputs):
+    """定位并校验 libgcc_s.so.1，返回已核对 SHA-256 的文件内容。
+
+    默认路径取自 GNU 编译器，显式路径只是同一份字节的另一处存放位置；
+    来源不能与任何输出位置重叠，身份不符时不会运行 `readelf`。
+    """
     if libgcc_s_path is None:
-        libgcc_s_path = glibc_library_directory / "libgcc_s.so.1"
+        libgcc_s_path = toolchain_libgcc_s(profile.compiler)
+    source = Path(libgcc_s_path).resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"libgcc source is not a regular file: {source}")
+    reject_source_overlap(source, outputs)
+    content = source.read_bytes()
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != profile.libgcc_sha256:
+        raise ValueError(
+            f"libgcc_s.so.1 SHA-256 mismatch: expected {profile.libgcc_sha256}, "
+            f"actual {actual}: {source}"
+        )
+    check_libgcc_s(source, profile)
+    return content
+
+
+def prepare_runtime_libraries(architecture, output_directory, glibc_locale_directory=None,
+                              libgcc_s_path=None):
+    """校验固定身份的 libgcc 与 locale 后写出 glibc 补充资产，并清除旧版工具遗留的 musl 与 glibc 库。
+
+    输出为 `glibc/lib/libgcc_s.so.1`、`glibc/identity` 和架构对应的 `glibc/usr/lib{,64}/locale/C.utf8`，
+    `identity` 一行依次记录测试根 libc 与动态链接器的 SHA-256 及加载器文件名。来源缺失、身份不符和
+    输出路径不合规都在第一次写入前报错。写入阶段的多项输出不构成整体事务，调用者以是否抛出异常判断成败。
+    """
+    if architecture not in RUNTIME_PROFILES:
+        raise ValueError(f"unsupported architecture: {architecture}")
+    profile = RUNTIME_PROFILES[architecture]
     output_directory = Path(output_directory).absolute()
-    locale_lib = "lib" if architecture == "riscv64" else "lib64"
-    locale_destination = output_directory / "glibc/usr" / locale_lib / "locale/C.utf8"
-    libraries = [
-        (musl_libc_path, output_directory / "musl/lib/libc.so"),
-        (glibc_library_directory / "libc.so.6", output_directory / "glibc/lib/libc.so.6"),
-        (glibc_library_directory / "libm.so.6", output_directory / "glibc/lib/libm.so.6"),
-        (glibc_library_directory / glibc_loader, output_directory / "glibc/lib" / glibc_loader),
-        (libgcc_s_path, output_directory / "glibc/lib/libgcc_s.so.1"),
-    ]
-    links = [output_directory / "musl/lib" / musl_loader]
-    if architecture == "loongarch64":
-        links.extend((output_directory / "musl/lib64", output_directory / "glibc/lib64"))
-    outputs = [path.resolve() for path in (
-        [output_directory, locale_destination] + [destination for _, destination in libraries] + links
-    )]
-    reject_source_overlap(glibc_library_directory, outputs)
-    resolved_libraries = []
-    for source_path, destination_path in libraries:
-        source_path = Path(source_path).resolve(strict=True)
-        if not source_path.is_file():
-            raise ValueError(f"required source is not a regular file: {source_path}")
-        reject_source_overlap(source_path, outputs)
-        resolved_libraries.append((source_path, destination_path))
-    if glibc_locale_directory is None:
-        glibc_locale_directory = builtin_locale_directory(architecture, resolved_libraries[1][0])
-    locale_source = check_locale_directory(Path(glibc_locale_directory), outputs)
+    libgcc_destination = output_directory / "glibc/lib/libgcc_s.so.1"
+    identity_destination = output_directory / "glibc/identity"
+    locale_destination = output_directory / "glibc" / profile.locale_path
+    destinations = [libgcc_destination, identity_destination, locale_destination]
+    stale_entries = [(output_directory / name, target) for name, target in STALE_RUNTIME_ENTRIES]
+    outputs = [path.resolve() for path in [output_directory, *destinations]]
+    reject_linked_parents(output_directory, destinations + [path for path, _ in stale_entries])
+    for destination in (libgcc_destination, identity_destination):
+        if destination.is_dir() and not destination.is_symlink():
+            raise ValueError(f"runtime output must not be a directory: {destination}")
     if locale_destination.is_symlink() or (
             locale_destination.exists() and not locale_destination.is_dir()):
         raise ValueError(f"locale output must be an ordinary directory: {locale_destination}")
-    # 所有源文件和 locale 均在写出前完成校验。
-    for source_path, _ in resolved_libraries:
-        check_runtime_library_elf(source_path, expected_machine)
-    check_libgcc_s(resolved_libraries[4][0], resolved_libraries[1][0],
-                   resolved_libraries[3][0], architecture)
-    print("Static symbol checks do not prove guest dynamic loading or locale compatibility; "
-          "guest dlopen and setlocale are required.")
-    for source_path, destination_path in resolved_libraries:
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        copy_runtime_library(source_path, destination_path)
-    install_loader_link(output_directory / "musl/lib" / musl_loader, "libc.so")
-    if architecture == "loongarch64":
-        install_loader_link(output_directory / "musl/lib64", "lib")
-        install_loader_link(output_directory / "glibc/lib64", "lib")
+    locale_source = builtin_locale_directory(architecture, glibc_locale_directory)
+    reject_source_overlap(locale_source, outputs)
+    libgcc = read_libgcc_s(profile, libgcc_s_path, outputs)
+    for path, target in stale_entries:
+        if is_stale_entry(path, target):
+            path.unlink()
+            print(f"Removed stale runtime entry: {path}")
+    publish_file(libgcc_destination, libgcc)
     publish_locale_directory(locale_source, locale_destination)
+    # identity 最后发表，首次准备中途失败的输出目录因缺少它而不完整。
+    identity = f"{profile.libc_sha256} {profile.loader_sha256} {profile.loader}\n"
+    publish_file(identity_destination, identity.encode("ascii"))
     print(f"Runtime libraries prepared: arch={architecture} output_directory={output_directory}")
 
 
 def main(argv=None):
-    """命令行入口：解析架构与运行库路径参数并执行准备流程，失败时输出错误并返回非零退出码。"""
+    """命令行入口：解析架构、输出目录和可选的 libgcc、locale 重定位路径并执行准备流程，失败时输出错误并返回非零退出码。"""
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--arch", choices=RUNTIME_LIBRARY_SOURCES, required=True)
-    parser.add_argument("--musl-libc", type=Path)
-    parser.add_argument("--glibc-libdir", type=Path)
-    parser.add_argument("--libgcc-s", type=Path)
-    parser.add_argument("--glibc-locale-dir", type=Path)
+    parser.add_argument("--arch", choices=RUNTIME_PROFILES, required=True)
+    parser.add_argument("--libgcc-s", type=Path,
+                        help="relocate libgcc_s.so.1; its SHA-256 must match the fixed identity")
+    parser.add_argument("--glibc-locale-dir", type=Path,
+                        help="relocate C.utf8; its manifest SHA-256 must match the fixed identity")
     parser.add_argument("--output-directory", type=Path, required=True)
     args = parser.parse_args(argv)
-    default_musl, default_glibc, _, _, _ = RUNTIME_LIBRARY_SOURCES[args.arch]
-    libgcc_s_path = args.libgcc_s
-    if libgcc_s_path is None and args.glibc_libdir is None:
-        libgcc_s_path = Path(DEFAULT_LIBGCC_S[args.arch])
     try:
-        prepare_runtime_libraries(
-            args.arch,
-            args.musl_libc if args.musl_libc is not None else Path(default_musl),
-            args.glibc_libdir if args.glibc_libdir is not None else Path(default_glibc),
-            args.output_directory,
-            args.glibc_locale_dir,
-            libgcc_s_path,
-        )
+        prepare_runtime_libraries(args.arch, args.output_directory,
+                                  args.glibc_locale_dir, args.libgcc_s)
     except (OSError, ValueError, RuntimeError, shutil.Error, subprocess.CalledProcessError) as error:
         print(f"Runtime library preparation failed: {error}", file=sys.stderr)
         return 1

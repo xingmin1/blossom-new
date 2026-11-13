@@ -4,7 +4,7 @@
 
 ## 1. 环境与构建职责
 
-所有宿主端构建与运行命令均在仓库根目录执行。开发机需准备固定版本的 Rust 工具链 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC 工具链，以及 QEMU `9.2.1`。制作 ext4 磁盘镜像需要使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；检查运行库需要使用支持目标架构 ELF 的 `readelf`。开发板设备树（DTB）从仓内源码编译生成，宿主需提供 C 预处理器（`cc`）和 `dtc`，打包 RAM 根文件系统镜像（`uInitrd`）还需提供 `fdtput`。上述工具通过 `PATH` 或显式 Make 参数提供；Makefile 不会调用系统包管理器，Nix 仅作为可选的个人开发环境。
+所有宿主端构建与运行命令均在仓库根目录执行。开发机需准备固定版本的 Rust 工具链 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC 工具链，以及 QEMU `9.2.1`。准备客体运行时资产时还需对应架构的 GNU 交叉 GCC；制作 ext4 磁盘镜像需要使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`，检查运行库需要使用支持目标架构 ELF 的 `readelf`。开发板设备树（DTB）从仓内源码编译生成，宿主需提供 C 预处理器（`cc`）和 `dtc`，打包 RAM 根文件系统镜像（`uInitrd`）还需提供 `fdtput`。上述工具通过 `PATH` 或显式 Make 参数提供；Makefile 不会调用系统包管理器，Nix 仅作为可选的个人开发环境。
 
 生成比赛用 FAT32 夹具还需要 `mkfs.fat`、`fsck.fat`、`mcopy` 和 `mmd`；缺少任一工具时构建会报错，不会下载依赖或改用其他文件系统。
 
@@ -12,7 +12,7 @@ Cargo 依赖统一使用仓内 `vendor` 目录。当通过 Rustup 代理调用�
 
 普通内核构建与 `ktest` 测试内核构建都需要该固定工具链的 `rust-src` 组件，由 `os/.cargo/config.toml` 统一从源码重新编译 `core`、`alloc` 及 `compiler-builtins-mem`。LoongArch 架构统一关闭 `ual`（非对齐访存）特性，确保内核与标准库都生成严格对齐的访存指令；不能只对内核代码禁用非对齐访存却继续链接预编译的标准库。Makefile 会清除外部环境变量中的 `RUSTFLAGS` 与 `CARGO_ENCODED_RUSTFLAGS`，改用 Cargo 原生的 `--config` 数组合并 panic/unwind 策略与目标 ISA 约束。若直接运行 Cargo 构建内核，仍须以 `os/` 为工作目录；独立的用户态 `std` 程序则消费已准备好的目标标准库和 sysroot，不读取内核的 Cargo 配置。
 
-单架构构建根据 `ARCH` 选择交叉工具链前缀 `MUSL_CROSS_RV` 或 `MUSL_CROSS_LA`，默认值分别为 `riscv64-linux-musl-` 和 `loongarch64-linux-musl-`；运行库参数 `MUSL_LIBC`、`GLIBC_LIBDIR`、`LIBGCC_S` 和 `GLIBC_LOCALE_DIR` 同样选择对应的 `_RV` 或 `_LA` 变量。显式传入单架构参数优先；`make all` 分别读取两套架构专属参数。默认 locale 与官方 libc 的完整哈希绑定，若更换 libc 须提供兼容的 `GLIBC_LOCALE_DIR`；固定来源和失败规则见[运行库来源](../userland/runtime/sources.md)。
+单架构构建根据 `ARCH` 选择交叉工具链前缀 `MUSL_CROSS_RV` 或 `MUSL_CROSS_LA`，默认值分别为 `riscv64-linux-musl-` 和 `loongarch64-linux-musl-`。运行时准备使用对应 GNU 交叉 GCC 提供的 `libgcc_s.so.1` 和仓内 locale；`LIBGCC_S`、`GLIBC_LOCALE_DIR` 及双架构的 `_RV`、`_LA` 变量只允许指定字节身份相同的其他路径。测试盘的 libc、加载器、libgcc 与 locale 必须匹配固定组合；来源和失败规则见[运行库来源](../userland/runtime/sources.md)。
 
 ```sh
 make help
@@ -26,7 +26,7 @@ make prepare-guest-runtime-libraries ARCH=riscv64
 |---|---|
 | `build-kernel` | 仅构建所选架构与平台的内核；默认为 `debug`、`abort` 配置，输出至 `build/kernel/ARCH/PLATFORM/PROFILE/kernel.elf` |
 | `build-guest-userland` | 增量构建 BusyBox、仓库内 C 用户程序、release 模式的 Rust `std` 比赛执行器与用户自测执行器 |
-| `prepare-guest-runtime-libraries` | 从显式指定的本地 libc 来源复制并校验匹配目标架构的动态运行库资产 |
+| `prepare-guest-runtime-libraries` | 校验并准备目标架构的 libgcc、locale 和测试盘运行库身份 |
 | `assemble-root-filesystem` | 汇总用户程序、运行库和配置文件，全量更新项目管理的单根文件系统输出目录 |
 | `create-ext4-image` | 仅将指定的完整目录树打包为不含日志（no-journal）的 raw ext4 磁盘镜像 |
 | `build-qemu-artifacts` | 生成指定架构的固定 `release`/`abort` 内核以及单根系统 ext4 镜像 |
@@ -43,14 +43,10 @@ make prepare-guest-runtime-libraries ARCH=riscv64
 
 ```sh
 make all \
-  MUSL_CROSS_RV=/srv/toolchains/riscv64/bin/riscv64-buildroot-linux-musl- \
+  MUSL_CROSS_RV=/srv/toolchains/riscv64/bin/riscv64-linux-musl- \
   MUSL_CROSS_LA=/srv/toolchains/loongarch64/bin/loongarch64-linux-musl- \
-  MUSL_LIBC_RV=/srv/contest-runtime/riscv64/musl/libc.so \
-  GLIBC_LIBDIR_RV=/srv/contest-runtime/riscv64/glibc/lib \
   LIBGCC_S_RV=/srv/contest-runtime/riscv64/glibc/libgcc_s.so.1 \
   GLIBC_LOCALE_DIR_RV=/srv/contest-runtime/riscv64/glibc/C.utf8 \
-  MUSL_LIBC_LA=/srv/contest-runtime/loongarch64/musl/libc.so \
-  GLIBC_LIBDIR_LA=/srv/contest-runtime/loongarch64/glibc/lib \
   LIBGCC_S_LA=/srv/contest-runtime/loongarch64/glibc/libgcc_s.so.1 \
   GLIBC_LOCALE_DIR_LA=/srv/contest-runtime/loongarch64/glibc/C.utf8 \
   RUNNER_SYSROOT_RV=/srv/rust-std/nightly-2025-01-18 \

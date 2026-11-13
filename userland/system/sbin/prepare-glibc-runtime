@@ -1,5 +1,5 @@
 #!/bin/sh
-# 在比赛工作根中补充与原 libc 匹配的 libgcc 和 C.UTF-8 locale。
+# 补充缺失的 libgcc 和 C.UTF-8 locale 前，核对测试根 libc 与 loader 的 SHA256 身份。
 # 由系统根的静态 BusyBox 执行；测试根须已准备 /.blossom/busybox。
 set -eu
 
@@ -29,6 +29,59 @@ check_parent() {
     if [ -e "$1" ] && [ ! -d "$1" ]; then
         fail "target parent is not a directory: $1"
     fi
+}
+
+# 判断参数是否为 64 位小写十六进制 SHA256。
+is_sha256() {
+    case $1 in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#1}" -eq 64 ]
+}
+
+# 读取系统根中的 glibc 身份文件，内容为以单个空格分隔的一行
+# "<libc SHA256> <loader SHA256> <loader 文件名>"，结果保存在 libc_sum、loader_sum 和
+# loader_name。loader 文件名只接受 RISC-V 与 LoongArch 两个固定名称；字段缺失、字段多余、
+# 多余行、额外空白或 SHA256 格式错误都使准备失败。
+read_identity() {
+    identity=$runtime/identity
+    [ -f "$identity" ] && [ ! -L "$identity" ] && [ -s "$identity" ] ||
+        fail "missing or invalid runtime identity: $identity"
+    # 末行缺少换行时 read 返回非零；第二次 read 必须直接遇到 EOF，才能排除多余内容。
+    {
+        IFS= read -r identity_line &&
+            ! IFS= read -r identity_extra &&
+            [ -z "$identity_extra" ]
+    } < "$identity" || fail "unreadable or malformed runtime identity: $identity"
+    # 只在单个空格处切分；多余的空格或字段会留在某个字段内，由下面的检查拒绝。
+    libc_sum=${identity_line%% *}
+    identity_rest=${identity_line#* }
+    loader_sum=${identity_rest%% *}
+    loader_name=${identity_rest#* }
+    is_sha256 "$libc_sum" && is_sha256 "$loader_sum" ||
+        fail "invalid SHA256 in runtime identity: $identity"
+    case $loader_name in
+        ld-linux-riscv64-lp64d.so.1|ld-linux-loongarch-lp64d.so.1) ;;
+        *) fail "unsupported loader in runtime identity: '$loader_name'" ;;
+    esac
+}
+
+# 输出测试根内路径 $1 所指普通文件的 SHA256 记录。最终组件是符号链接时交给测试根内的
+# BusyBox 在 chroot 中解析，绝对链接才会指向测试根而不是系统根。
+root_sha256() {
+    if [ -L "$root$1" ]; then
+        "$bb" chroot "$root" /.blossom/busybox sh -c \
+            '[ -f "$1" ] && /.blossom/busybox sha256sum "$1"' sh "$1"
+    else
+        [ -f "$root$1" ] && "$bb" sha256sum "$root$1"
+    fi
+}
+
+# 核对测试根内路径 $1 的 SHA256 等于身份文件记录的 $2，无法读取或不一致时失败。
+check_root_sha256() {
+    actual=$(root_sha256 "$1") || fail "cannot hash test-root file: $root$1"
+    actual=${actual%% *}
+    [ "$actual" = "$2" ] || fail "test-root $1 SHA256 mismatch: expected $2, got $actual"
 }
 
 trap cleanup EXIT
@@ -102,19 +155,12 @@ else
     need_locale=1
 fi
 
+# 补入的 libgcc 和 locale 只适用于身份文件记录的 libc 与 loader；
+# 两者的 SHA256 在创建任何临时文件或目标目录之前核对。
 if [ "$need_lib" -eq 1 ] || [ "$need_locale" -eq 1 ]; then
-    libc_source=$runtime/lib/libc.so.6
-    libc_target=$root/lib/libc.so.6
-    [ -f "$libc_source" ] && [ ! -L "$libc_source" ] || fail "invalid system libc: $libc_source"
-    source_sum=$("$bb" sha256sum "$libc_source") || fail "cannot hash system libc: $libc_source"
-    if [ -L "$libc_target" ]; then
-        target_sum=$("$bb" chroot "$root" /.blossom/busybox sha256sum /lib/libc.so.6) ||
-            fail "cannot hash test-root libc: $libc_target"
-    else
-        [ -f "$libc_target" ] || fail "invalid test-root libc: $libc_target"
-        target_sum=$("$bb" sha256sum "$libc_target") || fail "cannot hash test-root libc: $libc_target"
-    fi
-    [ "${source_sum%% *}" = "${target_sum%% *}" ] || fail "system and test-root libc SHA256 differ"
+    read_identity
+    check_root_sha256 /lib/libc.so.6 "$libc_sum"
+    check_root_sha256 "/lib/$loader_name" "$loader_sum"
 fi
 
 if [ "$need_lib" -eq 1 ]; then
